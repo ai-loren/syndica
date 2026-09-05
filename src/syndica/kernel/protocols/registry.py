@@ -2,6 +2,16 @@
 
 它只回答「这个 Agent 处于什么状态」；「这个 Agent 的对象在哪」由进程内的
 LocalAgentTable 回答。两者分离是存储层可替换的地基（spec §4.3）。
+
+所有实现共有两条不变式：
+
+- **读己所写**：写操作返回后，紧接着的读必须看到它。从落后副本返回旧值不合规。
+- **拒绝即无副作用**：抛异常的写操作不得留下部分写入。
+
+抛异常还是返回，取决于调用方的意图能否表达：**意图无法表达的操作抛异常，后置条件已经成立的
+操作成功返回**。`register` 重复 id 抛（调用方要的是「创建」），`update` 缺条目抛（没有东西可写），
+`unregister` 缺条目成功（「不在注册表里」已经成立）；`get` 与 `compare_and_set_status` 是提问
+不是要求，未知条目分别返回 `None` 与 `False`。
 """
 
 from __future__ import annotations
@@ -10,15 +20,32 @@ from typing import Any, Protocol, runtime_checkable
 
 from syndica.kernel.agent_types import AgentInfo, AgentStatus
 
-__all__ = ['AgentRegistry']
+__all__ = ['AgentRegistry', 'UPDATE_PROTECTED_FIELDS', 'UPDATE_WRITABLE_FIELDS']
+
+# 两个集合必须构成 AgentInfo 字段的一个划分：AgentInfo 新增字段必须落进其中之一，
+# 否则 update() 该不该写它无人回答。
+#
+# 可写 = 只有一个写者，无条件写不会覆盖掉别人的写入。
+UPDATE_WRITABLE_FIELDS: frozenset[str] = frozenset(
+    {'agent_type', 'heartbeat_at', 'metadata', 'name', 'owner', 'session_id'}
+)
+# 受保护 = 另有专用机制拥有它。agent_id 是主键，随条目创建与销毁；status 有并发写者，
+# 只能走 CAS；parent_id 与 children 是同一条链接的两端，单写一端会让父→子索引与 parent_id 脱钩。
+UPDATE_PROTECTED_FIELDS: frozenset[str] = frozenset({'agent_id', 'children', 'parent_id', 'status'})
 
 
 @runtime_checkable
 class AgentRegistry(Protocol):
-    async def register(self, info: AgentInfo) -> None: ...
+    async def register(self, info: AgentInfo) -> None:
+        """写入新条目并把它挂到父的 children 上。
+
+        agent_id 已存在、或 parent_id 非 None 而该父不在注册表中时抛异常；后者包含空串——
+        空串是「声称有父但父未注册」，不是「无父」，无父只有 None 一种写法。
+        """
+        ...
 
     async def get(self, agent_id: str) -> AgentInfo | None:
-        """返回快照。调用方修改返回值不得影响存储。"""
+        """返回快照。调用方修改返回值（含 metadata / children 等嵌套容器）不得影响存储。"""
         ...
 
     async def compare_and_set_status(
@@ -28,13 +55,23 @@ class AgentRegistry(Protocol):
         ...
 
     async def update(self, agent_id: str, **fields: Any) -> None:
-        """无条件写。仅限单一写者拥有的字段；多方可写的集合须用专用原子操作。"""
+        """无条件写 `UPDATE_WRITABLE_FIELDS` 里的字段。
+
+        `UPDATE_PROTECTED_FIELDS` 里的字段与两个集合之外的字段名一律抛异常，
+        且拒绝时一个字段都不写。agent_id 不存在时抛异常。
+        """
         ...
 
-    async def children_of(self, agent_id: str) -> list[str]: ...
+    async def children_of(self, agent_id: str) -> list[str]:
+        """返回子代 id 的快照；agent 不存在时返回空列表。"""
+        ...
 
     async def list(
         self, *, status: AgentStatus | None = None, parent_id: str | None = None
-    ) -> list[AgentInfo]: ...
+    ) -> list[AgentInfo]:
+        """返回快照列表，语义同 `get`。不保证顺序。"""
+        ...
 
-    async def unregister(self, agent_id: str) -> None: ...
+    async def unregister(self, agent_id: str) -> None:
+        """删除条目并把它从父的 children 上摘掉。agent 不存在时是 no-op，不抛异常。"""
+        ...

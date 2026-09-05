@@ -7,8 +7,17 @@ from typing import Any
 
 from syndica.kernel.agent_types import AgentInfo, AgentStatus
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.protocols.registry import UPDATE_PROTECTED_FIELDS, UPDATE_WRITABLE_FIELDS
 
 __all__ = ['InMemoryAgentRegistry']
+
+# 拒绝一个受保护字段时必须报出谁才是它的写入路径，否则调用方只知道被拒、不知道该走哪。
+_PROTECTED_FIELD_OWNER: dict[str, str] = {
+    'agent_id': 'register / unregister——主键随条目一起创建与销毁',
+    'children': 'register / unregister——它们同时更新父与子两端',
+    'parent_id': 'register / unregister——它们同时更新父与子两端',
+    'status': 'compare_and_set_status——状态有并发写者，只能靠 CAS 不丢转换',
+}
 
 
 class InMemoryAgentRegistry:
@@ -54,19 +63,25 @@ class InMemoryAgentRegistry:
                 received='注册表中不存在该条目',
                 next_action='先 register，或检查 agent_id 是否拼错',
             )
-        if 'children' in fields:
-            raise ConfigError(
-                expected='update 只写单一写者拥有的字段',
-                received='收到 children——父→子索引由父子双方写入，无条件写会与 parent_id 脱钩',
-                next_action='改用 register / unregister 维护父子关系，它们同时更新两端',
-            )
-        for key, value in fields.items():
-            if not hasattr(info, key):
+        # 先全量校验再写：任一字段被拒时不得留下部分写入。
+        for key in fields:
+            if key in UPDATE_PROTECTED_FIELDS:
+                owner = _PROTECTED_FIELD_OWNER.get(key, '注册表为该字段提供的专用操作')
                 raise ConfigError(
-                    expected=f'AgentInfo 拥有字段 {key!r}',
-                    received=f'AgentInfo 无此字段；可用字段: {sorted(vars(info))}',
-                    next_action='改用已存在的字段名，或把新字段加进 AgentInfo',
+                    expected=f'update 只写单一写者拥有的字段: {sorted(UPDATE_WRITABLE_FIELDS)}',
+                    received=f'收到受保护字段 {key!r}，它另有写入者，无条件写会覆盖掉对方的写入',
+                    next_action=f'改用 {owner}',
                 )
+            if key not in UPDATE_WRITABLE_FIELDS:
+                raise ConfigError(
+                    expected=f'update 只写单一写者拥有的字段: {sorted(UPDATE_WRITABLE_FIELDS)}',
+                    received=f'{key!r} 既不可写也不在受保护字段中，AgentInfo 上没有这个字段',
+                    next_action=(
+                        '改用可写字段名；若这是 AgentInfo 新增的字段，'
+                        '先把它归入 UPDATE_WRITABLE_FIELDS 或 UPDATE_PROTECTED_FIELDS'
+                    ),
+                )
+        for key, value in fields.items():
             setattr(info, key, value)
 
     async def children_of(self, agent_id: str) -> list[str]:
