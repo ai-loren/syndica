@@ -25,6 +25,8 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# docs 里的代码块是需求源文本，实现者逐字誊抄；formatter 重排它们会篡改需求。
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
@@ -35,4 +37,8 @@ quote-style = "single"
 [tool.pyright]
 include = ["src", "tests"]
 pythonVersion = "3.11"
-typeCheckingMode = "strict"
+# 硬约束是「公开 API 全量类型标注」（AGENTS.md #6），tests 不是公开 API，只跑 standard。
+# 必须用顶层 strict 路径列表：pyright 在 executionEnvironments 里不认 typeCheckingMode，
+# 改写成那种形式会让 src 静默降级为 standard。
+typeCheckingMode = "standard"
+strict = ["src"]
