@@ -16,11 +16,18 @@ LocalAgentTable 回答。两者分离是存储层可替换的地基（spec §4.3
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
 from syndica.kernel.agent_types import AgentInfo, AgentStatus
 
-__all__ = ['AgentRegistry', 'UPDATE_PROTECTED_FIELDS', 'UPDATE_WRITABLE_FIELDS']
+__all__ = [
+    'AgentRegistry',
+    'UPDATE_PROTECTED_FIELDS',
+    'UPDATE_PROTECTED_FIELD_OWNERS',
+    'UPDATE_WRITABLE_FIELDS',
+]
 
 # 两个集合必须构成 AgentInfo 字段的一个划分：AgentInfo 新增字段必须落进其中之一，
 # 否则 update() 该不该写它无人回答。
@@ -29,9 +36,18 @@ __all__ = ['AgentRegistry', 'UPDATE_PROTECTED_FIELDS', 'UPDATE_WRITABLE_FIELDS']
 UPDATE_WRITABLE_FIELDS: frozenset[str] = frozenset(
     {'agent_type', 'heartbeat_at', 'metadata', 'name', 'owner', 'session_id'}
 )
-# 受保护 = 另有专用机制拥有它。agent_id 是主键，随条目创建与销毁；status 有并发写者，
-# 只能走 CAS；parent_id 与 children 是同一条链接的两端，单写一端会让父→子索引与 parent_id 脱钩。
+# 受保护 = 另有专用机制拥有它，逐字段的机制与理由见 UPDATE_PROTECTED_FIELD_OWNERS。
 UPDATE_PROTECTED_FIELDS: frozenset[str] = frozenset({'agent_id', 'children', 'parent_id', 'status'})
+# 拒绝写一个受保护字段时必须报出谁才是它的写入路径，否则调用方只知道被拒、不知道该走哪条路。
+# 键集必须与 UPDATE_PROTECTED_FIELDS 逐字段对齐。
+UPDATE_PROTECTED_FIELD_OWNERS: Mapping[str, str] = MappingProxyType(
+    {
+        'agent_id': 'register / unregister——主键随条目一起创建与销毁',
+        'children': 'register / unregister——它们同时更新父与子两端',
+        'parent_id': 'register / unregister——它们同时更新父与子两端',
+        'status': 'compare_and_set_status——状态有并发写者，只能靠 CAS 不丢转换',
+    }
+)
 
 
 @runtime_checkable

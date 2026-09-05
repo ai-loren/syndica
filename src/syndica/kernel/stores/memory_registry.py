@@ -7,17 +7,13 @@ from typing import Any
 
 from syndica.kernel.agent_types import AgentInfo, AgentStatus
 from syndica.kernel.errors import ConfigError
-from syndica.kernel.protocols.registry import UPDATE_PROTECTED_FIELDS, UPDATE_WRITABLE_FIELDS
+from syndica.kernel.protocols.registry import (
+    UPDATE_PROTECTED_FIELD_OWNERS,
+    UPDATE_PROTECTED_FIELDS,
+    UPDATE_WRITABLE_FIELDS,
+)
 
 __all__ = ['InMemoryAgentRegistry']
-
-# 拒绝一个受保护字段时必须报出谁才是它的写入路径，否则调用方只知道被拒、不知道该走哪。
-_PROTECTED_FIELD_OWNER: dict[str, str] = {
-    'agent_id': 'register / unregister——主键随条目一起创建与销毁',
-    'children': 'register / unregister——它们同时更新父与子两端',
-    'parent_id': 'register / unregister——它们同时更新父与子两端',
-    'status': 'compare_and_set_status——状态有并发写者，只能靠 CAS 不丢转换',
-}
 
 
 class InMemoryAgentRegistry:
@@ -66,7 +62,7 @@ class InMemoryAgentRegistry:
         # 先全量校验再写：任一字段被拒时不得留下部分写入。
         for key in fields:
             if key in UPDATE_PROTECTED_FIELDS:
-                owner = _PROTECTED_FIELD_OWNER.get(key, '注册表为该字段提供的专用操作')
+                owner = UPDATE_PROTECTED_FIELD_OWNERS.get(key, '注册表为该字段提供的专用操作')
                 raise ConfigError(
                     expected=f'update 只写单一写者拥有的字段: {sorted(UPDATE_WRITABLE_FIELDS)}',
                     received=f'收到受保护字段 {key!r}，它另有写入者，无条件写会覆盖掉对方的写入',

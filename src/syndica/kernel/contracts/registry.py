@@ -20,6 +20,7 @@ from typing import Any
 from syndica.kernel.agent_types import AgentInfo, AgentStatus
 from syndica.kernel.errors import SyndicaError
 from syndica.kernel.protocols.registry import (
+    UPDATE_PROTECTED_FIELD_OWNERS,
     UPDATE_PROTECTED_FIELDS,
     UPDATE_WRITABLE_FIELDS,
     AgentRegistry,
@@ -80,20 +81,27 @@ class AgentRegistryContract:
             ' 把新字段归入 UPDATE_WRITABLE_FIELDS（只有一个写者）或 UPDATE_PROTECTED_FIELDS'
             '（另有专用写入机制），并删掉集合里已被移除的字段名。'
         )
+        unowned = UPDATE_PROTECTED_FIELDS - UPDATE_PROTECTED_FIELD_OWNERS.keys()
+        orphaned = UPDATE_PROTECTED_FIELD_OWNERS.keys() - UPDATE_PROTECTED_FIELDS
+        assert not unowned and not orphaned, (
+            '期望每个受保护字段都在 UPDATE_PROTECTED_FIELD_OWNERS 里写明哪个操作才能改它。'
+            f' 实际没写明: {sorted(unowned)}；已不再受保护却仍留着条目: {sorted(orphaned)}。'
+            ' 给每个受保护字段补上它的写入路径，否则拒绝写该字段时只告诉调用方被拒、'
+            '不告诉他该改用什么。'
+        )
 
     def test_async_cases_are_driven_by_an_async_plugin(self, request: Any) -> None:
-        # 标记是 collection 期打上的：被 -k / -m 过滤掉的 async 用例压根不会被收集，
-        # 因而也没有标记可读——此时「读不到标记」无法区分插件缺失与用例未被选中。
-        if request.config.option.keyword or request.config.option.markexpr:
+        async_items = [
+            item
+            for item in request.session.items
+            if getattr(item, 'cls', None) is type(self)
+            and iscoroutinefunction(getattr(item, 'obj', None))
+        ]
+        # 标记是 collection 期打上的：没被收集的 async 用例根本没有标记可读。因此收集数为零时
+        # 「读不到标记」既可能是插件缺失、也可能是 -k / -m / --deselect / --lf / xdist 分片
+        # 把它们排除了，两者无从区分——没有证据就不下结论，而不是判失败。
+        if not async_items:
             return
-        mine = [item for item in request.session.items if getattr(item, 'cls', None) is type(self)]
-        async_items = [item for item in mine if iscoroutinefunction(getattr(item, 'obj', None))]
-        assert async_items, (
-            f'期望在本次会话里收集到 {type(self).__name__} 的 async 用例。'
-            f' 实际一个都没有（本类共收集到 {len(mine)} 个用例）。'
-            ' 确认子类确实继承了 AgentRegistryContract'
-            ' 且用例未被 --deselect / --lf 之类的选择方式排除掉。'
-        )
         undriven = [
             item.nodeid
             for item in async_items
