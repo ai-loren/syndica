@@ -91,7 +91,7 @@ pyproject.toml
 
 **Interfaces:**
 - Consumes: 无
-- Produces: 可安装的包 `syndica`；`python scripts/check_deps.py` 返回 0 表示依赖方向合规
+- Produces: 可安装的包 `syndica`；`uv run python scripts/check_deps.py` 返回 0 表示依赖方向合规
 
 - [ ] **Step 1: 写失败测试**
 
@@ -3637,7 +3637,7 @@ __all__ = [
 
 - [ ] **Step 5: 运行全部测试**
 
-Run: `uv run pytest -v && uv run ruff check . && uv run ruff format --check . && uv run pyright && python scripts/check_deps.py`
+Run: `uv run pytest -v && uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run python scripts/check_deps.py`
 Expected: 全部 passed；lint、format、类型检查与依赖方向校验均通过
 
 - [ ] **Step 6: 提交**
