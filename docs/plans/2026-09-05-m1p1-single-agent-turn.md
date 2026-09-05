@@ -20,6 +20,7 @@
 - **错误消息三件套**：期望什么 / 实际收到什么 / 下一步做什么。缺一不可。
 - **注释只写代码表达不了的硬约束**，不写变更历史、不写"我为什么没那么做"。
 - 公开 API 的范围包括：函数签名、**切点名、Store Protocol、Flag key、声明式 Agent 清单字段**。
+- **dataclass 的容器默认值用参数化泛型别名作工厂**（`field(default_factory=list[ToolCall])`），不用裸 `list` / `dict` —— 裸形式在 `src` 的 pyright strict 下会被判成 `list[Unknown]` 而报错。
 
 ---
 
@@ -524,8 +525,10 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'syndica.kernel.cont
 # src/syndica/kernel/context.py
 """上下文数据类型。
 
-Context 只含产出，不含控制信息（spec §4）：类比进程返回 exit code 与 stdout，
-不返回「我是否被强制终止」。控制状态归 Registry。
+Context 只承载产出与终态：轨迹块，以及一个终止原因（含 ABORTED）。
+**运行中的控制状态不在这里** —— 当前状态、是否被挂起、中止是否已置位都归
+Registry（spec §4.3）。理由是 Agent 阻塞或崩溃时无法自报状态，所以状态必须
+在它之外可读。
 """
 
 from __future__ import annotations
@@ -585,11 +588,11 @@ class ToolCall:
 class ContextBlock:
     role: Role
     content: str | list[Any] | None = None
-    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list[ToolCall])
     tool_call_id: str | None = None
-    artifacts: list[ArtifactRef] = field(default_factory=list)
+    artifacts: list[ArtifactRef] = field(default_factory=list[ArtifactRef])
     trust: TrustLevel = TrustLevel.TRUSTED
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 class Context:
@@ -726,9 +729,9 @@ class AgentInfo:
     agent_type: str
     status: AgentStatus = AgentStatus.IDLE
     parent_id: str | None = None
-    children: list[str] = field(default_factory=list)
+    children: list[str] = field(default_factory=list[str])
     session_id: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict[str, Any])
     owner: str | None = None
     heartbeat_at: float | None = None
 ```
@@ -1711,7 +1714,7 @@ __all__ = ['Event', 'EventBus']
 class Event:
     kind: str
     agent_id: str
-    payload: dict[str, Any] = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 class EventBus:
@@ -1946,7 +1949,7 @@ __all__ = ['HookResult']
 @dataclass
 class HookResult:
     skip: bool = False
-    modified: dict[str, Any] = field(default_factory=dict)
+    modified: dict[str, Any] = field(default_factory=dict[str, Any])
     result: Any = None
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -2177,8 +2180,8 @@ class ContextOverflowError(SyndicaError):
 class LLMConfig:
     provider: str
     model: str
-    client_args: dict[str, Any] = field(default_factory=dict)
-    request_args: dict[str, Any] = field(default_factory=dict)
+    client_args: dict[str, Any] = field(default_factory=dict[str, Any])
+    request_args: dict[str, Any] = field(default_factory=dict[str, Any])
     timeout: float = 600.0
     context_window: int | None = None
 
@@ -2219,7 +2222,7 @@ __all__ = ['ScriptedLLM', 'ScriptedTurn']
 @dataclass
 class ScriptedTurn:
     content: str | None = None
-    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list[ToolCall])
     raises: BaseException | None = None
 
 
@@ -2429,8 +2432,8 @@ _JSON_TYPES: dict[type, str] = {
 @dataclass
 class ToolResult:
     output: str | list[Any]
-    meta: dict[str, Any] = field(default_factory=dict)
-    artifacts: list[ArtifactRef] = field(default_factory=list)
+    meta: dict[str, Any] = field(default_factory=dict[str, Any])
+    artifacts: list[ArtifactRef] = field(default_factory=list[ArtifactRef])
     trust: TrustLevel = TrustLevel.TRUSTED
 
 
@@ -3050,7 +3053,7 @@ __all__ = ['AgentOptions', 'BaseAgent']
 class AgentOptions:
     name: str
     llm: LLM
-    tools: dict[str, Tool] = field(default_factory=dict)
+    tools: dict[str, Tool] = field(default_factory=dict[str, Tool])
     system_prompt: str = ''
     max_turns: int | None = 50
 
