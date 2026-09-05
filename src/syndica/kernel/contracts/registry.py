@@ -82,12 +82,17 @@ class AgentRegistryContract:
         )
 
     def test_async_cases_are_driven_by_an_async_plugin(self, request: Any) -> None:
+        # 标记是 collection 期打上的：被 -k / -m 过滤掉的 async 用例压根不会被收集，
+        # 因而也没有标记可读——此时「读不到标记」无法区分插件缺失与用例未被选中。
+        if request.config.option.keyword or request.config.option.markexpr:
+            return
         mine = [item for item in request.session.items if getattr(item, 'cls', None) is type(self)]
         async_items = [item for item in mine if iscoroutinefunction(getattr(item, 'obj', None))]
         assert async_items, (
             f'期望在本次会话里收集到 {type(self).__name__} 的 async 用例。'
             f' 实际一个都没有（本类共收集到 {len(mine)} 个用例）。'
-            ' 确认子类确实继承了 AgentRegistryContract 且用例未被 -k / -m 过滤掉。'
+            ' 确认子类确实继承了 AgentRegistryContract'
+            ' 且用例未被 --deselect / --lf 之类的选择方式排除掉。'
         )
         undriven = [
             item.nodeid
