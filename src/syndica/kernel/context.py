@@ -1,7 +1,9 @@
 """上下文数据类型。
 
-Context 只含产出，不含控制信息（spec §4）：类比进程返回 exit code 与 stdout，
-不返回「我是否被强制终止」。控制状态归 Registry。
+Context 只承载产出与终态：轨迹块，以及一个终止原因（含 ABORTED）。
+**运行中的控制状态不在这里** —— 当前状态、是否被挂起、中止是否已置位都归
+Registry（spec §4.3）。理由是 Agent 阻塞或崩溃时无法自报状态，所以状态必须
+在它之外可读。
 """
 
 from __future__ import annotations

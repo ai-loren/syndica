@@ -35,8 +35,13 @@ def test_block_defaults_to_trusted():
 
 
 def test_untrusted_marking_is_explicit():
+    """取值撞车会让成员静默塌成别名（UNTRUSTED 即 TRUSTED）；取值随 trace 落盘，属对外契约。"""
     block = ContextBlock(role='tool', content='<html>', trust=TrustLevel.UNTRUSTED)
     assert block.trust is TrustLevel.UNTRUSTED
+    assert {level.name: level.value for level in TrustLevel} == {
+        'TRUSTED': 'trusted',
+        'UNTRUSTED': 'untrusted',
+    }
 
 
 def test_block_carries_artifact_refs():
@@ -89,7 +94,6 @@ def test_default_containers_are_not_shared_between_blocks():
 def test_artifact_ref_rejects_mutation():
     ref = _ref()
     with pytest.raises(dataclasses.FrozenInstanceError):
-        # 刻意违反标注：要验证的正是标注之外的运行时不可变保护。
         ref.path = 'moved.md'  # pyright: ignore[reportAttributeAccessIssue]
 
 
@@ -105,6 +109,11 @@ def test_artifacts_are_intermediate_until_declared_deliverable():
     assert _ref().is_deliverable is False
 
 
-@pytest.mark.parametrize('name', ['COMPLETED', 'ABORTED', 'ERROR', 'MAX_TURNS'])
-def test_stop_reason_covers_every_terminal_outcome(name):
-    assert isinstance(getattr(StopReason, name), StopReason)
+def test_stop_reason_covers_every_terminal_outcome():
+    """取值撞车会让成员静默塌成别名（四态塌成三态）；取值随 trace 落盘，属对外契约。"""
+    assert {reason.name: reason.value for reason in StopReason} == {
+        'COMPLETED': 'completed',
+        'ABORTED': 'aborted',
+        'ERROR': 'error',
+        'MAX_TURNS': 'max_turns',
+    }
