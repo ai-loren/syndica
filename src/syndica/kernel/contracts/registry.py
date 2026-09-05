@@ -14,10 +14,9 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import fields
-from inspect import iscoroutinefunction
-from typing import Any
 
 from syndica.kernel.agent_types import AgentInfo, AgentStatus
+from syndica.kernel.contracts.base import ContractSuite
 from syndica.kernel.errors import SyndicaError
 from syndica.kernel.protocols.registry import (
     UPDATE_PROTECTED_FIELD_OWNERS,
@@ -27,9 +26,6 @@ from syndica.kernel.protocols.registry import (
 )
 
 __all__ = ['AgentRegistryContract']
-
-# 能驱动 async 用例的插件所打的标记；命中任意一个即视为该用例真的会被执行。
-_ASYNC_PLUGIN_MARKS = frozenset({'anyio', 'asyncio', 'trio'})
 
 
 def _info(agent_id: str = 'a1', **kw: object) -> AgentInfo:
@@ -54,7 +50,7 @@ def _rejects(action: str) -> Generator[None]:
     )
 
 
-class AgentRegistryContract:
+class AgentRegistryContract(ContractSuite):
     """子类必须提供一个 `registry` fixture，且每个用例拿到的必须是空注册表。
 
     套件另外要求实现满足两条不变式，二者都被用例依赖但不体现在方法签名上：
@@ -88,31 +84,6 @@ class AgentRegistryContract:
             f' 实际没写明: {sorted(unowned)}；已不再受保护却仍留着条目: {sorted(orphaned)}。'
             ' 给每个受保护字段补上它的写入路径，否则拒绝写该字段时只告诉调用方被拒、'
             '不告诉他该改用什么。'
-        )
-
-    def test_async_cases_are_driven_by_an_async_plugin(self, request: Any) -> None:
-        async_items = [
-            item
-            for item in request.session.items
-            if getattr(item, 'cls', None) is type(self)
-            and iscoroutinefunction(getattr(item, 'obj', None))
-        ]
-        # 标记是 collection 期打上的：没被收集的 async 用例根本没有标记可读。因此收集数为零时
-        # 「读不到标记」既可能是插件缺失、也可能是 -k / -m / --deselect / --lf / xdist 分片
-        # 把它们排除了，两者无从区分——没有证据就不下结论，而不是判失败。
-        if not async_items:
-            return
-        undriven = [
-            item.nodeid
-            for item in async_items
-            if not any(mark.name in _ASYNC_PLUGIN_MARKS for mark in item.iter_markers())
-        ]
-        assert not undriven, (
-            f'期望每个 async 用例都带上 {sorted(_ASYNC_PLUGIN_MARKS)} 之一的标记，'
-            ' 即真的有插件驱动它。'
-            f' 实际有 {len(undriven)} 个没有，例如 {undriven[0]}。'
-            ' 装上 pytest-asyncio 并设 asyncio_mode = "auto"，否则这些用例会被静默跳过，'
-            ' 汇总里看起来与通过一模一样。'
         )
 
     async def test_register_then_get_roundtrips(self, registry: AgentRegistry) -> None:

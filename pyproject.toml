@@ -32,6 +32,13 @@ extend-exclude = ["docs"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
+[tool.ruff.lint.per-file-ignores]
+# ASYNC109（「别收 timeout 参数，让调用方套 asyncio.timeout」）与 MessageBroker 的等待上限
+# 冲突：远端实现要把 timeout 下推给服务端（Redis XREAD BLOCK），本地取消域只会把已阻塞的
+# 服务端连接留在那里。签名由 spec §4.4 固定，因此按文件豁免而不是全局关掉这条规则。
+"src/syndica/kernel/protocols/broker.py" = ["ASYNC109"]
+"src/syndica/kernel/stores/memory_broker.py" = ["ASYNC109"]
+
 [tool.ruff.format]
 quote-style = "single"
 
