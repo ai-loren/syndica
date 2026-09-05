@@ -1,3 +1,5 @@
+import pytest
+
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
 
 
@@ -67,3 +69,13 @@ def test_default_containers_are_not_shared_between_infos():
     first.metadata['origin'] = 'first'
     assert second.children == []
     assert second.metadata == {}
+
+
+def test_info_requires_agent_id_name_and_agent_type():
+    """agent_id 是 Registry 主键，三者任一悄悄变成可选都会让条目共用缺省值而相撞。"""
+    with pytest.raises(TypeError):
+        AgentInfo(name='Worker', agent_type='declarative')  # pyright: ignore[reportCallIssue]
+    with pytest.raises(TypeError):
+        AgentInfo(agent_id='a1', agent_type='declarative')  # pyright: ignore[reportCallIssue]
+    with pytest.raises(TypeError):
+        AgentInfo(agent_id='a1', name='Worker')  # pyright: ignore[reportCallIssue]
