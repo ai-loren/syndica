@@ -20,6 +20,7 @@ packages = ["src/syndica"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -35,9 +36,8 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 quote-style = "single"
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "scripts"]
 pythonVersion = "3.11"
-# 硬约束是「公开 API 全量类型标注」（AGENTS.md #6），tests 不是公开 API，只跑 standard。
 # 必须用顶层 strict 路径列表：pyright 在 executionEnvironments 里不认 typeCheckingMode，
 # 改写成那种形式会让 src 静默降级为 standard。
 typeCheckingMode = "standard"

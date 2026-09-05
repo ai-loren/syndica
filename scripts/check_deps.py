@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 PACKAGE = 'syndica'
+KERNEL = 'kernel'
 BACKENDS = 'backends'
 SURFACES = frozenset({'cli', 'server', 'runner'})
 FORBIDDEN_FROM_KERNEL = SURFACES | {BACKENDS}
@@ -80,7 +81,7 @@ def _resolve_import_from(node: ast.ImportFrom, package: tuple[str, ...]) -> list
 
 
 def _imported_components(path: Path, package_root: Path) -> set[tuple[str, ...]]:
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
     package = (PACKAGE, *path.parent.relative_to(package_root).parts)
     modules: list[tuple[str, ...]] = []
     for node in ast.walk(tree):
@@ -93,7 +94,7 @@ def _imported_components(path: Path, package_root: Path) -> set[tuple[str, ...]]
 
 def _violation(rel: Path, owner: tuple[str, ...], imported: tuple[str, ...]) -> str | None:
     owner_top, imported_top = owner[0], imported[0]
-    if owner_top == 'kernel' and imported_top in FORBIDDEN_FROM_KERNEL:
+    if owner_top == KERNEL and imported_top in FORBIDDEN_FROM_KERNEL:
         return (
             f'{rel}: kernel imports {imported_top!r}. '
             f'kernel 不得依赖 surface 或 backend（spec §3.2 规则 1）。'
