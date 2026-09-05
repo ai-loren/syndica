@@ -5,6 +5,10 @@ import pytest
 from syndica.kernel.context import TrustLevel
 from syndica.kernel.message import DeliveryResult, Message, Trigger
 
+# Message 当前每个字段都是标量，「消息是快照」因此只在顶层可观测，嵌套容器的隔离用例会空转。
+# 新增可变容器字段时 test_message_carries_no_mutable_container_field 会变红，提醒补上那条断言。
+_SCALAR_ANNOTATIONS = frozenset({'str', 'str | None', 'Trigger', 'TrustLevel'})
+
 
 def _msg() -> Message:
     return Message(sender='s', receiver='a1', content='hi')
@@ -37,6 +41,20 @@ def test_message_requires_sender_receiver_and_content():
         Message(sender='s', content='hi')  # pyright: ignore[reportCallIssue]
     with pytest.raises(TypeError):
         Message(sender='s', receiver='a1')  # pyright: ignore[reportCallIssue]
+
+
+def test_message_carries_no_mutable_container_field():
+    containers = {
+        f.name: str(f.type)
+        for f in dataclasses.fields(Message)
+        if str(f.type) not in _SCALAR_ANNOTATIONS
+    }
+    assert not containers, (
+        '期望 Message 的每个字段都是标量，快照性质因此在顶层就能验证完。'
+        f' 实际出现了非标量字段: {containers}。'
+        ' 给 MessageBrokerContract 补一条断言：改动该容器的内部元素之后，已入队的消息不受'
+        ' 影响；然后把新字段的标注加进 _SCALAR_ANNOTATIONS 或改写本用例。'
+    )
 
 
 def test_delivery_result_defaults_to_no_receipt_and_no_reason():

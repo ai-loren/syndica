@@ -22,8 +22,9 @@ class _Mailbox:
 
     # 工厂写成带参数的泛型别名而非裸 list：strict 模式下裸工厂推不出元素类型。
     messages: list[Message] = field(default_factory=list[Message])
-    # 电平信号，取值恒等于 messages 非空，只由 _refresh 派生。wait_for_messages 的谓词就是它，
-    # 因此它不需要在等待前清位。
+    # 电平信号，在还挂在 _mailboxes 上的记录里恒等于 messages 非空，只由 _refresh 派生。
+    # wait_for_messages 的谓词就是它，因此它不需要在等待前清位。remove_queue 摘下记录后会连同
+    # arrival 一起置位把等待者赶醒，此时两个信号只表示「别等了」，等待者必须复检记录还在不在。
     nonempty: asyncio.Event = field(default_factory=asyncio.Event)
     # 边沿信号，只由 publish 置位、由等待者在扫描前清位。take_by_correlation 不能等电平信号：
     # 邮箱里留着不匹配的消息时电平恒为高，等它会退化成忙轮询；它要等的是「又入队了一条」。
@@ -45,6 +46,14 @@ class InMemoryMessageBroker:
             mailbox.nonempty.set()
         else:
             mailbox.nonempty.clear()
+
+    def _is_live(self, agent_id: str, mailbox: _Mailbox) -> bool:
+        """等待者醒来后判断自己等的还是不是当前邮箱。
+
+        remove_queue 摘下记录时会置位它的信号来赶醒等待者，所以醒来不等于有消息；重建的同名
+        邮箱是另一条记录，旧等待者也不该继续等它。
+        """
+        return self._mailboxes.get(agent_id) is mailbox
 
     async def ensure_queue(self, agent_id: str) -> None:
         self._mailboxes.setdefault(agent_id, _Mailbox())
@@ -94,17 +103,19 @@ class InMemoryMessageBroker:
             await asyncio.wait_for(mailbox.nonempty.wait(), timeout=timeout)
         except TimeoutError:
             return False
+        if not self._is_live(agent_id, mailbox):
+            return False
         return bool(mailbox.messages)
 
     async def take_by_correlation(
         self, agent_id: str, correlation_id: str, timeout: float | None
     ) -> Message | None:
+        mailbox = self._mailboxes.get(agent_id)
+        if mailbox is None:
+            return None
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + timeout
         while True:
-            mailbox = self._mailboxes.get(agent_id)
-            if mailbox is None:
-                return None
             # 先清边沿信号再扫描：扫描到下面 await 之间没有挂起点，所以这之后入队的消息一定会
             # 重新置位并唤醒等待，不会漏掉唤醒。
             mailbox.arrival.clear()
@@ -120,9 +131,17 @@ class InMemoryMessageBroker:
                 await asyncio.wait_for(mailbox.arrival.wait(), timeout=remaining)
             except TimeoutError:
                 return None
+            if not self._is_live(agent_id, mailbox):
+                return None
 
     async def remove_queue(self, agent_id: str) -> None:
-        self._mailboxes.pop(agent_id, None)
+        mailbox = self._mailboxes.pop(agent_id, None)
+        if mailbox is None:
+            return
+        # 摘下来的记录再没人会置位它的信号，停在上面的等待者会一直等下去——timeout=None 时是
+        # 永久挂死。置位只为把它们赶醒，醒来后 _is_live 会判定邮箱已消失。
+        mailbox.nonempty.set()
+        mailbox.arrival.set()
 
     def on_missing_queue(self, cb: MissingQueueCallback) -> None:
         self._callbacks.append(cb)

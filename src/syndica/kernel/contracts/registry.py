@@ -3,10 +3,8 @@
 「可替换」若无测试证明即是空话（spec §13.3）。本套件随发行版发布，第三方
 写 backend 时继承它并提供 registry fixture 即可验证合规。
 
-**运行前提**：本套件绝大多数用例是 `async def`，需要 pytest-asyncio 且
-`asyncio_mode = "auto"`（或由宿主给用例打上 async 插件的标记）。缺了它，
-用例在旧版 pytest 上会被**静默跳过**而非报错——在汇总里与通过无法区分。
-`test_async_cases_are_driven_by_an_async_plugin` 就是为此把这种配置缺失变成显式失败。
+**运行前提**见 `syndica.kernel.contracts.base`：async 用例要有插件驱动，
+继承自 `ContractSuite` 的守卫会把配置缺失变成显式失败。
 """
 
 from __future__ import annotations

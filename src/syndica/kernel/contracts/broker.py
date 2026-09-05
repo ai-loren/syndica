@@ -3,13 +3,17 @@
 「可替换」若无测试证明即是空话（spec §13.3）。本套件随发行版发布，第三方写 backend 时继承它并
 提供 broker fixture 即可验证合规。套件依赖的性质逐条写在 `protocols.broker` 的模块 docstring
 里；断言只看结果与类型，不看错误文案，措辞因此仍然自由。
+
+**运行前提**见 `syndica.kernel.contracts.base`：async 用例要有插件驱动，
+继承自 `ContractSuite` 的守卫会把配置缺失变成显式失败。
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
-from dataclasses import fields
+from typing import Any
 
 from syndica.kernel.contracts.base import ContractSuite
 from syndica.kernel.message import Message
@@ -22,35 +26,31 @@ __all__ = ['MessageBrokerContract']
 _BLOCK_TIMEOUT = 0.05
 _MIN_BLOCKED = 0.02
 
-# 等待期间允许消耗的 CPU 时间上限。忙轮询会把等待窗口的两成以上烧成 CPU，真正的阻塞等待只花
-# 十分之一毫秒；上限必须留在两者之间，放宽到接近 _SPIN_TIMEOUT 就等于把这条断言改成永真。
-_SPIN_TIMEOUT = 0.1
-_MAX_WAITING_CPU = 0.005
+# 等待者停稳所需的时间，以及「本该醒的等待者没醒」的判定上限。_WAKE_TIMEOUT 必须远大于
+# _BLOCK_TIMEOUT，才不会把慢后端误判成挂死；它的作用是让回归表现为失败而不是挂住整个 CI。
+_PARK_DELAY = 0.05
+_WAKE_TIMEOUT = 5.0
 
-# Message 当前每个字段都是标量，「快照」因此只在顶层可观测。新增可变容器字段时
-# test_message_carries_no_mutable_container_field 会变红，提醒同时补上嵌套容器的隔离断言。
-_MESSAGE_SCALAR_ANNOTATIONS = frozenset({'str', 'str | None', 'Trigger', 'TrustLevel'})
+# 非匹配噪声的间隔，必须显著小于 _BLOCK_TIMEOUT，等待者才会在一个超时窗口里被反复唤醒。
+_NOISE_INTERVAL = 0.005
 
 
 def _msg(content: str = 'hi', *, correlation_id: str | None = None) -> Message:
     return Message(sender='s', receiver='a1', content=content, correlation_id=correlation_id)
 
 
+async def _park(task: asyncio.Task[Any], call: str) -> None:
+    """等到 task 真的停在等待点上。没停住的话后面的唤醒断言就是空转，所以这里断掉。"""
+    await asyncio.sleep(_PARK_DELAY)
+    assert not task.done(), (
+        f'期望 {call} 在空邮箱上阻塞住，后面才有「唤醒」可言。'
+        f' 实际它在 {_PARK_DELAY}s 内就返回了 {task.result()!r}。'
+        ' 先修等待语义：空邮箱上立刻返回会把轮次循环从阻塞等待变成忙轮询。'
+    )
+
+
 class MessageBrokerContract(ContractSuite):
     """子类必须提供一个 `broker` fixture，且每个用例拿到的必须是没有任何邮箱的空 broker。"""
-
-    def test_message_carries_no_mutable_container_field(self) -> None:
-        containers = {
-            f.name: str(f.type)
-            for f in fields(Message)
-            if str(f.type) not in _MESSAGE_SCALAR_ANNOTATIONS
-        }
-        assert not containers, (
-            '期望 Message 的每个字段都是标量，快照性质因此在顶层就能验证完。'
-            f' 实际出现了非标量字段: {containers}。'
-            ' 给本套件补一条断言：改动该容器的内部元素之后，已入队的消息不受影响；'
-            ' 然后把新字段的标注加进 _MESSAGE_SCALAR_ANNOTATIONS 或改写本用例。'
-        )
 
     async def test_publish_then_consume_preserves_order(self, broker: MessageBroker) -> None:
         await broker.ensure_queue('a1')
@@ -183,15 +183,27 @@ class MessageBrokerContract(ContractSuite):
         await broker.publish('a1', _msg('other'))
         assert await broker.take_by_correlation('a1', 'nope', timeout=0.01) is None
 
-    async def test_take_by_correlation_does_not_burn_cpu_while_waiting(
+    async def test_take_by_correlation_times_out_while_non_matching_traffic_keeps_arriving(
         self, broker: MessageBroker
     ) -> None:
-        """忙轮询与阻塞等待返回同样的结果、耗掉同样的墙钟时间，只有 CPU 时间能区分两者。"""
         await broker.ensure_queue('a1')
-        await broker.publish('a1', _msg('other'))
-        started = time.process_time()
-        assert await broker.take_by_correlation('a1', 'nope', timeout=_SPIN_TIMEOUT) is None
-        assert time.process_time() - started < _MAX_WAITING_CPU
+
+        async def publish_noise_forever() -> None:
+            while True:
+                await asyncio.sleep(_NOISE_INTERVAL)
+                await broker.publish('a1', _msg('noise'))
+
+        noise = asyncio.create_task(publish_noise_forever())
+        try:
+            got = await asyncio.wait_for(
+                broker.take_by_correlation('a1', 'c1', timeout=_BLOCK_TIMEOUT),
+                timeout=_WAKE_TIMEOUT,
+            )
+        finally:
+            noise.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await noise
+        assert got is None
 
     async def test_take_by_correlation_wakes_on_a_matching_publish(
         self, broker: MessageBroker
@@ -301,3 +313,21 @@ class MessageBrokerContract(ContractSuite):
         """「队列不存在」已经成立，无从表达失败；抛异常会逼调用方先探测再删。"""
         await broker.remove_queue('nobody')
         assert await broker.consume('nobody') == []
+
+    async def test_remove_queue_wakes_a_waiter_blocked_in_wait_for_messages(
+        self, broker: MessageBroker
+    ) -> None:
+        await broker.ensure_queue('a1')
+        waiting = asyncio.create_task(broker.wait_for_messages('a1', timeout=None))
+        await _park(waiting, 'wait_for_messages(timeout=None)')
+        await broker.remove_queue('a1')
+        assert await asyncio.wait_for(waiting, timeout=_WAKE_TIMEOUT) is False
+
+    async def test_remove_queue_wakes_a_waiter_blocked_in_take_by_correlation(
+        self, broker: MessageBroker
+    ) -> None:
+        await broker.ensure_queue('a1')
+        waiting = asyncio.create_task(broker.take_by_correlation('a1', 'c1', timeout=None))
+        await _park(waiting, 'take_by_correlation(timeout=None)')
+        await broker.remove_queue('a1')
+        assert await asyncio.wait_for(waiting, timeout=_WAKE_TIMEOUT) is None

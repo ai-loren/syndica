@@ -39,7 +39,10 @@ class MessageBroker(Protocol):
         ...
 
     async def publish(self, agent_id: str, message: Message) -> DeliveryResult:
-        """投递一条消息，成功时 message_id 是它的回执。
+        """投递一条消息，成功时 message_id 必须逐字等于 message.id。
+
+        id 由调用方在客户端生成，回执原样回声它，调用方才能把回执对上自己发的那一条；换成
+        后端自己的 entry id 就对不上了，而调用方手里没有别的对照物。
 
         邮箱不存在时先走 on_missing_queue 回调；回调之后仍不存在则返回 ok=False。
         """
@@ -58,6 +61,9 @@ class MessageBroker(Protocol):
         邮箱当前非空时立刻返回 True，因此 timeout=0 就是纯轮询（Redis 实现注意 `BLOCK 0`
         在 Redis 里是「永久阻塞」，语义相反，必须自己拦下 timeout=0）。邮箱为空时必须真的
         阻塞到超时——立刻返回 False 会把轮次循环从阻塞等待变成忙轮询。邮箱不存在时返回 False。
+
+        等待期间邮箱被 remove_queue 删掉时立刻返回 False，不等到超时：这是一个问句，答不出
+        「有消息」就答 False，与超时同一个答案，调用方下一步都是回去重读该 agent 的状态。
         """
         ...
 
@@ -71,6 +77,12 @@ class MessageBroker(Protocol):
 
         没有匹配项时必须阻塞等新消息入队，而不是反复重扫邮箱：邮箱里留着不匹配的消息时
         「邮箱非空」恒为真，拿它当唤醒条件就退化成忙轮询——结果照样正确，只有 CPU 时间看得出来。
+
+        timeout 是从调用那一刻起算的整段上限，不因期间来了不匹配的消息而顺延：每醒一次就重算
+        deadline 的话，稳定的非匹配流量会让它永不返回。
+
+        邮箱不存在时立刻返回 None，不等待；等待期间邮箱被 remove_queue 删掉时同样返回 None。
+        与 wait_for_messages 一致：问句答不出就答 None，不抛异常，也不另造第三种返回值。
         """
         ...
 
@@ -78,6 +90,10 @@ class MessageBroker(Protocol):
         """删除邮箱，未消费的消息一并丢弃。邮箱不存在时是 no-op，不抛异常。
 
         之后重建的同名邮箱必须是全新的：残留的唤醒信号会让 wait_for_messages 立刻返回。
+
+        必须唤醒此刻还停在这个邮箱上的等待者，让它们各自答 False / None：它们等的信号此后
+        再没人会置位，timeout=None 是公开签名的一部分，不唤醒就是永久挂死。按 key 寻址的远端
+        实现天然会看见重建后的流，内存实现不显式唤醒就在这里与它分叉。
         """
         ...
 
