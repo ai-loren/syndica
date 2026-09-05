@@ -13,7 +13,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from typing import Any
+from collections.abc import Awaitable
+from typing import Any, TypeVar
 
 from syndica.kernel.contracts.base import ContractSuite
 from syndica.kernel.message import Message
@@ -21,22 +22,56 @@ from syndica.kernel.protocols.broker import MessageBroker
 
 __all__ = ['MessageBrokerContract']
 
+_T = TypeVar('_T')
+
 # 阻塞类用例的超时与「确实阻塞过」的下限。下限只取超时的四成：asyncio 的超时只会因负载变长、
 # 不会变短，所以放宽下限不会让用例失去意义，而它要挡的失败是立刻返回（约 0 秒）。
 _BLOCK_TIMEOUT = 0.05
 _MIN_BLOCKED = 0.02
 
-# 等待者停稳所需的时间，以及「本该醒的等待者没醒」的判定上限。_WAKE_TIMEOUT 必须远大于
-# _BLOCK_TIMEOUT，才不会把慢后端误判成挂死；它的作用是让回归表现为失败而不是挂住整个 CI。
+# 等待者停稳所需的时间，以及「本该返回的调用没返回」的判定上限。_WAKE_TIMEOUT 必须远大于
+# _BLOCK_TIMEOUT 与 _MAX_PROMPT_REPLY，才不会把慢后端误判成挂死；它的作用是让回归表现为失败
+# 而不是挂住整个 CI。
 _PARK_DELAY = 0.05
 _WAKE_TIMEOUT = 5.0
 
 # 非匹配噪声的间隔，必须显著小于 _BLOCK_TIMEOUT，等待者才会在一个超时窗口里被反复唤醒。
 _NOISE_INTERVAL = 0.005
 
+# 邮箱不存在时必须「答而不等」。交给调用的超时取 _TIMEOUT_NEVER_REACHED，白等满窗口的实现会
+# 远远越过 _MAX_PROMPT_REPLY；上限取秒级而非微秒级，一次网络往返与负载抖动都远在它之下。
+_TIMEOUT_NEVER_REACHED = 30.0
+_MAX_PROMPT_REPLY = 1.0
+
 
 def _msg(content: str = 'hi', *, correlation_id: str | None = None) -> Message:
     return Message(sender='s', receiver='a1', content=content, correlation_id=correlation_id)
+
+
+async def _answered_without_waiting(call: Awaitable[_T], label: str) -> _T:
+    """断言 call 没有停下来等就给出答案。
+
+    外层必须有界：timeout=None 上的回归是永久挂死，无界地 await 它会把 CI 挂在这里，而回归应当
+    表现为失败。
+    """
+    started = time.monotonic()
+    try:
+        answer = await asyncio.wait_for(call, timeout=_WAKE_TIMEOUT)
+    except TimeoutError:
+        raise AssertionError(
+            f'期望 {label} 在邮箱不存在时不等待就作答。'
+            f' 实际到 {_WAKE_TIMEOUT}s 仍未返回。'
+            ' 让「邮箱不存在」这一支在进入等待之前就返回，别挂到一个占位邮箱上：'
+            ' timeout=None 是公开签名的一部分，停在那里就是永久挂死。'
+        ) from None
+    elapsed = time.monotonic() - started
+    assert elapsed < _MAX_PROMPT_REPLY, (
+        f'期望 {label} 在邮箱不存在时不等待就作答，耗时远低于 {_MAX_PROMPT_REPLY}s。'
+        f' 实际等了 {elapsed:.3f}s。'
+        ' 让「邮箱不存在」这一支在进入等待之前就返回：这是一个问句，答不出就答，'
+        ' 不要占满调用方交来的超时。'
+    )
+    return answer
 
 
 async def _park(task: asyncio.Task[Any], call: str) -> None:
@@ -134,10 +169,23 @@ class MessageBrokerContract(ContractSuite):
         await broker.ensure_queue('a1')
         assert await broker.wait_for_messages('a1', timeout=0.01) is False
 
-    async def test_wait_for_messages_on_unknown_queue_returns_false(
+    async def test_wait_for_messages_on_unknown_queue_answers_false_without_waiting(
         self, broker: MessageBroker
     ) -> None:
-        assert await broker.wait_for_messages('nobody', timeout=0.01) is False
+        answer = await _answered_without_waiting(
+            broker.wait_for_messages('nobody', timeout=_TIMEOUT_NEVER_REACHED),
+            f'wait_for_messages(timeout={_TIMEOUT_NEVER_REACHED})',
+        )
+        assert answer is False
+
+    async def test_wait_for_messages_on_unknown_queue_answers_false_when_timeout_is_none(
+        self, broker: MessageBroker
+    ) -> None:
+        answer = await _answered_without_waiting(
+            broker.wait_for_messages('nobody', timeout=None),
+            'wait_for_messages(timeout=None)',
+        )
+        assert answer is False
 
     async def test_wait_for_messages_still_blocks_after_consume_drains_the_mailbox(
         self, broker: MessageBroker
@@ -220,10 +268,23 @@ class MessageBrokerContract(ContractSuite):
         assert got is not None and got.content == 'answer'
         await task
 
-    async def test_take_by_correlation_on_unknown_queue_returns_none(
+    async def test_take_by_correlation_on_unknown_queue_answers_none_without_waiting(
         self, broker: MessageBroker
     ) -> None:
-        assert await broker.take_by_correlation('nobody', 'c1', timeout=0.01) is None
+        answer = await _answered_without_waiting(
+            broker.take_by_correlation('nobody', 'c1', timeout=_TIMEOUT_NEVER_REACHED),
+            f'take_by_correlation(timeout={_TIMEOUT_NEVER_REACHED})',
+        )
+        assert answer is None
+
+    async def test_take_by_correlation_on_unknown_queue_answers_none_when_timeout_is_none(
+        self, broker: MessageBroker
+    ) -> None:
+        answer = await _answered_without_waiting(
+            broker.take_by_correlation('nobody', 'c1', timeout=None),
+            'take_by_correlation(timeout=None)',
+        )
+        assert answer is None
 
     async def test_missing_queue_triggers_callback(self, broker: MessageBroker) -> None:
         activated: list[str] = []
