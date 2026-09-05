@@ -14,25 +14,51 @@ __all__ = [
 ]
 
 
+def _rebuild(
+    cls: type[SyndicaError], expected: str, received: str, next_action: str
+) -> SyndicaError:
+    """按关键字重建异常，供 `SyndicaError.__reduce__` 使用。"""
+    return cls(expected=expected, received=received, next_action=next_action)
+
+
+def _validated(name: str, value: object) -> str:
+    """校验单个部件是非空 str，不合法则抛出同样带三件套的 ValueError。"""
+    # value 标注为 object 而非 str：要挡的就是违反标注的运行时取值（如 dict.get() 给出的
+    # None）。收窄成 str 会让下面的 isinstance 变成 pyright 眼里的死代码。
+    if not isinstance(value, str):
+        raise ValueError(
+            f'SyndicaError 需要 str 类型的 {name}。'
+            f' 收到: {name}={value!r}，类型是 {type(value).__name__}。'
+            ' 传入字符串，或先转成 str，再重新构造。'
+        )
+    if not value.strip():
+        raise ValueError(
+            f'SyndicaError 需要非空的 {name}。'
+            f' 收到: {name}={value!r}。'
+            ' 三件套缺一不可，补齐后重新构造。'
+        )
+    return value
+
+
 class SyndicaError(Exception):
     """携带「期望 / 实际 / 下一步」三件套的基类。"""
 
     def __init__(self, *, expected: str, received: str, next_action: str) -> None:
-        for name, value in (
-            ('expected', expected),
-            ('received', received),
-            ('next_action', next_action),
-        ):
-            if not value.strip():
-                raise ValueError(
-                    f'SyndicaError 需要非空的 {name}。'
-                    f' 收到: {name}={value!r}。'
-                    f' 三件套缺一不可，补齐后重新构造。'
-                )
-        self.expected = expected
-        self.received = received
-        self.next_action = next_action
+        self.expected = _validated('expected', expected)
+        self.received = _validated('received', received)
+        self.next_action = _validated('next_action', next_action)
         super().__init__(self.message)
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # BaseException.__reduce__ 用位置参数重建，与本类 keyword-only 的签名不兼容：
+        # 少了这个覆写，copy / pickle 一律 TypeError，而异常需要跨进程边界传递
+        # （可替换的 Store 实现、子进程执行器）。
+        # 第三项交回 __dict__，让 add_note() 等构造后附加的状态活过往返。
+        return (
+            _rebuild,
+            (type(self), self.expected, self.received, self.next_action),
+            self.__dict__,
+        )
 
     @property
     def message(self) -> str:
