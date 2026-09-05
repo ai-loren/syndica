@@ -1003,9 +1003,54 @@ class LongHorizonStrategy(Protocol):
 
 ### 9.1 CLI
 
-统一入口，一张路由表加**全量惰性导入** —— `syndica --version` 不导入任何产品包。
+统一入口，一张路由表加**全量惰性导入** —— `syndica version` 不导入任何产品包。
 
-便利规则：第一个参数以 `-` 开头且不是已知顶层选项时，整体转给默认子命令，因此 `syndica --port 9010` 等价于 `syndica up --port 9010`。
+#### 命令树
+
+采用 **名词 + 动词** 结构：`syndica agents --help` 即可列出该域的全部操作，且新增能力不污染顶层命名空间。
+
+```
+核心（里程碑 1-2）
+  syndica run <prompt>                  跑一个任务
+          --agent <name>                指定角色
+          --topology <name>             指定拓扑
+          --session <id>                向已有会话追加消息
+          --max-turns / --max-cost / --max-tokens / --max-wall-clock
+          --flag <key>=<value>          可重复，feature flag
+  syndica chat                          交互式对话（见下）
+  syndica agents    list | show <name>
+  syndica topology  list | show <name>
+  syndica sessions  list | show <id> | resume <id> | rm <id>
+  syndica flags     list | show <key>
+  syndica doctor                        环境自检
+  syndica version
+
+里程碑 3 加   syndica trace  list | show <id> | replay <id>
+里程碑 9 加   syndica up | down | status
+里程碑 11 加  syndica batch <dataset>
+              syndica export <format>
+```
+
+**默认子命令是 `run`**：`syndica "写一份季度报告"` 等价于 `syndica run "写一份季度报告"`。属于 server 的参数要求显式写 `syndica up --port 9010` —— **只保留一套隐式规则**，不做"以 `-` 开头就转给某个子命令"这类第二重猜测。
+
+#### 预算与 flag 的传参形态刻意不同
+
+- **预算用独立参数**（`--max-turns` 等）：维度固定且已知（§8.4 四个），因此类型校验与 shell 补全免费获得。
+- **feature flag 用可重复的 `--flag key=value`**：它是开放集合（§5.5），只能这么传。
+
+**区别的依据是"集合是否封闭"**，不是形式美观。
+
+`syndica flags list` 从 Flag 声明生成，因此它同时是 §5.5"一份声明供代码 / 界面 / 文档三方消费"的**可执行验证** —— 该命令的输出与文档站不一致即说明机制已坏。
+
+#### 交互模式的两条约束
+
+**一、`chat` 是 `run --session` 的外壳，不是第二套实现。** 两者必须走同一条投递路径，否则行为会分叉——而分叉出来的差异极难排查（"为什么交互里能用、脚本里不行"）。
+
+**二、多 Agent 下必须能选择对话目标。** 单 Agent 系统里"你在跟谁说话"不是问题，多 Agent 系统里是：跟根协调者说话意味着派活，跟某个工人说话意味着干预它当前的工作。`chat` 需要显式的目标切换，且当前目标必须始终可见。
+
+#### 一条由此推出的内核要求
+
+CLI 的交互模式不经过 HTTP，因此**内核事件流必须首先是进程内可订阅的，HTTP SSE（§9.2）只是它的一个出口**。若事件流只存在于 HTTP 层，CLI 就只能自己再实现一套，那就回到了上面第一条禁止的分叉。
 
 ### 9.2 实时传输
 
@@ -1429,3 +1474,7 @@ CI 检查项：
 | 82 | 能力边界要明说 | 无人值守 + 不可信内容是有代价的组合，某些高风险操作做不了；**这是已知边界，必须写在文档里** |
 | 83 | Skill 可信度 | 第三方 Skill 正文**默认不可信**，可逐个声明可信。"用户装了"不等于"用户读过每一行" |
 | 84 | 压缩不变量 | 增加第五条：**不可信标记必须随衍生内容存活**（压缩与安全的交界处，最易漏） |
+| 85 | CLI 形态 | 名词 + 动词；**默认子命令 `run`**；只保留一套隐式规则 |
+| 86 | 传参形态 | 预算用独立参数（封闭集合，校验与补全免费）；feature flag 用可重复 `--flag k=v`（开放集合） |
+| 87 | 交互模式 | `chat` 是 `run --session` 的外壳而非第二套实现；多 Agent 下必须能选对话目标且目标始终可见 |
+| 88 | 事件流 | **首先是进程内可订阅的**，HTTP SSE 只是它的一个出口——否则 CLI 必须自己再实现一套 |
