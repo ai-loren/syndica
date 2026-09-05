@@ -29,3 +29,6 @@ node_modules/
 # local runtime state
 .syndica/
 *.log
+
+# sdd scratch
+.superpowers/

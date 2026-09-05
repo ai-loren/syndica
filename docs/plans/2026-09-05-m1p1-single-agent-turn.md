@@ -307,7 +307,7 @@ git commit -m "feat(kernel): 项目脚手架与依赖方向校验
 
 **Interfaces:**
 - Consumes: 无
-- Produces: `SyndicaError(expected: str, received: str, next_action: str)`；`.message` 属性返回拼装后的完整消息。子类 `ContractViolation`、`ConfigError`、`LLMResponseError`
+- Produces: `SyndicaError(expected: str, received: str, next_action: str)`；`.message` 属性返回拼装后的完整消息。子类 `ContractViolation`、`ConfigError`、`LLMResponseError`、`ToolFatalError`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -334,6 +334,19 @@ def test_all_three_parts_are_required():
     """三件套缺一不可（Global Constraints）——构造时就拦，不留到 code review。"""
     with pytest.raises(ValueError, match='next_action'):
         SyndicaError(expected='a', received='b', next_action='')
+
+
+def test_tool_fatal_error_also_carries_the_contract():
+    """致命工具错误会传播到 agent loop，因此它同样要说清下一步该做什么。"""
+    from syndica.kernel.errors import ToolFatalError
+
+    err = ToolFatalError(
+        expected='目标仓库存在且可写',
+        received='路径不存在，且父目录不可写',
+        next_action='换一个可写路径，或先创建父目录',
+    )
+    assert isinstance(err, SyndicaError)
+    assert '换一个可写路径' in str(err)
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -352,7 +365,13 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'syndica.kernel.erro
 
 from __future__ import annotations
 
-__all__ = ['ConfigError', 'ContractViolation', 'LLMResponseError', 'SyndicaError']
+__all__ = [
+    'ConfigError',
+    'ContractViolation',
+    'LLMResponseError',
+    'SyndicaError',
+    'ToolFatalError',
+]
 
 
 class SyndicaError(Exception):
@@ -390,12 +409,24 @@ class ConfigError(SyndicaError):
 
 class LLMResponseError(SyndicaError):
     """LLM 响应无法作为有效结果使用。"""
+
+
+class ToolFatalError(SyndicaError):
+    """工具遇到重试也不可能成功的错误。
+
+    继承本类的异常会**向上传播到 agent loop**，其余异常由 ToolExecutor 转成
+    给模型看的 output（spec §10）。「什么算致命」由工具作者决定——ToolExecutor
+    没有信息做这个判断。
+
+    致命：目标资源不存在且无法创建、权限不足、依赖的外部服务已下线。
+    非致命：参数不合法、临时超时、目标当前被占用——模型换个方式或换个参数可能成功。
+    """
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `uv run pytest tests/kernel/test_errors.py -v`
-Expected: 2 passed
+Expected: 3 passed
 
 - [ ] **Step 5: 提交**
 
@@ -1631,6 +1662,20 @@ async def test_close_ends_subscription():
     await bus.close()
     await asyncio.wait_for(task, timeout=1.0)
     assert seen == 0
+
+
+async def test_emit_after_close_is_a_noop():
+    bus = EventBus()
+    await bus.close()
+    await bus.emit(Event(kind='turn_start', agent_id='a1', payload={}))
+
+
+async def test_subscribe_after_close_ends_immediately():
+    """否则迟到的订阅者会永久挂在空队列上等一个永不到来的事件。"""
+    bus = EventBus()
+    await bus.close()
+    seen = [event async for event in bus.subscribe()]
+    assert seen == []
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1675,11 +1720,20 @@ class EventBus:
         self._closed = False
 
     async def emit(self, event: Event) -> None:
-        """向所有订阅者投递。无订阅者时直接丢弃，绝不阻塞主流程。"""
+        """向所有订阅者投递。
+
+        关闭后与无订阅者时都直接丢弃：可观测性不得拖垮主流程，所以这里既不
+        抛异常也不阻塞。
+        """
+        if self._closed:
+            return
         for queue in list(self._queues):
             queue.put_nowait(event)
 
     async def subscribe(self) -> AsyncIterator[Event]:
+        """订阅事件。已关闭时立即结束，不会挂住调用方。"""
+        if self._closed:
+            return
         queue: asyncio.Queue[Event | None] = asyncio.Queue()
         self._queues.append(queue)
         try:
@@ -1701,7 +1755,7 @@ class EventBus:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `uv run pytest tests/kernel/test_events.py -v`
-Expected: 4 passed
+Expected: 6 passed
 
 - [ ] **Step 5: 提交**
 
@@ -2503,13 +2557,26 @@ class _Echo(Tool):
 
 class _Boom(Tool):
     async def execute(self) -> ToolResult:
-        """总是抛异常。"""
+        """总是抛非致命异常。"""
         raise RuntimeError('kaboom')
+
+
+class _Fatal(Tool):
+    async def execute(self) -> ToolResult:
+        """总是抛致命异常。"""
+        from syndica.kernel.errors import ToolFatalError
+
+        raise ToolFatalError(
+            expected='目标可写',
+            received='路径不存在且父目录不可写',
+            next_action='换一个可写路径',
+        )
 
 
 def _executor(**hooks: object) -> tuple[ToolExecutor, HooksCenter]:
     center = HooksCenter()
-    return ToolExecutor(tools={'Echo': _Echo(), 'Boom': _Boom()}, hooks=center), center
+    tools = {'Echo': _Echo(), 'Boom': _Boom(), 'Fatal': _Fatal()}
+    return ToolExecutor(tools=tools, hooks=center), center
 
 
 async def test_result_becomes_tool_block_with_matching_id():
@@ -2543,12 +2610,27 @@ async def test_malformed_arguments_yield_actionable_tool_block():
     assert '{not json' in content
 
 
-async def test_tool_exception_is_reported_not_raised():
+async def test_non_fatal_tool_exception_is_reported_not_raised():
     executor, _ = _executor()
     ctx = Context()
     await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Boom', arguments='{}')])
     content = ctx.current_traj[-1].content
     assert isinstance(content, str) and 'kaboom' in content
+
+
+async def test_fatal_tool_error_propagates_to_agent_loop():
+    """spec §10：致命错误必须上抛，Agent 需要知道这条路根本不通。
+
+    转成 output 会让模型以为「再试一次也许能行」，于是它会一直试。
+    """
+    import pytest
+
+    from syndica.kernel.errors import ToolFatalError
+
+    executor, _ = _executor()
+    ctx = Context()
+    with pytest.raises(ToolFatalError):
+        await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Fatal', arguments='{}')])
 
 
 async def test_pre_tool_use_skip_substitutes_result():
@@ -2617,8 +2699,12 @@ Expected: FAIL —— `ModuleNotFoundError`
 # src/syndica/kernel/tool_executor.py
 """工具执行。
 
-本计划只做串行；分段并行随计划 2 补入。不变式：一次工具调用恰好产出一个
-role='tool' block，配对断裂会让下一轮请求直接非法。
+本计划只做串行；分段并行随计划 2 补入。
+
+两条不变式：
+- 一次工具调用恰好产出一个 role='tool' block，配对断裂会让下一轮请求直接非法。
+- ToolFatalError 上抛给 agent loop，其余异常转成 output 给模型（spec §10）。
+  「什么算致命」由工具作者通过异常类型表达——executor 没有信息做这个判断。
 """
 
 from __future__ import annotations
@@ -2628,6 +2714,7 @@ import json
 from typing import Any
 
 from syndica.kernel.context import Context, ContextBlock, ToolCall
+from syndica.kernel.errors import ToolFatalError
 from syndica.kernel.hooks import HooksCenter, Junction
 from syndica.kernel.tool import Tool, ToolResult
 
@@ -2688,6 +2775,10 @@ class ToolExecutor:
 
         try:
             result = await tool.execute(**args)
+        except ToolFatalError:
+            # 重试也不可能成功，上抛给 agent loop（spec §10）。转成 output 会让
+            # 模型以为再试一次也许能行，于是它会一直试。
+            raise
         except Exception as exc:
             result = ToolResult(
                 output=(
@@ -2707,7 +2798,7 @@ class ToolExecutor:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `uv run pytest tests/kernel/test_tool_executor.py -v`
-Expected: 8 passed
+Expected: 9 passed
 
 - [ ] **Step 5: 提交**
 
@@ -3211,6 +3302,19 @@ async def test_find_on_unknown_agent_returns_none_without_activating():
     await runtime.shutdown()
 
 
+async def test_wait_on_unknown_agent_raises_actionable_error():
+    """裸 KeyError 违反错误三件套，调用方看不出该怎么办。"""
+    import pytest
+
+    from syndica.kernel.errors import ConfigError
+
+    runtime = Runtime()
+    with pytest.raises(ConfigError) as info:
+        await runtime.wait('nope')
+    assert '下一步' in str(info.value)
+    await runtime.shutdown()
+
+
 async def test_send_to_unknown_agent_returns_structured_failure():
     """投递失败返回结构化结果而不抛异常，调用方才能识别可重试的瞬时错误。"""
     runtime = Runtime()
@@ -3323,6 +3427,7 @@ from typing import Any
 from syndica.kernel.agent import BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
 from syndica.kernel.context import Context
+from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
 from syndica.kernel.local_table import LocalAgentTable
@@ -3404,7 +3509,20 @@ class Runtime:
         task = self._table.get_task(agent_id)
         if task is not None:
             await task
-        return self._contexts[agent_id]
+        context = self._contexts.get(agent_id)
+        if context is None:
+            raise ConfigError(
+                expected=f'agent {agent_id!r} 曾经运行过并留下了 Context',
+                received=(
+                    '本进程没有该 agent 的运行记录'
+                    f'（已知: {sorted(self._contexts)}）'
+                ),
+                next_action=(
+                    '确认 agent_id 是 spawn 的返回值；'
+                    '若该 agent 由其他进程持有，本进程无法 wait 它'
+                ),
+            )
+        return context
 
     async def send(
         self,
@@ -3460,7 +3578,13 @@ from syndica.kernel.context import (
     ToolCall,
     TrustLevel,
 )
-from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError, SyndicaError
+from syndica.kernel.errors import (
+    ConfigError,
+    ContractViolation,
+    LLMResponseError,
+    SyndicaError,
+    ToolFatalError,
+)
 from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import LLM, ContextOverflowError, LLMConfig, ScriptedLLM, ScriptedTurn
@@ -3504,6 +3628,7 @@ __all__ = [
     'SyndicaError',
     'Tool',
     'ToolCall',
+    'ToolFatalError',
     'ToolResult',
     'Trigger',
     'TrustLevel',
@@ -3532,6 +3657,19 @@ git commit -m "feat(kernel): Runtime 最小闭环，单 Agent 一轮跑通
 
 事件循环、kill / pause / abort、按需激活留给计划 2。"
 ```
+
+---
+
+## 预检修正记录
+
+执行前的冲突预检发现四处问题，前三处已修进本计划：
+
+| # | 问题 | 修法 |
+| --- | --- | --- |
+| 1 | Task 12 用 `except Exception` 捕获全部工具异常并转成 output，**与 spec §10「致命错误抛出交给 Agent 循环」直接矛盾**。致命错误被吞掉后，模型会以为再试一次也许能行，于是一直试 | 新增 `ToolFatalError`（Task 2）：继承它的异常上抛，其余转 output。**「什么算致命」由工具作者通过异常类型表达**——executor 没有信息做这个判断 |
+| 2 | `Runtime.wait()` 对未知 agent 抛裸 `KeyError`，违反 Global Constraints 的错误三件套 | 改为抛 `ConfigError`，并列出本进程已知的 agent |
+| 3 | `EventBus._closed` 赋值两次、从不读取。它还暗示一个未定行为：`close()` 之后 `emit` 与 `subscribe` 该怎么办 | `emit` 关闭后静默丢弃（可观测性不得拖垮主流程）；`subscribe` 关闭后立即结束，否则迟到的订阅者会永久挂在空队列上 |
+| 4 | `take_by_correlation` 无条件 clear 共享 event，可能吞掉并发 `wait_for_messages` 的通知 | **未修**。串行单测不会暴露，但这是通知组件自身的正确性问题。记为 Minor 交最终整枝 review 裁决 |
 
 ---
 
