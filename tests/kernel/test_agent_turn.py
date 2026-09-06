@@ -1,0 +1,859 @@
+"""本模块**必须**保留 `from __future__ import annotations`：仓库每个模块都带它，于是标注在运行时
+是字符串。少了它，这里的工具类持有真类型对象，而 schema 反射按字符串取标注的缺陷在这里全绿、在每个
+真实工具上必炸——而工具 schema 会进请求前缀，正是本文件要钉住的东西。
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+
+from syndica.kernel.agent import AgentOptions, BaseAgent
+from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall
+from syndica.kernel.errors import ContractViolation, LLMResponseError, ToolFatalError
+from syndica.kernel.events import Event, EventBus, Subscription
+from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction
+from syndica.kernel.llm import ContextOverflowError, ScriptedLLM, ScriptedTurn
+from syndica.kernel.tool import Tool, ToolResult
+
+# 每个等待都设上限：回归应当让用例变红，而不是把 CI 挂住。
+_TIMEOUT = 1.0
+_SYSTEM_PROMPT = 'You are a worker.'
+# 逐字写死而不是读 tool.schema：期望值与被测对象同源时，schema 缺一半会让期望值跟着缩水。这份
+# schema 逐字进模型请求的字节前缀（spec §5.2），键序一并钉住。
+_ECHO_SCHEMA: dict[str, Any] = {
+    'name': 'Echo',
+    'description': '回显 text。',
+    'parameters': {
+        'type': 'object',
+        'properties': {'text': {'type': 'string'}},
+        'required': ['text'],
+    },
+}
+_LIFECYCLE: tuple[Junction, ...] = (
+    Junction.AGENT_START,
+    Junction.TURN_START,
+    Junction.TURN_END,
+    Junction.AGENT_END,
+    Junction.AGENT_ERROR,
+)
+
+
+class _Echo(Tool):
+    async def execute(self, text: str) -> ToolResult:
+        """回显 text。"""
+        return ToolResult(output=text)
+
+
+class _Fatal(Tool):
+    async def execute(self) -> ToolResult:
+        """总是抛致命异常。"""
+        raise ToolFatalError(
+            expected='目标可写',
+            received='路径不存在且父目录不可写',
+            next_action='换一个可写路径',
+        )
+
+
+class _RecordingBus(EventBus):
+    """把 emit 记进与 hook 共用的一条序列。
+
+    emit 与 agent 的 await 同步，因此这里记下的次序就是跨通道的真实次序；订阅者是另一个 task，
+    它看到的交错取决于调度。
+    """
+
+    def __init__(self, log: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self._log = log
+
+    async def emit(self, event: Event) -> None:
+        self._log.append(('event', event.kind))
+        await super().emit(event)
+
+
+def _agent(
+    script: list[ScriptedTurn],
+    *,
+    tools: dict[str, Tool] | None = None,
+    system_prompt: str = _SYSTEM_PROMPT,
+    max_turns: int | None = 50,
+    events: EventBus | None = None,
+) -> tuple[BaseAgent, HooksCenter]:
+    hooks = HooksCenter()
+    options = AgentOptions(
+        name='Worker',
+        llm=ScriptedLLM(script),
+        tools={'Echo': _Echo()} if tools is None else tools,
+        system_prompt=system_prompt,
+        max_turns=max_turns,
+    )
+    bus = events if events is not None else EventBus()
+    return BaseAgent(options, hooks=hooks, events=bus), hooks
+
+
+def _llm(agent: BaseAgent) -> ScriptedLLM:
+    llm = agent.options.llm
+    assert isinstance(llm, ScriptedLLM)
+    return llm
+
+
+def _call(call_id: str = 'c1', text: str = 'hi') -> ToolCall:
+    return ToolCall(id=call_id, name='Echo', arguments=f'{{"text":"{text}"}}')
+
+
+def _overflow() -> ContextOverflowError:
+    return ContextOverflowError(expected='请求在窗口内', received='超窗', next_action='压缩后重试')
+
+
+def _hook_recorder(junction: Junction, log: list[tuple[str, str]]) -> HookCallback:
+    async def record(**_: Any) -> HookResult:
+        log.append(('hook', junction.value))
+        return HookResult()
+
+    return record
+
+
+def _record_lifecycle(hooks: HooksCenter, log: list[tuple[str, str]]) -> None:
+    for junction in _LIFECYCLE:
+        hooks.register(junction, _hook_recorder(junction, log))
+
+
+def _kwarg_recorder(junction: Junction, seen: dict[str, list[tuple[str, ...]]]) -> HookCallback:
+    async def record(**kwargs: Any) -> HookResult:
+        seen.setdefault(junction.value, []).append(tuple(sorted(kwargs)))
+        return HookResult()
+
+    return record
+
+
+def _record_kwargs(hooks: HooksCenter, seen: dict[str, list[tuple[str, ...]]]) -> None:
+    for junction in Junction:
+        hooks.register(junction, _kwarg_recorder(junction, seen))
+
+
+async def _collect(events: Subscription) -> list[Event]:
+    seen: list[Event] = []
+    while True:
+        try:
+            seen.append(await anext(events))
+        except StopAsyncIteration:
+            return seen
+
+
+def _roles(blocks: list[ContextBlock]) -> list[str]:
+    return [block.role for block in blocks]
+
+
+def _marked(ctx: Context) -> list[str | list[Any] | None]:
+    return [block.content for block in ctx.current_traj if block.extra.get('llm_call_failed')]
+
+
+async def test_no_tool_calls_completes_immediately():
+    agent, _ = _agent([ScriptedTurn(content='done')])
+    ctx = await agent.run('go')
+    assert ctx.stop_reason is StopReason.COMPLETED
+    assert ctx.current_traj[-1].content == 'done'
+    assert len(_llm(agent).calls) == 1
+
+
+async def test_tool_call_then_completion_takes_two_turns():
+    agent, _ = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    ctx = await agent.run('go')
+    assert _roles(ctx.current_traj) == ['user', 'assistant', 'tool', 'assistant']
+    assert ctx.stop_reason is StopReason.COMPLETED
+
+
+async def test_the_loop_keeps_going_while_the_model_keeps_calling_tools():
+    agent, _ = _agent(
+        [
+            ScriptedTurn(tool_calls=[_call('c1', 'a')]),
+            ScriptedTurn(tool_calls=[_call('c2', 'b')]),
+            ScriptedTurn(tool_calls=[_call('c3', 'c')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    ctx = await agent.run('go')
+    assert _roles(ctx.current_traj) == [
+        'user',
+        'assistant',
+        'tool',
+        'assistant',
+        'tool',
+        'assistant',
+        'tool',
+        'assistant',
+    ]
+    assert len(_llm(agent).calls) == 4
+
+
+async def test_tool_results_are_in_the_trajectory_before_the_next_request():
+    agent, _ = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    await agent.run('go')
+    assert _roles(_llm(agent).calls[1]) == ['system', 'user', 'assistant', 'tool']
+
+
+async def test_a_propagating_tool_error_ends_the_agent_with_error():
+    agent, _ = _agent(
+        [ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Fatal', arguments='{}')])],
+        tools={'Fatal': _Fatal()},
+    )
+    with pytest.raises(ToolFatalError):
+        await agent.run('go')
+    assert agent.context.stop_reason is StopReason.ERROR
+
+
+async def test_system_prompt_is_not_stored_in_trajectory():
+    """SP 每轮重建并置于请求最前，但不进轨迹——否则压缩与持久化会重复携带它。"""
+    agent, _ = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    ctx = await agent.run('go')
+    assert all(block.role != 'system' for block in ctx.current_traj)
+
+
+async def test_the_request_is_the_system_block_followed_by_the_whole_trajectory():
+    agent, _ = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    ctx = await agent.run('go')
+    second = _llm(agent).calls[1]
+    assert _roles(second) == ['system', 'user', 'assistant', 'tool']
+    assert second[0].content == _SYSTEM_PROMPT
+    assert [block.content for block in second[1:]] == [
+        block.content for block in ctx.current_traj[:3]
+    ]
+
+
+async def test_an_empty_system_prompt_still_leads_the_request():
+    """SP 为空不改变前缀形状：请求首块随配置在与不在，会让前缀有两种形态。"""
+    agent, _ = _agent([ScriptedTurn(content='done')], system_prompt='')
+    await agent.run('go')
+    first = _llm(agent).calls[0]
+    assert _roles(first) == ['system', 'user']
+    assert first[0].content == ''
+
+
+async def test_the_request_prefix_is_byte_identical_and_append_only_across_turns():
+    """前缀缓存按请求字节前缀匹配（spec §5.2），前缀里的一切都算：SP、工具定义、以及它们与既有
+    内容的相对次序。前缀被改写既不报错也不失败，只是静默多付费。"""
+    agent, _ = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    await agent.run('go')
+    first, second = _llm(agent).calls[0], _llm(agent).calls[1]
+    assert first[0].role == 'system' and second[0].role == 'system'
+    assert first[0].content == second[0].content
+    assert second[: len(first)] == first
+
+
+async def test_tool_definitions_reach_every_request_unchanged_and_in_a_stable_key_order():
+    """`==` 对 dict 键序完全无感，而键序漂移会让整条会话的前缀缓存静默失效。"""
+    agent, _ = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    await agent.run('go')
+    for kwargs in _llm(agent).call_kwargs:
+        assert list(kwargs) == ['tools']
+        assert kwargs['tools'] == [_ECHO_SCHEMA]
+        assert [list(schema) for schema in kwargs['tools']] == [list(_ECHO_SCHEMA)]
+        assert list(kwargs['tools'][0]['parameters']) == list(_ECHO_SCHEMA['parameters'])
+
+
+async def test_an_agent_without_tools_sends_an_empty_tool_list():
+    agent, _ = _agent([ScriptedTurn(content='done')], tools={})
+    await agent.run('go')
+    assert _llm(agent).call_kwargs[0] == {'tools': []}
+
+
+async def test_max_turns_stops_the_loop():
+    agent, _ = _agent(
+        [ScriptedTurn(tool_calls=[_call(f'c{index}')]) for index in range(5)],
+        max_turns=2,
+    )
+    ctx = await agent.run('go')
+    assert ctx.stop_reason is StopReason.MAX_TURNS
+    assert len(_llm(agent).calls) == 2
+
+
+@pytest.mark.parametrize('max_turns', [0, -1], ids=['zero', 'negative'])
+async def test_a_budget_with_no_turns_left_stops_before_calling_the_llm(max_turns):
+    """0 与「已用满」是同一件事：预算算出来就是 0 时，立刻以 MAX_TURNS 停下才是它的自然终态。"""
+    agent, _ = _agent([ScriptedTurn(content='done')], max_turns=max_turns)
+    ctx = await agent.run('go')
+    assert ctx.stop_reason is StopReason.MAX_TURNS
+    assert _llm(agent).calls == []
+    assert _roles(ctx.current_traj) == ['user']
+
+
+async def test_max_turns_none_runs_past_the_default_cap():
+    script = [ScriptedTurn(tool_calls=[_call(f'c{index}')]) for index in range(50)]
+    script.append(ScriptedTurn(content='done'))
+    agent, _ = _agent(script, max_turns=None)
+    ctx = await agent.run('go')
+    assert ctx.stop_reason is StopReason.COMPLETED
+    assert len(_llm(agent).calls) == 51
+
+
+def test_the_options_defaults_are_no_tools_no_system_prompt_and_a_bounded_budget():
+    options = AgentOptions(name='Worker', llm=ScriptedLLM([]))
+    assert (options.tools, options.system_prompt, options.max_turns) == ({}, '', 50)
+
+
+async def test_an_agent_that_declared_no_budget_still_stops_and_sends_an_empty_system_prompt():
+    """默认预算是唯一挡住失控 Agent 的东西，而它失效时不报错，只是一直烧钱。"""
+    llm = ScriptedLLM([ScriptedTurn(tool_calls=[_call(f'c{index}')]) for index in range(50)])
+    options = AgentOptions(name='Worker', llm=llm, tools={'Echo': _Echo()})
+    agent = BaseAgent(options, hooks=HooksCenter(), events=EventBus())
+    ctx = await agent.run('go')
+    assert ctx.stop_reason is StopReason.MAX_TURNS
+    assert len(llm.calls) == 50
+    assert llm.calls[0][0].content == ''
+
+
+async def test_each_agent_gets_its_own_id_so_a_shared_stream_can_tell_them_apart():
+    bus = EventBus()
+    first, _ = _agent([ScriptedTurn(content='done')], events=bus)
+    second, _ = _agent([ScriptedTurn(content='done')], events=bus)
+    assert first.agent_id != second.agent_id
+    async with bus.subscribe() as events:
+        await first.run('go')
+        await second.run('go')
+        await bus.close()
+        delivered = await asyncio.wait_for(_collect(events), timeout=_TIMEOUT)
+    ids = [event.agent_id for event in delivered]
+    assert ids == [first.agent_id] * 4 + [second.agent_id] * 4
+
+
+async def test_run_returns_the_agents_own_context():
+    agent, _ = _agent([ScriptedTurn(content='done')])
+    assert await agent.run('go') is agent.context
+
+
+async def test_a_second_run_continues_the_same_trajectory():
+    """ZOMBIE 保持可寻址正是为了「一条消息复活、续用原上下文」（spec §4.1）。"""
+    agent, _ = _agent([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    first = await agent.run('one')
+    second = await agent.run('two')
+    assert second is first
+    assert [(block.role, block.content) for block in second.current_traj] == [
+        ('user', 'one'),
+        ('assistant', 'first'),
+        ('user', 'two'),
+        ('assistant', 'second'),
+    ]
+    assert _roles(_llm(agent).calls[1]) == ['system', 'user', 'assistant', 'user']
+
+
+async def test_the_turn_counter_spans_runs_so_a_later_run_can_exhaust_the_budget():
+    agent, hooks = _agent(
+        [
+            ScriptedTurn(tool_calls=[_call()]),
+            ScriptedTurn(content='done'),
+            ScriptedTurn(content='again'),
+        ],
+        max_turns=3,
+    )
+    turns: list[int] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        turns.append(kwargs['turn'])
+        return HookResult()
+
+    hooks.register(Junction.TURN_START, record)
+    await agent.run('one')
+    assert (await agent.run('two')).stop_reason is StopReason.COMPLETED
+    exhausted = await agent.run('three')
+    assert turns == [1, 2, 3]
+    assert exhausted.stop_reason is StopReason.MAX_TURNS
+    assert len(_llm(agent).calls) == 3
+    assert exhausted.current_traj[-1].content == 'three'
+
+
+async def test_a_second_run_clears_the_previous_stop_reason():
+    agent, _ = _agent([ScriptedTurn(content='done'), ScriptedTurn(raises=asyncio.CancelledError())])
+    await agent.run('one')
+    with pytest.raises(asyncio.CancelledError):
+        await agent.run('two')
+    assert agent.context.stop_reason is None
+
+
+@pytest.mark.parametrize(
+    'interrupt',
+    [asyncio.CancelledError(), KeyboardInterrupt()],
+    ids=['cancelled', 'keyboard-interrupt'],
+)
+async def test_an_interrupt_is_reported_as_neither_completion_nor_failure(interrupt):
+    """取消既不是正常结束也不是失败：展开的路上不得再触发切点或发事件，否则一个被杀掉的 Agent
+    会留下一次干净收尾的记录。"""
+    log: list[tuple[str, str]] = []
+    agent, hooks = _agent([ScriptedTurn(raises=interrupt)], events=_RecordingBus(log))
+    _record_lifecycle(hooks, log)
+    with pytest.raises(type(interrupt)) as excinfo:
+        await agent.run('go')
+    assert excinfo.value is interrupt
+    assert log == [
+        ('event', 'agent_start'),
+        ('hook', 'agent_start'),
+        ('event', 'turn_start'),
+        ('hook', 'turn_start'),
+    ]
+    assert agent.context.stop_reason is None
+
+
+async def test_hooks_and_events_interleave_in_a_fixed_order():
+    """事件在外、切点在内：turn 的可观测数据在 turn_end 切点之后才冻结，切点自身的耗时也计入
+    （spec §5.1）。"""
+    log: list[tuple[str, str]] = []
+    agent, hooks = _agent([ScriptedTurn(content='done')], events=_RecordingBus(log))
+    _record_lifecycle(hooks, log)
+    await agent.run('go')
+    assert log == [
+        ('event', 'agent_start'),
+        ('hook', 'agent_start'),
+        ('event', 'turn_start'),
+        ('hook', 'turn_start'),
+        ('hook', 'turn_end'),
+        ('event', 'turn_end'),
+        ('hook', 'agent_end'),
+        ('event', 'agent_end'),
+    ]
+
+
+async def test_a_failing_turn_reports_agent_error_and_never_agent_end():
+    log: list[tuple[str, str]] = []
+    agent, hooks = _agent([ScriptedTurn(content=None)], events=_RecordingBus(log))
+    _record_lifecycle(hooks, log)
+    with pytest.raises(LLMResponseError):
+        await agent.run('go')
+    assert log == [
+        ('event', 'agent_start'),
+        ('hook', 'agent_start'),
+        ('event', 'turn_start'),
+        ('hook', 'turn_start'),
+        ('hook', 'agent_error'),
+        ('event', 'agent_error'),
+    ]
+    assert agent.context.stop_reason is StopReason.ERROR
+
+
+async def test_turn_events_reach_a_subscriber_in_order():
+    bus = EventBus()
+    agent, _ = _agent(
+        [ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')], events=bus
+    )
+    async with bus.subscribe() as events:
+        await agent.run('go')
+        await bus.close()
+        delivered = await asyncio.wait_for(_collect(events), timeout=_TIMEOUT)
+        assert events.dropped == 0
+    assert [event.kind for event in delivered] == [
+        'agent_start',
+        'turn_start',
+        'turn_end',
+        'turn_start',
+        'turn_end',
+        'agent_end',
+    ]
+    assert {event.agent_id for event in delivered} == {agent.agent_id}
+
+
+async def test_turn_events_carry_the_turn_number():
+    bus = EventBus()
+    agent, _ = _agent(
+        [ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')], events=bus
+    )
+    async with bus.subscribe() as events:
+        await agent.run('go')
+        await bus.close()
+        delivered = await asyncio.wait_for(_collect(events), timeout=_TIMEOUT)
+    assert [event.payload for event in delivered if event.kind.startswith('turn')] == [
+        {'turn': 1},
+        {'turn': 1},
+        {'turn': 2},
+        {'turn': 2},
+    ]
+
+
+@pytest.mark.parametrize(
+    ('script', 'expected'),
+    [
+        ([ScriptedTurn(content='done')], 'completed'),
+        ([ScriptedTurn(tool_calls=[_call()])], 'max_turns'),
+    ],
+    ids=['completed', 'max-turns'],
+)
+async def test_agent_end_reports_the_stop_reason_as_plain_data(script, expected):
+    """payload 要能同样地走进程内出口与序列化的 SSE 出口，枚举成员在后一个出口上不可序列化。"""
+    bus = EventBus()
+    agent, _ = _agent(script, events=bus, max_turns=1)
+    async with bus.subscribe() as events:
+        await agent.run('go')
+        await bus.close()
+        delivered = await asyncio.wait_for(_collect(events), timeout=_TIMEOUT)
+    assert delivered[-1].kind == 'agent_end'
+    assert delivered[-1].payload == {'stop_reason': expected}
+
+
+async def test_turn_end_sees_the_tool_results_already_in_the_trajectory():
+    agent, hooks = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    snapshots: list[list[str]] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        snapshots.append(_roles(kwargs['ctx'].current_traj))
+        return HookResult()
+
+    hooks.register(Junction.TURN_END, record)
+    await agent.run('go')
+    assert snapshots == [
+        ['user', 'assistant', 'tool'],
+        ['user', 'assistant', 'tool', 'assistant'],
+    ]
+
+
+async def test_every_junction_on_the_happy_path_receives_its_documented_kwargs():
+    """kwarg 名是 hook 作者写代码的依据，计入公开 API。"""
+    agent, hooks = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    seen: dict[str, list[tuple[str, ...]]] = {}
+    _record_kwargs(hooks, seen)
+    await agent.run('go')
+    assert seen['agent_start'] == [('ctx',)]
+    assert seen['turn_start'] == [('ctx', 'turn'), ('ctx', 'turn')]
+    assert seen['turn_end'] == [('ctx', 'message', 'turn'), ('ctx', 'message', 'turn')]
+    assert seen['agent_end'] == [('ctx',)]
+    assert seen['pre_llm_request'] == [('ctx', 'request'), ('ctx', 'request')]
+    assert seen['post_llm_response'] == [
+        ('ctx', 'request', 'response'),
+        ('ctx', 'request', 'response'),
+    ]
+    assert 'llm_failure' not in seen
+    assert 'context_overflow' not in seen
+    assert 'agent_error' not in seen
+
+
+async def test_the_failure_junctions_receive_the_request_and_the_error():
+    agent, hooks = _agent([ScriptedTurn(raises=_overflow()), ScriptedTurn(raises=RuntimeError())])
+    seen: dict[str, list[tuple[str, ...]]] = {}
+    _record_kwargs(hooks, seen)
+
+    async def handled(**_: Any) -> HookResult:
+        return HookResult(skip=True)
+
+    hooks.register(Junction.CONTEXT_OVERFLOW, handled)
+    with pytest.raises(RuntimeError):
+        await agent.run('go')
+    assert seen['context_overflow'] == [('ctx', 'error', 'request')]
+    assert seen['llm_failure'] == [('ctx', 'error', 'request')]
+    assert seen['agent_error'] == [('ctx',)]
+
+
+async def test_turn_end_carries_the_assistant_message_and_none_when_the_turn_produced_nothing():
+    agent, hooks = _agent([ScriptedTurn(raises=_overflow()), ScriptedTurn(content='done')])
+    messages: list[Any] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        messages.append(kwargs['message'])
+        return HookResult()
+
+    async def handled(**_: Any) -> HookResult:
+        return HookResult(skip=True)
+
+    hooks.register(Junction.TURN_END, record)
+    hooks.register(Junction.CONTEXT_OVERFLOW, handled)
+    await agent.run('go')
+    assert messages[0] is None
+    assert messages[1].content == 'done'
+
+
+@pytest.mark.parametrize('content', [None, ''], ids=['none', 'empty-string'])
+async def test_an_empty_assistant_block_is_treated_as_llm_failure(content):
+    """既无 content 又无 tool_calls 的 block 不得入 context：它会污染此后所有请求的前缀。"""
+    agent, _ = _agent([ScriptedTurn(content=content)])
+    with pytest.raises(LLMResponseError):
+        await agent.run('go')
+    assert _roles(agent.context.current_traj) == ['user']
+
+
+async def test_a_response_with_tool_calls_and_no_content_is_not_empty():
+    agent, _ = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    ctx = await agent.run('go')
+    assert ctx.stop_reason is StopReason.COMPLETED
+
+
+async def test_the_empty_guard_runs_after_post_llm_response():
+    """守卫坐在 hook 之前，一个负责补全内容的 hook 就永远拿不到那条空响应。"""
+    agent, hooks = _agent([ScriptedTurn(content=None)])
+
+    async def fill_in(**_: Any) -> HookResult:
+        return HookResult(modified={'response': ContextBlock(role='assistant', content='patched')})
+
+    hooks.register(Junction.POST_LLM_RESPONSE, fill_in)
+    ctx = await agent.run('go')
+    assert ctx.current_traj[-1].content == 'patched'
+
+
+@pytest.mark.parametrize('content', [None, '', []], ids=['none', 'empty-string', 'empty-list'])
+async def test_a_post_llm_response_hook_emptying_the_response_is_caught_too(content):
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+
+    async def strip(**_: Any) -> HookResult:
+        return HookResult(modified={'response': ContextBlock(role='assistant', content=content)})
+
+    hooks.register(Junction.POST_LLM_RESPONSE, strip)
+    with pytest.raises(LLMResponseError):
+        await agent.run('go')
+    assert _roles(agent.context.current_traj) == ['user']
+
+
+@pytest.mark.parametrize('role', ['user', 'system', 'tool'], ids=['user', 'system', 'tool'])
+async def test_a_post_llm_response_hook_returning_a_non_assistant_block_is_rejected(role):
+    """改写块会作为模型本轮的产出进轨迹：换个 role 等于替别人伪造一条消息，而空响应守卫也只认
+    assistant，放过去就等于同时绕开了它。"""
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+
+    async def rewrite(**_: Any) -> HookResult:
+        return HookResult(modified={'response': ContextBlock(role=role, content='smuggled')})
+
+    hooks.register(Junction.POST_LLM_RESPONSE, rewrite)
+    with pytest.raises(ContractViolation) as excinfo:
+        await agent.run('go')
+    assert Junction.POST_LLM_RESPONSE.value in excinfo.value.expected
+    assert _roles(agent.context.current_traj) == ['user']
+
+
+@pytest.mark.parametrize('rewritten', ['done', None, 42], ids=['str', 'none', 'int'])
+async def test_a_post_llm_response_hook_returning_a_non_block_is_rejected(rewritten):
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+
+    async def rewrite(**_: Any) -> HookResult:
+        return HookResult(modified={'response': rewritten})
+
+    hooks.register(Junction.POST_LLM_RESPONSE, rewrite)
+    with pytest.raises(ContractViolation):
+        await agent.run('go')
+    assert _roles(agent.context.current_traj) == ['user']
+
+
+async def test_post_llm_response_returning_no_opinion_leaves_the_response_alone():
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+
+    async def observe(**_: Any) -> HookResult:
+        return HookResult()
+
+    hooks.register(Junction.POST_LLM_RESPONSE, observe)
+    ctx = await agent.run('go')
+    assert ctx.current_traj[-1].content == 'done'
+
+
+async def test_llm_failure_hook_can_supply_substitute_response():
+    agent, hooks = _agent([ScriptedTurn(raises=RuntimeError('flaky'))])
+
+    async def substitute(**_: Any) -> HookResult:
+        return HookResult(
+            modified={'response': ContextBlock(role='assistant', content='recovered')}
+        )
+
+    hooks.register(Junction.LLM_FAILURE, substitute)
+    ctx = await agent.run('go')
+    assert ctx.current_traj[-1].content == 'recovered'
+    assert ctx.stop_reason is StopReason.COMPLETED
+
+
+async def test_a_substitute_carrying_tool_calls_keeps_the_loop_going():
+    agent, hooks = _agent(
+        [ScriptedTurn(raises=RuntimeError('flaky')), ScriptedTurn(content='done')]
+    )
+
+    async def substitute(**_: Any) -> HookResult:
+        return HookResult(
+            modified={'response': ContextBlock(role='assistant', tool_calls=[_call()])}
+        )
+
+    hooks.register(Junction.LLM_FAILURE, substitute)
+    ctx = await agent.run('go')
+    assert _roles(ctx.current_traj) == ['user', 'assistant', 'tool', 'assistant']
+
+
+async def test_a_substitute_still_goes_through_post_llm_response():
+    agent, hooks = _agent([ScriptedTurn(raises=RuntimeError('flaky'))])
+    seen: list[Any] = []
+
+    async def substitute(**_: Any) -> HookResult:
+        return HookResult(
+            modified={'response': ContextBlock(role='assistant', content='recovered')}
+        )
+
+    async def observe(**kwargs: Any) -> HookResult:
+        seen.append(kwargs['response'].content)
+        return HookResult()
+
+    hooks.register(Junction.LLM_FAILURE, substitute)
+    hooks.register(Junction.POST_LLM_RESPONSE, observe)
+    await agent.run('go')
+    assert seen == ['recovered']
+
+
+@pytest.mark.parametrize(
+    'substitute',
+    [
+        'recovered',
+        42,
+        ContextBlock(role='user', content='recovered'),
+        ContextBlock(role='assistant'),
+    ],
+    ids=['str', 'int', 'user-block', 'empty-assistant-block'],
+)
+async def test_a_substitute_that_is_not_a_usable_assistant_block_is_rejected(substitute):
+    """替身直接作为模型本轮的产出进轨迹。放过一块空的，空 block 守卫就形同虚设。"""
+    agent, hooks = _agent([ScriptedTurn(raises=RuntimeError('flaky'))])
+
+    async def supply(**_: Any) -> HookResult:
+        return HookResult(modified={'response': substitute})
+
+    hooks.register(Junction.LLM_FAILURE, supply)
+    with pytest.raises(ContractViolation) as excinfo:
+        await agent.run('go')
+    assert Junction.LLM_FAILURE.value in excinfo.value.expected
+    assert _roles(agent.context.current_traj) == ['user']
+
+
+async def test_an_unhandled_llm_failure_propagates_the_original_error():
+    error = RuntimeError('flaky')
+    agent, _ = _agent([ScriptedTurn(raises=error)])
+    with pytest.raises(RuntimeError) as excinfo:
+        await agent.run('go')
+    assert excinfo.value is error
+    assert agent.context.stop_reason is StopReason.ERROR
+
+
+async def test_an_unhandled_llm_failure_marks_the_last_user_or_tool_block():
+    agent, _ = _agent(
+        [ScriptedTurn(tool_calls=[_call(text='hi')]), ScriptedTurn(raises=RuntimeError('flaky'))]
+    )
+    with pytest.raises(RuntimeError):
+        await agent.run('go')
+    assert _marked(agent.context) == ['hi']
+
+
+async def test_an_unhandled_empty_response_marks_the_last_user_or_tool_block():
+    agent, _ = _agent([ScriptedTurn(content=None)])
+    with pytest.raises(LLMResponseError):
+        await agent.run('go')
+    assert _marked(agent.context) == ['go']
+
+
+async def test_a_handled_llm_failure_leaves_no_failure_mark():
+    agent, hooks = _agent([ScriptedTurn(raises=RuntimeError('flaky'))])
+
+    async def substitute(**_: Any) -> HookResult:
+        return HookResult(
+            modified={'response': ContextBlock(role='assistant', content='recovered')}
+        )
+
+    hooks.register(Junction.LLM_FAILURE, substitute)
+    ctx = await agent.run('go')
+    assert _marked(ctx) == []
+
+
+def test_the_failure_mark_relies_on_current_traj_handing_out_the_live_blocks():
+    """失败标记是就地改一块 `current_traj` 交出来的 block。`current_traj` 改成深拷贝，标记会写进
+    一个随即被丢弃的副本——在另一个模块里静默失效。"""
+    ctx = Context()
+    ctx.append(ContextBlock(role='user', content='go'))
+    ctx.current_traj[0].extra['probe'] = True
+    assert ctx.current_traj[0].extra == {'probe': True}
+
+
+async def test_context_overflow_handled_by_hook_retries_on_the_next_turn():
+    agent, hooks = _agent([ScriptedTurn(raises=_overflow()), ScriptedTurn(content='done')])
+
+    async def handled(**_: Any) -> HookResult:
+        return HookResult(skip=True)
+
+    hooks.register(Junction.CONTEXT_OVERFLOW, handled)
+    ctx = await agent.run('go')
+    assert ctx.stop_reason is StopReason.COMPLETED
+    assert len(_llm(agent).calls) == 2
+    assert _roles(ctx.current_traj) == ['user', 'assistant']
+    assert ctx.current_traj[-1].content == 'done'
+
+
+async def test_a_handled_overflow_still_consumes_the_turn_it_happened_in():
+    agent, hooks = _agent(
+        [ScriptedTurn(raises=_overflow()), ScriptedTurn(content='done')], max_turns=1
+    )
+
+    async def handled(**_: Any) -> HookResult:
+        return HookResult(skip=True)
+
+    hooks.register(Junction.CONTEXT_OVERFLOW, handled)
+    ctx = await agent.run('go')
+    assert ctx.stop_reason is StopReason.MAX_TURNS
+    assert len(_llm(agent).calls) == 1
+
+
+async def test_context_overflow_unhandled_propagates():
+    error = _overflow()
+    agent, _ = _agent([ScriptedTurn(raises=error)])
+    with pytest.raises(ContextOverflowError) as excinfo:
+        await agent.run('go')
+    assert excinfo.value is error
+    assert agent.context.stop_reason is StopReason.ERROR
+
+
+async def test_overflow_and_generic_failures_never_reach_each_others_junction():
+    """超窗是请求侧、压缩后可重试的状况；合并两条路会让压缩永不触发，只表现为任务失败。"""
+    agent, hooks = _agent([ScriptedTurn(raises=_overflow()), ScriptedTurn(raises=RuntimeError())])
+    fired: list[str] = []
+
+    async def record_overflow(**_: Any) -> HookResult:
+        fired.append('context_overflow')
+        return HookResult(skip=True)
+
+    async def record_failure(**_: Any) -> HookResult:
+        fired.append('llm_failure')
+        return HookResult()
+
+    hooks.register(Junction.CONTEXT_OVERFLOW, record_overflow)
+    hooks.register(Junction.LLM_FAILURE, record_failure)
+    with pytest.raises(RuntimeError):
+        await agent.run('go')
+    assert fired == ['context_overflow', 'llm_failure']
+
+
+async def test_pre_llm_request_hook_can_rewrite_messages():
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+
+    async def inject(**kwargs: Any) -> HookResult:
+        request = dict(kwargs['request'])
+        request['messages'] = [*request['messages'], ContextBlock(role='user', content='injected')]
+        return HookResult(modified={'request': request})
+
+    hooks.register(Junction.PRE_LLM_REQUEST, inject)
+    ctx = await agent.run('go')
+    assert _llm(agent).calls[0][-1].content == 'injected'
+    assert [block.content for block in ctx.current_traj] == ['go', 'done']
+
+
+async def test_pre_llm_request_hook_can_add_request_kwargs():
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+
+    async def tune(**kwargs: Any) -> HookResult:
+        return HookResult(modified={'request': {**kwargs['request'], 'temperature': 0.0}})
+
+    hooks.register(Junction.PRE_LLM_REQUEST, tune)
+    await agent.run('go')
+    assert _llm(agent).call_kwargs[0] == {'tools': [_ECHO_SCHEMA], 'temperature': 0.0}
+
+
+@pytest.mark.parametrize(
+    'rewritten',
+    ['messages', None, [], {'tools': []}],
+    ids=['str', 'none', 'list', 'dict-without-messages'],
+)
+async def test_a_pre_llm_request_hook_replacing_the_request_with_something_unusable_is_rejected(
+    rewritten,
+):
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+
+    async def rewrite(**_: Any) -> HookResult:
+        return HookResult(modified={'request': rewritten})
+
+    hooks.register(Junction.PRE_LLM_REQUEST, rewrite)
+    with pytest.raises(ContractViolation) as excinfo:
+        await agent.run('go')
+    assert Junction.PRE_LLM_REQUEST.value in excinfo.value.expected
+    assert _llm(agent).calls == []
