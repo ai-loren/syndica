@@ -57,13 +57,17 @@ class HooksCenter:
         `result`。
 
         可观察切点并行执行，返回值与异常一律丢弃，因此恒返回空 `HookResult`。
+
+        两类切点都在触发时对 hook 列表取快照：hook 里注册的 hook 留到下次触发才生效。两条
+        分发路径必须在这一点上一致，否则同一段代码的行为取决于它挂在哪类切点上。
         """
-        hooks = self._hooks[junction]
+        validated = _validated_junction(junction)
+        hooks = list(self._hooks[validated])
         if not hooks:
             return HookResult()
-        if junction in INTERCEPTABLE:
+        if validated in INTERCEPTABLE:
             return await self._trigger_serial(hooks, **kwargs)
-        await self._trigger_parallel(junction, hooks, **kwargs)
+        await self._trigger_parallel(validated, hooks, **kwargs)
         return HookResult()
 
     async def _trigger_serial(self, hooks: list[HookCallback], **kwargs: Any) -> HookResult:
