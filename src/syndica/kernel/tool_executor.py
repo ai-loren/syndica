@@ -19,9 +19,10 @@ N 条结果的 assistant 消息，所以工具不存在、参数非法、执行�
 RuntimeError / OSError 是那次操作的真实失败，模型换个方式可能绕开。按 `ToolFatalError` 划界不够——
 ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是它的**兄弟**而非子类。
 
-**trust 只能收紧，不能放松。** hook 改写结果时最终 trust 取原结果与改写结果里更严的那一
-个：ToolResult 上没有任何东西能区分「消毒之后刻意提升」与「忘了带 trust=」，而后者的后果是未标记的
-不可信内容进模型上下文（spec §12.2），比前者常见得多。刻意提升需要一个显式机制，目前不存在。
+**trust 只能收紧，不能放松。** hook 改写结果时最终 trust 取原结果与**链上每一次改写**里最严的那
+一个：ToolResult 上没有任何东西能区分「消毒之后刻意提升」与「忘了带 trust=」，而后者的后果是未标记
+的不可信内容进模型上下文（spec §12.2），比前者常见得多。刻意提升需要一个显式机制，目前不存在。看
+`HookResult.history` 而不是 `modified`：后者 last-wins，链中间那次收紧会被后一个 hook 的默认值抹掉。
 
 **executor 自撰的 block，凡嵌进了既非工具、亦非本模块写下的文本，一律 UNTRUSTED。** `str(exc)` 经
 常携带工具自己没写过的字节（fetch 回来的正文、读进来的文件、子进程的 stderr），且它是这些字节**第
@@ -70,6 +71,19 @@ def _tightened(baseline: TrustLevel, derived: ToolResult) -> ToolResult:
     if baseline is TrustLevel.UNTRUSTED and derived.trust is not baseline:
         return replace(derived, trust=TrustLevel.UNTRUSTED)
     return derived
+
+
+def _strictest(result: ToolResult, rewrites: list[Any]) -> TrustLevel:
+    """工具的结果与链上**每一次**改写里最严的那个 trust。
+
+    只看合并结论会漏掉链中间那次收紧：`modified` 是 last-wins，前一个 hook 标了 UNTRUSTED、后一个
+    hook 交出带默认 trust 的新结果时，收紧信息在链上就没了。非 ToolResult 的中间值没有 trust 可读
+    （最终值另有守卫拦），跳过。
+    """
+    for candidate in (result, *rewrites):
+        if isinstance(candidate, ToolResult) and candidate.trust is TrustLevel.UNTRUSTED:
+            return TrustLevel.UNTRUSTED
+    return result.trust
 
 
 def _rewrite_rejected(
@@ -284,4 +298,4 @@ class ToolExecutor:
         rewritten = post.get('result', result)
         if not isinstance(rewritten, ToolResult):
             raise _rewrite_rejected(Junction.POST_TOOL_USE, 'result', ToolResult, rewritten)
-        return _tightened(result.trust, rewritten)
+        return _tightened(_strictest(result, post.rewrites('result')), rewritten)

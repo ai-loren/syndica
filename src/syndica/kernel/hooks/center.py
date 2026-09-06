@@ -75,6 +75,9 @@ class HooksCenter:
         `modified` 只含被改过的键而非整份 kwargs；`skip=True` 终止后续 hook 并带出它的
         `result`，不带 `skip` 的 `result` 报 `ContractViolation`（见 `_orphan_result`）。
 
+        `modified` 是 last-wins 的结论，`history` 另外交出每个键在链上被赋过的**全部**值：只能单
+        向收紧的量（trust）看结论会漏掉链中间那次收紧，而那正是不可信标记该起作用的时候。
+
         可观察切点并行执行，返回值与异常一律丢弃，因此恒返回空 `HookResult`。
 
         两类切点都在触发时对 hook 列表取快照：hook 里注册的 hook 留到下次触发才生效。两条
@@ -93,6 +96,7 @@ class HooksCenter:
         self, junction: Junction, hooks: list[HookCallback], **kwargs: Any
     ) -> HookResult:
         merged: dict[str, Any] = {}
+        history: dict[str, list[Any]] = {}
         current = dict(kwargs)
         for cb in hooks:
             outcome = await cb(**current)
@@ -101,10 +105,14 @@ class HooksCenter:
             if outcome.result is not None and not outcome.skip:
                 raise _orphan_result(junction, cb, outcome)
             merged.update(outcome.modified)
+            for key, value in outcome.modified.items():
+                history.setdefault(key, []).append(value)
             current.update(outcome.modified)
             if outcome.skip:
-                return HookResult(skip=True, modified=merged, result=outcome.result)
-        return HookResult(modified=merged)
+                return HookResult(
+                    skip=True, modified=merged, result=outcome.result, history=history
+                )
+        return HookResult(modified=merged, history=history)
 
     async def _trigger_parallel(
         self, junction: Junction, hooks: list[HookCallback], **kwargs: Any

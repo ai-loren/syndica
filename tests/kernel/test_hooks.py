@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import logging
 
 import pytest
@@ -490,3 +491,76 @@ async def test_a_later_hook_giving_an_orphan_result_is_still_caught():
     center.register(Junction.PRE_TOOL_USE, substitute)
     with pytest.raises(ContractViolation):
         await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)
+
+
+async def test_the_chain_reports_every_value_a_key_was_given_not_only_the_last():
+    """`modified` 是 last-wins 的结论，只能单向收紧的量（trust）看结论会漏掉链中间那次收紧。基数
+    取 3 且收紧落在中间：只看首项或只看末项的实现都必须变红。"""
+    center = HooksCenter()
+
+    async def first(**_: object) -> HookResult:
+        return HookResult(modified={'result': 'plain'})
+
+    async def second(**_: object) -> HookResult:
+        return HookResult(modified={'result': 'tightened', 'args': {}})
+
+    async def third(**_: object) -> HookResult:
+        return HookResult(modified={'result': 'loosened'})
+
+    for cb in (first, second, third):
+        center.register(Junction.POST_TOOL_USE, cb)
+    outcome = await center.trigger(Junction.POST_TOOL_USE, result='original')
+    assert outcome.modified == {'result': 'loosened', 'args': {}}
+    assert outcome.rewrites('result') == ['plain', 'tightened', 'loosened']
+    assert outcome.rewrites('args') == [{}]
+    assert outcome.rewrites('never-touched') == []
+
+
+async def test_the_rewrites_of_a_skipping_chain_stop_where_the_chain_did():
+    center = HooksCenter()
+
+    async def first(**_: object) -> HookResult:
+        return HookResult(modified={'result': 'tightened'})
+
+    async def denier(**_: object) -> HookResult:
+        return HookResult(skip=True, modified={'result': 'denied'}, result='denied')
+
+    async def never(**_: object) -> HookResult:
+        return HookResult(modified={'result': 'unreachable'})
+
+    for cb in (first, denier, never):
+        center.register(Junction.PRE_TOOL_USE, cb)
+    outcome = await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)
+    assert outcome.rewrites('result') == ['tightened', 'denied']
+
+
+async def test_mutating_the_returned_rewrites_cannot_reach_the_record_behind_them():
+    """收紧判定按这份清单做，而同一个 HookResult 会被读多次；交出内部列表，第一个读者一次
+    `append` 就改了后来每个读者看到的历史。"""
+    center = HooksCenter()
+
+    async def rewrite(**_: object) -> HookResult:
+        return HookResult(modified={'result': 'once'})
+
+    center.register(Junction.POST_TOOL_USE, rewrite)
+    outcome = await center.trigger(Junction.POST_TOOL_USE, result='original')
+    outcome.rewrites('result').append('injected')
+    assert outcome.rewrites('result') == ['once']
+    assert outcome.history['result'] == ['once']
+
+
+def test_hook_result_history_defaults_to_empty_and_is_not_shared():
+    first = HookResult()
+    second = HookResult()
+    assert first.history == {}
+    first.history['result'] = ['a']
+    assert second.history == {}
+
+
+def test_hook_result_fields_are_the_positional_contract():
+    assert [f.name for f in dataclasses.fields(HookResult)] == [
+        'skip',
+        'modified',
+        'result',
+        'history',
+    ]

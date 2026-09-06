@@ -1208,3 +1208,33 @@ async def test_post_tool_use_still_accepts_a_bare_skip_to_end_the_chain():
     )
     assert calls == ['first']
     assert ctx.current_traj[-1].content == 'hi'
+
+
+_CHAINS: list[tuple[tuple[HookCallback, ...], TrustLevel]] = [
+    ((_rewrite_to_untrusted, _rewrite_to_trusted), TrustLevel.UNTRUSTED),
+    ((_rewrite_to_trusted, _rewrite_to_untrusted), TrustLevel.UNTRUSTED),
+    (
+        (_rewrite_to_trusted, _rewrite_to_untrusted, _summarise_without_carrying_the_mark),
+        TrustLevel.UNTRUSTED,
+    ),
+    ((_rewrite_to_trusted, _observe_only, _rewrite_to_trusted), TrustLevel.TRUSTED),
+]
+_CHAIN_IDS: list[str] = [
+    'tighten-then-loosen',
+    'loosen-then-tighten',
+    'tightening-in-the-middle-of-three',
+    'nobody-tightens',
+]
+
+
+@pytest.mark.parametrize(('chain', 'expected'), _CHAINS, ids=_CHAIN_IDS)
+async def test_a_chain_of_post_hooks_cannot_lose_an_intermediate_untrusted_mark(chain, expected):
+    """`modified` 是 last-wins：中间那次收紧不在结论里，executor 拿结论无论如何补不回来。链条会随
+    计划 2 变长（pre 授权 + post 消毒是典型两段式），而丢掉的正是不可信标记。"""
+    center = HooksCenter()
+    for cb in chain:
+        center.register(Junction.POST_TOOL_USE, cb)
+    executor = ToolExecutor(tools={'Produce': _trusted_tool()}, hooks=center)
+    ctx = Context()
+    await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Produce', arguments='{}')])
+    assert ctx.current_traj[-1].trust is expected
