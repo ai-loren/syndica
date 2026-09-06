@@ -7,6 +7,11 @@ schema 三级回退 `__tool_schema__` → `__tool_model__` → 反射：工具�
 对它，因此必须允许手写调优；多数工具不需要那么精细，反射足够。三级之间只按「声明了没有」分派，
 `None` 是未声明的唯一写法；反射遇到读不懂的标注一律报错，不静默降级——降级会让模型收到一份缺
 参数的 schema，然后调用失败得莫名其妙。
+
+**一个工具有三条互相独立的身份轴：注册表的键、`name`、`schema['name']`。** 三者必须逐字相同，
+`validate_tool_names` 是那道守卫，收下工具表的每一处都要过它。不校验的后果不是「某个调用失败」：
+模型按 `schema['name']` 发起调用、executor 按键查表，键写错则**每一次**调用都落空，而 run 照常
+以 COMPLETED 返回——失败被当成成功上报。
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from __future__ import annotations
 import copy
 import inspect
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Any, ClassVar, get_args, get_origin
 
@@ -22,7 +28,7 @@ from pydantic import BaseModel
 from syndica.kernel.context import ArtifactRef, TrustLevel
 from syndica.kernel.errors import ConfigError
 
-__all__ = ['Tool', 'ToolResult']
+__all__ = ['Tool', 'ToolResult', 'tool_name_disagreement', 'validate_tool_names']
 
 _JSON_TYPES: dict[type, str] = {
     str: 'string',
@@ -271,3 +277,41 @@ class Tool(ABC):
         默认 False，只有确认本次调用不写任何共享状态才该覆写成 True。
         """
         return False
+
+
+def tool_name_disagreement(key: str, tool: Tool) -> ConfigError | None:
+    """三条身份轴（注册表键 / `name` / `schema['name']`）不一致时给出错误，一致则 None。"""
+    name = tool.name
+    schema = tool.schema
+    schema_name: object = schema.get('name')
+    if key == name and schema_name == name:
+        return None
+    cls = type(tool).__name__
+    if 'name' not in schema:
+        fix = f"把 'name' 补进 {cls}.__tool_schema__（值写 {key!r}），或删掉手写 schema 改用反射"
+    elif schema_name != name:
+        fix = (
+            f'把 {cls}.__tool_schema__["name"] 改成 {name!r}，'
+            f'或给 {cls} 声明 __tool_name__ = {schema_name!r}'
+        )
+    else:
+        fix = f'把 dict 键改成 {name!r}，或给 {cls} 声明 __tool_name__ = {key!r}'
+    return ConfigError(
+        expected='工具的三条身份轴逐字相同: 注册表键 == tool.name == schema["name"]',
+        received=(
+            f'{cls} 上三者不一致: 注册表键 {key!r}、'
+            f'tool.name {name!r}、schema["name"] {schema_name!r}'
+        ),
+        next_action=(
+            f'{fix}；模型按 schema["name"] 发起调用、executor 按注册表键查表，'
+            '两者不同则每一次调用都必然落空，而 run 仍以 COMPLETED 返回'
+        ),
+    )
+
+
+def validate_tool_names(tools: Mapping[str, Tool]) -> None:
+    """校验整张工具表的身份轴。收下工具表的每一处都必须调它。"""
+    for key, tool in tools.items():
+        error = tool_name_disagreement(key, tool)
+        if error is not None:
+            raise error

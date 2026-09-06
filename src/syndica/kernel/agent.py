@@ -64,7 +64,7 @@ from syndica.kernel.errors import ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HooksCenter, Junction
 from syndica.kernel.llm import LLM, ContextOverflowError
-from syndica.kernel.tool import Tool
+from syndica.kernel.tool import Tool, validate_tool_names
 from syndica.kernel.tool_executor import ToolExecutor
 
 __all__ = ['AgentOptions', 'BaseAgent']
@@ -74,7 +74,10 @@ __all__ = ['AgentOptions', 'BaseAgent']
 class AgentOptions:
     """一个 Agent 的静态配置。`max_turns=None` 表示不限轮次。
 
-    `tools` 的**迭代顺序**逐字进请求前缀，因此它是配置的一部分而不只是一张查找表。
+    `tools` 的**迭代顺序**逐字进请求前缀，因此它是配置的一部分而不只是一张查找表。它的键必须与
+    `tool.name` 和 `schema['name']` 逐字相同（见 `validate_tool_names`）；校验在这里而不只在
+    executor 里，宿主才能在声明的那一行拿到错误。**不替换成副本**：executor 与本字段共享同一个
+    dict 对象，热插拔靠的就是这个。
     """
 
     name: str
@@ -83,6 +86,9 @@ class AgentOptions:
     tools: dict[str, Tool] = field(default_factory=dict[str, Tool])
     system_prompt: str = ''
     max_turns: int | None = 50
+
+    def __post_init__(self) -> None:
+        validate_tool_names(self.tools)
 
 
 def _is_empty(block: ContextBlock) -> bool:

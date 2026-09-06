@@ -12,7 +12,12 @@ import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall
-from syndica.kernel.errors import ContractViolation, LLMResponseError, ToolFatalError
+from syndica.kernel.errors import (
+    ConfigError,
+    ContractViolation,
+    LLMResponseError,
+    ToolFatalError,
+)
 from syndica.kernel.events import Event, EventBus, Subscription
 from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ContextOverflowError, ScriptedLLM, ScriptedTurn
@@ -1299,3 +1304,23 @@ async def test_llm_failure_fires_twice_when_post_llm_response_empties_the_substi
     ctx = await agent.run('go')
     assert errors == ['RuntimeError', 'LLMResponseError']
     assert ctx.current_traj[-1].content == 'recovered'
+
+
+def test_agent_options_reject_a_tools_key_that_disagrees_with_the_tool_name():
+    """宿主在声明的那一行就该拿到错误：`{'greet': Greeter()}` 建出来的 Agent，模型的每一次调用都
+    落空，而 run 照常返回 COMPLETED。"""
+    with pytest.raises(ConfigError) as excinfo:
+        AgentOptions(name='Worker', llm=ScriptedLLM([]), tools={'echo': _Echo()})
+    assert "'echo'" in excinfo.value.received
+    assert "'Echo'" in excinfo.value.received
+
+
+async def test_a_tool_smuggled_into_the_live_tools_table_fails_the_run_instead_of_completing():
+    """`options.tools` 与 executor 共享同一个 dict（热插拔靠的就是这个），所以构造时的校验挡不住
+    之后塞进来的错配条目。它必须让 run 以异常结束——把「每次调用都失败」报成 COMPLETED 是本仓最坏
+    的失败形态。"""
+    agent, _ = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')], tools={})
+    agent.options.tools['echo'] = _Echo()
+    with pytest.raises(ConfigError):
+        await agent.run('go')
+    assert agent.context.stop_reason is StopReason.ERROR

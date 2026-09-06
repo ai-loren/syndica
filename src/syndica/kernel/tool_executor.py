@@ -47,9 +47,9 @@ from dataclasses import replace
 from typing import Any, cast
 
 from syndica.kernel.context import Context, ContextBlock, ToolCall, TrustLevel
-from syndica.kernel.errors import ContractViolation, SyndicaError
+from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
 from syndica.kernel.hooks import HooksCenter, Junction
-from syndica.kernel.tool import Tool, ToolResult
+from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
 
 __all__ = ['ToolExecutor']
 
@@ -157,6 +157,18 @@ def _not_executed_result(call: ToolCall, failed: ToolCall, exc: BaseException) -
     )
 
 
+def _misregistered(tools: dict[str, Tool], requested: str) -> ConfigError | None:
+    """查表落空时，找出一个「名字对得上、注册表键对不上」的工具。
+
+    构造时的校验挡不住此后往这张**活表**里塞条目（`tools` 每次调用时查表，不快照）。只在落空这条
+    路上走一遍，正常调用零成本；不报出来的后果是每一次调用都失败而 run 报 COMPLETED。
+    """
+    for key, tool in tools.items():
+        if tool.name == requested:
+            return tool_name_disagreement(key, tool)
+    return None
+
+
 def _skipped_result(call: ToolCall, substitute: object) -> ToolResult:
     if isinstance(substitute, ToolResult):
         return substitute
@@ -176,10 +188,12 @@ def _skipped_result(call: ToolCall, substitute: object) -> ToolResult:
 class ToolExecutor:
     """串行执行一批工具调用，把每个调用的结果作为 role='tool' block 追加进 ctx。
 
-    `tools` 每次调用时查表，不在构造时快照。
+    `tools` 每次调用时查表，不在构造时快照——因此构造时的身份轴校验只覆盖当时表里的条目，此后塞进
+    来的条目由查表落空那条路上的 `_misregistered` 兜住。
     """
 
     def __init__(self, tools: dict[str, Tool], hooks: HooksCenter) -> None:
+        validate_tool_names(tools)
         self._tools = tools
         self._hooks = hooks
 
@@ -211,6 +225,9 @@ class ToolExecutor:
     async def _execute_one(self, call: ToolCall) -> ToolResult:
         tool = self._tools.get(call.name)
         if tool is None:
+            misregistered = _misregistered(self._tools, call.name)
+            if misregistered is not None:
+                raise misregistered
             return _unknown_tool_result(call, sorted(self._tools))
 
         args: dict[str, Any] = {}

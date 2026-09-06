@@ -13,7 +13,12 @@ from pydantic import BaseModel, Field, Json
 
 from syndica.kernel.context import ArtifactRef, TrustLevel
 from syndica.kernel.errors import ConfigError
-from syndica.kernel.tool import Tool, ToolResult
+from syndica.kernel.tool import (
+    Tool,
+    ToolResult,
+    tool_name_disagreement,
+    validate_tool_names,
+)
 
 if TYPE_CHECKING:
     from decimal import Decimal
@@ -761,3 +766,67 @@ def test_result_carries_untrusted_content_and_artifacts():
     assert result.output == ['fetched']
     assert result.artifacts == [artifact]
     assert result.trust is TrustLevel.UNTRUSTED
+
+
+class _Greeter(Tool):
+    async def execute(self) -> ToolResult:
+        """打个招呼。"""
+        return ToolResult(output='hi')
+
+
+class _Renamed(Tool):
+    __tool_name__ = 'declared'
+
+    async def execute(self) -> ToolResult:
+        """名字来自声明而非类名。"""
+        return ToolResult(output='ok')
+
+
+class _SchemaWithoutName(Tool):
+    __tool_schema__ = {'description': 'd', 'parameters': {}}
+
+    async def execute(self) -> ToolResult:
+        """手写 schema 漏了 name。"""
+        return ToolResult(output='ok')
+
+
+def test_three_agreeing_axes_are_accepted():
+    assert tool_name_disagreement('Greeter', _Greeter()) is None
+    assert tool_name_disagreement('declared', _Renamed()) is None
+    assert validate_tool_names({'Greeter': _Greeter(), 'declared': _Renamed()}) is None
+
+
+def test_a_registry_key_that_differs_from_the_tools_name_is_rejected():
+    """宿主写 `{'greet': Greeter()}` 时，模型看到的名字是 'Greeter'、executor 查的键是 'greet'，
+    于是每一次调用都落空而 run 仍报 COMPLETED——本项目最坏的失败形态。"""
+    error = tool_name_disagreement('greet', _Greeter())
+    assert isinstance(error, ConfigError)
+    assert "'greet'" in error.received
+    assert "'Greeter'" in error.received
+    assert "'Greeter'" in error.next_action
+
+
+@pytest.mark.parametrize('key', ['Custom', 'HandWritten'], ids=['keyed-by-schema', 'keyed-by-name'])
+def test_a_hand_written_schema_name_that_differs_from_the_tools_name_is_rejected(key):
+    """`Tool` 自己刻意不调和这两个名字；调和的判据在收下工具表的那一层。两个键都要拒：与 name 对齐
+    的那个键让模型按 schema 里的 'Custom' 调用而 executor 查不到，只校验键与 name 会漏掉它。"""
+    error = tool_name_disagreement(key, _HandWritten())
+    assert isinstance(error, ConfigError)
+    assert "'Custom'" in error.received
+    assert "'HandWritten'" in error.received
+    assert '__tool_schema__' in error.next_action
+
+
+def test_a_schema_without_a_name_key_is_rejected():
+    error = tool_name_disagreement('SchemaWithoutName', _SchemaWithoutName())
+    assert isinstance(error, ConfigError)
+    assert '__tool_schema__' in error.next_action
+
+
+def test_validation_names_the_disagreeing_tool_rather_than_the_first_one():
+    """一表多工具时报错必须指向出问题的那个；只看第一项会让后面的错配静默通过。"""
+    tools = {'Greeter': _Greeter(), 'wrong': _Renamed(), 'Reflected': _Reflected()}
+    with pytest.raises(ConfigError) as excinfo:
+        validate_tool_names(tools)
+    assert "'wrong'" in excinfo.value.received
+    assert "'declared'" in excinfo.value.received
