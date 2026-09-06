@@ -1324,3 +1324,46 @@ async def test_a_tool_smuggled_into_the_live_tools_table_fails_the_run_instead_o
     with pytest.raises(ConfigError):
         await agent.run('go')
     assert agent.context.stop_reason is StopReason.ERROR
+
+
+async def test_a_pre_llm_request_hook_cannot_rewrite_history_through_the_request():
+    """这个切点上最自然的插件是「发请求前脱敏」。请求消息与轨迹块共享对象时它会永久改写历史：前缀
+    此后不再逐轮一致，缓存静默全失效（spec §5.2 纪律 3），而脱敏本该发生在写入持久化之前。"""
+    agent, hooks = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+
+    async def redact(**kwargs: Any) -> HookResult:
+        for block in kwargs['request']['messages']:
+            block.content = '[REDACTED]'
+            block.extra['redacted'] = True
+            block.tool_calls.clear()
+        return HookResult()
+
+    hooks.register(Junction.PRE_LLM_REQUEST, redact)
+    ctx = await agent.run('go')
+    blocks = ctx.current_traj
+    assert [block.content for block in blocks] == ['go', None, 'hi', 'done']
+    assert [call.name for block in blocks for call in block.tool_calls] == ['Echo']
+    assert [block for block in blocks if block.extra] == []
+
+
+async def test_a_pre_llm_request_hooks_rewrite_still_reaches_the_model():
+    """隔离不得把 hook 的改写一起隔离掉：脱敏后的那一份必须是真正发出去的那一份。"""
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+
+    async def redact(**kwargs: Any) -> HookResult:
+        for block in kwargs['request']['messages']:
+            block.content = '[REDACTED]'
+        return HookResult()
+
+    hooks.register(Junction.PRE_LLM_REQUEST, redact)
+    await agent.run('secret')
+    assert [block.content for block in _llm(agent).calls[0]] == ['[REDACTED]', '[REDACTED]']
+
+
+async def test_the_failure_mark_still_lands_on_the_trajectory_block_not_on_a_request_copy():
+    """`_mark_failed` 与请求隔离方向相反且同样承重：它必须写到轨迹里那一块上，所以它读 ctx 而不读
+    请求。把它改成读 request['messages'] 会让标记写进一份随即被丢弃的副本。"""
+    agent, _ = _agent([ScriptedTurn(raises=RuntimeError('provider down'))])
+    with pytest.raises(RuntimeError):
+        await agent.run('go')
+    assert _marked(agent.context) == ['go']

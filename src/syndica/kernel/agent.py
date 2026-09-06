@@ -25,6 +25,8 @@ block，下一轮重试），LLM_FAILURE 只认 `modified['response']` 里的替
 **LLM_FAILURE 一轮内可以触发两次**：替身给出后被 POST_LLM_RESPONSE 清空时，空块守卫会再要一次替
 身，第二次的 error 是 LLMResponseError。按轮计数的重试插件会把这一轮记成两次。
 
+**请求里的消息是轨迹块的副本，不是轨迹块本身。** 见 `_isolated`：hook 改写 request 不得改到历史。
+
 **PRE_LLM_REQUEST 的 `skip=True` 是一票否决。** 它带出的 `result` 直接成为本轮的响应，模型不再被调
 用（响应缓存、预算否决走这条路）；`result` 不是 assistant ContextBlock 时报 ContractViolation——跳过
 之后没有任何东西能顶替本轮的产出，静默照调等于把 hook 作者的否决扔了。此后它与真实响应同路：
@@ -56,7 +58,7 @@ from __future__ import annotations
 import itertools
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall
@@ -179,6 +181,30 @@ def _empty_response_error(llm: LLM) -> LLMResponseError:
             f'provider={llm.config.provider!r} model={llm.config.model!r} 返回了两者皆空的响应'
         ),
         next_action=('检查 provider 与模型配置；若为偶发，挂一个 llm_failure hook 给出替身或重试'),
+    )
+
+
+def _isolated(block: ContextBlock) -> ContextBlock:
+    """请求里那一份块的副本。**改这个副本改不到轨迹。**
+
+    `Context.current_traj` 只拷列表、不拷块，于是不隔离的话 `request['messages']` 里除首块外全是
+    轨迹里那些块**本身**，而这个切点上最自然的插件——发请求前脱敏——会因此永久改写历史：spec §5.2
+    纪律 3 要求前缀只 append 不改动（改了不报错，只让此后每一轮的缓存静默全失效），而 spec §12.3
+    的脱敏本该发生在写入持久化**之前**，在轨迹已经写入之后就地改是另一件事。
+
+    只拷块与它的顶层容器，不深拷内容：这条路每轮都走一次，逐轮全量深拷的代价随轨迹长度线性增长。
+    因此 `extra` 的值、`content` 列表里的元素仍与轨迹共享——挡得住脱敏 / 截断 / 打标这些真实写法，
+    挡不住往嵌套容器里就地写。`artifacts` 的元素是 frozen 的，共享它们安全。
+
+    `_mark_failed` 与本函数方向相反且都是承重的：它必须写到轨迹里那一块上，所以它读 ctx 而不读
+    请求。两者不可互换。
+    """
+    return replace(
+        block,
+        content=list(block.content) if isinstance(block.content, list) else block.content,
+        tool_calls=[replace(call) for call in block.tool_calls],
+        artifacts=list(block.artifacts),
+        extra=dict(block.extra),
     )
 
 
@@ -338,7 +364,7 @@ class BaseAgent:
         """本轮的模型调用；返回 None 表示超窗已被插件处理，本轮不产出 assistant block。"""
         system_block = ContextBlock(role='system', content=self.get_system_prompt())
         request: dict[str, Any] = {
-            'messages': [system_block, *ctx.current_traj],
+            'messages': [system_block, *(_isolated(block) for block in ctx.current_traj)],
             'tools': tool_defs,
         }
         hooked = await self._hooks.trigger(Junction.PRE_LLM_REQUEST, ctx=ctx, request=request)
