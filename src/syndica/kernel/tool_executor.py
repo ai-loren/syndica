@@ -19,9 +19,16 @@ N 条结果的 assistant 消息，所以工具不存在、参数非法、执行�
 RuntimeError / OSError 是那次操作的真实失败，模型换个方式可能绕开。按 `ToolFatalError` 划界不够——
 ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是它的**兄弟**而非子类。
 
-**trust 只能收紧，不能放松。** hook 改写结果时最终 trust 取原结果与改写结果里更严的那一个：
-ToolResult 上没有任何东西能区分「消毒之后刻意提升」与「忘了带 trust=」，而后者的后果是未标记的不可
-信内容进模型上下文（spec §12.2），比前者常见得多。刻意提升需要一个显式机制，目前不存在。
+**trust 只能收紧，不能放松。** hook 改写结果时最终 trust 取原结果与**链上每一次改写**里最严的那
+一个：ToolResult 上没有任何东西能区分「消毒之后刻意提升」与「忘了带 trust=」，而后者的后果是未标记
+的不可信内容进模型上下文（spec §12.2），比前者常见得多。刻意提升需要一个显式机制，目前不存在。看
+`HookResult.history` 而不是 `modified`：后者 last-wins，链中间那次收紧会被后一个 hook 的默认值抹掉。
+
+**executor 自撰的 block，凡嵌进了既非工具、亦非本模块写下的文本，一律 UNTRUSTED。** `str(exc)` 经
+常携带工具自己没写过的字节（fetch 回来的正文、读进来的文件、子进程的 stderr），且它是这些字节**第
+一次**进入轨迹；异常对象上没有任何 trust 标记可读，而假定可信是不安全的那一侧。只嵌代码里的标识符
+（异常类名、工具名、调用 id）或模型自己的产出（`call.name` / `call.arguments`）不算：后者已经以同样
+或更松的 trust 躺在轨迹里，回显它不会让任何新字节洗成可信。
 
 `modified` 通道改写的是 kwargs，类型必须与传进去的一致（`args` 是 dict，`result` 是 ToolResult）；
 不合就是 hook 的编程错误，报 ContractViolation 而不是静默丢弃作者的意图。工具自己返回非 ToolResult
@@ -116,7 +123,8 @@ def _tool_raised_result(call: ToolCall, exc: Exception) -> ToolResult:
             f'期望: {call.name} 正常执行完成。'
             f' 实际: 抛出 {_described(exc)}。'
             ' 下一步: 调整参数后重试，或换用其他方式达成同一目标。'
-        )
+        ),
+        trust=TrustLevel.UNTRUSTED,
     )
 
 
@@ -132,7 +140,8 @@ def _aborted_result(call: ToolCall, exc: BaseException) -> ToolResult:
             f' 实际: 本次调用中止于 {_described(exc)}，是否已经产生副作用未知。'
             ' 下一步: 本批调用已在此停下，错误已交给上层处理；'
             '不要重复同一调用，换一种方式达成同一目标。'
-        )
+        ),
+        trust=TrustLevel.UNTRUSTED,
     )
 
 
