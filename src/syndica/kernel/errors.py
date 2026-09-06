@@ -25,21 +25,26 @@ def _rebuild(
     return cls(expected=expected, received=received, next_action=next_action)
 
 
-def _validated(name: str, value: object) -> str:
-    """校验单个部件是非空 str，不合法则抛出同样带三件套的 ValueError。"""
+def _validated(cls: type[SyndicaError], name: str, value: object) -> str:
+    """校验单个部件是非空 str，不合法则抛出同样带三件套的内建异常。
+
+    类名由构造中的那个类给出，不写死基类名：这条消息的读者正在写子类，报出 `SyndicaError` 会指着
+    一个没问题的地方。类型不符抛 `TypeError`、空值抛 `ValueError`——两者合成一个，调用方要区分
+    「传错了类型」与「传了空串」就只剩匹配文本这条路。
+    """
     # value 标注为 object 而非 str：要挡的就是违反标注的运行时取值（如 dict.get() 给出的
     # None）。收窄成 str 会让下面的 isinstance 变成 pyright 眼里的死代码。
     if not isinstance(value, str):
-        raise ValueError(
-            f'SyndicaError 需要 str 类型的 {name}。'
-            f' 收到: {name}={value!r}，类型是 {type(value).__name__}。'
-            ' 传入字符串，或先转成 str，再重新构造。'
+        raise TypeError(
+            f'期望: {cls.__name__} 的 {name} 是 str。'
+            f' 实际: 收到 {name}={value!r}，类型是 {type(value).__name__}。'
+            ' 下一步: 传入字符串，或先转成 str，再重新构造。'
         )
     if not value.strip():
         raise ValueError(
-            f'SyndicaError 需要非空的 {name}。'
-            f' 收到: {name}={value!r}。'
-            ' 三件套缺一不可，补齐后重新构造。'
+            f'期望: {cls.__name__} 的 {name} 是非空 str。'
+            f' 实际: 收到 {name}={value!r}。'
+            ' 下一步: 三件套缺一不可，补齐后重新构造。'
         )
     return value
 
@@ -48,9 +53,10 @@ class SyndicaError(Exception):
     """携带「期望 / 实际 / 下一步」三件套的基类。"""
 
     def __init__(self, *, expected: str, received: str, next_action: str) -> None:
-        self.expected = _validated('expected', expected)
-        self.received = _validated('received', received)
-        self.next_action = _validated('next_action', next_action)
+        cls = type(self)
+        self.expected = _validated(cls, 'expected', expected)
+        self.received = _validated(cls, 'received', received)
+        self.next_action = _validated(cls, 'next_action', next_action)
         super().__init__(self.message)
 
     def __reduce__(self) -> tuple[object, ...]:

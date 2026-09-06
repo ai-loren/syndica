@@ -117,6 +117,16 @@ def _rebuild_keyed(
     return cls(key=key, expected=expected, received=received, next_action=next_action)
 
 
+# 分隔符带前导空格：这些消息是单行三件套，不带空格会匹配到被嵌进去的另一份。
+_THREE_PART: tuple[str, ...] = ('期望: ', ' 实际: ', ' 下一步: ')
+
+
+def _assert_three_part(text: str) -> None:
+    positions = [text.find(mark) for mark in _THREE_PART]
+    assert -1 not in positions
+    assert positions == sorted(positions)
+
+
 def _module_name_on_disk(path: Path, root: Path) -> str:
     parts = path.relative_to(root).with_suffix('').parts
     if parts[-1] == '__init__':
@@ -186,15 +196,38 @@ def test_every_part_rejects_blank_and_names_itself(field, blank):
 @pytest.mark.parametrize('bad', [None, 0, b'a', ['a']], ids=['None', 'int', 'bytes', 'list'])
 @pytest.mark.parametrize('field', ['expected', 'received', 'next_action'])
 def test_non_str_part_is_rejected_with_the_field_name_and_the_type_received(field, bad):
+    """类型不符是 TypeError 而非 ValueError：调用方分不出「传错了类型」与「传了空串」，就只剩匹配
+    文本这条路，而这两个异常类型是公开 API。"""
     parts = {'expected': 'a', 'received': 'b', 'next_action': 'c'}
     parts[field] = bad
-    with pytest.raises(ValueError, match=field) as excinfo:
+    with pytest.raises(TypeError, match=field) as excinfo:
         SyndicaError(
             expected=parts['expected'],
             received=parts['received'],
             next_action=parts['next_action'],
         )
     assert type(bad).__name__ in str(excinfo.value)
+    _assert_three_part(str(excinfo.value))
+
+
+@pytest.mark.parametrize('error_cls', KERNEL_ERROR_CLASSES, ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize(
+    ('bad', 'raised'), [(None, TypeError), ('', ValueError)], ids=['wrong-type', 'blank']
+)
+def test_a_rejected_part_names_the_class_being_constructed_not_the_base(error_cls, bad, raised):
+    """这条消息的读者正在写子类；报出基类名会指着一个没问题的地方。"""
+    parts = {**PARTS, 'expected': bad}
+    with pytest.raises(raised) as excinfo:
+        error_cls(**parts)
+    assert error_cls.__name__ in str(excinfo.value)
+    if error_cls is not SyndicaError:
+        assert SyndicaError.__name__ not in str(excinfo.value)
+
+
+def test_a_blank_part_is_a_three_part_message_too():
+    with pytest.raises(ValueError) as excinfo:
+        SyndicaError(expected='a', received='b', next_action='  ')
+    _assert_three_part(str(excinfo.value))
 
 
 @pytest.mark.parametrize('error_cls', KERNEL_ERROR_CLASSES, ids=lambda cls: cls.__name__)
