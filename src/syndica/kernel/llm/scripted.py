@@ -44,10 +44,11 @@ class ScriptedLLM:
     脚本与返回块之间不共享可变状态：同一个 `ScriptedTurn` 列表可以跨 ScriptedLLM 实例复用，
     消费者改动返回的块改不到脚本。
 
-    `calls` 记的是收到那一刻的**深拷贝**。turn 循环跨轮复用同一个 SP block，记录若存共享对象，
-    「前缀逐轮字节一致」这条前缀缓存性质就退化成恒等断言——重建前缀与递交同一对象无从区分。
-    代价是传进来的块必须可深拷（`extra` 里别放活的连接）。`call_kwargs` 与 `calls` 逐位对应，
-    但只记 kwargs 映射本身，值与调用方共享。
+    `calls` 与 `call_kwargs` 记的都是收到那一刻的**深拷贝**。turn 循环跨轮复用同一个 SP block、
+    也跨轮递交同一个 tool schema 列表对象，记录若存共享对象，「前缀逐轮字节一致」这条前缀缓存性质
+    就退化成恒等断言——重建前缀与递交同一对象无从区分，轮间就地漂移再改回来更是全程隐形。
+    代价是传进来的块与 kwargs 都必须可深拷（`extra` 里别放活的连接）。`call_kwargs` 与 `calls`
+    逐位对应。
     """
 
     def __init__(self, script: list[ScriptedTurn], config: LLMConfig | None = None) -> None:
@@ -66,7 +67,7 @@ class ScriptedLLM:
 
     async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
         self.calls.append(copy.deepcopy(messages))
-        self.call_kwargs.append(kwargs)
+        self.call_kwargs.append(copy.deepcopy(kwargs))
         if self._index >= len(self._script):
             raise ConfigError(
                 expected=f'脚本至少有 {self._index + 1} 轮',

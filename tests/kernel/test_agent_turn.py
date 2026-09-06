@@ -32,6 +32,26 @@ _ECHO_SCHEMA: dict[str, Any] = {
         'required': ['text'],
     },
 }
+# 两个参数而不是一个：单属性下 properties 的键序不可观测，而它同样进请求前缀。
+_CONCAT_SCHEMA: dict[str, Any] = {
+    'name': 'Concat',
+    'description': '拼接 left 与 right。',
+    'parameters': {
+        'type': 'object',
+        'properties': {'left': {'type': 'string'}, 'right': {'type': 'string'}},
+        'required': ['left', 'right'],
+    },
+}
+_UPPER_SCHEMA: dict[str, Any] = {
+    'name': 'Upper',
+    'description': '把 text 转成大写。',
+    'parameters': {
+        'type': 'object',
+        'properties': {'text': {'type': 'string'}},
+        'required': ['text'],
+    },
+}
+_TOOL_SCHEMAS: list[dict[str, Any]] = [_ECHO_SCHEMA, _CONCAT_SCHEMA, _UPPER_SCHEMA]
 _LIFECYCLE: tuple[Junction, ...] = (
     Junction.AGENT_START,
     Junction.TURN_START,
@@ -47,6 +67,18 @@ class _Echo(Tool):
         return ToolResult(output=text)
 
 
+class _Concat(Tool):
+    async def execute(self, left: str, right: str) -> ToolResult:
+        """拼接 left 与 right。"""
+        return ToolResult(output=left + right)
+
+
+class _Upper(Tool):
+    async def execute(self, text: str) -> ToolResult:
+        """把 text 转成大写。"""
+        return ToolResult(output=text.upper())
+
+
 class _Fatal(Tool):
     async def execute(self) -> ToolResult:
         """总是抛致命异常。"""
@@ -55,6 +87,39 @@ class _Fatal(Tool):
             received='路径不存在且父目录不可写',
             next_action='换一个可写路径',
         )
+
+
+class _Blocking(Tool):
+    """停在 release 上，直到测试放开它或它被取消。
+
+    取消与并发这两条路都必须让 run 真的挂在半途：脚本化 LLM 与无 hook 的切点全程不让出控制权，
+    靠调度顺序碰不出「上一次还没跑完」这个状态。
+    """
+
+    def __init__(self, entered: asyncio.Event, release: asyncio.Event) -> None:
+        self._entered = entered
+        self._release = release
+
+    async def execute(self) -> ToolResult:
+        """一直等着。"""
+        self._entered.set()
+        await self._release.wait()
+        return ToolResult(output='released')
+
+
+class _NumberedPrompt(BaseAgent):
+    """每次 get_system_prompt 返回不同的值。
+
+    刻意违反「逐轮字节一致」：SP 是否每轮重建，只有在返回值会变时才可观测。
+    """
+
+    def __init__(self, options: AgentOptions, *, hooks: HooksCenter, events: EventBus) -> None:
+        super().__init__(options, hooks=hooks, events=events)
+        self.prompt_calls = 0
+
+    def get_system_prompt(self) -> str:
+        self.prompt_calls += 1
+        return f'prompt {self.prompt_calls}'
 
 
 class _RecordingBus(EventBus):
@@ -73,6 +138,16 @@ class _RecordingBus(EventBus):
         await super().emit(event)
 
 
+def _tools() -> dict[str, Tool]:
+    """默认工具表。
+
+    三个工具、注册顺序既非升序也非降序：n=1 时反转 / 排序 / 去重 / 取首 / 取尾全是同一个答案，
+    而工具定义的次序进请求前缀（spec §5.2）。这个顺序同时区别于 ['Concat','Echo','Upper']、
+    ['Upper','Echo','Concat'] 与 ['Upper','Concat','Echo']。
+    """
+    return {'Echo': _Echo(), 'Concat': _Concat(), 'Upper': _Upper()}
+
+
 def _agent(
     script: list[ScriptedTurn],
     *,
@@ -85,7 +160,7 @@ def _agent(
     options = AgentOptions(
         name='Worker',
         llm=ScriptedLLM(script),
-        tools={'Echo': _Echo()} if tools is None else tools,
+        tools=_tools() if tools is None else tools,
         system_prompt=system_prompt,
         max_turns=max_turns,
     )
@@ -248,9 +323,33 @@ async def test_tool_definitions_reach_every_request_unchanged_and_in_a_stable_ke
     await agent.run('go')
     for kwargs in _llm(agent).call_kwargs:
         assert list(kwargs) == ['tools']
-        assert kwargs['tools'] == [_ECHO_SCHEMA]
-        assert [list(schema) for schema in kwargs['tools']] == [list(_ECHO_SCHEMA)]
-        assert list(kwargs['tools'][0]['parameters']) == list(_ECHO_SCHEMA['parameters'])
+        assert kwargs['tools'] == _TOOL_SCHEMAS
+        assert [list(schema) for schema in kwargs['tools']] == [
+            list(schema) for schema in _TOOL_SCHEMAS
+        ]
+        assert [list(schema['parameters']) for schema in kwargs['tools']] == [
+            list(schema['parameters']) for schema in _TOOL_SCHEMAS
+        ]
+        assert [list(schema['parameters']['properties']) for schema in kwargs['tools']] == [
+            ['text'],
+            ['left', 'right'],
+            ['text'],
+        ]
+
+
+async def test_the_tool_definitions_reach_the_request_in_registration_order():
+    """次序进请求字节前缀：重排既不报错也不失败，只让整条会话的缓存静默失效。"""
+    agent, _ = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    await agent.run('go')
+    for kwargs in _llm(agent).call_kwargs:
+        assert [schema['name'] for schema in kwargs['tools']] == ['Echo', 'Concat', 'Upper']
+
+
+async def test_every_registered_tool_reaches_the_request_exactly_once():
+    agent, _ = _agent([ScriptedTurn(content='done')])
+    await agent.run('go')
+    names = [schema['name'] for schema in _llm(agent).call_kwargs[0]['tools']]
+    assert len(names) == len(agent.options.tools) == 3
 
 
 async def test_an_agent_without_tools_sends_an_empty_tool_list():
@@ -279,6 +378,21 @@ async def test_a_budget_with_no_turns_left_stops_before_calling_the_llm(max_turn
     assert _roles(ctx.current_traj) == ['user']
 
 
+async def test_a_failed_turn_still_consumes_the_budget():
+    """翻转它，一个每轮都失败的 Agent 可以被无限次 run 而永不撞 max_turns——而默认预算是唯一挡住
+    失控烧钱的东西。"""
+    agent, _ = _agent(
+        [ScriptedTurn(raises=RuntimeError('flaky')) for _ in range(3)],
+        max_turns=2,
+    )
+    for query in ('one', 'two'):
+        with pytest.raises(RuntimeError):
+            await agent.run(query)
+    exhausted = await agent.run('three')
+    assert exhausted.stop_reason is StopReason.MAX_TURNS
+    assert len(_llm(agent).calls) == 2
+
+
 async def test_max_turns_none_runs_past_the_default_cap():
     script = [ScriptedTurn(tool_calls=[_call(f'c{index}')]) for index in range(50)]
     script.append(ScriptedTurn(content='done'))
@@ -296,7 +410,7 @@ def test_the_options_defaults_are_no_tools_no_system_prompt_and_a_bounded_budget
 async def test_an_agent_that_declared_no_budget_still_stops_and_sends_an_empty_system_prompt():
     """默认预算是唯一挡住失控 Agent 的东西，而它失效时不报错，只是一直烧钱。"""
     llm = ScriptedLLM([ScriptedTurn(tool_calls=[_call(f'c{index}')]) for index in range(50)])
-    options = AgentOptions(name='Worker', llm=llm, tools={'Echo': _Echo()})
+    options = AgentOptions(name='Worker', llm=llm, tools=_tools())
     agent = BaseAgent(options, hooks=HooksCenter(), events=EventBus())
     ctx = await agent.run('go')
     assert ctx.stop_reason is StopReason.MAX_TURNS
@@ -316,6 +430,15 @@ async def test_each_agent_gets_its_own_id_so_a_shared_stream_can_tell_them_apart
         delivered = await asyncio.wait_for(_collect(events), timeout=_TIMEOUT)
     ids = [event.agent_id for event in delivered]
     assert ids == [first.agent_id] * 4 + [second.agent_id] * 4
+
+
+def test_the_agent_id_is_a_full_uuid4_hex_string():
+    """id 撞车不是软失败：AgentRegistry.register 拒绝重复 id，撞上的 Agent 直接注册不进去。
+    截短它换来的可读性没有任何调用方需要。"""
+    ids = {_agent([])[0].agent_id for _ in range(64)}
+    assert len(ids) == 64
+    assert all(len(agent_id) == 32 for agent_id in ids)
+    assert all(set(agent_id) <= set('0123456789abcdef') for agent_id in ids)
 
 
 async def test_run_returns_the_agents_own_context():
@@ -369,6 +492,148 @@ async def test_a_second_run_clears_the_previous_stop_reason():
     with pytest.raises(asyncio.CancelledError):
         await agent.run('two')
     assert agent.context.stop_reason is None
+
+
+async def test_a_second_run_while_the_first_is_still_running_is_rejected():
+    """交错写同一份轨迹会把工具结果推到另一个 run 的 user block 后面，配对的相邻性断裂；两次调用
+    都正常返回 COMPLETED，而 Context 归 Agent 所有，坏前缀此后每次请求都带着走。"""
+    entered, release = asyncio.Event(), asyncio.Event()
+    agent, _ = _agent(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='b1', name='Blocking', arguments='{}')]),
+            ScriptedTurn(content='done'),
+        ],
+        tools={'Blocking': _Blocking(entered, release)},
+    )
+    task = asyncio.create_task(agent.run('go'))
+    await asyncio.wait_for(entered.wait(), timeout=_TIMEOUT)
+    with pytest.raises(ContractViolation):
+        await agent.run('other')
+    release.set()
+    ctx = await asyncio.wait_for(task, timeout=_TIMEOUT)
+    assert _roles(ctx.current_traj) == ['user', 'assistant', 'tool', 'assistant']
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == ['go']
+
+
+async def test_two_concurrent_runs_leave_exactly_one_of_them_unstarted():
+    entered, release = asyncio.Event(), asyncio.Event()
+    agent, _ = _agent(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='b1', name='Blocking', arguments='{}')]),
+            ScriptedTurn(content='done'),
+        ],
+        tools={'Blocking': _Blocking(entered, release)},
+    )
+    first = asyncio.create_task(agent.run('a'))
+    await asyncio.wait_for(entered.wait(), timeout=_TIMEOUT)
+    second = asyncio.create_task(agent.run('b'))
+    release.set()
+    outcomes = await asyncio.wait_for(
+        asyncio.gather(first, second, return_exceptions=True), timeout=_TIMEOUT
+    )
+    assert outcomes[0] is agent.context
+    assert isinstance(outcomes[1], ContractViolation)
+    assert _roles(agent.context.current_traj) == ['user', 'assistant', 'tool', 'assistant']
+
+
+async def test_a_reentrant_run_from_inside_a_hook_is_rejected():
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+
+    async def reenter(**_: Any) -> HookResult:
+        await agent.run('nested')
+        return HookResult()
+
+    hooks.register(Junction.PRE_LLM_REQUEST, reenter)
+    with pytest.raises(ContractViolation):
+        await agent.run('go')
+    assert _roles(agent.context.current_traj) == ['user']
+    assert _llm(agent).calls == []
+
+
+@pytest.mark.parametrize(
+    'interrupt',
+    [RuntimeError('flaky'), asyncio.CancelledError()],
+    ids=['failure', 'cancelled'],
+)
+async def test_the_concurrency_guard_is_released_when_a_run_does_not_return_normally(interrupt):
+    """守卫漏放一次就把这个实例永久锁死，而 ZOMBIE 留在注册表可寻址正是为了被 resume。"""
+    agent, _ = _agent([ScriptedTurn(raises=interrupt), ScriptedTurn(content='done')])
+    with pytest.raises(type(interrupt)):
+        await agent.run('one')
+    assert (await agent.run('two')).stop_reason is StopReason.COMPLETED
+
+
+async def test_a_resume_repairs_only_the_tool_calls_the_cancellation_left_unpaired():
+    """provider 会拒掉一个声明了 N 个调用、后面不足 N 条结果的 assistant 消息，而 ToolExecutor
+    按约定不在取消展开的路上写轨迹。本类是这份 Context 此后唯一的持有者，修复只能在这里做。"""
+    entered, never = asyncio.Event(), asyncio.Event()
+    agent, _ = _agent(
+        [
+            ScriptedTurn(
+                tool_calls=[_call('c1', 'hi'), ToolCall(id='b1', name='Blocking', arguments='{}')]
+            ),
+            ScriptedTurn(content='done'),
+        ],
+        tools={'Echo': _Echo(), 'Blocking': _Blocking(entered, never)},
+    )
+    task = asyncio.create_task(agent.run('go'))
+    await asyncio.wait_for(entered.wait(), timeout=_TIMEOUT)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=_TIMEOUT)
+    assert [(block.role, block.tool_call_id) for block in agent.context.current_traj] == [
+        ('user', None),
+        ('assistant', None),
+        ('tool', 'c1'),
+    ]
+
+    ctx = await agent.run('again')
+    assert [(block.role, block.tool_call_id) for block in ctx.current_traj] == [
+        ('user', None),
+        ('assistant', None),
+        ('tool', 'c1'),
+        ('tool', 'b1'),
+        ('user', None),
+        ('assistant', None),
+    ]
+    assert _roles(_llm(agent).calls[1]) == ['system', 'user', 'assistant', 'tool', 'tool', 'user']
+    assert ctx.stop_reason is StopReason.COMPLETED
+
+
+async def test_the_repaired_block_records_the_interruption_without_inventing_a_result():
+    """两个方向都是对 resume 撒谎：声称没有副作用会让它跳过重做，声称成功会让它接着往下走。"""
+    entered, never = asyncio.Event(), asyncio.Event()
+    agent, _ = _agent(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='b1', name='Blocking', arguments='{}')]),
+            ScriptedTurn(content='done'),
+        ],
+        tools={'Blocking': _Blocking(entered, never)},
+    )
+    task = asyncio.create_task(agent.run('go'))
+    await asyncio.wait_for(entered.wait(), timeout=_TIMEOUT)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=_TIMEOUT)
+    repaired = (await agent.run('again')).current_traj[2]
+    assert repaired.extra == {'interrupted': True}
+    assert isinstance(repaired.content, str) and repaired.content
+
+
+async def test_a_resume_leaves_an_already_paired_batch_alone():
+    """工具跑完之后才失败的那一轮留下的轨迹是自洽的：这里补一块就是凭空多出一条工具结果。"""
+    agent, _ = _agent(
+        [
+            ScriptedTurn(tool_calls=[_call()]),
+            ScriptedTurn(raises=RuntimeError('flaky')),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    with pytest.raises(RuntimeError):
+        await agent.run('one')
+    assert _roles(agent.context.current_traj) == ['user', 'assistant', 'tool']
+    ctx = await agent.run('two')
+    assert _roles(ctx.current_traj) == ['user', 'assistant', 'tool', 'user', 'assistant']
 
 
 @pytest.mark.parametrize(
@@ -836,7 +1101,7 @@ async def test_pre_llm_request_hook_can_add_request_kwargs():
 
     hooks.register(Junction.PRE_LLM_REQUEST, tune)
     await agent.run('go')
-    assert _llm(agent).call_kwargs[0] == {'tools': [_ECHO_SCHEMA], 'temperature': 0.0}
+    assert _llm(agent).call_kwargs[0] == {'tools': _TOOL_SCHEMAS, 'temperature': 0.0}
 
 
 @pytest.mark.parametrize(
@@ -857,3 +1122,180 @@ async def test_a_pre_llm_request_hook_replacing_the_request_with_something_unusa
         await agent.run('go')
     assert Junction.PRE_LLM_REQUEST.value in excinfo.value.expected
     assert _llm(agent).calls == []
+
+
+async def test_pre_llm_request_skip_supplies_the_response_without_calling_the_model():
+    """空脚本：模型只要被调用一次，ScriptedLLM 就会当场报配置错误。响应缓存与预算否决走这条路，
+    静默照调等于把 hook 作者的否决扔了。"""
+    agent, hooks = _agent([])
+
+    async def cached(**_: Any) -> HookResult:
+        return HookResult(skip=True, result=ContextBlock(role='assistant', content='cached'))
+
+    hooks.register(Junction.PRE_LLM_REQUEST, cached)
+    ctx = await agent.run('go')
+    assert ctx.stop_reason is StopReason.COMPLETED
+    assert _roles(ctx.current_traj) == ['user', 'assistant']
+    assert ctx.current_traj[-1].content == 'cached'
+    assert _llm(agent).calls == []
+
+
+async def test_a_skipped_response_still_goes_through_post_llm_response():
+    agent, hooks = _agent([])
+    seen: list[Any] = []
+
+    async def cached(**_: Any) -> HookResult:
+        return HookResult(skip=True, result=ContextBlock(role='assistant', content='cached'))
+
+    async def observe(**kwargs: Any) -> HookResult:
+        seen.append(kwargs['response'].content)
+        return HookResult()
+
+    hooks.register(Junction.PRE_LLM_REQUEST, cached)
+    hooks.register(Junction.POST_LLM_RESPONSE, observe)
+    await agent.run('go')
+    assert seen == ['cached']
+
+
+async def test_a_skipped_response_carrying_tool_calls_keeps_the_loop_going():
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+    skipped: list[int] = []
+
+    async def cached(**_: Any) -> HookResult:
+        if skipped:
+            return HookResult()
+        skipped.append(1)
+        return HookResult(skip=True, result=ContextBlock(role='assistant', tool_calls=[_call()]))
+
+    hooks.register(Junction.PRE_LLM_REQUEST, cached)
+    ctx = await agent.run('go')
+    assert _roles(ctx.current_traj) == ['user', 'assistant', 'tool', 'assistant']
+    assert len(_llm(agent).calls) == 1
+
+
+async def test_an_empty_skipped_response_goes_through_the_empty_response_guard():
+    """与真实的空响应同路：空块守卫不因为响应来自 hook 而放行。"""
+    agent, hooks = _agent([])
+
+    async def cached(**_: Any) -> HookResult:
+        return HookResult(skip=True, result=ContextBlock(role='assistant'))
+
+    hooks.register(Junction.PRE_LLM_REQUEST, cached)
+    with pytest.raises(LLMResponseError):
+        await agent.run('go')
+    assert _roles(agent.context.current_traj) == ['user']
+
+
+@pytest.mark.parametrize(
+    'result',
+    [None, 'cached', 42, ContextBlock(role='user', content='cached')],
+    ids=['none', 'str', 'int', 'user-block'],
+)
+async def test_a_skipping_pre_llm_request_hook_without_an_assistant_block_is_rejected(result):
+    """跳过之后没有任何东西能顶替本轮的产出，所以缺一块合法响应不能静默降级成「照调模型」。"""
+    agent, hooks = _agent([])
+
+    async def veto(**_: Any) -> HookResult:
+        return HookResult(skip=True, result=result)
+
+    hooks.register(Junction.PRE_LLM_REQUEST, veto)
+    with pytest.raises(ContractViolation) as excinfo:
+        await agent.run('go')
+    assert Junction.PRE_LLM_REQUEST.value in excinfo.value.expected
+    assert _roles(agent.context.current_traj) == ['user']
+    assert _llm(agent).calls == []
+
+
+async def test_an_overflow_raised_by_a_pre_llm_request_hook_is_not_classified_as_overflow():
+    """三级分类的对象是「调用 LLM」（spec §5.1 第 8 步）。那个 hook 手里就握着 request，要压缩就地
+    压缩即可；把它抛的异常也收进分类，等于让压缩链在自己出错时递归调用自己。"""
+    error = _overflow()
+    agent, hooks = _agent([ScriptedTurn(content='done')])
+    fired: list[str] = []
+
+    async def raise_overflow(**_: Any) -> HookResult:
+        raise error
+
+    async def handled(**_: Any) -> HookResult:
+        fired.append('context_overflow')
+        return HookResult(skip=True)
+
+    hooks.register(Junction.PRE_LLM_REQUEST, raise_overflow)
+    hooks.register(Junction.CONTEXT_OVERFLOW, handled)
+    with pytest.raises(ContextOverflowError) as excinfo:
+        await agent.run('go')
+    assert excinfo.value is error
+    assert fired == []
+    assert agent.context.stop_reason is StopReason.ERROR
+    assert _llm(agent).calls == []
+
+
+async def test_the_executor_looks_tools_up_at_call_time_rather_than_snapshotting_them():
+    """ToolExecutor 的契约是每次调用时查表；这里传一份快照进去，那条跨模块性质会静默失效。"""
+    agent, _ = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')], tools={})
+    agent.options.tools['Echo'] = _Echo()
+    ctx = await agent.run('go')
+    assert ctx.current_traj[2].content == 'hi'
+
+
+async def test_the_system_prompt_is_rebuilt_every_turn():
+    """get_system_prompt 是被指定的公开方法：子类覆写它时，每 run 建一次与每轮建一次行为分叉。"""
+    options = AgentOptions(
+        name='Worker',
+        llm=ScriptedLLM([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')]),
+        tools=_tools(),
+    )
+    agent = _NumberedPrompt(options, hooks=HooksCenter(), events=EventBus())
+    await agent.run('go')
+    assert [call[0].content for call in _llm(agent).calls] == ['prompt 1', 'prompt 2']
+    assert agent.prompt_calls == 2
+
+
+async def test_the_last_turn_end_sees_the_stop_reason_already_set():
+    """turn 的可观测数据在 turn_end 之后才冻结（spec §5.1）：按轮汇总的插件在最后一轮要么看到终
+    态、要么看到 None，两者不能都算对。"""
+    agent, hooks = _agent([ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')])
+    seen: list[StopReason | None] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        seen.append(kwargs['ctx'].stop_reason)
+        return HookResult()
+
+    hooks.register(Junction.TURN_END, record)
+    await agent.run('go')
+    assert seen == [None, StopReason.COMPLETED]
+
+
+async def test_agent_start_sees_the_new_query_already_in_the_trajectory():
+    agent, hooks = _agent([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    snapshots: list[list[Any]] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        snapshots.append([block.content for block in kwargs['ctx'].current_traj])
+        return HookResult()
+
+    hooks.register(Junction.AGENT_START, record)
+    await agent.run('one')
+    await agent.run('two')
+    assert snapshots == [['one'], ['one', 'first', 'two']]
+
+
+async def test_llm_failure_fires_twice_when_post_llm_response_empties_the_substitute():
+    """一轮内两次不同的失败：数重试次数的插件按轮计数会偏。"""
+    agent, hooks = _agent([ScriptedTurn(raises=RuntimeError('flaky'))])
+    errors: list[str] = []
+
+    async def substitute(**kwargs: Any) -> HookResult:
+        errors.append(type(kwargs['error']).__name__)
+        return HookResult(
+            modified={'response': ContextBlock(role='assistant', content='recovered')}
+        )
+
+    async def strip(**_: Any) -> HookResult:
+        return HookResult(modified={'response': ContextBlock(role='assistant')})
+
+    hooks.register(Junction.LLM_FAILURE, substitute)
+    hooks.register(Junction.POST_LLM_RESPONSE, strip)
+    ctx = await agent.run('go')
+    assert errors == ['RuntimeError', 'LLMResponseError']
+    assert ctx.current_traj[-1].content == 'recovered'

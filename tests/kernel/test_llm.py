@@ -373,6 +373,20 @@ async def test_per_call_kwargs_are_recorded_alongside_the_messages():
     assert len(llm.call_kwargs) == len(llm.calls)
 
 
+async def test_one_kwarg_value_sent_twice_is_recorded_as_two_independent_snapshots():
+    """turn 循环跨轮递交同一个 tool schema 列表对象。记录共享它时「每轮的工具定义都是这一份」
+    只在最终值也偏离时才会红——轮间就地改一下再改回来全程隐形，而那正是前缀缓存失效的形状。"""
+    llm = ScriptedLLM([ScriptedTurn(content='a'), ScriptedTurn(content='b')])
+    tools = [{'name': 'Echo'}]
+    await llm.create([], tools=tools)
+    tools[0]['name'] = 'Drifted'
+    await llm.create([], tools=tools)
+    assert [kwargs['tools'] for kwargs in llm.call_kwargs] == [
+        [{'name': 'Echo'}],
+        [{'name': 'Drifted'}],
+    ]
+
+
 async def test_returned_tool_calls_are_not_shared_with_the_script():
     """脚本会跨轮、跨用例复用；消费者改动返回的块不得改到脚本本身。"""
     turn = ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Echo', arguments='{}')])
