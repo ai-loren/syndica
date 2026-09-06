@@ -3228,7 +3228,7 @@ max_turns 约束整个任务而非单个周期：轮次计数跨周期不重置�
 **Interfaces:**
 - Consumes: 全部前序任务
 - Produces:
-  - `Runtime(registry=None, broker=None)`：`.events` / `.hooks` / `spawn(agent_factory, *, query, exit_mode)` / `wait(agent_id) -> Context` / `send(agent_id, content, *, trigger, activate) -> DeliveryResult` / `find(agent_id) -> AgentInfo | None` / `shutdown()`
+  - `Runtime(registry=None, broker=None)`：`.events` / `.hooks` / `spawn(agent_factory, *, query, exit_mode)` / `wait(agent_id) -> Context` / `send(agent_id, content, *, trigger) -> DeliveryResult`（spec §4 的 `activate` 参数随「按需激活」一并落在计划 2：本计划里 Runtime 不注册 `on_missing_queue` 回调，暴露一个不生效的开关比不暴露更糟） / `find(agent_id) -> AgentInfo | None` / `shutdown()`
   - `syndica.kernel` 顶层导出
 
 - [ ] **Step 1: 写失败测试**
