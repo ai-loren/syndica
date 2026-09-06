@@ -4,10 +4,11 @@
 对象（Agent 实例、asyncio 任务），只在持有它们的进程内有意义，因此不进
 Protocol（spec §4.3）。多进程部署时前者共享，后者各进程只有自己那部分。
 
-一条不变式：**一个 slot 里的 Agent 实例与任务必须描述同一个 Agent，且未结束的任务不得失去
-句柄**。`put` 与 `set_task` 因此拒绝会破坏它的写入，`_tasks` 的键恒为 `_agents` 的子集——
-teardown 只遍历 `agent_ids()`，落在它之外的任务永远轮不到被取消。`pop` 是唯一允许丢弃未结束
-任务的入口（EXIT 模式下 Agent 在自己的任务里摘掉自己），需要那个任务就先 `get_task`。
+本表保证的是同一个 id 上的时序：**重复 `put`、给没有实例的 id `set_task`、替换未结束的
+任务都被拒绝**，实例与任务描述不同 Agent 的一对不会从这三处产生；`_tasks` 的键恒为 `_agents`
+的子集——teardown 只遍历 `agent_ids()`，落在它之外的任务永远轮不到被取消。未结束的任务不会
+失去句柄，`pop` 除外（EXIT 模式下 Agent 在自己的任务里摘掉自己），要那个任务就先 `get_task`。
+跨 slot 的别名不查：同一个任务对象装进两个 slot 不会被拒绝。
 """
 
 from __future__ import annotations

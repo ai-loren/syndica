@@ -130,7 +130,6 @@ def test_put_rejects_a_duplicate_even_when_the_agent_is_the_same_object():
 
 
 async def test_rejected_put_leaves_the_stored_pair_untouched():
-    """覆写会让 slot 里的实例与任务描述两个不同的 Agent，而幸存的任务再没有句柄可取消。"""
     table: LocalAgentTable[_FakeAgent] = LocalAgentTable()
     agent = _FakeAgent('w1')
     task = asyncio.create_task(_noop())
@@ -142,8 +141,20 @@ async def test_rejected_put_leaves_the_stored_pair_untouched():
     await task
 
 
+async def test_put_rejects_a_duplicate_even_when_a_task_is_supplied(
+    running: Callable[[], asyncio.Task[None]],
+):
+    table: LocalAgentTable[_FakeAgent] = LocalAgentTable()
+    agent = _FakeAgent('w1')
+    task = running()
+    table.put('a1', agent, task)
+    with pytest.raises(ConfigError):
+        table.put('a1', _FakeAgent('w2'), running())
+    assert table.get('a1') is agent
+    assert table.get_task('a1') is task
+
+
 async def test_set_task_rejects_an_agent_id_with_no_agent():
-    """agent_ids() 只列 Agent，落在它之外的任务 teardown 永远取不到，只能泄漏。"""
     table: LocalAgentTable[_FakeAgent] = LocalAgentTable()
     task = asyncio.create_task(_noop())
     with pytest.raises(ConfigError) as excinfo:
@@ -161,9 +172,10 @@ async def test_set_task_rejects_replacing_a_task_that_is_still_running(
     table.put('a1', _FakeAgent('w1'))
     first = running()
     table.set_task('a1', first)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError) as excinfo:
         table.set_task('a1', running())
     assert table.get_task('a1') is first
+    assert 'get_task' in excinfo.value.next_action
 
 
 async def test_set_task_replaces_a_finished_task_so_an_agent_can_be_re_driven():
@@ -208,7 +220,6 @@ def test_pop_unknown_id_is_a_noop():
 async def test_pop_accepts_a_task_that_is_still_running(
     running: Callable[[], asyncio.Task[None]],
 ):
-    """EXIT 模式下 Agent 在自己的任务里摘掉自己，拒绝未结束的任务会把那条路堵死。"""
     table: LocalAgentTable[_FakeAgent] = LocalAgentTable()
     table.put('a1', _FakeAgent('w1'))
     task = running()
