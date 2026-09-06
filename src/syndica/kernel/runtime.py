@@ -22,6 +22,9 @@
 **ZOMBIE 保留邮箱。** spec §4.1 的 ZOMBIE 靠按需激活重建队列来维持可寻址；按需激活在计划 2，此刻
 移除队列会让 ZOMBIE 一条消息都收不到，而「一条消息即可复活」正是它存在的理由。
 
+**`shutdown` 是终态。** 关闭后的事件总线静默丢弃 emit，此后 spawn 出来的 Agent 会照常干完活却完全
+不可观测，因此 spawn 在关闭后报错，而不是交出一个不可观测的 Agent。
+
 **取消落在 `finally` 里的注册表写之前时，条目会停在 RUNNING。** 内存实现的那两个 await 不挂起，
 单机默认没有这个窗口；远端实现留下的孤儿由 `owner` / `heartbeat_at` 租约回收（spec §4.3）。
 """
@@ -61,6 +64,17 @@ _TERMINAL_STATUS: Mapping[ExitMode, AgentStatus] = MappingProxyType(
 )
 
 
+def _already_shut_down() -> ConfigError:
+    return ConfigError(
+        expected='Runtime 尚未 shutdown，spawn 出来的 Agent 事件仍有订阅者能收到',
+        received=(
+            'shutdown() 已经跑过：事件总线已关闭，此后 emit 一律静默丢弃，'
+            '这个 Agent 会照常干完活却完全不可观测'
+        ),
+        next_action='要再跑 Agent 就新建一个 Runtime；shutdown 是终态，同一个 Runtime 不重开',
+    )
+
+
 class Runtime:
     """Agent 的生命周期驱动。"""
 
@@ -76,6 +90,7 @@ class Runtime:
         self.hooks: HooksCenter = HooksCenter()
         self._table: LocalAgentTable[BaseAgent] = LocalAgentTable()
         self._contexts: dict[str, Context] = {}
+        self._closed = False
 
     async def spawn(
         self,
@@ -90,6 +105,8 @@ class Runtime:
 
         工厂收下本 Runtime 的 hooks 与事件总线：Agent 自己新建一份，宿主注册的切点与订阅就都落空了。
         """
+        if self._closed:
+            raise _already_shut_down()
         agent = factory(self.hooks, self.events)
         agent_id = agent.agent_id
         await self.registry.register(
@@ -157,6 +174,9 @@ class Runtime:
     async def wait(self, agent_id: str) -> Context:
         """类比 waitpid：等驱动任务结束，交回它的轨迹。
 
+        交回的是 Agent 自己那份 Context，不是快照：ZOMBIE 靠一条消息复活时续用的就是它，拿到副本
+        的调用方会与 Agent 将来读写的那一份静默分叉。
+
         Agent 的异常与取消都是**被等待者**的终态，不冒充成本次调用自己的失败：崩溃在
         `ctx.stop_reason` 上是 ERROR，被取消的运行没有 stop_reason。
         """
@@ -197,6 +217,9 @@ class Runtime:
         """投递一条消息到目标邮箱。
 
         **只投递，不激活**；spec §4.2 的 `activate` 随按需激活能力在计划 2 一并加入。
+
+        可寻址性以注册表为准，不以邮箱在不在为准：残留邮箱（远端 broker 的 remove_queue 失败、
+        或 ensure_queue 之后注册失败）会让投递看起来成功，而再没有人会去消费它。
         """
         if await self.registry.get(agent_id) is None:
             return DeliveryResult(
@@ -217,11 +240,13 @@ class Runtime:
         return await self.registry.get(agent_id)
 
     async def shutdown(self) -> None:
-        """取消所有驱动任务，**等它们收完尾**再关事件总线。幂等。
+        """取消所有驱动任务，**等它们收完尾**再关事件总线。幂等，且是终态：此后 spawn 报错。
 
         取消不等于结束：任务的 `finally` 还要写注册表、EXIT 还要摘队列。不等它们收完尾，
         未结束的任务会在解释器退出时留下一串 "Task was destroyed but it is pending"。
         """
+        # 置位在 gather 之前：与本次关机并发的 spawn 既赶不上取消名单、事件又发不出去。
+        self._closed = True
         tasks = [
             task
             for agent_id in self._table.agent_ids()

@@ -17,7 +17,7 @@ from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
-from syndica.kernel.message import Message
+from syndica.kernel.message import Message, Trigger
 from syndica.kernel.runtime import AgentFactory, Runtime
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
@@ -48,6 +48,10 @@ class _Concat(Tool):
     async def execute(self, left: str, right: str) -> ToolResult:
         """拼接 left 与 right。"""
         return ToolResult(output=left + right)
+
+
+class _Specialist(BaseAgent):
+    """agent_type 取自实例的类名：只有一个 Agent 类时，写死的类名与真取值是同一个答案。"""
 
 
 class _Block(Tool):
@@ -119,10 +123,14 @@ def _done(content: str = 'done') -> ScriptedLLM:
 
 
 def _factory(
-    llm: ScriptedLLM, *, name: str = 'Worker', tools: dict[str, Tool] | None = None
+    llm: ScriptedLLM,
+    *,
+    name: str = 'Worker',
+    tools: dict[str, Tool] | None = None,
+    cls: type[BaseAgent] = BaseAgent,
 ) -> AgentFactory:
     def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
-        return BaseAgent(
+        return cls(
             AgentOptions(
                 name=name,
                 llm=llm,
@@ -132,6 +140,17 @@ def _factory(
             hooks=hooks,
             events=events,
         )
+
+    return build
+
+
+def _capturing(built: list[BaseAgent], llm: ScriptedLLM) -> AgentFactory:
+    inner = _factory(llm)
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = inner(hooks, events)
+        built.append(agent)
+        return agent
 
     return build
 
@@ -157,6 +176,12 @@ async def _status(runtime: Runtime, agent_id: str) -> AgentStatus | None:
     return None if info is None else info.status
 
 
+async def _info(runtime: Runtime, agent_id: str) -> AgentInfo:
+    info = await runtime.find(agent_id)
+    assert info is not None
+    return info
+
+
 async def _mailbox_exists(broker: InMemoryMessageBroker, agent_id: str) -> bool:
     """邮箱在不在。没有 on_missing_queue 回调时，publish 失败当且仅当邮箱不存在。"""
     result = await broker.publish(
@@ -173,6 +198,50 @@ async def test_spawn_gives_each_agent_its_own_id_and_registry_entry():
     found = [await runtime.find(agent_id) for agent_id in ids]
     assert [info.name for info in found if info is not None] == names
     assert [info.agent_id for info in found if info is not None] == ids
+    await runtime.shutdown()
+
+
+async def test_spawn_files_each_child_under_its_own_parent():
+    runtime = Runtime()
+    parents = [await runtime.spawn(_factory(_done()), query='go') for _ in range(2)]
+    plan = [parents[0], parents[0], parents[1]]
+    children = [
+        await runtime.spawn(_factory(_done()), query='go', parent_id=parent) for parent in plan
+    ]
+
+    assert [(await _info(runtime, child)).parent_id for child in children] == plan
+    assert [(await _info(runtime, parent)).parent_id for parent in parents] == [None, None]
+    assert await runtime.registry.children_of(parents[0]) == children[:2]
+    assert await runtime.registry.children_of(parents[1]) == children[2:]
+    await runtime.shutdown()
+
+
+async def test_spawn_under_an_unknown_parent_leaves_no_half_built_agent_behind():
+    runtime = Runtime()
+    with pytest.raises(ConfigError):
+        await runtime.spawn(_factory(_done()), query='go', parent_id='nope')
+    assert runtime._table.agent_ids() == []
+    assert runtime._contexts == {}
+    await runtime.shutdown()
+
+
+async def test_spawn_records_each_agents_own_metadata_and_class_name():
+    runtime = Runtime()
+    scout = await runtime.spawn(
+        _factory(_done()), query='go', metadata={'role': 'scout', 'depth': 1}
+    )
+    scribe = await runtime.spawn(
+        _factory(_done(), cls=_Specialist), query='go', metadata={'role': 'scribe'}
+    )
+    bare = await runtime.spawn(_factory(_done()), query='go')
+
+    infos = [await _info(runtime, agent_id) for agent_id in (scout, scribe, bare)]
+    assert [info.metadata for info in infos] == [
+        {'role': 'scout', 'depth': 1},
+        {'role': 'scribe'},
+        {},
+    ]
+    assert [info.agent_type for info in infos] == ['BaseAgent', '_Specialist', 'BaseAgent']
     await runtime.shutdown()
 
 
@@ -265,6 +334,47 @@ async def test_send_reaches_only_the_addressed_agents_mailbox():
     assert (await runtime.send(second, 'for second')).ok is True
     assert [message.content for message in await broker.consume(first)] == []
     assert [message.content for message in await broker.consume(second)] == ['for second']
+    await runtime.shutdown()
+
+
+async def test_send_puts_the_requested_trigger_on_the_delivered_message():
+    broker = InMemoryMessageBroker()
+    runtime = Runtime(broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await runtime.wait(agent_id)
+
+    await runtime.send(agent_id, 'next turn')
+    await runtime.send(agent_id, 'after the run', trigger=Trigger.DEFERRED)
+    delivered = await broker.consume(agent_id)
+    assert [message.trigger for message in delivered] == [Trigger.PENDING, Trigger.DEFERRED]
+    await runtime.shutdown()
+
+
+async def test_send_stamps_the_runtime_as_sender_on_every_addressees_message():
+    broker = InMemoryMessageBroker()
+    runtime = Runtime(broker=broker)
+    ids = [await runtime.spawn(_factory(_done()), query='go') for _ in range(2)]
+    for agent_id in ids:
+        await runtime.wait(agent_id)
+        assert (await runtime.send(agent_id, 'ping')).ok is True
+
+    delivered = [(await broker.consume(agent_id))[0] for agent_id in ids]
+    assert [message.sender for message in delivered] == ['runtime', 'runtime']
+    assert [message.receiver for message in delivered] == ids
+    await runtime.shutdown()
+
+
+async def test_send_refuses_an_unregistered_agent_even_when_a_stale_mailbox_exists():
+    broker = InMemoryMessageBroker()
+    runtime = Runtime(broker=broker)
+    await broker.ensure_queue('ghost')
+
+    result = await runtime.send('ghost', 'hello')
+    assert result.ok is False
+    assert result.message_id is None
+    assert result.reason is not None
+    _assert_three_part(result.reason)
+    assert await broker.consume('ghost') == []
     await runtime.shutdown()
 
 
@@ -435,6 +545,34 @@ async def test_wait_returns_the_trajectory_of_a_failed_run_instead_of_raising(
     await runtime.shutdown()
 
 
+async def test_an_exit_mode_agent_that_fails_is_reaped_without_its_exception_leaving_the_driver(
+    caplog: pytest.LogCaptureFixture,
+):
+    runtime = Runtime()
+    failing = ScriptedLLM([ScriptedTurn(raises=RuntimeError('boom'))])
+    agent_id = await runtime.spawn(_factory(failing), query='go', exit_mode=ExitMode.EXIT)
+    # 只有 EXIT 能观测到「异常有没有逃出去」：条目被摘掉后 shutdown 的 gather 再也看不见这个
+    # 任务，逃出来的异常无人取回，只会在 GC 时变成一行日志。
+    task = runtime._table.get_task(agent_id)
+    assert task is not None
+    await asyncio.wait({task})
+
+    assert task.exception() is None
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert await runtime.find(agent_id) is None
+    with pytest.raises(ConfigError):
+        await runtime.wait(agent_id)
+    await runtime.shutdown()
+
+
+async def test_wait_hands_back_the_agents_own_context_not_a_snapshot():
+    runtime = Runtime()
+    built: list[BaseAgent] = []
+    agent_id = await runtime.spawn(_capturing(built, _done()), query='go')
+    assert await runtime.wait(agent_id) is built[0].context
+    await runtime.shutdown()
+
+
 async def test_shutdown_is_idempotent():
     runtime = Runtime()
     agent_id = await runtime.spawn(_factory(_done()), query='go')
@@ -442,6 +580,14 @@ async def test_shutdown_is_idempotent():
     await runtime.shutdown()
     await runtime.shutdown()
     assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+
+
+async def test_spawn_after_shutdown_is_refused_instead_of_dropping_the_new_agents_events():
+    runtime = Runtime()
+    await runtime.shutdown()
+    with pytest.raises(ConfigError):
+        await runtime.spawn(_factory(_done()), query='go')
+    assert runtime._table.agent_ids() == []
 
 
 async def test_every_spawned_agent_gets_the_runtimes_own_hooks_and_event_bus():

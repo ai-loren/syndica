@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from syndica.kernel import (
+    AgentFactory,
     AgentOptions,
     AgentStatus,
     BaseAgent,
@@ -25,6 +26,11 @@ from syndica.kernel import (
     ToolResult,
 )
 
+# 工具顺序逐字进请求前缀（spec §5.2）。三个而非两个，且注册顺序既非升序（Farewell / Greeter /
+# Introduce）亦非降序、反转后同样两者都不是：n <= 2 时「保持注册顺序」与「排序」「反转」里必有
+# 一对是同一个答案。
+_TOOL_NAMES = ['Greeter', 'Farewell', 'Introduce']
+
 
 class Greeter(Tool):
     async def execute(self, name: str) -> ToolResult:
@@ -38,36 +44,45 @@ class Farewell(Tool):
         return ToolResult(output=f'Bye, {name}!', meta={'left': name})
 
 
-def _build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
-    return BaseAgent(
-        AgentOptions(
-            name='Greeter',
-            llm=ScriptedLLM(
-                [
-                    ScriptedTurn(
-                        tool_calls=[ToolCall(id='c1', name='Greeter', arguments='{"name":"Loren"}')]
-                    ),
-                    ScriptedTurn(content='I greeted Loren.'),
-                ]
+class Introduce(Tool):
+    async def execute(self, name: str) -> ToolResult:
+        """介绍 name。"""
+        return ToolResult(output=f'This is {name}.', meta={'introduced': name})
+
+
+def _build(llm: ScriptedLLM) -> AgentFactory:
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(
+                name='Greeter',
+                llm=llm,
+                tools={'Greeter': Greeter(), 'Farewell': Farewell(), 'Introduce': Introduce()},
+                system_prompt='You greet people.',
             ),
-            # 注册顺序既非升序（Farewell / Greeter）亦非降序：单工具下「保持注册顺序」与「排序」
-            # 是同一个答案，而工具顺序逐字进请求前缀（spec §5.2）。
-            tools={'Greeter': Greeter(), 'Farewell': Farewell()},
-            system_prompt='You greet people.',
-        ),
-        hooks=hooks,
-        events=events,
-    )
+            hooks=hooks,
+            events=events,
+        )
+
+    return build
 
 
 async def test_agent_calls_tool_then_answers():
     runtime = Runtime()
     subscription = runtime.events.subscribe()
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall(id='c1', name='Greeter', arguments='{"name":"Loren"}')]
+            ),
+            ScriptedTurn(content='I greeted Loren.'),
+        ]
+    )
 
-    agent_id = await runtime.spawn(_build, query='Please greet Loren')
+    agent_id = await runtime.spawn(_build(llm), query='Please greet Loren')
     ctx = await runtime.wait(agent_id)
 
     assert ctx.stop_reason is StopReason.COMPLETED
+    assert [schema['name'] for schema in llm.call_kwargs[0]['tools']] == _TOOL_NAMES
     tool_block = next(block for block in ctx.current_traj if block.role == 'tool')
     assert tool_block.content == 'Hello, Loren!'
     assert tool_block.extra['tool_meta'] == {'greeted': 'Loren'}
