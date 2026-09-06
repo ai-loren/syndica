@@ -15,7 +15,7 @@ import copy
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Annotated, Any, ClassVar, get_args, get_origin
 
 from pydantic import BaseModel
 
@@ -33,32 +33,46 @@ _JSON_TYPES: dict[type, str] = {
     dict: 'object',
 }
 _SUPPORTED_ANNOTATIONS: str = ', '.join(sorted(annotation.__name__ for annotation in _JSON_TYPES))
+# 三级各自字面构造，键集合却必须一致：`.description` / `.parameters` 是 schema 的投影，手写那一级
+# 缺键时得报得出缺了什么。
+_SCHEMA_KEYS: tuple[str, ...] = ('name', 'description', 'parameters')
+# PEP 563 只字符串化一层，作者手写引号会再套一层，两层足够；不设上限时 `_X = '_X'` 这类自指别名
+# 会让求值不收敛。
+_MAX_ANNOTATION_EVALS: int = 2
 
 
 def _resolved(annotation: Any, param_name: str, globalns: dict[str, Any]) -> Any:
-    """求值一个标注。
+    """逐层求值一个标注，直到不是字符串。
 
     `from __future__ import annotations` 下标注在运行时是字符串，而 `inspect.signature` 不求值
-    字符串。只求值参数标注，返回标注不碰；求值作用域是 execute 所在模块的全局，函数局部作用域里
-    定义的类型在这里解析不了。
+    字符串；作者自己加的引号会再套一层（`text: 'str'` 的标注是 `"'str'"`）。只求值参数标注，返回
+    标注不碰；求值作用域是 execute 所在模块的全局，函数局部作用域里定义的类型在这里解析不了。
     """
-    if not isinstance(annotation, str):
-        return annotation
-    try:
-        return eval(annotation, globalns)
-    except Exception as exc:
-        raise ConfigError(
-            expected=f'参数 {param_name!r} 的标注能在 execute 所在模块的全局作用域里求值',
-            received=f'标注 {annotation!r} 求值失败：{type(exc).__name__}: {exc}',
-            next_action=(
-                f'把 {param_name!r} 的标注类型移到模块顶层，'
-                '或给这个工具声明 __tool_model__ / __tool_schema__ 跳过反射'
-            ),
-        ) from exc
+    resolved = annotation
+    for _ in range(_MAX_ANNOTATION_EVALS):
+        if not isinstance(resolved, str):
+            break
+        try:
+            resolved = eval(resolved, globalns)
+        except Exception as exc:
+            raise ConfigError(
+                expected=f'参数 {param_name!r} 的标注能在 execute 所在模块的全局作用域里求值',
+                received=f'标注 {resolved!r} 求值失败：{type(exc).__name__}: {exc}',
+                next_action=(
+                    f'把 {param_name!r} 标注用到的 import 移出 if TYPE_CHECKING'
+                    '（反射在运行时求值标注，TYPE_CHECKING 块在运行时不执行），'
+                    f'或把 {param_name!r} 的标注类型移到模块顶层，'
+                    '或给这个工具声明 __tool_model__ / __tool_schema__ 跳过反射'
+                ),
+            ) from exc
+    return resolved
 
 
 def _json_type(annotation: Any, param_name: str, globalns: dict[str, Any]) -> str:
     resolved = _resolved(annotation, param_name, globalns)
+    # `Annotated[int, Field(...)]` 是 pydantic 的惯用写法，元数据不参与 JSON 类型判定。
+    if get_origin(resolved) is Annotated:
+        resolved = get_args(resolved)[0]
     # 先过 isinstance 再查表：泛型别名与联合类型不是 type，其中一部分还不可哈希，直接查表会撞
     # 一个不提参数名的 TypeError。
     json_type = _JSON_TYPES.get(resolved) if isinstance(resolved, type) else None
@@ -91,7 +105,8 @@ def _parsed_doc(doc: str, param_names: frozenset[str]) -> tuple[str, dict[str, s
     """docstring → （摘要，逐参数描述）。
 
     参数描述只认单行 `name: 描述`，且 `name` 必须是真实参数名——否则散文里的冒号会变成一条参数
-    描述。续行不拼接。摘要在第一个空行或第一条参数描述处结束。
+    描述。按**第一个**冒号切分：描述本身常含冒号（`url: https://example.com`），按最后一个切会把
+    描述前半段静默丢掉。续行不拼接。摘要在第一个空行或第一条参数描述处结束。
     """
     summary: list[str] = []
     descriptions: dict[str, str] = {}
@@ -139,11 +154,13 @@ class Tool(ABC):
         """模型看到的名字。
 
         默认取类名并去掉**全部**前导下划线：下划线是 Python 的私有标记，对模型没有含义，而
-        `_Grep` 与 `__Grep` 是同一个工具的两种写法。剩下空串时报错而不是交出一个没有名字的工具。
+        `_Grep` 与 `__Grep` 是同一个工具的两种写法。两侧空白一并去掉：判空判的是 strip 后的值，
+        原样交出会让 `'  Grep  '` 进模型请求，而多数 provider 对工具名有字符集约束。剩下空串时
+        报错而不是交出一个没有名字的工具。
         """
         declared = self.__tool_name__
-        resolved = declared if declared is not None else type(self).__name__.lstrip('_')
-        if not resolved.strip():
+        resolved = (declared if declared is not None else type(self).__name__.lstrip('_')).strip()
+        if not resolved:
             raise ConfigError(
                 expected='工具名非空：模型按名字调用工具，没有名字的工具调不到',
                 received=(
@@ -157,11 +174,33 @@ class Tool(ABC):
 
     @property
     def description(self) -> str:
-        return self.schema['description']
+        return self._projected('description')
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return self.schema['parameters']
+        return self._projected('parameters')
+
+    def _projected(self, key: str) -> Any:
+        """schema 的单键投影，缺键时替裸 KeyError 说清缺了什么。
+
+        校验整套 `_SCHEMA_KEYS` 而不只校验 `key`：手写 schema 的键集合已由另两级完全确定，一份
+        缺 `parameters` 的 schema 对模型已经不可用，只报被读到的那个键会让作者修一次再撞一次。
+        """
+        schema = self.schema
+        missing = [name for name in _SCHEMA_KEYS if name not in schema]
+        if missing:
+            raise ConfigError(
+                expected=f'工具 schema 含 {", ".join(_SCHEMA_KEYS)} 三个键',
+                received=(
+                    f'{type(self).__name__} 的 __tool_schema__ 缺 {missing}，'
+                    f'实际的键是 {sorted(schema)}'
+                ),
+                next_action=(
+                    '把缺的键补进 __tool_schema__，'
+                    '或删掉 __tool_schema__ 改用 __tool_model__ / 反射自动生成'
+                ),
+            )
+        return schema[key]
 
     @property
     def schema(self) -> dict[str, Any]:
@@ -194,6 +233,18 @@ class Tool(ABC):
             # 参数的工具直接报错。
             if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
                 continue
+            # 仅位置参数报错而不是跳过：模型只会按 schema 填一个 kwargs dict，这个参数它永远填不
+            # 进去。收进 schema 则每次调用都因缺必填参数失败，跳过则是交给模型一份缺参数的
+            # schema——两条都只在调用时炸，且炸得莫名其妙。
+            if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+                raise ConfigError(
+                    expected=f'参数 {param_name!r} 能按名字传：模型按 schema 填一个 kwargs dict',
+                    received=f'参数 {param_name!r} 是仅位置参数（execute 签名里有 / 分隔符）',
+                    next_action=(
+                        f'把 {param_name!r} 移到 / 之后，或删掉 execute 签名里的 /，'
+                        '或给这个工具声明 __tool_model__ / __tool_schema__ 跳过反射'
+                    ),
+                )
             properties[param_name] = {'type': _json_type(param.annotation, param_name, globalns)}
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)

@@ -6,14 +6,17 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, Json
 
 from syndica.kernel.context import ArtifactRef, TrustLevel
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.tool import Tool, ToolResult
+
+if TYPE_CHECKING:
+    from decimal import Decimal
 
 
 class _Reflected(Tool):
@@ -24,6 +27,20 @@ class _Reflected(Tool):
         times: 重复次数
         """
         return ToolResult(output=text * times)
+
+
+class _Grep(Tool):
+    """参数名刻意非字典序（`pattern` < `path` 的排序形式相反）：`a, b, c` 那样的取名让「声明序」
+    与「字典序」的断言无从区分，顺序漂移测不出来。"""
+
+    async def execute(self, pattern: str, path: str, limit: int = 20) -> ToolResult:
+        """在 path 下搜索 pattern。
+
+        pattern: 正则表达式
+        path: 搜索根目录
+        limit: 最多返回几条
+        """
+        return ToolResult(output='')
 
 
 class _ModelArgs(BaseModel):
@@ -38,6 +55,19 @@ class _WithModel(Tool):
 
     async def execute(self, path: str) -> ToolResult:
         return ToolResult(output=path)
+
+
+class _BlobArgs(BaseModel):
+    blob: Json[dict[str, Any]]
+
+
+class _WithJsonBlob(Tool):
+    """把 blob 落盘。"""
+
+    __tool_model__ = _BlobArgs
+
+    async def execute(self, blob: str) -> ToolResult:
+        return ToolResult(output=blob)
 
 
 class _HandWritten(Tool):
@@ -84,6 +114,28 @@ def test_declared_tool_name_wins_over_the_class_name():
             return ToolResult(output=text)
 
     assert _Renamed().name == 'Grep'
+
+
+def test_only_leading_underscores_are_dropped_from_the_class_name():
+    class _Grep_(Tool):
+        async def execute(self) -> ToolResult:
+            return ToolResult(output='')
+
+    assert _Grep_().name == 'Grep_'
+
+
+def test_a_padded_declared_tool_name_is_stripped():
+    """判空判的是 strip 后的值：原样交出会让带空白的名字进模型请求，而多数 provider 对工具名有
+    字符集约束。"""
+
+    class _Padded(Tool):
+        __tool_name__ = '  Grep  '
+
+        async def execute(self) -> ToolResult:
+            return ToolResult(output='')
+
+    assert _Padded().name == 'Grep'
+    assert _Padded().schema['name'] == 'Grep'
 
 
 def test_a_class_name_that_is_all_underscores_is_rejected():
@@ -149,7 +201,17 @@ def test_reflection_builds_the_whole_schema_from_signature_and_docstring():
 def test_properties_follow_declaration_order():
     """dict 相等比较不看顺序，而 schema 要被序列化进请求前缀：顺序漂移一次，该会话此后的前缀
     缓存全失效（spec §5.2）。"""
+    assert list(_Grep().schema['parameters']['properties']) == ['pattern', 'path', 'limit']
     assert list(_AllTypes().schema['parameters']['properties']) == ['a', 'b', 'c', 'd', 'e', 'f']
+
+
+def test_the_schema_emits_its_keys_in_a_fixed_order():
+    """键集合是 `.description` / `.parameters` 两个投影的依据，键序则进请求前缀——两者都是公开
+    契约，而 dict 相等比较对键序是瞎的（spec §5.2）。"""
+    assert list(_Reflected().schema) == ['name', 'description', 'parameters']
+    assert list(_WithModel().schema) == ['name', 'description', 'parameters']
+    assert list(_HandWritten().schema) == ['name', 'description', 'parameters']
+    assert list(_Reflected().schema['parameters']) == ['type', 'properties', 'required']
 
 
 def test_reflection_maps_every_supported_annotation_to_its_json_type():
@@ -164,8 +226,8 @@ def test_reflection_maps_every_supported_annotation_to_its_json_type():
 
 
 def test_required_lists_exactly_the_parameters_without_defaults_in_declaration_order():
+    assert _Grep().schema['parameters']['required'] == ['pattern', 'path']
     assert _AllTypes().schema['parameters']['required'] == ['a', 'b', 'c', 'd', 'e', 'f']
-    assert _Reflected().schema['parameters']['required'] == ['text']
 
 
 def test_self_never_reaches_the_schema():
@@ -180,6 +242,34 @@ def test_var_args_and_var_kwargs_never_reach_the_schema():
         'properties': {'text': {'type': 'string'}},
         'required': ['text'],
     }
+
+
+def test_keyword_only_parameters_reach_the_schema():
+    """模型按名字填参，`async def execute(self, *, path: str)` 是写工具最自然的形式；跳过这类
+    参数会交给模型一份「本工具不接受任何入参」的 schema。"""
+
+    class _KeywordOnly(Tool):
+        async def execute(self, *, pattern: str, limit: int = 20) -> ToolResult:
+            return ToolResult(output='')
+
+    assert _KeywordOnly().schema['parameters'] == {
+        'type': 'object',
+        'properties': {'pattern': {'type': 'string'}, 'limit': {'type': 'integer'}},
+        'required': ['pattern'],
+    }
+
+
+def test_a_positional_only_parameter_is_rejected_naming_the_parameter():
+    """模型只会按 schema 填一个 kwargs dict，仅位置参数它永远填不进去：收进 schema 则每次调用
+    都因缺必填参数失败，跳过则是交出一份缺参数的 schema，两条都只在调用时才炸。"""
+
+    class _PositionalOnly(Tool):
+        async def execute(self, path: str, /) -> ToolResult:
+            return ToolResult(output=path)
+
+    with pytest.raises(ConfigError) as excinfo:
+        _ = _PositionalOnly().schema
+    assert 'path' in str(excinfo.value)
 
 
 def test_a_tool_without_parameters_gets_an_empty_property_map():
@@ -250,6 +340,38 @@ def test_a_prose_line_with_a_colon_is_not_taken_as_a_parameter_description():
     assert schema['description'] == '回显 text。'
 
 
+def test_a_parameter_description_keeps_the_colons_inside_it():
+    """按最后一个冒号切分会把描述前半段静默丢掉，而 URL、时间格式这类描述里含冒号很常见。"""
+
+    class _Fetch(Tool):
+        async def execute(self, url: str) -> ToolResult:
+            """抓取 url。
+
+            url: 目标地址，如 https://example.com:8443/a
+            """
+            return ToolResult(output=url)
+
+    properties = _Fetch().schema['parameters']['properties']
+    assert properties['url']['description'] == '目标地址，如 https://example.com:8443/a'
+
+
+def test_a_bare_parameter_name_without_text_is_not_a_description():
+    """空描述比没有描述更糟：模型收到一个 `'description': ''` 的参数，占着请求前缀的字节却什么
+    都没说。"""
+
+    class _Bare(Tool):
+        async def execute(self, text: str) -> ToolResult:
+            """回显 text。
+
+            text:
+            """
+            return ToolResult(output=text)
+
+    schema = _Bare().schema
+    assert schema['parameters']['properties'] == {'text': {'type': 'string'}}
+    assert schema['description'] == '回显 text。'
+
+
 def test_parameter_descriptions_are_read_from_an_indented_args_block():
     class _GoogleStyle(Tool):
         async def execute(self, text: str) -> ToolResult:
@@ -278,8 +400,6 @@ def test_an_undocumented_parameter_gets_no_description_key():
 
 
 def test_a_tool_without_a_docstring_does_not_borrow_the_base_class_one():
-    """描述必须来自工具自己的 docstring：沿 MRO 继承会把 harness 的内部散文当成工具描述交给模型。"""
-
     class _Undocumented(Tool):
         async def execute(self, text: str) -> ToolResult:
             return ToolResult(output=text)
@@ -293,6 +413,53 @@ def test_the_model_tier_takes_priority_over_reflection():
     assert set(schema['parameters']['properties']) == {'path', 'depth'}
     assert schema['name'] == 'WithModel'
     assert schema['description'] == '按 __tool_model__ 生成 schema。'
+
+
+def test_the_model_tier_builds_the_whole_schema_from_the_model_and_the_class_docstring():
+    """`title` / 私有模型类名进了 parameters，是这一级当前的实测输出；按 provider 裁剪属于
+    provider 层，本断言先把交出去的东西钉死。"""
+    assert _WithModel().schema == {
+        'name': 'WithModel',
+        'description': '按 __tool_model__ 生成 schema。',
+        'parameters': {
+            'properties': {
+                'path': {'title': 'Path', 'type': 'string'},
+                'depth': {'default': 1, 'title': 'Depth', 'type': 'integer'},
+            },
+            'required': ['path'],
+            'title': '_ModelArgs',
+            'type': 'object',
+        },
+    }
+
+
+def test_the_model_tier_describes_what_execute_accepts_not_what_it_returns():
+    """`model_json_schema()` 默认是校验模式。序列化模式给的是模型**输出**的形状：`Json[...]`
+    在那边是 object，而工具只接受 JSON 字符串，模型照那份 schema 填参会被 pydantic 拒掉。"""
+    assert _WithJsonBlob().schema['parameters'] == {
+        'properties': {
+            'blob': {
+                'contentMediaType': 'application/json',
+                'contentSchema': {'additionalProperties': True, 'type': 'object'},
+                'title': 'Blob',
+                'type': 'string',
+            }
+        },
+        'required': ['blob'],
+        'title': '_BlobArgs',
+        'type': 'object',
+    }
+
+
+def test_the_declared_name_reaches_the_model_schema():
+    class _Renamed(Tool):
+        __tool_name__ = 'Grep'
+        __tool_model__ = _ModelArgs
+
+        async def execute(self, path: str) -> ToolResult:
+            return ToolResult(output=path)
+
+    assert _Renamed().schema['name'] == 'Grep'
 
 
 def test_a_model_tools_description_is_dedented():
@@ -331,9 +498,48 @@ def test_the_hand_written_tier_takes_priority_over_the_other_two():
     }
 
 
-def test_a_declared_schema_is_used_as_is_even_when_it_is_empty():
-    """空 dict 与「没声明」是两件事：真值判断会让它静默落到下一级，
-    作者于是拿到一份自己没写过的 schema。"""
+def test_a_hand_written_schema_name_is_not_reconciled_with_the_tool_name():
+    """两个名字来源不同，本类不做调和：只有注册层知道该以哪个为准。这是公开行为，钉住它才能让
+    以后真去调和时表现为一次显式的破坏性变更。"""
+    tool = _HandWritten()
+    assert (tool.name, tool.schema['name']) == ('HandWritten', 'Custom')
+
+
+def test_description_and_parameters_come_from_the_schema():
+    tool = _Reflected()
+    assert tool.description == tool.schema['description']
+    assert tool.parameters == tool.schema['parameters']
+
+
+def test_a_hand_written_schema_missing_a_key_is_rejected_naming_the_key():
+    class _NoParameters(Tool):
+        __tool_schema__ = {'name': 'Custom', 'description': '手写描述'}
+
+        async def execute(self, text: str) -> ToolResult:
+            return ToolResult(output=text)
+
+    with pytest.raises(ConfigError) as excinfo:
+        _ = _NoParameters().parameters
+    assert 'parameters' in str(excinfo.value)
+
+
+def test_a_projection_rejects_a_schema_missing_another_key_than_its_own():
+    """键集合由另两级完全确定，缺一个键这份 schema 对模型就已经不可用；只报被读到的那个键，
+    作者会修一次再撞一次。"""
+
+    class _NoParameters(Tool):
+        __tool_schema__ = {'name': 'Custom', 'description': '手写描述'}
+
+        async def execute(self, text: str) -> ToolResult:
+            return ToolResult(output=text)
+
+    with pytest.raises(ConfigError):
+        _ = _NoParameters().description
+
+
+def test_an_empty_declared_schema_is_handed_out_as_is_and_cannot_be_projected():
+    """空 dict 与「没声明」是两件事：真值判断会让它静默落到下一级，作者于是拿到一份自己没写过
+    的 schema。`.schema` 照旧原样交出，只有两个投影在读不到键时出声。"""
 
     class _Empty(Tool):
         __tool_schema__ = {}
@@ -342,12 +548,10 @@ def test_a_declared_schema_is_used_as_is_even_when_it_is_empty():
             return ToolResult(output=text)
 
     assert _Empty().schema == {}
-
-
-def test_description_and_parameters_come_from_the_schema():
-    tool = _Reflected()
-    assert tool.description == tool.schema['description']
-    assert tool.parameters == tool.schema['parameters']
+    with pytest.raises(ConfigError):
+        _ = _Empty().description
+    with pytest.raises(ConfigError):
+        _ = _Empty().parameters
 
 
 def test_reading_the_schema_twice_gives_independent_copies():
@@ -360,7 +564,6 @@ def test_reading_the_schema_twice_gives_independent_copies():
 
 
 def test_mutating_a_schema_cannot_reach_another_instance_of_the_same_tool():
-    """`__tool_schema__` 是 ClassVar：交出它本身，一次调用方的改动就污染了该工具的所有实例。"""
     _HandWritten().schema['parameters']['properties']['injected'] = {'type': 'string'}
     assert _HandWritten().schema['parameters']['properties'] == {}
 
@@ -393,17 +596,42 @@ def test_an_unsupported_annotation_is_rejected_naming_the_parameter():
     assert 'thing' in str(excinfo.value)
 
 
+def test_an_annotated_parameter_uses_the_underlying_type():
+    """`Annotated[int, Field(...)]` 是 pydantic 的惯用写法，元数据不参与 JSON 类型判定；拒掉它
+    等于拒掉一个合法工具。"""
+
+    class _Documented(Tool):
+        async def execute(self, limit: Annotated[int, Field(description='最多几条')]) -> ToolResult:
+            return ToolResult(output='')
+
+    assert _Documented().schema['parameters']['properties'] == {'limit': {'type': 'integer'}}
+
+
 def test_an_unhashable_annotation_is_rejected_naming_the_parameter():
-    """`Annotated[int, {...}]` 不可哈希（pydantic 的 `Annotated[int, Field(...)]` 是同一形状）。
-    不先判 type 就查表，撞的是一个不提参数名的 TypeError。"""
+    """联合类型的 hash 连带 hash 各分支，`Annotated[int, {...}] | None` 于是不可哈希。不先判
+    type 就查表，撞的是一个不提参数名的 TypeError。"""
 
     class _Bad(Tool):
-        async def execute(self, thing: Annotated[int, {'unit': 'ms'}]) -> ToolResult:
+        async def execute(self, thing: Annotated[int, {'unit': 'ms'}] | None) -> ToolResult:
             return ToolResult(output='')
 
     with pytest.raises(ConfigError) as excinfo:
         _ = _Bad().schema
     assert 'thing' in str(excinfo.value)
+
+
+def test_a_quoted_forward_reference_is_resolved():
+    """PEP 563 已经把标注字符串化，作者再手写引号就是两层。判成「标注不受支持」会拒掉一个本来
+    解析得出 str 的工具，而消息读作「标注是 "'str'"」，作者看不出问题在哪。
+
+    那对引号就是本例的载荷，而 UP037 会把它自动改掉——本仓不写引号，工具作者的仓库不一定。
+    """
+
+    class _Quoted(Tool):
+        async def execute(self, text: 'str') -> ToolResult:  # noqa: UP037
+            return ToolResult(output=text)
+
+    assert _Quoted().schema['parameters']['properties'] == {'text': {'type': 'string'}}
 
 
 def test_a_parameter_without_an_annotation_is_rejected_naming_the_parameter():
@@ -430,6 +658,19 @@ def test_an_unresolvable_annotation_is_rejected_naming_the_parameter():
     with pytest.raises(ConfigError) as excinfo:
         _ = _Bad().schema
     assert 'thing' in str(excinfo.value)
+
+
+def test_a_type_checking_only_annotation_is_rejected_naming_the_parameter():
+    """`if TYPE_CHECKING:` 块在运行时不执行，而反射在读 schema 时真的求值标注。这是合法作者最
+    容易踩进这条分支的方式，所以 next_action 必须指向「把 import 移出 TYPE_CHECKING」。"""
+
+    class _Deferred(Tool):
+        async def execute(self, amount: Decimal) -> ToolResult:
+            return ToolResult(output='')
+
+    with pytest.raises(ConfigError) as excinfo:
+        _ = _Deferred().schema
+    assert 'amount' in str(excinfo.value)
 
 
 def test_an_unresolvable_return_annotation_does_not_block_schema_generation():
