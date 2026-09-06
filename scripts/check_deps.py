@@ -1,13 +1,21 @@
 """校验 spec §3.2 的依赖方向规则。
 
-实现三条检查，编号与 spec §3.2 一致：
+编号与 spec §3.2 一致；每条规则都是「只允许依赖 kernel」的一个方向：
 
 1. kernel 不得 import surface（cli / server / runner）或 backend。
-2. surface 之间互不依赖。
-3. backend 之间互不依赖。
+2. surface 之间互不依赖，且 surface 不得 import backend。后半条挡的是发布形态：
+   `pip install syndica` = kernel + CLI + **零重依赖**（spec §3.3），CLI 里一句
+   `from syndica.backends.llm_openai import …` 就把这条承诺推翻，而它看起来完全无害。
+3. backend 之间互不依赖，且 backend 不得 import surface。
 
-规则 3 的另一半「backend 不得 import surface」不在本校验器范围内。
 相对导入先按导入方所在的包解析成绝对模块路径，再套用以上规则。
+
+两处已知盲区：动态导入（`importlib.import_module('syndica.backends.x')`）看不见；
+模块级单段导入（`import syndica`）被 `len(parts) >= 2` 过滤掉，它引不进任何组件。
+
+源文件一律按 utf-8 读。**不能省掉 `encoding=`**：不带它时 `Path.read_text()` 按 locale 解码，
+C locale（CI 容器的默认值之一）下遇到带中文的源文件直接 UnicodeDecodeError，校验器以非零退出、
+表现为一次与依赖方向毫无关系的构建失败。
 """
 
 from __future__ import annotations
@@ -105,6 +113,19 @@ def _violation(rel: Path, owner: tuple[str, ...], imported: tuple[str, ...]) -> 
             f'{rel}: surface {owner_top!r} imports surface {imported_top!r}. '
             f'surface 之间必须互不依赖（spec §3.2 规则 2）。'
             f' 把共用逻辑下沉到 kernel。'
+        )
+    if owner_top in SURFACES and imported_top == BACKENDS:
+        return (
+            f'{rel}: surface {owner_top!r} imports {".".join(imported)!r}. '
+            f'surface 只允许依赖 kernel（spec §3.2 规则 2）。'
+            f' 改为依赖 kernel 里的 Protocol，由宿主装配层注入 backend 实现；'
+            f' surface 直接 import backend 会让 pip install syndica 拖进重依赖（spec §3.3）。'
+        )
+    if owner_top == BACKENDS and imported_top in SURFACES:
+        return (
+            f'{rel}: backend {".".join(owner)!r} imports surface {imported_top!r}. '
+            f'backend 只允许依赖 kernel（spec §3.2 规则 3）。'
+            f' 把 backend 需要的类型与入口下沉到 kernel，由 surface 单向依赖它。'
         )
     if len(owner) == 2 and len(imported) == 2 and owner_top == BACKENDS == imported_top:
         if owner[1] != imported[1]:

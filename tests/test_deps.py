@@ -1,18 +1,30 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
 CHECKER = REPO_ROOT / 'scripts' / 'check_deps.py'
+# 关掉 PEP 538 的 C locale 强制与 PEP 540 的 UTF-8 模式，只剩 locale 决定默认编码。缺任何一个，
+# 解释器都会替你把默认编码修正回 UTF-8，于是这个环境测不出「忘了写 encoding=」。
+C_LOCALE = {
+    'LC_ALL': 'C',
+    'LANG': 'C',
+    'PYTHONCOERCECLOCALE': '0',
+    'PYTHONUTF8': '0',
+}
 
 
-def _run_checker(*args: str) -> 'subprocess.CompletedProcess[str]':
+def _run_checker(
+    *args: str, env: dict[str, str] | None = None
+) -> 'subprocess.CompletedProcess[str]':
     # cwd 固定到仓库根：不传 --root 时校验器默认扫 'src'，那是相对路径。
     return subprocess.run(
         [sys.executable, str(CHECKER), *args],
         capture_output=True,
         text=True,
         cwd=REPO_ROOT,
+        env=None if env is None else {**os.environ, **env},
     )
 
 
@@ -113,3 +125,47 @@ def test_relative_import_inside_own_package_is_allowed(tmp_path):
     (module.parent / 'cli.py').write_text('')
     result = _run_checker('--root', str(tmp_path / 'src'))
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_surface_importing_a_backend_is_caught(tmp_path):
+    """surface 只允许依赖 kernel（spec §3.2 规则 2）。这条挡的是发布形态：`pip install syndica`
+    承诺 kernel + CLI + 零重依赖，CLI 里一句 import backend 就推翻它，而它看起来完全无害。"""
+    module = tmp_path / 'src' / 'syndica' / 'cli' / 'main.py'
+    module.parent.mkdir(parents=True)
+    module.write_text('from syndica.backends.llm_openai import Client\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert 'cli/main.py' in result.stdout
+    assert 'backends.llm_openai' in result.stdout
+
+
+def test_backend_importing_a_surface_is_caught(tmp_path):
+    """backend 只允许依赖 kernel（spec §3.2 规则 3）。"""
+    module = tmp_path / 'src' / 'syndica' / 'backends' / 'alpha' / 'client.py'
+    module.parent.mkdir(parents=True)
+    module.write_text('from syndica.cli import main\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert 'backends/alpha/client.py' in result.stdout
+    assert 'cli' in result.stdout
+
+
+def test_a_backend_may_import_its_own_sibling_module(tmp_path):
+    """规则 3 只禁跨 backend 与 backend→surface；一个 backend 内部的模块必须放行。"""
+    module = tmp_path / 'src' / 'syndica' / 'backends' / 'alpha' / 'client.py'
+    module.parent.mkdir(parents=True)
+    module.write_text('from syndica.backends.alpha.auth import token\n')
+    (module.parent / 'auth.py').write_text('')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_sources_are_read_as_utf_8_regardless_of_locale(tmp_path):
+    """本仓每个模块都带中文。不写 `encoding='utf-8'` 时 `Path.read_text()` 按 locale 解码，C
+    locale 下当场 UnicodeDecodeError——校验器非零退出，表现为一次与依赖方向毫无关系的构建失败。"""
+    module = tmp_path / 'src' / 'syndica' / 'kernel' / 'chinese.py'
+    module.parent.mkdir(parents=True)
+    module.write_text('# 中文注释：locale 是 C 时按 ASCII 解码会当场失败\n', encoding='utf-8')
+    result = _run_checker('--root', str(tmp_path / 'src'), env=C_LOCALE)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'UnicodeDecodeError' not in result.stderr
