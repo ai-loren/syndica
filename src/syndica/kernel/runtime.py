@@ -40,7 +40,7 @@ from typing import Any
 from syndica.kernel.agent import BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
 from syndica.kernel.context import Context
-from syndica.kernel.errors import ConfigError
+from syndica.kernel.errors import ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
 from syndica.kernel.local_table import LocalAgentTable
@@ -64,8 +64,8 @@ _TERMINAL_STATUS: Mapping[ExitMode, AgentStatus] = MappingProxyType(
 )
 
 
-def _already_shut_down() -> ConfigError:
-    return ConfigError(
+def _already_shut_down() -> ContractViolation:
+    return ContractViolation(
         expected='Runtime 尚未 shutdown，spawn 出来的 Agent 事件仍有订阅者能收到',
         received=(
             'shutdown() 已经跑过：事件总线已关闭，此后 emit 一律静默丢弃，'
@@ -188,9 +188,9 @@ class Runtime:
             raise self._nothing_to_wait_for(agent_id)
         return context
 
-    def _nothing_to_wait_for(self, agent_id: str) -> ConfigError:
+    def _nothing_to_wait_for(self, agent_id: str) -> ContractViolation:
         if self._table.get(agent_id) is not None:
-            return ConfigError(
+            return ContractViolation(
                 expected=f'agent {agent_id!r} 的驱动任务跑过一遍并留下了 Context',
                 received=(
                     '本进程 spawn 过它，但驱动任务没有进入 run：'
@@ -198,7 +198,7 @@ class Runtime:
                 ),
                 next_action='用 find() 读它当前的 status 与 owner；确认它空闲后重新 spawn 一个',
             )
-        return ConfigError(
+        return ContractViolation(
             expected=f'agent {agent_id!r} 由本进程 spawn，且结束后仍留在本进程里',
             received=(
                 f'本进程没有它的运行记录（已知: {sorted(self._contexts)}）：'

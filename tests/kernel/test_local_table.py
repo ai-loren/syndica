@@ -4,7 +4,7 @@ from contextlib import suppress
 
 import pytest
 
-from syndica.kernel.errors import ConfigError
+from syndica.kernel.errors import ContractViolation
 from syndica.kernel.local_table import LocalAgentTable
 
 
@@ -113,7 +113,7 @@ def test_put_rejects_an_agent_id_that_is_already_present():
     table: LocalAgentTable[_FakeAgent] = LocalAgentTable()
     first = _FakeAgent('w1')
     table.put('a1', first)
-    with pytest.raises(ConfigError) as excinfo:
+    with pytest.raises(ContractViolation) as excinfo:
         table.put('a1', _FakeAgent('w2'))
     assert table.get('a1') is first
     assert 'a1' in str(excinfo.value)
@@ -124,7 +124,7 @@ def test_put_rejects_a_duplicate_even_when_the_agent_is_the_same_object():
     table: LocalAgentTable[_FakeAgent] = LocalAgentTable()
     agent = _FakeAgent('w1')
     table.put('a1', agent)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         table.put('a1', agent)
     assert table.get('a1') is agent
 
@@ -134,7 +134,7 @@ async def test_rejected_put_leaves_the_stored_pair_untouched():
     agent = _FakeAgent('w1')
     task = asyncio.create_task(_noop())
     table.put('a1', agent, task)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         table.put('a1', _FakeAgent('w2'))
     assert table.get('a1') is agent
     assert table.get_task('a1') is task
@@ -148,7 +148,7 @@ async def test_put_rejects_a_duplicate_even_when_a_task_is_supplied(
     agent = _FakeAgent('w1')
     task = running()
     table.put('a1', agent, task)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         table.put('a1', _FakeAgent('w2'), running())
     assert table.get('a1') is agent
     assert table.get_task('a1') is task
@@ -157,7 +157,7 @@ async def test_put_rejects_a_duplicate_even_when_a_task_is_supplied(
 async def test_set_task_rejects_an_agent_id_with_no_agent():
     table: LocalAgentTable[_FakeAgent] = LocalAgentTable()
     task = asyncio.create_task(_noop())
-    with pytest.raises(ConfigError) as excinfo:
+    with pytest.raises(ContractViolation) as excinfo:
         table.set_task('a1', task)
     assert table.get_task('a1') is None
     assert table.agent_ids() == []
@@ -172,7 +172,7 @@ async def test_set_task_rejects_replacing_a_task_that_is_still_running(
     table.put('a1', _FakeAgent('w1'))
     first = running()
     table.set_task('a1', first)
-    with pytest.raises(ConfigError) as excinfo:
+    with pytest.raises(ContractViolation) as excinfo:
         table.set_task('a1', running())
     assert table.get_task('a1') is first
     assert 'get_task' in excinfo.value.next_action

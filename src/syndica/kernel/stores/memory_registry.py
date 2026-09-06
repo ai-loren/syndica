@@ -6,7 +6,7 @@ import copy
 from typing import Any
 
 from syndica.kernel.agent_types import AgentInfo, AgentStatus
-from syndica.kernel.errors import ConfigError
+from syndica.kernel.errors import ContractViolation
 from syndica.kernel.protocols.registry import (
     UPDATE_PROTECTED_FIELD_OWNERS,
     UPDATE_PROTECTED_FIELDS,
@@ -22,14 +22,14 @@ class InMemoryAgentRegistry:
 
     async def register(self, info: AgentInfo) -> None:
         if info.agent_id in self._infos:
-            raise ConfigError(
+            raise ContractViolation(
                 expected=f'agent_id {info.agent_id!r} 尚未注册',
                 received='该 agent_id 已存在于注册表',
                 next_action='换一个 agent_id，或先 unregister 旧条目',
             )
         parent = self._infos.get(info.parent_id) if info.parent_id is not None else None
         if info.parent_id is not None and parent is None:
-            raise ConfigError(
+            raise ContractViolation(
                 expected=f'parent_id {info.parent_id!r} 已在注册表中',
                 received='注册表中不存在该父条目，父→子索引无处可写',
                 next_action='先 register 父 Agent 再注册子 Agent，或把 parent_id 置为 None',
@@ -54,7 +54,7 @@ class InMemoryAgentRegistry:
     async def update(self, agent_id: str, **fields: Any) -> None:
         info = self._infos.get(agent_id)
         if info is None:
-            raise ConfigError(
+            raise ContractViolation(
                 expected=f'agent_id {agent_id!r} 已注册',
                 received='注册表中不存在该条目',
                 next_action='先 register，或检查 agent_id 是否拼错',
@@ -63,13 +63,13 @@ class InMemoryAgentRegistry:
         for key in fields:
             if key in UPDATE_PROTECTED_FIELDS:
                 owner = UPDATE_PROTECTED_FIELD_OWNERS.get(key, '注册表为该字段提供的专用操作')
-                raise ConfigError(
+                raise ContractViolation(
                     expected=f'update 只写单一写者拥有的字段: {sorted(UPDATE_WRITABLE_FIELDS)}',
                     received=f'收到受保护字段 {key!r}，它另有写入者，无条件写会覆盖掉对方的写入',
                     next_action=f'改用 {owner}',
                 )
             if key not in UPDATE_WRITABLE_FIELDS:
-                raise ConfigError(
+                raise ContractViolation(
                     expected=f'update 只写单一写者拥有的字段: {sorted(UPDATE_WRITABLE_FIELDS)}',
                     received=f'{key!r} 既不可写也不在受保护字段中，AgentInfo 上没有这个字段',
                     next_action=(

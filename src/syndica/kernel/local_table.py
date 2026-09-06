@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from typing import Generic, TypeVar
 
-from syndica.kernel.errors import ConfigError
+from syndica.kernel.errors import ContractViolation
 
 __all__ = ['LocalAgentTable']
 
@@ -31,7 +31,7 @@ class LocalAgentTable(Generic[AgentT]):
     def put(self, agent_id: str, agent: AgentT, task: asyncio.Task[None] | None = None) -> None:
         """写入新条目。agent_id 已存在时抛异常，与 `AgentRegistry.register` 同一前提。"""
         if agent_id in self._agents:
-            raise ConfigError(
+            raise ContractViolation(
                 expected=f'agent_id {agent_id!r} 尚未在本表中',
                 received=(
                     '该 agent_id 已有 Agent 实例：覆写会让 slot 里的实例与任务描述两个不同的'
@@ -49,7 +49,7 @@ class LocalAgentTable(Generic[AgentT]):
     def set_task(self, agent_id: str, task: asyncio.Task[None]) -> None:
         """挂上驱动该 Agent 的任务。已有未结束的任务时抛异常；替换已结束的任务是重新激活。"""
         if agent_id not in self._agents:
-            raise ConfigError(
+            raise ContractViolation(
                 expected=f'agent_id {agent_id!r} 已经 put 过 Agent 实例',
                 received=(
                     '本表没有该条目：agent_ids() 只列 Agent 实例，挂在它之外的任务 teardown'
@@ -59,7 +59,7 @@ class LocalAgentTable(Generic[AgentT]):
             )
         existing = self._tasks.get(agent_id)
         if existing is not None and not existing.done():
-            raise ConfigError(
+            raise ContractViolation(
                 expected=f'agent_id {agent_id!r} 没有未结束的任务',
                 received='该条目已有未结束的任务：替换它就失去了取消它的唯一句柄',
                 next_action=(

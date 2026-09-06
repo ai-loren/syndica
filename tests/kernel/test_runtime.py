@@ -13,7 +13,7 @@ import pytest
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
 from syndica.kernel.context import StopReason, ToolCall
-from syndica.kernel.errors import ConfigError
+from syndica.kernel.errors import ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
@@ -218,7 +218,7 @@ async def test_spawn_files_each_child_under_its_own_parent():
 
 async def test_spawn_under_an_unknown_parent_leaves_no_half_built_agent_behind():
     runtime = Runtime()
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         await runtime.spawn(_factory(_done()), query='go', parent_id='nope')
     assert runtime._table.agent_ids() == []
     assert runtime._contexts == {}
@@ -288,7 +288,7 @@ async def test_each_exit_mode_records_its_own_pair_of_transitions():
     runtime = Runtime(registry=registry)
     modes = [ExitMode.EXIT, ExitMode.IDLE, ExitMode.ZOMBIE]
     ids = [await runtime.spawn(_factory(_done()), query='go', exit_mode=mode) for mode in modes]
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         await runtime.wait(ids[0])
     await runtime.wait(ids[1])
     await runtime.wait(ids[2])
@@ -383,7 +383,7 @@ async def test_exit_mode_reaps_only_its_own_agent_from_every_per_agent_structure
     runtime = Runtime(broker=broker)
     reaped = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.EXIT)
     kept = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.ZOMBIE)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         await runtime.wait(reaped)
     await runtime.wait(kept)
 
@@ -410,7 +410,7 @@ async def test_find_on_unknown_agent_returns_none_without_creating_a_mailbox():
 async def test_wait_on_unknown_agent_raises_actionable_error():
     """裸 KeyError 违反错误三件套，调用方看不出该怎么办。"""
     runtime = Runtime()
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         await runtime.wait('nope')
     await runtime.shutdown()
 
@@ -418,9 +418,9 @@ async def test_wait_on_unknown_agent_raises_actionable_error():
 async def test_wait_tells_a_never_started_drive_apart_from_an_agent_it_never_saw():
     denied = Runtime(registry=_RecordingRegistry(deny=(AgentStatus.IDLE, AgentStatus.RUNNING)))
     never_started = await denied.spawn(_factory(_done()), query='go')
-    with pytest.raises(ConfigError) as started:
+    with pytest.raises(ContractViolation) as started:
         await denied.wait(never_started)
-    with pytest.raises(ConfigError) as unknown:
+    with pytest.raises(ContractViolation) as unknown:
         await denied.wait('nope')
     assert never_started in started.value.expected
     assert started.value.received != unknown.value.received
@@ -473,7 +473,7 @@ async def test_lost_transition_into_running_stops_the_drive_before_it_calls_the_
     runtime = Runtime(registry=registry, broker=broker)
     llm = _done()
     agent_id = await runtime.spawn(_factory(llm), query='go')
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         await runtime.wait(agent_id)
 
     assert llm.calls == []
@@ -493,7 +493,7 @@ async def test_lost_terminal_transition_is_reported_and_exit_still_releases_reso
     broker = InMemoryMessageBroker()
     runtime = Runtime(registry=registry, broker=broker)
     agent_id = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.EXIT)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         await runtime.wait(agent_id)
 
     assert [record.levelname for record in caplog.records] == ['ERROR']
@@ -560,7 +560,7 @@ async def test_an_exit_mode_agent_that_fails_is_reaped_without_its_exception_lea
     assert task.exception() is None
     assert [record.levelname for record in caplog.records] == ['ERROR']
     assert await runtime.find(agent_id) is None
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         await runtime.wait(agent_id)
     await runtime.shutdown()
 
@@ -585,7 +585,7 @@ async def test_shutdown_is_idempotent():
 async def test_spawn_after_shutdown_is_refused_instead_of_dropping_the_new_agents_events():
     runtime = Runtime()
     await runtime.shutdown()
-    with pytest.raises(ConfigError):
+    with pytest.raises(ContractViolation):
         await runtime.spawn(_factory(_done()), query='go')
     assert runtime._table.agent_ids() == []
 
