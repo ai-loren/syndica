@@ -1,7 +1,8 @@
 import copy
 import pickle
+import sys
 from importlib import import_module
-from inspect import getmembers, isclass
+from inspect import Parameter, getmembers, isclass, signature
 from pathlib import Path
 from pkgutil import walk_packages
 from types import ModuleType
@@ -13,6 +14,11 @@ from syndica.kernel.errors import SyndicaError, ToolFatalError
 
 ROUNDTRIPS = [copy.copy, copy.deepcopy, lambda err: pickle.loads(pickle.dumps(err))]
 ROUNDTRIP_IDS = ['copy', 'deepcopy', 'pickle']
+PARTS = {
+    'expected': 'kind=spreadsheet 的处理器唯一',
+    'received': 'syndica-office 与 syndica-sheets 都注册了 mime=xlsx',
+    'next_action': '卸载其中之一，或用更具体的 mime 区分',
+}
 
 
 def _kernel_modules() -> list[ModuleType]:
@@ -23,6 +29,26 @@ def _kernel_modules() -> list[ModuleType]:
     return modules
 
 
+def _classes_in(module: ModuleType) -> set[type]:
+    """模块里的每个类，**包括嵌在类体里的**。
+
+    `getmembers(module, isclass)` 只看模块属性：`class Store: class NotFound(SyndicaError)`
+    这种写法它拿到的是外层 `Store`，内层类被 issubclass 过滤掉，于是覆盖静默漏一个。仓内有四个
+    Store Protocol，这个写法很自然。只下潜本模块定义的类——嵌套子类与外层同模块，而外来类的
+    成员是别人的事。
+    """
+    found: set[type] = set()
+    pending = [obj for _name, obj in getmembers(module, isclass)]
+    while pending:
+        obj = pending.pop()
+        if obj in found:
+            continue
+        found.add(obj)
+        if obj.__module__ == module.__name__:
+            pending.extend(nested for _name, nested in getmembers(obj, isclass))
+    return found
+
+
 def _kernel_error_classes() -> list[type[SyndicaError]]:
     """kernel 里出现的每个异常类，按类名排序。
 
@@ -31,13 +57,64 @@ def _kernel_error_classes() -> list[type[SyndicaError]]:
     """
     found: set[type[SyndicaError]] = set()
     for module in _kernel_modules():
-        for _name, obj in getmembers(module, isclass):
+        for obj in _classes_in(module):
             if issubclass(obj, SyndicaError):
                 found.add(obj)
     return sorted(found, key=lambda cls: cls.__name__)
 
 
+def _probe(error_cls: type[SyndicaError]) -> SyndicaError:
+    """按类自己的签名造一个探针实例：子类额外的**必填**参数用占位串补上。
+
+    守卫要考的是「往返能不能无损」，不是「构造签名有没有多参数」。写死三件套会连合规子类
+    （额外必填参数 + 自己覆写 `__reduce__`）一起拦下，而拦住正确代码的守卫会被人关掉。
+    占位串意味着非 str 的必填参数仍需子类自备默认值。
+    """
+    extra = {
+        name: 'probe'
+        for name, parameter in signature(error_cls).parameters.items()
+        if parameter.default is Parameter.empty
+        and parameter.kind not in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD)
+        and name not in PARTS
+    }
+    return error_cls(**PARTS, **extra)
+
+
 KERNEL_ERROR_CLASSES = _kernel_error_classes()
+
+
+class _ProbeStore:
+    class NotFound(SyndicaError):
+        """探针：嵌在类体里的异常子类。它自身不是 kernel 模块的成员，不进覆盖清单。"""
+
+
+class _KeyedError(SyndicaError):
+    """合规子类：额外必填参数 + 覆写 `__reduce__`，正是 `_rebuild` 的 docstring 要求的形态。"""
+
+    def __init__(self, *, key: str, expected: str, received: str, next_action: str) -> None:
+        super().__init__(expected=expected, received=received, next_action=next_action)
+        self.key = key
+
+    def __reduce__(self) -> tuple[object, ...]:
+        return (
+            _rebuild_keyed,
+            (type(self), self.key, self.expected, self.received, self.next_action),
+            self.__dict__,
+        )
+
+
+class _UnreducedError(SyndicaError):
+    """不合规子类：额外必填参数却沿用基类的 `__reduce__`，重建时必然缺参数。"""
+
+    def __init__(self, *, key: str, expected: str, received: str, next_action: str) -> None:
+        super().__init__(expected=expected, received=received, next_action=next_action)
+        self.key = key
+
+
+def _rebuild_keyed(
+    cls: type[_KeyedError], key: str, expected: str, received: str, next_action: str
+) -> _KeyedError:
+    return cls(key=key, expected=expected, received=received, next_action=next_action)
 
 
 def _module_name_on_disk(path: Path, root: Path) -> str:
@@ -54,6 +131,12 @@ def test_the_walk_imports_every_module_under_the_kernel():
     root = Path(kernel.__path__[0])
     on_disk = {_module_name_on_disk(path, root) for path in root.rglob('*.py')}
     assert {module.__name__ for module in _kernel_modules()} == on_disk
+
+
+def test_discovery_reaches_a_subclass_nested_in_a_class_body():
+    """`Store.NotFound` 这样藏起来的子类不是模块属性。实测它加一个必填参数后 copy / deepcopy /
+    pickle 三条往返全坏，而只看模块属性的枚举让整套测试保持全绿。"""
+    assert _ProbeStore.NotFound in _classes_in(sys.modules[__name__])
 
 
 def test_discovery_covers_every_error_class_present_in_the_kernel():
@@ -118,17 +201,28 @@ def test_non_str_part_is_rejected_with_the_field_name_and_the_type_received(fiel
 @pytest.mark.parametrize('roundtrip', ROUNDTRIPS, ids=ROUNDTRIP_IDS)
 def test_roundtrip_preserves_the_class_and_all_three_parts(roundtrip, error_cls):
     """异常会跨进程边界传递（Store 实现、子进程执行器），copy / pickle 必须无损。"""
-    err = error_cls(
-        expected='kind=spreadsheet 的处理器唯一',
-        received='syndica-office 与 syndica-sheets 都注册了 mime=xlsx',
-        next_action='卸载其中之一，或用更具体的 mime 区分',
-    )
+    err = _probe(error_cls)
     clone = roundtrip(err)
     assert type(clone) is error_cls
     assert clone.expected == err.expected
     assert clone.received == err.received
     assert clone.next_action == err.next_action
     assert str(clone) == str(err)
+
+
+@pytest.mark.parametrize('roundtrip', ROUNDTRIPS, ids=ROUNDTRIP_IDS)
+def test_roundtrip_accepts_a_subclass_that_overrides_reduce_for_its_own_argument(roundtrip):
+    clone = roundtrip(_probe(_KeyedError))
+    assert type(clone) is _KeyedError
+    assert clone.key == 'probe'
+    assert clone.next_action == PARTS['next_action']
+
+
+@pytest.mark.parametrize('roundtrip', ROUNDTRIPS, ids=ROUNDTRIP_IDS)
+def test_roundtrip_still_catches_a_subclass_that_leaves_reduce_alone(roundtrip):
+    """放宽构造方式不等于放宽守卫：额外必填参数没被 `__reduce__` 带上，重建就缺参数。"""
+    with pytest.raises(TypeError):
+        roundtrip(_probe(_UnreducedError))
 
 
 @pytest.mark.parametrize('roundtrip', ROUNDTRIPS, ids=ROUNDTRIP_IDS)

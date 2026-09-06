@@ -15,6 +15,7 @@ from typing import Any
 
 from syndica.kernel.context import ContextBlock, ToolCall
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.llm.base import LLMConfig
 
 __all__ = ['ScriptedLLM', 'ScriptedTurn']
 
@@ -25,21 +26,47 @@ class ScriptedTurn:
     tool_calls: list[ToolCall] = field(default_factory=list[ToolCall])
     raises: BaseException | None = None
 
+    def __post_init__(self) -> None:
+        if self.raises is not None and (self.content is not None or self.tool_calls):
+            raise ConfigError(
+                expected='一轮要么抛异常、要么给回复，raises 与 content / tool_calls 不同时给',
+                received=(
+                    f'raises={type(self.raises).__name__} 同时带了'
+                    f' content={self.content!r}、{len(self.tool_calls)} 个 tool_calls'
+                ),
+                next_action='拆成两轮：一轮 ScriptedTurn(raises=...)，一轮带回复的 ScriptedTurn',
+            )
+
 
 class ScriptedLLM:
     """按序回放预设响应的 LLM 替身。
 
     脚本与返回块之间不共享可变状态：同一个 `ScriptedTurn` 列表可以跨 ScriptedLLM 实例复用，
     消费者改动返回的块改不到脚本。
+
+    `calls` 记的是收到那一刻的**深拷贝**。turn 循环跨轮复用同一个 SP block，记录若存共享对象，
+    「前缀逐轮字节一致」这条前缀缓存性质就退化成恒等断言——重建前缀与递交同一对象无从区分。
+    代价是传进来的块必须可深拷（`extra` 里别放活的连接）。`call_kwargs` 与 `calls` 逐位对应，
+    但只记 kwargs 映射本身，值与调用方共享。
     """
 
-    def __init__(self, script: list[ScriptedTurn]) -> None:
+    def __init__(self, script: list[ScriptedTurn], config: LLMConfig | None = None) -> None:
         self._script = list(script)
         self._index = 0
+        # 默认 context_window 留 None：「窗口未知」是真实状态，编个数字会让压缩判定测到假前提。
+        self._config = (
+            config if config is not None else LLMConfig(provider='scripted', model='scripted')
+        )
         self.calls: list[list[ContextBlock]] = []
+        self.call_kwargs: list[dict[str, Any]] = []
+
+    @property
+    def config(self) -> LLMConfig:
+        return self._config
 
     async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
-        self.calls.append(list(messages))
+        self.calls.append(copy.deepcopy(messages))
+        self.call_kwargs.append(kwargs)
         if self._index >= len(self._script):
             raise ConfigError(
                 expected=f'脚本至少有 {self._index + 1} 轮',
