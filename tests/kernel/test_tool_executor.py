@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -17,7 +18,7 @@ from syndica.kernel.errors import (
     SyndicaError,
     ToolFatalError,
 )
-from syndica.kernel.hooks import HookResult, HooksCenter, Junction
+from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ContextOverflowError
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tool_executor import ToolExecutor
@@ -79,6 +80,46 @@ class _Producer(Tool):
         return self.result
 
 
+class _External(Tool):
+    async def execute(self) -> ToolResult:
+        """返回外部内容。"""
+        return ToolResult(output='<html>', trust=TrustLevel.UNTRUSTED)
+
+
+class _SideEffect(Tool):
+    """记下自己跑过几次，用来区分「工具没跑」与「工具跑完之后才失败」。"""
+
+    def __init__(self) -> None:
+        self.ran = 0
+
+    async def execute(self) -> ToolResult:
+        """写一次，记一次。"""
+        self.ran += 1
+        return ToolResult(output='written')
+
+
+class _ReturnsWrongType(Tool):
+    """违反 execute 的返回契约。
+
+    标注是 Any 而不是 ToolResult：这个工具存在的意义就是返回别的东西，标成 ToolResult 会让类型
+    检查器先于被测守卫报错，于是这条运行时路径永远走不到。
+    """
+
+    def __init__(self, value: Any) -> None:
+        self._value = value
+
+    async def execute(self) -> Any:
+        """交出预置的非 ToolResult 值。"""
+        return self._value
+
+
+class _HostileStr(Exception):
+    """`__str__` 自己抛异常，模拟第三方异常里惰性求值的属性。"""
+
+    def __str__(self) -> str:
+        raise ValueError('__str__ is broken')
+
+
 _PROPAGATING: list[SyndicaError] = [
     ToolFatalError(expected='目标可写', received='路径不存在', next_action='换一个可写路径'),
     ConfigError(expected='schema 含 parameters', received='缺 parameters', next_action='补上它'),
@@ -92,6 +133,19 @@ def _executor() -> tuple[ToolExecutor, HooksCenter]:
     center = HooksCenter()
     tools: dict[str, Tool] = {'Echo': _Echo(), 'Boom': _Boom(), 'Fatal': _Fatal()}
     return ToolExecutor(tools=tools, hooks=center), center
+
+
+def _executor_with(
+    tools: dict[str, Tool],
+    pre: HookCallback | None = None,
+    post: HookCallback | None = None,
+) -> ToolExecutor:
+    center = HooksCenter()
+    if pre is not None:
+        center.register(Junction.PRE_TOOL_USE, pre)
+    if post is not None:
+        center.register(Junction.POST_TOOL_USE, post)
+    return ToolExecutor(tools=tools, hooks=center)
 
 
 def _artifact(ref_id: str = 'a1') -> ArtifactRef:
@@ -111,6 +165,24 @@ def _text(block: ContextBlock) -> str:
     return content
 
 
+# 三段的分隔符带前导空格：executor 自撰的消息是单行，而 `{exc}` 可能嵌进一份换行分隔的三件套
+# （SyndicaError.message），不带空格会匹配到被嵌的那一份。
+_THREE_PART: tuple[str, ...] = ('期望: ', ' 实际: ', ' 下一步: ')
+# 逐字写死而不是读 tool.parameters：期望值与被测对象同源时，schema 缺一半会让期望值跟着缩水。
+# 键序一并钉住——这份 schema 进模型请求的字节前缀（spec §5.2）。
+_ECHO_SCHEMA = (
+    "{'type': 'object', 'properties': {'text': {'type': 'string'}}, 'required': ['text']}"
+)
+_SIDE_EFFECTS_DENIED = '没有产生任何副作用'
+_SIDE_EFFECTS_UNKNOWN = '是否已经产生副作用未知'
+
+
+def _assert_three_part(content: str) -> None:
+    positions = [content.find(mark) for mark in _THREE_PART]
+    assert -1 not in positions
+    assert positions == sorted(positions)
+
+
 async def test_result_becomes_tool_block_with_matching_id():
     executor, _ = _executor()
     ctx = Context()
@@ -121,6 +193,8 @@ async def test_result_becomes_tool_block_with_matching_id():
     assert block.role == 'tool'
     assert block.tool_call_id == 'c1'
     assert block.content == 'hi'
+    # 既是结果又声明调用的 tool block 会往此后每一次请求里注入一个幽灵声明。
+    assert block.tool_calls == []
 
 
 async def test_blocks_are_appended_after_the_existing_trajectory():
@@ -144,7 +218,6 @@ async def test_an_empty_batch_appends_nothing():
 
 
 async def test_each_id_is_paired_with_its_own_result():
-    """id 取错、固定成第一个、或结果顺序反了，下一轮请求就把结果配到别的调用上。"""
     executor, _ = _executor()
     ctx = Context()
     await executor.execute_tool_calls(
@@ -169,30 +242,31 @@ async def test_a_list_output_reaches_the_block_unchanged():
     assert ctx.current_traj[-1].content == ['fetched', {'kind': 'image'}]
 
 
-async def test_the_block_copies_the_results_artifacts_instead_of_sharing_the_list():
-    artifact = _artifact()
-    produced = ToolResult(output='ok', artifacts=[artifact])
+async def test_the_block_copies_the_results_artifacts_in_order_instead_of_sharing_the_list():
+    first, second = _artifact('a1'), _artifact('a2')
+    produced = ToolResult(output='ok', artifacts=[first, second])
     executor = ToolExecutor(tools={'Produce': _Producer(produced)}, hooks=HooksCenter())
     ctx = Context()
     await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Produce', arguments='{}')])
     block = ctx.current_traj[-1]
-    assert block.artifacts == [artifact]
-    block.artifacts.append(_artifact('a2'))
-    assert produced.artifacts == [artifact]
+    assert block.artifacts == [first, second]
+    block.artifacts.append(_artifact('a3'))
+    assert produced.artifacts == [first, second]
 
 
-async def test_result_meta_reaches_extra_and_never_the_content():
+async def test_result_meta_reaches_extra_in_key_order_and_never_the_content():
     """`output` 给模型、`meta` 给工作流代码，两者不得合并（Task 11）。block 会被持久化并活过这个
-    ToolResult，所以拷一份而不是共享。"""
-    produced = ToolResult(output='for model', meta={'rows': 3})
+    ToolResult，所以拷一份而不是共享；`==` 对 dict 键序无感，键序要单独断言。"""
+    produced = ToolResult(output='for model', meta={'rows': 3, 'cached': True})
     executor = ToolExecutor(tools={'Produce': _Producer(produced)}, hooks=HooksCenter())
     ctx = Context()
     await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Produce', arguments='{}')])
     block = ctx.current_traj[-1]
     assert block.content == 'for model'
-    assert block.extra == {'tool_meta': {'rows': 3}}
+    assert block.extra == {'tool_meta': {'rows': 3, 'cached': True}}
+    assert list(block.extra['tool_meta']) == ['rows', 'cached']
     block.extra['tool_meta']['rows'] = 99
-    assert produced.meta == {'rows': 3}
+    assert produced.meta == {'rows': 3, 'cached': True}
 
 
 async def test_a_result_without_meta_leaves_extra_empty():
@@ -214,11 +288,6 @@ async def test_a_trusted_result_leaves_the_block_trusted():
 
 
 async def test_untrusted_result_marks_the_tool_block():
-    class _External(Tool):
-        async def execute(self) -> ToolResult:
-            """返回外部内容。"""
-            return ToolResult(output='<html>', trust=TrustLevel.UNTRUSTED)
-
     executor = ToolExecutor(tools={'External': _External()}, hooks=HooksCenter())
     ctx = Context()
     await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='External', arguments='{}')])
@@ -247,7 +316,8 @@ async def test_malformed_arguments_yield_actionable_tool_block():
     assert block.tool_call_id == 'c1'
     content = _text(block)
     assert '{not json' in content
-    assert 'text' in content
+    # 整份 schema：少了 required，模型就失去「哪些参数是必填」这唯一一条能自我纠正的信息。
+    assert _ECHO_SCHEMA in content
 
 
 @pytest.mark.parametrize(
@@ -262,7 +332,7 @@ async def test_arguments_that_parse_to_a_non_object_yield_actionable_tool_block(
     assert block.tool_call_id == 'c1'
     content = _text(block)
     assert arguments in content
-    assert 'text' in content
+    assert _ECHO_SCHEMA in content
 
 
 @pytest.mark.parametrize('arguments', ['', '   ', '{}'], ids=['empty', 'blank', 'empty-object'])
@@ -381,6 +451,97 @@ async def test_the_aborted_calls_block_does_not_invite_a_retry():
     assert 'ToolFatalError' in aborted
     assert 'c2' in aborted
     assert '重试' not in aborted
+
+
+async def test_the_failed_call_and_the_calls_that_never_ran_get_non_interchangeable_blocks():
+    """轨迹会被持久化，resume 与读轨迹的父 Agent 按这两条消息决定要不要重做：把失败的那个标成
+    「从未执行」是对可能已经落盘的副作用撒谎，反过来也一样。"""
+    executor, _ = _executor()
+    ctx = Context()
+    with pytest.raises(ToolFatalError):
+        await executor.execute_tool_calls(ctx, _aborting_batch())
+    blocks = [block for block in ctx.current_traj if block.role == 'tool']
+    aborted = _text(blocks[1])
+    assert _SIDE_EFFECTS_UNKNOWN in aborted
+    assert _SIDE_EFFECTS_DENIED not in aborted
+    for block in blocks[2:]:
+        never_ran = _text(block)
+        assert _SIDE_EFFECTS_DENIED in never_ran
+        assert _SIDE_EFFECTS_UNKNOWN not in never_ran
+
+
+async def test_a_post_hook_raising_after_the_tool_ran_does_not_deny_the_side_effects():
+    tool = _SideEffect()
+    boom = RuntimeError('audit sink unreachable')
+
+    async def explodes(**_: Any) -> HookResult:
+        raise boom
+
+    executor = _executor_with({'Write': tool}, post=explodes)
+    ctx = Context()
+    calls = [
+        ToolCall(id='c1', name='Write', arguments='{}'),
+        ToolCall(id='c2', name='Write', arguments='{}'),
+    ]
+    with pytest.raises(RuntimeError) as excinfo:
+        await executor.execute_tool_calls(ctx, calls)
+    assert excinfo.value is boom
+    assert tool.ran == 1
+    blocks = [block for block in ctx.current_traj if block.role == 'tool']
+    assert [block.tool_call_id for block in blocks] == ['c1', 'c2']
+    assert _SIDE_EFFECTS_DENIED not in _text(blocks[0])
+    assert _SIDE_EFFECTS_DENIED in _text(blocks[1])
+
+
+@pytest.mark.parametrize(
+    'interrupt',
+    [asyncio.CancelledError(), KeyboardInterrupt()],
+    ids=['cancelled', 'keyboard-interrupt'],
+)
+async def test_an_interrupt_mid_batch_propagates_without_writing_any_further_block(interrupt):
+    """BaseException 不补配对：取消不该在展开的路上干实质工作。代价是这一批留下的 block 少于
+    assistant 声明的调用数，这份轨迹持久化后要由 resume 侧收拾。"""
+    executor = ToolExecutor(
+        tools={'Echo': _Echo(), 'Stop': _Raising(interrupt)}, hooks=HooksCenter()
+    )
+    ctx = Context()
+    calls = [
+        ToolCall(id='c1', name='Echo', arguments='{"text":"a"}'),
+        ToolCall(id='c2', name='Stop', arguments='{}'),
+        ToolCall(id='c3', name='Echo', arguments='{"text":"c"}'),
+        ToolCall(id='c4', name='Echo', arguments='{"text":"d"}'),
+    ]
+    with pytest.raises(type(interrupt)) as excinfo:
+        await executor.execute_tool_calls(ctx, calls)
+    assert excinfo.value is interrupt
+    assert [block.tool_call_id for block in ctx.current_traj] == ['c1']
+
+
+async def test_an_exception_whose_str_raises_still_leaves_one_block_per_call():
+    executor, center = _executor()
+    boom = _HostileStr()
+
+    async def explodes(**kwargs: Any) -> HookResult:
+        if kwargs['tool_call'].id == 'c2':
+            raise boom
+        return HookResult()
+
+    center.register(Junction.PRE_TOOL_USE, explodes)
+    ctx = Context()
+    calls = [
+        ToolCall(id='c1', name='Echo', arguments='{"text":"a"}'),
+        ToolCall(id='c2', name='Echo', arguments='{"text":"b"}'),
+        ToolCall(id='c3', name='Echo', arguments='{"text":"c"}'),
+        ToolCall(id='c4', name='Echo', arguments='{"text":"d"}'),
+    ]
+    with pytest.raises(_HostileStr) as excinfo:
+        await executor.execute_tool_calls(ctx, calls)
+    assert excinfo.value is boom
+    blocks = [block for block in ctx.current_traj if block.role == 'tool']
+    assert [block.tool_call_id for block in blocks] == ['c1', 'c2', 'c3', 'c4']
+    aborted = _text(blocks[1])
+    _assert_three_part(aborted)
+    assert '_HostileStr' in aborted
 
 
 async def test_hooks_do_not_run_for_a_call_that_never_ran():
@@ -619,7 +780,10 @@ async def test_a_skip_result_that_is_not_a_tool_result_becomes_the_output():
     await executor.execute_tool_calls(
         ctx, [ToolCall(id='c1', name='Echo', arguments='{"text":"hi"}')]
     )
-    assert ctx.current_traj[-1].content == 'denied by policy'
+    block = ctx.current_traj[-1]
+    assert block.content == 'denied by policy'
+    # 裸值上没有标记可读，而 skip 的替代结果常来自缓存命中或旁路读取，都可能是外部内容。
+    assert block.trust is TrustLevel.UNTRUSTED
 
 
 async def test_a_skip_without_a_result_reports_that_nothing_ran():
@@ -711,6 +875,37 @@ async def test_a_post_tool_use_hook_rewriting_result_to_a_non_result_is_rejected
     assert [block.tool_call_id for block in ctx.current_traj] == ['c1']
 
 
+@pytest.mark.parametrize('returned', [None, 'plain string', 42], ids=['none', 'str', 'int'])
+async def test_a_tool_returning_a_non_result_blames_the_tool_and_not_an_absent_hook(returned):
+    """点名 post_tool_use 会把零 hook 的调用方指去修一个不存在的 hook，而缺陷在工具里。"""
+    executor = ToolExecutor(tools={'Broken': _ReturnsWrongType(returned)}, hooks=HooksCenter())
+    ctx = Context()
+    with pytest.raises(ContractViolation) as excinfo:
+        await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Broken', arguments='{}')])
+    error = excinfo.value
+    assert '_ReturnsWrongType' in error.expected
+    assert Junction.POST_TOOL_USE.value not in error.message
+    assert [block.tool_call_id for block in ctx.current_traj] == ['c1']
+
+
+async def test_tightening_a_rewritten_result_copies_it_instead_of_mutating_the_hooks_object():
+    artifact = _artifact()
+    summary = ToolResult(output='summary of <html>', meta={'rows': 3}, artifacts=[artifact])
+
+    async def summarise(**_: Any) -> HookResult:
+        return HookResult(modified={'result': summary})
+
+    executor = _executor_with({'External': _External()}, post=summarise)
+    ctx = Context()
+    await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='External', arguments='{}')])
+    block = ctx.current_traj[-1]
+    assert block.content == 'summary of <html>'
+    assert block.trust is TrustLevel.UNTRUSTED
+    assert block.artifacts == [artifact]
+    assert block.extra == {'tool_meta': {'rows': 3}}
+    assert summary.trust is TrustLevel.TRUSTED
+
+
 async def test_hooks_do_not_run_for_an_unknown_tool():
     """PRE_TOOL_USE 的 `tool` kwarg 没有可填的值——工具根本不存在。"""
     executor, center = _executor()
@@ -743,3 +938,150 @@ async def test_hooks_do_not_run_for_malformed_arguments():
     await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Echo', arguments='{not json')])
     assert seen == []
     assert [block.tool_call_id for block in ctx.current_traj] == ['c1']
+
+
+def _trusted_tool() -> Tool:
+    return _Producer(ToolResult(output='ok'))
+
+
+async def _observe_only(**_: Any) -> HookResult:
+    return HookResult()
+
+
+async def _summarise_without_carrying_the_mark(**_: Any) -> HookResult:
+    """最自然的截断 / 摘要 hook：只写 output，于是 trust 落回默认值。"""
+    return HookResult(modified={'result': ToolResult(output='summary of <html>')})
+
+
+async def _rewrite_to_untrusted(**_: Any) -> HookResult:
+    return HookResult(modified={'result': ToolResult(output='<html>', trust=TrustLevel.UNTRUSTED)})
+
+
+async def _rewrite_to_trusted(**_: Any) -> HookResult:
+    return HookResult(modified={'result': ToolResult(output='rewritten')})
+
+
+async def _skip_with_untrusted_result(**_: Any) -> HookResult:
+    return HookResult(skip=True, result=ToolResult(output='<html>', trust=TrustLevel.UNTRUSTED))
+
+
+async def _skip_with_trusted_result(**_: Any) -> HookResult:
+    return HookResult(skip=True, result=ToolResult(output='from cache'))
+
+
+async def _skip_with_a_bare_string(**_: Any) -> HookResult:
+    return HookResult(skip=True, result='<html>fetched from cache</html>')
+
+
+async def _skip_without_a_result(**_: Any) -> HookResult:
+    return HookResult(skip=True)
+
+
+_TRUST_PATHS: list[tuple[Tool, HookCallback | None, HookCallback | None, TrustLevel]] = [
+    (_trusted_tool(), None, None, TrustLevel.TRUSTED),
+    (_External(), None, None, TrustLevel.UNTRUSTED),
+    (_Boom(), None, None, TrustLevel.TRUSTED),
+    (_External(), None, _observe_only, TrustLevel.UNTRUSTED),
+    (_External(), None, _summarise_without_carrying_the_mark, TrustLevel.UNTRUSTED),
+    (_trusted_tool(), None, _summarise_without_carrying_the_mark, TrustLevel.TRUSTED),
+    (_trusted_tool(), None, _rewrite_to_trusted, TrustLevel.TRUSTED),
+    (_trusted_tool(), None, _rewrite_to_untrusted, TrustLevel.UNTRUSTED),
+    (_trusted_tool(), _skip_with_untrusted_result, None, TrustLevel.UNTRUSTED),
+    (_trusted_tool(), _skip_with_trusted_result, None, TrustLevel.TRUSTED),
+    (_trusted_tool(), _skip_with_a_bare_string, None, TrustLevel.UNTRUSTED),
+    (_trusted_tool(), _skip_without_a_result, None, TrustLevel.TRUSTED),
+]
+_TRUST_IDS: list[str] = [
+    'tool-trusted',
+    'tool-untrusted',
+    'tool-raised',
+    'post-has-no-opinion',
+    'post-summarises-without-the-mark',
+    'post-summarises-a-trusted-result',
+    'post-rewrites-a-trusted-result',
+    'post-adds-the-mark',
+    'pre-skip-untrusted-result',
+    'pre-skip-trusted-result',
+    'pre-skip-bare-string',
+    'pre-skip-no-result',
+]
+
+
+@pytest.mark.parametrize(('tool', 'pre', 'post', 'expected'), _TRUST_PATHS, ids=_TRUST_IDS)
+async def test_every_result_supplying_path_pins_the_blocks_trust(tool, pre, post, expected):
+    """标记必须随衍生内容存活（spec §12.2）：hook 只能收紧，不能放松。ToolResult 上没有任何东西
+    能区分「消毒之后刻意提升」与「忘了带 trust=」，而后者让未标记的不可信内容进模型上下文。"""
+    executor = _executor_with({'T': tool}, pre=pre, post=post)
+    ctx = Context()
+    await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='T', arguments='{}')])
+    assert ctx.current_traj[-1].trust is expected
+
+
+async def _unknown_tool_blocks() -> list[ContextBlock]:
+    executor, _ = _executor()
+    ctx = Context()
+    await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Nope', arguments='{}')])
+    return ctx.current_traj
+
+
+async def _bad_arguments_blocks() -> list[ContextBlock]:
+    executor, _ = _executor()
+    ctx = Context()
+    await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Echo', arguments='{not json')])
+    return ctx.current_traj
+
+
+async def _tool_raised_blocks() -> list[ContextBlock]:
+    executor, _ = _executor()
+    ctx = Context()
+    await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Boom', arguments='{}')])
+    return ctx.current_traj
+
+
+async def _pre_skip_without_result_blocks() -> list[ContextBlock]:
+    executor = _executor_with({'Echo': _Echo()}, pre=_skip_without_a_result)
+    ctx = Context()
+    await executor.execute_tool_calls(
+        ctx, [ToolCall(id='c1', name='Echo', arguments='{"text":"hi"}')]
+    )
+    return ctx.current_traj
+
+
+async def _aborted_blocks() -> list[ContextBlock]:
+    executor, _ = _executor()
+    ctx = Context()
+    with pytest.raises(ToolFatalError):
+        await executor.execute_tool_calls(ctx, _aborting_batch())
+    return ctx.current_traj[1:2]
+
+
+async def _not_executed_blocks() -> list[ContextBlock]:
+    executor, _ = _executor()
+    ctx = Context()
+    with pytest.raises(ToolFatalError):
+        await executor.execute_tool_calls(ctx, _aborting_batch())
+    return ctx.current_traj[2:]
+
+
+_AUTHORED_BLOCKS = [
+    _unknown_tool_blocks,
+    _bad_arguments_blocks,
+    _tool_raised_blocks,
+    _pre_skip_without_result_blocks,
+    _aborted_blocks,
+    _not_executed_blocks,
+]
+
+
+@pytest.mark.parametrize(
+    'produce', _AUTHORED_BLOCKS, ids=[produce.__name__ for produce in _AUTHORED_BLOCKS]
+)
+async def test_every_block_the_executor_writes_itself_is_a_trusted_three_part_message(produce):
+    """模型是这些消息的第一读者，自我纠正依赖三段结构；内容由 executor 自撰、不来自外部，所以
+    可信，而结果 block 不得声明自己的 tool_calls。"""
+    blocks = await produce()
+    assert blocks
+    for block in blocks:
+        _assert_three_part(_text(block))
+        assert block.trust is TrustLevel.TRUSTED
+        assert block.tool_calls == []
