@@ -17,7 +17,11 @@ __all__ = [
 def _rebuild(
     cls: type[SyndicaError], expected: str, received: str, next_action: str
 ) -> SyndicaError:
-    """按关键字重建异常，供 `SyndicaError.__reduce__` 使用。"""
+    """按关键字重建异常，供 `SyndicaError.__reduce__` 使用。
+
+    只传三件套：给 `__init__` 增加必填参数的子类必须自己覆写 `__reduce__`，否则 copy / pickle
+    往返时重建缺参数。
+    """
     return cls(expected=expected, received=received, next_action=next_action)
 
 
