@@ -18,16 +18,53 @@ from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any, Self
 
-from syndica.kernel.errors import ConfigError
+from syndica.kernel.errors import ConfigError, ContractViolation
 
 __all__ = ['Event', 'EventBus', 'Subscription']
 
 
 @dataclass(frozen=True)
 class Event:
+    """一条事件记录。
+
+    `payload` 必须是**纯数据**：dict / list / str / 数字 / bool / None 及其嵌套，能被
+    `copy.deepcopy` 复制。锁、生成器、模块、文件、`asyncio.Task` 这类活对象不行，`EventBus.emit`
+    会当场抛 `ContractViolation`——事件要能同样地走进程内出口与序列化的 SSE 出口，两边都得能复制它。
+
+    投递出去的事件**只读**：所有订阅者拿到的是同一份快照，改动 payload 就改到了别人的那一份。
+    """
+
     kind: str
     agent_id: str
     payload: dict[str, Any] = field(default_factory=dict[str, Any])
+
+
+def _snapshot(event: Event) -> Event:
+    """事件的独立副本。
+
+    存副本而不是调用方的对象：否则调用方 emit 之后改动 payload 里的嵌套容器就改到了已入队的
+    内容，而序列化的 SSE 出口不会，换出口即行为分叉。
+    """
+    try:
+        return copy.deepcopy(event)
+    except Exception as exc:
+        raise ContractViolation(
+            expected=(
+                'event.payload 是纯数据：dict / list / str / 数字 / bool / None 及其嵌套，可深拷贝'
+            ),
+            received=f'{_why_copying_failed(event.payload, exc)}；事件 kind={event.kind!r}',
+            next_action='把这个值换成可序列化的表示再 emit，例如它的 id、名字或 repr 字符串',
+        ) from exc
+
+
+def _why_copying_failed(payload: dict[str, Any], exc: Exception) -> str:
+    """指出是哪个键拷不动。逐键重试是拿到键名的唯一途径：copy 抛的异常里只有类型名。"""
+    for key, value in payload.items():
+        try:
+            copy.deepcopy(value)
+        except Exception:
+            return f'payload[{key!r}] 是 {type(value).__name__}，深拷贝失败：{exc}'
+    return f'payload 是 {type(payload).__name__}，深拷贝失败：{exc}'
 
 
 class _Buffer:
@@ -45,14 +82,10 @@ class _Buffer:
         self.dropped = 0
 
     def offer(self, event: Event) -> None:
-        """收下一份独立副本；缓冲已满则先挤掉最旧的一条，并记一次丢弃。
-
-        存副本而不是调用方的对象：否则调用方 emit 之后改动 payload 里的嵌套容器就改到了
-        已入队的内容，而序列化的 SSE 出口不会，换出口即行为分叉；两个订阅者之间同理。
-        """
+        """收下一条；缓冲已满则先挤掉最旧的一条，并记一次丢弃。"""
         if len(self._events) == self._capacity:
             self.dropped += 1
-        self._events.append(copy.deepcopy(event))
+        self._events.append(event)
         self._ready.set()
 
     def end(self) -> None:
@@ -94,10 +127,11 @@ class Subscription:
 
     @property
     def dropped(self) -> int:
-        """本订阅溢出丢掉的事件数，单调递增。
+        """本订阅溢出丢掉的事件数，单调递增，退订与总线关闭都不清零。
 
         缓冲满时 emit 丢最旧的一条，既不阻塞也不报错；消费者靠这个数把「什么都没发生」与
-        「我漏了 37 条」区分开——渲染这条流的界面否则只会显示一段没有解释的空白。
+        「我漏了 37 条」区分开——渲染这条流的界面否则只会显示一段没有解释的空白。它只告诉总数、
+        不告诉漏在流的哪个位置，要位置信息得由消费方自己在流里补标记。
         """
         return self._buffer.dropped
 
@@ -149,18 +183,43 @@ class EventBus:
         self._closed = False
 
     async def emit(self, event: Event) -> None:
-        """给每个订阅者投一份独立副本。
+        """把同一份快照投给每个订阅者。
 
-        关闭后与无订阅者时直接丢弃，某个订阅者的缓冲已满时挤掉它最旧的一条：可观测性不得拖
-        垮主流程，所以这里既不抛异常也不阻塞。
+        **不阻塞，也不会因为订阅者读得慢而失败**：可观测性不得拖垮主流程，所以缓冲满了只是挤掉
+        该订阅者最旧的一条并给它的 `dropped` 加一。关闭后与无订阅者时事件直接丢弃。
+
+        `event.payload` 不是纯数据时抛 `ContractViolation`（见 `Event`）：拿不到副本的事件本来
+        就不能既进内存队列又出 SSE，静默降级成一条残缺的可观测记录更糟。拷贝只发生一次、在投递
+        之前，因此要么所有订阅者都收到，要么谁都没收到。
         """
+        # 无订阅者、总线已关闭时也照样拷：否则 payload 合不合约要看当时有没有人在听，一个确定
+        # 的编程错误会退化成只在特定时序下现身的 heisenbug。
+        snapshot = _snapshot(event)
         if self._closed:
             return
+        # 必须先快照订阅者集合：缓冲满时被挤掉的那条事件在 append 里当场回收，它 payload 的
+        # __del__ 于是运行在本循环中途，而 __del__ 里 subscribe / close 会改动 _buffers——直接
+        # 迭代 WeakSet 会撞 RuntimeError: Set changed size during iteration。
         for buffer in list(self._buffers):
-            buffer.offer(event)
+            buffer.offer(snapshot)
+
+    @property
+    def subscriber_count(self) -> int:
+        """当前还在收事件的订阅数。
+
+        兜底回收把「忘了持有 Subscription」变成一次无声的空订阅，这个数是唯一能看见它的地方。
+        """
+        return len(self._buffers)
 
     def subscribe(self) -> Subscription:
         """订阅。**同步注册**：返回时已在收事件，此后 emit 的每一条都不会漏。
+
+        规范写法是 `async with bus.subscribe() as sub:`——退订时机确定，且 `sub` 有名字可以读
+        `dropped`。裸 `async for event in bus.subscribe():` 两样都没有：匿名订阅看不到丢弃数，
+        清理也只能等兜底回收。
+
+        返回的 Subscription 必须一直被引用：放手即停止收事件，且不报错，只有
+        `subscriber_count` 会显示它已经不在了。
 
         总线已关闭时返回一个立刻结束的空订阅，迟到的订阅者不会挂在空缓冲上等一个永不到来的
         事件。

@@ -66,7 +66,7 @@ class SyndicaError(Exception):
 
 
 class ContractViolation(SyndicaError):
-    """Protocol 契约被违反。"""
+    """Protocol 契约或文档化的调用方契约被违反。"""
 
 
 class ConfigError(SyndicaError):

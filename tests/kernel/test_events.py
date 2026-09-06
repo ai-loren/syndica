@@ -1,14 +1,16 @@
 import asyncio
 import dataclasses
 import gc
+import io
+import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import suppress
 from typing import Any
 
 import pytest
 
-from syndica.kernel.errors import ConfigError
+from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import Event, EventBus, Subscription
 
 # 每个等待都设上限：回归应当让用例变红，而不是把 CI 挂住。
@@ -24,6 +26,63 @@ _MAX_PARKED_CPU = 0.005
 
 def _event(kind: str = 'turn_start', **payload: Any) -> Event:
     return Event(kind=kind, agent_id='a1', payload=payload)
+
+
+def _live_generator() -> Iterator[int]:
+    yield 1
+
+
+class _ValueThatRefusesToCopy:
+    """深拷贝失败，且异常消息里不含自己的类型名。"""
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> '_ValueThatRefusesToCopy':
+        raise TypeError('nope')
+
+
+# asyncio.Task 同样拷不动，但它要一个运行中的循环和收尾，由 emit 的其余用例覆盖。
+UNCOPYABLE_PAYLOADS = [
+    pytest.param(threading.Lock, 'lock', id='lock'),
+    pytest.param(_live_generator, 'generator', id='generator'),
+    pytest.param(lambda: asyncio, 'module', id='module'),
+    pytest.param(lambda: io.TextIOWrapper(io.BytesIO()), 'TextIOWrapper', id='file'),
+    pytest.param(_ValueThatRefusesToCopy, '_ValueThatRefusesToCopy', id='custom_deepcopy'),
+]
+
+
+class _PayloadThatRefusesToCopy(dict[str, Any]):
+    """拷不动的是 payload 自身而不是某个值：逐键重试找不到肇事者。"""
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        raise TypeError('cannot pickle this mapping')
+
+
+class _CopyableOnce:
+    """第二次深拷贝就失败。"""
+
+    def __init__(self) -> None:
+        self.copies = 0
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> '_CopyableOnce':
+        self.copies += 1
+        if self.copies > 1:
+            raise TypeError("cannot pickle '_CopyableOnce' object")
+        return self
+
+
+class _SubscribesWhenCollected:
+    """被回收时给总线加一路订阅。
+
+    缓冲挤掉最旧的一条时会当场回收它，因此这个 __del__ 运行在 emit 的投递循环中途。
+    """
+
+    def __init__(self, bus: EventBus) -> None:
+        self._bus = bus
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> '_SubscribesWhenCollected':
+        return _SubscribesWhenCollected(self._bus)
+
+    def __del__(self) -> None:
+        self._bus.subscribe()
 
 
 async def _collect(events: Subscription, parked: asyncio.Event | None = None) -> list[Event]:
@@ -117,14 +176,62 @@ async def test_mutating_a_nested_payload_container_after_emit_does_not_reach_sub
     assert received.payload == {'tools': ['read']}
 
 
-async def test_one_subscriber_mutating_its_event_does_not_reach_another():
+async def test_every_subscriber_gets_the_same_snapshot_from_a_single_copy():
     bus = EventBus()
-    async with bus.subscribe() as cli, bus.subscribe() as server:
-        await bus.emit(Event(kind='turn_start', agent_id='a1', payload={'tools': ['read']}))
-        mine = await asyncio.wait_for(anext(cli), timeout=_TIMEOUT)
-        mine.payload['tools'].append('write')
-        theirs = await asyncio.wait_for(anext(server), timeout=_TIMEOUT)
-    assert theirs.payload == {'tools': ['read']}
+    probe = _CopyableOnce()
+    async with bus.subscribe() as cli, bus.subscribe() as server, bus.subscribe() as third:
+        await bus.emit(Event(kind='turn_end', agent_id='a1', payload={'probe': probe}))
+        received = [
+            await asyncio.wait_for(anext(sub), timeout=_TIMEOUT) for sub in (cli, server, third)
+        ]
+    assert probe.copies == 1
+    assert received[0] is received[1] is received[2]
+
+
+@pytest.mark.parametrize(('make_value', 'type_name'), UNCOPYABLE_PAYLOADS)
+async def test_a_payload_that_cannot_be_copied_names_the_key_and_type_that_broke_it(
+    make_value, type_name
+):
+    bus = EventBus()
+    async with bus.subscribe():
+        with pytest.raises(ContractViolation) as excinfo:
+            await bus.emit(_event('turn_start', handle=make_value()))
+    assert "payload['handle']" in excinfo.value.received
+    assert type_name in excinfo.value.received
+    assert 'turn_start' in excinfo.value.received
+    assert 'payload' in excinfo.value.expected
+    assert 'emit' in excinfo.value.next_action
+
+
+async def test_a_payload_whose_own_copy_fails_names_the_payload_type():
+    bus = EventBus()
+    async with bus.subscribe():
+        with pytest.raises(ContractViolation) as excinfo:
+            await bus.emit(
+                Event(kind='turn_start', agent_id='a1', payload=_PayloadThatRefusesToCopy())
+            )
+    assert '_PayloadThatRefusesToCopy' in excinfo.value.received
+
+
+async def test_a_payload_that_cannot_be_copied_reaches_no_subscriber():
+    bus = EventBus()
+    first = bus.subscribe()
+    second = bus.subscribe()
+    with pytest.raises(ContractViolation):
+        await bus.emit(_event('turn_start', handle=threading.Lock()))
+    await bus.close()
+    assert await asyncio.wait_for(_collect(first), timeout=_TIMEOUT) == []
+    assert await asyncio.wait_for(_collect(second), timeout=_TIMEOUT) == []
+
+
+async def test_the_payload_contract_holds_with_nobody_subscribed_and_after_close():
+    bus = EventBus()
+    unsendable = _event('turn_start', handle=threading.Lock())
+    with pytest.raises(ContractViolation):
+        await bus.emit(unsendable)
+    await bus.close()
+    with pytest.raises(ContractViolation):
+        await bus.emit(unsendable)
 
 
 async def test_overflow_keeps_the_newest_events_and_drops_the_oldest():
@@ -152,6 +259,24 @@ async def test_dropped_stays_zero_while_the_subscriber_keeps_up():
             await bus.emit(_event('turn_end', index=index))
             await asyncio.wait_for(anext(events), timeout=_TIMEOUT)
         assert events.dropped == 0
+
+
+async def test_dropped_survives_closing_the_subscription():
+    bus = EventBus(capacity=1)
+    events = bus.subscribe()
+    for index in range(4):
+        await bus.emit(_event('turn_end', index=index))
+    events.close()
+    assert events.dropped == 3
+
+
+async def test_dropped_survives_closing_the_bus():
+    bus = EventBus(capacity=1)
+    events = bus.subscribe()
+    for index in range(4):
+        await bus.emit(_event('turn_end', index=index))
+    await bus.close()
+    assert events.dropped == 3
 
 
 async def test_each_subscriber_counts_drops_on_its_own_buffer():
@@ -263,13 +388,36 @@ async def test_closing_the_bus_twice_is_a_noop():
     assert await asyncio.wait_for(_collect(events), timeout=_TIMEOUT) == []
 
 
+async def test_subscriber_count_tracks_live_subscriptions():
+    bus = EventBus()
+    assert bus.subscriber_count == 0
+    async with bus.subscribe(), bus.subscribe():
+        assert bus.subscriber_count == 2
+    assert bus.subscriber_count == 0
+
+
+async def test_subscriber_count_shows_an_unbound_subscription_no_longer_listening():
+    bus = EventBus()
+    bus.subscribe()
+    gc.collect()
+    assert bus.subscriber_count == 0
+
+
+async def test_delivery_is_not_disturbed_by_a_subscription_created_while_it_runs():
+    bus = EventBus(capacity=1)
+    async with bus.subscribe() as events:
+        await bus.emit(_event('turn_start', canary=_SubscribesWhenCollected(bus)))
+        await bus.emit(_event('turn_end'))
+        assert (await asyncio.wait_for(anext(events), timeout=_TIMEOUT)).kind == 'turn_end'
+        assert events.dropped == 1
+
+
 async def test_leaving_an_async_with_block_deregisters_the_subscription():
-    # events 在块外仍被引用，缓冲因此不会被回收：这里量的是 __aexit__ 真的退了订，
-    # 而不是垃圾回收替它把痕迹擦掉了。
+    # events 必须在块外仍被引用：解绑它，缓冲会被兜底回收，本用例就不再测 __aexit__ 退订。
     bus = EventBus()
     async with bus.subscribe() as events:
-        assert len(bus._buffers) == 1
-    assert len(bus._buffers) == 0
+        assert bus.subscriber_count == 1
+    assert bus.subscriber_count == 0
     assert await asyncio.wait_for(_collect(events), timeout=_TIMEOUT) == []
 
 
@@ -311,7 +459,7 @@ async def test_closing_a_subscription_twice_is_a_noop():
     events.close()
     events.close()
     assert await asyncio.wait_for(_collect(events), timeout=_TIMEOUT) == []
-    assert len(bus._buffers) == 0
+    assert bus.subscriber_count == 0
 
 
 async def test_breaking_out_of_async_for_leaves_no_buffer_behind(
@@ -333,14 +481,14 @@ async def test_breaking_out_of_async_for_leaves_no_buffer_behind(
     await bus.emit(_event())
     await asyncio.wait_for(task, timeout=_TIMEOUT)
     gc.collect()
-    assert len(bus._buffers) == 0
+    assert bus.subscriber_count == 0
 
 
 async def test_a_subscription_the_consumer_dropped_stops_being_tracked():
     """忘了退订是兜底路径：缓冲随 Subscription 一并被回收，而不是留到总线关闭。"""
     bus = EventBus()
     subscription = bus.subscribe()
-    assert len(bus._buffers) == 1
+    assert bus.subscriber_count == 1
     del subscription
     gc.collect()
-    assert len(bus._buffers) == 0
+    assert bus.subscriber_count == 0
