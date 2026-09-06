@@ -21,7 +21,9 @@ CONTEXT_OVERFLOW（spec §5.1 第 8 步的分类对象是「调用 LLM」）。�
 就地压缩即可；把它抛的异常也收进分类，等于让压缩链在自己出错时递归调用自己。
 
 **两个失败切点的「我处理了」写法不同，不要互换。** CONTEXT_OVERFLOW 认 `skip=True`（本轮不产出
-block，下一轮重试），LLM_FAILURE 只认 `modified['response']` 里的替身、不读它的 `skip` / `result`。
+block，下一轮重试），LLM_FAILURE 只认 `modified['response']` 里的替身。**各自读不到的那个槽位一律
+当场报 ContractViolation**：静默丢弃让作者以为处理了而任务照样以同一个错误失败，是最坏的一种反馈。
+逐切点的槽位语义见 `hooks.junctions` 模块 docstring 的表。
 **LLM_FAILURE 一轮内可以触发两次**：替身给出后被 POST_LLM_RESPONSE 清空时，空块守卫会再要一次替
 身，第二次的 error 是 LLMResponseError。按轮计数的重试插件会把这一轮记成两次。
 
@@ -64,7 +66,7 @@ from typing import Any, cast
 from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall
 from syndica.kernel.errors import ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
-from syndica.kernel.hooks import HooksCenter, Junction
+from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import LLM, ContextOverflowError
 from syndica.kernel.tool import Tool, validate_tool_names
 from syndica.kernel.tool_executor import ToolExecutor
@@ -170,6 +172,55 @@ def _bad_substitute(value: object) -> ContractViolation:
         next_action=(
             "把 HookResult.modified['response'] 换成一块非空的 assistant ContextBlock，"
             '或去掉它让原始错误上抛；空块会污染此后每一次请求的前缀'
+        ),
+    )
+
+
+def _bad_overflow_idiom(outcome: HookResult) -> ContractViolation:
+    """超窗切点收到 `modified['response']` 或 `result`。"""
+    return ContractViolation(
+        expected=(
+            f'{Junction.CONTEXT_OVERFLOW.value} hook 表示「我处理了」的唯一写法是 skip=True'
+            '（本轮不产出 block，下一轮用压缩后的轨迹重试）'
+        ),
+        received=(
+            f"收到 modified['response']={_described(outcome.get('response'))}、"
+            f'result={_described(outcome.result)}，本切点两者都不读'
+        ),
+        next_action=(
+            '压缩 ctx（它就是传给 hook 的 kwarg，下一轮的请求按它重建）后返回 skip=True；'
+            "要给一整块替身响应就把 hook 挂到 llm_failure 上，那个切点认 modified['response']"
+        ),
+    )
+
+
+def _bad_failure_idiom(outcome: HookResult) -> ContractViolation:
+    """失败切点收到 `skip` 或 `result`。"""
+    return ContractViolation(
+        expected=(
+            f'{Junction.LLM_FAILURE.value} hook 表示「我处理了」的唯一写法是'
+            " modified['response'] 给出替身"
+        ),
+        received=f'收到 skip={outcome.skip}、result={_described(outcome.result)}，本切点两者都不读',
+        next_action=(
+            "把替身放进 HookResult.modified['response']（重试与故障转移都走这条路）；"
+            '不打算处理就返回 HookResult() 让原始错误上抛。'
+            '静默忽略等于把作者的否决扔了，而任务照样以同一个错误失败'
+        ),
+    )
+
+
+def _bad_post_response_idiom(outcome: HookResult) -> ContractViolation:
+    """后置改写切点收到 `result`：那是前置拦截的槽位。"""
+    return ContractViolation(
+        expected=(
+            f"{Junction.POST_LLM_RESPONSE.value} hook 改写产出的唯一写法是 modified['response']"
+        ),
+        received=f'收到 result={_described(outcome.result)}，本切点不读它',
+        next_action=(
+            "把它放进 HookResult.modified['response']；"
+            'result 是前置切点跳过原操作时的替代结果槽位，模型这一轮已经被调用过了。'
+            'skip=True 本身合法，它只表示终止后续 hook'
         ),
     )
 
@@ -385,6 +436,8 @@ class BaseAgent:
         post = await self._hooks.trigger(
             Junction.POST_LLM_RESPONSE, ctx=ctx, request=request, response=response
         )
+        if post.result is not None:
+            raise _bad_post_response_idiom(post)
         reviewed = post.get('response', response)
         if not isinstance(reviewed, ContextBlock) or reviewed.role != 'assistant':
             raise _bad_response(reviewed)
@@ -402,6 +455,9 @@ class BaseAgent:
             outcome = await self._hooks.trigger(
                 Junction.CONTEXT_OVERFLOW, ctx=ctx, request=request, error=exc
             )
+            # 先拒后认：skip 与 response 同时给出时，认了 skip 就把 response 静默扔了。
+            if 'response' in outcome.modified or outcome.result is not None:
+                raise _bad_overflow_idiom(outcome) from exc
             if outcome.skip:
                 return None
             raise
@@ -415,6 +471,8 @@ class BaseAgent:
         outcome = await self._hooks.trigger(
             Junction.LLM_FAILURE, ctx=ctx, request=request, error=error
         )
+        if outcome.skip or outcome.result is not None:
+            raise _bad_failure_idiom(outcome) from error
         substitute = outcome.get('response')
         if substitute is None:
             _mark_failed(ctx)

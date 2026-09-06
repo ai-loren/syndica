@@ -3,7 +3,7 @@ import logging
 
 import pytest
 
-from syndica.kernel.errors import ConfigError
+from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.hooks import INTERCEPTABLE, OBSERVABLE, HookResult, HooksCenter, Junction
 
 # 并发用例回归时应当变红，而不是把 CI 挂住。
@@ -458,3 +458,35 @@ async def test_triggering_unknown_junction_is_rejected():
         await center.trigger('turn_start', turn=1)  # pyright: ignore[reportArgumentType]
     assert 'Junction' in excinfo.value.expected
     assert 'turn_start' in excinfo.value.received
+
+
+async def test_a_result_without_skip_is_rejected_rather_than_dropped():
+    """合并结论只在 skip 那一支带出 `result`，所以不带 skip 的 result 哪个切点都读不到。静默丢弃让
+    作者以为自己顶替了本次操作的产出，而原操作照常执行。"""
+    center = HooksCenter()
+
+    async def substitute(**_: object) -> HookResult:
+        return HookResult(result='substitute')
+
+    center.register(Junction.PRE_TOOL_USE, substitute)
+    with pytest.raises(ContractViolation) as excinfo:
+        await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)
+    assert Junction.PRE_TOOL_USE.value in excinfo.value.expected
+    assert 'substitute' in excinfo.value.received
+    assert 'skip=True' in excinfo.value.next_action
+
+
+async def test_a_later_hook_giving_an_orphan_result_is_still_caught():
+    """只检查第一个 hook 会让链条后段静默失效。"""
+    center = HooksCenter()
+
+    async def observe(**_: object) -> HookResult:
+        return HookResult()
+
+    async def substitute(**_: object) -> HookResult:
+        return HookResult(result='substitute')
+
+    center.register(Junction.PRE_TOOL_USE, observe)
+    center.register(Junction.PRE_TOOL_USE, substitute)
+    with pytest.raises(ContractViolation):
+        await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)

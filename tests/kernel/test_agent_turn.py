@@ -1367,3 +1367,109 @@ async def test_the_failure_mark_still_lands_on_the_trajectory_block_not_on_a_req
     with pytest.raises(RuntimeError):
         await agent.run('go')
     assert _marked(agent.context) == ['go']
+
+
+async def test_context_overflow_rejects_the_substitute_idiom_instead_of_dropping_it():
+    """超窗切点只认 skip=True。收下 `modified['response']` 却不读它，作者会以为本轮已被顶上，而
+    ContextOverflowError 照样上抛——两个失败切点的写法相反，猜错必须响。"""
+    agent, hooks = _agent([ScriptedTurn(raises=_overflow())])
+
+    async def substitute(**_: Any) -> HookResult:
+        return HookResult(modified={'response': ContextBlock(role='assistant', content='patched')})
+
+    hooks.register(Junction.CONTEXT_OVERFLOW, substitute)
+    with pytest.raises(ContractViolation) as excinfo:
+        await agent.run('go')
+    assert Junction.CONTEXT_OVERFLOW.value in excinfo.value.expected
+    assert Junction.LLM_FAILURE.value in excinfo.value.next_action
+
+
+async def test_context_overflow_rejects_a_result_slot_alongside_skip():
+    agent, hooks = _agent([ScriptedTurn(raises=_overflow())])
+
+    async def handled_with_a_result(**_: Any) -> HookResult:
+        return HookResult(skip=True, result=ContextBlock(role='assistant', content='patched'))
+
+    hooks.register(Junction.CONTEXT_OVERFLOW, handled_with_a_result)
+    with pytest.raises(ContractViolation):
+        await agent.run('go')
+
+
+async def test_context_overflow_still_accepts_a_bare_skip():
+    """拒绝读不到的槽位不得动到这个切点真正认的那种写法。"""
+    agent, hooks = _agent([ScriptedTurn(raises=_overflow()), ScriptedTurn(content='done')])
+
+    async def compressed(**_: Any) -> HookResult:
+        return HookResult(skip=True)
+
+    hooks.register(Junction.CONTEXT_OVERFLOW, compressed)
+    ctx = await agent.run('go')
+    assert ctx.stop_reason is StopReason.COMPLETED
+
+
+@pytest.mark.parametrize(
+    'outcome',
+    [
+        HookResult(skip=True),
+        HookResult(skip=True, result=ContextBlock(role='assistant', content='patched')),
+    ],
+    ids=['skip', 'skip-with-result'],
+)
+async def test_llm_failure_rejects_the_skip_idiom_instead_of_dropping_it(outcome):
+    """失败切点只认 `modified['response']`。静默忽略 skip 正是它自己对 pre_llm_request 的坏 result
+    所拒绝的那件事：作者以为处理了，任务照样以同一个错误失败。"""
+    boom = RuntimeError('provider down')
+    agent, hooks = _agent([ScriptedTurn(raises=boom)])
+
+    async def handled(**_: Any) -> HookResult:
+        return outcome
+
+    hooks.register(Junction.LLM_FAILURE, handled)
+    with pytest.raises(ContractViolation) as excinfo:
+        await agent.run('go')
+    assert Junction.LLM_FAILURE.value in excinfo.value.expected
+    assert excinfo.value.__cause__ is boom
+
+
+async def test_llm_failure_still_accepts_a_substitute_response():
+    agent, hooks = _agent([ScriptedTurn(raises=RuntimeError('provider down'))])
+
+    async def substitute(**_: Any) -> HookResult:
+        return HookResult(modified={'response': ContextBlock(role='assistant', content='patched')})
+
+    hooks.register(Junction.LLM_FAILURE, substitute)
+    ctx = await agent.run('go')
+    assert [block.content for block in ctx.current_traj] == ['go', 'patched']
+
+
+async def test_post_llm_response_rejects_a_result_slot_instead_of_dropping_it():
+    """后置切点改写产出只有 `modified['response']` 一种写法；`result` 是前置跳过时的槽位。"""
+    agent, hooks = _agent([ScriptedTurn(content='original')])
+
+    async def rewrite_via_the_wrong_slot(**_: Any) -> HookResult:
+        return HookResult(skip=True, result=ContextBlock(role='assistant', content='rewritten'))
+
+    hooks.register(Junction.POST_LLM_RESPONSE, rewrite_via_the_wrong_slot)
+    with pytest.raises(ContractViolation) as excinfo:
+        await agent.run('go')
+    assert Junction.POST_LLM_RESPONSE.value in excinfo.value.expected
+
+
+async def test_post_llm_response_still_accepts_a_bare_skip_to_end_the_chain():
+    """`skip` 在后置切点上的作用是终止后续 hook，那是 HooksCenter 的语义，不是「我处理了」。"""
+    agent, hooks = _agent([ScriptedTurn(content='original')])
+    calls: list[str] = []
+
+    async def stop_the_chain(**_: Any) -> HookResult:
+        calls.append('first')
+        return HookResult(skip=True)
+
+    async def never(**_: Any) -> HookResult:
+        calls.append('never')
+        return HookResult()
+
+    hooks.register(Junction.POST_LLM_RESPONSE, stop_the_chain)
+    hooks.register(Junction.POST_LLM_RESPONSE, never)
+    ctx = await agent.run('go')
+    assert calls == ['first']
+    assert [block.content for block in ctx.current_traj] == ['go', 'original']

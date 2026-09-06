@@ -19,10 +19,9 @@ N 条结果的 assistant 消息，所以工具不存在、参数非法、执行�
 RuntimeError / OSError 是那次操作的真实失败，模型换个方式可能绕开。按 `ToolFatalError` 划界不够——
 ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是它的**兄弟**而非子类。
 
-**trust 只能收紧，不能放松。** hook 改写结果时最终 trust 取原结果与**链上每一次改写**里最严的那
-一个：ToolResult 上没有任何东西能区分「消毒之后刻意提升」与「忘了带 trust=」，而后者的后果是未标记
-的不可信内容进模型上下文（spec §12.2），比前者常见得多。刻意提升需要一个显式机制，目前不存在。看
-`HookResult.history` 而不是 `modified`：后者 last-wins，链中间那次收紧会被后一个 hook 的默认值抹掉。
+**trust 只能收紧，不能放松。** hook 改写结果时最终 trust 取原结果与改写结果里更严的那一
+个：ToolResult 上没有任何东西能区分「消毒之后刻意提升」与「忘了带 trust=」，而后者的后果是未标记的
+不可信内容进模型上下文（spec §12.2），比前者常见得多。刻意提升需要一个显式机制，目前不存在。
 
 **executor 自撰的 block，凡嵌进了既非工具、亦非本模块写下的文本，一律 UNTRUSTED。** `str(exc)` 经
 常携带工具自己没写过的字节（fetch 回来的正文、读进来的文件、子进程的 stderr），且它是这些字节**第
@@ -48,7 +47,7 @@ from typing import Any, cast
 
 from syndica.kernel.context import Context, ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
-from syndica.kernel.hooks import HooksCenter, Junction
+from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
 
 __all__ = ['ToolExecutor']
@@ -82,6 +81,19 @@ def _rewrite_rejected(
         next_action=(
             f'把 hook 的 HookResult.modified[{key!r}] 改成 {expected.__name__}；'
             f'{key!r} 是传给 hook 的 kwarg，改写不得改变它的类型'
+        ),
+    )
+
+
+def _post_result_slot_rejected(outcome: HookResult) -> ContractViolation:
+    """后置切点收到 `HookResult.result`：那是前置拦截的槽位，本切点不读它。"""
+    return ContractViolation(
+        expected=(f"{Junction.POST_TOOL_USE.value} hook 改写结果的唯一写法是 modified['result']"),
+        received=f'收到 result={type(outcome.result).__name__} 类型的 {outcome.result!r}',
+        next_action=(
+            "把它放进 HookResult.modified['result']；"
+            'result 是前置切点跳过原操作时的替代结果槽位，而工具这次已经跑过了。'
+            'skip=True 本身合法，它只表示终止后续 hook'
         ),
     )
 
@@ -267,6 +279,8 @@ class ToolExecutor:
         post = await self._hooks.trigger(
             Junction.POST_TOOL_USE, tool_call=call, tool=tool, args=args, result=result
         )
+        if post.result is not None:
+            raise _post_result_slot_rejected(post)
         rewritten = post.get('result', result)
         if not isinstance(rewritten, ToolResult):
             raise _rewrite_rejected(Junction.POST_TOOL_USE, 'result', ToolResult, rewritten)

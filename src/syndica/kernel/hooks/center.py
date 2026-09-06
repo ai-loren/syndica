@@ -15,7 +15,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from syndica.kernel.errors import ConfigError
+from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.hooks.junctions import INTERCEPTABLE, Junction
 from syndica.kernel.hooks.result import HookResult
 
@@ -24,6 +24,25 @@ __all__ = ['HookCallback', 'HooksCenter']
 logger = logging.getLogger(__name__)
 
 HookCallback = Callable[..., Awaitable[HookResult | None]]
+
+
+def _orphan_result(junction: Junction, cb: HookCallback, outcome: HookResult) -> ContractViolation:
+    """`result` 不带 `skip=True`：这个值哪个切点都读不到。
+
+    合并结论只在 `skip` 那一支带出 `result`，因此不报出来就是静默丢弃——作者以为自己顶上了本次操作的
+    产出，实际上原操作照常执行。要改产出用 `modified`，要顶替产出用 `skip=True` + `result`。
+    """
+    return ContractViolation(
+        expected=f'{junction.value} 上的 HookResult.result 只在 skip=True 时给出',
+        received=(
+            f'{getattr(cb, "__qualname__", cb)!r} 返回了 skip=False 而 result='
+            f'{type(outcome.result).__name__} 类型的 {outcome.result!r}'
+        ),
+        next_action=(
+            '要顶替原操作就同时置 skip=True；只想改写参数或产出就把值放进 HookResult.modified；'
+            'result 不带 skip 时没有任何切点会读到它'
+        ),
+    )
 
 
 def _validated_junction(junction: object) -> Junction:
@@ -54,7 +73,7 @@ class HooksCenter:
 
         可拦截切点按注册顺序串行：前一个 hook 的 `modified` 并入后续 hook 的 kwargs，返回的
         `modified` 只含被改过的键而非整份 kwargs；`skip=True` 终止后续 hook 并带出它的
-        `result`。
+        `result`，不带 `skip` 的 `result` 报 `ContractViolation`（见 `_orphan_result`）。
 
         可观察切点并行执行，返回值与异常一律丢弃，因此恒返回空 `HookResult`。
 
@@ -66,17 +85,21 @@ class HooksCenter:
         if not hooks:
             return HookResult()
         if validated in INTERCEPTABLE:
-            return await self._trigger_serial(hooks, **kwargs)
+            return await self._trigger_serial(validated, hooks, **kwargs)
         await self._trigger_parallel(validated, hooks, **kwargs)
         return HookResult()
 
-    async def _trigger_serial(self, hooks: list[HookCallback], **kwargs: Any) -> HookResult:
+    async def _trigger_serial(
+        self, junction: Junction, hooks: list[HookCallback], **kwargs: Any
+    ) -> HookResult:
         merged: dict[str, Any] = {}
         current = dict(kwargs)
         for cb in hooks:
             outcome = await cb(**current)
             if outcome is None:
                 continue
+            if outcome.result is not None and not outcome.skip:
+                raise _orphan_result(junction, cb, outcome)
             merged.update(outcome.modified)
             current.update(outcome.modified)
             if outcome.skip:

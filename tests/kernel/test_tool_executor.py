@@ -1167,3 +1167,44 @@ async def test_a_name_the_model_invented_still_yields_a_block_rather_than_raisin
     ctx = Context()
     await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Nope', arguments='{}')])
     assert ctx.current_traj[-1].tool_call_id == 'c1'
+
+
+async def test_post_tool_use_rejects_a_result_slot_instead_of_dropping_it():
+    """后置切点改写结果只有 `modified['result']` 一种写法。静默丢弃 `result` 会让「消毒之后交出干净
+    结果」这类 hook 以为自己生效了，而模型看到的还是原结果。"""
+    executor, center = _executor()
+
+    async def sanitise_via_the_wrong_slot(**_: Any) -> HookResult:
+        return HookResult(skip=True, result=ToolResult(output='sanitised'))
+
+    center.register(Junction.POST_TOOL_USE, sanitise_via_the_wrong_slot)
+    ctx = Context()
+    with pytest.raises(ContractViolation) as excinfo:
+        await executor.execute_tool_calls(
+            ctx, [ToolCall(id='c1', name='Echo', arguments='{"text":"hi"}')]
+        )
+    assert Junction.POST_TOOL_USE.value in excinfo.value.expected
+    assert "modified['result']" in excinfo.value.expected
+
+
+async def test_post_tool_use_still_accepts_a_bare_skip_to_end_the_chain():
+    """`skip` 在后置切点上只终止后续 hook；那是 HooksCenter 的语义，不是「我处理了」。"""
+    executor, center = _executor()
+    calls: list[str] = []
+
+    async def stop_the_chain(**_: Any) -> HookResult:
+        calls.append('first')
+        return HookResult(skip=True)
+
+    async def never(**_: Any) -> HookResult:
+        calls.append('never')
+        return HookResult()
+
+    center.register(Junction.POST_TOOL_USE, stop_the_chain)
+    center.register(Junction.POST_TOOL_USE, never)
+    ctx = Context()
+    await executor.execute_tool_calls(
+        ctx, [ToolCall(id='c1', name='Echo', arguments='{"text":"hi"}')]
+    )
+    assert calls == ['first']
+    assert ctx.current_traj[-1].content == 'hi'
