@@ -29,15 +29,26 @@
 
 两个失败切点的写法相反，不要互换：超窗是「这一轮不该产出东西」，失败是「这一轮的产出由插件顶上」。
 
-本计划只落地单 Agent 一轮所需的切点，其余（agent_spawn / message_injected / 背景任务等）
+本计划只落地单 Agent 一轮所需的枚举切点，其余（agent_spawn / message_injected / 背景任务等）
 随后续计划补齐。
+
+## 扩展切点
+
+第三方能力用 `<owner>:<event>` 形式的命名空间字符串注册自己的切点（spec §5.4），无需改内核、
+无需等发版，并由**声明它的那个能力自己触发**（内核只在固定位置触发枚举切点）。
+
+扩展切点与枚举切点走同一套分发，因此同样必须有分类；但它的分类**不进 `INTERCEPTABLE` /
+`OBSERVABLE`**——那两个集合是对 `Junction` 成员的一个划分，掺进字符串会让「新增枚举成员两边都
+不在即变红」这条断言失效。扩展切点的分类由声明者在 `HooksCenter.declare_extension_junction`
+上用 `JunctionKind` 显式给出，另存一处。
 """
 
 from __future__ import annotations
 
 from enum import Enum
+from typing import TypeAlias
 
-__all__ = ['INTERCEPTABLE', 'Junction', 'OBSERVABLE']
+__all__ = ['INTERCEPTABLE', 'Junction', 'JunctionKind', 'JunctionRef', 'OBSERVABLE']
 
 
 class Junction(Enum):
@@ -74,3 +85,19 @@ OBSERVABLE: frozenset[Junction] = frozenset(
         Junction.TURN_END,
     }
 )
+
+
+class JunctionKind(Enum):
+    """一个切点按哪套语义分发。
+
+    只用于**扩展切点**：它没有编译期成员表可供划分，分类必须由声明者显式给出，本枚举就是那个
+    参数的值域。内核切点的分类仍由 `INTERCEPTABLE` / `OBSERVABLE` 表达，**不要改用本枚举重写
+    它们**——那两个集合的价值在于「新增枚举成员两边都不在」会变红，换成逐成员标注就丢了。
+    """
+
+    INTERCEPTABLE = 'interceptable'
+    OBSERVABLE = 'observable'
+
+
+JunctionRef: TypeAlias = Junction | str
+"""切点引用：内核枚举成员，或 `<owner>:<event>` 形式的扩展切点名。"""
