@@ -5,7 +5,15 @@ import logging
 import pytest
 
 from syndica.kernel.errors import ConfigError, ContractViolation
-from syndica.kernel.hooks import INTERCEPTABLE, OBSERVABLE, HookResult, HooksCenter, Junction
+from syndica.kernel.hooks import (
+    INTERCEPTABLE,
+    OBSERVABLE,
+    HookResult,
+    HooksCenter,
+    Junction,
+    JunctionKind,
+)
+from syndica.kernel.hooks import center as center_module
 
 # 并发用例回归时应当变红，而不是把 CI 挂住。
 _TIMEOUT = 1.0
@@ -438,27 +446,22 @@ async def test_a_hook_registered_by_an_observable_hook_runs_from_the_next_trigge
     assert sorted(calls) == ['latecomer', 'registrar', 'registrar']
 
 
-def test_registering_unknown_junction_is_rejected():
+def test_registering_a_non_junction_non_string_is_rejected():
     center = HooksCenter()
 
     async def cb(**_: object) -> None:
         return None
 
-    with pytest.raises(ConfigError) as excinfo:
-        center.register('turn_start', cb)  # pyright: ignore[reportArgumentType]
-    assert 'Junction' in excinfo.value.expected
-    assert 'turn_start' in excinfo.value.received
-    assert 'Junction' in excinfo.value.next_action
+    with pytest.raises(ConfigError):
+        center.register(7, cb)  # pyright: ignore[reportArgumentType]
 
 
-async def test_triggering_unknown_junction_is_rejected():
-    """裸字符串在 trigger 上同样是配置错误；KeyError 说不出期望、实际与下一步。"""
+async def test_triggering_a_non_junction_non_string_is_rejected():
+    """既不是枚举成员也不是字符串时说不出期望、实际与下一步的 KeyError 是最差的反馈。"""
     center = HooksCenter()
 
-    with pytest.raises(ConfigError) as excinfo:
-        await center.trigger('turn_start', turn=1)  # pyright: ignore[reportArgumentType]
-    assert 'Junction' in excinfo.value.expected
-    assert 'turn_start' in excinfo.value.received
+    with pytest.raises(ConfigError):
+        await center.trigger(7, turn=1)  # pyright: ignore[reportArgumentType]
 
 
 async def test_a_result_without_skip_is_rejected_rather_than_dropped():
@@ -564,3 +567,448 @@ def test_hook_result_fields_are_the_positional_contract():
         'result',
         'history',
     ]
+
+
+def test_two_junction_kinds_exist():
+    """取值撞车会让成员静默塌成别名；分类决定切点的执行语义，与切点名同属公开 API。"""
+    assert {kind.name: kind.value for kind in JunctionKind} == {
+        'INTERCEPTABLE': 'interceptable',
+        'OBSERVABLE': 'observable',
+    }
+
+
+def test_declaring_extension_junctions_leaves_the_kernel_classifications_untouched():
+    """两个集合是对 `Junction` 成员的划分；掺进扩展切点，「新增枚举成员两边都不在即变红」就失效。"""
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+    assert INTERCEPTABLE == {
+        Junction.PRE_TOOL_USE,
+        Junction.POST_TOOL_USE,
+        Junction.PRE_LLM_REQUEST,
+        Junction.POST_LLM_RESPONSE,
+        Junction.CONTEXT_OVERFLOW,
+        Junction.LLM_FAILURE,
+    }
+    assert OBSERVABLE == {
+        Junction.AGENT_START,
+        Junction.AGENT_END,
+        Junction.AGENT_ERROR,
+        Junction.TURN_START,
+        Junction.TURN_END,
+    }
+    assert len(set(Junction)) == 11
+
+
+async def test_a_kernel_junction_in_neither_classification_is_rejected_at_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """分发处不写「不在可拦截即可观察」：那会让新增枚举成员靠遗漏拿到「并行 + 吞异常」语义。
+    分类在空 hook 列表检查之前取，所以一个没人挂钩的未归类切点同样要报出来。"""
+    monkeypatch.setattr(center_module, 'OBSERVABLE', OBSERVABLE - {Junction.TURN_START})
+    with pytest.raises(ContractViolation):
+        await HooksCenter().trigger(Junction.TURN_START, turn=1)
+
+
+async def test_an_interceptable_extension_junction_is_serial_and_accumulates_modified():
+    """扩展切点与枚举切点共用同一条分发路径：中间件语义必须逐条成立，而不是只有枚举切点才有。
+    基数取 3 且顺序既非升序亦非降序，否则排序类变异过不了关。"""
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    seen: list[dict[str, object]] = []
+
+    async def redact(**_: object) -> HookResult:
+        return HookResult(modified={'artifact': 'redacted'})
+
+    async def stamp(**kwargs: object) -> HookResult:
+        seen.append(dict(kwargs))
+        return HookResult(modified={'version': 2})
+
+    async def audit(**kwargs: object) -> HookResult:
+        seen.append(dict(kwargs))
+        return HookResult(modified={'audited': True})
+
+    for cb in (redact, stamp, audit):
+        center.register('artifact:created', cb)
+    result = await center.trigger('artifact:created', artifact='raw', kind='spreadsheet')
+    assert seen == [
+        {'artifact': 'redacted', 'kind': 'spreadsheet'},
+        {'artifact': 'redacted', 'kind': 'spreadsheet', 'version': 2},
+    ]
+    assert result.modified == {'artifact': 'redacted', 'version': 2, 'audited': True}
+
+
+async def test_an_interceptable_extension_junction_reports_every_value_a_key_was_given():
+    """只能单向收紧的量（trust）看 last-wins 的结论会漏掉链中间那次收紧。"""
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+
+    async def first(**_: object) -> HookResult:
+        return HookResult(modified={'trust': 'plain'})
+
+    async def second(**_: object) -> HookResult:
+        return HookResult(modified={'trust': 'tightened'})
+
+    async def third(**_: object) -> HookResult:
+        return HookResult(modified={'trust': 'loosened'})
+
+    for cb in (first, second, third):
+        center.register('artifact:created', cb)
+    result = await center.trigger('artifact:created', trust='original')
+    assert result.rewrites('trust') == ['plain', 'tightened', 'loosened']
+
+
+async def test_an_interceptable_extension_junctions_skip_stops_the_chain_and_carries_its_result():
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    calls: list[str] = []
+
+    async def deny(**_: object) -> HookResult:
+        calls.append('deny')
+        return HookResult(skip=True, result='denied')
+
+    async def never(**_: object) -> HookResult:
+        calls.append('never')
+        return HookResult()
+
+    center.register('artifact:created', deny)
+    center.register('artifact:created', never)
+    result = await center.trigger('artifact:created', artifact='raw')
+    assert calls == ['deny']
+    assert (result.skip, result.result) == (True, 'denied')
+
+
+async def test_an_interceptable_extension_hook_that_raises_propagates():
+    """扩展切点上的可拦截 hook 同样是策略；跳过一个失败的策略检查等于放行未经检查的操作。"""
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    boom = RuntimeError('artifact policy blew up')
+
+    async def explodes(**_: object) -> HookResult:
+        raise boom
+
+    center.register('artifact:created', explodes)
+    with pytest.raises(RuntimeError) as excinfo:
+        await center.trigger('artifact:created', artifact='raw')
+    assert excinfo.value is boom
+
+
+async def test_an_orphan_result_at_an_extension_junction_is_rejected_rather_than_dropped():
+    """`result` 不带 `skip` 哪个切点都读不到，与切点是枚举还是字符串无关。"""
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+
+    async def substitute(**_: object) -> HookResult:
+        return HookResult(result='substitute')
+
+    center.register('artifact:created', substitute)
+    with pytest.raises(ContractViolation) as excinfo:
+        await center.trigger('artifact:created', artifact='raw')
+    assert 'artifact:created' in excinfo.value.expected
+
+
+async def test_an_observable_extension_junction_runs_its_hooks_concurrently():
+    """串行执行会卡死在栅栏上；扩展切点声明为可观察就得真拿到并行。"""
+    center = HooksCenter()
+    center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+    both_started = asyncio.Barrier(2)
+
+    async def wait_for_the_other(**_: object) -> None:
+        await both_started.wait()
+
+    center.register('metrics:sampled', wait_for_the_other)
+    center.register('metrics:sampled', wait_for_the_other)
+    await asyncio.wait_for(center.trigger('metrics:sampled', value=1), timeout=_TIMEOUT)
+
+
+async def test_an_observable_extension_hook_that_raises_does_not_break_trigger(
+    caplog: pytest.LogCaptureFixture,
+):
+    center = HooksCenter()
+    center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+    calls: list[str] = []
+    boom = RuntimeError('metrics hook blew up')
+
+    async def explodes(**_: object) -> None:
+        calls.append('explodes')
+        raise boom
+
+    async def survivor(**_: object) -> None:
+        calls.append('survivor')
+
+    center.register('metrics:sampled', explodes)
+    center.register('metrics:sampled', survivor)
+    result = await center.trigger('metrics:sampled', value=1)
+    assert sorted(calls) == ['explodes', 'survivor']
+    assert (result.skip, result.modified, result.result) == (False, {}, None)
+    (record,) = caplog.records
+    assert record.exc_info is not None
+    assert record.exc_info[1] is boom
+    assert 'metrics:sampled' in record.getMessage()
+
+
+async def test_an_observable_extension_hooks_returned_result_is_discarded():
+    center = HooksCenter()
+    center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+
+    async def opinionated(**_: object) -> HookResult:
+        return HookResult(skip=True, modified={'value': 99}, result='substitute')
+
+    center.register('metrics:sampled', opinionated)
+    result = await center.trigger('metrics:sampled', value=1)
+    assert (result.skip, result.modified, result.result) == (False, {}, None)
+
+
+async def test_a_hook_registered_by_an_interceptable_extension_hook_waits_for_the_next_trigger():
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    calls: list[str] = []
+
+    async def latecomer(**_: object) -> HookResult:
+        calls.append('latecomer')
+        return HookResult()
+
+    async def registrar(**_: object) -> HookResult:
+        calls.append('registrar')
+        center.register('artifact:created', latecomer)
+        return HookResult()
+
+    center.register('artifact:created', registrar)
+    await center.trigger('artifact:created', artifact='raw')
+    assert calls == ['registrar']
+    await center.trigger('artifact:created', artifact='raw')
+    assert calls == ['registrar', 'registrar', 'latecomer']
+
+
+async def test_a_hook_registered_by_an_observable_extension_hook_waits_for_the_next_trigger():
+    """两条分发路径在「本轮 hook 集合何时定下」上必须同解，扩展切点也一样。"""
+    center = HooksCenter()
+    center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+    calls: list[str] = []
+
+    async def latecomer(**_: object) -> None:
+        calls.append('latecomer')
+
+    async def registrar(**_: object) -> None:
+        calls.append('registrar')
+        center.register('metrics:sampled', latecomer)
+
+    center.register('metrics:sampled', registrar)
+    await center.trigger('metrics:sampled', value=1)
+    assert calls == ['registrar']
+    await center.trigger('metrics:sampled', value=1)
+    assert sorted(calls) == ['latecomer', 'registrar', 'registrar']
+
+
+async def test_two_owners_declaring_the_same_event_name_get_two_separate_junctions():
+    """owner 段存在的第一个理由：两个扩展不该抢同一个名字，也不该收到对方的事件。"""
+    center = HooksCenter()
+    center.declare_extension_junction('syndica-office:created', JunctionKind.OBSERVABLE)
+    center.declare_extension_junction('syndica-sheets:created', JunctionKind.OBSERVABLE)
+    calls: list[str] = []
+
+    async def office(**_: object) -> None:
+        calls.append('office')
+
+    async def sheets(**_: object) -> None:
+        calls.append('sheets')
+
+    center.register('syndica-office:created', office)
+    center.register('syndica-sheets:created', sheets)
+    await center.trigger('syndica-office:created', artifact='raw')
+    assert calls == ['office']
+
+
+async def test_an_extension_junction_and_a_kernel_junction_do_not_share_hooks():
+    center = HooksCenter()
+    center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+    calls: list[str] = []
+
+    async def extension(**_: object) -> None:
+        calls.append('extension')
+
+    async def kernel(**_: object) -> None:
+        calls.append('kernel')
+
+    center.register('metrics:sampled', extension)
+    center.register(Junction.TURN_START, kernel)
+    await center.trigger(Junction.TURN_START, turn=1)
+    assert calls == ['kernel']
+
+
+async def test_declaring_the_same_extension_junction_with_the_same_kind_keeps_its_hooks():
+    """后置条件已成立即成功；但重复声明不得把已挂上的 hook 抹掉。"""
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    calls: list[str] = []
+
+    async def existing(**_: object) -> HookResult:
+        calls.append('existing')
+        return HookResult()
+
+    center.register('artifact:created', existing)
+    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    await center.trigger('artifact:created', artifact='raw')
+    assert calls == ['existing']
+
+
+async def test_redeclaring_an_extension_junction_with_a_different_kind_is_rejected():
+    """今天没有注册者标识可比，分类冲突是唯一能观测到的抢名信号：静默让先声明者胜，会让后来者的
+    可拦截 hook 按可观察跑，异常就被吞了。"""
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    with pytest.raises(ContractViolation):
+        center.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
+
+    boom = RuntimeError('artifact policy blew up')
+
+    async def explodes(**_: object) -> HookResult:
+        raise boom
+
+    center.register('artifact:created', explodes)
+    with pytest.raises(RuntimeError) as excinfo:
+        await center.trigger('artifact:created', artifact='raw')
+    assert excinfo.value is boom
+
+
+def test_declaring_an_extension_junction_with_a_kind_lookalike_string_is_rejected():
+    """`'observable'` 与两个成员都不相等，收下它会让分发 `is` 比较落进可观察那一侧。"""
+    center = HooksCenter()
+    name = 'artifact:created'
+    with pytest.raises(ConfigError):
+        center.declare_extension_junction(name, 'observable')  # pyright: ignore[reportArgumentType]
+
+
+def test_declaring_an_extension_junction_with_a_non_string_name_is_rejected():
+    center = HooksCenter()
+    kind = JunctionKind.OBSERVABLE
+    with pytest.raises(ConfigError):
+        center.declare_extension_junction(7, kind)  # pyright: ignore[reportArgumentType]
+
+
+def test_an_extension_junction_name_without_a_separator_is_rejected():
+    center = HooksCenter()
+    with pytest.raises(ConfigError):
+        center.declare_extension_junction('created', JunctionKind.OBSERVABLE)
+
+
+def test_an_extension_junction_name_with_more_than_one_separator_is_rejected():
+    """多级命名空间日后放宽不是破坏性变更，现在收下了却再也收不回来。"""
+    center = HooksCenter()
+    with pytest.raises(ConfigError):
+        center.declare_extension_junction('artifact:created:v2', JunctionKind.OBSERVABLE)
+
+
+def test_an_extension_junction_name_with_an_empty_owner_is_rejected():
+    center = HooksCenter()
+    with pytest.raises(ConfigError):
+        center.declare_extension_junction(':created', JunctionKind.OBSERVABLE)
+
+
+def test_an_extension_junction_name_with_an_empty_event_is_rejected():
+    center = HooksCenter()
+    with pytest.raises(ConfigError):
+        center.declare_extension_junction('artifact:', JunctionKind.OBSERVABLE)
+
+
+def test_an_empty_extension_junction_name_is_rejected():
+    center = HooksCenter()
+    with pytest.raises(ConfigError):
+        center.declare_extension_junction('', JunctionKind.OBSERVABLE)
+
+
+def test_an_extension_junction_name_with_whitespace_anywhere_is_rejected():
+    center = HooksCenter()
+    for name in (
+        ' artifact:created',
+        'artifact:created ',
+        'my artifact:created',
+        'artifact: created',
+        'artifact:\tcreated',
+    ):
+        with pytest.raises(ConfigError):
+            center.declare_extension_junction(name, JunctionKind.OBSERVABLE)
+
+
+async def test_a_whitespace_padded_name_does_not_resolve_to_the_declared_one():
+    """刻意不自动 strip：两种拼法在日志与错误消息里长得一样，静默合并会让日后绑定注册者标识时
+    没有唯一的规范拼法可比。"""
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
+    calls: list[str] = []
+
+    async def cb(**_: object) -> None:
+        calls.append('cb')
+
+    center.register('artifact:created', cb)
+    with pytest.raises(ConfigError):
+        await center.trigger(' artifact:created', artifact='raw')
+    assert calls == []
+
+
+async def test_extension_junction_names_are_case_sensitive():
+    """名字计入公开 API，折叠大小写等于让两种拼法映射到同一个切点。"""
+    center = HooksCenter()
+    center.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
+    with pytest.raises(ContractViolation):
+        await center.trigger('artifact:Created', artifact='raw')
+
+
+def test_declaring_a_kernel_junctions_string_value_as_an_extension_is_rejected():
+    center = HooksCenter()
+    with pytest.raises(ConfigError):
+        center.declare_extension_junction('turn_start', JunctionKind.OBSERVABLE)
+
+
+def test_registering_a_kernel_junction_by_its_string_value_is_rejected():
+    """字符串与枚举通到同一个切点，会让按枚举触发时读不到按字符串注册的 hook——静默空转。"""
+    center = HooksCenter()
+
+    async def cb(**_: object) -> None:
+        return None
+
+    with pytest.raises(ConfigError):
+        center.register('turn_start', cb)
+
+
+async def test_triggering_a_kernel_junction_by_its_string_value_neither_fires_nor_aliases():
+    center = HooksCenter()
+    calls: list[str] = []
+
+    async def cb(**_: object) -> None:
+        calls.append('cb')
+
+    center.register(Junction.TURN_START, cb)
+    with pytest.raises(ConfigError):
+        await center.trigger('turn_start', turn=1)
+    assert calls == []
+
+
+def test_registering_an_undeclared_extension_junction_is_rejected():
+    """分类没有默认值，所以没有「先挂上、分类以后再说」这条路：那个 hook 会永不触发。"""
+    center = HooksCenter()
+
+    async def cb(**_: object) -> None:
+        return None
+
+    with pytest.raises(ContractViolation):
+        center.register('artifact:created', cb)
+
+
+async def test_triggering_an_undeclared_extension_junction_is_rejected():
+    center = HooksCenter()
+    with pytest.raises(ContractViolation):
+        await center.trigger('artifact:created', artifact='raw')
+
+
+def test_extension_junctions_are_not_shared_between_centers():
+    """声明挂在实例上而非模块全局：两个 Runtime 各有一个 HooksCenter，串台会让一个能力的切点
+    在另一个 Runtime 里凭空存在。"""
+    declaring = HooksCenter()
+    declaring.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
+
+    async def cb(**_: object) -> None:
+        return None
+
+    with pytest.raises(ContractViolation):
+        HooksCenter().register('artifact:created', cb)
