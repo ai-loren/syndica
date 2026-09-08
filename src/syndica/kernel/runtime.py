@@ -87,12 +87,10 @@ class _Slot:
     """本进程为一个 Agent 额外持有的东西。
 
     实例与任务在 `LocalAgentTable`，可序列化状态在 `AgentRegistry`；这里放的是两边都不该管的
-    第三样：它是怎么被造出来的（`factory`）、这轮工作结束后该去哪（`exit_mode`）、控制块与门，
-    以及**本进程的驱动任务到底接管过它没有**（`owned`——接管失败与从未 spawn 是两回事，`wait`
-    要分开答）。
+    第三样：这轮工作结束后该去哪（`exit_mode`）、控制块与门，以及**本进程的驱动任务到底接管过
+    它没有**（`owned`——接管失败与从未 spawn 是两回事，`wait` 要分开答）。
     """
 
-    factory: AgentFactory
     exit_mode: ExitMode
     control: ControlBlock
     gate: BrokerTurnGate
@@ -163,9 +161,7 @@ class Runtime:
         # put 先于 create_task：put 被拒时还没有任务可泄漏。两者之间没有挂起点，任务因此不会在
         # set_task 之前就跑起来。
         self._table.put(agent_id, agent)
-        self._slots[agent_id] = _Slot(
-            factory=factory, exit_mode=exit_mode, control=control, gate=gate
-        )
+        self._slots[agent_id] = _Slot(exit_mode=exit_mode, control=control, gate=gate)
         task = asyncio.create_task(self._drive(agent_id, agent, query), name=f'agent:{agent_id}')
         self._table.set_task(agent_id, task)
         return agent_id
