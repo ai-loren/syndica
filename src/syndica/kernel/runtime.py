@@ -99,6 +99,15 @@ _LIVE_STATUSES: tuple[AgentStatus, ...] = (
     AgentStatus.ABORTING,
 )
 
+# 挂起要求「有一个事件循环可以停下来」。这一个元组同时决定 `pause` 的早退拒绝与它那次 CAS 的
+# expected 集合：拆成两份写，两份就会各自漂移，而漂移的表现是「拒绝的理由说得通、CAS 却静默转不
+# 过去」，或者反过来——放行了一个转换不进去的状态，报出的却是一句关于 CAS 的话。
+_PAUSABLE_STATUSES: tuple[AgentStatus, ...] = (
+    AgentStatus.IDLE,
+    AgentStatus.RUNNING,
+    AgentStatus.WAITING,
+)
+
 
 @dataclass
 class _Slot:
@@ -549,24 +558,22 @@ class Runtime:
         slot, info = await self._control_target('pause', agent_id, named=named)
         if slot is None or info is None:
             return
-        if info.status in (AgentStatus.ZOMBIE, AgentStatus.ABORTING):
+        # 已经是 PAUSED 的一并放行：后置条件已经成立的操作成功返回。
+        if info.status not in (*_PAUSABLE_STATUSES, AgentStatus.PAUSED):
             self._refuse_control(
                 'pause',
                 agent_id,
                 named=named,
                 received=f'它当前是 {info.status.value}',
                 next_action=(
+                    f'只有 {" / ".join(status.value for status in _PAUSABLE_STATUSES)} 能挂起。'
                     'zombie 没有事件循环可停，而它的注册表状态正是复活它的凭据；'
                     'aborting 正在收尾。要让它彻底不再被叫醒就用 despawn'
                 ),
             )
             return
         # 先落注册表再落门：记不下 PAUSED 就不要真的停——那会停在一个谁都看不见的地方。
-        if not await self._switch(
-            agent_id,
-            new=AgentStatus.PAUSED,
-            allowed=(AgentStatus.IDLE, AgentStatus.RUNNING, AgentStatus.WAITING),
-        ):
+        if not await self._switch(agent_id, new=AgentStatus.PAUSED, allowed=_PAUSABLE_STATUSES):
             self._refuse_control(
                 'pause',
                 agent_id,

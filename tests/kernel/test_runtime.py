@@ -2030,6 +2030,40 @@ async def test_a_paused_agent_does_not_consume_its_next_message_and_resume_does_
     await runtime.shutdown()
 
 
+async def test_pause_and_resume_survive_three_full_round_trips_on_one_agent():
+    """挂起是电平、唤醒是边沿：把唤醒当电平用，第二次入园就退化成不让出控制权的空转。
+
+    这条性质要跨**第二次**往返才现身，只挂起 / 恢复一次的用例对它完全无感；而空转击穿每一层
+    asyncio 超时作用域，表现为整套测试挂死而不是一条红色断言。三轮而非两轮，消息顺序既非升序
+    亦非降序，反转后同样两者都不是。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    agent_id = await _resident(runtime, broker)
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    control = runtime._slots[agent_id].control
+
+    for parks, content in enumerate(('bravo', 'alpha', 'charlie'), start=2):
+        await runtime.pause(agent_id)
+        assert (await runtime.send(agent_id, content)).ok is True
+        assert await control.wait_until_parked(_TIMEOUT) is True
+        await runtime.resume(agent_id)
+        await asyncio.wait_for(broker.reach(agent_id, parks), _TIMEOUT)
+
+    assert [block.content for block in agent.context.current_traj] == [
+        'bravo',
+        'turn-0',
+        'alpha',
+        'turn-1',
+        'charlie',
+        'turn-2',
+    ]
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    assert control.paused is False
+    await runtime.shutdown()
+
+
 async def test_pause_and_resume_are_both_idempotent_on_an_agent_between_cycles():
     registry = _RecordingRegistry()
     broker = _SpyBroker(registry)
@@ -2099,6 +2133,28 @@ async def test_pausing_an_agent_inside_a_turn_returns_at_once_and_stops_it_at_th
         (AgentStatus.PAUSED, AgentStatus.RUNNING),
         (AgentStatus.RUNNING, AgentStatus.ZOMBIE),
     ]
+    await runtime.shutdown()
+
+
+async def test_pause_enters_from_every_status_that_still_has_an_event_loop_to_stop():
+    """不在可挂起集合里的活状态会静默转不过去：拒绝的理由说得通，而 CAS 根本没生效。
+
+    WAITING 由后续任务产出。三个而非一个，顺序既非声明序亦非其反转。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    for status in (AgentStatus.WAITING, AgentStatus.IDLE, AgentStatus.RUNNING):
+        agent_id = await _resident(runtime, broker)
+        assert await registry.compare_and_set_status(
+            agent_id, expected=AgentStatus.IDLE, new=status
+        )
+
+        await runtime.pause(agent_id)
+
+        assert await _status(runtime, agent_id) is AgentStatus.PAUSED
+        assert runtime._slots[agent_id].control.paused is True
+        assert registry.applied_of(agent_id)[-1] == (status, AgentStatus.PAUSED)
     await runtime.shutdown()
 
 
