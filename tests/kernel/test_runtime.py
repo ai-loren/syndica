@@ -3082,6 +3082,54 @@ async def test_a_second_abort_on_an_agent_already_winding_down_is_a_no_op():
     await runtime.shutdown()
 
 
+async def test_an_aborted_cycle_comes_back_out_of_aborting_on_both_exits():
+    """ABORTING 是 `ensure_active` 明文拒绝复活的状态：进得去出不来，这个 Agent 就对**所有**进程
+    失联，而 `send` 照答 ok=True。
+
+    出口不在 abort 手上——它由 `_LIVE_STATUSES` 经 `_finish`（→ zombie）与 `_oscillate`
+    （→ idle / paused）提供，而 abort 是第一个真的会写下 ABORTING 的操作。两边一旦不认同一张表，
+    这一步就静默变成单向门；三条出口各由不同的 exit_mode / 门状态走到，只走一条时其余的从未被
+    检查过。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    resident_block, reaped_block = _Block(), _Block()
+    resident = await runtime.spawn(_blocking(resident_block), query='go', exit_mode=ExitMode.IDLE)
+    reaped = await runtime.spawn(_blocking(reaped_block), query='go', exit_mode=ExitMode.ZOMBIE)
+    for blocker in (resident_block, reaped_block):
+        await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+
+    for agent_id in (resident, reaped):
+        await runtime.abort(agent_id)
+    for blocker in (resident_block, reaped_block):
+        blocker.release.set()
+    await asyncio.wait_for(broker.reach(resident, 1), _TIMEOUT)
+    await asyncio.wait_for(runtime.wait(reaped), _TIMEOUT)
+
+    assert [await _status(runtime, agent_id) for agent_id in (resident, reaped)] == [
+        AgentStatus.IDLE,
+        AgentStatus.ZOMBIE,
+    ]
+
+    # 出得来才叫得醒：卡在 aborting 上时 `ensure_active` 答 False，这条消息永远没人消费。
+    assert (await runtime.send(resident, 'carry on')).ok is True
+    await asyncio.wait_for(broker.reach(resident, 2), _TIMEOUT)
+    assert (await runtime.send(reaped, 'carry on')).ok is True
+    await asyncio.wait_for(runtime.wait(reaped), _TIMEOUT)
+
+    for agent_id in (resident, reaped):
+        agent = runtime._table.get(agent_id)
+        assert agent is not None
+        assert [(block.role, block.content) for block in agent.context.current_traj] == [
+            ('user', 'go'),
+            ('assistant', None),
+            ('tool', 'released'),
+            ('user', 'carry on'),
+            ('assistant', 'done'),
+        ]
+    await runtime.shutdown()
+
+
 async def _running_tree(runtime: Runtime, broker: _SpyBroker, registry: _RecordingRegistry):
     """一棵五个子代跨两代的树，全部推到 RUNNING，另有一个不在树上的 Agent。
 
