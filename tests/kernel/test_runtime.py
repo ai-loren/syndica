@@ -96,11 +96,21 @@ class _RecordingRegistry:
     转换记录是「注册表看到了什么」的唯一证据：EXIT 的条目紧接着被 unregister 抹掉，只看注册表
     的最终内容分不出它中途走过哪些状态。尝试与生效分开记：`_switch` 逐个试 CAS，失败的那些是
     实现细节，走过的状态路径才是行为。
+
+    `hold_before` 把「转去某个状态」的 CAS 停在 `switches` 这道闸上：`_finish` 摘完队列、还没
+    转 ZOMBIE 的那一刻，在 Runtime 外面没有别的观测点。
     """
 
-    def __init__(self, *, deny: tuple[AgentStatus, AgentStatus] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        deny: tuple[AgentStatus, AgentStatus] | None = None,
+        hold_before: AgentStatus | None = None,
+    ) -> None:
         self._inner = InMemoryAgentRegistry()
         self._deny = deny
+        self._hold_before = hold_before
+        self.switches = _Hold()
         self.transitions: list[tuple[str, AgentStatus, AgentStatus]] = []
         self.applied: list[tuple[str, AgentStatus, AgentStatus]] = []
 
@@ -113,6 +123,8 @@ class _RecordingRegistry:
     async def compare_and_set_status(
         self, agent_id: str, *, expected: AgentStatus, new: AgentStatus
     ) -> bool:
+        if new is self._hold_before:
+            await self.switches.passing(agent_id)
         self.transitions.append((agent_id, expected, new))
         if self._deny == (expected, new):
             return False
@@ -206,6 +218,9 @@ class _SpyBroker:
     def on_missing_queue(self, cb: MissingQueueCallback) -> None:
         self._inner.on_missing_queue(cb)
 
+    def off_missing_queue(self, cb: MissingQueueCallback) -> None:
+        self._inner.off_missing_queue(cb)
+
     async def _seen_status(self, agent_id: str) -> AgentStatus | None:
         if self._registry is None:
             return None
@@ -291,6 +306,9 @@ class _HeldBroker:
 
     def on_missing_queue(self, cb: MissingQueueCallback) -> None:
         self._inner.on_missing_queue(cb)
+
+    def off_missing_queue(self, cb: MissingQueueCallback) -> None:
+        self._inner.off_missing_queue(cb)
 
 
 def _tools() -> dict[str, Tool]:
@@ -1708,3 +1726,69 @@ async def test_the_runtimes_callback_takes_its_turn_in_the_chain_and_only_stops_
     assert (await runtime.send(agent_id, 'quiet', activate=False)).ok is False
     assert seen == ['bravo', 'alpha', 'charlie']
     await runtime.shutdown()
+
+
+async def test_the_callback_declines_rather_than_claim_a_mailbox_it_did_not_build(
+    caplog: pytest.LogCaptureFixture,
+):
+    """回调答 True 的含义是「已认领**并把邮箱建好**」（见 `MessageBroker.on_missing_queue`）。
+
+    活驱动那一支不建邮箱，而 `_finish` 摘完队列、还没转 ZOMBIE 的那一刻正落在这里。谎报认领会
+    掐断回调链：后面那些本来能把邮箱建起来的回调根本不会被问到。
+    """
+    registry = _RecordingRegistry(hold_before=AgentStatus.ZOMBIE)
+    broker = InMemoryMessageBroker()
+    runtime = Runtime(registry=registry, broker=broker)
+    seen: list[str] = []
+    for name in ('bravo', 'alpha', 'charlie'):
+        broker.on_missing_queue(_declining(name, seen))
+    registry.switches.close()
+    agent_id = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.ZOMBIE)
+    await asyncio.wait_for(registry.switches.reach(1), _TIMEOUT)
+
+    delivered = await runtime.send(agent_id, 'while it winds down')
+
+    assert seen == ['bravo', 'alpha', 'charlie']
+    # 收据仍然诚实：没人把邮箱建起来，投递就该失败——代价本来只在链上，不在数据上。
+    assert delivered.ok is False
+    assert delivered.reason is not None
+    _assert_three_part(delivered.reason)
+    assert caplog.records == []
+
+    registry.switches.open()
+    await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    await runtime.shutdown()
+
+
+async def test_shutdown_takes_its_own_callback_off_a_shared_brokers_chain_and_only_its_own(
+    caplog: pytest.LogCaptureFixture,
+):
+    """回调链归 broker，活得比任何一个 Runtime 长。
+
+    不摘，共享 broker 上每个关停的 Runtime 都在链上留一条永远答 False 的死回调，并靠那条引用
+    把自己连同持有的 Agent 实例钉在内存里；摘多了，别的 Runtime 的 ZOMBIE 再也复活不了。
+    三个而非一个、关掉的是中间那个：只关首尾时「摘掉自己那条」与「摘掉第一条」「摘掉最后一条」
+    是同一个答案。
+    """
+    broker = InMemoryMessageBroker()
+    runtimes = [Runtime(broker=broker) for _ in range(3)]
+    llms = [
+        ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+        for _ in range(3)
+    ]
+    ids = [await runtimes[index].spawn(_factory(llms[index]), query='go') for index in range(3)]
+    for index in range(3):
+        await runtimes[index].wait(ids[index])
+
+    await runtimes[1].shutdown()
+
+    assert broker._callbacks == [runtimes[0]._on_missing_queue, runtimes[2]._on_missing_queue]
+    assert (await runtimes[1].send(ids[1], 'too late')).ok is False
+    for index in (0, 2):
+        assert (await runtimes[index].send(ids[index], 'keep going')).ok is True
+        await asyncio.wait_for(runtimes[index].wait(ids[index]), _TIMEOUT)
+    assert [len(llm.calls) for llm in llms] == [2, 1, 2]
+    # 「这个 Agent 不归我」是链上设计好的一支，转手不该报错。
+    assert caplog.records == []
+    for index in (0, 2):
+        await runtimes[index].shutdown()

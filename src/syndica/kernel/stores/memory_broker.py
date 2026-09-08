@@ -145,3 +145,7 @@ class InMemoryMessageBroker:
 
     def on_missing_queue(self, cb: MissingQueueCallback) -> None:
         self._callbacks.append(cb)
+
+    def off_missing_queue(self, cb: MissingQueueCallback) -> None:
+        if cb in self._callbacks:
+            self._callbacks.remove(cb)

@@ -79,9 +79,8 @@ AgentFactory = Callable[[HooksCenter, EventBus], BaseAgent]
 
 # 「这一次 send 允不允许把目标叫醒」。用 ContextVar 而不是 Runtime 上的一个字段：它的作用域是
 # **这一次调用**，两个并发 send 的意图因此互不污染；放在实例上则第二个 send 会读到第一个的开关。
-# 代价是一条对 broker 实现的硬约束：on_missing_queue 必须跑在 publish 那次调用的上下文里——同一个
-# 任务，或由它 create_task 出来的任务。改由一个早已存在的后台任务去调回调的实现读不到这一位，
-# activate=False 于是静默失效，而失效表现为「一条消息叫醒了一个不该醒的 Agent」，不报任何错。
+# 代价是 broker 必须让回调看得见调用方 publish 时的上下文；这条已经是 MessageBroker 的明文契约
+# 并由契约套件强制，见 protocols/broker.py。
 _ACTIVATION_ALLOWED: ContextVar[bool] = ContextVar('syndica_activation_allowed', default=True)
 
 # 本进程的事件循环认得的活状态：从其中任何一个都可以被它转去另一个活状态或 ZOMBIE。不在这里的
@@ -492,7 +491,15 @@ class Runtime:
         return task is not None and not task.done()
 
     async def _on_missing_queue(self, agent_id: str) -> bool:
+        """回调答的是「邮箱建好了没有」，不是「它活着没有」；两者只在活驱动这一支上分叉。
+
+        活驱动而邮箱不在，只可能落在 `_finish` 摘掉队列之后。此刻把邮箱建回来，消息会落进一个
+        再没有消费者的地方；答 True 却没建好，则掐断回调链——本来能把它建起来的下一个回调不会
+        被问到。
+        """
         if not _ACTIVATION_ALLOWED.get():
+            return False
+        if self._has_live_driver(agent_id):
             return False
         return await self.ensure_active(agent_id)
 
@@ -508,6 +515,9 @@ class Runtime:
         """
         # 置位在 gather 之前：与本次关机并发的 spawn 既赶不上取消名单、事件又发不出去。
         self._closed = True
+        # 摘回调也在 gather 之前：链是 broker 的，活得比本 Runtime 长。不摘，共享 broker 上每个
+        # 关停的 Runtime 都留一条永远答 False 的死回调，并靠那条引用把自己整个钉在内存里。
+        self.broker.off_missing_queue(self._on_missing_queue)
         tasks = [
             task
             for agent_id in self._table.agent_ids()

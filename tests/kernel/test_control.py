@@ -96,6 +96,9 @@ class _CountingBroker:
     def on_missing_queue(self, cb) -> None:
         self.inner.on_missing_queue(cb)
 
+    def off_missing_queue(self, cb) -> None:
+        self.inner.off_missing_queue(cb)
+
 
 async def test_a_fresh_control_block_lets_the_turn_loop_through():
     control = ControlBlock()

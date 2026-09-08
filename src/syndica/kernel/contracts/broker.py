@@ -83,6 +83,16 @@ async def _answered_without_waiting(call: Awaitable[_T], label: str) -> _T:
     return answer
 
 
+def _declining(name: str, asked: list[str]) -> MissingQueueCallback:
+    """记名后放弃的回调：一条回调在链上的位次、以及它到底有没有被问到，只有它记得下来。"""
+
+    async def callback(agent_id: str) -> bool:
+        asked.append(name)
+        return False
+
+    return callback
+
+
 async def _park(task: asyncio.Task[Any], call: str) -> None:
     """等到 task 真的停在等待点上。没停住的话后面的唤醒断言就是空转，所以这里断掉。"""
     await asyncio.sleep(_PARK_DELAY)
@@ -402,21 +412,13 @@ class MessageBrokerContract(ContractSuite):
         self, broker: MessageBroker
     ) -> None:
         asked: list[str] = []
-
-        def declining(name: str) -> MissingQueueCallback:
-            async def callback(agent_id: str) -> bool:
-                asked.append(name)
-                return False
-
-            return callback
-
         first, *rest = _CHAIN_NAMES
-        broker.on_missing_queue(declining(first))
+        broker.on_missing_queue(_declining(first, asked))
         assert (await broker.publish('early', _msg())).ok is False
         assert asked == [first]
 
         for name in rest:
-            broker.on_missing_queue(declining(name))
+            broker.on_missing_queue(_declining(name, asked))
         asked.clear()
         assert (await broker.publish('late', _msg())).ok is False
 
@@ -428,6 +430,31 @@ class MessageBrokerContract(ContractSuite):
             '而共享 broker 上这意味着此后构造的 Runtime 复活不了自己的 ZOMBIE——'
             '整套契约在这种实现上仍然全绿。'
         )
+
+    async def test_a_detached_callback_is_no_longer_asked(self, broker: MessageBroker) -> None:
+        asked: list[str] = []
+        chain = {name: _declining(name, asked) for name in _CHAIN_NAMES}
+        for callback in chain.values():
+            broker.on_missing_queue(callback)
+        # 摘中间那条：只摘首尾时，「摘掉点名的那条」与「摘掉第一条」「摘掉最后一条」
+        # 是同一个答案。
+        head, detached, tail = _CHAIN_NAMES
+        broker.off_missing_queue(chain[detached])
+
+        assert (await broker.publish('lazy', _msg())).ok is False
+        assert asked == [head, tail]
+
+    async def test_off_missing_queue_for_a_callback_never_registered_is_a_noop(
+        self, broker: MessageBroker
+    ) -> None:
+        """「它不在链上」已经成立，无从表达失败；抛异常会逼调用方先探测再摘。"""
+        asked: list[str] = []
+        for name in _CHAIN_NAMES:
+            broker.on_missing_queue(_declining(name, asked))
+        broker.off_missing_queue(_declining('stranger', asked))
+
+        assert (await broker.publish('lazy', _msg())).ok is False
+        assert asked == list(_CHAIN_NAMES)
 
     async def test_ensure_queue_keeps_messages_already_queued(self, broker: MessageBroker) -> None:
         """「队列存在」已经成立，重复 ensure 必须成功且什么都不动。"""

@@ -24,7 +24,7 @@
 
 抛异常还是返回，取决于调用方的意图能否表达：**意图无法表达的操作抛异常，后置条件已经成立的
 操作成功返回**。`ensure_queue` 队列已存在时成功（「队列存在」已经成立），`remove_queue` 队列
-不存在时也成功（「队列不存在」已经成立）。
+不存在时也成功（「队列不存在」已经成立），`off_missing_queue` 摘一条从未注册过的回调时同理。
 """
 
 from __future__ import annotations
@@ -114,5 +114,13 @@ class MessageBroker(Protocol):
 
         调用时机、顺序、跑在哪个上下文里、列表何时读，见模块 docstring——四者都是契约的一部分，
         不是实现的自由度。
+        """
+        ...
+
+    def off_missing_queue(self, cb: MissingQueueCallback) -> None:
+        """摘掉一条已注册的回调。没注册过是 no-op。
+
+        注册没有配套的注销，共享 broker 上每个已经关停的 Runtime 就在链上留一条永不回收的死
+        回调，并靠那条引用把整个 Runtime 连同它持有的 Agent 实例一起钉在内存里。
         """
         ...
