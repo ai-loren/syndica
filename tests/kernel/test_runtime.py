@@ -69,6 +69,27 @@ class _Block(Tool):
         return ToolResult(output='released')
 
 
+class _Gate(Tool):
+    """每次调用停在自己的那道闸上：一个周期里需要两个可控停点时用它。
+
+    第二个停点是「暂存队列已经装上东西、而这个周期还没结束」这一刻的唯一观测点——延迟消息
+    只在轮边界进暂存，而周期结束时它们又立刻被取走。
+    """
+
+    def __init__(self, stops: int) -> None:
+        self.entered = [asyncio.Event() for _ in range(stops)]
+        self.release = [asyncio.Event() for _ in range(stops)]
+        self._calls = 0
+
+    async def execute(self) -> ToolResult:
+        """一直等到测试放行本次调用。"""
+        index = self._calls
+        self._calls += 1
+        self.entered[index].set()
+        await self.release[index].wait()
+        return ToolResult(output=f'released {index}')
+
+
 class _RecordingRegistry:
     """记下每一次状态转换（尝试的与真的写进去的），并可让指定的一次转换失败。
 
@@ -826,28 +847,33 @@ async def test_deferred_messages_wait_for_the_whole_cycle_then_start_the_next_on
 async def test_one_agents_deferred_messages_never_reach_another_agents_context():
     """暂存队列是 per-agent 的：共用一个控制块会让一个 Agent 的延迟消息进到另一个的上下文里。"""
     runtime = Runtime()
-    addressed_blocker = _Block()
+    gate = _Gate(2)
     quiet_blocker = _Block()
     llm = ScriptedLLM(
         [
-            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Block', arguments='{}')]),
+            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Gate', arguments='{}')]),
+            ScriptedTurn(tool_calls=[ToolCall(id='c2', name='Gate', arguments='{}')]),
             ScriptedTurn(content='first cycle done'),
             ScriptedTurn(content='second cycle done'),
         ]
     )
-    addressed = await runtime.spawn(_factory(llm, tools={'Block': addressed_blocker}), query='go')
+    addressed = await runtime.spawn(_factory(llm, tools={'Gate': gate}), query='go')
     quiet = await runtime.spawn(_blocking(quiet_blocker), query='go')
-    for blocker in (addressed_blocker, quiet_blocker):
-        await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    await asyncio.wait_for(gate.entered[0].wait(), _TIMEOUT)
+    await asyncio.wait_for(quiet_blocker.entered.wait(), _TIMEOUT)
     for content in ('bravo', 'alpha', 'charlie'):
         assert (await runtime.send(addressed, content, trigger=Trigger.DEFERRED)).ok is True
 
-    # 先让没被寻址的那个跑完：它此刻若看得见这三条，就会替收件人把它们消费掉。
+    # 放行第一个停点：第二轮的门把这三条挪进暂存，随后停在第二个停点上，周期还没结束。
+    gate.release[0].set()
+    await asyncio.wait_for(gate.entered[1].wait(), _TIMEOUT)
+
+    # 此刻让没被寻址的那个走到它自己的周期边界：它若看得见那份暂存，就会替收件人消费掉。
     quiet_blocker.release.set()
     quiet_ctx = await asyncio.wait_for(runtime.wait(quiet), _TIMEOUT)
     assert [block.content for block in quiet_ctx.current_traj if block.role == 'user'] == ['go']
 
-    addressed_blocker.release.set()
+    gate.release[1].set()
     ctx = await asyncio.wait_for(runtime.wait(addressed), _TIMEOUT)
     assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
         'go',
