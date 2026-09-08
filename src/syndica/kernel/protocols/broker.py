@@ -11,6 +11,13 @@
   publish 是唯一会失败的写操作，它以返回值报告失败。
 - **on_missing_queue 每次 publish 最多触发一轮**：按注册顺序调用，停在第一个返回 True 的回调
   上，不重复调用已经调过的回调。
+- **回调跑在 publish 那次调用的上下文里**：同一个任务，或由它 `create_task` 出来的任务（新任务
+  复制当前 Context）。回调因此读得到调用方在 publish 之前设下的 ContextVar，而 Runtime 正是靠
+  一个 ContextVar 表达「这一次 send 允不允许把目标叫醒」。改由一个早已存在的后台任务派发回调的
+  实现读不到那一位，抑制于是静默失效——一条消息叫醒了一个本该继续睡的 Agent，不报任何错。
+- **回调列表每次 publish 现读**：在首次 publish 时把它冻结成快照的实现满足上面每一条，却让此后
+  注册的回调永远不被调用。共享 broker 上这意味着第一次 missing-queue publish 之后构造的
+  Runtime 复活不了自己的 ZOMBIE。
 - **等待上限是方法参数，不是让调用方在外面套 `asyncio.timeout`**：远端实现要把它下推给服务端
   （Redis `XREAD BLOCK`），在本地包一层取消域只会把已经阻塞住的服务端连接留在那里。ruff 的
   ASYNC109 因此在本模块与内存实现里按文件豁免（见 pyproject）。
@@ -104,5 +111,8 @@ class MessageBroker(Protocol):
         """注册按需激活回调。「队列不存在」是懒启动与 ZOMBIE 复活的触发点。
 
         回调返回 True 表示已认领并把邮箱建好，False 表示放弃、让下一个回调接手。
+
+        调用时机、顺序、跑在哪个上下文里、列表何时读，见模块 docstring——四者都是契约的一部分，
+        不是实现的自由度。
         """
         ...

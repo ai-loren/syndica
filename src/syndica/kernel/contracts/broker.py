@@ -14,11 +14,12 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Awaitable
+from contextvars import ContextVar
 from typing import Any, TypeVar
 
 from syndica.kernel.contracts.base import ContractSuite
 from syndica.kernel.message import Message
-from syndica.kernel.protocols.broker import MessageBroker
+from syndica.kernel.protocols.broker import MessageBroker, MissingQueueCallback
 
 __all__ = ['MessageBrokerContract']
 
@@ -42,6 +43,14 @@ _NOISE_INTERVAL = 0.005
 # 远远越过 _MAX_PROMPT_REPLY；上限取秒级而非微秒级，一次网络往返与负载抖动都远在它之下。
 _TIMEOUT_NEVER_REACHED = 30.0
 _MAX_PROMPT_REPLY = 1.0
+
+# 回调链上每个回调都必须读得到调用方在 publish 之前设下的这一位。名字带前缀是因为 ContextVar
+# 是进程全局的，宿主自己的同名变量会与它撞车。
+_PUBLISHER_MARK: ContextVar[str] = ContextVar('syndica_contract_publisher_mark', default='')
+
+# 陪跑回调的名字，顺序既非升序（alpha / bravo / charlie）亦非降序，反转后同样两者都不是：
+# 回调链是一个顺序与多重性都承重的集合，基数取到 3 才挡得住排序类实现。
+_CHAIN_NAMES = ('bravo', 'alpha', 'charlie')
 
 
 def _msg(content: str = 'hi', *, correlation_id: str | None = None) -> Message:
@@ -355,6 +364,70 @@ class MessageBrokerContract(ContractSuite):
         result = await broker.publish('lazy', _msg())
         assert result.ok is False
         assert result.reason is not None
+
+    async def test_every_missing_queue_callback_runs_in_the_publishers_context(
+        self, broker: MessageBroker
+    ) -> None:
+        seen: list[tuple[str, str]] = []
+
+        def watching(name: str) -> MissingQueueCallback:
+            async def callback(agent_id: str) -> bool:
+                seen.append((name, _PUBLISHER_MARK.get()))
+                if name != _CHAIN_NAMES[-1]:
+                    return False
+                await broker.ensure_queue(agent_id)
+                return True
+
+            return callback
+
+        for name in _CHAIN_NAMES:
+            broker.on_missing_queue(watching(name))
+        token = _PUBLISHER_MARK.set('set-before-publish')
+        try:
+            assert (await broker.publish('lazy', _msg())).ok is True
+        finally:
+            _PUBLISHER_MARK.reset(token)
+
+        expected = [(name, 'set-before-publish') for name in _CHAIN_NAMES]
+        assert seen == expected, (
+            '期望链上每个回调都跑在 publish 那次调用的上下文里，因而读得到调用方在 publish 之前'
+            f' 设下的 ContextVar: {expected}。'
+            f' 实际 (回调, 它读到的值) = {seen}。'
+            ' 在 publish 自己的任务里 await 回调，或用 create_task 派生（新任务复制当前 Context）。'
+            ' 交给一个早已存在的后台任务派发就读不到这一位，调用方「这次投递不要叫醒它」的意图'
+            '会静默失效：一条消息叫醒了一个本该继续睡的 Agent，而没有任何错误被报出来。'
+        )
+
+    async def test_a_callback_registered_after_an_earlier_publish_still_joins_the_chain(
+        self, broker: MessageBroker
+    ) -> None:
+        asked: list[str] = []
+
+        def declining(name: str) -> MissingQueueCallback:
+            async def callback(agent_id: str) -> bool:
+                asked.append(name)
+                return False
+
+            return callback
+
+        first, *rest = _CHAIN_NAMES
+        broker.on_missing_queue(declining(first))
+        assert (await broker.publish('early', _msg())).ok is False
+        assert asked == [first]
+
+        for name in rest:
+            broker.on_missing_queue(declining(name))
+        asked.clear()
+        assert (await broker.publish('late', _msg())).ok is False
+
+        assert asked == list(_CHAIN_NAMES), (
+            f'期望回调列表每次 publish 现读，因此第一次 publish 之后注册的回调照样进链: '
+            f'{list(_CHAIN_NAMES)}。'
+            f' 实际这一轮问到的是 {asked}。'
+            ' 别在首次 publish 时把列表冻结成快照：那之后注册的回调永远不会被调用，'
+            '而共享 broker 上这意味着此后构造的 Runtime 复活不了自己的 ZOMBIE——'
+            '整套契约在这种实现上仍然全绿。'
+        )
 
     async def test_ensure_queue_keeps_messages_already_queued(self, broker: MessageBroker) -> None:
         """「队列存在」已经成立，重复 ensure 必须成功且什么都不动。"""
