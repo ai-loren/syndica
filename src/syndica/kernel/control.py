@@ -101,7 +101,11 @@ class ControlBlock:
         self._wakeup.set()
 
     def take_abort(self) -> bool:
-        """取走中止位并清位。一次 abort 只兑现一次。"""
+        """取走中止位并清位。一次 abort 只兑现一次。
+
+        `hold_until_runnable` 是唯一的预期消费者。中止位是一次性边沿，别处抢先取走会让停在挂起
+        门上的执行体收不到它、静默重新入园，而 `request_abort` 的调用方拿不到任何反馈。
+        """
         taken = self._abort_requested
         self._abort_requested = False
         return taken
@@ -127,8 +131,12 @@ class ControlBlock:
         """等到有执行体真的停在挂起门上；超时返回 False。
 
         这是一个问句，答不出就答 False，不抛异常——与 `MessageBroker.wait_for_messages` 同一条
-        一致性规则。上限因此是本方法的参数（ASYNC109 就地豁免，同 pyproject 给 broker 两文件的
-        那两条）：换成调用方在外面套 `asyncio.timeout`，答不出就变成了 TimeoutError。
+        一致性规则，上限因此是本方法的参数。
+
+        **返回前必须复检 `_parked`。** 被 `_parked_event` 唤醒与执行到这里之间隔着若干就绪队列
+        槽位（3.11 的 `asyncio.wait_for` 把内层协程包成 Task 再挂 done-callback，实测这段窗口
+        容得下先于本任务入队的每一个回调），公园可能已经在这期间被腾空。答案说的是**此刻**有人
+        停着，不是「曾经有人停过」。
         """
         if self._parked > 0:
             return True
