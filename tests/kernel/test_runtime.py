@@ -2825,7 +2825,8 @@ async def test_abort_pierces_a_pause_taken_inside_a_turn_without_lifting_it():
 async def test_abort_on_an_agent_parked_at_the_pause_gate_is_taken_at_once_and_it_stays_paused():
     """挂起态的执行体停在门上，`request_abort` 的唤醒边沿当场送到——位不会 armed 着等下一条消息。
 
-    这正是 PAUSED 与 IDLE 的分界，也是允许前者、拒绝后者的全部理由。
+    与它同名 PAUSED 的另一支（挂起着而邮箱为空）停在邮箱上，收不到这条边沿：注册表把两处叫成
+    同一个取值，只有 `parked` 与 `parked_on_mailbox` 分得出。
     """
     registry = _RecordingRegistry()
     broker = _SpyBroker(registry)
