@@ -2503,6 +2503,49 @@ async def test_a_descendant_whose_transition_is_refused_is_skipped_without_stopp
     await runtime.shutdown()
 
 
+async def test_a_recursive_pause_walks_through_a_descendant_another_process_holds(
+    caplog: pytest.LogCaptureFixture,
+):
+    """树在共享注册表里，本进程持有哪些实例与树的形状无关。
+
+    在第一个外人那里停住、或者干脆不往下走，会漏掉它下面属于我们的整片子树——而遍历是 pause /
+    abort / despawn 三条路的公共前置。外人排在三个子代的**中间**：排在末位时「走过它」与「走到
+    它为止」是同一个答案。
+    """
+    caplog.set_level(logging.INFO)
+    registry = InMemoryAgentRegistry()
+    broker = _SpyBroker(registry)
+    owner = Runtime(registry=registry, broker=broker)
+    peer = Runtime(registry=registry, broker=broker)
+    root = await _resident(owner, broker)
+    bravo = await _resident(owner, broker, parent_id=root)
+    outsider = await _resident(peer, broker, parent_id=root)
+    charlie = await _resident(owner, broker, parent_id=root)
+    # 外人下面挂着的仍然是本进程的 Agent：只有走过外人才够得着它。
+    delta = await _resident(owner, broker, parent_id=outsider)
+
+    await owner.pause(root, recursive=True)
+
+    ours = (root, bravo, charlie, delta)
+    assert [await _status(owner, agent_id) for agent_id in ours] == [AgentStatus.PAUSED] * 4
+    assert [owner._slots[agent_id].control.paused for agent_id in ours] == [True] * 4
+
+    assert await _status(owner, outsider) is AgentStatus.IDLE
+    assert peer._slots[outsider].control.paused is False
+    assert (await peer.send(outsider, 'go ahead')).ok is True
+    await asyncio.wait_for(broker.reach(outsider, 2), _TIMEOUT)
+    outside_agent = peer._table.get(outsider)
+    assert outside_agent is not None
+    assert [block.content for block in outside_agent.context.current_traj] == ['go ahead', 'turn-0']
+
+    assert [record.levelname for record in caplog.records] == ['INFO']
+    skipped = caplog.records[0].getMessage()
+    assert outsider in skipped
+    assert delta not in skipped and charlie not in skipped
+    await peer.shutdown()
+    await owner.shutdown()
+
+
 async def test_a_pause_the_registry_refuses_is_reported_and_parks_nothing():
     """记不下 PAUSED 就不要真的停——那会停在一个谁都看不见的地方，而调用方以为按住了它。"""
     registry = _RecordingRegistry(deny=(AgentStatus.IDLE, AgentStatus.PAUSED))
