@@ -50,11 +50,11 @@ children 上摘掉、不动自己的子代，于是删掉一个有子代的父�
 到（`children_of` 只能从父往下问）。钉住期间 `spawn` 拒绝往树上挂新子代、`ensure_active` 拒绝复活
 树里的节点——后者若放行，复活出来的驱动会在条目被摘掉时失去句柄，成为永不被取消的孤儿。
 
-**钉住按「一次调用」计，不是进程级的一个开关。** 同一个节点可以同时落在多条在飞级联的钉住范围里
-（拆除中途重入的 hook、两次重叠的 `despawn`、`ExitMode.EXIT` 撞上一次外部 `despawn`），而释放写在
-`finally` 里、因此**一个节点都没拆就退出时照样执行**。无条件释放于是会撤掉别人放上去的那一份：这棵
-树重新开放挂子代，而新子代不在别人早已冻结好的拆除名单里，它的 `parent_id` 永久指向一个已被注销
-的父。
+**钉住与拆除的占位都按「一次调用」计，不是进程级的一个开关。** 同一个节点可以同时落在多条在飞
+级联里（拆除中途重入的 hook、两次重叠的 `despawn`、`ExitMode.EXIT` 撞上一次外部 `despawn`），而
+释放写在 `finally` 里、因此**一个节点都没拆就退出时照样执行**。无条件释放于是会撤掉别人的那一份：
+钉住撤早了这棵树重新开放挂子代，而新子代不在别人早已冻结好的拆除名单里，它的 `parent_id` 永久指向
+一个已被注销的父；拆除占位撤早了同一次消失会被报两遍 `AGENT_DESPAWN`。
 
 **`_slots` 的键恒为实例表键的子集。** EXIT 把队列、注册表条目、实例表条目与 slot 一起摘掉，于是
 本类持有的每一份 Context 都对应一个仍可寻址的 Agent，随时间无界增长的只有活着的 Agent 数。代价
@@ -214,6 +214,9 @@ class Runtime:
         # 同时落在多条级联的钉住范围里，而释放必须只撤掉本次调用自己放上去的那一份（理由见模块
         # 文档）。成员判定仍是 `agent_id in self._doomed`。
         self._doomed: dict[str, int] = {}
+        # 此刻正在被 `_destroy` 拆的条目 → 拆完时置位的那个事件。用来把同一个条目上重叠的拆除
+        # 串起来：痕迹检查自带一个 await，两个重叠的拆除都会先看到「它还在」。
+        self._destroying: dict[str, asyncio.Event] = {}
         self._closed = False
         # 「队列不存在」是懒启动与 ZOMBIE 复活的唯一触发点（spec §4.4）。接在这里，而不是让每个
         # 调用方自己先判断再激活——那样「复活」就有了 N 份实现。
@@ -254,14 +257,18 @@ class Runtime:
             )
         )
         await self.broker.ensure_queue(agent_id)
-        # `_closed` 在方法开头读过一次，此后隔着 register / ensure_queue 两个 Protocol await。任何
-        # 会挂起的 store 下，并发的 shutdown 会在 gather 返回之后才走到这里，于是建出一个永不被
-        # 取消、永不被 await 的驱动，并把一个再没有订阅者的 Agent 留在注册表里。复检与 create_task
-        # 之间没有挂起点，因此这道守卫按得住；建好的两样按逆序还回去，不留半个 Agent。
+        # `_closed` 与 `_doomed` 在方法开头各读过一次，此后隔着 register / ensure_queue 两个
+        # Protocol await。任何会挂起的 store 下，并发的 shutdown / despawn 会在这两个 await 期间
+        # 插进来，于是：关机那一支建出一个永不被取消、永不被 await 的驱动，并把一个再没有订阅者的
+        # Agent 留在注册表里；拆除那一支交出一个级联刚刚注销掉的 agent_id 却报成功，留下一份属于
+        # 不可寻址 Agent 的 Context，并让同一个 agent_id 先 `AGENT_DESPAWN` 后 `AGENT_SPAWN`。
+        # 复检与 create_task 之间没有挂起点，因此这两道守卫按得住。
         if self._closed:
-            await self.broker.remove_queue(agent_id)
-            await self.registry.unregister(agent_id)
+            await self._unbuild(agent_id)
             raise _already_shut_down()
+        if parent_id is not None and parent_id in self._doomed:
+            await self._unbuild(agent_id)
+            raise _parent_being_destroyed(parent_id)
         # put 先于 create_task：put 被拒时还没有任务可泄漏。两者之间没有挂起点，任务因此不会在
         # set_task 之前就跑起来。
         self._table.put(agent_id, agent)
@@ -270,6 +277,15 @@ class Runtime:
         self._table.set_task(agent_id, task)
         await self.hooks.trigger(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)
         return agent_id
+
+    async def _unbuild(self, agent_id: str) -> None:
+        """把 `spawn` 已经建好的两样按逆序还回去，不留半个 Agent。
+
+        两步都对「已经不在」是 no-op（Protocol 明文），因此一条并发的级联抢先摘掉其中之一时这里
+        照样收干净——那正是 `_doomed` 这道复检要处理的局面。
+        """
+        await self.broker.remove_queue(agent_id)
+        await self.registry.unregister(agent_id)
 
     async def _drive(self, agent_id: str, agent: BaseAgent, query: str | None) -> None:
         # `get` 而不是下标：任务是 create_task 排上去的，在它真正跑起来之前 slot 可能已经被摘掉。
@@ -820,30 +836,51 @@ class Runtime:
                 del self._doomed[agent_id]
 
     async def _destroy(self, agent_id: str) -> None:
-        """拆掉一个 Agent 的全部痕迹。幂等。
+        """拆掉一个 Agent 的全部痕迹。幂等，且 `AGENT_DESPAWN` 对一次消失恰好报一次。
 
         本进程没有它的实例时只摘条目与队列：树的形状与本进程持有哪些实例无关。
         """
-        # 已经没有痕迹可拆就什么都不做。`AGENT_DESPAWN` 报的是「这个条目刚刚消失」这个既成事实，
-        # 对一个早已不在的条目再报一次是个假事件，而本方法会被走到两次——`kill` 的收割任务与驱动
-        # 任务自己的 finally 都通向它。
-        if (
-            agent_id not in self._slots
-            and self._table.get(agent_id) is None
-            and await self.registry.get(agent_id) is None
-        ):
+        # 「还有没有痕迹可拆」自带一个 await，因此它是 check-then-act：两个重叠的拆除都会先看到
+        # 「它还在」，然后各自摘一遍、各自报一次 `AGENT_DESPAWN`——那个切点报的是既成事实，重复报
+        # 就是假事件。占位在痕迹检查**之前**，两者之间没有挂起点。
+        in_flight = self._destroying.get(agent_id)
+        if in_flight is not None:
+            # 第二个**等**而不是早退：调用方的后置条件是「回来之后条目不在了」，早退等于把它转交
+            # 给另一个执行体，于是返回的那一刻它还不成立。等的是那个后置条件，不是那次拆除的全程
+            # ——痕迹已经没了就当场回答，别停在别人的 `AGENT_DESPAWN` hook 上：那个切点只是观察者，
+            # 它跑多久不属于 despawn 的承诺，而它可以在拆除之内重入 Runtime。
+            if await self._has_traces(agent_id):
+                await in_flight.wait()
             return
-        task = self._table.get_task(agent_id)
-        # `is not current_task()`：`ExitMode.EXIT` 是在驱动任务自己的 finally 里走到这条路的，
-        # 取消并 await 自己就是永久挂死。
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-            await asyncio.wait({task})
-        await self.broker.remove_queue(agent_id)
-        await self.registry.unregister(agent_id)
-        self._table.pop(agent_id)
-        self._slots.pop(agent_id, None)
-        await self.hooks.trigger(Junction.AGENT_DESPAWN, agent_id=agent_id)
+        torn_down = asyncio.Event()
+        self._destroying[agent_id] = torn_down
+        try:
+            if not await self._has_traces(agent_id):
+                return
+            task = self._table.get_task(agent_id)
+            # `is not current_task()`：`ExitMode.EXIT` 是在驱动任务自己的 finally 里走到这条路的，
+            # 取消并 await 自己就是永久挂死。
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+                await asyncio.wait({task})
+            await self.broker.remove_queue(agent_id)
+            await self.registry.unregister(agent_id)
+            self._table.pop(agent_id)
+            self._slots.pop(agent_id, None)
+            await self.hooks.trigger(Junction.AGENT_DESPAWN, agent_id=agent_id)
+        finally:
+            # 只摘自己那一份：清掉整张表会撤掉别的在飞拆除的占位，于是它正拆着的那个节点会被
+            # 第二次拆除认成「还在」，同一次消失报两遍。
+            self._destroying.pop(agent_id, None)
+            torn_down.set()
+
+    async def _has_traces(self, agent_id: str) -> bool:
+        """本进程或注册表里还留着这个 Agent 的东西吗。"""
+        return (
+            agent_id in self._slots
+            or self._table.get(agent_id) is not None
+            or await self.registry.get(agent_id) is not None
+        )
 
     async def _reap(self, agent_id: str, slot: _Slot) -> None:
         """在事件循环之外收尾。
