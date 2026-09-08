@@ -205,6 +205,23 @@ def _parent_being_destroyed(parent_id: str) -> ContractViolation:
     )
 
 
+def _entry_vanished_during_spawn(agent_id: str, parent_id: str | None) -> ContractViolation:
+    return ContractViolation(
+        expected=f'agent {agent_id!r} 刚注册进去的条目在 spawn 返回之前还在注册表里',
+        received=(
+            f'它在 spawn 之内就被注销了（parent_id: {parent_id!r}）：一条并发的级联在 register 与'
+            ' ensure_queue 之间发现了它并把它拆掉，而级联在这段窗口里**跑完**时钉住早已撤掉——'
+            '只复检「那个父此刻在不在被拆」看不见这一支。交出这个 agent_id 就是交出一个注册表里'
+            '不存在的 Agent，并留下一份属于不可寻址 Agent 的 Context'
+        ),
+        next_action=(
+            '不要拿这个 agent_id 去 send / wait，它不可寻址。'
+            '用 find() 确认那个父还在不在，再决定把这个 Agent 挂到哪个父下面；'
+            '它不需要父就把 parent_id 置为 None'
+        ),
+    )
+
+
 def _already_shut_down() -> ContractViolation:
     return ContractViolation(
         expected='Runtime 尚未 shutdown，spawn 出来的 Agent 事件仍有订阅者能收到',
@@ -290,7 +307,15 @@ class Runtime:
         # 插进来，于是：关机那一支建出一个永不被取消、永不被 await 的驱动，并把一个再没有订阅者的
         # Agent 留在注册表里；拆除那一支交出一个级联刚刚注销掉的 agent_id 却报成功，留下一份属于
         # 不可寻址 Agent 的 Context，并让同一个 agent_id 先 `AGENT_DESPAWN` 后 `AGENT_SPAWN`。
-        # 复检与 create_task 之间没有挂起点，因此这两道守卫按得住。
+        #
+        # 复检的是**后置条件**（我注册的那一条还在不在），不只是标志位：级联若在这段窗口里跑完，
+        # 钉住早已撤掉，`_doomed` 那一问答「没在被拆」而它注销掉的正是这一条。两问合起来没有缝，
+        # 因为能注销这个条目的级联必然先把它钉住、且钉住活到该级联自己结束：还在飞的被 `_doomed`
+        # 按住，已经跑完的被这次 get 按住。顺序是**先带 await 的那一问、再读两个同步标志位**，
+        # 于是最后一道守卫与 create_task 之间没有挂起点。
+        if await self.registry.get(agent_id) is None:
+            await self._unbuild(agent_id)
+            raise _entry_vanished_during_spawn(agent_id, parent_id)
         if self._closed:
             await self._unbuild(agent_id)
             raise _already_shut_down()
