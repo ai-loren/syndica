@@ -40,6 +40,12 @@ compare-and-set」，而那次真的丢失的转换零痕迹。
 本类持有的每一份 Context 都对应一个仍可寻址的 Agent，随时间无界增长的只有活着的 Agent 数。代价
 写在 `wait` 的契约里：被 reap 的 Agent 没有 waitpid 可言。
 
+**激活只有一个入口。** 复活 ZOMBIE、重开事件循环、日后的「从落盘会话恢复」在语义上是同一件事，
+因此都走 `ensure_active`；`send` 的按需激活经 broker 的 `on_missing_queue` 回到同一个方法。让每个
+调用方自己「先判断再激活」会让复活有 N 份实现。**判定「它已经活着」看驱动任务，不看注册表状态**：
+停在邮箱上的 Agent 是 IDLE，而 IDLE -> RUNNING 的 CAS 对第二个驱动任务照样成功，拿状态当所有权凭据
+会让同一个邮箱被两道门 consume，而 consume 恰好一次——输的那道门静默收不到任何消息。
+
 **`shutdown` 是终态。** 关闭后的事件总线静默丢弃 emit，此后 spawn 出来的 Agent 会照常干完活却完全
 不可观测，因此 spawn 在关闭后报错。
 """
@@ -49,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -69,6 +76,13 @@ __all__ = ['AgentFactory', 'Runtime']
 logger = logging.getLogger(__name__)
 
 AgentFactory = Callable[[HooksCenter, EventBus], BaseAgent]
+
+# 「这一次 send 允不允许把目标叫醒」。用 ContextVar 而不是 Runtime 上的一个字段：它的作用域是
+# **这一次调用**，两个并发 send 的意图因此互不污染；放在实例上则第二个 send 会读到第一个的开关。
+# 代价是一条对 broker 实现的硬约束：on_missing_queue 必须跑在 publish 那次调用的上下文里——同一个
+# 任务，或由它 create_task 出来的任务。改由一个早已存在的后台任务去调回调的实现读不到这一位，
+# activate=False 于是静默失效，而失效表现为「一条消息叫醒了一个不该醒的 Agent」，不报任何错。
+_ACTIVATION_ALLOWED: ContextVar[bool] = ContextVar('syndica_activation_allowed', default=True)
 
 # 本进程的事件循环认得的活状态：从其中任何一个都可以被它转去另一个活状态或 ZOMBIE。不在这里的
 # 就是终态，本进程不得把它带回来。周期边界的 `allowed` 由本元组派生，漏一个就是「某个状态下
@@ -124,6 +138,9 @@ class Runtime:
         self._table: LocalAgentTable[BaseAgent] = LocalAgentTable()
         self._slots: dict[str, _Slot] = {}
         self._closed = False
+        # 「队列不存在」是懒启动与 ZOMBIE 复活的唯一触发点（spec §4.4）。接在这里，而不是让每个
+        # 调用方自己先判断再激活——那样「复活」就有了 N 份实现。
+        self.broker.on_missing_queue(self._on_missing_queue)
 
     async def spawn(
         self,
@@ -370,12 +387,22 @@ class Runtime:
         )
 
     async def send(
-        self, agent_id: str, content: str, *, trigger: Trigger = Trigger.PENDING
+        self,
+        agent_id: str,
+        content: str,
+        *,
+        trigger: Trigger = Trigger.PENDING,
+        activate: bool = True,
+        sender: str = 'runtime',
+        correlation_id: str | None = None,
     ) -> DeliveryResult:
         """投递一条消息到目标邮箱。
 
-        **只投递，不激活**；spec §4.2 的按需激活随 `on_missing_queue` 接线在计划里下一个任务加入，
-        在那之前 ZOMBIE 的邮箱已经摘掉，投给它会拿到 `ok=False`。
+        **默认激活目标**：绝大多数调用方要的语义是「发消息，它没在跑就叫醒它」（spec §4.2）。
+        要严格的「仅入队」语义就传 `activate=False`——此时目标若已经进了 ZOMBIE（队列已摘），
+        投递返回 `ok=False`，而不是把消息塞进一个没人消费的地方。
+
+        **投递失败返回结构化结果而不抛异常**，调用方才能识别可重试的瞬时错误。
 
         可寻址性以注册表为准，不以邮箱在不在为准：残留邮箱（远端 broker 的 remove_queue 失败、
         或 ensure_queue 之后注册失败）会让投递看起来成功，而再没有人会去消费它。
@@ -389,10 +416,85 @@ class Runtime:
                     ' 下一步: 先 spawn 它；以 ExitMode.EXIT 结束的 Agent 已被销毁，只能重新 spawn。'
                 ),
             )
-        return await self.broker.publish(
-            agent_id,
-            Message(sender='runtime', receiver=agent_id, content=content, trigger=trigger),
+        message = Message(
+            sender=sender,
+            receiver=agent_id,
+            content=content,
+            trigger=trigger,
+            correlation_id=correlation_id,
         )
+        token = _ACTIVATION_ALLOWED.set(activate)
+        try:
+            return await self.broker.publish(agent_id, message)
+        finally:
+            _ACTIVATION_ALLOWED.reset(token)
+
+    async def ensure_active(self, agent_id: str) -> bool:
+        """唯一的激活入口：复活 ZOMBIE、重开事件循环（spec §4.2）。
+
+        复活、重开、从落盘会话恢复、恢复子会话在语义上是同一件事，不该暴露成四个方法让用户猜。
+
+        返回 True 表示「此刻它有一个活着的事件循环」，False 表示本进程做不到——**两者都是回答，
+        都不抛异常**（问句只答不抛）。三种本进程无法自助诊断的 False 各记一条日志：手里没有它的
+        实例、它正在收尾、状态转换被拒。注册表里没有它不记——那与 `find` 答 None 是同一个正常
+        答案，而且「这个 Agent 不归我」正是回调链上设计好的一支，记下来只会让每一次转手都报错。
+        """
+        if self._closed:
+            return False
+        info = await self.registry.get(agent_id)
+        if info is None:
+            return False
+        slot = self._slots.get(agent_id)
+        agent = self._table.get(agent_id)
+        if slot is None or agent is None:
+            logger.error(
+                '期望: agent %s 的实例在本进程的实例表里，可以直接重开它的事件循环。'
+                ' 实际: 注册表里有它，本进程手里没有——它由别的进程持有，'
+                '或者只剩落盘会话而恢复能力尚未实现。'
+                ' 下一步: 在持有它的进程上激活它；'
+                '要在本进程续跑就重新 spawn 一个并把会话交给它。',
+                agent_id,
+            )
+            return False
+        if self._has_live_driver(agent_id):
+            return True
+        if info.status is AgentStatus.ABORTING:
+            logger.error(
+                '期望: agent %s 处在可以重开事件循环的状态。'
+                ' 实际: 它正在收尾（aborting），此刻重开会与收尾抢同一份轨迹。'
+                ' 下一步: 等它进 zombie 之后再激活；用 find() 读它当前的状态。',
+                agent_id,
+            )
+            return False
+        if not await self._switch(agent_id, new=AgentStatus.IDLE, allowed=(AgentStatus.ZOMBIE,)):
+            logger.error(
+                '期望: agent %s 在注册表里是 idle 或 zombie，可由本进程重开事件循环。'
+                ' 实际: 转换被拒，本进程读到它是 %s，而本进程手里的驱动任务已经结束——'
+                '它由别人在跑，或已被送进别的状态。'
+                ' 下一步: 用 find() 读它当前的状态；条目已被 despawn 就只能重新 spawn。',
+                agent_id,
+                info.status.value,
+            )
+            return False
+        await self.broker.ensure_queue(agent_id)
+        # 上面那次 has_live_driver 之后隔着两个挂起点，并发的另一次激活可能已经把驱动挂上去了。
+        # 复检与 create_task / set_task 之间没有挂起点，这三步因此对事件循环是原子的；少了复检，
+        # 第二次会撞上实例表拒绝替换未结束任务，把只答不抛的问句变成抛异常并丢下一个孤儿任务。
+        if self._has_live_driver(agent_id):
+            return True
+        # 复活的循环没有 query：它要干什么由那条把它叫醒的消息说，门会在第一轮开始前消费它。
+        revived = asyncio.create_task(self._drive(agent_id, agent, None), name=f'agent:{agent_id}')
+        self._table.set_task(agent_id, revived)
+        return True
+
+    def _has_live_driver(self, agent_id: str) -> bool:
+        task = self._table.get_task(agent_id)
+        return task is not None and not task.done()
+
+    async def _on_missing_queue(self, agent_id: str) -> bool:
+        if not _ACTIVATION_ALLOWED.get():
+            return False
+        return await self.ensure_active(agent_id)
 
     async def find(self, agent_id: str) -> AgentInfo | None:
         """只读路径，绝不激活任何 Agent。"""

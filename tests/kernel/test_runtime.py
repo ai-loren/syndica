@@ -213,6 +213,86 @@ class _SpyBroker:
         return None if info is None else info.status
 
 
+class _Hold:
+    """一道可开合的闸，外加「已经有几个执行体停在上面」这个边沿信号。
+
+    闸开着时 `passing` 不挂起（`asyncio.Event.wait` 在已置位时直接返回），因此没被 `close` 的
+    闸对被测代码完全透明。
+    """
+
+    def __init__(self) -> None:
+        self.arrivals: list[str] = []
+        self._arrived = asyncio.Event()
+        self._open = asyncio.Event()
+        self._open.set()
+
+    def close(self) -> None:
+        self._open.clear()
+        self.arrivals.clear()
+
+    def open(self) -> None:
+        self._open.set()
+
+    async def reach(self, count: int) -> None:
+        """等到有 `count` 个执行体停在闸上。上界由调用方套一层 `wait_for` 给。"""
+        while True:
+            self._arrived.clear()
+            if len(self.arrivals) >= count:
+                return
+            await self._arrived.wait()
+
+    async def passing(self, agent_id: str) -> None:
+        self.arrivals.append(agent_id)
+        self._arrived.set()
+        await self._open.wait()
+
+
+class _HeldBroker:
+    """能把 publish 或 ensure_queue 停在半路的 broker，用来制造真正的交错。
+
+    内存实现下 `send` 与 `ensure_active` 全程不挂起，两次调用总是一前一后各自跑完：那时「按调用
+    作用域的抑制位」与「放在 Runtime 上的一个字段」是同一个答案，「同一个 Agent 只有一个驱动」
+    也永远轮不到被检验，两条断言测的都成了调度顺序。
+    """
+
+    def __init__(self) -> None:
+        self._inner = InMemoryMessageBroker()
+        self.publishes = _Hold()
+        self.ensures = _Hold()
+
+    async def ensure_queue(self, agent_id: str) -> None:
+        await self.ensures.passing(agent_id)
+        await self._inner.ensure_queue(agent_id)
+
+    async def publish(self, agent_id: str, message: Message) -> DeliveryResult:
+        await self.publishes.passing(agent_id)
+        return await self._inner.publish(agent_id, message)
+
+    async def consume(self, agent_id: str, *, max_n: int = 0) -> list[Message]:
+        return await self._inner.consume(agent_id, max_n=max_n)
+
+    async def wait_for_messages(
+        self,
+        agent_id: str,
+        timeout: float | None,  # noqa: ASYNC109
+    ) -> bool:
+        return await self._inner.wait_for_messages(agent_id, timeout)
+
+    async def take_by_correlation(
+        self,
+        agent_id: str,
+        correlation_id: str,
+        timeout: float | None,  # noqa: ASYNC109
+    ) -> Message | None:
+        return await self._inner.take_by_correlation(agent_id, correlation_id, timeout)
+
+    async def remove_queue(self, agent_id: str) -> None:
+        await self._inner.remove_queue(agent_id)
+
+    def on_missing_queue(self, cb: MissingQueueCallback) -> None:
+        self._inner.on_missing_queue(cb)
+
+
 def _tools() -> dict[str, Tool]:
     return {'Echo': _Echo(), 'Upper': _Upper(), 'Concat': _Concat()}
 
@@ -262,6 +342,16 @@ def _blocking(blocker: _Block) -> AgentFactory:
         ]
     )
     return _factory(llm, tools={'Block': blocker})
+
+
+def _declining(name: str, seen: list[str]) -> MissingQueueCallback:
+    """一个记名后放弃的 on_missing_queue 回调：用来观测本 Runtime 在回调链上的位次。"""
+
+    async def decline(agent_id: str) -> bool:
+        seen.append(name)
+        return False
+
+    return decline
 
 
 def _assert_three_part(text: str) -> None:
@@ -427,7 +517,8 @@ async def test_zombie_keeps_its_registry_entry_but_loses_its_mailbox():
     await runtime.wait(agent_id)
 
     assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
-    refused = await runtime.send(agent_id, '继续')
+    # 抑制激活才问得出「邮箱还在不在」：默认的 send 会把它叫醒并顺手把邮箱建回来。
+    refused = await runtime.send(agent_id, '继续', activate=False)
     assert refused.ok is False
     assert refused.message_id is None
     assert refused.reason is not None
@@ -1239,4 +1330,381 @@ async def test_wait_refuses_an_agent_this_process_never_spawned_even_with_a_shar
         await second.wait(agent_id)
     assert agent_id in excinfo.value.expected
     await second.shutdown()
+    await runtime.shutdown()
+
+
+async def test_a_message_revives_a_zombie_with_its_context_intact():
+    """ZOMBIE 留在注册表可寻址，就是为了「一条消息带着上下文继续干」（spec §4.1）。"""
+    runtime = Runtime()
+    built: list[BaseAgent] = []
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    agent_id = await runtime.spawn(_capturing(built, llm), query='go')
+    await runtime.wait(agent_id)
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+
+    delivered = await runtime.send(agent_id, 'keep going')
+
+    assert delivered.ok is True
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
+        'go',
+        'keep going',
+    ]
+    assert [block.content for block in ctx.current_traj if block.role == 'assistant'] == [
+        'first',
+        'second',
+    ]
+    # 续用的是原来那个实例与它那份 Context：新建一个就等于把「一条消息带着上下文继续干」丢了。
+    assert [agent.agent_id for agent in built] == [agent_id]
+    assert ctx is built[0].context
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    await runtime.shutdown()
+
+
+async def test_send_without_activation_neither_revives_nor_silently_succeeds():
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    agent_id = await runtime.spawn(_factory(llm), query='go')
+    await runtime.wait(agent_id)
+
+    delivered = await runtime.send(agent_id, 'queue only', activate=False)
+
+    assert delivered.ok is False
+    assert delivered.message_id is None
+    assert delivered.reason is not None
+    _assert_three_part(delivered.reason)
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    assert len(llm.calls) == 1
+    assert broker.parks(agent_id) == 0
+    await runtime.shutdown()
+
+
+async def test_suppressing_activation_on_one_send_does_not_leak_to_a_concurrent_one():
+    """抑制位是按调用的：两个并发 send 各自的意图不得互相污染。"""
+    broker = _HeldBroker()
+    runtime = Runtime(broker=broker)
+    llms = [
+        ScriptedLLM([ScriptedTurn(content='a1'), ScriptedTurn(content='a2')]),
+        ScriptedLLM([ScriptedTurn(content='b1'), ScriptedTurn(content='b2')]),
+    ]
+    first, second = [await runtime.spawn(_factory(llm), query='go') for llm in llms]
+    await runtime.wait(first)
+    await runtime.wait(second)
+
+    broker.publishes.close()
+    quiet = asyncio.create_task(runtime.send(first, 'queue only', activate=False))
+    await asyncio.wait_for(broker.publishes.reach(1), _TIMEOUT)
+    loud = asyncio.create_task(runtime.send(second, 'wake up'))
+    await asyncio.wait_for(broker.publishes.reach(2), _TIMEOUT)
+    broker.publishes.open()
+
+    assert (await asyncio.wait_for(quiet, _TIMEOUT)).ok is False
+    assert (await asyncio.wait_for(loud, _TIMEOUT)).ok is True
+    await asyncio.wait_for(runtime.wait(second), _TIMEOUT)
+    assert [len(llm.calls) for llm in llms] == [1, 2]
+    await runtime.shutdown()
+
+
+async def test_suppressing_activation_does_not_outlive_the_send_that_asked_for_it():
+    """抑制位按调用生效，不残留在这条任务的上下文里。
+
+    残留下来的话，此后每一次投递都静默失去激活能力——而「队列不存在」是复活的唯一触发点，
+    投递方拿到的仍是一句「没人把邮箱建起来」，看不出激活是被上一次调用关掉的。
+    """
+    runtime = Runtime()
+    llms = [
+        ScriptedLLM([ScriptedTurn(content='a1'), ScriptedTurn(content='a2')]),
+        ScriptedLLM([ScriptedTurn(content='b1'), ScriptedTurn(content='b2')]),
+    ]
+    quiet, loud = [await runtime.spawn(_factory(llm), query='go') for llm in llms]
+    await runtime.wait(quiet)
+    await runtime.wait(loud)
+
+    assert (await runtime.send(quiet, 'queue only', activate=False)).ok is False
+    # 同一条任务里紧接着的一次投递照常激活：回调链上的「按需激活」不是本 Runtime 的一个模式位。
+    delivered = await runtime.broker.publish(
+        loud, Message(sender='user', receiver=loud, content='wake up')
+    )
+
+    assert delivered.ok is True
+    await asyncio.wait_for(runtime.wait(loud), _TIMEOUT)
+    assert [len(llm.calls) for llm in llms] == [1, 2]
+    assert await _status(runtime, quiet) is AgentStatus.ZOMBIE
+    await runtime.shutdown()
+
+
+async def test_send_stamps_each_calls_own_sender_and_correlation_id_on_its_message():
+    """两个参数各有下游消费者（`wait_for` 认 correlation_id，编排工具认 sender）。
+
+    发不出去的参数就是一个静默什么都不做的旋钮。三条而非一条，且发件人顺序既非升序
+    （alpha / bravo / charlie）亦非降序，反转后同样两者都不是。
+    """
+    broker = InMemoryMessageBroker()
+    runtime = Runtime(broker=broker)
+    blocker = _Block()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go')
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+
+    plan = [('bravo', 'c-bravo'), ('alpha', None), ('charlie', 'c-charlie')]
+    for sender, correlation_id in plan:
+        result = await runtime.send(
+            agent_id, f'from {sender}', sender=sender, correlation_id=correlation_id
+        )
+        assert result.ok is True
+    assert (await runtime.send(agent_id, 'from the runtime')).ok is True
+
+    delivered = await broker.consume(agent_id)
+    assert [(message.sender, message.correlation_id) for message in delivered] == [
+        *plan,
+        ('runtime', None),
+    ]
+    assert [message.content for message in delivered] == [
+        'from bravo',
+        'from alpha',
+        'from charlie',
+        'from the runtime',
+    ]
+    await runtime.shutdown()
+
+
+async def test_ensure_active_is_a_question_and_answers_false_for_an_unknown_agent(
+    caplog: pytest.LogCaptureFixture,
+):
+    """答不出就答 False，不抛异常，也不留下一个没人消费的邮箱。
+
+    「这个 Agent 不归我」是回调链上设计好的一支（后面的回调接手），因此它不记日志。
+    """
+    broker = InMemoryMessageBroker()
+    runtime = Runtime(broker=broker)
+
+    assert await runtime.ensure_active('nope') is False
+
+    assert await _mailbox_exists(broker, 'nope') is False
+    assert caplog.records == []
+    await runtime.shutdown()
+
+
+async def test_ensure_active_on_a_parked_agent_answers_true_without_starting_a_second_driver(
+    caplog: pytest.LogCaptureFixture,
+):
+    """停在邮箱上的 Agent 状态是 IDLE，而 IDLE -> RUNNING 的 CAS 对第二个驱动任务照样成功。
+
+    所有权凭据因此只能是驱动任务本身：两道门会各自 consume 同一个邮箱，而 consume 恰好一次，
+    输的那个静默收不到任何消息。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    llm = ScriptedLLM([ScriptedTurn(content='woken'), ScriptedTurn(content='woken again')])
+    agent_id = await runtime.spawn(_factory(llm), exit_mode=ExitMode.IDLE)
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+    parked = runtime._table.get_task(agent_id)
+
+    assert await runtime.ensure_active(agent_id) is True
+
+    assert runtime._table.get_task(agent_id) is parked
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    assert broker.parks(agent_id) == 1
+
+    assert (await runtime.send(agent_id, 'wake up')).ok is True
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+    assert [block.content for block in await broker.consume(agent_id)] == []
+    assert len(llm.calls) == 1
+    assert caplog.records == []
+    await runtime.shutdown()
+
+
+async def test_ensure_active_answers_true_for_a_live_agent_whatever_the_registry_calls_it(
+    caplog: pytest.LogCaptureFixture,
+):
+    """判据是驱动任务活着，不是状态恰好落在某个可复活的取值上。
+
+    控制面在周期内能留下 RUNNING / PAUSED / WAITING，拿状态当判据会让「它在跑吗」对这三个
+    一律答 False，而它们每一个都真的在跑。三个而非一个，顺序既非声明序亦非其反转。
+    """
+    registry = _RecordingRegistry()
+    runtime = Runtime(registry=registry)
+    for status in (AgentStatus.PAUSED, AgentStatus.WAITING, AgentStatus.RUNNING):
+        blocker = _Block()
+        agent_id = await runtime.spawn(_blocking(blocker), query='go')
+        await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+        assert await registry.compare_and_set_status(
+            agent_id, expected=AgentStatus.RUNNING, new=status
+        )
+        driving = runtime._table.get_task(agent_id)
+
+        assert await runtime.ensure_active(agent_id) is True
+
+        assert runtime._table.get_task(agent_id) is driving
+        assert await _status(runtime, agent_id) is status
+        blocker.release.set()
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert caplog.records == []
+    await runtime.shutdown()
+
+
+async def test_ensure_active_refuses_an_agent_that_is_winding_down(
+    caplog: pytest.LogCaptureFixture,
+):
+    """ABORTING 是「中止已置位、正在收尾」：此刻重开事件循环就是和收尾抢同一份轨迹。"""
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await runtime.wait(agent_id)
+    assert await registry.compare_and_set_status(
+        agent_id, expected=AgentStatus.ZOMBIE, new=AgentStatus.ABORTING
+    )
+
+    assert await runtime.ensure_active(agent_id) is False
+
+    assert await _status(runtime, agent_id) is AgentStatus.ABORTING
+    assert broker.parks(agent_id) == 0
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert caplog.records[0].args == (agent_id,)
+    _assert_three_part(caplog.records[0].getMessage())
+    await runtime.shutdown()
+
+
+async def test_ensure_active_refuses_an_agent_the_registry_says_someone_else_is_running(
+    caplog: pytest.LogCaptureFixture,
+):
+    """注册表说 RUNNING 而本进程手里的驱动任务已经结束，就是 spec §4.3 说的那种孤儿条目。
+
+    本进程既不知道谁在跑它，也没有租约可以判它已死，因此答不出就答 False；而「读到的是什么」
+    是这条日志与「它正在收尾」唯一的区别，少报这一项，两种情形的下一步动作就分不开了。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await runtime.wait(agent_id)
+    assert await registry.compare_and_set_status(
+        agent_id, expected=AgentStatus.ZOMBIE, new=AgentStatus.RUNNING
+    )
+
+    assert await runtime.ensure_active(agent_id) is False
+
+    assert await _status(runtime, agent_id) is AgentStatus.RUNNING
+    assert broker.parks(agent_id) == 0
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert caplog.records[0].args == (agent_id, AgentStatus.RUNNING.value)
+    _assert_three_part(caplog.records[0].getMessage())
+    await runtime.shutdown()
+
+
+async def test_ensure_active_refuses_an_agent_this_process_does_not_hold(
+    caplog: pytest.LogCaptureFixture,
+):
+    """注册表可以共享，实例表不行：本进程手里没有实例就重开不了它的事件循环。"""
+    runtime = Runtime()
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await runtime.wait(agent_id)
+    second = Runtime(registry=runtime.registry, broker=runtime.broker)
+
+    assert await second.ensure_active(agent_id) is False
+
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    assert second._table.agent_ids() == []
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert caplog.records[0].args == (agent_id,)
+    _assert_three_part(caplog.records[0].getMessage())
+    await second.shutdown()
+    await runtime.shutdown()
+
+
+async def test_ensure_active_refuses_after_shutdown(caplog: pytest.LogCaptureFixture):
+    """shutdown 是终态：此后 spawn 报错，激活同样不再发生。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await runtime.wait(agent_id)
+    await runtime.shutdown()
+
+    assert await runtime.ensure_active(agent_id) is False
+
+    assert (await runtime.send(agent_id, 'wake up')).ok is False
+    assert broker.parks(agent_id) == 0
+    assert caplog.records == []
+
+
+async def test_two_concurrent_activations_of_one_zombie_start_exactly_one_driver():
+    """激活是唯一入口，因此「一个 Agent 只有一个驱动」这条也在它这里成立。
+
+    复检若隔着挂起点，第二次会撞上实例表拒绝替换未结束任务，把一个只答不抛的问句变成抛异常，
+    同时丢下一个无人认领的驱动任务。
+    """
+    broker = _HeldBroker()
+    runtime = Runtime(broker=broker)
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    agent_id = await runtime.spawn(_factory(llm), query='go')
+    await runtime.wait(agent_id)
+
+    broker.ensures.close()
+    both = asyncio.gather(runtime.ensure_active(agent_id), runtime.ensure_active(agent_id))
+    await asyncio.wait_for(broker.ensures.reach(2), _TIMEOUT)
+    broker.ensures.open()
+
+    assert await asyncio.wait_for(both, _TIMEOUT) == [True, True]
+    # 快照取在两次激活都返回的那一刻：多出来的那个驱动没人持有，只会停在同一个邮箱上不动。
+    live = [task for task in asyncio.all_tasks() if task.get_name() == f'agent:{agent_id}']
+    assert live == [runtime._table.get_task(agent_id)]
+
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    assert (await runtime.send(agent_id, 'keep going')).ok is True
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
+        'go',
+        'keep going',
+    ]
+    assert len(llm.calls) == 2
+    await runtime.shutdown()
+
+
+async def test_find_still_never_activates():
+    """只读路径与激活路径必须分离，否则查询类工具无法把「不存在」与「存在但未运行」分开答。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    agent_id = await runtime.spawn(_factory(llm), query='go')
+    await runtime.wait(agent_id)
+    finished = runtime._table.get_task(agent_id)
+
+    known = await runtime.find(agent_id)
+    unknown = await runtime.find('nope')
+
+    assert known is not None and known.status is AgentStatus.ZOMBIE
+    assert unknown is None
+    # 邮箱仍然不存在：不激活的投递失败当且仅当邮箱不在。
+    assert (await runtime.send(agent_id, 'x', activate=False)).ok is False
+    assert runtime._table.get_task(agent_id) is finished
+    assert broker.parks(agent_id) == 0
+    assert len(llm.calls) == 1
+    await runtime.shutdown()
+
+
+async def test_the_runtimes_callback_takes_its_turn_in_the_chain_and_only_stops_it_by_reviving():
+    """回调链按注册顺序走、停在第一个认领者上；本 Runtime 只是链上的一个。
+
+    四个而非一个：只有一个回调时「按顺序走」「停在认领者上」「放弃时让后面的接手」是同一个
+    答案。三个陪跑回调的顺序既非升序（alpha / bravo / charlie）亦非降序，反转后同样两者都不是。
+    """
+    broker = InMemoryMessageBroker()
+    seen: list[str] = []
+    broker.on_missing_queue(_declining('bravo', seen))
+    runtime = Runtime(broker=broker)
+    broker.on_missing_queue(_declining('alpha', seen))
+    broker.on_missing_queue(_declining('charlie', seen))
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    agent_id = await runtime.spawn(_factory(llm), query='go')
+    await runtime.wait(agent_id)
+
+    assert (await runtime.send(agent_id, 'wake up')).ok is True
+    assert seen == ['bravo']
+    await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    seen.clear()
+    assert (await runtime.send(agent_id, 'quiet', activate=False)).ok is False
+    assert seen == ['bravo', 'alpha', 'charlie']
     await runtime.shutdown()
