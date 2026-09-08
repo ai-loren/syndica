@@ -173,10 +173,13 @@ class _RecordingRegistry:
 
 
 class _SpyBroker:
-    """观测 broker 这一侧的接缝：谁停在邮箱上等消息，以及摘队列的那一刻注册表怎么说。
+    """观测 broker 这一侧的接缝：谁停在邮箱上等消息、谁取走过消息，以及摘队列的那一刻注册表怎么说。
 
     「事件循环在等消息」（spec §4.1 给 IDLE 的定义）在 Runtime 外面没有别的观测点——注册表里的
     `IDLE` 与「刚注册、驱动任务还没跑起来」是同一个取值，拿它当握手信号分不出这两件事。
+
+    「挂起期间没有取走消息」同理只有 `consumes` 答得出：邮箱剩几条、轨迹里有没有那一轮，对
+    「从来没取走」与「取走了又放回去 / 取走了暂存起来」是同一个答案。
     """
 
     def __init__(self, registry: AgentRegistry | None = None) -> None:
@@ -185,10 +188,14 @@ class _SpyBroker:
         # 边沿信号：入园即置位，等待者扫描前清位。「已入园 n 次」是电平，等的是「又入了一次」。
         self._parked = asyncio.Event()
         self._parks: dict[str, int] = {}
+        self._consumes: dict[str, int] = {}
         self.removals: list[tuple[str, AgentStatus | None]] = []
 
     def parks(self, agent_id: str) -> int:
         return self._parks.get(agent_id, 0)
+
+    def consumes(self, agent_id: str) -> int:
+        return self._consumes.get(agent_id, 0)
 
     async def reach(self, agent_id: str, parks: int) -> None:
         """等到该 agent 第 `parks` 次停到邮箱上。上界由调用方套一层 `wait_for` 给。"""
@@ -205,6 +212,7 @@ class _SpyBroker:
         return await self._inner.publish(agent_id, message)
 
     async def consume(self, agent_id: str, *, max_n: int = 0) -> list[Message]:
+        self._consumes[agent_id] = self.consumes(agent_id) + 1
         return await self._inner.consume(agent_id, max_n=max_n)
 
     async def wait_for_messages(
@@ -2005,7 +2013,11 @@ async def test_descendants_converges_on_a_registry_that_reports_a_cycle():
 
 
 async def test_a_paused_agent_does_not_consume_its_next_message_and_resume_does_not_lose_it():
-    """门坐在「有消息」与「取走消息」之间：醒来照常 consume 的话，resume 之后它已经不在了。"""
+    """门坐在「有消息」与「取走消息」之间：醒来照常 consume 的话，resume 之后它已经不在了。
+
+    判据是 consume 的**次数**，不是邮箱里最后剩几条：一个取走再放回、或取走进暂存的门，邮箱与
+    轨迹上给的都是同一个答案。
+    """
     broker = _SpyBroker()
     runtime = Runtime(broker=broker)
     agent_id = await _resident(runtime, broker)
@@ -2017,16 +2029,54 @@ async def test_a_paused_agent_does_not_consume_its_next_message_and_resume_does_
     assert (await runtime.send(agent_id, 'arrived while paused')).ok is True
     assert await control.wait_until_parked(_TIMEOUT) is True
     assert agent.context.current_traj == []
+    assert broker.consumes(agent_id) == 0
 
     await runtime.resume(agent_id)
     await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
 
+    assert broker.consumes(agent_id) == 1
     assert [(block.role, block.content) for block in agent.context.current_traj] == [
         ('user', 'arrived while paused'),
         ('assistant', 'turn-0'),
     ]
     # 恰好一次：邮箱现在是空的，那条消息既没丢也没被注入两遍。
     assert await broker.consume(agent_id) == []
+    await runtime.shutdown()
+
+
+async def test_a_pause_taken_inside_a_turn_consumes_nothing_before_the_next_turns_gate_opens():
+    """挂起门有两道：周期之间那道在 `_cycles` 里，轮与轮之间那道在 `BrokerTurnGate` 里。
+
+    周期之间挂起的用例根本走不到第二道门——它停在开周期之前，`before_turn` 一次都没被调用。要让
+    「取走了又放回去 / 取走了暂存起来」有机会发生，消息必须在门被抬起**之前**就躺在邮箱里。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    blocker = _Block()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go')
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    control = runtime._slots[agent_id].control
+    # 第一轮的门已经取过一次空邮箱：每一轮恰好一次 consume。
+    assert broker.consumes(agent_id) == 1
+
+    await runtime.pause(agent_id)
+    assert (await runtime.send(agent_id, 'arrived while paused')).ok is True
+    blocker.release.set()
+    assert await control.wait_until_parked(_TIMEOUT) is True
+
+    assert broker.consumes(agent_id) == 1
+
+    await runtime.resume(agent_id)
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert broker.consumes(agent_id) == 2
+    assert [(block.role, block.content) for block in ctx.current_traj] == [
+        ('user', 'go'),
+        ('assistant', None),
+        ('tool', 'released'),
+        ('user', 'arrived while paused'),
+        ('assistant', 'done'),
+    ]
     await runtime.shutdown()
 
 
