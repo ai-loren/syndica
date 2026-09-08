@@ -47,6 +47,10 @@ compare-and-set」，而那次真的丢失的转换零痕迹。
 共享注册表里，本进程持有哪些实例与树的形状无关，在第一个外人那里截断会漏掉它下面属于我们的整片
 子树。
 
+**控制面只作用于本进程接管过的 Agent。** 状态写进共享注册表，而这里的门只按得住本进程的事件循环。
+替一个接管失败的条目写下 PAUSED，真正的持有者的 `ensure_active` 从此转不回 IDLE，而投递方仍在拿
+`ok=True` 的收据——一次谁都叫不醒的静默失联。
+
 **激活只有一个入口。** 复活 ZOMBIE、重开事件循环、日后的「从落盘会话恢复」在语义上是同一件事，
 因此都走 `ensure_active`；`send` 的按需激活经 broker 的 `on_missing_queue` 回到同一个方法。让每个
 调用方自己「先判断再激活」会让复活有 N 份实现。**判定「它已经活着」看驱动任务，不看注册表状态**：
@@ -611,25 +615,49 @@ class Runtime:
     async def _control_target(
         self, operation: str, agent_id: str, *, named: bool
     ) -> tuple[_Slot | None, AgentInfo | None]:
-        """取出控制面操作的目标；取不到时按 named 决定抛还是记日志。"""
+        """取出控制面操作的目标；取不到时按 named 决定抛还是记日志。
+
+        **驱动任务没有接管过它，就不算取到。** 控制面写的是共享注册表里的状态，而这里的门只按得住
+        本进程的事件循环；接管失败的那个条目归别人所有，替它写下 PAUSED 之后谁的 `ensure_active`
+        都转不回 IDLE（`allowed` 只有 ZOMBIE），而 `send` 仍旧照答 ok=True——一张通往没有消费者的
+        邮箱的收据。
+        """
         slot = self._slots.get(agent_id)
         info = await self.registry.get(agent_id)
-        if slot is not None and info is not None:
-            return slot, info
-        self._refuse_control(
-            operation,
-            agent_id,
-            named=named,
-            received=(
-                '注册表里没有这个条目' if info is None else '本进程没有它的实例——它由别的进程持有'
-            ),
-            next_action=(
-                '确认 agent_id 是 spawn 的返回值；'
-                '被 despawn 或以 ExitMode.EXIT 结束的 Agent 已被销毁，只能重新 spawn。'
-                '若它由其他进程持有，在那个进程上操作它'
-            ),
-        )
-        return None, None
+        if slot is None or info is None:
+            self._refuse_control(
+                operation,
+                agent_id,
+                named=named,
+                received=(
+                    '注册表里没有这个条目'
+                    if info is None
+                    else '本进程没有它的实例——它由别的进程持有'
+                ),
+                next_action=(
+                    '确认 agent_id 是 spawn 的返回值；'
+                    '被 despawn 或以 ExitMode.EXIT 结束的 Agent 已被销毁，只能重新 spawn。'
+                    '若它由其他进程持有，在那个进程上操作它'
+                ),
+            )
+            return None, None
+        if not slot.owned:
+            self._refuse_control(
+                operation,
+                agent_id,
+                named=named,
+                received=(
+                    '本进程 spawn 过它，但驱动任务没有接管成功：'
+                    'IDLE -> RUNNING 的转换被拒（它已被别人拿走），或任务在这之前就被取消——'
+                    '本进程没有它的事件循环可以停'
+                ),
+                next_action=(
+                    '用 find() 读它当前的 status 与 owner；在持有它的进程上操作它。'
+                    '确认它空闲后重新 spawn 一个，才能在本进程里控制它'
+                ),
+            )
+            return None, None
+        return slot, info
 
     def _refuse_control(
         self, operation: str, agent_id: str, *, named: bool, received: str, next_action: str

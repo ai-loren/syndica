@@ -2268,6 +2268,38 @@ async def test_each_control_operation_names_itself_when_it_refuses_an_unknown_ag
     await runtime.shutdown()
 
 
+async def test_pausing_an_agent_whose_drive_never_took_over_is_refused_and_leaves_it_revivable():
+    """接管失败的条目归别人所有：本进程没有它的事件循环可停，写下的状态却谁都改不回来。
+
+    `ensure_active` 只肯从 idle / zombie 重开，所以一个替它写下的 PAUSED 会把它对**任何**进程
+    锁死；而 `send` 照答 `ok=True`——一张通往没有消费者的邮箱的收据，正是收据本要分辨的那件事。
+    """
+    registry = _RecordingRegistry(deny=(AgentStatus.IDLE, AgentStatus.RUNNING))
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    with pytest.raises(ContractViolation):
+        await runtime.wait(agent_id)
+    peer = Runtime(registry=registry, broker=broker)
+
+    with pytest.raises(ContractViolation) as stranded:
+        await runtime.pause(agent_id)
+    with pytest.raises(ContractViolation) as unknown:
+        await runtime.pause('nope')
+    with pytest.raises(ContractViolation) as not_mine:
+        await peer.pause(agent_id)
+
+    # 三种「控制不了」的下一步动作互不相同：重新 spawn / 去持有它的进程上操作 / 它压根没被接管。
+    assert len({exc.value.received for exc in (stranded, unknown, not_mine)}) == 3
+    assert agent_id in stranded.value.expected
+    assert runtime._slots[agent_id].control.paused is False
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    # 状态没被动过，它就仍然叫得醒；写下 PAUSED 的话这一句答 False。
+    assert await runtime.ensure_active(agent_id) is True
+    await peer.shutdown()
+    await runtime.shutdown()
+
+
 async def test_pause_tells_an_unknown_agent_apart_from_one_another_process_holds():
     """两种「取不到」的下一步动作不同：一个要重新 spawn，一个要去持有它的进程上操作。"""
     broker = _SpyBroker()
