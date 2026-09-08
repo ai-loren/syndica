@@ -10,11 +10,12 @@
 **只有一条消息消费路径。** 中途插话与唤醒都由同一道门（`BrokerTurnGate`）在轮开始前消费。两条
 路径分开写必然分叉，而分叉出来的差异只在有人插话时才现身。
 
-**三处状态转换都只走 CAS，且允许失败。** `_switch` 逐个试 CAS 而不是「读一次再写」：读与写之间
-的窗口正是 CAS 存在的理由。IDLE↔RUNNING 的振荡失败不是错误——控制面上有别人（pause / abort /
-wait_for）合法地改过它，此时保持注册表现有的说法比强行覆盖更诚实。**接管与终态两处则必须看返回
-值**：接管失败意味着这个 Agent 已归别人所有，本进程既不跑它也不替它清理；终态失败意味着注册表与
-本进程对「刚才在跑什么」的看法不一致，记 ERROR。
+**每一处状态转换都只走 CAS，且失败都必须留痕。** `_switch` 逐个试 CAS 而不是「读一次再写」：读与
+写之间的窗口正是 CAS 存在的理由。周期边界上的 IDLE↔RUNNING 走 `_oscillate`，它的 `allowed` 覆盖
+控制面能在周期之间留下的**每一个**活状态（pause / wait_for / abort 各自留下的那些），因此被拒只剩
+一种解释：条目已被摘掉，或已被别人送进终态。接管失败意味着这个 Agent 已归别人所有，本进程既不跑它
+也不替它清理；其余各处失败意味着循环还在跑而注册表说着另一套——丢掉这个结论就是丢掉「它为什么是
+compare-and-set」，而那次真的丢失的转换零痕迹。
 
 **`_finish` 先摘队列再改状态。** 这两步之间落进来的 `send` 会拿到 `ok=False`（队列没了），调用方
 于是收到一次诚实的失败；反过来先改状态，那条消息会成功投进一个即将消失的队列，静默丢掉。
@@ -69,7 +70,9 @@ logger = logging.getLogger(__name__)
 
 AgentFactory = Callable[[HooksCenter, EventBus], BaseAgent]
 
-# 进了这些状态就不该再被本进程的事件循环带回 RUNNING / IDLE。
+# 本进程的事件循环认得的活状态：从其中任何一个都可以被它转去另一个活状态或 ZOMBIE。不在这里的
+# 就是终态，本进程不得把它带回来。周期边界的 `allowed` 由本元组派生，漏一个就是「某个状态下
+# 静默转不过去」。
 _LIVE_STATUSES: tuple[AgentStatus, ...] = (
     AgentStatus.IDLE,
     AgentStatus.RUNNING,
@@ -208,11 +211,7 @@ class Runtime:
         """IDLE↔RUNNING：等一条消息，跑一个周期，再等下一条。"""
         while True:
             if query is None and slot.control.deferred_count == 0:
-                await self._switch(
-                    agent_id,
-                    new=AgentStatus.IDLE,
-                    allowed=(AgentStatus.RUNNING, AgentStatus.ABORTING),
-                )
+                await self._oscillate(agent_id, new=AgentStatus.IDLE)
                 # timeout=None 是刻意的：这个循环的退出路径是取消（kill / shutdown）与队列消失，
                 # 不是超时。答 False 只有一个原因——邮箱已经被摘掉了。
                 if not await self.broker.wait_for_messages(agent_id, None):
@@ -225,11 +224,7 @@ class Runtime:
             # user 块的 assistant 块。回去等，让「邮箱没了」在它唯一的观测点上被答出来。
             if query is None and not await self._has_unhandled_input(agent_id, slot):
                 continue
-            await self._switch(
-                agent_id,
-                new=AgentStatus.RUNNING,
-                allowed=(AgentStatus.IDLE, AgentStatus.ABORTING),
-            )
+            await self._oscillate(agent_id, new=AgentStatus.RUNNING)
             slot.gate.begin_cycle()
             slot.control.enter_run()
             try:
@@ -254,6 +249,23 @@ class Runtime:
         if slot.control.deferred_count:
             return True
         return await self._has_queued_message(agent_id)
+
+    async def _oscillate(self, agent_id: str, *, new: AgentStatus) -> None:
+        """周期边界上的 IDLE↔RUNNING 转换。失败不改变循环的走向，但必须留痕。
+
+        `allowed` 是除目标状态之外的全部活状态：控制面在周期之间能留下的每一个状态都在内，所以
+        被拒只剩一种解释——条目已被摘掉，或已被别人送进终态。
+        """
+        allowed = tuple(status for status in _LIVE_STATUSES if status is not new)
+        if not await self._switch(agent_id, new=new, allowed=allowed):
+            logger.error(
+                '期望: agent %s 在周期边界上仍是本进程认得的活状态，可由本进程转去 %s。'
+                ' 实际: 转换被拒——它现在既不是目标状态，也不在本进程认得的活状态里，'
+                '说明注册表条目已被摘掉或已被别人送进终态，而本进程的事件循环还在跑。'
+                ' 下一步: 用 find() 读它当前的状态；要真的停下这个循环就 kill 它。',
+                agent_id,
+                new.value,
+            )
 
     async def _switch(
         self, agent_id: str, *, new: AgentStatus, allowed: tuple[AgentStatus, ...]

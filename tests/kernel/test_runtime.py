@@ -1116,6 +1116,58 @@ async def test_a_mailbox_that_vanishes_while_paused_ends_the_loop_instead_of_ope
     await runtime.shutdown()
 
 
+async def test_a_refused_oscillation_at_a_cycle_boundary_is_reported(
+    caplog: pytest.LogCaptureFixture,
+):
+    """周期边界的两次 CAS 是 compare-and-set 而不是赋值；丢掉它的结论就是丢掉它的理由。
+
+    `allowed` 覆盖控制面能留下的全部活状态，所以被拒意味着注册表已经不认本进程的转换了，而
+    循环还在跑——零痕迹的话，注册表与本进程各说一套且无从查起。
+    """
+    registry = _RecordingRegistry(deny=(AgentStatus.RUNNING, AgentStatus.IDLE))
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.IDLE)
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert caplog.records[0].args == (agent_id, AgentStatus.IDLE.value)
+    assert await _status(runtime, agent_id) is AgentStatus.RUNNING
+    await runtime.shutdown()
+
+
+async def test_a_cycle_starts_from_every_state_the_control_plane_can_leave_between_cycles(
+    caplog: pytest.LogCaptureFixture,
+):
+    """PAUSED / WAITING / ABORTING 都是后续任务会在周期之间留下的状态。
+
+    不在 `allowed` 里的那些会让循环照常跑而注册表停在旧状态上——静默转不过去。三个而非一个，
+    顺序既非声明序亦非其反转。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    for status in (AgentStatus.WAITING, AgentStatus.ABORTING, AgentStatus.PAUSED):
+        agent_id = await runtime.spawn(_factory(_done()), exit_mode=ExitMode.IDLE)
+        await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+        assert await registry.compare_and_set_status(
+            agent_id, expected=AgentStatus.IDLE, new=status
+        )
+
+        assert (await runtime.send(agent_id, 'go ahead')).ok is True
+        await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+
+        assert registry.applied_of(agent_id) == [
+            (AgentStatus.IDLE, AgentStatus.RUNNING),
+            (AgentStatus.RUNNING, AgentStatus.IDLE),
+            (AgentStatus.IDLE, status),
+            (status, AgentStatus.RUNNING),
+            (AgentStatus.RUNNING, AgentStatus.IDLE),
+        ]
+    assert caplog.records == []
+    await runtime.shutdown()
+
+
 async def test_a_failing_cycle_ends_a_resident_event_loop_instead_of_retrying_it(
     caplog: pytest.LogCaptureFixture,
 ):
