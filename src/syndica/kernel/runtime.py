@@ -20,9 +20,12 @@ wait_for）合法地改过它，此时保持注册表现有的说法比强行覆
 于是收到一次诚实的失败；反过来先改状态，那条消息会成功投进一个即将消失的队列，静默丢掉。
 **丢数据是静默的、灾难性的；失败是显式的、可恢复的。**
 
-**预算耗尽（MAX_TURNS）结束事件循环，即便 exit_mode 是 IDLE。** 一个已经用完轮次的 Agent 对任何
-后续消息都产不出新的一轮，继续等下去只会被同一条消息反复唤醒又立刻返回——一个不让出控制权的
-空转。
+**拿过 `ok=True` 收据的输入不得随队列一起消失。** 收据的用途是让调用方分辨可重试的瞬时失败与永久
+失败，而一条「投递成功了但永远不会被处理」的消息把这个能力整个抹掉。因此非 IDLE 退出模式只在
+**没有未处理输入**时才结束循环——邮箱里剩下的消息与暂存的延迟消息是同一件事的两个落点。唯一处理不
+了的是预算耗尽：一个没有轮次的 Agent 产不出新的一轮，再开周期只会被同一条消息反复唤醒又立刻返回，
+一个不让出控制权的空转。那条路因此无条件退出，代价由 `_finish` 记成 ERROR——**丢数据可以，静默不
+可以**。
 
 **取消不做收尾工作。** 驱动任务被取消时，`finally` 里既不改注册表也不摘资源：取消可能落在轮的
 中间，那时轨迹里留着不配对的调用，而 spec 把「收尾」定义为一个**有状态**的动作。收尾由发起取消
@@ -226,10 +229,23 @@ class Runtime:
             finally:
                 slot.control.leave_run()
             query = None
+            # 预算耗尽这条路无条件退出，即便还有已收下的输入：没有轮次可用，再开一个周期只会
+            # 被同一条消息反复唤醒又立刻返回。丢下的那些由 `_finish` 记成 ERROR。
             if agent.context.stop_reason is StopReason.MAX_TURNS:
                 return
-            if slot.exit_mode is not ExitMode.IDLE and slot.control.deferred_count == 0:
+            if slot.exit_mode is not ExitMode.IDLE and not await self._has_unhandled_input(
+                agent_id, slot
+            ):
                 return
+
+    async def _has_unhandled_input(self, agent_id: str, slot: _Slot) -> bool:
+        """还有已经收下、却还没被处理的输入吗？
+
+        邮箱里剩下的消息与暂存的延迟消息是同一件事的两个落点，两边的发送方都拿到过 `ok=True`。
+        """
+        if slot.control.deferred_count:
+            return True
+        return await self._has_queued_message(agent_id)
 
     async def _switch(
         self, agent_id: str, *, new: AgentStatus, allowed: tuple[AgentStatus, ...]
@@ -246,6 +262,7 @@ class Runtime:
 
     async def _finish(self, agent_id: str, slot: _Slot) -> None:
         """事件循环退出后的归宿（spec §4.1 的 ExitMode）。"""
+        await self._report_abandoned_input(agent_id, slot)
         await self.broker.remove_queue(agent_id)
         if slot.exit_mode is ExitMode.EXIT:
             await self.registry.unregister(agent_id)
@@ -259,6 +276,37 @@ class Runtime:
                 ' 下一步: 用 find() 读它当前的状态；本进程已经不再驱动它。',
                 agent_id,
             )
+
+    async def _report_abandoned_input(self, agent_id: str, slot: _Slot) -> None:
+        """摘队列之前，把「拿过 ok=True 收据、却不会再被处理」的输入记下来。
+
+        循环只在没有未处理输入时退出，所以这条日志出现即意味着一次真的丢失：预算耗尽、周期抛
+        异常，或摘队列与最后一次门检查之间的那个窗口。暂存的那些还留在控制块里（slot 在 ZOMBIE
+        之后不摘），邮箱里的随队列一起没了。
+        """
+        stashed = slot.control.deferred_count
+        queued = await self._has_queued_message(agent_id)
+        if not stashed and not queued:
+            return
+        logger.error(
+            '期望: agent %s 的事件循环退出时，已经收下的输入都已处理——'
+            'publish 答过 ok=True 的消息不该随队列一起消失。'
+            ' 实际: 还剩 %d 条暂存的延迟消息，邮箱非空=%s；队列即将被摘掉，'
+            '邮箱里那些就此丢失，暂存的那些留在控制块里但这个循环不会再读。'
+            ' 下一步: 读 wait() 交回的 Context 看它停在哪一轮（预算耗尽就提高 max_turns），'
+            '再把这些消息重投一次——在发送方看来它们是投递成功的。',
+            agent_id,
+            stashed,
+            queued,
+        )
+
+    async def _has_queued_message(self, agent_id: str) -> bool:
+        """邮箱此刻非空吗。
+
+        `timeout=0` 是纯轮询（见 `MessageBroker.wait_for_messages`）：它不取走消息，因此不与门
+        那唯一一条消费路径分叉；也不构成一次「停在邮箱上等」。
+        """
+        return await self.broker.wait_for_messages(agent_id, 0)
 
     async def wait(self, agent_id: str) -> Context:
         """类比 waitpid：等事件循环结束，交回它的轨迹。

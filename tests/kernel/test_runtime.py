@@ -184,8 +184,11 @@ class _SpyBroker:
         agent_id: str,
         timeout: float | None,  # noqa: ASYNC109
     ) -> bool:
-        self._parks[agent_id] = self.parks(agent_id) + 1
-        self._parked.set()
+        # 只有 timeout=None 才是「停在邮箱上等」。timeout=0 是纯轮询——问一句「现在有吗」，
+        # 问完就走；把它也算成入园会让 parks 从「循环在等消息」退化成「循环碰过 broker」。
+        if timeout is None:
+            self._parks[agent_id] = self.parks(agent_id) + 1
+            self._parked.set()
         return await self._inner.wait_for_messages(agent_id, timeout)
 
     async def take_by_correlation(
@@ -984,6 +987,101 @@ async def test_an_exhausted_turn_budget_ends_the_event_loop_even_for_a_resident_
     assert ctx.stop_reason is StopReason.MAX_TURNS
     assert len(llm.calls) == 1
     assert broker.parks(agent_id) == 1
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    await runtime.shutdown()
+
+
+async def test_a_message_that_won_an_ok_receipt_after_the_last_gate_check_is_still_processed(
+    caplog: pytest.LogCaptureFixture,
+):
+    """收据的用途是分辨可重试的瞬时失败与永久失败；一条「投递成功却永不被处理」的消息把它抹掉。
+
+    窗口不是一瞬间：它覆盖本周期最后一轮的整个模型调用——门已经检查过了，而循环即将摘掉邮箱。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold(**kwargs: Any) -> HookResult:
+        if kwargs['turn'] == 1:
+            entered.set()
+            await release.wait()
+        return HookResult()
+
+    runtime.hooks.register(Junction.TURN_END, hold)
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    agent_id = await runtime.spawn(_factory(llm), query='go', exit_mode=ExitMode.ZOMBIE)
+    await asyncio.wait_for(entered.wait(), _TIMEOUT)
+
+    assert (await runtime.send(agent_id, 'after the last gate check')).ok is True
+    release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert [(block.role, block.content) for block in ctx.current_traj] == [
+        ('user', 'go'),
+        ('assistant', 'first'),
+        ('user', 'after the last gate check'),
+        ('assistant', 'second'),
+    ]
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    # 没有输入被丢下，因此摘队列那一刻不该有任何东西要报告。
+    assert caplog.records == []
+    await runtime.shutdown()
+
+
+async def test_an_exhausted_budget_keeps_the_deferred_stash_and_reports_what_it_abandons(
+    caplog: pytest.LogCaptureFixture,
+):
+    """预算耗尽是唯一处理不了已收下输入的退出路径：没有轮次可用，再开周期就是空转。
+
+    丢下它们可以，静默丢下不可以——暂存的三条必须原封不动留在控制块里，邮箱里剩的那条随队列
+    消失，两件事都要出现在同一条 ERROR 里。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    gate = _Gate(2)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Gate', arguments='{}')]),
+            ScriptedTurn(tool_calls=[ToolCall(id='c2', name='Gate', arguments='{}')]),
+        ]
+    )
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(
+                name='Worker',
+                llm=llm,
+                tools={'Gate': gate},
+                system_prompt=_SYSTEM_PROMPT,
+                max_turns=2,
+            ),
+            hooks=hooks,
+            events=events,
+        )
+
+    agent_id = await runtime.spawn(build, query='go', exit_mode=ExitMode.ZOMBIE)
+    await asyncio.wait_for(gate.entered[0].wait(), _TIMEOUT)
+    for content in ('bravo', 'alpha', 'charlie'):
+        assert (await runtime.send(agent_id, content, trigger=Trigger.DEFERRED)).ok is True
+
+    # 第二轮的门把三条挪进暂存；停在第二个停点上时预算已经用尽，不会再有第三轮的门。
+    gate.release[0].set()
+    await asyncio.wait_for(gate.entered[1].wait(), _TIMEOUT)
+    assert (await runtime.send(agent_id, 'never consumed')).ok is True
+    gate.release[1].set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.MAX_TURNS
+    control = runtime._slots[agent_id].control
+    assert [message.content for message in control.take_deferred()] == [
+        'bravo',
+        'alpha',
+        'charlie',
+    ]
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert caplog.records[0].args == (agent_id, 3, True)
     assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
     await runtime.shutdown()
 
