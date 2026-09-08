@@ -1818,3 +1818,68 @@ async def test_shutdown_takes_its_own_callback_off_a_shared_brokers_chain_and_on
     assert caplog.records == []
     for index in (0, 2):
         await runtimes[index].shutdown()
+
+
+async def test_a_peer_runtime_on_the_same_chain_passes_along_an_agent_it_does_not_hold():
+    """回调链存在的理由就是一个 broker 上挂着多个 Runtime；「这个 Agent 不归我」必须让位。
+
+    共享注册表下每个 Runtime 都查得到这个条目，只有实例表分得出谁真的持有它。认领了却复活不
+    了，收件人的 ZOMBIE 就永远醒不过来，而投递方拿到的只是一句「没人把邮箱建起来」。
+
+    持有者排在链上第四位，前后各夹一个记名回调：只有一个陪跑者时「让位」与「链上只有我」是
+    同一个答案，持有者排在末位时「停在持有者上」与「走完整条链」也是同一个答案。
+    """
+    registry = InMemoryAgentRegistry()
+    broker = InMemoryMessageBroker()
+    seen: list[str] = []
+    bravo = Runtime(registry=registry, broker=broker)
+    alpha = Runtime(registry=registry, broker=broker)
+    broker.on_missing_queue(_declining('past the peers', seen))
+    owner = Runtime(registry=registry, broker=broker)
+    broker.on_missing_queue(_declining('past the owner', seen))
+    charlie = Runtime(registry=registry, broker=broker)
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    agent_id = await owner.spawn(_factory(llm), query='go')
+    await owner.wait(agent_id)
+
+    assert (await owner.send(agent_id, 'keep going')).ok is True
+
+    ctx = await asyncio.wait_for(owner.wait(agent_id), _TIMEOUT)
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
+        'go',
+        'keep going',
+    ]
+    assert len(llm.calls) == 2
+    assert seen == ['past the peers']
+    for runtime in (bravo, alpha, owner, charlie):
+        await runtime.shutdown()
+
+
+async def test_suppressing_activation_reaches_the_runtime_that_actually_holds_the_agent(
+    caplog: pytest.LogCaptureFixture,
+):
+    """抑制位的作用域是**这一次 publish**，不是发起它的那个 Runtime。
+
+    共享注册表 + 共享 broker 下，投递方与持有者可以是两个不同的 Runtime。抑制位若挂在实例上，
+    持有者的回调读不到别人设的那一位，`activate=False` 就静默把它叫醒了。
+    """
+    registry = InMemoryAgentRegistry()
+    broker = InMemoryMessageBroker()
+    owner = Runtime(registry=registry, broker=broker)
+    peer = Runtime(registry=registry, broker=broker)
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    agent_id = await owner.spawn(_factory(llm), query='go')
+    await owner.wait(agent_id)
+
+    quiet = await peer.send(agent_id, 'queue only', activate=False)
+
+    assert quiet.ok is False
+    assert await _status(owner, agent_id) is AgentStatus.ZOMBIE
+    assert len(llm.calls) == 1
+    # 同一个投递方、同一条链，只摘掉抑制位：持有者照常复活，上面那条因此不是「反正都醒不了」。
+    assert (await peer.send(agent_id, 'wake up')).ok is True
+    await asyncio.wait_for(owner.wait(agent_id), _TIMEOUT)
+    assert len(llm.calls) == 2
+    assert caplog.records == []
+    await peer.shutdown()
+    await owner.shutdown()
