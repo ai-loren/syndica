@@ -2535,8 +2535,10 @@ async def test_a_resume_the_registry_refuses_still_lifts_the_gate(
     """只有 pause / resume 能抬门，所以记不下就不抬会把它永久停在门上。
 
     一个过时的状态可以用 find() 重读，一个没人能抬起的门谁都救不回来。
+
+    **不调 `caplog.set_level`**：这次转换失败的唯一痕迹就是这条记录，而 root logger 默认停在
+    WARNING，低于它的级别连记录都不会被创建。
     """
-    caplog.set_level(logging.INFO)
     registry = _RecordingRegistry(deny=(AgentStatus.PAUSED, AgentStatus.IDLE))
     broker = _SpyBroker(registry)
     runtime = Runtime(registry=registry, broker=broker)
@@ -2556,9 +2558,41 @@ async def test_a_resume_the_registry_refuses_still_lifts_the_gate(
         'turn-0',
     ]
     assert control.paused is False
-    assert [record.levelname for record in caplog.records] == ['INFO']
+    assert [record.levelname for record in caplog.records] == ['WARNING']
     assert caplog.records[0].args == (agent_id, AgentStatus.IDLE.value)
     _assert_three_part(caplog.records[0].getMessage())
+    await runtime.shutdown()
+
+
+async def test_a_refused_resume_inside_a_run_reports_running_as_the_state_it_could_not_write(
+    caplog: pytest.LogCaptureFixture,
+):
+    """`back_to` 只有 RUNNING / IDLE 两个取值，而只走过其中一个的话，另一支的措辞从未被检查。
+
+    这里覆盖的是整个取值域，不是取样：把这一项写死成任一个常量，两条用例里必有一条变红。
+    """
+    registry = _RecordingRegistry(deny=(AgentStatus.PAUSED, AgentStatus.RUNNING))
+    runtime = Runtime(registry=registry)
+    blocker = _Block()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go')
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    control = runtime._slots[agent_id].control
+    await runtime.pause(agent_id)
+
+    await runtime.resume(agent_id)
+
+    assert control.in_run is True
+    assert [record.levelname for record in caplog.records] == ['WARNING']
+    assert caplog.records[0].args == (agent_id, AgentStatus.RUNNING.value)
+    _assert_three_part(caplog.records[0].getMessage())
+    # 门照常抬起：注册表记不下不该把它永久停在门上。
+    assert control.paused is False
+    blocker.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert [block.content for block in ctx.current_traj if block.role == 'assistant'] == [
+        None,
+        'done',
+    ]
     await runtime.shutdown()
 
 

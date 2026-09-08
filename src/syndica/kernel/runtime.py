@@ -593,7 +593,10 @@ class Runtime:
         slot.control.resume()
         back_to = AgentStatus.RUNNING if slot.control.in_run else AgentStatus.IDLE
         if not await self._switch(agent_id, new=back_to, allowed=(AgentStatus.PAUSED,)):
-            logger.info(
+            # WARNING 而不是 INFO：root logger 默认停在 WARNING，INFO 的记录根本不会被创建，而
+            # 本模块的不变式是「每一处状态转换失败都必须留痕」。也不是 ERROR：门已经抬起、这个
+            # Agent 照常跑，任何远端注册表上「它自己先往下走了」都会让 ERROR 变成常态误报。
+            logger.warning(
                 '期望: agent %s 在注册表里是 paused，可由本进程转回 %s。'
                 ' 实际: 这次 CAS 被拒，它此刻不是 paused——'
                 '它可能已经自己往下走了，也可能状态归了别人。'
