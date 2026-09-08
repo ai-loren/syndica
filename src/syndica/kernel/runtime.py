@@ -115,17 +115,6 @@ _PAUSABLE_STATUSES: tuple[AgentStatus, ...] = (
     AgentStatus.WAITING,
 )
 
-# 中止兑现在门上，所以这里列的是**事件循环还够得着一道门**的那些状态：RUNNING / WAITING 的下一道
-# 门在轮边界，PAUSED 的执行体要么已经停在门上（`request_abort` 的唤醒边沿当场送到），要么在一轮
-# 之内到得了。IDLE 不在内——那时循环阻塞在邮箱上，那条边沿谁也收不到，位会一直 armed 到下一条消息
-# 把它引爆，而那条消息本该得到一个完整的周期。与 `_PAUSABLE_STATUSES` 同理，这一个元组同时决定
-# `abort` 的早退拒绝与它那次 CAS 的 expected 集合。
-_ABORTABLE_STATUSES: tuple[AgentStatus, ...] = (
-    AgentStatus.RUNNING,
-    AgentStatus.WAITING,
-    AgentStatus.PAUSED,
-)
-
 
 @dataclass
 class _Slot:
@@ -140,6 +129,10 @@ class _Slot:
     control: ControlBlock
     gate: BrokerTurnGate
     owned: bool = False
+    # 事件循环此刻停在邮箱上（>0）还是在往前走（0）。注册表答不出这件事：停在邮箱上的 PAUSED
+    # 与停在挂起门上的 PAUSED 是同一个取值，而只有后者收得到唤醒边沿。读它与改它都是同步的，
+    # 因此控制面在一段不含 await 的代码里读到的答案与驱动任务此刻的位置严格一致。
+    parked_on_mailbox: int = 0
 
 
 def _parked_status(slot: _Slot) -> AgentStatus:
@@ -264,11 +257,20 @@ class Runtime:
         """IDLE↔RUNNING：等一条消息，跑一个周期，再等下一条。"""
         while True:
             if query is None and slot.control.deferred_count == 0:
-                await self._oscillate(agent_id, new=_parked_status(slot))
-                # timeout=None 是刻意的：这个循环的退出路径是取消（kill / shutdown）与队列消失，
-                # 不是超时。答 False 只有一个原因——邮箱已经被摘掉了。
-                if not await self.broker.wait_for_messages(agent_id, None):
-                    return
+                # 这三句之间没有挂起点，因此它们对控制面是一次原子的「我要去停在邮箱上了」：
+                # 到这里手上已经没有在飞的轮，一个还没被消费的中止位没有东西可停，作废它；
+                # 紧随其后的 `_oscillate` 把注册表从 ABORTING 带回停泊态。置位在两个 await
+                # **之前**，`abort` 因此不会在这段窗口里写下一个没人会取走的 ABORTING。
+                slot.control.take_abort()
+                slot.parked_on_mailbox += 1
+                try:
+                    await self._oscillate(agent_id, new=_parked_status(slot))
+                    # timeout=None 是刻意的：这个循环的退出路径是取消（kill / shutdown）与队列
+                    # 消失，不是超时。答 False 只有一个原因——邮箱已经被摘掉了。
+                    if not await self.broker.wait_for_messages(agent_id, None):
+                        return
+                finally:
+                    slot.parked_on_mailbox -= 1
             if await slot.control.hold_until_runnable():
                 # 中止落在周期之间：这一轮不开始，位已消费，回去继续等。
                 query = None
@@ -596,9 +598,16 @@ class Runtime:
         不在）。abort 是「停下手上这一件事」，不是「从此不再干活」。**暂存的延迟消息不在被停的
         范围里**——它们排的是下一件事的队，那一件还没开始。
 
-        只允许从 RUNNING / WAITING / PAUSED 发起（见 `_ABORTABLE_STATUSES`）：这三个状态下事件
-        循环都够得着一道门，位因此在一轮之内被消费掉。IDLE 与 ZOMBIE 报错并指向 `kill` /
-        `despawn`——调用方在那两种状态下想要的多半是「别再理它」，而那是另一件事。
+        **手上没有活时它成功，并且什么都不写。** 事件循环停在邮箱上（IDLE，或挂起着而邮箱空）、
+        或已经结束（ZOMBIE），此刻轨迹已经配对完整——那正是协作式中止要保住的东西，后置条件已经
+        成立。判据是**驱动任务此刻在哪**，不是注册表说什么：注册表分不出停在邮箱上的 PAUSED 与
+        停在挂起门上的 PAUSED，而只有后者收得到唤醒边沿。这条判断在一段不含 await 的代码里做完，
+        因此与「一个周期开始」之间没有交错窗口。之后才到达的消息开的是**下一件事**，不在本次调用
+        的范围里——它本来也停不住：被中止的周期不 consume 邮箱，那条消息照样换来一个完整的周期。
+
+        因此 abort **不因为「它在做什么」而拒绝**。拒绝只剩下「本进程答不了这个问题」：注册表里
+        没有这个条目、本进程手里没有它的实例、驱动任务没有接管过它，以及转 ABORTING 的 CAS 输给
+        了并发的写者。
 
         对 PAUSED 允许，且中止**穿透挂起门**：先挂起再中止是真实顺序，若中止要等解除挂起才被
         看见，这个 Agent 会永远停在那里而调用方毫无反馈。**穿透不等于解除**：门原样落着，兑现
@@ -617,24 +626,13 @@ class Runtime:
         slot, info = await self._control_target('abort', agent_id, named=named)
         if slot is None or info is None:
             return
-        # 已经是 ABORTING 的一并放行：后置条件已经成立的操作成功返回。
-        if info.status not in (*_ABORTABLE_STATUSES, AgentStatus.ABORTING):
-            self._refuse_control(
-                'abort',
-                agent_id,
-                named=named,
-                received=f'它当前是 {info.status.value}，手上没有正在进行的工作',
-                next_action=(
-                    f'只有 {" / ".join(status.value for status in _ABORTABLE_STATUSES)} 能中止——'
-                    'abort 停的是「手上这一件事」，而只有这三个状态下的事件循环够得着一道门。'
-                    'idle 停在邮箱上，中止位要等下一条消息才被看见，而那条消息本该跑完一个周期；'
-                    'zombie 连事件循环都没有。'
-                    '要让一个空闲的 Agent 停止事件循环用 kill；要连注册表条目一起去掉用 despawn'
-                ),
-            )
+        # 两个读都是同步的，且此后到 `request_abort()` 为止只隔着一次 CAS：驱动任务在本函数让出
+        # 控制权之前动不了，因此「它此刻没有在飞的轮」这个判断不会被一个并发开始的周期推翻。
+        if not self._has_live_driver(agent_id) or slot.parked_on_mailbox:
             return
         # 先落注册表再落位：记不下 ABORTING 就不要真的置位——那会停掉一件谁都看不出被停了的活。
-        if not await self._switch(agent_id, new=AgentStatus.ABORTING, allowed=_ABORTABLE_STATUSES):
+        # 反过来这两句之间也没有挂起点，所以驱动任务看到的永远是「状态与位一起到」。
+        if not await self._switch(agent_id, new=AgentStatus.ABORTING, allowed=_LIVE_STATUSES):
             self._refuse_control(
                 'abort',
                 agent_id,
@@ -730,12 +728,14 @@ class Runtime:
                 agent_id,
                 named=named,
                 received=(
-                    '本进程 spawn 过它，但驱动任务没有接管成功：'
-                    'IDLE -> RUNNING 的转换被拒（它已被别人拿走），或任务在这之前就被取消——'
-                    '本进程没有它的事件循环可以停'
+                    '本进程 spawn 过它，但驱动任务还没有接管：'
+                    'spawn 只是把任务排上去，它可能还没被调度到；'
+                    '也可能 IDLE -> RUNNING 的转换被拒（它已被别人拿走），或任务在这之前就被取消'
+                    '——本进程没有它的事件循环可以停'
                 ),
                 next_action=(
-                    '用 find() 读它当前的 status 与 owner；在持有它的进程上操作它。'
+                    '刚 spawn 完就调用的话先重试一次：每一次 await 都给驱动任务一个接管的机会。'
+                    '重试仍是这一条就用 find() 读它当前的 status 与 owner，在持有它的进程上操作它；'
                     '确认它空闲后重新 spawn 一个，才能在本进程里控制它'
                 ),
             )

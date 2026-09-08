@@ -489,6 +489,21 @@ async def _resident(runtime: Runtime, broker: _SpyBroker, *, parent_id: str | No
     return agent_id
 
 
+async def _running(
+    runtime: Runtime, blockers: list[_Block], *, parent_id: str | None = None
+) -> str:
+    """起一个真的停在一次工具调用里的 Agent，握手用工具入口而不是注册表。
+
+    把停在邮箱上的 Agent 的注册表改成 RUNNING 只是改了一个字符串：它手上依然没有活，事件循环
+    也依然停在邮箱上。`abort` 的判据是驱动任务此刻在哪，用假状态搭出来的树对它完全无感。
+    """
+    blocker = _Block()
+    blockers.append(blocker)
+    agent_id = await runtime.spawn(_blocking(blocker), query='go', parent_id=parent_id)
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    return agent_id
+
+
 async def test_spawn_gives_each_agent_its_own_id_and_registry_entry():
     runtime = Runtime()
     names = ['Beta', 'Alpha', 'Gamma']
@@ -2813,45 +2828,86 @@ async def test_abort_on_an_agent_parked_at_the_pause_gate_is_taken_at_once_and_i
     await runtime.shutdown()
 
 
-async def test_aborting_an_idle_agent_is_refused_and_arms_nothing_for_the_next_message():
-    """手上没有活就没有「停下手上这一件事」可言；IDLE 的循环还阻塞在邮箱上，唤醒边沿送不到它。
+async def test_aborting_an_agent_parked_on_its_mailbox_succeeds_and_writes_nothing():
+    """停在邮箱上就没有「手上这一件事」可停：轨迹已经配对完整，后置条件已经成立。
 
-    位若真的置上去，它会一直 armed 到下一条消息把它引爆——而那条消息本该得到一个完整的周期。
+    写下 ABORTING 才是真的坏——邮箱上没有等唤醒边沿的执行体，那个状态要等下一条消息才被纠正，
+    在此期间注册表对**所有**进程谎报「它正在收尾」。
     """
-    broker = _SpyBroker()
-    runtime = Runtime(broker=broker)
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
     agent_id = await _resident(runtime, broker)
+    before = len(registry.transitions)
 
-    with pytest.raises(ContractViolation) as excinfo:
-        await runtime.abort(agent_id)
+    await runtime.abort(agent_id)
 
-    assert agent_id in excinfo.value.expected
-    assert AgentStatus.IDLE.value in excinfo.value.received
-    assert 'kill' in excinfo.value.next_action
-    assert 'despawn' in excinfo.value.next_action
+    # 一次 CAS 都没试过：拒绝与放行之外的第三种答案是「什么都不写」。
+    assert registry.transitions[before:] == []
     assert runtime._slots[agent_id].control.abort_requested is False
     assert await _status(runtime, agent_id) is AgentStatus.IDLE
 
+    # 之后到达的消息开的是**下一件事**，不在本次调用的范围里，照常换来一个完整的周期。
     assert (await runtime.send(agent_id, 'still working')).ok is True
     await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
     agent = runtime._table.get(agent_id)
     assert agent is not None
     assert [block.content for block in agent.context.current_traj] == ['still working', 'turn-0']
+    assert agent.context.stop_reason is StopReason.COMPLETED
     await runtime.shutdown()
 
 
-async def test_aborting_a_zombie_is_refused_and_leaves_it_revivable():
-    """ZOMBIE 连事件循环都没有，而它的注册表状态正是 `ensure_active` 复活它的凭据。"""
-    runtime = Runtime()
+async def test_aborting_a_paused_agent_with_an_empty_mailbox_leaves_it_paused_and_resumable():
+    """挂起着而邮箱空的执行体停在**邮箱**上，不在挂起门上——唤醒边沿在那里没有等待者。
+
+    这一支与 IDLE 在事件循环里是同一个位置，只有注册表把它们叫成两个名字；按状态准入的判据分不出
+    它与停在挂起门上的 PAUSED。写下 ABORTING 的话，`resume` 的 CAS（expected 只有 paused）落空，
+    只剩一条入站消息能改回来——一个没有任何操作纠正得了的假状态。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await _resident(runtime, broker)
+    control = runtime._slots[agent_id].control
+    await runtime.pause(agent_id)
+    assert control.parked == 0
+    before = len(registry.transitions)
+
+    await runtime.abort(agent_id)
+
+    assert registry.transitions[before:] == []
+    assert control.abort_requested is False
+    assert control.paused is True
+    assert await _status(runtime, agent_id) is AgentStatus.PAUSED
+
+    # resume 修得回来，这正是写下 ABORTING 之后失效的那一步。
+    await runtime.resume(agent_id)
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    assert (await runtime.send(agent_id, 'carry on')).ok is True
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert [block.content for block in agent.context.current_traj] == ['carry on', 'turn-0']
+    await runtime.shutdown()
+
+
+async def test_aborting_a_zombie_succeeds_without_writing_the_state_that_would_bury_it():
+    """ZOMBIE 的那件事早就停了，后置条件已经成立。
+
+    成功与拒绝的差别不在返回值上，在于它**没有写下 ABORTING**：`ensure_active` 明文拒绝复活一个
+    aborting 的 Agent，而 ZOMBIE 的注册表状态正是复活它的凭据。
+    """
+    registry = _RecordingRegistry()
+    runtime = Runtime(registry=registry)
     llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
     agent_id = await runtime.spawn(_factory(llm), query='go')
     await runtime.wait(agent_id)
     assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    before = len(registry.transitions)
 
-    with pytest.raises(ContractViolation) as excinfo:
-        await runtime.abort(agent_id)
+    await runtime.abort(agent_id)
 
-    assert AgentStatus.ZOMBIE.value in excinfo.value.received
+    assert registry.transitions[before:] == []
     assert runtime._slots[agent_id].control.abort_requested is False
     assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
 
@@ -2864,33 +2920,51 @@ async def test_aborting_a_zombie_is_refused_and_leaves_it_revivable():
     await runtime.shutdown()
 
 
-async def test_the_two_ways_an_abort_can_be_refused_do_not_read_the_same():
-    """「手上没有活」与「这次 CAS 输给了别人」的下一步动作不同：一个换工具，一个重读状态再决定。
+async def test_a_send_followed_at_once_by_an_abort_is_not_a_refusal():
+    """界面上「发出去 → 立刻按停止」那一格：此刻注册表多半还说 idle，驱动任务还没被调度到。
 
-    合成一条消息的话，一次输掉的竞争会被报成「它空闲着」，调用方于是照着去 kill 一个正在干活的
-    Agent——而它的活本可以协作式地停下来。
+    这条 abort 本来就停不住那条消息——被中止的周期不 consume 邮箱，它照样换来一个完整的周期，
+    放行与拒绝的终局逐字相同。既然如此就不该拒绝，更不该把调用方推去 kill 一个本可协作停下的
+    Agent：kill 拆的是整个事件循环。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    agent_id = await _resident(runtime, broker)
+
+    assert (await runtime.send(agent_id, 'do the thing')).ok is True
+    await runtime.abort(agent_id)
+
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert [block.content for block in agent.context.current_traj] == ['do the thing', 'turn-0']
+    assert agent.context.stop_reason is StopReason.COMPLETED
+    assert runtime._slots[agent_id].control.abort_requested is False
+    await runtime.shutdown()
+
+
+async def test_an_abort_that_loses_the_race_reads_as_a_race_and_not_as_an_idle_agent():
+    """输掉的 CAS 报成「它空闲着」的话，调用方会照着去动一个正在干活的 Agent。
+
+    而它的活本可以协作式地停下来；`kill` 拆的是整个事件循环，远大于「这件事别做了」。
     """
     registry = _RecordingRegistry(deny=(AgentStatus.RUNNING, AgentStatus.ABORTING))
-    broker = _SpyBroker(registry)
-    runtime = Runtime(registry=registry, broker=broker)
-    idle = await _resident(runtime, broker)
-    contended = await _resident(runtime, broker)
-    assert await registry.compare_and_set_status(
-        contended, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
-    )
+    runtime = Runtime(registry=registry)
+    blockers: list[_Block] = []
+    contended = await _running(runtime, blockers)
 
-    with pytest.raises(ContractViolation) as nothing_to_stop:
-        await runtime.abort(idle)
     with pytest.raises(ContractViolation) as lost_the_race:
         await runtime.abort(contended)
 
-    assert nothing_to_stop.value.received != lost_the_race.value.received
-    assert nothing_to_stop.value.next_action != lost_the_race.value.next_action
+    assert contended in lost_the_race.value.expected
     assert AgentStatus.ABORTING.value in lost_the_race.value.received
-    # 输掉竞争的那一个仍在跑：拿它当「空闲」报出去，调用方会去动一个不该动的东西。
     assert AgentStatus.IDLE.value not in lost_the_race.value.received
+    assert 'kill' not in lost_the_race.value.next_action
+    assert 'find()' in lost_the_race.value.next_action
     assert runtime._slots[contended].control.abort_requested is False
     assert await _status(runtime, contended) is AgentStatus.RUNNING
+    for blocker in blockers:
+        blocker.release.set()
     await runtime.shutdown()
 
 
@@ -3036,18 +3110,24 @@ async def test_an_abort_leaves_the_deferred_stash_for_the_next_cycle():
     await runtime.shutdown()
 
 
-async def test_abort_enters_from_every_status_whose_loop_can_still_reach_a_gate():
-    """不在可中止集合里的活状态会静默转不过去：拒绝的理由说得通，而 CAS 根本没生效。
+async def test_abort_writes_aborting_from_every_live_status_its_own_loop_can_be_in():
+    """不在 CAS `allowed` 里的活状态会静默转不过去：位置上了，注册表却停在旧状态上。
 
-    三个而非一个，顺序既非声明序亦非其反转。
+    四个而非一个，顺序既非 `_LIVE_STATUSES` 的声明序亦非其反转，也不是取值的升序或降序。每一个都
+    真的停在一次工具调用里——注册表的取值是被改出来的，而准入判据读的是驱动任务此刻在哪。
     """
     registry = _RecordingRegistry()
-    broker = _SpyBroker(registry)
-    runtime = Runtime(registry=registry, broker=broker)
-    for status in (AgentStatus.PAUSED, AgentStatus.RUNNING, AgentStatus.WAITING):
-        agent_id = await _resident(runtime, broker)
+    runtime = Runtime(registry=registry)
+    blockers: list[_Block] = []
+    for status in (
+        AgentStatus.WAITING,
+        AgentStatus.IDLE,
+        AgentStatus.PAUSED,
+        AgentStatus.RUNNING,
+    ):
+        agent_id = await _running(runtime, blockers)
         assert await registry.compare_and_set_status(
-            agent_id, expected=AgentStatus.IDLE, new=status
+            agent_id, expected=AgentStatus.RUNNING, new=status
         )
 
         await runtime.abort(agent_id)
@@ -3055,6 +3135,8 @@ async def test_abort_enters_from_every_status_whose_loop_can_still_reach_a_gate(
         assert await _status(runtime, agent_id) is AgentStatus.ABORTING
         assert runtime._slots[agent_id].control.abort_requested is True
         assert registry.applied_of(agent_id)[-1] == (status, AgentStatus.ABORTING)
+    for blocker in blockers:
+        blocker.release.set()
     await runtime.shutdown()
 
 
@@ -3078,6 +3160,52 @@ async def test_a_second_abort_on_an_agent_already_winding_down_is_a_no_op():
         (AgentStatus.RUNNING, AgentStatus.ABORTING),
         (AgentStatus.ABORTING, AgentStatus.ABORTING),
         (AgentStatus.ABORTING, AgentStatus.ZOMBIE),
+    ]
+    await runtime.shutdown()
+
+
+async def test_an_abort_that_lands_after_the_last_turn_is_spent_before_the_loop_parks():
+    """位在停到邮箱上之前就作废：那一刻手上已经没有轮了，它没有东西可停。
+
+    留着它的话下一条消息会先烧掉一次循环迭代——终局一模一样（那条消息照样换来一个完整的周期），
+    只有「停着的时候位是干净的」这一句分得出这一位到底是被谁取走的。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    ending = _Hold()
+    ending.close()
+
+    async def hold(**kwargs: Any) -> HookResult:
+        await ending.passing('agent_end')
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_END, hold)
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    agent_id = await runtime.spawn(_factory(llm), query='go', exit_mode=ExitMode.IDLE)
+    await asyncio.wait_for(ending.reach(1), _TIMEOUT)
+    # 这一轮已经跑完而循环还没回到邮箱上：既不在门上，也不在邮箱上。
+    slot = runtime._slots[agent_id]
+    assert slot.parked_on_mailbox == 0
+
+    await runtime.abort(agent_id)
+
+    assert slot.control.abort_requested is True
+    assert await _status(runtime, agent_id) is AgentStatus.ABORTING
+
+    ending.open()
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+    assert slot.control.abort_requested is False
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+
+    assert (await runtime.send(agent_id, 'next')).ok is True
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert [block.content for block in agent.context.current_traj] == [
+        'go',
+        'first',
+        'next',
+        'second',
     ]
     await runtime.shutdown()
 
@@ -3130,21 +3258,17 @@ async def test_an_aborted_cycle_comes_back_out_of_aborting_on_both_exits():
     await runtime.shutdown()
 
 
-async def _running_tree(runtime: Runtime, broker: _SpyBroker, registry: _RecordingRegistry):
-    """一棵五个子代跨两代的树，全部推到 RUNNING，另有一个不在树上的 Agent。
+async def _running_tree(runtime: Runtime, blockers: list[_Block]) -> tuple[tuple[str, ...], str]:
+    """一棵五个子代跨两代的树，每一个都真的停在一次工具调用里，另有一个不在树上的 Agent。
 
     子代必须真的可中止，否则「遍历漏了它」与「遍历到了但它不可中止」是同一个答案，而后者只记
     日志——整条递归路径于是可以被一个什么都不做的实现满足。
     """
-    root = await _resident(runtime, broker)
-    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
-    delta = await _resident(runtime, broker, parent_id=bravo)
-    echo = await _resident(runtime, broker, parent_id=alpha)
-    outsider = await _resident(runtime, broker)
-    for agent_id in (root, bravo, alpha, charlie, delta, echo, outsider):
-        assert await registry.compare_and_set_status(
-            agent_id, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
-        )
+    root = await _running(runtime, blockers)
+    bravo, alpha, charlie = [await _running(runtime, blockers, parent_id=root) for _ in range(3)]
+    delta = await _running(runtime, blockers, parent_id=bravo)
+    echo = await _running(runtime, blockers, parent_id=alpha)
+    outsider = await _running(runtime, blockers)
     return (root, bravo, alpha, charlie, delta, echo), outsider
 
 
@@ -3155,9 +3279,9 @@ async def test_recursive_abort_reaches_every_descendant_and_goes_parent_first():
     反转全都互不相同。
     """
     registry = _RecordingRegistry()
-    broker = _SpyBroker(registry)
-    runtime = Runtime(registry=registry, broker=broker)
-    tree, outsider = await _running_tree(runtime, broker, registry)
+    runtime = Runtime(registry=registry)
+    blockers: list[_Block] = []
+    tree, outsider = await _running_tree(runtime, blockers)
 
     await runtime.abort(tree[0], recursive=True)
 
@@ -3168,6 +3292,8 @@ async def test_recursive_abort_reaches_every_descendant_and_goes_parent_first():
 
     assert await _status(runtime, outsider) is AgentStatus.RUNNING
     assert runtime._slots[outsider].control.abort_requested is False
+    for blocker in blockers:
+        blocker.release.set()
     await runtime.shutdown()
 
 
@@ -3177,16 +3303,11 @@ async def test_recursive_abort_from_a_node_with_a_parent_never_climbs_to_its_anc
     祖先必须自己也可中止，否则「爬上去了但被拒」与「没爬上去」是同一个答案。两个深度上各三个
     节点，注册顺序既非升序亦非降序，反转后同样两者都不是。
     """
-    registry = _RecordingRegistry()
-    broker = _SpyBroker(registry)
-    runtime = Runtime(registry=registry, broker=broker)
-    root = await _resident(runtime, broker)
-    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
-    echo, foxtrot, delta = [await _resident(runtime, broker, parent_id=bravo) for _ in range(3)]
-    for agent_id in (root, bravo, alpha, charlie, echo, foxtrot, delta):
-        assert await registry.compare_and_set_status(
-            agent_id, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
-        )
+    runtime = Runtime()
+    blockers: list[_Block] = []
+    root = await _running(runtime, blockers)
+    bravo, alpha, charlie = [await _running(runtime, blockers, parent_id=root) for _ in range(3)]
+    echo, foxtrot, delta = [await _running(runtime, blockers, parent_id=bravo) for _ in range(3)]
 
     await runtime.abort(bravo, recursive=True)
 
@@ -3197,6 +3318,8 @@ async def test_recursive_abort_from_a_node_with_a_parent_never_climbs_to_its_anc
     above = (root, alpha, charlie)
     assert [await _status(runtime, agent_id) for agent_id in above] == [AgentStatus.RUNNING] * 3
     assert [runtime._slots[agent_id].control.abort_requested for agent_id in above] == [False] * 3
+    for blocker in blockers:
+        blocker.release.set()
     await runtime.shutdown()
 
 
@@ -3206,19 +3329,14 @@ async def test_a_recursive_abort_on_one_tree_leaves_an_independent_tree_alone():
     两棵**独立**的树而不是一棵树的两支：同一棵树上的两支共享一个根，「只走这一支」与「走整棵树」
     可以被同一个实现同时满足。
     """
-    registry = _RecordingRegistry()
-    broker = _SpyBroker(registry)
-    runtime = Runtime(registry=registry, broker=broker)
+    runtime = Runtime()
+    blockers: list[_Block] = []
     trees: list[tuple[str, ...]] = []
     for _ in range(2):
-        root = await _resident(runtime, broker)
-        bravo, alpha = [await _resident(runtime, broker, parent_id=root) for _ in range(2)]
-        delta = await _resident(runtime, broker, parent_id=bravo)
+        root = await _running(runtime, blockers)
+        bravo, alpha = [await _running(runtime, blockers, parent_id=root) for _ in range(2)]
+        delta = await _running(runtime, blockers, parent_id=bravo)
         trees.append((root, bravo, alpha, delta))
-    for agent_id in (*trees[0], *trees[1]):
-        assert await registry.compare_and_set_status(
-            agent_id, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
-        )
 
     # 第二棵而不是第一棵：作用在「第一棵」上的实现在只有一棵树时与正确实现无从区分。
     await runtime.abort(trees[1][0], recursive=True)
@@ -3229,30 +3347,29 @@ async def test_a_recursive_abort_on_one_tree_leaves_an_independent_tree_alone():
     assert [runtime._slots[agent_id].control.abort_requested for agent_id in trees[0]] == [
         False
     ] * 4
+    for blocker in blockers:
+        blocker.release.set()
     await runtime.shutdown()
 
 
-async def test_a_descendant_with_nothing_to_stop_is_skipped_without_stopping_the_walk(
+async def test_a_descendant_with_nothing_to_stop_is_left_alone_without_a_record(
     caplog: pytest.LogCaptureFixture,
 ):
-    """递归是尽力而为的：为第一个冲突抛异常只会留下一棵改了一半的树。
+    """后置条件已经成立不是一次事件：这两个子代既没被写状态，也没留下记录，而遍历照常往下走。
 
-    两个跳过的排在三个子代的**中间**：排在末位时「走过它们」与「走到它们为止」是同一个答案。
+    两个「手上没有活」的排在四个子代的**中间**：排在末位时「走过它们」与「走到它们为止」是同一个
+    答案。它们是两种不同的「没有活」——一个已经收尾（ZOMBIE，连事件循环都没了），一个停在邮箱上。
     """
     caplog.set_level(logging.INFO)
-    registry = _RecordingRegistry()
-    broker = _SpyBroker(registry)
-    runtime = Runtime(registry=registry, broker=broker)
-    root = await _resident(runtime, broker)
-    bravo = await _resident(runtime, broker, parent_id=root)
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    blockers: list[_Block] = []
+    root = await _running(runtime, blockers)
+    bravo = await _running(runtime, blockers, parent_id=root)
     finished = await runtime.spawn(_factory(_done()), query='go', parent_id=root)
     await runtime.wait(finished)
     resting = await _resident(runtime, broker, parent_id=root)
-    charlie = await _resident(runtime, broker, parent_id=root)
-    for agent_id in (root, bravo, charlie):
-        assert await registry.compare_and_set_status(
-            agent_id, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
-        )
+    charlie = await _running(runtime, blockers, parent_id=root)
 
     await runtime.abort(root, recursive=True)
 
@@ -3261,32 +3378,24 @@ async def test_a_descendant_with_nothing_to_stop_is_skipped_without_stopping_the
     ] * 3
     assert await _status(runtime, finished) is AgentStatus.ZOMBIE
     assert await _status(runtime, resting) is AgentStatus.IDLE
-    skipped_agents = (finished, resting)
-    assert [runtime._slots[agent_id].control.abort_requested for agent_id in skipped_agents] == [
+    untouched = (finished, resting)
+    assert [runtime._slots[agent_id].control.abort_requested for agent_id in untouched] == [
         False,
         False,
     ]
-
-    assert [record.levelname for record in caplog.records] == ['INFO', 'INFO']
-    skipped = [record.getMessage() for record in caplog.records]
-    assert all('abort' in message for message in skipped)
-    assert [finished in message for message in skipped] == [True, False]
-    assert [resting in message for message in skipped] == [False, True]
-    assert all(root not in message and charlie not in message for message in skipped)
+    assert caplog.records == []
+    for blocker in blockers:
+        blocker.release.set()
     await runtime.shutdown()
 
 
 async def test_an_abort_the_registry_refuses_arms_nothing_and_leaves_the_tree_untouched():
     """记不下 aborting 就不要真的置位——那会停掉一件谁都看不出被停了的活。"""
     registry = _RecordingRegistry(deny=(AgentStatus.RUNNING, AgentStatus.ABORTING))
-    broker = _SpyBroker(registry)
-    runtime = Runtime(registry=registry, broker=broker)
-    agent_id = await _resident(runtime, broker)
-    child = await _resident(runtime, broker, parent_id=agent_id)
-    for target in (agent_id, child):
-        assert await registry.compare_and_set_status(
-            target, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
-        )
+    runtime = Runtime(registry=registry)
+    blockers: list[_Block] = []
+    agent_id = await _running(runtime, blockers)
+    child = await _running(runtime, blockers, parent_id=agent_id)
     registry.deny_for = agent_id
 
     with pytest.raises(ContractViolation) as excinfo:
@@ -3297,6 +3406,8 @@ async def test_an_abort_the_registry_refuses_arms_nothing_and_leaves_the_tree_un
     # 父先于子：被点名的那一个抛出来时，这棵树还没被走过。
     assert await _status(runtime, child) is AgentStatus.RUNNING
     assert runtime._slots[child].control.abort_requested is False
+    for blocker in blockers:
+        blocker.release.set()
     await runtime.shutdown()
 
 
