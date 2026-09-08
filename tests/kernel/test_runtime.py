@@ -2748,6 +2748,32 @@ async def test_abort_ends_the_current_cycle_with_a_consistent_trajectory():
     await runtime.shutdown()
 
 
+async def test_an_aborted_cycle_puts_its_stop_reason_on_the_bus_as_plain_data():
+    """`stop_reason` 走的是事件总线这道序列化出口，而 payload 必须是纯数据。
+
+    在 agent 层用一个固定答案的假门钉住过它，但真实链路是 `Runtime.abort` → 控制块 → 真实
+    `BrokerTurnGate` → turn 循环：一个性质在某一层被钉住，不等于在真正依赖它的那道接缝上被钉住。
+    """
+    runtime = Runtime()
+    subscription = runtime.events.subscribe()
+    blocker = _Block()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go')
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+
+    await runtime.abort(agent_id)
+
+    blocker.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert ctx.stop_reason is StopReason.ABORTED
+    await runtime.shutdown()
+
+    ends = [event async for event in subscription if event.kind == 'agent_end']
+    assert [(event.agent_id, event.payload) for event in ends] == [
+        (agent_id, {'stop_reason': 'aborted'})
+    ]
+    assert [type(value) for value in ends[0].payload.values()] == [str]
+
+
 async def test_abort_pierces_a_pause_taken_inside_a_turn_without_lifting_it():
     """先挂起再中止是真实顺序：中止若要等解除挂起才被看见，调用方永远拿不到反馈。
 
