@@ -20,7 +20,7 @@ from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.protocols import AgentRegistry, MissingQueueCallback
-from syndica.kernel.runtime import AgentFactory, Runtime
+from syndica.kernel.runtime import _LIVE_STATUSES, AgentFactory, Runtime
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
 
@@ -4808,4 +4808,197 @@ async def test_a_spawn_whose_parent_is_doomed_while_it_waits_hands_back_no_unadd
         for subject in (charlie, alpha, bravo, root)
     ] == [True] * 4
     assert await _dangling_parents(registry) == []
+    await runtime.shutdown()
+
+
+async def test_the_self_refusal_pre_pass_finishes_before_the_first_node_comes_down():
+    """预检查是独立的一遍，抛在动手之前：半棵拆掉的树没有人能收拾。
+
+    调用者放在深度 1，另有一条更深的兄弟子树：拆除相是 `reversed(BFS)`，把检查挪进拆除循环时
+    那三个更深的节点会先被真的拆掉，再停在调用者身上。调用者在最深处时两种写法给同一个答案。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    holder: dict[str, str] = {}
+    seen: list[str] = []
+    ready = asyncio.Event()
+
+    class _DespawnAncestor(Tool):
+        async def execute(self, note: str) -> ToolResult:
+            """等测试搭完这棵树，然后试着销毁自己的祖先。"""
+            await ready.wait()
+            try:
+                await runtime.despawn(holder['root'])
+            except ContractViolation as error:
+                return ToolResult(output=f'refused: {error.received}')
+            return ToolResult(output='not refused')
+
+    async def record(**kwargs: Any) -> HookResult:
+        seen.append(kwargs['agent_id'])
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, record)
+    root = await _resident(runtime, broker)
+    holder['root'] = root
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall(id='c1', name='DespawnAncestor', arguments='{"note":"bye"}')]
+            ),
+            ScriptedTurn(content='still alive'),
+        ]
+    )
+    # 调用者在深度 1 且**先于** bravo 注册：广度优先的答案是 [caller, bravo, deep, deeper]，
+    # 因此独立的一遍预检查第一个就撞上它，而拆除相的逆序里它排在最后。
+    caller = await runtime.spawn(
+        _factory(llm, tools={'DespawnAncestor': _DespawnAncestor()}), query='go', parent_id=root
+    )
+    bravo = await _resident(runtime, broker, parent_id=root)
+    deep = await _resident(runtime, broker, parent_id=bravo)
+    deeper = await _resident(runtime, broker, parent_id=deep)
+    ready.set()
+
+    ctx = await asyncio.wait_for(runtime.wait(caller), _TIMEOUT)
+
+    tool_blocks = [block for block in ctx.current_traj if block.role == 'tool']
+    assert len(tool_blocks) == 1
+    assert isinstance(tool_blocks[0].content, str)
+    assert tool_blocks[0].content.startswith('refused: ')
+    tree = (root, caller, bravo, deep, deeper)
+    assert [await runtime.find(agent_id) is not None for agent_id in tree] == [True] * 5
+    assert registry.unregisters == []
+    assert seen == []
+    assert runtime._doomed == {}
+    await runtime.shutdown()
+
+
+async def test_reviving_a_zombie_that_sits_in_a_doomed_subtree_is_refused(
+    caplog: pytest.LogCaptureFixture,
+):
+    """复活一个正在被拆的节点，它的驱动会在条目被摘掉时失去句柄——一个永不被取消的孤儿。
+
+    这道守卫够得着，需要一个「已经是 ZOMBIE、又落在被拆的树里」的节点：钉住相在遍历返回之后
+    才落，所以窗口只能架在被点名的那一个身上。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    task = runtime._table.get_task(agent_id)
+    registry.hold_children_of = agent_id
+    registry.walks.close()
+    despawning = asyncio.create_task(runtime.despawn(agent_id))
+    await asyncio.wait_for(registry.walks.reach(1), _TIMEOUT)
+    caplog.set_level(logging.INFO)
+
+    assert await runtime.ensure_active(agent_id) is False
+
+    # 复活写下去的那个 IDLE 必须收回：留着它就是宣布「它能处理消息」，而 zombie 才是复活的凭据。
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    assert runtime._table.get_task(agent_id) is task
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert caplog.records[0].args == (agent_id,)
+    registry.walks.open()
+    await asyncio.wait_for(despawning, _TIMEOUT)
+    assert await runtime.find(agent_id) is None
+    await runtime.shutdown()
+
+
+async def test_the_despawn_junction_fires_only_after_every_trace_is_already_gone():
+    """`AGENT_DESPAWN` 报的是既成事实，所以想留下父子关系只能在 `AGENT_SPAWN` 上记。
+
+    这条契约本身就是「hook 里读不到条目」，因此只有在 hook 里当场问才验得出来：在外面事后问，
+    触发点挪到摘条目**之前**同样答「不在了」。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    observed: list[tuple[str, bool, bool, bool]] = []
+
+    async def look_around(**kwargs: Any) -> HookResult:
+        agent_id = kwargs['agent_id']
+        observed.append(
+            (
+                agent_id,
+                await runtime.find(agent_id) is None,
+                agent_id not in runtime._slots,
+                runtime._table.get(agent_id) is None,
+            )
+        )
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, look_around)
+    root = await _resident(runtime, broker)
+    bravo = await _resident(runtime, broker, parent_id=root)
+    delta = await _resident(runtime, broker, parent_id=bravo)
+
+    await runtime.despawn(root)
+
+    assert observed == [
+        (delta, True, True, True),
+        (bravo, True, True, True),
+        (root, True, True, True),
+    ]
+    await runtime.shutdown()
+
+
+async def test_kill_reaches_aborting_from_every_status_this_process_calls_live():
+    """`kill` 的 `allowed` 必须是 `_LIVE_STATUSES` 本体，不是一份手写的子集。
+
+    基数由那个元组自己给出：漏掉的成员今天可能还没有写者（`WAITING`），但手写子集会让它落地那天
+    静默转不过去——而 `kill` 刻意不为转换失败留痕，末态又被 `_finish` 那一次 CAS 兜回 zombie，
+    于是只有走过的状态路径能把这件事说出来。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    blockers: list[_Block] = []
+    agents = [await _running(runtime, blockers) for _ in _LIVE_STATUSES]
+    for agent_id, status in zip(agents, _LIVE_STATUSES, strict=True):
+        assert await registry.compare_and_set_status(
+            agent_id, expected=AgentStatus.RUNNING, new=status
+        )
+
+    for agent_id in agents:
+        await runtime.kill(agent_id)
+    await asyncio.wait_for(_reaped(runtime), _TIMEOUT)
+
+    assert [
+        (status, AgentStatus.ABORTING) in registry.applied_of(agent_id)
+        for agent_id, status in zip(agents, _LIVE_STATUSES, strict=True)
+    ] == [True] * len(_LIVE_STATUSES)
+    assert [await _status(runtime, agent_id) for agent_id in agents] == [AgentStatus.ZOMBIE] * len(
+        _LIVE_STATUSES
+    )
+    await runtime.shutdown()
+
+
+async def test_despawn_clears_the_context_of_an_agent_whose_entry_someone_else_already_removed():
+    """痕迹检查看的是**全部**痕迹，不只是注册表条目。
+
+    只看注册表就会在条目已经被别的进程摘掉时早退，把 slot 与实例留在本进程里——而模块文档明写
+    「本类持有的每一份 Context 都对应一个仍可寻址的 Agent」。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    seen: list[str] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        seen.append(kwargs['agent_id'])
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, record)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    await registry.unregister(agent_id)
+
+    await runtime.despawn(agent_id)
+
+    assert agent_id not in runtime._slots
+    assert runtime._table.get(agent_id) is None
+    assert seen == [agent_id]
     await runtime.shutdown()
