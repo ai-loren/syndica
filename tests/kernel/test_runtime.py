@@ -2918,6 +2918,35 @@ async def test_aborting_a_paused_agent_with_an_empty_mailbox_leaves_it_paused_an
     await runtime.shutdown()
 
 
+async def test_an_abort_landing_while_the_loop_is_on_its_way_to_the_mailbox_writes_nothing():
+    """「它停着」这个事实要在循环**开始**往邮箱走的时候就成立，不是在它到达之后。
+
+    置位晚一步，落在这段窗口里的 abort 就会写下一个 ABORTING、再由循环停到邮箱上——正是那个没有
+    等待者、要等下一条消息才被纠正的假状态。窗口本身靠停住注册表那次 CAS 造出来。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await _resident(runtime, broker)
+    registry.hold_before = AgentStatus.IDLE
+    registry.switches.close()
+    assert (await runtime.send(agent_id, 'one')).ok is True
+    # 这个周期已经跑完，循环正卡在「转回停泊态」那一次 CAS 上，还没停到邮箱上。
+    await asyncio.wait_for(registry.switches.reach(1), _TIMEOUT)
+    assert runtime._slots[agent_id].parked_on_mailbox == 1
+    before = len(registry.transitions)
+
+    await runtime.abort(agent_id)
+
+    assert registry.transitions[before:] == []
+    assert runtime._slots[agent_id].control.abort_requested is False
+
+    registry.switches.open()
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    await runtime.shutdown()
+
+
 async def test_aborting_a_zombie_succeeds_without_writing_the_state_that_would_bury_it():
     """ZOMBIE 的那件事早就停了，后置条件已经成立。
 
