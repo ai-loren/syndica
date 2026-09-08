@@ -35,7 +35,20 @@ compare-and-set」，而那次真的丢失的转换零痕迹。
 
 **取消不做收尾工作。** 驱动任务被取消时，`finally` 里既不改注册表也不摘资源：取消可能落在轮的
 中间，那时轨迹里留着不配对的调用，而 spec 把「收尾」定义为一个**有状态**的动作。收尾由发起取消
-的那一方在取消之外完成，因此它不必在一个正在被取消的任务里 await。
+的那一方在取消之外完成，因此它不必在一个正在被取消的任务里 await。`kill` 因此把收尾放进一个独立
+的收割任务——它也是那条路上**唯一**保证得了归宿的地方。
+
+**只有一条拆除顺序。** `kill` 的收尾、`despawn`、`ExitMode.EXIT` 三条路都走 `_destroy_tree` →
+`_destroy`。各写一份清理迟早会在「先摘队列还是先注销」这种地方分叉，而分叉出来的差异只在并发投递
+恰好落进那个窗口时才现身。分工按「删不删注册表条目」切开：`kill` 不删（送进 ZOMBIE，条目还在，
+子代不会指向空洞，因此不需要级联）；`despawn` 一定删，所以**必须**级联到全部子代，子先于父。
+
+**条目要么和它的子树一起走，要么整棵树都留着。** `AgentRegistry.unregister` 只把自己从父的
+children 上摘掉、不动自己的子代，于是删掉一个有子代的父会留下一串 `parent_id` 指着不存在的条目：
+`children_of` 从此永远漏掉它们，而它们自己看起来还有个父。这是数据完整性问题不是策略，所以级联
+没有开关。**级联先把整棵子树钉住再动手**：边走边拆的话，中间节点一旦注销，它下面的条目就再也走不
+到（`children_of` 只能从父往下问）。钉住期间 `spawn` 拒绝往树上挂新子代、`ensure_active` 拒绝复活
+树里的节点——后者若放行，复活出来的驱动会在条目被摘掉时失去句柄，成为永不被取消的孤儿。
 
 **`_slots` 的键恒为实例表键的子集。** EXIT 把队列、注册表条目、实例表条目与 slot 一起摘掉，于是
 本类持有的每一份 Context 都对应一个仍可寻址的 Agent，随时间无界增长的只有活着的 Agent 数。代价
@@ -77,7 +90,7 @@ from syndica.kernel.context import Context, StopReason
 from syndica.kernel.control import BrokerTurnGate, ControlBlock
 from syndica.kernel.errors import ContractViolation
 from syndica.kernel.events import EventBus
-from syndica.kernel.hooks import HooksCenter
+from syndica.kernel.hooks import HooksCenter, Junction
 from syndica.kernel.local_table import LocalAgentTable
 from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.protocols import AgentRegistry, MessageBroker
@@ -144,6 +157,21 @@ def _parked_status(slot: _Slot) -> AgentStatus:
     return AgentStatus.PAUSED if slot.control.paused else AgentStatus.IDLE
 
 
+def _parent_being_destroyed(parent_id: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'parent_id {parent_id!r} 不在被拆的过程中',
+        received=(
+            '它正在被 despawn（或以 ExitMode.EXIT 收尾），它的整棵子树都要消失：'
+            '此刻挂上去的子代会带着一个指向已注销条目的 parent_id 留在注册表里，'
+            'children_of 从此永远漏掉它，而它自己看起来还有个父'
+        ),
+        next_action=(
+            '等这次拆除结束——用 find() 确认那个父已经不在注册表里——再决定把这个 Agent 挂到哪个'
+            '父下面；它不需要父就把 parent_id 置为 None'
+        ),
+    )
+
+
 def _already_shut_down() -> ContractViolation:
     return ContractViolation(
         expected='Runtime 尚未 shutdown，spawn 出来的 Agent 事件仍有订阅者能收到',
@@ -170,6 +198,12 @@ class Runtime:
         self.hooks: HooksCenter = HooksCenter()
         self._table: LocalAgentTable[BaseAgent] = LocalAgentTable()
         self._slots: dict[str, _Slot] = {}
+        # 收尾在事件循环之外做，因此它自己是一个任务；不在实例表里，`shutdown` 的取消名单看不见
+        # 它们，只能另等一次。
+        self._reapers: set[asyncio.Task[None]] = set()
+        # 正在被拆的 Agent，计数而不是集合成员：`ExitMode.EXIT` 的拆除可能嵌在一次 `despawn`
+        # 的子树里，先结束的那一个把标记撤掉，另一个就在自己还需要它的时候失去了这道拦。
+        self._doomed: dict[str, int] = {}
         self._closed = False
         # 「队列不存在」是懒启动与 ZOMBIE 复活的唯一触发点（spec §4.4）。接在这里，而不是让每个
         # 调用方自己先判断再激活——那样「复活」就有了 N 份实现。
@@ -193,6 +227,8 @@ class Runtime:
         """
         if self._closed:
             raise _already_shut_down()
+        if parent_id is not None and parent_id in self._doomed:
+            raise _parent_being_destroyed(parent_id)
         agent = factory(self.hooks, self.events)
         agent_id = agent.agent_id
         control = ControlBlock()
@@ -208,12 +244,21 @@ class Runtime:
             )
         )
         await self.broker.ensure_queue(agent_id)
+        # `_closed` 在方法开头读过一次，此后隔着 register / ensure_queue 两个 Protocol await。任何
+        # 会挂起的 store 下，并发的 shutdown 会在 gather 返回之后才走到这里，于是建出一个永不被
+        # 取消、永不被 await 的驱动，并把一个再没有订阅者的 Agent 留在注册表里。复检与 create_task
+        # 之间没有挂起点，因此这道守卫按得住；建好的两样按逆序还回去，不留半个 Agent。
+        if self._closed:
+            await self.broker.remove_queue(agent_id)
+            await self.registry.unregister(agent_id)
+            raise _already_shut_down()
         # put 先于 create_task：put 被拒时还没有任务可泄漏。两者之间没有挂起点，任务因此不会在
         # set_task 之前就跑起来。
         self._table.put(agent_id, agent)
         self._slots[agent_id] = _Slot(exit_mode=exit_mode, control=control, gate=gate)
         task = asyncio.create_task(self._drive(agent_id, agent, query), name=f'agent:{agent_id}')
         self._table.set_task(agent_id, task)
+        await self.hooks.trigger(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)
         return agent_id
 
     async def _drive(self, agent_id: str, agent: BaseAgent, query: str | None) -> None:
@@ -338,13 +383,15 @@ class Runtime:
         return False
 
     async def _finish(self, agent_id: str, slot: _Slot) -> None:
-        """事件循环退出后的归宿（spec §4.1 的 ExitMode）。"""
+        """事件循环退出后的归宿（spec §4.1 的 ExitMode）。
+
+        **幂等**：`kill` 的收割任务与驱动任务自己的 finally 都可能走到这里，而两者谁先谁后取决于
+        取消是否赶上。
+        """
         await self._report_abandoned_input(agent_id, slot)
         await self.broker.remove_queue(agent_id)
         if slot.exit_mode is ExitMode.EXIT:
-            await self.registry.unregister(agent_id)
-            self._table.pop(agent_id)
-            self._slots.pop(agent_id, None)
+            await self._destroy_tree(agent_id, operation='exit')
             return
         if not await self._switch(agent_id, new=AgentStatus.ZOMBIE, allowed=_LIVE_STATUSES):
             logger.error(
@@ -391,8 +438,8 @@ class Runtime:
         交回的是 Agent 自己那份 Context，不是快照：ZOMBIE 靠一条消息复活时续用的就是它，拿到副本
         的调用方会与 Agent 将来读写的那一份静默分叉。
 
-        **`ExitMode.IDLE` 的 Agent 事件循环常驻**，因此 `wait` 只在它被 shutdown（或后续加入的
-        kill / despawn）之后才返回——对守护型 Agent 调 `wait` 等于故意把自己挂住。
+        **`ExitMode.IDLE` 的 Agent 事件循环常驻**，因此 `wait` 只在它被 shutdown / kill / despawn
+        之后才返回——对守护型 Agent 调 `wait` 等于故意把自己挂住。
 
         Agent 的异常与取消都是**被等待者**的终态，不冒充成本次调用自己的失败：崩溃在
         `ctx.stop_reason` 上是 ERROR，被取消的运行没有 stop_reason。
@@ -526,6 +573,20 @@ class Runtime:
         # 第二次会撞上实例表拒绝替换未结束任务，把只答不抛的问句变成抛异常并丢下一个孤儿任务。
         if self._has_live_driver(agent_id):
             return True
+        if self._closed or agent_id in self._doomed:
+            # ZOMBIE -> IDLE 已经写下去了，而这里不会再有驱动接着：留着 idle 就是宣布「它能处理
+            # 消息」，而 zombie 才是复活它的凭据（`ensure_active` 的 `allowed` 只有它）。
+            await self._switch(agent_id, new=AgentStatus.ZOMBIE, allowed=(AgentStatus.IDLE,))
+            logger.error(
+                '期望: agent %s 可以重开事件循环。'
+                ' 实际: 复活走到一半时本 Runtime 已经 shutdown、或它已经在被拆——此刻建出来的驱动'
+                '没人会取消也没人会 await，只会在解释器退出时变成一行「Task was destroyed but it'
+                ' is pending」。'
+                ' 下一步: 注册表状态已经写回 zombie；被拆的等它拆完（find() 会答 None），'
+                '关机的新建一个 Runtime 重新 spawn。',
+                agent_id,
+            )
+            return False
         # 复活的循环没有 query：它要干什么由那条把它叫醒的消息说，门会在第一轮开始前消费它。
         revived = asyncio.create_task(self._drive(agent_id, agent, None), name=f'agent:{agent_id}')
         self._table.set_task(agent_id, revived)
@@ -621,6 +682,181 @@ class Runtime:
         if recursive:
             for descendant in await self._descendants(agent_id):
                 await self._abort_one(descendant, named=False)
+
+    async def kill(self, agent_id: str) -> None:
+        """硬终止：取消事件循环并**立刻返回**，收尾在后台完成。
+
+        spec §4.1 给 ABORTING 的理由就是这个——它是中间态，好让 `kill` 不必等收尾。
+
+        取消可能落在轮的中间，因此这条路**不产生 `stop_reason`**，并且会留下一个声明了 N 个调用却
+        不足 N 条结果的 assistant block。那不是缺陷：`BaseAgent.run` 在入口按「中断、副作用未知」
+        把它补成配对完整的轨迹，于是被杀掉的 Agent 仍然可以被一条消息复活并继续干。要一次配对完整、
+        带 `StopReason.ABORTED` 的收场，那是 `abort`——两者的区别正是 `ABORTED` 存在的理由。
+
+        **`kill` 自己不注销注册表条目**，它把 Agent 送进 ZOMBIE：条目还在，因此它的子代不会指向一
+        个已被删掉的父，`kill` 也就不需要级联。条目的去留仍由 `exit_mode` 决定——`ExitMode.EXIT` 的
+        Agent 走的是同一条级联拆除，条目连同整棵子树一起消失。要无条件连条目一起去掉是 `despawn`。
+
+        **刻意不置中止位。** 取消已经足够；而中止位是会留下来的状态，此后一次 `ensure_active` 复活会
+        在第一轮就把它消费掉，让复活出来的 Agent 立刻结束——一次 kill 变成了永久的诅咒。
+
+        `shutdown` 之后是成功的 no-op：事件循环那时都已经停下（后置条件已成立），而收尾与 `shutdown`
+        自己一样不做；此刻再排一个收割任务，那是个永不被 await 的孤儿。
+        """
+        slot, info = await self._control_target('kill', agent_id, named=True)
+        if slot is None or info is None:
+            return
+        if self._closed:
+            return
+        # 转换失败不记：那只意味着它已经进了终态（killing 一个 zombie 是成功的 no-op），而真正
+        # 要保证的归宿由收割任务给出，那一步失败会自己留痕。
+        await self._switch(agent_id, new=AgentStatus.ABORTING, allowed=_LIVE_STATUSES)
+        # 复检与 create_task 之间没有挂起点：并发的 shutdown 已经等过收割任务，此刻再建一个就是
+        # 永不被 await 的孤儿。
+        if self._closed:
+            return
+        task = self._table.get_task(agent_id)
+        if task is not None and not task.done():
+            task.cancel()
+        reaper = asyncio.create_task(self._reap(agent_id, slot), name=f'reap:{agent_id}')
+        self._reapers.add(reaper)
+        reaper.add_done_callback(self._reapers.discard)
+
+    async def despawn(self, agent_id: str) -> None:
+        """销毁：连注册表条目一起去掉，**并且级联到全部子代**。
+
+        级联不是可选项，所以这里没有 `recursive` 开关：**要么条目还在，要么它和它的子树一起不在**
+        （理由见模块文档）。拆除顺序是**子先于父**——任何一刻都不存在「父已经没了而子还活着」的中
+        间态。
+
+        **不因为「本进程没接管过它」而拒绝。** 树在共享注册表里，而 `pause` / `resume` / `abort`
+        只作用于本进程按得住的 Agent；`despawn` 照搬那条规则就会留下一个别人持有的子代，它的
+        `parent_id` 指向一个已被注销的父。因此本方法作用在**条目**上，不作用在事件循环的所有权上。
+
+        `despawn` 等**本进程持有的**每一个事件循环真的停下来再返回——它对调用方的承诺是「回来之后
+        这些条目都不在了」，而这个承诺只有等到才作数。别的进程持有的那些停不了，它们自己会在下一个
+        周期边界发现条目已经不在。要立刻返回就用 `kill`。
+
+        未知 agent 是成功的 no-op：「它不在注册表里」这个后置条件已经成立。
+        """
+        self._refuse_self('despawn', agent_id)
+        if agent_id not in self._slots and await self.registry.get(agent_id) is None:
+            return
+        await self._destroy_tree(agent_id, operation='despawn')
+
+    async def _destroy_tree(self, agent_id: str, *, operation: str) -> None:
+        """`kill` 的收尾、`despawn` 与 `ExitMode.EXIT` 共用的唯一拆除顺序。
+
+        **先把整棵子树钉住，再拆**（理由见模块文档）。反复走而不是走一遍：第一遍的 `children_of`
+        与钉住之间有窗口，那一刻出生的子代只有下一遍才看得见；钉住之后树上再挂不进新子代，所以走到
+        没有新节点为止这棵树的形状就冻住了。
+
+        拆除顺序是**发现顺序的逆序**：广度优先只能经由父发现子，因此逆序里子一定在父之前被拆。
+
+        遍历到的子代拆不掉只记日志、不中断：递归操作是尽力而为的，为第一个冲突抛异常会留下一棵改了
+        一半的树，而调用方无从得知改到哪了。被点名的那一个照常抛。
+        """
+        descendants: list[str] = []
+        seen = {agent_id}
+        self._doom([agent_id])
+        try:
+            while fresh := [
+                found for found in await self._descendants(agent_id) if found not in seen
+            ]:
+                seen.update(fresh)
+                descendants.extend(fresh)
+                self._doom(fresh)
+            # 抛在动手之前：等自己就是永久挂死，而半棵拆掉的树没有人能收拾。
+            for descendant in descendants:
+                self._refuse_self(operation, descendant)
+            for descendant in reversed(descendants):
+                try:
+                    await self._destroy(descendant)
+                except Exception:
+                    logger.exception(
+                        '期望: agent %s 作为 %s 的子代被拆掉，条目随子树一起消失。'
+                        ' 实际: 拆它时抛了异常，条目留在注册表里，而它的父即将被注销——'
+                        '它的 parent_id 从此指向一个不存在的条目，children_of 再也找不到它。'
+                        ' 下一步: 用 find() 确认它还在，再按 agent_id 单独 despawn 它；'
+                        '它的父已经不在，只能这样够得着它。',
+                        descendant,
+                        agent_id,
+                    )
+            await self._destroy(agent_id)
+        finally:
+            self._undoom([agent_id, *descendants])
+
+    async def _destroy(self, agent_id: str) -> None:
+        """拆掉一个 Agent 的全部痕迹。幂等。
+
+        本进程没有它的实例时只摘条目与队列：树的形状与本进程持有哪些实例无关。
+        """
+        task = self._table.get_task(agent_id)
+        # `is not current_task()`：`ExitMode.EXIT` 是在驱动任务自己的 finally 里走到这条路的，
+        # 取消并 await 自己就是永久挂死。
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.wait({task})
+        await self.broker.remove_queue(agent_id)
+        await self.registry.unregister(agent_id)
+        self._table.pop(agent_id)
+        self._slots.pop(agent_id, None)
+        await self.hooks.trigger(Junction.AGENT_DESPAWN, agent_id=agent_id)
+
+    async def _reap(self, agent_id: str, slot: _Slot) -> None:
+        """在事件循环之外收尾。
+
+        `_drive` 的 finally 在取消路径上刻意不收尾，因此**被取消的那一次退出只有这里保证得了归宿**
+        ——少了它，Agent 停在 ABORTING，而 `ensure_active` 明文拒绝复活一个正在收尾的 Agent。
+
+        收尾要写注册表、摘队列，而这些 await 落在一个正在被取消的任务里会再次被取消——内存实现没有
+        挂起点所以看不出来，远端实现下就是收了一半的尾。放进独立任务，`kill` 因此也能立刻返回。
+
+        异常在这里收口：收割任务没有调用方，逃出去的异常无人取回，只会在 GC 时变成一行看不出主体
+        的日志。
+        """
+        try:
+            task = self._table.get_task(agent_id)
+            if task is not None:
+                await asyncio.wait({task})
+            await self._finish(agent_id, slot)
+        except Exception:
+            logger.exception(
+                '期望: agent %s 被取消之后的收尾走完，它落到 exit_mode 说的那个归宿上。'
+                ' 实际: 收尾自己抛了异常，它可能停在 aborting——而 aborting 的 Agent 复活不了。'
+                ' 下一步: 用 find() 读它当前的状态；停在 aborting 就 despawn 它再重新 spawn。',
+                agent_id,
+            )
+
+    def _refuse_self(self, operation: str, agent_id: str) -> None:
+        """拒绝一个要等目标停下、而目标就是调用者自己的操作。
+
+        这不是「冲突」而是意图无法表达，所以遍历找到的主体上照样抛：等自己就是永久挂死。
+        """
+        task = self._table.get_task(agent_id)
+        if task is None or task is not asyncio.current_task():
+            return
+        raise ContractViolation(
+            expected=f'{operation} 的目标子树里不含发起这次调用的那个 Agent 自己',
+            received=f'这次 {operation} 落在 agent {agent_id!r} 自己的事件循环里',
+            next_action=(
+                f'{operation} 要等目标的事件循环停下来，等自己就是永久挂死。'
+                '要让自己停下来用 abort（它在下一轮边界上兑现，轨迹保持一致）；'
+                '要让别人把你销毁，就把这件事交给你的父 Agent'
+            ),
+        )
+
+    def _doom(self, agent_ids: list[str]) -> None:
+        for agent_id in agent_ids:
+            self._doomed[agent_id] = self._doomed.get(agent_id, 0) + 1
+
+    def _undoom(self, agent_ids: list[str]) -> None:
+        for agent_id in agent_ids:
+            remaining = self._doomed.get(agent_id, 0) - 1
+            if remaining > 0:
+                self._doomed[agent_id] = remaining
+            else:
+                self._doomed.pop(agent_id, None)
 
     async def _abort_one(self, agent_id: str, *, named: bool) -> None:
         slot, info = await self._control_target('abort', agent_id, named=named)
@@ -805,4 +1041,12 @@ class Runtime:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # 收割任务不在实例表里，上面那份取消名单看不见它们；不等掉就是一串 "Task was destroyed but
+        # it is pending"。清空之后再等：done-callback 要过一次事件循环才把它们摘掉，照着集合等会
+        # 白转一圈。收割任务自己不会再排新的收割任务。
+        while self._reapers:
+            reapers = list(self._reapers)
+            self._reapers.clear()
+            await asyncio.gather(*reapers, return_exceptions=True)
+        await self.hooks.trigger(Junction.RUNTIME_SHUTDOWN)
         await self.events.close()

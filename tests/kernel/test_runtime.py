@@ -114,6 +114,12 @@ class _RecordingRegistry:
 
     `deny_for` 把拒绝收窄到一个 agent。递归操作对「被点名的那一个」与「遍历到的子代」处理不同，
     而只按 (expected, new) 拒绝会同时打中两者，那条子代分支于是永远走不到。
+
+    `hold_children_of` 把遍历停在**某一个节点**的 `children_of` 上：级联拆除先走完整棵树再动手，
+    而「走的时候出生的子代」只能在树里某个已经被问过的父下面出现，没有别的构造方式。
+
+    `fail_unregister` 让一个条目注销不掉。注销失败留下的是永久孤儿（父被注销、它自己留着），
+    而这类丢失的唯一证据就是那条日志。
     """
 
     def __init__(
@@ -127,9 +133,13 @@ class _RecordingRegistry:
         self._deny = deny
         self.hold_before = hold_before
         self.deny_for = deny_for
+        self.hold_children_of: str | None = None
+        self.fail_unregister: str | None = None
         self.switches = _Hold()
+        self.walks = _Hold()
         self.transitions: list[tuple[str, AgentStatus, AgentStatus]] = []
         self.applied: list[tuple[str, AgentStatus, AgentStatus]] = []
+        self.unregisters: list[str] = []
 
     async def register(self, info: AgentInfo) -> None:
         await self._inner.register(info)
@@ -154,6 +164,8 @@ class _RecordingRegistry:
         await self._inner.update(agent_id, **fields)
 
     async def children_of(self, agent_id: str) -> list[str]:
+        if agent_id == self.hold_children_of:
+            await self.walks.passing(agent_id)
         return await self._inner.children_of(agent_id)
 
     async def list(
@@ -162,6 +174,9 @@ class _RecordingRegistry:
         return await self._inner.list(status=status, parent_id=parent_id)
 
     async def unregister(self, agent_id: str) -> None:
+        if agent_id == self.fail_unregister:
+            raise RuntimeError(f'注销 {agent_id} 失败')
+        self.unregisters.append(agent_id)
         await self._inner.unregister(agent_id)
 
     def of(self, agent_id: str) -> list[tuple[AgentStatus, AgentStatus]]:
@@ -457,6 +472,31 @@ async def _info(runtime: Runtime, agent_id: str) -> AgentInfo:
     info = await runtime.find(agent_id)
     assert info is not None
     return info
+
+
+async def _reaped(runtime: Runtime) -> None:
+    """等本 Runtime 已经排出的收割任务收完尾。上界由调用方套一层 `wait_for` 给。
+
+    比轮询注册表状态确定：收尾在一个独立任务里跑，而轮询把「还没被调度到」与「收尾拒绝了这次
+    转换」看成同一件事。不吞异常——收割任务里逃出来的异常无人取回时只会在 GC 时变成一行日志。
+    """
+    while runtime._reapers:
+        await asyncio.gather(*list(runtime._reapers))
+
+
+async def _dangling_parents(registry: AgentRegistry) -> list[str]:
+    """`parent_id` 指着一个不在注册表里的条目的那些 agent_id。
+
+    这就是级联拆除要防的那件事本身：父的条目被摘掉而子代留着，`children_of` 从此永远漏掉它们，
+    而它们自己看起来还有个父——没有任何后续操作能把这棵树恢复过来。
+    """
+    infos = await registry.list()
+    known = {info.agent_id for info in infos}
+    return sorted(
+        info.agent_id
+        for info in infos
+        if info.parent_id is not None and info.parent_id not in known
+    )
 
 
 async def _mailbox_exists(broker: InMemoryMessageBroker, agent_id: str) -> bool:
@@ -3539,4 +3579,627 @@ async def test_aborting_an_agent_whose_drive_never_took_over_is_refused_and_leav
     # 状态没被动过，它就仍然叫得醒；写下 aborting 的话这一句答 False。
     assert await runtime.ensure_active(agent_id) is True
     await peer.shutdown()
+    await runtime.shutdown()
+
+
+async def test_kill_returns_before_its_teardown_has_written_anything():
+    """收尾要 await，而在一个正在被取消的任务里 await 只会收一半的尾；所以它在别的任务里跑。
+
+    等自己的收尾就把「立刻返回」变成「等收尾」，spec §4.1 给 ABORTING 的理由随之作废；这里的上界
+    让那个变异变成一条 1 秒就红的断言，而不是一次挂死。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    blockers: list[_Block] = []
+    agent_id = await _running(runtime, blockers)
+    registry.hold_before = AgentStatus.ZOMBIE
+    registry.switches.close()
+
+    await asyncio.wait_for(runtime.kill(agent_id), _TIMEOUT)
+
+    await asyncio.wait_for(registry.switches.reach(1), _TIMEOUT)
+    assert await _status(runtime, agent_id) is AgentStatus.ABORTING
+    registry.switches.open()
+    await asyncio.wait_for(_reaped(runtime), _TIMEOUT)
+
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    await runtime.shutdown()
+
+
+async def test_a_killed_agent_comes_back_on_one_message_with_its_batch_paired_up():
+    """取消落在轮的中间，留下一个声明了调用却没有结果的 assistant block。
+
+    那不是缺陷：`BaseAgent.run` 在入口按「中断、副作用未知」把它补成配对完整的轨迹，于是被杀掉的
+    Agent 仍然能被一条消息复活并继续干。**中止位刻意不置**——位是会留下来的状态，一次复活会在第一
+    轮就把它消费掉，让复活出来的 Agent 立刻结束，一次 kill 于是变成永久的诅咒。
+    """
+    runtime = Runtime()
+    blocker = _Block()
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Block', arguments='{}')]),
+            ScriptedTurn(content='resumed after the kill'),
+        ]
+    )
+    agent_id = await runtime.spawn(_factory(llm, tools={'Block': blocker}), query='go')
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+
+    await runtime.kill(agent_id)
+    await asyncio.wait_for(_reaped(runtime), _TIMEOUT)
+
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert agent.context.stop_reason is None
+    assert [block.role for block in agent.context.current_traj] == ['user', 'assistant']
+    assert runtime._slots[agent_id].control.abort_requested is False
+
+    assert (await runtime.send(agent_id, 'carry on')).ok is True
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert [(block.role, block.tool_call_id) for block in ctx.current_traj] == [
+        ('user', None),
+        ('assistant', None),
+        ('tool', 'c1'),
+        ('user', None),
+        ('assistant', None),
+    ]
+    assert ctx.current_traj[2].extra == {'interrupted': True}
+    assert ctx.current_traj[4].content == 'resumed after the kill'
+    assert ctx.stop_reason is StopReason.COMPLETED
+    await runtime.shutdown()
+
+
+async def test_kill_keeps_the_registry_entry_so_children_never_point_at_a_hole():
+    """kill 送它进 ZOMBIE 而不摘条目，因此它根本不会制造悬空 parent_id，也就不需要级联。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    parent = await _resident(runtime, broker)
+    child = await _resident(runtime, broker, parent_id=parent)
+
+    await runtime.kill(parent)
+    await asyncio.wait_for(_reaped(runtime), _TIMEOUT)
+
+    assert await _status(runtime, parent) is AgentStatus.ZOMBIE
+    info = await runtime.find(child)
+    assert info is not None and info.parent_id == parent
+    assert await runtime.registry.children_of(parent) == [child]
+    assert await _status(runtime, child) is AgentStatus.IDLE
+    await runtime.shutdown()
+
+
+async def test_killing_an_exit_mode_agent_takes_its_subtree_with_it_instead_of_orphaning_it():
+    """kill 自己不选择注销——去留由 exit_mode 决定，而 EXIT 走的是同一条级联。
+
+    条目会消失的那条路上必须级联，否则「kill 不制造悬空 parent_id」只在 ZOMBIE / IDLE 两种退出
+    模式下成立。三个子代跨两个深度，注册顺序既非升序亦非降序，反转后同样两者都不是。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    blocker = _Block()
+    parent = await runtime.spawn(_blocking(blocker), query='go', exit_mode=ExitMode.EXIT)
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    bravo = await _resident(runtime, broker, parent_id=parent)
+    alpha = await _resident(runtime, broker, parent_id=parent)
+    delta = await _resident(runtime, broker, parent_id=bravo)
+
+    await runtime.kill(parent)
+    await asyncio.wait_for(_reaped(runtime), _TIMEOUT)
+
+    tree = (parent, bravo, alpha, delta)
+    assert [await runtime.find(agent_id) for agent_id in tree] == [None] * 4
+    assert await _dangling_parents(registry) == []
+    await runtime.shutdown()
+
+
+async def test_kill_refuses_an_agent_this_process_never_took_over():
+    """接管失败的条目归别人所有：本进程没有它的事件循环可停，而 kill 会替它写下 aborting——
+
+    `ensure_active` 明文拒绝复活一个 aborting 的 Agent，所以那一笔连真正的持有者也再叫不醒它。
+    """
+    registry = _RecordingRegistry(deny=(AgentStatus.IDLE, AgentStatus.RUNNING))
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    with pytest.raises(ContractViolation):
+        await runtime.wait(agent_id)
+    peer = Runtime(registry=registry, broker=broker)
+
+    with pytest.raises(ContractViolation) as stranded:
+        await runtime.kill(agent_id)
+    with pytest.raises(ContractViolation) as not_mine:
+        await peer.kill(agent_id)
+
+    assert stranded.value.received != not_mine.value.received
+    assert runtime._reapers == set()
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    assert await runtime.ensure_active(agent_id) is True
+    await peer.shutdown()
+    await runtime.shutdown()
+
+
+async def test_killing_the_same_agent_twice_lands_on_the_same_place_without_reporting_a_thing(
+    caplog: pytest.LogCaptureFixture,
+):
+    """收尾幂等：两次 kill 排出两个收割任务，两者都会走到同一个归宿。"""
+    runtime = Runtime()
+    blockers: list[_Block] = []
+    agent_id = await _running(runtime, blockers)
+
+    await runtime.kill(agent_id)
+    await runtime.kill(agent_id)
+    await asyncio.wait_for(_reaped(runtime), _TIMEOUT)
+
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    assert caplog.records == []
+    await runtime.shutdown()
+
+
+async def test_kill_after_shutdown_starts_no_reaper_nobody_will_ever_await():
+    """shutdown 是终态且已经等掉了收割任务，此后再排一个就是永不被 await 的孤儿。"""
+    runtime = Runtime()
+    blockers: list[_Block] = []
+    agent_id = await _running(runtime, blockers)
+    await runtime.shutdown()
+
+    await runtime.kill(agent_id)
+
+    assert runtime._reapers == set()
+
+
+async def test_despawn_takes_the_whole_subtree_with_it_and_leaves_an_independent_tree_alone():
+    """`unregister` 只把自己从父的 children 上摘掉、不动自己的子代。
+
+    五个子代跨两个深度，注册顺序既非升序亦非降序，反转后同样两者都不是；另一棵独立的树必须整棵
+    原样活着——「操作没错但作用在错的主体上」在本仓是一等缺陷类。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    root = await _resident(runtime, broker)
+    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+    echo = await _resident(runtime, broker, parent_id=bravo)
+    delta = await _resident(runtime, broker, parent_id=alpha)
+    other_root = await _resident(runtime, broker)
+    other_child = await _resident(runtime, broker, parent_id=other_root)
+    other_leaf = await _resident(runtime, broker, parent_id=other_child)
+
+    await runtime.despawn(root)
+
+    doomed = (root, bravo, alpha, charlie, echo, delta)
+    assert [await runtime.find(agent_id) for agent_id in doomed] == [None] * 6
+    assert [agent_id in runtime._slots for agent_id in doomed] == [False] * 6
+    assert await _dangling_parents(registry) == []
+
+    survivors = (other_root, other_child, other_leaf)
+    assert [await _status(runtime, agent_id) for agent_id in survivors] == [AgentStatus.IDLE] * 3
+    for index, agent_id in enumerate(survivors):
+        assert (await runtime.send(agent_id, f'still working {index}')).ok is True
+        await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+        agent = runtime._table.get(agent_id)
+        assert agent is not None
+        assert [block.content for block in agent.context.current_traj] == [
+            f'still working {index}',
+            'turn-0',
+        ]
+    await runtime.shutdown()
+
+
+async def test_despawn_destroys_every_child_before_its_parent():
+    """任何一刻都不存在「父已经没了而子还活着」的中间态。
+
+    子代跨两个深度、注册顺序既非升序亦非降序：n=2 时 `sorted` 与 `sorted(reverse=True)` 里必有
+    一个是恒等变换，反转类变异挡不住。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    root = await _resident(runtime, broker)
+    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+    echo, foxtrot, delta = [await _resident(runtime, broker, parent_id=bravo) for _ in range(3)]
+
+    await runtime.despawn(root)
+
+    assert registry.unregisters == [delta, foxtrot, echo, charlie, alpha, bravo, root]
+    await runtime.shutdown()
+
+
+async def test_despawn_returns_only_after_every_loop_it_holds_has_actually_stopped():
+    """承诺是「回来之后这些条目都不在了」，而这个承诺只有等到才作数。
+
+    快照取在 `despawn` 返回的那一刻：被取消的任务事件循环转下去照样会跑完，在 `await` 之后断言
+    「它停了」测的是调度顺序而不是等待语义。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    blockers: list[_Block] = []
+    root = await _running(runtime, blockers)
+    bravo = await _running(runtime, blockers, parent_id=root)
+    alpha = await _running(runtime, blockers, parent_id=root)
+    delta = await _running(runtime, blockers, parent_id=bravo)
+    tree = (root, bravo, alpha, delta)
+    tasks = [runtime._table.get_task(agent_id) for agent_id in tree]
+    assert [task is not None and not task.done() for task in tasks] == [True] * 4
+
+    await runtime.despawn(root)
+
+    assert [task is not None and task.done() for task in tasks] == [True] * 4
+    assert [await runtime.find(agent_id) for agent_id in tree] == [None] * 4
+    await runtime.shutdown()
+
+
+async def test_despawning_a_child_leaves_the_parent_and_its_siblings_alone():
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    root = await _resident(runtime, broker)
+    doomed = await _resident(runtime, broker, parent_id=root)
+    bravo = await _resident(runtime, broker, parent_id=root)
+    alpha = await _resident(runtime, broker, parent_id=root)
+
+    await runtime.despawn(doomed)
+
+    assert await runtime.find(doomed) is None
+    assert await runtime.registry.children_of(root) == [bravo, alpha]
+    assert [await _status(runtime, agent_id) for agent_id in (root, bravo, alpha)] == [
+        AgentStatus.IDLE
+    ] * 3
+    await runtime.shutdown()
+
+
+async def test_despawning_an_unknown_agent_succeeds_because_the_postcondition_already_holds():
+    """意图无法表达才抛；「它不在注册表里」这个后置条件已经成立。"""
+    runtime = Runtime()
+    await runtime.despawn('nope')
+    assert await runtime.find('nope') is None
+    await runtime.shutdown()
+
+
+async def test_exit_mode_exit_uses_the_same_cascade_as_despawn():
+    """EXIT 是在驱动任务自己的 finally 里走到这条路的：取消并 await 自己就是永久挂死。
+
+    上界让「自取消守卫被删掉」变成一条会红的断言：那时 `_destroy` 在自己身上等自己，收尾停在
+    半路，条目留在注册表里。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    blocker = _Block()
+    parent = await runtime.spawn(_blocking(blocker), query='go', exit_mode=ExitMode.EXIT)
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    bravo = await _resident(runtime, broker, parent_id=parent)
+    alpha = await _resident(runtime, broker, parent_id=parent)
+    delta = await _resident(runtime, broker, parent_id=bravo)
+    task = runtime._table.get_task(parent)
+    assert task is not None
+
+    blocker.release.set()
+    await asyncio.wait_for(asyncio.shield(task), _TIMEOUT)
+
+    tree = (parent, bravo, alpha, delta)
+    assert [await runtime.find(agent_id) for agent_id in tree] == [None] * 4
+    assert registry.unregisters == [delta, alpha, bravo, parent]
+    assert await _dangling_parents(registry) == []
+    await runtime.shutdown()
+
+
+async def test_despawning_yourself_from_inside_your_own_loop_is_refused():
+    """despawn 要等目标的事件循环停下来，等自己就是永久挂死。"""
+    runtime = Runtime()
+    holder: dict[str, str] = {}
+
+    class _SelfDespawn(Tool):
+        async def execute(self, note: str) -> ToolResult:
+            """记下 note 然后试着销毁自己。"""
+            try:
+                await runtime.despawn(holder['agent_id'])
+            except ContractViolation as error:
+                return ToolResult(output=f'refused: {error.next_action}')
+            return ToolResult(output='not refused')
+
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall(id='c1', name='SelfDespawn', arguments='{"note":"bye"}')]
+            ),
+            ScriptedTurn(content='still alive'),
+        ]
+    )
+    agent_id = await runtime.spawn(_factory(llm, tools={'SelfDespawn': _SelfDespawn()}), query='go')
+    holder['agent_id'] = agent_id
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    tool_blocks = [block for block in ctx.current_traj if block.role == 'tool']
+    assert len(tool_blocks) == 1
+    assert isinstance(tool_blocks[0].content, str)
+    assert tool_blocks[0].content.startswith('refused: ')
+    assert 'abort' in tool_blocks[0].content
+    assert await runtime.find(agent_id) is not None
+    await runtime.shutdown()
+
+
+async def test_despawning_an_ancestor_from_inside_your_own_loop_is_refused():
+    """自己在目标的子树里，`despawn` 同样等不到它停下来——而它抛在动手之前，树原样留着。
+
+    只挡住被点名的那一个是不够的：拒绝的判据挂在名字上而不是挂在遍历找到的主体上时，这条路会
+    先把祖先的整棵子树拆掉一半，再停在自己身上。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    holder: dict[str, str] = {}
+
+    class _DespawnAncestor(Tool):
+        async def execute(self, note: str) -> ToolResult:
+            """记下 note 然后试着销毁自己的祖先。"""
+            try:
+                await runtime.despawn(holder['root'])
+            except ContractViolation as error:
+                return ToolResult(output=f'refused: {error.received}')
+            return ToolResult(output='not refused')
+
+    root = await _resident(runtime, broker)
+    middle = await _resident(runtime, broker, parent_id=root)
+    sibling = await _resident(runtime, broker, parent_id=root)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall(id='c1', name='DespawnAncestor', arguments='{"note":"bye"}')]
+            ),
+            ScriptedTurn(content='still alive'),
+        ]
+    )
+    agent_id = await runtime.spawn(
+        _factory(llm, tools={'DespawnAncestor': _DespawnAncestor()}),
+        query='go',
+        parent_id=middle,
+    )
+    holder['root'] = root
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    tool_blocks = [block for block in ctx.current_traj if block.role == 'tool']
+    assert len(tool_blocks) == 1
+    assert isinstance(tool_blocks[0].content, str)
+    assert tool_blocks[0].content.startswith('refused: ')
+    tree = (root, middle, sibling, agent_id)
+    assert [await runtime.find(name) is not None for name in tree] == [True] * 4
+    await runtime.shutdown()
+
+
+async def test_a_child_born_while_the_walk_is_under_way_never_outlives_its_parent():
+    """走一遍就动手是不行的：中间节点一旦注销，它下面的条目就再也走不到，而它们的 parent_id
+    已经指向一个不存在的条目。
+
+    闸装在树里**最后**被问到的那个节点上：那一刻 `children_of(bravo)` 已经答过，第一遍再也不会
+    回头看它。落在这个窗口里的子代只有第二遍才发现得了，而钉住期间挂到已发现节点下的意图根本
+    表达不出来——两者缺一，这棵树就会留下一个永久孤儿。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    root = await _resident(runtime, broker)
+    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+    delta = await _resident(runtime, broker, parent_id=bravo)
+    registry.hold_children_of = delta
+    registry.walks.close()
+
+    despawning = asyncio.create_task(runtime.despawn(root))
+    await asyncio.wait_for(registry.walks.reach(1), _TIMEOUT)
+    latecomer = await _resident(runtime, broker, parent_id=bravo)
+    with pytest.raises(ContractViolation) as refused:
+        await _resident(runtime, broker, parent_id=root)
+    registry.walks.open()
+    await asyncio.wait_for(despawning, _TIMEOUT)
+
+    assert root in refused.value.expected
+    tree = (root, bravo, alpha, charlie, delta, latecomer)
+    assert [await runtime.find(agent_id) for agent_id in tree] == [None] * 6
+    assert await _dangling_parents(registry) == []
+    # 子先于父仍然成立：后来的那个排在它父亲前面。
+    assert registry.unregisters.index(latecomer) < registry.unregisters.index(bravo)
+    await runtime.shutdown()
+
+
+async def test_despawn_removes_a_descendant_another_process_holds_instead_of_orphaning_it(
+    caplog: pytest.LogCaptureFixture,
+):
+    """树在共享注册表里，本进程持有哪些实例与树的形状无关。
+
+    `pause` / `resume` / `abort` 拒绝一个本进程接管不了的 Agent，`despawn` 不能照搬那条规则：
+    留下一个别的进程持有的子代，它的 parent_id 就指向一个已被注销的父。外人排在三个子代的
+    **中间**，且它下面还挂着本进程的 Agent——排在末位时「走过它」与「走到它为止」是同一个答案。
+    """
+    caplog.set_level(logging.INFO)
+    registry = InMemoryAgentRegistry()
+    broker = _SpyBroker(registry)
+    owner = Runtime(registry=registry, broker=broker)
+    peer = Runtime(registry=registry, broker=broker)
+    root = await _resident(owner, broker)
+    bravo = await _resident(owner, broker, parent_id=root)
+    outsider = await _resident(peer, broker, parent_id=root)
+    charlie = await _resident(owner, broker, parent_id=root)
+    delta = await _resident(owner, broker, parent_id=outsider)
+    stranded = peer._table.get_task(outsider)
+    assert stranded is not None
+
+    await owner.despawn(root)
+
+    tree = (root, bravo, outsider, charlie, delta)
+    assert [await owner.find(agent_id) for agent_id in tree] == [None] * 5
+    assert await _dangling_parents(registry) == []
+
+    # 别的进程的循环由它自己发现条目已经不在，本进程既停不了它、也不替它清理。
+    await asyncio.wait_for(asyncio.wait({stranded}), _TIMEOUT)
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert outsider in caplog.records[0].getMessage()
+    # 跳过一个子代留下的是永久孤儿，因此这条路上不该有一条「跳过」记录。
+    assert [record.getMessage() for record in caplog.records if record.levelname == 'INFO'] == []
+    await peer.shutdown()
+    await owner.shutdown()
+
+
+async def test_a_descendant_that_cannot_be_destroyed_is_reported_and_the_walk_carries_on(
+    caplog: pytest.LogCaptureFixture,
+):
+    """遍历到的子代拆不掉只记日志：为第一个冲突抛异常会留下一棵改了一半的树。
+
+    而这次跳过留下的是一个**永久**孤儿——它的父已经注销，`children_of` 再也找不到它——所以那条
+    记录必须在 root logger 的默认级别之上真的被创建出来，并说清是哪一个条目留下来了。
+    """
+    caplog.set_level(logging.INFO)
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    root = await _resident(runtime, broker)
+    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+    echo = await _resident(runtime, broker, parent_id=bravo)
+    registry.fail_unregister = bravo
+
+    await runtime.despawn(root)
+
+    assert [await runtime.find(agent_id) for agent_id in (root, alpha, charlie, echo)] == [None] * 4
+    assert await runtime.find(bravo) is not None
+    assert await _dangling_parents(registry) == [bravo]
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert caplog.records[0].args == (bravo, root)
+    await runtime.shutdown()
+
+
+async def test_spawning_under_a_parent_that_is_being_destroyed_is_refused():
+    """挂上去的子代会带着一个指向即将消失的条目的 parent_id 留下来，而那是不可逆的。"""
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    root = await _resident(runtime, broker)
+    bravo = await _resident(runtime, broker, parent_id=root)
+    registry.hold_children_of = bravo
+    registry.walks.close()
+
+    despawning = asyncio.create_task(runtime.despawn(root))
+    await asyncio.wait_for(registry.walks.reach(1), _TIMEOUT)
+
+    with pytest.raises(ContractViolation) as refused:
+        await runtime.spawn(_factory(_done()), query='go', parent_id=root)
+
+    assert root in refused.value.expected
+    assert 'parent_id' in refused.value.next_action
+    registry.walks.open()
+    await asyncio.wait_for(despawning, _TIMEOUT)
+
+    # 拆完就不再是那个理由了：条目已经不在，注册表自己会拒。
+    with pytest.raises(ContractViolation) as gone:
+        await runtime.spawn(_factory(_done()), query='go', parent_id=root)
+    assert gone.value.received != refused.value.received
+    assert await _dangling_parents(registry) == []
+    await runtime.shutdown()
+
+
+async def test_a_spawn_that_lands_after_shutdown_leaves_no_orphan_driver():
+    """`_closed` 在方法开头读过一次，此后隔着两个 Protocol await。
+
+    任何会挂起的 store 下，并发的 shutdown 会在 gather 返回之后才走到 create_task，于是建出一个
+    永不被取消、永不被 await 的驱动，并把一个再没有订阅者的 Agent 留在注册表里。
+    """
+    registry = InMemoryAgentRegistry()
+    broker = _HeldBroker()
+    runtime = Runtime(registry=registry, broker=broker)
+    broker.ensures.close()
+    spawning = asyncio.create_task(runtime.spawn(_factory(_done()), query='go'))
+    await asyncio.wait_for(broker.ensures.reach(1), _TIMEOUT)
+    await runtime.shutdown()
+    broker.ensures.open()
+
+    with pytest.raises(ContractViolation) as refused:
+        await asyncio.wait_for(spawning, _TIMEOUT)
+
+    assert 'shutdown' in refused.value.received
+    assert await registry.list() == []
+    assert runtime._table.agent_ids() == []
+
+
+async def test_an_activation_that_lands_after_shutdown_leaves_no_orphan_driver(
+    caplog: pytest.LogCaptureFixture,
+):
+    """同一个洞的另一半：`ensure_active` 也隔着三个 await 才 create_task。
+
+    它是问句，所以答 False 而不抛；但注册表已经被它从 zombie 翻成 idle 了，而 idle 宣布的是
+    「它能处理消息」——此后再没有驱动会去处理，那条状态必须写回去。
+    """
+    broker = _HeldBroker()
+    runtime = Runtime(broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await runtime.wait(agent_id)
+    original = runtime._table.get_task(agent_id)
+    broker.ensures.close()
+    activating = asyncio.create_task(runtime.ensure_active(agent_id))
+    await asyncio.wait_for(broker.ensures.reach(1), _TIMEOUT)
+    await runtime.shutdown()
+    broker.ensures.open()
+
+    assert await asyncio.wait_for(activating, _TIMEOUT) is False
+
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    assert runtime._table.get_task(agent_id) is original
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert agent_id in caplog.records[0].getMessage()
+
+
+async def test_the_lifecycle_junctions_report_every_agent_as_it_arrives_and_as_it_goes():
+    """切点名与它的分类都计入公开 API：spawn / despawn / shutdown 报的都是既成事实。
+
+    两代三个 Agent：只有一个 Agent 时「报了自己」与「报了随便一个」是同一个答案。
+    """
+    seen: list[tuple[str, str]] = []
+
+    async def record_spawn(**kwargs: Any) -> HookResult:
+        seen.append(('spawn', kwargs['agent_id']))
+        return HookResult()
+
+    async def record_despawn(**kwargs: Any) -> HookResult:
+        seen.append(('despawn', kwargs['agent_id']))
+        return HookResult()
+
+    async def record_shutdown(**kwargs: Any) -> HookResult:
+        seen.append(('shutdown', ''))
+        return HookResult()
+
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    runtime.hooks.register(Junction.AGENT_SPAWN, record_spawn)
+    runtime.hooks.register(Junction.AGENT_DESPAWN, record_despawn)
+    runtime.hooks.register(Junction.RUNTIME_SHUTDOWN, record_shutdown)
+    root = await _resident(runtime, broker)
+    bravo = await _resident(runtime, broker, parent_id=root)
+    delta = await _resident(runtime, broker, parent_id=bravo)
+
+    await runtime.despawn(root)
+    await runtime.shutdown()
+
+    assert seen == [
+        ('spawn', root),
+        ('spawn', bravo),
+        ('spawn', delta),
+        ('despawn', delta),
+        ('despawn', bravo),
+        ('despawn', root),
+        ('shutdown', ''),
+    ]
+
+
+async def test_the_spawn_junction_reports_the_parent_each_child_was_filed_under():
+    """父子关系是 spawn 这一刻唯一还看得见的地方：despawn 之后条目已经不在了。"""
+    filed: dict[str, str | None] = {}
+
+    async def record(**kwargs: Any) -> HookResult:
+        filed[kwargs['agent_id']] = kwargs['parent_id']
+        return HookResult()
+
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    runtime.hooks.register(Junction.AGENT_SPAWN, record)
+    root = await _resident(runtime, broker)
+    bravo = await _resident(runtime, broker, parent_id=root)
+    delta = await _resident(runtime, broker, parent_id=bravo)
+
+    assert filed == {root: None, bravo: root, delta: bravo}
     await runtime.shutdown()

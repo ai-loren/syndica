@@ -19,9 +19,12 @@ from syndica.kernel.hooks import center as center_module
 _TIMEOUT = 1.0
 
 
-def test_twelve_junctions_exist():
+def test_fifteen_junctions_exist():
     """取值撞车会让成员静默塌成别名；切点名计入公开 API。"""
     assert {junction.name: junction.value for junction in Junction} == {
+        'RUNTIME_SHUTDOWN': 'runtime_shutdown',
+        'AGENT_SPAWN': 'agent_spawn',
+        'AGENT_DESPAWN': 'agent_despawn',
         'AGENT_START': 'agent_start',
         'AGENT_END': 'agent_end',
         'AGENT_ERROR': 'agent_error',
@@ -48,6 +51,9 @@ def test_each_junction_is_classified_as_declared():
         Junction.LLM_FAILURE,
     }
     assert OBSERVABLE == {
+        Junction.RUNTIME_SHUTDOWN,
+        Junction.AGENT_SPAWN,
+        Junction.AGENT_DESPAWN,
         Junction.AGENT_START,
         Junction.AGENT_END,
         Junction.AGENT_ERROR,
@@ -593,6 +599,9 @@ def test_declaring_extension_junctions_leaves_the_kernel_classifications_untouch
         Junction.LLM_FAILURE,
     }
     assert OBSERVABLE == {
+        Junction.RUNTIME_SHUTDOWN,
+        Junction.AGENT_SPAWN,
+        Junction.AGENT_DESPAWN,
         Junction.AGENT_START,
         Junction.AGENT_END,
         Junction.AGENT_ERROR,
@@ -600,7 +609,7 @@ def test_declaring_extension_junctions_leaves_the_kernel_classifications_untouch
         Junction.TURN_END,
         Junction.MESSAGE_INJECTED,
     }
-    assert len(set(Junction)) == 12
+    assert len(set(Junction)) == 15
 
 
 async def test_a_kernel_junction_in_neither_classification_is_rejected_at_trigger(

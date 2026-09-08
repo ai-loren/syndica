@@ -29,10 +29,13 @@
 
 两个失败切点的写法相反，不要互换：超窗是「这一轮不该产出东西」，失败是「这一轮的产出由插件顶上」。
 
-本计划只落地单 Agent 一轮与控制面所需的枚举切点，其余（agent_spawn / 背景任务等）随后续计划补齐。
-
 `MESSAGE_INJECTED` 是可观察切点：它报告「这条消息已经进上下文了」这个既成事实，改不了任何东西。
 要在消息进上下文**之前**改写它，正确的位置是投递侧而不是这里。
+
+三个生命周期切点（`RUNTIME_SHUTDOWN` / `AGENT_SPAWN` / `AGENT_DESPAWN`）同样只报既成事实：
+Agent 已经建好、条目已经摘掉、关机已经开始，没有一处还能被 hook 改。`AGENT_DESPAWN` 在条目消失
+**之后**触发，因此想留下父子关系只能在 `AGENT_SPAWN` 上记（它带 `parent_id`）。`RUNTIME_START`
+不在这里：`Runtime.__init__` 是同步的，没有可以 await hook 的位置。
 
 ## 扩展切点
 
@@ -54,6 +57,9 @@ __all__ = ['INTERCEPTABLE', 'Junction', 'JunctionKind', 'JunctionRef', 'OBSERVAB
 
 
 class Junction(Enum):
+    RUNTIME_SHUTDOWN = 'runtime_shutdown'
+    AGENT_SPAWN = 'agent_spawn'
+    AGENT_DESPAWN = 'agent_despawn'
     AGENT_START = 'agent_start'
     AGENT_END = 'agent_end'
     AGENT_ERROR = 'agent_error'
@@ -81,6 +87,9 @@ INTERCEPTABLE: frozenset[Junction] = frozenset(
 
 OBSERVABLE: frozenset[Junction] = frozenset(
     {
+        Junction.RUNTIME_SHUTDOWN,
+        Junction.AGENT_SPAWN,
+        Junction.AGENT_DESPAWN,
         Junction.AGENT_START,
         Junction.AGENT_END,
         Junction.AGENT_ERROR,
