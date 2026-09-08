@@ -1086,6 +1086,36 @@ async def test_an_exhausted_budget_keeps_the_deferred_stash_and_reports_what_it_
     await runtime.shutdown()
 
 
+async def test_a_mailbox_that_vanishes_while_paused_ends_the_loop_instead_of_opening_a_cycle(
+    caplog: pytest.LogCaptureFixture,
+):
+    """零输入的周期会写下一块没有前置 user 块的 assistant 块，而轨迹是要持久化的。
+
+    第一轮的请求此时只有 system prompt 一条消息；provider 会拒掉这样的消息，而故障要等到下一次
+    resume 读那份轨迹时才现身。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    llm = _done('never asked')
+    agent_id = await runtime.spawn(_factory(llm), exit_mode=ExitMode.IDLE)
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+    control = runtime._slots[agent_id].control
+    control.pause()
+
+    assert (await runtime.send(agent_id, 'wake up')).ok is True
+    assert await control.wait_until_parked(_TIMEOUT) is True
+    await broker.remove_queue(agent_id)
+    control.resume()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert llm.calls == []
+    assert ctx.current_traj == []
+    assert ctx.stop_reason is None
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    assert caplog.records == []
+    await runtime.shutdown()
+
+
 async def test_a_failing_cycle_ends_a_resident_event_loop_instead_of_retrying_it(
     caplog: pytest.LogCaptureFixture,
 ):

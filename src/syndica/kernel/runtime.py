@@ -27,6 +27,10 @@ wait_for）合法地改过它，此时保持注册表现有的说法比强行覆
 一个不让出控制权的空转。那条路因此无条件退出，代价由 `_finish` 记成 ERROR——**丢数据可以，静默不
 可以**。
 
+**没有输入就不开周期。** 邮箱可能在「有消息」与门的 `consume` 之间被摘掉，此时周期的第一轮会发出
+一个只有 system prompt 的请求，在轨迹里留下一块没有前置 user 块的 assistant 块。轨迹是要持久化的，
+这块坏前缀会让此后每一次 provider 请求都非法，而故障在下一次 resume 才现身。
+
 **取消不做收尾工作。** 驱动任务被取消时，`finally` 里既不改注册表也不摘资源：取消可能落在轮的
 中间，那时轨迹里留着不配对的调用，而 spec 把「收尾」定义为一个**有状态**的动作。收尾由发起取消
 的那一方在取消之外完成，因此它不必在一个正在被取消的任务里 await。
@@ -216,6 +220,10 @@ class Runtime:
             if await slot.control.hold_until_runnable():
                 # 中止落在周期之间：这一轮不开始，位已消费，回去继续等。
                 query = None
+                continue
+            # 挂起窗口或并发的 despawn 可能已经把邮箱摘掉：此刻开周期就会写下一块没有前置
+            # user 块的 assistant 块。回去等，让「邮箱没了」在它唯一的观测点上被答出来。
+            if query is None and not await self._has_unhandled_input(agent_id, slot):
                 continue
             await self._switch(
                 agent_id,
