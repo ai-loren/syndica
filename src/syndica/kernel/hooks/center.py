@@ -201,7 +201,12 @@ class HooksCenter:
         self._hooks.setdefault(validated, [])
 
     def register(self, junction: JunctionRef, cb: HookCallback) -> None:
-        """挂一个 hook。同一切点上按注册先后执行。"""
+        """挂一个 hook。同一切点上按注册先后执行。
+
+        挂到**可观察**切点上时，`cb` 返回的 `HookResult` 会被整个丢弃（见 `trigger`）。这一点
+        typing 拦不住（`HookCallback` 对两类切点是同一个类型），运行期也不产生任何警告，因此挂之
+        前先确认这个切点在 `INTERCEPTABLE` 里——要改 kwargs 或顶替产出只有那一侧读得到。
+        """
         self._hooks[self._resolved(junction)].append(cb)
 
     async def trigger(self, junction: JunctionRef, **kwargs: Any) -> HookResult:

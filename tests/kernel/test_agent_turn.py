@@ -134,6 +134,13 @@ class _FixedGate:
         return self.decision
 
 
+class _BrokenGate:
+    """问一句就抛的门，代表控制面自己出了故障。"""
+
+    async def before_turn(self, turn: int) -> TurnGateDecision:
+        raise RuntimeError('control plane unreachable')
+
+
 class _Publisher(Tool):
     """执行时往自己的邮箱里投一条消息，用来构造「用户在一轮的中途插话」。
 
@@ -795,23 +802,31 @@ async def test_turn_events_carry_the_turn_number():
 
 
 @pytest.mark.parametrize(
-    ('script', 'expected'),
+    ('script', 'decision', 'expected'),
     [
-        ([ScriptedTurn(content='done')], 'completed'),
-        ([ScriptedTurn(tool_calls=[_call()])], 'max_turns'),
+        ([ScriptedTurn(content='done')], None, 'completed'),
+        ([ScriptedTurn(tool_calls=[_call()])], None, 'max_turns'),
+        ([ScriptedTurn(content='never reached')], TurnGateDecision(abort=True), 'aborted'),
     ],
-    ids=['completed', 'max-turns'],
+    ids=['completed', 'max-turns', 'aborted'],
 )
-async def test_agent_end_reports_the_stop_reason_as_plain_data(script, expected):
-    """payload 要能同样地走进程内出口与序列化的 SSE 出口，枚举成员在后一个出口上不可序列化。"""
+async def test_agent_end_reports_the_stop_reason_as_plain_data(script, decision, expected):
+    """payload 要能同样地走进程内出口与序列化的 SSE 出口，枚举成员在后一个出口上不可序列化。
+
+    payload 与 `ctx` 是同一个周期的两个观察者：界面读前者、程序读后者，两边给出不同答案时没有
+    任何一方能发现自己读到的是错的。
+    """
     bus = EventBus()
-    agent, _ = _agent(script, events=bus, max_turns=1)
+    agent, _ = _agent(
+        script, events=bus, max_turns=1, gate=None if decision is None else _FixedGate(decision)
+    )
     async with bus.subscribe() as events:
-        await agent.run('go')
+        ctx = await agent.run('go')
         await bus.close()
         delivered = await asyncio.wait_for(_collect(events), timeout=_TIMEOUT)
     assert delivered[-1].kind == 'agent_end'
     assert delivered[-1].payload == {'stop_reason': expected}
+    assert ctx.stop_reason is not None and ctx.stop_reason.value == expected
 
 
 async def test_turn_end_sees_the_tool_results_already_in_the_trajectory():
@@ -1582,6 +1597,28 @@ async def test_aborting_between_turns_does_not_spend_a_turn():
     assert ctx.stop_reason is StopReason.COMPLETED
 
 
+async def test_a_gate_that_raises_ends_the_cycle_as_an_error():
+    """门答不出来时替它编一个答案，等于让一次控制面故障静默变成「忽略中止、忽略插话，照常往下
+    跑」；编成一次正常结束更糟——界面上这个周期看起来是干完了活。"""
+    log: list[tuple[str, str]] = []
+    agent, hooks = _agent(
+        [ScriptedTurn(content='never reached')], gate=_BrokenGate(), events=_RecordingBus(log)
+    )
+    _record_lifecycle(hooks, log)
+
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert agent.context.stop_reason is StopReason.ERROR
+    assert _llm(agent).calls == []
+    assert log == [
+        ('event', 'agent_start'),
+        ('hook', 'agent_start'),
+        ('hook', 'agent_error'),
+        ('event', 'agent_error'),
+    ]
+
+
 async def test_an_aborting_decision_wins_over_the_messages_it_carries():
     """spec §5.1 把中止检查排在消费消息之前。这一轮既然不会跑，注入只会把消息埋进一份没人再读的
     轨迹里，而它此时已经离开邮箱了。"""
@@ -1693,8 +1730,14 @@ async def test_a_message_arriving_mid_run_is_injected_before_the_next_turn():
     ]
 
 
-async def test_injected_messages_keep_their_trust_level():
-    """不可信内容经消息进来仍然不可信——标记必须随内容走（spec §12.2）。"""
+@pytest.mark.parametrize(
+    'trust', [TrustLevel.UNTRUSTED, TrustLevel.TRUSTED], ids=['untrusted', 'trusted']
+)
+async def test_injected_messages_keep_their_trust_level(trust):
+    """标记必须随内容走（spec §12.2），而这是个两值格，两侧都得走到：只走一侧时「原样带过来」与
+    「写死成这一侧」是同一个答案。写死 TRUSTED 让外部内容绕过授权升级；写死 UNTRUSTED 则让每一条
+    用户插话都要求升级，而且不报错。
+    """
     control = ControlBlock()
     gate, broker = await _gate(control)
     agent, _ = _agent([ScriptedTurn(content='ok')], gate=gate)
@@ -1704,14 +1747,14 @@ async def test_injected_messages_keep_their_trust_level():
             sender='webhook',
             receiver=_MAILBOX,
             content='<from the internet>',
-            trust=TrustLevel.UNTRUSTED,
+            trust=trust,
         ),
     )
 
     ctx = await asyncio.wait_for(agent.run(None), timeout=_TIMEOUT)
 
     injected = [block for block in ctx.current_traj if block.role == 'user']
-    assert [block.trust for block in injected] == [TrustLevel.UNTRUSTED]
+    assert [block.trust for block in injected] == [trust]
 
 
 async def test_three_injected_messages_keep_arrival_order():
@@ -1727,6 +1770,23 @@ async def test_three_injected_messages_keep_arrival_order():
         'beta',
         'alpha',
         'gamma',
+    ]
+
+
+async def test_injected_content_reaches_the_context_byte_for_byte():
+    """空串是一个取值而不是一次缺席，首尾空白同理。顺手清洗（`.strip()`、真值判断）会静默改写用户
+    说过的话，而那条消息此时已经离开邮箱、无从找回。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, _ = _agent([ScriptedTurn(content='ok')], gate=gate)
+    await _post(broker, '  padded  ', '', '\n\t')
+
+    ctx = await asyncio.wait_for(agent.run(None), timeout=_TIMEOUT)
+
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
+        '  padded  ',
+        '',
+        '\n\t',
     ]
 
 
@@ -1752,6 +1812,33 @@ async def test_message_injected_fires_per_message_once_that_message_is_in_the_co
         ('alpha', ['beta', 'alpha']),
         ('gamma', ['beta', 'alpha', 'gamma']),
     ]
+
+
+async def test_the_message_injected_hook_gets_the_live_message_not_a_snapshot():
+    """切点交出的是门递来的那一条消息本身。审计与 surface 据此回查它，拿到快照就等于回查到一份此
+    后再也不会更新的副本。"""
+    posted = [
+        Message(sender='user', receiver=_MAILBOX, content=content)
+        for content in ('beta', 'alpha', 'gamma')
+    ]
+    agent, hooks = _agent(
+        [ScriptedTurn(content='ok')], gate=_FixedGate(TurnGateDecision(messages=tuple(posted)))
+    )
+    seen: list[Message] = []
+
+    async def record(**kwargs: Any) -> None:
+        received = kwargs['message']
+        assert isinstance(received, Message)
+        seen.append(received)
+
+    hooks.register(Junction.MESSAGE_INJECTED, record)
+    await asyncio.wait_for(agent.run(None), timeout=_TIMEOUT)
+
+    # 改完再读同一个对象：交一份副本的实现下跨对象比较取值同样相等，只有改过之后才看得出交出的是
+    # 不是那一个。逐条改成互不相同的值，一并挡住「每一条都交出同一个对象」。
+    for index, message in enumerate(posted):
+        message.content = f'tampered {index}'
+    assert [received.content for received in seen] == ['tampered 0', 'tampered 1', 'tampered 2']
 
 
 async def test_each_injected_block_records_the_id_of_its_own_message():
@@ -1798,6 +1885,24 @@ async def test_the_injected_blocks_source_record_carries_the_trigger_as_plain_da
     assert [block.extra['trigger'] for block in injected] == ['deferred']
 
 
+async def test_every_injected_blocks_source_record_lists_its_keys_in_one_fixed_order():
+    """`extra` 随块进 `request['messages']`，键序漂移让整条会话的缓存静默失效（spec §5.2）——而
+    `==` 比较 dict 对键序完全无感，只有 `list(d)` 看得见它。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, _ = _agent([ScriptedTurn(content='ok')], gate=gate)
+    await _post(broker, 'beta', 'alpha', 'gamma')
+
+    ctx = await asyncio.wait_for(agent.run(None), timeout=_TIMEOUT)
+
+    injected = [block for block in ctx.current_traj if block.role == 'user']
+    assert [list(block.extra) for block in injected] == [
+        ['message_id', 'sender', 'trigger'],
+        ['message_id', 'sender', 'trigger'],
+        ['message_id', 'sender', 'trigger'],
+    ]
+
+
 async def test_an_empty_query_is_still_a_query_and_not_the_gate_sentinel():
     """`None` 是「这一轮的输入从门里来」的哨兵，空串不是：按真值判断会把一次空提问静默变成一次
     唤醒，而模型此后看不到用户确实说过话。"""
@@ -1840,14 +1945,21 @@ async def test_a_gate_attached_after_construction_drives_the_turns():
 
 
 @pytest.mark.parametrize('via_constructor', [False, True], ids=['attached', 'constructed'])
-async def test_a_second_gate_is_rejected_however_the_first_one_arrived(via_constructor):
+async def test_a_rejected_second_gate_leaves_the_first_one_driving_the_turns(via_constructor):
     """两道门就是两个消费同一个邮箱的人，`consume` 恰好一次，输的那个**静默**收不到消息。构造
-    参数与 attach_gate 是同一件事的两个入口，守卫必须认得两者。"""
-    control = ControlBlock()
-    first, _ = await _gate(control)
-    second, _ = await _gate(control)
+    参数与 attach_gate 是同一件事的两个入口，守卫必须认得两者。
+
+    抛出**之外**还要断言状态没动：捕获 `ContractViolation` 继续走的调用方（Runtime 的降级路径）
+    会假定什么都没发生，而一个换完门再抛的实现此后由第二道门驱动，第一道门静默失联。
+    """
+    first = _FixedGate(TurnGateDecision())
+    second = _FixedGate(TurnGateDecision())
     agent, _ = _agent([ScriptedTurn(content='ok')], gate=first if via_constructor else None)
     if not via_constructor:
         agent.attach_gate(first)
     with pytest.raises(ContractViolation):
         agent.attach_gate(second)
+
+    await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert (first.turns, second.turns) == ([1], [])
