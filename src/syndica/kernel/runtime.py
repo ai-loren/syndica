@@ -201,9 +201,10 @@ class Runtime:
         # 收尾在事件循环之外做，因此它自己是一个任务；不在实例表里，`shutdown` 的取消名单看不见
         # 它们，只能另等一次。
         self._reapers: set[asyncio.Task[None]] = set()
-        # 正在被拆的 Agent，计数而不是集合成员：`ExitMode.EXIT` 的拆除可能嵌在一次 `despawn`
-        # 的子树里，先结束的那一个把标记撤掉，另一个就在自己还需要它的时候失去了这道拦。
-        self._doomed: dict[str, int] = {}
+        # 此刻有收尾在飞的 Agent。一个 Agent 同时只有一次收尾：两次并发的收尾会各自走一遍级联，
+        # 而它们在拆同一个节点时都会先看到「它还在」，于是同一个 Agent 被报两遍 despawn。
+        self._reaping: set[str] = set()
+        self._doomed: set[str] = set()
         self._closed = False
         # 「队列不存在」是懒启动与 ZOMBIE 复活的唯一触发点（spec §4.4）。接在这里，而不是让每个
         # 调用方自己先判断再激活——那样「复活」就有了 N 份实现。
@@ -385,8 +386,8 @@ class Runtime:
     async def _finish(self, agent_id: str, slot: _Slot) -> None:
         """事件循环退出后的归宿（spec §4.1 的 ExitMode）。
 
-        **幂等**：`kill` 的收割任务与驱动任务自己的 finally 都可能走到这里，而两者谁先谁后取决于
-        取消是否赶上。
+        **状态与资源的拆除是幂等的**：`kill` 的收割任务与驱动任务自己的 finally 都可能走到这里，
+        而两者谁先谁后取决于取消是否赶上。
         """
         await self._report_abandoned_input(agent_id, slot)
         await self.broker.remove_queue(agent_id)
@@ -718,6 +719,10 @@ class Runtime:
         task = self._table.get_task(agent_id)
         if task is not None and not task.done():
             task.cancel()
+        # 已经有一次收尾在飞就不再排一个：那一次会把它送到同一个归宿，后置条件已经成立。
+        if agent_id in self._reaping:
+            return
+        self._reaping.add(agent_id)
         reaper = asyncio.create_task(self._reap(agent_id, slot), name=f'reap:{agent_id}')
         self._reapers.add(reaper)
         reaper.add_done_callback(self._reapers.discard)
@@ -758,14 +763,14 @@ class Runtime:
         """
         descendants: list[str] = []
         seen = {agent_id}
-        self._doom([agent_id])
+        self._doomed.add(agent_id)
         try:
             while fresh := [
                 found for found in await self._descendants(agent_id) if found not in seen
             ]:
                 seen.update(fresh)
                 descendants.extend(fresh)
-                self._doom(fresh)
+                self._doomed.update(fresh)
             # 抛在动手之前：等自己就是永久挂死，而半棵拆掉的树没有人能收拾。
             for descendant in descendants:
                 self._refuse_self(operation, descendant)
@@ -784,13 +789,22 @@ class Runtime:
                     )
             await self._destroy(agent_id)
         finally:
-            self._undoom([agent_id, *descendants])
+            self._doomed.difference_update(seen)
 
     async def _destroy(self, agent_id: str) -> None:
         """拆掉一个 Agent 的全部痕迹。幂等。
 
         本进程没有它的实例时只摘条目与队列：树的形状与本进程持有哪些实例无关。
         """
+        # 已经没有痕迹可拆就什么都不做。`AGENT_DESPAWN` 报的是「这个条目刚刚消失」这个既成事实，
+        # 对一个早已不在的条目再报一次是个假事件，而本方法会被走到两次——`kill` 的收割任务与驱动
+        # 任务自己的 finally 都通向它。
+        if (
+            agent_id not in self._slots
+            and self._table.get(agent_id) is None
+            and await self.registry.get(agent_id) is None
+        ):
+            return
         task = self._table.get_task(agent_id)
         # `is not current_task()`：`ExitMode.EXIT` 是在驱动任务自己的 finally 里走到这条路的，
         # 取消并 await 自己就是永久挂死。
@@ -827,6 +841,8 @@ class Runtime:
                 ' 下一步: 用 find() 读它当前的状态；停在 aborting 就 despawn 它再重新 spawn。',
                 agent_id,
             )
+        finally:
+            self._reaping.discard(agent_id)
 
     def _refuse_self(self, operation: str, agent_id: str) -> None:
         """拒绝一个要等目标停下、而目标就是调用者自己的操作。
@@ -845,18 +861,6 @@ class Runtime:
                 '要让别人把你销毁，就把这件事交给你的父 Agent'
             ),
         )
-
-    def _doom(self, agent_ids: list[str]) -> None:
-        for agent_id in agent_ids:
-            self._doomed[agent_id] = self._doomed.get(agent_id, 0) + 1
-
-    def _undoom(self, agent_ids: list[str]) -> None:
-        for agent_id in agent_ids:
-            remaining = self._doomed.get(agent_id, 0) - 1
-            if remaining > 0:
-                self._doomed[agent_id] = remaining
-            else:
-                self._doomed.pop(agent_id, None)
 
     async def _abort_one(self, agent_id: str, *, named: bool) -> None:
         slot, info = await self._control_target('abort', agent_id, named=named)
