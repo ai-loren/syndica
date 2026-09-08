@@ -2319,6 +2319,75 @@ async def test_recursive_pause_reaches_every_descendant_and_nothing_outside_the_
     await runtime.shutdown()
 
 
+async def test_recursive_pause_from_a_node_with_a_parent_never_climbs_to_its_ancestors():
+    """`recursive` 说的是**子树**，不是整个家族。
+
+    既有的每一条递归用例都作用在一个**没有父**的根上，于是「只往下走」与「先爬到森林根再往下走」
+    是同一个答案，连「顺带把直接父也挂起」都看不出来。两个深度上各三个子代，注册顺序既非升序
+    亦非降序，反转后同样两者都不是。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    root = await _resident(runtime, broker)
+    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+    echo, foxtrot, delta = [await _resident(runtime, broker, parent_id=bravo) for _ in range(3)]
+
+    await runtime.pause(bravo, recursive=True)
+
+    subtree = (bravo, echo, foxtrot, delta)
+    assert [await _status(runtime, agent_id) for agent_id in subtree] == [AgentStatus.PAUSED] * 4
+    assert [runtime._slots[agent_id].control.paused for agent_id in subtree] == [True] * 4
+
+    above = (root, alpha, charlie)
+    assert [await _status(runtime, agent_id) for agent_id in above] == [AgentStatus.IDLE] * 3
+    assert [runtime._slots[agent_id].control.paused for agent_id in above] == [False] * 3
+    # 标志位为假也可能是「按住了又放开」；跑完一个周期才证明这道门从头到尾没落下来过。
+    for index, agent_id in enumerate(above):
+        assert (await runtime.send(agent_id, f'still working {index}')).ok is True
+        await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+        agent = runtime._table.get(agent_id)
+        assert agent is not None
+        assert [block.content for block in agent.context.current_traj] == [
+            f'still working {index}',
+            'turn-0',
+        ]
+    await runtime.shutdown()
+
+
+async def test_recursive_resume_of_an_interior_subtree_leaves_the_rest_of_the_tree_paused():
+    """正操作作用在超集、逆操作作用在一棵**真子树**：差集必须原样停着。
+
+    pause 与 resume 施加在同一个根上时，「只恢复这棵子树」与「恢复整棵树」是同一个答案。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    root = await _resident(runtime, broker)
+    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+    echo, foxtrot, delta = [await _resident(runtime, broker, parent_id=bravo) for _ in range(3)]
+    await runtime.pause(root, recursive=True)
+
+    await runtime.resume(bravo, recursive=True)
+
+    freed = (bravo, echo, foxtrot, delta)
+    assert [await _status(runtime, agent_id) for agent_id in freed] == [AgentStatus.IDLE] * 4
+    assert [runtime._slots[agent_id].control.paused for agent_id in freed] == [False] * 4
+
+    held = (root, alpha, charlie)
+    assert [await _status(runtime, agent_id) for agent_id in held] == [AgentStatus.PAUSED] * 3
+    assert [runtime._slots[agent_id].control.paused for agent_id in held] == [True] * 3
+    # 同一条消息把两边分开：恢复的那些跑完一个周期，其余的停在门上，一轮都不跑。
+    for agent_id in (*freed, *held):
+        assert (await runtime.send(agent_id, 'go ahead')).ok is True
+    for agent_id in freed:
+        await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+    for agent_id in held:
+        assert await runtime._slots[agent_id].control.wait_until_parked(_TIMEOUT) is True
+        agent = runtime._table.get(agent_id)
+        assert agent is not None
+        assert agent.context.current_traj == []
+    await runtime.shutdown()
+
+
 async def test_recursive_pause_goes_parent_first_while_recursive_resume_goes_children_first():
     """方向不是对称性：pause 先掐掉还会生出新子代的那一头，resume 先让子代就位。
 
