@@ -2566,6 +2566,23 @@ spec 把 ABORTED 留给轮与轮之间的协作式中止——那时轨迹配对
   - `Runtime.despawn(agent_id)`：级联销毁自己与全部子代，等它们真的停下来再返回
   - `Runtime._destroy_tree` / `_destroy`：`kill` 的收尾、`despawn`、`ExitMode.EXIT` 共用的唯一拆除顺序
 
+**Task 4 移交的三件既有缺陷**（都不是 Task 4 引入的，都归拆除顺序管，因此归本任务）：
+
+1. **`shutdown` 之后仍可能被激活出一个孤儿驱动。** `ensure_active` 只在方法开头读一次
+   `_closed`，之后还隔着 `registry.get` / `compare_and_set_status` / `broker.ensure_queue`
+   三个 Protocol await 才 `create_task`，且不复检。任何会挂起的 store（即任何远端实现）下，
+   `ensure_active` 与 `shutdown` 并发会在 `gather()` 返回之后建出一个永不被取消、永不被 await
+   的驱动，并把注册表从 zombie 翻回 `idle`。**`spawn()` 形状相同、洞相同**（同样先查 `_closed`、
+   同样隔着两个 await 才 `create_task`），实测同样产出孤儿——所以要修就两处一起修，补一个
+   关机态守卫。目前只是被 `asyncio.run()` 自己的 teardown 兜住，因此 pending-task 扫描是干净的。
+2. **`_finish` 里 `_report_abandoned_input` 与 `remove_queue` 之间落进来的 `send` 拿到
+   `ok=True` 却被丢弃，且没有任何 ERROR。** 实测：`ok=True` → 事后 `consume` 为空 → ERROR 记录
+   0 条。这正是「拿过 ok=True 收据的输入不得静默消失」要防的那件事的盲区，而它就在收尾顺序里。
+   注意 `remove_queue` **之后**那个紧邻窗口不同：那里收据是诚实的（`ok=False`），已复核。
+3. **`shutdown` 之后 `send` 给一个当时停在邮箱上的 Agent 仍答 `ok=True`**，消息落进一个再没有
+   消费者的邮箱（`test_ensure_active_refuses_after_shutdown` 已把这条现状钉住并与「早已 zombie」
+   那一种分开）。根因与第 1 条同源——取消不做收尾，因此关机态守卫落地时一并裁决。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
