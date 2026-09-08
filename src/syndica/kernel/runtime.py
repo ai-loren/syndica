@@ -50,11 +50,24 @@ children 上摘掉、不动自己的子代，于是删掉一个有子代的父�
 到（`children_of` 只能从父往下问）。钉住期间 `spawn` 拒绝往树上挂新子代、`ensure_active` 拒绝复活
 树里的节点——后者若放行，复活出来的驱动会在条目被摘掉时失去句柄，成为永不被取消的孤儿。
 
-**钉住与拆除的占位都按「一次调用」计，不是进程级的一个开关。** 同一个节点可以同时落在多条在飞
-级联里（拆除中途重入的 hook、两次重叠的 `despawn`、`ExitMode.EXIT` 撞上一次外部 `despawn`），而
-释放写在 `finally` 里、因此**一个节点都没拆就退出时照样执行**。无条件释放于是会撤掉别人的那一份：
-钉住撤早了这棵树重新开放挂子代，而新子代不在别人早已冻结好的拆除名单里，它的 `parent_id` 永久指向
-一个已被注销的父；拆除占位撤早了同一次消失会被报两遍 `AGENT_DESPAWN`。
+**钉住按「一次调用」计，不是进程级的一个开关。** 同一个节点可以同时落在多条在飞级联里（拆除
+中途重入的 hook、两次重叠的 `despawn`、`ExitMode.EXIT` 撞上一次外部 `despawn`），而释放写在
+`finally` 里、因此**一个节点都没拆就退出时照样执行**。无条件释放于是会撤掉别人的那一份：钉住撤
+早了这棵树重新开放挂子代，而新子代不在别人早已冻结好的拆除名单里，它的 `parent_id` 永久指向一个
+已被注销的父。
+
+**重叠的拆除各自动手，不等对方。** 拆除的每一步都是幂等的，同时拆没有代价；而「等另一个**调用
+方**」这条边可以成环——两条级联各自停在对方正拆的节点上，两次 `despawn` 永不返回，被卡住的子树
+再没有任何办法拆掉（`despawn` 是唯一入口，而它自己挂在环上）。`despawn` 承诺的是**自己的后代**，
+后代成树，所以往自己子树里等（等一个子代的驱动任务停下来）不会成环；等一个平级的调用方会。同一次
+消失只报一次 `AGENT_DESPAWN` 靠一份共享的收据：真的把痕迹摘干净的那一次报，而收据是同步取的，
+两条并发的拆除里因此只有一个取得到。
+
+**别人的信号不是关于世界的证据。** 一个「拆完了」的完成信号说的是**持有者离开了**，不是**这个条目
+已经不在了**：它被取消或抛异常时信号同样置位，而那时条目还在。收到信号就返回的调用方于是带着一个
+为假的后置条件继续往上拆，把它的父注销掉，留下永久悬空的 `parent_id`，且一条日志都不留。所以这里
+没有等待者：每个调用方自己动手，动手之后**复检**痕迹是否真的没了，复检不过记一条带下一步的
+ERROR——**返回即意味着「它不在了」或者「有一条 ERROR 说清了它为什么还在」**。
 
 **`_slots` 的键恒为实例表键的子集。** EXIT 把队列、注册表条目、实例表条目与 slot 一起摘掉，于是
 本类持有的每一份 Context 都对应一个仍可寻址的 Agent，随时间无界增长的只有活着的 Agent 数。代价
@@ -154,6 +167,20 @@ class _Slot:
     parked_on_mailbox: int = 0
 
 
+@dataclass
+class _Teardown:
+    """一个条目上在飞的那些 `_destroy` 共享的一份记录。
+
+    `holders` 是此刻有几个 `_destroy` 在拆它——最后一个离开的把这条记录摘掉，因此还在飞的那些
+    看到的永远是同一份。`reported` 是**这次消失的收据**：拆除的每一步都是幂等的，多条级联可以
+    各自把同一个节点摘一遍，收据只保证同一次消失不被报两遍 `AGENT_DESPAWN`。它**不是**「谁负责
+    拆」的约定——没有任何调用方因为它而少拆一步，因此没有人的后置条件依赖别人兑现。
+    """
+
+    holders: int = 0
+    reported: bool = False
+
+
 def _parked_status(slot: _Slot) -> AgentStatus:
     """事件循环停到邮箱上时，注册表该说的那个状态。
 
@@ -214,9 +241,10 @@ class Runtime:
         # 同时落在多条级联的钉住范围里，而释放必须只撤掉本次调用自己放上去的那一份（理由见模块
         # 文档）。成员判定仍是 `agent_id in self._doomed`。
         self._doomed: dict[str, int] = {}
-        # 此刻正在被 `_destroy` 拆的条目 → 拆完时置位的那个事件。用来把同一个条目上重叠的拆除
-        # 串起来：痕迹检查自带一个 await，两个重叠的拆除都会先看到「它还在」。
-        self._destroying: dict[str, asyncio.Event] = {}
+        # 此刻正在被 `_destroy` 拆的条目 → 那些拆除共享的记录。它只承载「这次消失报过没有」这张
+        # 收据：痕迹检查自带一个 await，两条重叠的拆除都会先看到「它还在」，于是各自摘一遍——
+        # 摘是幂等的，报不是。**不用它让谁等谁**（理由见模块文档）。
+        self._destroying: dict[str, _Teardown] = {}
         self._closed = False
         # 「队列不存在」是懒启动与 ZOMBIE 复活的唯一触发点（spec §4.4）。接在这里，而不是让每个
         # 调用方自己先判断再激活——那样「复活」就有了 N 份实现。
@@ -744,7 +772,9 @@ class Runtime:
         task = self._table.get_task(agent_id)
         if task is not None and not task.done():
             task.cancel()
-        # 已经有一次收尾在飞就不再排一个：那一次会把它送到同一个归宿，后置条件已经成立。
+        # 已经有一次收尾在飞就不再排一个：第二个收割任务会把同一次收尾整个走第二遍。归宿由那一次
+        # 在飞的收尾给出，而 `kill` 承诺的只是**立刻返回**、不承诺归宿已经到达——所以这里不是
+        # 「后置条件已成立」，而是「这件事已经有人在做，且它失败会自己记一条 ERROR」。
         if agent_id in self._reaping:
             return
         self._reaping.add(agent_id)
@@ -767,10 +797,13 @@ class Runtime:
         连问都问不出来。别的进程持有的那些停不了，它们自己会在下一个周期边界发现条目已经不在。要
         立刻返回就用 `kill`。
 
-        **拆除是尽力而为的**：遍历到的某个子代注销不掉（远端注册表抖动、`unregister` 抛）时，那个
-        条目留在注册表里、其余照拆，失败只记一条 ERROR。此后它的父已经注销，它的 `parent_id` 指向
-        一个不存在的条目——那条记录里的下一步（按 agent_id 单独 despawn 它）是够得着它的唯一办法。
-        所以返回不等于「这棵子树一个条目都不剩」，要确认就用 `find`。
+        **拆除是尽力而为的**：某个条目注销不掉（远端注册表抖动、`unregister` 抛，或它返回了却没
+        真的把条目摘掉）时，那个条目留在注册表里、其余照拆。此后它的父已经注销，它的 `parent_id`
+        指向一个不存在的条目——那条记录里的下一步（按 agent_id 单独 despawn 它）是够得着它的唯一
+        办法。所以返回不等于「这棵子树一个条目都不剩」，要确认就用 `find`。
+
+        **但返回意味着二者之一**：这棵子树一个条目都不剩，或者留下的每一个都记了一条 ERROR。
+        取消不在这个承诺里——被取消的 `despawn` **不返回**，`CancelledError` 一路上抛。
 
         未知 agent 是成功的 no-op：「它不在注册表里」这个后置条件已经成立。
         """
@@ -844,27 +877,22 @@ class Runtime:
         """拆掉一个 Agent 的全部痕迹。幂等，且 `AGENT_DESPAWN` 对一次消失恰好报一次。
 
         本进程没有它的实例时只摘条目与队列：树的形状与本进程持有哪些实例无关。
+
+        **别的级联正在拆同一个条目时，这里照样自己动手。** 不等它：那是一条落在**平级调用方**
+        身上的阻塞边，可以成环（理由见模块文档）。也不因为它在拆就早退：那是把自己的后置条件转交
+        给另一个执行体，而它被取消时没有人兑现。摘是幂等的，报不是——报由收据定，见 `_Teardown`。
         """
-        # 「还有没有痕迹可拆」自带一个 await，因此它是 check-then-act：两个重叠的拆除都会先看到
-        # 「它还在」，然后各自摘一遍、各自报一次 `AGENT_DESPAWN`——那个切点报的是既成事实，重复报
-        # 就是假事件。占位在痕迹检查**之前**，两者之间没有挂起点。
-        in_flight = self._destroying.get(agent_id)
-        if in_flight is not None:
-            # 第二个**等**而不是早退：调用方的后置条件是「回来之后条目不在了」，早退等于把它转交
-            # 给另一个执行体，于是返回的那一刻它还不成立。等的是那个后置条件，不是那次拆除的全程
-            # ——痕迹已经没了就当场回答，别停在别人的 `AGENT_DESPAWN` hook 上：那个切点只是观察者，
-            # 它跑多久不属于 despawn 的承诺，而它可以在拆除之内重入 Runtime。
-            if await self._has_traces(agent_id):
-                await in_flight.wait()
-            return
-        torn_down = asyncio.Event()
-        self._destroying[agent_id] = torn_down
+        teardown = self._destroying.get(agent_id)
+        if teardown is None:
+            teardown = _Teardown()
+            self._destroying[agent_id] = teardown
+        teardown.holders += 1
         try:
             if not await self._has_traces(agent_id):
                 return
             task = self._table.get_task(agent_id)
             # `is not current_task()`：`ExitMode.EXIT` 是在驱动任务自己的 finally 里走到这条路的，
-            # 取消并 await 自己就是永久挂死。
+            # 取消并 await 自己就是永久挂死。等一个子代的驱动任务停下来是往自己子树里等，不成环。
             if task is not None and task is not asyncio.current_task():
                 task.cancel()
                 await asyncio.wait({task})
@@ -872,12 +900,33 @@ class Runtime:
             await self.registry.unregister(agent_id)
             self._table.pop(agent_id)
             self._slots.pop(agent_id, None)
-            await self.hooks.trigger(Junction.AGENT_DESPAWN, agent_id=agent_id)
+            if await self._has_traces(agent_id):
+                # 复检而不是相信 `unregister` 的明文契约：这是本方法唯一对外承诺的东西，而剩下
+                # 痕迹时没有第二个执行体会来兑现它。它没消失，所以既不报 `AGENT_DESPAWN`（那会是
+                # 假事件），也不能一声不响返回——这条记录是这次丢失留下的全部痕迹。
+                logger.error(
+                    '期望: agent %s 的痕迹在拆除之后全部消失——'
+                    'unregister 返回即意味着条目已被摘掉。'
+                    ' 实际: 摘完之后它还在（注册表条目、本进程的 slot 或实例三者之一），'
+                    '说明这一步没有真的生效；它的父即将被注销，'
+                    '它的 parent_id 从此指向一个不存在的条目，children_of 再也找不到它。'
+                    ' 下一步: 用 find() 确认它还在，再按 agent_id 单独 despawn 它；'
+                    '它的父已经不在，只能这样够得着它。反复如此就换一个注册表实现——'
+                    '这个实现没有兑现 unregister 的契约。',
+                    agent_id,
+                )
+                return
+            # 收据是同步取的，因此两条并发的拆除里只有一个取得到；取到之前拆除的每一步都已经跑完
+            # 并复检过，所以这个切点报的仍是既成事实。
+            if not teardown.reported:
+                teardown.reported = True
+                await self.hooks.trigger(Junction.AGENT_DESPAWN, agent_id=agent_id)
         finally:
-            # 只摘自己那一份：清掉整张表会撤掉别的在飞拆除的占位，于是它正拆着的那个节点会被
-            # 第二次拆除认成「还在」，同一次消失报两遍。
-            self._destroying.pop(agent_id, None)
-            torn_down.set()
+            # 只摘自己那一份：清掉整张表会撤掉别的在飞拆除共享的那份收据，于是同一次消失会被
+            # 第二条级联再报一次。
+            teardown.holders -= 1
+            if teardown.holders <= 0:
+                self._destroying.pop(agent_id, None)
 
     async def _has_traces(self, agent_id: str) -> bool:
         """本进程或注册表里还留着这个 Agent 的东西吗。"""

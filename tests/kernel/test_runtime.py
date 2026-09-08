@@ -80,6 +80,30 @@ class _Block(Tool):
         return ToolResult(output='released')
 
 
+class _Retaliate(Tool):
+    """停在自己的闸上；被取消时在收尾里拆掉另一棵树。
+
+    「走的时候把我的 helper 一起收掉」是普通的工具代码，而它跑在一个**正在被取消的**驱动任务
+    里——于是另一条级联的 `await asyncio.wait({driver})` 落在这段收尾之内，两条级联各自停在对方
+    正在拆的节点上。调用方这一侧只是两次普通的 `despawn`。
+    """
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.runtime: Runtime | None = None
+        self.target: str | None = None
+
+    async def execute(self) -> ToolResult:
+        """一直等；被取消时在收尾里拆掉另一棵树。"""
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            assert self.runtime is not None and self.target is not None
+            await self.runtime.despawn(self.target)
+        return ToolResult(output='retaliated')
+
+
 class _Gate(Tool):
     """每次调用停在自己的那道闸上：一个周期里需要两个可控停点时用它。
 
@@ -120,6 +144,13 @@ class _RecordingRegistry:
 
     `fail_unregister` 让一个条目注销不掉。注销失败留下的是永久孤儿（父被注销、它自己留着），
     而这类丢失的唯一证据就是那条日志。
+
+    `silent_unregister` 是同一件事更坏的那一面：**答应了却没真的摘掉**。它是「接缝另一侧的合法
+    替换」——不抛、不说谎，只是没兑现 `unregister` 的明文契约；把后置条件从契约里推出来而不去
+    复检的实现，在它下面会一声不响地报一次假 `AGENT_DESPAWN`。
+
+    `unregisters` 只记**真的被摘掉的那些**，按摘掉的顺序：重叠的级联会各自对同一个条目调一次
+    `unregister`（摘是幂等的），把 no-op 也记下来就分不出「摘了几次」与「消失了几次」。
     """
 
     def __init__(
@@ -135,6 +166,7 @@ class _RecordingRegistry:
         self.deny_for = deny_for
         self.hold_children_of: str | None = None
         self.fail_unregister: str | None = None
+        self.silent_unregister: str | None = None
         self.switches = _Hold()
         self.walks = _Hold()
         self.transitions: list[tuple[str, AgentStatus, AgentStatus]] = []
@@ -176,7 +208,10 @@ class _RecordingRegistry:
     async def unregister(self, agent_id: str) -> None:
         if agent_id == self.fail_unregister:
             raise RuntimeError(f'注销 {agent_id} 失败')
-        self.unregisters.append(agent_id)
+        if agent_id == self.silent_unregister:
+            return
+        if await self._inner.get(agent_id) is not None:
+            self.unregisters.append(agent_id)
         await self._inner.unregister(agent_id)
 
     def of(self, agent_id: str) -> list[tuple[AgentStatus, AgentStatus]]:
@@ -4669,8 +4704,8 @@ async def test_one_finished_teardown_leaves_another_nodes_in_flight_claim_alone(
     await runtime.shutdown()
 
 
-async def test_a_despawn_that_finds_the_node_already_being_torn_down_waits_for_it_to_be_gone():
-    """去重不能靠早退：`despawn` 的后置条件是它自己回答的，不是交给另一个执行体去兑现。
+async def test_a_despawn_that_finds_the_node_already_being_torn_down_tears_it_down_itself():
+    """去重不能靠早退，也不能靠等对方：`despawn` 的后置条件是它自己回答的。
 
     答案在**被测调用返回的那一刻**取，且取在它自己的任务里：另一条级联的事件循环转下去照样会
     把这个条目摘掉，在外面 `await` 之后再问，测的是调度顺序而不是等待语义。
@@ -4700,6 +4735,173 @@ async def test_a_despawn_that_finds_the_node_already_being_torn_down_waits_for_i
     assert await asyncio.wait_for(inner, _TIMEOUT) is True
     await asyncio.wait_for(outer, _TIMEOUT)
     assert await _dangling_parents(registry) == []
+    await runtime.shutdown()
+
+
+async def test_despawn_reports_the_disappearance_of_a_descendant_this_process_never_held():
+    """`AGENT_DESPAWN` 报的是「这个**条目**刚刚消失」，而条目的去留与本进程持有哪些实例无关。
+
+    只在本进程持有过实例的节点上报，挂在这个切点上记账的 hook 会漏掉整片属于别人的子树——而正是
+    这条级联把它们注销掉的。外人排在三个子代的**中间**，且它下面还挂着本进程的 Agent：排在末位
+    时「报了它」与「报到它为止」是同一个答案。
+    """
+    registry = InMemoryAgentRegistry()
+    broker = _SpyBroker(registry)
+    owner = Runtime(registry=registry, broker=broker)
+    peer = Runtime(registry=registry, broker=broker)
+    reported: list[str] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        reported.append(kwargs['agent_id'])
+        return HookResult()
+
+    owner.hooks.register(Junction.AGENT_DESPAWN, record)
+    root = await _resident(owner, broker)
+    bravo = await _resident(owner, broker, parent_id=root)
+    outsider = await _resident(peer, broker, parent_id=root)
+    charlie = await _resident(owner, broker, parent_id=root)
+    delta = await _resident(owner, broker, parent_id=outsider)
+
+    await asyncio.wait_for(owner.despawn(root), _TIMEOUT)
+
+    assert reported == [delta, charlie, outsider, bravo, root]
+    assert await _dangling_parents(registry) == []
+    await peer.shutdown()
+    await owner.shutdown()
+
+
+async def test_a_teardown_cancelled_before_it_removes_anything_leaves_the_peer_nothing_to_trust():
+    """一个「拆完了」的信号说的是**持有者离开了**，不是**这个条目已经不在了**。
+
+    持有者被取消时两者分叉：条目还在，而相信那个信号的一方会接着注销这个条目的**父**——永久
+    悬空的 `parent_id`，且任何级别的日志都没有一条（取消刻意不留痕，而持有者「正常」返回了）。
+    所以第二条级联自己动手，判据是它**也**到了摘队列那道闸上：相信对方的写法在那里永远只有一个
+    到达者。另一棵独立的树必须整棵原样活着。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    reported: list[str] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        reported.append(kwargs['agent_id'])
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, record)
+    root = await _resident(runtime, broker)
+    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+    delta, echo, foxtrot = [await _resident(runtime, broker, parent_id=bravo) for _ in range(3)]
+    other_root = await _resident(runtime, broker)
+    other_child = await _resident(runtime, broker, parent_id=other_root)
+    other_leaf = await _resident(runtime, broker, parent_id=other_child)
+    broker.hold_removal_of = delta
+    broker.removal_hold.close()
+
+    holder = asyncio.create_task(runtime.despawn(delta))
+    await asyncio.wait_for(broker.removal_hold.reach(1), _TIMEOUT)
+    peer = asyncio.create_task(runtime.despawn(root))
+    await asyncio.wait_for(broker.removal_hold.reach(2), _TIMEOUT)
+    holder.cancel()
+    await asyncio.gather(holder, return_exceptions=True)
+    broker.removal_hold.open()
+    await asyncio.wait_for(peer, _TIMEOUT)
+
+    assert broker.removal_hold.arrivals == [delta, delta]
+    doomed = (root, bravo, alpha, charlie, delta, echo, foxtrot)
+    assert [await runtime.find(agent_id) for agent_id in doomed] == [None] * 7
+    assert sorted(reported) == sorted(doomed)
+    assert await _dangling_parents(registry) == []
+    assert runtime._doomed == {}
+    assert runtime._destroying == {}
+    survivors = (other_root, other_child, other_leaf)
+    assert [await _status(runtime, agent_id) for agent_id in survivors] == [AgentStatus.IDLE] * 3
+    await runtime.shutdown()
+
+
+async def test_two_cascades_that_each_tear_down_the_others_tree_both_return():
+    """新加的阻塞边若落在一个**平级调用方**身上，它可以成环——而 `despawn` 是唯一入口，环上的
+    两棵子树因此永久不可拆。
+
+    环的长度是 2，走的不是 hook 那条自环：`_destroy` 在**摘掉任何痕迹之前**就 `await` 子代的
+    驱动任务，那时痕迹还在，「痕迹已经没了就当场回答」这个例外够不着它。调用方这一侧只是两次
+    普通的 `despawn`，两个 Agent 的工具收尾里各拆掉对方那棵树。上界让死锁变成一条红色的断言。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    reported: list[str] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        reported.append(kwargs['agent_id'])
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, record)
+    trees: list[tuple[str, list[str], str]] = []
+    tools = [_Retaliate(), _Retaliate()]
+    for tool in tools:
+        root = await _resident(runtime, broker)
+        kids = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+        llm = ScriptedLLM(
+            [
+                ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Retaliate', arguments='{}')]),
+                ScriptedTurn(content='done'),
+            ]
+        )
+        worker = await runtime.spawn(
+            _factory(llm, tools={'Retaliate': tool}), query='go', parent_id=kids[0]
+        )
+        trees.append((root, kids, worker))
+    for tool, (root, _, _) in zip(tools, reversed(trees), strict=True):
+        tool.runtime = runtime
+        tool.target = root
+    await asyncio.wait_for(asyncio.gather(*(tool.entered.wait() for tool in tools)), _TIMEOUT)
+
+    first = asyncio.create_task(runtime.despawn(trees[0][0]))
+    second = asyncio.create_task(runtime.despawn(trees[1][0]))
+    await asyncio.wait_for(asyncio.gather(first, second), _TIMEOUT)
+
+    everything = [agent_id for root, kids, worker in trees for agent_id in (root, *kids, worker)]
+    assert [await runtime.find(agent_id) for agent_id in everything] == [None] * 10
+    assert sorted(reported) == sorted(everything)
+    assert await _dangling_parents(registry) == []
+    assert runtime._doomed == {}
+    assert runtime._destroying == {}
+    await runtime.shutdown()
+
+
+async def test_a_despawn_whose_registry_keeps_the_entry_reports_it_instead_of_the_despawn(
+    caplog: pytest.LogCaptureFixture,
+):
+    """后置条件是复检出来的，不是从 `unregister` 的明文契约推出来的。
+
+    一个答应了却没真的摘掉条目的注册表既不该换来一次 `AGENT_DESPAWN`（它没消失，那是假事件），
+    也不该一声不响返回——留下的条目此后 `parent_id` 指着空洞，而那条 ERROR 里的下一步是够得着
+    它的唯一办法。这是「接缝另一侧的合法替换」：不抛、不说谎，只是没兑现契约。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    reported: list[str] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        reported.append(kwargs['agent_id'])
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, record)
+    root = await _resident(runtime, broker)
+    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+    delta = await _resident(runtime, broker, parent_id=bravo)
+    registry.silent_unregister = delta
+
+    await asyncio.wait_for(runtime.despawn(root), _TIMEOUT)
+
+    assert reported == [charlie, alpha, bravo, root]
+    assert await runtime.find(delta) is not None
+    assert await _dangling_parents(registry) == [delta]
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    message = caplog.records[0].getMessage()
+    assert caplog.records[0].args == (delta,)
+    _assert_three_part(message)
     await runtime.shutdown()
 
 
