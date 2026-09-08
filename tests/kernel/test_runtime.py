@@ -823,6 +823,69 @@ async def test_deferred_messages_wait_for_the_whole_cycle_then_start_the_next_on
     await runtime.shutdown()
 
 
+async def test_one_agents_deferred_messages_never_reach_another_agents_context():
+    """暂存队列是 per-agent 的：共用一个控制块会让一个 Agent 的延迟消息进到另一个的上下文里。"""
+    runtime = Runtime()
+    addressed_blocker = _Block()
+    quiet_blocker = _Block()
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Block', arguments='{}')]),
+            ScriptedTurn(content='first cycle done'),
+            ScriptedTurn(content='second cycle done'),
+        ]
+    )
+    addressed = await runtime.spawn(_factory(llm, tools={'Block': addressed_blocker}), query='go')
+    quiet = await runtime.spawn(_blocking(quiet_blocker), query='go')
+    for blocker in (addressed_blocker, quiet_blocker):
+        await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    for content in ('bravo', 'alpha', 'charlie'):
+        assert (await runtime.send(addressed, content, trigger=Trigger.DEFERRED)).ok is True
+
+    # 先让没被寻址的那个跑完：它此刻若看得见这三条，就会替收件人把它们消费掉。
+    quiet_blocker.release.set()
+    quiet_ctx = await asyncio.wait_for(runtime.wait(quiet), _TIMEOUT)
+    assert [block.content for block in quiet_ctx.current_traj if block.role == 'user'] == ['go']
+
+    addressed_blocker.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(addressed), _TIMEOUT)
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
+        'go',
+        'bravo',
+        'alpha',
+        'charlie',
+    ]
+    await runtime.shutdown()
+
+
+async def test_pausing_one_agent_leaves_the_others_running():
+    """挂起门是 per-agent 的：共用一个控制块会让一次 pause 按住整个 Runtime。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    held, free = [
+        await runtime.spawn(_factory(_done(f'{name} woke')), exit_mode=ExitMode.IDLE)
+        for name in ('held', 'free')
+    ]
+    for agent_id in (held, free):
+        await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+    runtime._slots[held].control.pause()
+
+    assert (await runtime.send(free, 'go ahead')).ok is True
+    await asyncio.wait_for(broker.reach(free, 2), _TIMEOUT)
+    assert (await runtime.send(held, 'not yet')).ok is True
+    assert await runtime._slots[held].control.wait_until_parked(_TIMEOUT) is True
+
+    held_agent = runtime._table.get(held)
+    free_agent = runtime._table.get(free)
+    assert held_agent is not None and free_agent is not None
+    assert held_agent.context.current_traj == []
+    assert [block.content for block in free_agent.context.current_traj] == [
+        'go ahead',
+        'free woke',
+    ]
+    await runtime.shutdown()
+
+
 async def test_removing_the_mailbox_ends_a_resident_event_loop():
     """`wait_for_messages` 答 False 只有一个含义：邮箱已经被摘掉了，该退出。"""
     broker = _SpyBroker()
