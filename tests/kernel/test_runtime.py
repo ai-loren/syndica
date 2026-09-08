@@ -17,7 +17,8 @@ from syndica.kernel.errors import ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
-from syndica.kernel.message import Message, Trigger
+from syndica.kernel.message import DeliveryResult, Message, Trigger
+from syndica.kernel.protocols import AgentRegistry, MissingQueueCallback
 from syndica.kernel.runtime import AgentFactory, Runtime
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
@@ -69,16 +70,18 @@ class _Block(Tool):
 
 
 class _RecordingRegistry:
-    """记下每一次状态转换，并可让指定的一次转换失败。
+    """记下每一次状态转换（尝试的与真的写进去的），并可让指定的一次转换失败。
 
-    转换记录是「注册表看到了什么」的唯一证据：EXIT 的终态紧接着被 unregister 抹掉，只看注册表
-    的最终内容分不出它转去了哪一个状态。
+    转换记录是「注册表看到了什么」的唯一证据：EXIT 的条目紧接着被 unregister 抹掉，只看注册表
+    的最终内容分不出它中途走过哪些状态。尝试与生效分开记：`_switch` 逐个试 CAS，失败的那些是
+    实现细节，走过的状态路径才是行为。
     """
 
     def __init__(self, *, deny: tuple[AgentStatus, AgentStatus] | None = None) -> None:
         self._inner = InMemoryAgentRegistry()
         self._deny = deny
         self.transitions: list[tuple[str, AgentStatus, AgentStatus]] = []
+        self.applied: list[tuple[str, AgentStatus, AgentStatus]] = []
 
     async def register(self, info: AgentInfo) -> None:
         await self._inner.register(info)
@@ -92,7 +95,10 @@ class _RecordingRegistry:
         self.transitions.append((agent_id, expected, new))
         if self._deny == (expected, new):
             return False
-        return await self._inner.compare_and_set_status(agent_id, expected=expected, new=new)
+        applied = await self._inner.compare_and_set_status(agent_id, expected=expected, new=new)
+        if applied:
+            self.applied.append((agent_id, expected, new))
+        return applied
 
     async def update(self, agent_id: str, **fields: Any) -> None:
         await self._inner.update(agent_id, **fields)
@@ -112,6 +118,75 @@ class _RecordingRegistry:
         return [
             (expected, new) for recorded, expected, new in self.transitions if recorded == agent_id
         ]
+
+    def applied_of(self, agent_id: str) -> list[tuple[AgentStatus, AgentStatus]]:
+        return [(expected, new) for recorded, expected, new in self.applied if recorded == agent_id]
+
+
+class _SpyBroker:
+    """观测 broker 这一侧的接缝：谁停在邮箱上等消息，以及摘队列的那一刻注册表怎么说。
+
+    「事件循环在等消息」（spec §4.1 给 IDLE 的定义）在 Runtime 外面没有别的观测点——注册表里的
+    `IDLE` 与「刚注册、驱动任务还没跑起来」是同一个取值，拿它当握手信号分不出这两件事。
+    """
+
+    def __init__(self, registry: AgentRegistry | None = None) -> None:
+        self._inner = InMemoryMessageBroker()
+        self._registry = registry
+        # 边沿信号：入园即置位，等待者扫描前清位。「已入园 n 次」是电平，等的是「又入了一次」。
+        self._parked = asyncio.Event()
+        self._parks: dict[str, int] = {}
+        self.removals: list[tuple[str, AgentStatus | None]] = []
+
+    def parks(self, agent_id: str) -> int:
+        return self._parks.get(agent_id, 0)
+
+    async def reach(self, agent_id: str, parks: int) -> None:
+        """等到该 agent 第 `parks` 次停到邮箱上。上界由调用方套一层 `wait_for` 给。"""
+        while True:
+            self._parked.clear()
+            if self.parks(agent_id) >= parks:
+                return
+            await self._parked.wait()
+
+    async def ensure_queue(self, agent_id: str) -> None:
+        await self._inner.ensure_queue(agent_id)
+
+    async def publish(self, agent_id: str, message: Message) -> DeliveryResult:
+        return await self._inner.publish(agent_id, message)
+
+    async def consume(self, agent_id: str, *, max_n: int = 0) -> list[Message]:
+        return await self._inner.consume(agent_id, max_n=max_n)
+
+    async def wait_for_messages(
+        self,
+        agent_id: str,
+        timeout: float | None,  # noqa: ASYNC109
+    ) -> bool:
+        self._parks[agent_id] = self.parks(agent_id) + 1
+        self._parked.set()
+        return await self._inner.wait_for_messages(agent_id, timeout)
+
+    async def take_by_correlation(
+        self,
+        agent_id: str,
+        correlation_id: str,
+        timeout: float | None,  # noqa: ASYNC109
+    ) -> Message | None:
+        return await self._inner.take_by_correlation(agent_id, correlation_id, timeout)
+
+    async def remove_queue(self, agent_id: str) -> None:
+        self.removals.append((agent_id, await self._seen_status(agent_id)))
+        await self._inner.remove_queue(agent_id)
+
+    def on_missing_queue(self, cb: MissingQueueCallback) -> None:
+        self._inner.on_missing_queue(cb)
+
+    async def _seen_status(self, agent_id: str) -> AgentStatus | None:
+        if self._registry is None:
+            return None
+        info = await self._registry.get(agent_id)
+        return None if info is None else info.status
 
 
 def _tools() -> dict[str, Tool]:
@@ -221,7 +296,7 @@ async def test_spawn_under_an_unknown_parent_leaves_no_half_built_agent_behind()
     with pytest.raises(ContractViolation):
         await runtime.spawn(_factory(_done()), query='go', parent_id='nope')
     assert runtime._table.agent_ids() == []
-    assert runtime._contexts == {}
+    assert runtime._slots == {}
     await runtime.shutdown()
 
 
@@ -272,64 +347,90 @@ async def test_wait_returns_once_its_own_agent_is_done_while_a_sibling_still_run
     await runtime.shutdown()
 
 
-async def test_exit_mode_idle_and_zombie_each_park_their_own_agent_in_their_own_status():
-    runtime = Runtime()
+async def test_idle_exit_mode_stays_resident_while_zombie_exit_mode_ends_its_own_loop():
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
     idle = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.IDLE)
     zombie = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.ZOMBIE)
-    await runtime.wait(idle)
     await runtime.wait(zombie)
+    await asyncio.wait_for(broker.reach(idle, 1), _TIMEOUT)
+
     assert await _status(runtime, idle) is AgentStatus.IDLE
     assert await _status(runtime, zombie) is AgentStatus.ZOMBIE
+    assert [broker.parks(idle), broker.parks(zombie)] == [1, 0]
+    assert [agent_id for agent_id, _ in broker.removals] == [zombie]
     await runtime.shutdown()
 
 
-async def test_each_exit_mode_records_its_own_pair_of_transitions():
+async def test_each_exit_mode_walks_its_own_status_path():
     registry = _RecordingRegistry()
-    runtime = Runtime(registry=registry)
-    modes = [ExitMode.EXIT, ExitMode.IDLE, ExitMode.ZOMBIE]
-    ids = [await runtime.spawn(_factory(_done()), query='go', exit_mode=mode) for mode in modes]
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    # 顺序既非升序（exit / idle / zombie）亦非降序，反转后同样两者都不是。
+    modes = [ExitMode.ZOMBIE, ExitMode.EXIT, ExitMode.IDLE]
+    zombie, reaped, resident = [
+        await runtime.spawn(_factory(_done()), query='go', exit_mode=mode) for mode in modes
+    ]
+    await runtime.wait(zombie)
     with pytest.raises(ContractViolation):
-        await runtime.wait(ids[0])
-    await runtime.wait(ids[1])
-    await runtime.wait(ids[2])
-    assert registry.of(ids[0]) == [
+        await runtime.wait(reaped)
+    await asyncio.wait_for(broker.reach(resident, 1), _TIMEOUT)
+
+    assert registry.applied_of(zombie) == [
         (AgentStatus.IDLE, AgentStatus.RUNNING),
+        (AgentStatus.RUNNING, AgentStatus.RUNNING),
         (AgentStatus.RUNNING, AgentStatus.ZOMBIE),
     ]
-    assert registry.of(ids[1]) == [
+    assert registry.applied_of(resident) == [
         (AgentStatus.IDLE, AgentStatus.RUNNING),
+        (AgentStatus.RUNNING, AgentStatus.RUNNING),
         (AgentStatus.RUNNING, AgentStatus.IDLE),
     ]
-    assert registry.of(ids[2]) == [
+    # EXIT 的归宿是「不在注册表里」而不是某个状态，因此它连一次终态转换都不试。
+    assert registry.applied_of(reaped) == [
         (AgentStatus.IDLE, AgentStatus.RUNNING),
-        (AgentStatus.RUNNING, AgentStatus.ZOMBIE),
+        (AgentStatus.RUNNING, AgentStatus.RUNNING),
     ]
+    assert [pair for pair in registry.of(reaped) if pair[1] is AgentStatus.ZOMBIE] == []
     await runtime.shutdown()
 
 
-async def test_zombie_agent_still_receives_a_message_addressed_to_it():
-    broker = InMemoryMessageBroker()
+async def test_zombie_keeps_its_registry_entry_but_loses_its_mailbox():
+    """spec §4.1：ZOMBIE 是「事件循环已退出、队列已移除，但仍在注册表中」。"""
+    broker = _SpyBroker()
     runtime = Runtime(broker=broker)
     agent_id = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.ZOMBIE)
     await runtime.wait(agent_id)
-    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
 
-    result = await runtime.send(agent_id, '继续')
-    assert result.ok is True
-    delivered = await broker.consume(agent_id)
-    assert [message.content for message in delivered] == ['继续']
-    assert delivered[0].receiver == agent_id
-    assert result.message_id == delivered[0].id
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    refused = await runtime.send(agent_id, '继续')
+    assert refused.ok is False
+    assert refused.message_id is None
+    assert refused.reason is not None
+    _assert_three_part(refused.reason)
+    assert await broker.consume(agent_id) == []
+    await runtime.shutdown()
+
+
+async def test_the_mailbox_goes_before_the_status_so_a_racing_send_fails_instead_of_vanishing():
+    """先改状态那条消息会成功投进一个即将消失的队列，静默丢掉；先摘队列它拿到的是显式失败。"""
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.ZOMBIE)
+    await runtime.wait(agent_id)
+
+    assert broker.removals == [(agent_id, AgentStatus.RUNNING)]
     await runtime.shutdown()
 
 
 async def test_send_reaches_only_the_addressed_agents_mailbox():
     broker = InMemoryMessageBroker()
     runtime = Runtime(broker=broker)
-    first = await runtime.spawn(_factory(_done()), query='go')
-    second = await runtime.spawn(_factory(_done()), query='go')
-    await runtime.wait(first)
-    await runtime.wait(second)
+    blockers = [_Block(), _Block()]
+    first, second = [await runtime.spawn(_blocking(blocker), query='go') for blocker in blockers]
+    for blocker in blockers:
+        await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
 
     assert (await runtime.send(second, 'for second')).ok is True
     assert [message.content for message in await broker.consume(first)] == []
@@ -340,8 +441,9 @@ async def test_send_reaches_only_the_addressed_agents_mailbox():
 async def test_send_puts_the_requested_trigger_on_the_delivered_message():
     broker = InMemoryMessageBroker()
     runtime = Runtime(broker=broker)
-    agent_id = await runtime.spawn(_factory(_done()), query='go')
-    await runtime.wait(agent_id)
+    blocker = _Block()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go')
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
 
     await runtime.send(agent_id, 'next turn')
     await runtime.send(agent_id, 'after the run', trigger=Trigger.DEFERRED)
@@ -353,9 +455,11 @@ async def test_send_puts_the_requested_trigger_on_the_delivered_message():
 async def test_send_stamps_the_runtime_as_sender_on_every_addressees_message():
     broker = InMemoryMessageBroker()
     runtime = Runtime(broker=broker)
-    ids = [await runtime.spawn(_factory(_done()), query='go') for _ in range(2)]
+    blockers = [_Block(), _Block()]
+    ids = [await runtime.spawn(_blocking(blocker), query='go') for blocker in blockers]
+    for blocker in blockers:
+        await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
     for agent_id in ids:
-        await runtime.wait(agent_id)
         assert (await runtime.send(agent_id, 'ping')).ok is True
 
     delivered = [(await broker.consume(agent_id))[0] for agent_id in ids]
@@ -379,7 +483,7 @@ async def test_send_refuses_an_unregistered_agent_even_when_a_stale_mailbox_exis
 
 
 async def test_exit_mode_reaps_only_its_own_agent_from_every_per_agent_structure():
-    broker = InMemoryMessageBroker()
+    broker = _SpyBroker()
     runtime = Runtime(broker=broker)
     reaped = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.EXIT)
     kept = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.ZOMBIE)
@@ -388,14 +492,15 @@ async def test_exit_mode_reaps_only_its_own_agent_from_every_per_agent_structure
     await runtime.wait(kept)
 
     assert await runtime.find(reaped) is None
-    assert await _mailbox_exists(broker, reaped) is False
     assert runtime._table.get(reaped) is None
-    assert reaped not in runtime._contexts
+    assert reaped not in runtime._slots
 
     assert await runtime.find(kept) is not None
-    assert await _mailbox_exists(broker, kept) is True
     assert runtime._table.get(kept) is not None
-    assert kept in runtime._contexts
+    assert kept in runtime._slots
+
+    # 两条路都摘队列，区别只在注册表条目与本进程的记录还留不留。
+    assert {agent_id for agent_id, _ in broker.removals} == {reaped, kept}
     await runtime.shutdown()
 
 
@@ -486,35 +591,40 @@ async def test_lost_transition_into_running_stops_the_drive_before_it_calls_the_
     await runtime.shutdown()
 
 
-async def test_lost_terminal_transition_is_reported_and_exit_still_releases_resources(
+async def test_lost_terminal_transition_is_reported_and_leaves_the_registry_as_it_found_it(
     caplog: pytest.LogCaptureFixture,
 ):
     registry = _RecordingRegistry(deny=(AgentStatus.RUNNING, AgentStatus.ZOMBIE))
-    broker = InMemoryMessageBroker()
+    broker = _SpyBroker(registry)
     runtime = Runtime(registry=registry, broker=broker)
-    agent_id = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.EXIT)
-    with pytest.raises(ContractViolation):
-        await runtime.wait(agent_id)
+    agent_id = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.ZOMBIE)
+    await runtime.wait(agent_id)
 
     assert [record.levelname for record in caplog.records] == ['ERROR']
     assert agent_id in caplog.text
-    assert await runtime.find(agent_id) is None
-    assert await _mailbox_exists(broker, agent_id) is False
+    # 转换被拒说明这个状态已经不是本进程写的了；保持注册表现有的说法比强行覆盖更诚实。
+    assert await _status(runtime, agent_id) is AgentStatus.RUNNING
+    assert [agent_id for agent_id, _ in broker.removals] == [agent_id]
     await runtime.shutdown()
 
 
-async def test_shutdown_returns_only_after_every_cancelled_drive_has_finished_unwinding():
-    runtime = Runtime()
-    blockers = [_Block(), _Block()]
+async def test_shutdown_waits_for_every_cancelled_drive_and_leaves_its_cleanup_undone():
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    blockers = [_Block(), _Block(), _Block()]
     ids = [await runtime.spawn(_blocking(blocker), query='go') for blocker in blockers]
     for blocker in blockers:
         await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
-    assert [await _status(runtime, agent_id) for agent_id in ids] == [AgentStatus.RUNNING] * 2
+    assert [await _status(runtime, agent_id) for agent_id in ids] == [AgentStatus.RUNNING] * 3
 
     await runtime.shutdown()
 
-    # 终态由每个任务自己的 finally 写：shutdown 返回时它已经是终态，说明 shutdown 等到了它。
-    assert [await _status(runtime, agent_id) for agent_id in ids] == [AgentStatus.ZOMBIE] * 2
+    # 快照取在 shutdown 返回的那一刻：被丢下的任务事件循环转下去照样会跑完。
+    tasks = [runtime._table.get_task(agent_id) for agent_id in ids]
+    assert [task is not None and task.done() for task in tasks] == [True] * 3
+    # 取消可能落在轮的中间，而收尾是一个有状态的动作：它归发起取消的那一方。
+    assert [await _status(runtime, agent_id) for agent_id in ids] == [AgentStatus.RUNNING] * 3
+    assert broker.removals == []
 
 
 async def test_wait_returns_the_partial_trajectory_of_a_cancelled_run():
@@ -609,3 +719,226 @@ async def test_every_spawned_agent_gets_the_runtimes_own_hooks_and_event_bus():
     ended = {event.agent_id async for event in subscription if event.kind == 'agent_end'}
     assert ended == {first, second}
     assert sorted(queries) == ['one', 'two']
+
+
+async def test_spawning_without_a_query_parks_the_loop_instead_of_running_a_cycle(
+    caplog: pytest.LogCaptureFixture,
+):
+    """lazy boot：起来就在等消息，第一条消息才是它的第一个周期。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    llm = _done('woken')
+    agent_id = await runtime.spawn(_factory(llm), exit_mode=ExitMode.IDLE)
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert llm.calls == []
+    assert agent.context.current_traj == []
+
+    assert (await runtime.send(agent_id, 'wake up')).ok is True
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+
+    assert [(block.role, block.content) for block in agent.context.current_traj] == [
+        ('user', 'wake up'),
+        ('assistant', 'woken'),
+    ]
+    assert caplog.records == []
+    await runtime.shutdown()
+
+
+async def test_a_resident_loop_runs_one_cycle_per_message_on_the_same_context(
+    caplog: pytest.LogCaptureFixture,
+):
+    """一条消息一个周期，Context 不重建、轮次不重置（spec §5.1）。
+
+    三个周期而非两个，且答复顺序既非升序（alpha / bravo / charlie）亦非降序，反转后同样两者都
+    不是：只跑一个周期、或把注入顺序排一遍序，在两个周期下都能蒙对。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    replies = ['bravo said', 'alpha said', 'charlie said']
+    agent_id = await runtime.spawn(
+        _factory(ScriptedLLM([ScriptedTurn(content=reply) for reply in replies])),
+        query='bravo',
+        exit_mode=ExitMode.IDLE,
+    )
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+    for parks, content in enumerate(('alpha', 'charlie'), start=2):
+        assert (await runtime.send(agent_id, content)).ok is True
+        await asyncio.wait_for(broker.reach(agent_id, parks), _TIMEOUT)
+
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    traj = agent.context.current_traj
+    assert [block.content for block in traj if block.role == 'user'] == [
+        'bravo',
+        'alpha',
+        'charlie',
+    ]
+    assert [block.content for block in traj if block.role == 'assistant'] == replies
+    assert caplog.records == []
+    await runtime.shutdown()
+
+
+async def test_deferred_messages_wait_for_the_whole_cycle_then_start_the_next_one():
+    """spec §4.5：DEFERRED 的语义是「先把手上的事做完，然后再看这个」。
+
+    三条而非两条，且顺序既非升序亦非降序，反转后同样两者都不是：在轮中间注入、注入两遍、
+    全部丢掉、以及把暂存队列排一遍序，都必须让这条用例变红。
+    """
+    runtime = Runtime()
+    blocker = _Block()
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Block', arguments='{}')]),
+            ScriptedTurn(content='first cycle done'),
+            ScriptedTurn(content='second cycle done'),
+        ]
+    )
+    agent_id = await runtime.spawn(_factory(llm, tools={'Block': blocker}), query='go')
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    for content in ('bravo', 'alpha', 'charlie'):
+        assert (await runtime.send(agent_id, content, trigger=Trigger.DEFERRED)).ok is True
+    blocker.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert [block.role for block in ctx.current_traj] == [
+        'user',
+        'assistant',
+        'tool',
+        'assistant',
+        'user',
+        'user',
+        'user',
+        'assistant',
+    ]
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
+        'go',
+        'bravo',
+        'alpha',
+        'charlie',
+    ]
+    assert ctx.current_traj[-1].content == 'second cycle done'
+    await runtime.shutdown()
+
+
+async def test_removing_the_mailbox_ends_a_resident_event_loop():
+    """`wait_for_messages` 答 False 只有一个含义：邮箱已经被摘掉了，该退出。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.IDLE)
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+
+    await broker.remove_queue(agent_id)
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.COMPLETED
+    assert broker.parks(agent_id) == 1
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    await runtime.shutdown()
+
+
+async def test_an_exhausted_turn_budget_ends_the_event_loop_even_for_a_resident_agent():
+    """预算耗尽的 Agent 对任何后续消息都产不出新的一轮，继续等只会被同一条消息反复唤醒。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    llm = _done('only turn')
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(
+                name='Worker',
+                llm=llm,
+                tools=_tools(),
+                system_prompt=_SYSTEM_PROMPT,
+                max_turns=1,
+            ),
+            hooks=hooks,
+            events=events,
+        )
+
+    agent_id = await runtime.spawn(build, query='go', exit_mode=ExitMode.IDLE)
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+    assert (await runtime.send(agent_id, 'more work')).ok is True
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.MAX_TURNS
+    assert len(llm.calls) == 1
+    assert broker.parks(agent_id) == 1
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    await runtime.shutdown()
+
+
+async def test_a_failing_cycle_ends_a_resident_event_loop_instead_of_retrying_it(
+    caplog: pytest.LogCaptureFixture,
+):
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    failing = ScriptedLLM([ScriptedTurn(raises=RuntimeError('boom'))])
+    agent_id = await runtime.spawn(_factory(failing), query='go', exit_mode=ExitMode.IDLE)
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.ERROR
+    assert len(failing.calls) == 1
+    assert broker.parks(agent_id) == 0
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    await runtime.shutdown()
+
+
+async def test_the_pause_gate_sits_between_a_waiting_message_and_starting_the_cycle():
+    """被挂起的 Agent 既不开始周期，也不把消息从邮箱里取走——否则 resume 之后它已经不在了。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    subscription = runtime.events.subscribe()
+    agent_id = await runtime.spawn(_factory(_done('woken')), exit_mode=ExitMode.IDLE)
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+    control = runtime._slots[agent_id].control
+    control.pause()
+
+    assert (await runtime.send(agent_id, 'wake up')).ok is True
+    assert await control.wait_until_parked(_TIMEOUT) is True
+
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    assert [message.content for message in await broker.consume(agent_id)] == ['wake up']
+    await runtime.shutdown()
+    assert [event.kind async for event in subscription] == []
+
+
+async def test_an_abort_taken_between_cycles_drops_that_cycles_input_and_goes_back_to_waiting():
+    """中止位一次性：被它掐掉的那个周期不开始，而下一条消息照常开一个新周期。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    llm = _done('woken')
+    agent_id = await runtime.spawn(_factory(llm), query='go', exit_mode=ExitMode.IDLE)
+    # create_task 只排队不立刻运行，因此这一位一定先于第一个周期被看见。
+    runtime._slots[agent_id].control.request_abort()
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert llm.calls == []
+    assert agent.context.current_traj == []
+
+    assert (await runtime.send(agent_id, 'wake up')).ok is True
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+    assert [(block.role, block.content) for block in agent.context.current_traj] == [
+        ('user', 'wake up'),
+        ('assistant', 'woken'),
+    ]
+    await runtime.shutdown()
+
+
+async def test_wait_refuses_an_agent_this_process_never_spawned_even_with_a_shared_registry():
+    """交回的是本进程持有的那份 Context；共享注册表的另一个进程手里没有它。"""
+    runtime = Runtime()
+    agent_id = await runtime.spawn(_factory(_done()), query='go', exit_mode=ExitMode.ZOMBIE)
+    await runtime.wait(agent_id)
+
+    second = Runtime(registry=runtime.registry, broker=runtime.broker)
+    with pytest.raises(ContractViolation) as excinfo:
+        await second.wait(agent_id)
+    assert agent_id in excinfo.value.expected
+    await second.shutdown()
+    await runtime.shutdown()
