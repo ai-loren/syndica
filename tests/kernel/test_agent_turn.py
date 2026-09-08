@@ -11,7 +11,8 @@ from typing import Any
 import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
-from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall
+from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall, TrustLevel
+from syndica.kernel.control import BrokerTurnGate, ControlBlock, TurnGate, TurnGateDecision
 from syndica.kernel.errors import (
     ConfigError,
     ContractViolation,
@@ -21,11 +22,16 @@ from syndica.kernel.errors import (
 from syndica.kernel.events import Event, EventBus, Subscription
 from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ContextOverflowError, ScriptedLLM, ScriptedTurn
+from syndica.kernel.message import Message, Trigger
+from syndica.kernel.stores import InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
 
 # 每个等待都设上限：回归应当让用例变红，而不是把 CI 挂住。
 _TIMEOUT = 1.0
 _SYSTEM_PROMPT = 'You are a worker.'
+# 门按 agent_id 认邮箱，而 BaseAgent 的 agent_id 是构造时才生成的 uuid；这些用例只需要门与
+# broker 说的是同一个邮箱，用哪个名字无关紧要。
+_MAILBOX = 'a1'
 # 逐字写死而不是读 tool.schema：期望值与被测对象同源时，schema 缺一半会让期望值跟着缩水。这份
 # schema 逐字进模型请求的字节前缀（spec §5.2），键序一并钉住。
 _ECHO_SCHEMA: dict[str, Any] = {
@@ -112,6 +118,43 @@ class _Blocking(Tool):
         return ToolResult(output='released')
 
 
+class _FixedGate:
+    """按固定结论作答的门，并记下自己被问过哪些轮。
+
+    `BrokerTurnGate` 中止时不消费邮箱，因此它永远给不出「既中止又带消息」的结论；而 `TurnGate`
+    是公开 Protocol，任何第三方实现都给得出，两个字段的优先级必须有唯一答案。
+    """
+
+    def __init__(self, decision: TurnGateDecision) -> None:
+        self.decision = decision
+        self.turns: list[int] = []
+
+    async def before_turn(self, turn: int) -> TurnGateDecision:
+        self.turns.append(turn)
+        return self.decision
+
+
+class _Publisher(Tool):
+    """执行时往自己的邮箱里投一条消息，用来构造「用户在一轮的中途插话」。
+
+    插话必须来自一轮的**中间**：周期开始前就躺在邮箱里的消息，无论门是每周期问一次还是每轮问一
+    次都会被注入，区分不出两者。
+    """
+
+    def __init__(self, broker: InMemoryMessageBroker, agent_id: str, content: str) -> None:
+        self._broker = broker
+        self._agent_id = agent_id
+        self._content = content
+
+    async def execute(self) -> ToolResult:
+        """投一条消息给自己。"""
+        await self._broker.publish(
+            self._agent_id,
+            Message(sender='user', receiver=self._agent_id, content=self._content),
+        )
+        return ToolResult(output='published')
+
+
 class _NumberedPrompt(BaseAgent):
     """每次 get_system_prompt 返回不同的值。
 
@@ -160,6 +203,7 @@ def _agent(
     system_prompt: str = _SYSTEM_PROMPT,
     max_turns: int | None = 50,
     events: EventBus | None = None,
+    gate: TurnGate | None = None,
 ) -> tuple[BaseAgent, HooksCenter]:
     hooks = HooksCenter()
     options = AgentOptions(
@@ -170,7 +214,19 @@ def _agent(
         max_turns=max_turns,
     )
     bus = events if events is not None else EventBus()
-    return BaseAgent(options, hooks=hooks, events=bus), hooks
+    return BaseAgent(options, hooks=hooks, events=bus, gate=gate), hooks
+
+
+async def _gate(control: ControlBlock) -> tuple[BrokerTurnGate, InMemoryMessageBroker]:
+    """一道接上内存 broker 的门，邮箱按 `_MAILBOX` 建好。"""
+    broker = InMemoryMessageBroker()
+    await broker.ensure_queue(_MAILBOX)
+    return BrokerTurnGate(_MAILBOX, broker, control), broker
+
+
+async def _post(broker: InMemoryMessageBroker, *contents: str) -> None:
+    for content in contents:
+        await broker.publish(_MAILBOX, Message(sender='user', receiver=_MAILBOX, content=content))
 
 
 def _llm(agent: BaseAgent) -> ScriptedLLM:
@@ -1473,3 +1529,325 @@ async def test_post_llm_response_still_accepts_a_bare_skip_to_end_the_chain():
     ctx = await agent.run('go')
     assert calls == ['first']
     assert [block.content for block in ctx.current_traj] == ['go', 'original']
+
+
+async def test_gate_abort_between_turns_stops_with_aborted():
+    """协作式中止落在轮与轮之间，此时轨迹是一致的——这正是 ABORTED 与硬取消的分界。"""
+    control = ControlBlock()
+    gate, _ = await _gate(control)
+    agent, _ = _agent([ScriptedTurn(content='never reached')], gate=gate)
+    control.request_abort()
+
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.ABORTED
+    assert _roles(ctx.current_traj) == ['user']
+    assert _llm(agent).calls == []
+
+
+async def test_an_aborted_cycle_starts_no_turn():
+    """中止检查在计数与 turn_start 之前，所以被中止的那一轮从未开始：发出一个没有 turn_end 与之
+    配对的 turn_start，界面上就是一轮永远做不完的工作。"""
+    log: list[tuple[str, str]] = []
+    control = ControlBlock()
+    gate, _ = await _gate(control)
+    agent, hooks = _agent(
+        [ScriptedTurn(content='never reached')], gate=gate, events=_RecordingBus(log)
+    )
+    _record_lifecycle(hooks, log)
+    control.request_abort()
+
+    await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert log == [
+        ('event', 'agent_start'),
+        ('hook', 'agent_start'),
+        ('hook', 'agent_end'),
+        ('event', 'agent_end'),
+    ]
+
+
+async def test_aborting_between_turns_does_not_spend_a_turn():
+    """中止发生在计数之前：一个被中止的周期不该吃掉整个任务的预算。"""
+    control = ControlBlock()
+    gate, _ = await _gate(control)
+    agent, _ = _agent(
+        [ScriptedTurn(content='first'), ScriptedTurn(content='second')], gate=gate, max_turns=2
+    )
+    await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+    control.request_abort()
+    await asyncio.wait_for(agent.run('again'), timeout=_TIMEOUT)
+    ctx = await asyncio.wait_for(agent.run('third time'), timeout=_TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.COMPLETED
+
+
+async def test_an_aborting_decision_wins_over_the_messages_it_carries():
+    """spec §5.1 把中止检查排在消费消息之前。这一轮既然不会跑，注入只会把消息埋进一份没人再读的
+    轨迹里，而它此时已经离开邮箱了。"""
+    gate = _FixedGate(
+        TurnGateDecision(
+            abort=True,
+            messages=(Message(sender='user', receiver=_MAILBOX, content='too late'),),
+        )
+    )
+    agent, _ = _agent([ScriptedTurn(content='never reached')], gate=gate)
+
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.ABORTED
+    assert _roles(ctx.current_traj) == ['user']
+
+
+async def test_the_gate_is_consulted_once_per_turn_with_that_turns_number():
+    """每轮一次而不是每周期一次：门要在轮与轮之间放行中止与插话，一个周期问一次就只剩周期边界。"""
+    gate = _FixedGate(TurnGateDecision())
+    agent, _ = _agent(
+        [
+            ScriptedTurn(tool_calls=[_call('c1')]),
+            ScriptedTurn(tool_calls=[_call('c2')]),
+            ScriptedTurn(content='done'),
+        ],
+        gate=gate,
+    )
+
+    await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert gate.turns == [1, 2, 3]
+
+
+async def test_pending_messages_are_injected_before_the_turn_starts():
+    """spec §5.1：消费待处理消息发生在 turn_start 之前，用户中途插话在下一轮就可见。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, _ = _agent(
+        [ScriptedTurn(tool_calls=[_call()]), ScriptedTurn(content='done')],
+        gate=gate,
+    )
+    await _post(broker, 'also check the logs')
+
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert _roles(ctx.current_traj) == ['user', 'user', 'assistant', 'tool', 'assistant']
+    assert ctx.current_traj[1].content == 'also check the logs'
+    assert ctx.current_traj[1].extra['sender'] == 'user'
+    # 只看轨迹次序不够：一个先调模型、再把消息插进 index 1 的实现同样能通过上面三条，而它交给
+    # 模型的那一轮里没有这条消息。
+    assert _roles(_llm(agent).calls[0]) == ['system', 'user', 'user']
+
+
+async def test_injected_messages_are_visible_to_the_turn_start_hook():
+    """注入排在 turn_start 之前，挂在 turn_start 上的预算 / 审计 hook 看到的才是这一轮真正要发出
+    去的轨迹。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, hooks = _agent([ScriptedTurn(content='ok')], gate=gate)
+    seen: list[list[Any]] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        seen.append([block.content for block in kwargs['ctx'].current_traj])
+        return HookResult()
+
+    hooks.register(Junction.TURN_START, record)
+    await _post(broker, 'also check the logs')
+
+    await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert seen == [['go', 'also check the logs']]
+
+
+async def test_an_injected_message_goes_into_the_trajectory_not_into_the_system_prompt():
+    """SP 是请求前缀而不是对话的一部分：把消息拼进它，该会话此后每一次请求的缓存都静默失效
+    （spec §5.2）。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, _ = _agent([ScriptedTurn(content='ok')], gate=gate)
+    await _post(broker, 'also check the logs')
+
+    await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    system_block = _llm(agent).calls[0][0]
+    assert system_block.role == 'system'
+    assert system_block.content == _SYSTEM_PROMPT
+
+
+async def test_a_message_arriving_mid_run_is_injected_before_the_next_turn():
+    """门每轮问一次而不是每周期问一次：这条消息在第一轮已经跑起来之后才到，只有逐轮问才看得见。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, _ = _agent(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='p1', name='Publisher', arguments='{}')]),
+            ScriptedTurn(content='done'),
+        ],
+        tools={'Publisher': _Publisher(broker, _MAILBOX, 'and now check the logs')},
+        gate=gate,
+    )
+
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert _roles(ctx.current_traj) == ['user', 'assistant', 'tool', 'user', 'assistant']
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
+        'go',
+        'and now check the logs',
+    ]
+
+
+async def test_injected_messages_keep_their_trust_level():
+    """不可信内容经消息进来仍然不可信——标记必须随内容走（spec §12.2）。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, _ = _agent([ScriptedTurn(content='ok')], gate=gate)
+    await broker.publish(
+        _MAILBOX,
+        Message(
+            sender='webhook',
+            receiver=_MAILBOX,
+            content='<from the internet>',
+            trust=TrustLevel.UNTRUSTED,
+        ),
+    )
+
+    ctx = await asyncio.wait_for(agent.run(None), timeout=_TIMEOUT)
+
+    injected = [block for block in ctx.current_traj if block.role == 'user']
+    assert [block.trust for block in injected] == [TrustLevel.UNTRUSTED]
+
+
+async def test_three_injected_messages_keep_arrival_order():
+    """基数 3 且既非升序亦非降序：两条消息挡不住任何排序类变异。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, _ = _agent([ScriptedTurn(content='ok')], gate=gate)
+    await _post(broker, 'beta', 'alpha', 'gamma')
+
+    ctx = await asyncio.wait_for(agent.run(None), timeout=_TIMEOUT)
+
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
+        'beta',
+        'alpha',
+        'gamma',
+    ]
+
+
+async def test_message_injected_fires_per_message_once_that_message_is_in_the_context():
+    """这个切点报告的是既成事实：它在消息**已经**进上下文之后才触发，因此它改不了任何东西。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, hooks = _agent([ScriptedTurn(content='ok')], gate=gate)
+    seen: list[tuple[Any, list[Any]]] = []
+
+    async def record(**kwargs: Any) -> None:
+        message = kwargs['message']
+        assert isinstance(message, Message)
+        seen.append((message.content, [block.content for block in kwargs['ctx'].current_traj]))
+
+    hooks.register(Junction.MESSAGE_INJECTED, record)
+    await _post(broker, 'beta', 'alpha', 'gamma')
+
+    await asyncio.wait_for(agent.run(None), timeout=_TIMEOUT)
+
+    assert seen == [
+        ('beta', ['beta']),
+        ('alpha', ['beta', 'alpha']),
+        ('gamma', ['beta', 'alpha', 'gamma']),
+    ]
+
+
+async def test_each_injected_block_records_the_id_of_its_own_message():
+    """`extra` 是这一块内容的来源事实，审计与 surface 靠 message_id 把它追回那条消息；几块共用
+    一份来源记录，追回去的会是同一条。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, _ = _agent([ScriptedTurn(content='ok')], gate=gate)
+    posted = [
+        Message(sender='user', receiver=_MAILBOX, content=content)
+        for content in ('beta', 'alpha', 'gamma')
+    ]
+    for message in posted:
+        await broker.publish(_MAILBOX, message)
+
+    ctx = await asyncio.wait_for(agent.run(None), timeout=_TIMEOUT)
+
+    injected = [block for block in ctx.current_traj if block.role == 'user']
+    assert [block.extra['message_id'] for block in injected] == [message.id for message in posted]
+    # 改完再读同一个对象：几块共享同一份 extra 时，跨两块比较取值仍然相等，只有改过之后才看得出
+    # 它们本来就是一份。
+    injected[0].extra['message_id'] = 'tampered'
+    assert injected[1].extra['message_id'] == posted[1].id
+
+
+async def test_the_injected_blocks_source_record_carries_the_trigger_as_plain_data():
+    """`extra` 随轨迹持久化，枚举成员走不出序列化出口——与事件 payload 同一条规则。"""
+    control = ControlBlock()
+    gate, broker = await _gate(control)
+    agent, _ = _agent([ScriptedTurn(content='ok')], gate=gate)
+    await broker.publish(
+        _MAILBOX,
+        Message(
+            sender='user',
+            receiver=_MAILBOX,
+            content='look at this once you are free',
+            trigger=Trigger.DEFERRED,
+        ),
+    )
+
+    ctx = await asyncio.wait_for(agent.run(None), timeout=_TIMEOUT)
+
+    injected = [block for block in ctx.current_traj if block.role == 'user']
+    assert [block.extra['trigger'] for block in injected] == ['deferred']
+
+
+async def test_an_empty_query_is_still_a_query_and_not_the_gate_sentinel():
+    """`None` 是「这一轮的输入从门里来」的哨兵，空串不是：按真值判断会把一次空提问静默变成一次
+    唤醒，而模型此后看不到用户确实说过话。"""
+    agent, _ = _agent([ScriptedTurn(content='ok')])
+
+    ctx = await asyncio.wait_for(agent.run(''), timeout=_TIMEOUT)
+
+    assert [(block.role, block.content) for block in ctx.current_traj] == [
+        ('user', ''),
+        ('assistant', 'ok'),
+    ]
+
+
+async def test_run_without_a_query_appends_no_user_block_of_its_own():
+    """`None` 表示「这一轮的输入从门里来」；补一块空 user block 会让模型收到一条没有内容的消息。"""
+    agent, _ = _agent([ScriptedTurn(content='ok')])
+    ctx = await asyncio.wait_for(agent.run(None), timeout=_TIMEOUT)
+    assert _roles(ctx.current_traj) == ['assistant']
+
+
+async def test_run_defaults_to_taking_its_input_from_the_gate():
+    """签名默认值与显式 None 必须同路：事件循环被一条消息唤醒时不带 query。"""
+    agent, _ = _agent([ScriptedTurn(content='ok')])
+    ctx = await asyncio.wait_for(agent.run(), timeout=_TIMEOUT)
+    assert _roles(ctx.current_traj) == ['assistant']
+
+
+async def test_a_gate_attached_after_construction_drives_the_turns():
+    """`Runtime` 只能在构造之后装门：门要按 agent_id 认邮箱，而 agent_id 在构造时才生成。"""
+    control = ControlBlock()
+    gate, _ = await _gate(control)
+    agent, _ = _agent([ScriptedTurn(content='never reached')])
+    agent.attach_gate(gate)
+    control.request_abort()
+
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.ABORTED
+    assert _llm(agent).calls == []
+
+
+@pytest.mark.parametrize('via_constructor', [False, True], ids=['attached', 'constructed'])
+async def test_a_second_gate_is_rejected_however_the_first_one_arrived(via_constructor):
+    """两道门就是两个消费同一个邮箱的人，`consume` 恰好一次，输的那个**静默**收不到消息。构造
+    参数与 attach_gate 是同一件事的两个入口，守卫必须认得两者。"""
+    control = ControlBlock()
+    first, _ = await _gate(control)
+    second, _ = await _gate(control)
+    agent, _ = _agent([ScriptedTurn(content='ok')], gate=first if via_constructor else None)
+    if not via_constructor:
+        agent.attach_gate(first)
+    with pytest.raises(ContractViolation):
+        agent.attach_gate(second)

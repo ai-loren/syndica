@@ -19,7 +19,7 @@ from syndica.kernel.hooks import center as center_module
 _TIMEOUT = 1.0
 
 
-def test_eleven_junctions_exist():
+def test_twelve_junctions_exist():
     """取值撞车会让成员静默塌成别名；切点名计入公开 API。"""
     assert {junction.name: junction.value for junction in Junction} == {
         'AGENT_START': 'agent_start',
@@ -27,6 +27,7 @@ def test_eleven_junctions_exist():
         'AGENT_ERROR': 'agent_error',
         'TURN_START': 'turn_start',
         'TURN_END': 'turn_end',
+        'MESSAGE_INJECTED': 'message_injected',
         'PRE_TOOL_USE': 'pre_tool_use',
         'POST_TOOL_USE': 'post_tool_use',
         'PRE_LLM_REQUEST': 'pre_llm_request',
@@ -52,6 +53,7 @@ def test_each_junction_is_classified_as_declared():
         Junction.AGENT_ERROR,
         Junction.TURN_START,
         Junction.TURN_END,
+        Junction.MESSAGE_INJECTED,
     }
 
 
@@ -596,8 +598,9 @@ def test_declaring_extension_junctions_leaves_the_kernel_classifications_untouch
         Junction.AGENT_ERROR,
         Junction.TURN_START,
         Junction.TURN_END,
+        Junction.MESSAGE_INJECTED,
     }
-    assert len(set(Junction)) == 11
+    assert len(set(Junction)) == 12
 
 
 async def test_a_kernel_junction_in_neither_classification_is_rejected_at_trigger(

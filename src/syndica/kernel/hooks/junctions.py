@@ -29,8 +29,10 @@
 
 两个失败切点的写法相反，不要互换：超窗是「这一轮不该产出东西」，失败是「这一轮的产出由插件顶上」。
 
-本计划只落地单 Agent 一轮所需的枚举切点，其余（agent_spawn / message_injected / 背景任务等）
-随后续计划补齐。
+本计划只落地单 Agent 一轮与控制面所需的枚举切点，其余（agent_spawn / 背景任务等）随后续计划补齐。
+
+`MESSAGE_INJECTED` 是可观察切点：它报告「这条消息已经进上下文了」这个既成事实，改不了任何东西。
+要在消息进上下文**之前**改写它，正确的位置是投递侧而不是这里。
 
 ## 扩展切点
 
@@ -57,6 +59,7 @@ class Junction(Enum):
     AGENT_ERROR = 'agent_error'
     TURN_START = 'turn_start'
     TURN_END = 'turn_end'
+    MESSAGE_INJECTED = 'message_injected'
     PRE_TOOL_USE = 'pre_tool_use'
     POST_TOOL_USE = 'post_tool_use'
     PRE_LLM_REQUEST = 'pre_llm_request'
@@ -83,6 +86,7 @@ OBSERVABLE: frozenset[Junction] = frozenset(
         Junction.AGENT_ERROR,
         Junction.TURN_START,
         Junction.TURN_END,
+        Junction.MESSAGE_INJECTED,
     }
 )
 

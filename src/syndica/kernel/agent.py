@@ -45,6 +45,15 @@ COMPLETED，且 Context 归 Agent 所有，这段坏前缀此后每一次请求�
 事件循环下不需要锁。「什么时候跑、排队、抢占」归 Runtime，「进来的调用满不满足本类的前置条件」归本
 类。
 
+**轮与轮之间有一道门。** spec §5.1 的前三步（中止检查 / 挂起检查 / 消费待处理消息）依赖的状态
+一样都不属于本类——它们归控制面（§4.3）。因此本类只在每轮开头问门一句「还能往下走吗、有什么要
+先看的」，`TurnGate` 之外的一切（注册表、broker、控制块）本类都不认识。没装门时用
+`NullTurnGate`，行为与计划 1 逐字一致。
+
+**`ABORTED` 只从这道门出来。** 它是**协作式**中止落在轮与轮之间的结果，此时轨迹是一致的、可以
+直接 resume；硬取消落在轮中间，可能留下不配对的调用，因此它**不设** `stop_reason`。合并两者会
+毁掉 resume 正需要的那个区分。
+
 **入口修复上一次留下的不配对批次。** 硬取消落在轮中间时，ToolExecutor 按约定不在展开的路上写轨迹
 （见 tool_executor 模块 docstring），于是留下一个声明了 N 个调用、后面不足 N 条结果的 assistant
 block——provider 会拒掉这样的消息。本类是那份 Context 此后唯一的持有者，所以这段修复只能在这里做：
@@ -64,6 +73,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall
+from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
 from syndica.kernel.errors import ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
@@ -323,7 +333,14 @@ class BaseAgent:
     Context 归本对象所有并跨 `run` 存活；取消与失败时 `run` 不返回，轨迹只能从 `context` 读。
     """
 
-    def __init__(self, options: AgentOptions, *, hooks: HooksCenter, events: EventBus) -> None:
+    def __init__(
+        self,
+        options: AgentOptions,
+        *,
+        hooks: HooksCenter,
+        events: EventBus,
+        gate: TurnGate | None = None,
+    ) -> None:
         self.options: AgentOptions = options
         # 全量 uuid4 hex 而非截断：id 撞车不是软失败——AgentRegistry.register 拒绝重复 id，
         # 撞上的那个 Agent 直接注册不进去。
@@ -334,16 +351,45 @@ class BaseAgent:
         self._context = Context()
         self._current_turn = 0
         self._running = False
+        self._gate: TurnGate = gate if gate is not None else NullTurnGate()
+        self._gate_attached = gate is not None
 
     @property
     def context(self) -> Context:
         return self._context
 
+    def attach_gate(self, gate: TurnGate) -> None:
+        """装上控制面的门。
+
+        `Runtime` 只能在这里装：门要按 `agent_id` 认邮箱，而 `agent_id` 在本类构造时才生成，
+        工厂手里没有它。
+
+        已经装过就报错。两道门意味着两个消费同一个邮箱的人，`consume` 恰好一次，因此输的那个会
+        **静默**收不到任何消息——一个只在有人插话时才现身的缺陷。
+        """
+        if self._gate_attached:
+            raise ContractViolation(
+                expected=f'agent {self.agent_id!r} 还没有装过 turn 门',
+                received=f'它已经装了一个 {type(self._gate).__name__}',
+                next_action=(
+                    '一个 Agent 只归一个控制面驱动：要换驱动方就新建一个 Agent 实例。'
+                    '两道门会各自 consume 同一个邮箱，而 consume 恰好一次，输的那个静默收不到消息'
+                ),
+            )
+        self._gate = gate
+        self._gate_attached = True
+
     def get_system_prompt(self) -> str:
         """必须逐轮返回字节一致的结果：SP 变一个字节，该会话此后所有请求缓存全失效。"""
         return self.options.system_prompt
 
-    async def run(self, query: str) -> Context:
+    async def run(self, query: str | None = None) -> Context:
+        """跑一个工作周期。
+
+        `query=None` 表示「这一次的输入从门里来」——事件循环被一条消息唤醒时走的就是这条路，
+        消息由门在第一轮开始前消费并注入。**只有一条消费路径**：中途插话与唤醒用的是同一段代码，
+        两者的行为因此不会分叉。
+        """
         if self._running:
             raise _concurrent_run(self.agent_id)
         # 置位与上面的检查之间没有挂起点，单事件循环下这对操作是原子的。finally 必须包住
@@ -354,11 +400,12 @@ class BaseAgent:
         finally:
             self._running = False
 
-    async def _run(self, query: str) -> Context:
+    async def _run(self, query: str | None) -> Context:
         ctx = self._context
         ctx.stop_reason = None
         _repair_interrupted_batch(ctx)
-        ctx.append(ContextBlock(role='user', content=query))
+        if query is not None:
+            ctx.append(ContextBlock(role='user', content=query))
         await self._emit('agent_start', {})
         await self._hooks.trigger(Junction.AGENT_START, ctx=ctx)
         # Exception 而非 BaseException：取消既不是正常结束也不是失败，展开的路上不再触发切点、
@@ -384,6 +431,14 @@ class BaseAgent:
             else range(self._current_turn + 1, max_turns + 1)
         )
         for turn in turns:
+            # spec §5.1 的第 1–3 步都在计数之前：被中止的一轮不消耗预算，挂起的那段时间也不算
+            # 进任何一轮。
+            decision = await self._gate.before_turn(turn)
+            if decision.abort:
+                ctx.stop_reason = StopReason.ABORTED
+                return StopReason.ABORTED
+            await self._inject(ctx, decision)
+
             self._current_turn = turn
             await self._emit('turn_start', {'turn': turn})
             await self._hooks.trigger(Junction.TURN_START, ctx=ctx, turn=turn)
@@ -403,6 +458,28 @@ class BaseAgent:
             await self._end_turn(ctx, turn, response)
         ctx.stop_reason = StopReason.MAX_TURNS
         return StopReason.MAX_TURNS
+
+    async def _inject(self, ctx: Context, decision: TurnGateDecision) -> None:
+        """把门交来的消息追加成 user block，逐条触发 MESSAGE_INJECTED。
+
+        `trust` 从消息上原样带过来：外部来源的消息经这条路进上下文时仍必须是不可信的
+        （spec §12.2 第 2 条）。`extra` 只记来源事实（谁发的、什么时机），**不带任何展示策略**
+        ——那是 surface 的事（spec §4.5）。
+        """
+        for message in decision.messages:
+            ctx.append(
+                ContextBlock(
+                    role='user',
+                    content=message.content,
+                    trust=message.trust,
+                    extra={
+                        'message_id': message.id,
+                        'sender': message.sender,
+                        'trigger': message.trigger.value,
+                    },
+                )
+            )
+            await self._hooks.trigger(Junction.MESSAGE_INJECTED, ctx=ctx, message=message)
 
     async def _end_turn(self, ctx: Context, turn: int, message: ContextBlock | None) -> None:
         """turn 的可观测数据在 turn_end 切点之后才冻结，切点自身的耗时也计入（spec §5.1）。"""
