@@ -643,6 +643,9 @@ async def test_shutdown_waits_for_every_cancelled_drive_and_leaves_its_cleanup_u
     # 快照取在 shutdown 返回的那一刻：被丢下的任务事件循环转下去照样会跑完。
     tasks = [runtime._table.get_task(agent_id) for agent_id in ids]
     assert [task is not None and task.done() for task in tasks] == [True] * 3
+    # 被取消的驱动任务必须**以取消结束**：吞掉 CancelledError 会让它报告正常完成，取消于是
+    # 停在任务边界内，外层每一个 asyncio.timeout / wait_for 作用域都被击穿。
+    assert [task is not None and task.cancelled() for task in tasks] == [True] * 3
     # 取消可能落在轮的中间，而收尾是一个有状态的动作：它归发起取消的那一方。
     assert [await _status(runtime, agent_id) for agent_id in ids] == [AgentStatus.RUNNING] * 3
     assert broker.removals == []
@@ -802,45 +805,71 @@ async def test_a_resident_loop_runs_one_cycle_per_message_on_the_same_context(
     await runtime.shutdown()
 
 
-async def test_deferred_messages_wait_for_the_whole_cycle_then_start_the_next_one():
+async def test_the_loop_holds_the_in_run_flag_only_while_a_cycle_is_running():
+    """`in_run` 的读者全在后续任务里（`resume` 靠它决定该回到 RUNNING 还是 IDLE）。
+
+    这一对簿记写坏了不会在这里表现成失败，而是让此后**每一次** `resume` 把 Agent 送进错的状态。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    blocker = _Block()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go', exit_mode=ExitMode.IDLE)
+    control = runtime._slots[agent_id].control
+    # create_task 只排队不立刻运行，因此此刻第一个周期一定还没开始。
+    assert control.in_run is False
+
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    assert control.in_run is True
+
+    blocker.release.set()
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+    assert control.in_run is False
+    await runtime.shutdown()
+
+
+async def test_deferred_messages_wait_for_the_rest_of_the_cycle_not_merely_the_next_turn():
     """spec §4.5：DEFERRED 的语义是「先把手上的事做完，然后再看这个」。
 
-    三条而非两条，且顺序既非升序亦非降序，反转后同样两者都不是：在轮中间注入、注入两遍、
-    全部丢掉、以及把暂存队列排一遍序，都必须让这条用例变红。
+    周期跑三轮而非两轮——恰好两轮时「这个周期剩下的部分」与「下一轮」是同一个答案，于是把等待
+    从一个周期降级成一轮的实现照样全绿。消息三条，顺序既非升序亦非降序，反转后同样两者都不是。
     """
     runtime = Runtime()
-    blocker = _Block()
+    gate = _Gate(2)
     llm = ScriptedLLM(
         [
-            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Block', arguments='{}')]),
+            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Gate', arguments='{}')]),
+            ScriptedTurn(tool_calls=[ToolCall(id='c2', name='Gate', arguments='{}')]),
             ScriptedTurn(content='first cycle done'),
             ScriptedTurn(content='second cycle done'),
         ]
     )
-    agent_id = await runtime.spawn(_factory(llm, tools={'Block': blocker}), query='go')
-    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    agent_id = await runtime.spawn(_factory(llm, tools={'Gate': gate}), query='go')
+    await asyncio.wait_for(gate.entered[0].wait(), _TIMEOUT)
     for content in ('bravo', 'alpha', 'charlie'):
         assert (await runtime.send(agent_id, content, trigger=Trigger.DEFERRED)).ok is True
-    blocker.release.set()
+
+    # 放行第一个停点：第二轮的门把三条挪进暂存，随后停在第二个停点上——此时这个周期还剩第三轮。
+    gate.release[0].set()
+    await asyncio.wait_for(gate.entered[1].wait(), _TIMEOUT)
+    control = runtime._slots[agent_id].control
+    assert control.deferred_count == 3
+
+    gate.release[1].set()
     ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
 
-    assert [block.role for block in ctx.current_traj] == [
-        'user',
-        'assistant',
-        'tool',
-        'assistant',
-        'user',
-        'user',
-        'user',
-        'assistant',
+    assert [(block.role, block.content) for block in ctx.current_traj] == [
+        ('user', 'go'),
+        ('assistant', None),
+        ('tool', 'released 0'),
+        ('assistant', None),
+        ('tool', 'released 1'),
+        ('assistant', 'first cycle done'),
+        ('user', 'bravo'),
+        ('user', 'alpha'),
+        ('user', 'charlie'),
+        ('assistant', 'second cycle done'),
     ]
-    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
-        'go',
-        'bravo',
-        'alpha',
-        'charlie',
-    ]
-    assert ctx.current_traj[-1].content == 'second cycle done'
+    assert control.deferred_count == 0
     await runtime.shutdown()
 
 
