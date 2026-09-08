@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
@@ -31,6 +32,16 @@ _SYSTEM_PROMPT = 'You are a worker.'
 _TOOL_NAMES = ['Echo', 'Upper', 'Concat']
 # 分隔符带前导空格：DeliveryResult.reason 是单行三件套，不带空格会匹配到被嵌进去的另一份。
 _THREE_PART: tuple[str, ...] = ('期望: ', ' 实际: ', ' 下一步: ')
+# 五个子代跨两代。广度优先的答案（bravo / alpha / charlie / delta / echo）与深度优先
+# （bravo / delta / alpha / echo / charlie）、升序、降序、以及这四者的反转全都互不相同。
+_TREE: tuple[tuple[str, str | None], ...] = (
+    ('root', None),
+    ('bravo', 'root'),
+    ('alpha', 'root'),
+    ('charlie', 'root'),
+    ('delta', 'bravo'),
+    ('echo', 'alpha'),
+)
 
 
 class _Echo(Tool):
@@ -99,17 +110,22 @@ class _RecordingRegistry:
 
     `hold_before` 把「转去某个状态」的 CAS 停在 `switches` 这道闸上：`_finish` 摘完队列、还没
     转 ZOMBIE 的那一刻，在 Runtime 外面没有别的观测点。
+
+    `deny_for` 把拒绝收窄到一个 agent。递归操作对「被点名的那一个」与「遍历到的子代」处理不同，
+    而只按 (expected, new) 拒绝会同时打中两者，那条子代分支于是永远走不到。
     """
 
     def __init__(
         self,
         *,
         deny: tuple[AgentStatus, AgentStatus] | None = None,
+        deny_for: str | None = None,
         hold_before: AgentStatus | None = None,
     ) -> None:
         self._inner = InMemoryAgentRegistry()
         self._deny = deny
         self._hold_before = hold_before
+        self.deny_for = deny_for
         self.switches = _Hold()
         self.transitions: list[tuple[str, AgentStatus, AgentStatus]] = []
         self.applied: list[tuple[str, AgentStatus, AgentStatus]] = []
@@ -126,7 +142,7 @@ class _RecordingRegistry:
         if new is self._hold_before:
             await self.switches.passing(agent_id)
         self.transitions.append((agent_id, expected, new))
-        if self._deny == (expected, new):
+        if self._deny == (expected, new) and self.deny_for in (None, agent_id):
             return False
         applied = await self._inner.compare_and_set_status(agent_id, expected=expected, new=new)
         if applied:
@@ -311,6 +327,51 @@ class _HeldBroker:
         self._inner.off_missing_queue(cb)
 
 
+class _LoopingRegistry:
+    """`children_of` 报出一个环，并给遍历的提问次数设上界。
+
+    环是远端注册表的真实可能：条目可以被别的进程写过。上界不能用 `asyncio.wait_for` 给——环里
+    的 `children_of` 从不挂起，取消永远送不到，那个超时作用域整个被击穿。
+    """
+
+    def __init__(self, children: dict[str, list[str]], *, budget: int = 16) -> None:
+        self._children = children
+        self._budget = budget
+        self._inner = InMemoryAgentRegistry()
+        self.asked: list[str] = []
+
+    async def register(self, info: AgentInfo) -> None:
+        await self._inner.register(info)
+
+    async def get(self, agent_id: str) -> AgentInfo | None:
+        return await self._inner.get(agent_id)
+
+    async def compare_and_set_status(
+        self, agent_id: str, *, expected: AgentStatus, new: AgentStatus
+    ) -> bool:
+        return await self._inner.compare_and_set_status(agent_id, expected=expected, new=new)
+
+    async def update(self, agent_id: str, **fields: Any) -> None:
+        await self._inner.update(agent_id, **fields)
+
+    async def children_of(self, agent_id: str) -> list[str]:
+        self.asked.append(agent_id)
+        if len(self.asked) > self._budget:
+            raise AssertionError(
+                f'children_of 已被问了 {len(self.asked)} 次，超过上界 {self._budget}：'
+                '遍历没有在环上收敛'
+            )
+        return list(self._children.get(agent_id, []))
+
+    async def list(
+        self, *, status: AgentStatus | None = None, parent_id: str | None = None
+    ) -> list[AgentInfo]:
+        return await self._inner.list(status=status, parent_id=parent_id)
+
+    async def unregister(self, agent_id: str) -> None:
+        await self._inner.unregister(agent_id)
+
+
 def _tools() -> dict[str, Tool]:
     return {'Echo': _Echo(), 'Upper': _Upper(), 'Concat': _Concat()}
 
@@ -395,6 +456,29 @@ async def _mailbox_exists(broker: InMemoryMessageBroker, agent_id: str) -> bool:
         agent_id, Message(sender='probe', receiver=agent_id, content='probe')
     )
     return result.ok
+
+
+async def _register_tree(registry: AgentRegistry) -> None:
+    for agent_id, parent_id in _TREE:
+        await registry.register(
+            AgentInfo(agent_id=agent_id, name=agent_id, agent_type='BaseAgent', parent_id=parent_id)
+        )
+
+
+async def _resident(runtime: Runtime, broker: _SpyBroker, *, parent_id: str | None = None) -> str:
+    """起一个常驻 Agent，等它真的停在邮箱上。脚本给足三轮，够本文件里任何一个用例用。
+
+    握手用入园而不是「注册表里是 IDLE」：刚注册、驱动任务还没跑起来时状态也是 IDLE，拿它当信号
+    会让 pause 赶在接管之前写掉状态，IDLE -> RUNNING 于是被拒——这个 Agent 从头到尾没有事件循环，
+    而后面每一条断言看上去都还成立。
+    """
+    agent_id = await runtime.spawn(
+        _factory(ScriptedLLM([ScriptedTurn(content=f'turn-{index}') for index in range(3)])),
+        exit_mode=ExitMode.IDLE,
+        parent_id=parent_id,
+    )
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+    return agent_id
 
 
 async def test_spawn_gives_each_agent_its_own_id_and_registry_entry():
@@ -1883,3 +1967,444 @@ async def test_suppressing_activation_reaches_the_runtime_that_actually_holds_th
     assert caplog.records == []
     await peer.shutdown()
     await owner.shutdown()
+
+
+async def test_descendants_lists_every_generation_breadth_first_and_never_the_named_agent():
+    """pause / abort / despawn 三条路的公共前置：浅的在前，被点名的那一个不在其中。"""
+    runtime = Runtime()
+    await _register_tree(runtime.registry)
+
+    assert await runtime._descendants('root') == ['bravo', 'alpha', 'charlie', 'delta', 'echo']
+    # 从被点名的那一个出发，不是从树根出发。
+    assert await runtime._descendants('bravo') == ['delta']
+    assert await runtime._descendants('echo') == []
+    assert await runtime._descendants('nope') == []
+    await runtime.shutdown()
+
+
+async def test_descendants_converges_on_a_registry_that_reports_a_cycle():
+    """`visited` 不是防御性编程：注册表可以是远端的、可以被别的进程写过。
+
+    每个节点恰好被问一次正是 `visited` 的职责；少了它，这个遍历在环上永不返回，而三条控制面
+    路径都要先经过它。
+    """
+    registry = _LoopingRegistry(
+        {
+            'root': ['bravo'],
+            'bravo': ['alpha', 'root'],
+            'alpha': ['charlie', 'bravo'],
+            'charlie': ['alpha'],
+        }
+    )
+    runtime = Runtime(registry=registry)
+
+    assert await runtime._descendants('root') == ['bravo', 'alpha', 'charlie']
+
+    assert registry.asked == ['root', 'bravo', 'alpha', 'charlie']
+    await runtime.shutdown()
+
+
+async def test_a_paused_agent_does_not_consume_its_next_message_and_resume_does_not_lose_it():
+    """门坐在「有消息」与「取走消息」之间：醒来照常 consume 的话，resume 之后它已经不在了。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    agent_id = await _resident(runtime, broker)
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    control = runtime._slots[agent_id].control
+
+    await runtime.pause(agent_id)
+    assert (await runtime.send(agent_id, 'arrived while paused')).ok is True
+    assert await control.wait_until_parked(_TIMEOUT) is True
+    assert agent.context.current_traj == []
+
+    await runtime.resume(agent_id)
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+
+    assert [(block.role, block.content) for block in agent.context.current_traj] == [
+        ('user', 'arrived while paused'),
+        ('assistant', 'turn-0'),
+    ]
+    # 恰好一次：邮箱现在是空的，那条消息既没丢也没被注入两遍。
+    assert await broker.consume(agent_id) == []
+    await runtime.shutdown()
+
+
+async def test_pause_and_resume_are_both_idempotent_on_an_agent_between_cycles():
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await _resident(runtime, broker)
+    control = runtime._slots[agent_id].control
+
+    await runtime.pause(agent_id)
+    await runtime.pause(agent_id)
+    assert await _status(runtime, agent_id) is AgentStatus.PAUSED
+    assert control.paused is True
+
+    await runtime.resume(agent_id)
+    await runtime.resume(agent_id)
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    assert control.paused is False
+
+    # 周期之间挂起的那个回 IDLE，不回 RUNNING；第二次的后置条件已成立，走的是 new -> new。
+    assert registry.applied_of(agent_id) == [
+        (AgentStatus.IDLE, AgentStatus.RUNNING),
+        (AgentStatus.RUNNING, AgentStatus.IDLE),
+        (AgentStatus.IDLE, AgentStatus.PAUSED),
+        (AgentStatus.PAUSED, AgentStatus.PAUSED),
+        (AgentStatus.PAUSED, AgentStatus.IDLE),
+        (AgentStatus.IDLE, AgentStatus.IDLE),
+    ]
+    await runtime.shutdown()
+
+
+async def test_pausing_an_agent_inside_a_turn_returns_at_once_and_stops_it_at_the_next_boundary():
+    """「已请求挂起」与「真的停下来了」是两件事：turn 循环可能正卡在一次模型调用里。
+
+    挂起的那段时间不计入任何一轮——门在计数之前，所以这一轮既不会被切成两半，也不多花一次调用。
+    """
+    registry = _RecordingRegistry()
+    runtime = Runtime(registry=registry)
+    blocker = _Block()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go')
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    control = runtime._slots[agent_id].control
+
+    await runtime.pause(agent_id)
+
+    assert await _status(runtime, agent_id) is AgentStatus.PAUSED
+    assert control.parked == 0
+
+    blocker.release.set()
+    assert await control.wait_until_parked(_TIMEOUT) is True
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert [block.role for block in agent.context.current_traj] == ['user', 'assistant', 'tool']
+
+    await runtime.resume(agent_id)
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert [(block.role, block.content) for block in ctx.current_traj] == [
+        ('user', 'go'),
+        ('assistant', None),
+        ('tool', 'released'),
+        ('assistant', 'done'),
+    ]
+    # 在一次 run() 之内挂起就回 RUNNING：注册表上不记「挂起之前是什么」，控制块说了算。
+    assert registry.applied_of(agent_id) == [
+        (AgentStatus.IDLE, AgentStatus.RUNNING),
+        (AgentStatus.RUNNING, AgentStatus.RUNNING),
+        (AgentStatus.RUNNING, AgentStatus.PAUSED),
+        (AgentStatus.PAUSED, AgentStatus.RUNNING),
+        (AgentStatus.RUNNING, AgentStatus.ZOMBIE),
+    ]
+    await runtime.shutdown()
+
+
+async def test_pausing_a_zombie_is_refused_and_leaves_it_revivable():
+    """ZOMBIE 的注册表状态正是 `ensure_active` 复活它的凭据；写上 PAUSED 它就再也叫不醒。"""
+    runtime = Runtime()
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    agent_id = await runtime.spawn(_factory(llm), query='go')
+    await runtime.wait(agent_id)
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+
+    with pytest.raises(ContractViolation) as excinfo:
+        await runtime.pause(agent_id)
+
+    assert agent_id in excinfo.value.expected
+    assert AgentStatus.ZOMBIE.value in excinfo.value.received
+    assert runtime._slots[agent_id].control.paused is False
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+
+    assert (await runtime.send(agent_id, 'keep going')).ok is True
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert [block.content for block in ctx.current_traj if block.role == 'assistant'] == [
+        'first',
+        'second',
+    ]
+    await runtime.shutdown()
+
+
+async def test_pausing_an_agent_that_is_winding_down_is_refused():
+    """ABORTING 正在收尾，挂起一个正在拆的东西没有可表达的意图。"""
+    registry = _RecordingRegistry()
+    runtime = Runtime(registry=registry)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await runtime.wait(agent_id)
+    assert await registry.compare_and_set_status(
+        agent_id, expected=AgentStatus.ZOMBIE, new=AgentStatus.ABORTING
+    )
+
+    with pytest.raises(ContractViolation) as excinfo:
+        await runtime.pause(agent_id)
+
+    assert AgentStatus.ABORTING.value in excinfo.value.received
+    assert runtime._slots[agent_id].control.paused is False
+    assert await _status(runtime, agent_id) is AgentStatus.ABORTING
+    await runtime.shutdown()
+
+
+async def test_each_control_operation_names_itself_when_it_refuses_an_unknown_agent():
+    """裸 KeyError 违反错误三件套；而说错了操作名，调用方会去查另一条路径。"""
+    runtime = Runtime()
+
+    with pytest.raises(ContractViolation) as paused:
+        await runtime.pause('nope')
+    with pytest.raises(ContractViolation) as resumed:
+        await runtime.resume('nope')
+
+    assert 'pause' in paused.value.expected
+    assert 'resume' in resumed.value.expected
+    assert 'nope' in paused.value.expected and 'nope' in resumed.value.expected
+    assert paused.value.next_action == resumed.value.next_action
+    await runtime.shutdown()
+
+
+async def test_pause_tells_an_unknown_agent_apart_from_one_another_process_holds():
+    """两种「取不到」的下一步动作不同：一个要重新 spawn，一个要去持有它的进程上操作。"""
+    broker = _SpyBroker()
+    owner = Runtime(broker=broker)
+    agent_id = await _resident(owner, broker)
+    peer = Runtime(registry=owner.registry, broker=owner.broker)
+
+    with pytest.raises(ContractViolation) as unknown:
+        await peer.pause('nope')
+    with pytest.raises(ContractViolation) as not_mine:
+        await peer.pause(agent_id)
+
+    assert 'nope' in unknown.value.expected
+    assert agent_id in not_mine.value.expected
+    assert unknown.value.received != not_mine.value.received
+    # 作用在错的主体上：peer 既不该按住持有者的 Agent，也不该改它的状态。
+    assert await _status(owner, agent_id) is AgentStatus.IDLE
+    assert owner._slots[agent_id].control.paused is False
+    await peer.shutdown()
+    await owner.shutdown()
+
+
+async def test_recursive_pause_reaches_every_descendant_and_nothing_outside_the_subtree():
+    """六个 Agent 跨三代，另有一个不在这棵树上：按住整个 Runtime 与按住一棵子树都能让树内全绿。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    root = await _resident(runtime, broker)
+    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+    delta = await _resident(runtime, broker, parent_id=bravo)
+    echo = await _resident(runtime, broker, parent_id=alpha)
+    outsider = await _resident(runtime, broker)
+
+    await runtime.pause(root, recursive=True)
+
+    tree = (root, bravo, alpha, charlie, delta, echo)
+    assert [await _status(runtime, agent_id) for agent_id in tree] == [AgentStatus.PAUSED] * 6
+    assert [runtime._slots[agent_id].control.paused for agent_id in tree] == [True] * 6
+
+    assert await _status(runtime, outsider) is AgentStatus.IDLE
+    assert runtime._slots[outsider].control.paused is False
+    assert (await runtime.send(outsider, 'go ahead')).ok is True
+    await asyncio.wait_for(broker.reach(outsider, 2), _TIMEOUT)
+    outside_agent = runtime._table.get(outsider)
+    assert outside_agent is not None
+    assert [block.content for block in outside_agent.context.current_traj] == [
+        'go ahead',
+        'turn-0',
+    ]
+    await runtime.shutdown()
+
+
+async def test_recursive_pause_goes_parent_first_while_recursive_resume_goes_children_first():
+    """方向不是对称性：pause 先掐掉还会生出新子代的那一头，resume 先让子代就位。
+
+    父恢复之后可能立刻要用子代，先恢复子代，它就不会看见一棵只恢复了一半的树。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    root = await _resident(runtime, broker)
+    bravo, alpha, charlie = [await _resident(runtime, broker, parent_id=root) for _ in range(3)]
+    delta = await _resident(runtime, broker, parent_id=bravo)
+
+    await runtime.pause(root, recursive=True)
+    await runtime.resume(root, recursive=True)
+
+    assert [agent_id for agent_id, _, new in registry.applied if new is AgentStatus.PAUSED] == [
+        root,
+        bravo,
+        alpha,
+        charlie,
+        delta,
+    ]
+    assert [
+        agent_id
+        for agent_id, expected, new in registry.applied
+        if expected is AgentStatus.PAUSED and new is AgentStatus.IDLE
+    ] == [delta, charlie, alpha, bravo, root]
+    assert [
+        await _status(runtime, agent_id) for agent_id in (root, bravo, alpha, charlie, delta)
+    ] == [AgentStatus.IDLE] * 5
+    await runtime.shutdown()
+
+
+async def test_recursive_resume_hands_every_descendant_back_its_own_pending_message():
+    """恢复是逐个 Agent 的：共用一个控制块时，抬一次门会把整棵树一起放走。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    root = await _resident(runtime, broker)
+    bravo, alpha = [await _resident(runtime, broker, parent_id=root) for _ in range(2)]
+    delta = await _resident(runtime, broker, parent_id=bravo)
+    await runtime.pause(root, recursive=True)
+
+    plan = {root: 'for root', bravo: 'for bravo', alpha: 'for alpha', delta: 'for delta'}
+    for agent_id, content in plan.items():
+        assert (await runtime.send(agent_id, content)).ok is True
+        assert await runtime._slots[agent_id].control.wait_until_parked(_TIMEOUT) is True
+
+    await runtime.resume(root, recursive=True)
+
+    for agent_id, content in plan.items():
+        await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+        agent = runtime._table.get(agent_id)
+        assert agent is not None
+        assert [block.content for block in agent.context.current_traj] == [content, 'turn-0']
+    await runtime.shutdown()
+
+
+async def test_a_descendant_that_cannot_be_paused_is_skipped_without_stopping_the_walk(
+    caplog: pytest.LogCaptureFixture,
+):
+    """递归是尽力而为的：为第一个冲突抛异常只会留下一棵改了一半的树。"""
+    caplog.set_level(logging.INFO)
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    root = await _resident(runtime, broker)
+    finished = await runtime.spawn(_factory(_done()), query='go', parent_id=root)
+    await runtime.wait(finished)
+    still_running = await _resident(runtime, broker, parent_id=root)
+
+    await runtime.pause(root, recursive=True)
+
+    assert await _status(runtime, finished) is AgentStatus.ZOMBIE
+    assert [await _status(runtime, agent_id) for agent_id in (root, still_running)] == [
+        AgentStatus.PAUSED,
+        AgentStatus.PAUSED,
+    ]
+    assert runtime._slots[finished].control.paused is False
+
+    assert [record.levelname for record in caplog.records] == ['INFO']
+    skipped = caplog.records[0].getMessage()
+    assert 'pause' in skipped
+    assert finished in skipped
+    assert AgentStatus.ZOMBIE.value in skipped
+    assert root not in skipped and still_running not in skipped
+    await runtime.shutdown()
+
+
+async def test_a_descendant_whose_transition_is_refused_is_skipped_without_stopping_the_walk(
+    caplog: pytest.LogCaptureFixture,
+):
+    """CAS 失败按同一条规则处理：子代只记日志，遍历继续走到后面那些。"""
+    caplog.set_level(logging.INFO)
+    registry = _RecordingRegistry(deny=(AgentStatus.IDLE, AgentStatus.PAUSED))
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    root = await _resident(runtime, broker)
+    refused = await _resident(runtime, broker, parent_id=root)
+    later = await _resident(runtime, broker, parent_id=root)
+    registry.deny_for = refused
+
+    await runtime.pause(root, recursive=True)
+
+    assert [await _status(runtime, agent_id) for agent_id in (root, refused, later)] == [
+        AgentStatus.PAUSED,
+        AgentStatus.IDLE,
+        AgentStatus.PAUSED,
+    ]
+    assert runtime._slots[refused].control.paused is False
+    assert [record.levelname for record in caplog.records] == ['INFO']
+    skipped = caplog.records[0].getMessage()
+    assert refused in skipped
+    assert root not in skipped and later not in skipped
+    await runtime.shutdown()
+
+
+async def test_a_pause_the_registry_refuses_is_reported_and_parks_nothing():
+    """记不下 PAUSED 就不要真的停——那会停在一个谁都看不见的地方，而调用方以为按住了它。"""
+    registry = _RecordingRegistry(deny=(AgentStatus.IDLE, AgentStatus.PAUSED))
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await _resident(runtime, broker)
+    child = await _resident(runtime, broker, parent_id=agent_id)
+    registry.deny_for = agent_id
+
+    with pytest.raises(ContractViolation) as excinfo:
+        await runtime.pause(agent_id, recursive=True)
+
+    assert agent_id in excinfo.value.expected
+    assert runtime._slots[agent_id].control.paused is False
+    # 父先于子：被点名的那一个抛出来时，这棵树还没被走过。
+    assert await _status(runtime, child) is AgentStatus.IDLE
+    assert runtime._slots[child].control.paused is False
+
+    assert (await runtime.send(agent_id, 'still working')).ok is True
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert [block.content for block in agent.context.current_traj] == ['still working', 'turn-0']
+    await runtime.shutdown()
+
+
+async def test_a_resume_the_registry_refuses_still_lifts_the_gate(
+    caplog: pytest.LogCaptureFixture,
+):
+    """只有 pause / resume 能抬门，所以记不下就不抬会把它永久停在门上。
+
+    一个过时的状态可以用 find() 重读，一个没人能抬起的门谁都救不回来。
+    """
+    caplog.set_level(logging.INFO)
+    registry = _RecordingRegistry(deny=(AgentStatus.PAUSED, AgentStatus.IDLE))
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await _resident(runtime, broker)
+    control = runtime._slots[agent_id].control
+    await runtime.pause(agent_id)
+    assert (await runtime.send(agent_id, 'arrived while paused')).ok is True
+    assert await control.wait_until_parked(_TIMEOUT) is True
+
+    await runtime.resume(agent_id)
+
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert [block.content for block in agent.context.current_traj] == [
+        'arrived while paused',
+        'turn-0',
+    ]
+    assert control.paused is False
+    assert [record.levelname for record in caplog.records] == ['INFO']
+    assert caplog.records[0].args == (agent_id, AgentStatus.IDLE.value)
+    _assert_three_part(caplog.records[0].getMessage())
+    await runtime.shutdown()
+
+
+async def test_resuming_an_agent_that_was_never_paused_leaves_it_where_it_is():
+    """后置条件已经成立，所以它成功；而它不得把一个从没被挂起的 Agent 挪到别的状态上。"""
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await _resident(runtime, broker)
+
+    await runtime.resume(agent_id)
+
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    assert runtime._slots[agent_id].control.paused is False
+    assert (await runtime.send(agent_id, 'go ahead')).ok is True
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+    assert registry.applied_of(agent_id) == [
+        (AgentStatus.IDLE, AgentStatus.RUNNING),
+        (AgentStatus.RUNNING, AgentStatus.IDLE),
+        (AgentStatus.IDLE, AgentStatus.IDLE),
+        (AgentStatus.IDLE, AgentStatus.RUNNING),
+        (AgentStatus.RUNNING, AgentStatus.IDLE),
+    ]
+    await runtime.shutdown()

@@ -40,6 +40,11 @@ compare-and-set」，而那次真的丢失的转换零痕迹。
 本类持有的每一份 Context 都对应一个仍可寻址的 Agent，随时间无界增长的只有活着的 Agent 数。代价
 写在 `wait` 的契约里：被 reap 的 Agent 没有 waitpid 可言。
 
+**递归的控制面操作对被点名的那一个抛，对遍历到的子代只记日志。** 子代可能是 ZOMBIE、可能正在
+被拆，为第一个冲突抛异常只会留下一棵改了一半的树，而调用方无从得知改到哪了；被点名的那一个意图
+无歧义，照常抛。CAS 失败同样按这条处理。遍历（`_descendants`）广度优先且带环保护——注册表可以是
+远端的，一个环会让这个公共前置永不返回。
+
 **激活只有一个入口。** 复活 ZOMBIE、重开事件循环、日后的「从落盘会话恢复」在语义上是同一件事，
 因此都走 `ensure_active`；`send` 的按需激活经 broker 的 `on_missing_queue` 回到同一个方法。让每个
 调用方自己「先判断再激活」会让复活有 N 份实现。**判定「它已经活着」看驱动任务，不看注册表状态**：
@@ -502,6 +507,154 @@ class Runtime:
         if self._has_live_driver(agent_id):
             return False
         return await self.ensure_active(agent_id)
+
+    async def pause(self, agent_id: str, *, recursive: bool = False) -> None:
+        """挂起：让它在下一个轮的边界上停下来（spec §5.1 第 2 步），注册表转成 PAUSED。
+
+        挂起的那段时间**不计入任何一轮**——门在计数之前，因此挂起既不消耗预算，也不会把一轮切成
+        两半。**返回不等于它已经停下来**：turn 循环可能正卡在一次 LLM 调用里，「真的停了」只有
+        `ControlBlock.parked` 答得出。
+
+        允许从 IDLE / RUNNING / WAITING 进入；已经是 PAUSED 是成功（后置条件已成立）。ZOMBIE 与
+        ABORTING 报错：前者没有事件循环可停，而它的注册表状态正是 `ensure_active` 复活它的凭据，
+        写上 PAUSED 它就再也叫不醒；后者正在收尾，挂起一个正在拆的东西没有可表达的意图。
+
+        `recursive=True` 时**父先于子**：先让父停下来，它才不会在我们走这棵树的时候再生出新的
+        子代。
+        """
+        await self._pause_one(agent_id, named=True)
+        if recursive:
+            for descendant in await self._descendants(agent_id):
+                await self._pause_one(descendant, named=False)
+
+    async def resume(self, agent_id: str, *, recursive: bool = False) -> None:
+        """解除挂起，注册表从 PAUSED 转回它该在的地方。
+
+        **回到哪里由控制块说了算**：它在一次 `run()` 之内就回 RUNNING，否则回 IDLE。只有持有
+        事件循环的进程知道这件事，而注册表上没有「挂起之前是什么」——记一份就多出一个必须与真相
+        保持一致的东西，且它在挂起期间还会被 `wait_for` 改。
+
+        **门无条件抬起，注册表那一步尽力而为。** 只有本组方法抬得起这道门，因此「记不下就不抬」
+        会把这个 Agent 永久停在门上；过时的状态可以用 `find` 重读，没人能抬起的门谁都救不回来。
+
+        `recursive=True` 时**子先于父**：父恢复之后可能立刻要用子代，先恢复子代，它就不会看见
+        一棵只恢复了一半的树。
+        """
+        if recursive:
+            for descendant in reversed(await self._descendants(agent_id)):
+                await self._resume_one(descendant, named=False)
+        await self._resume_one(agent_id, named=True)
+
+    async def _pause_one(self, agent_id: str, *, named: bool) -> None:
+        slot, info = await self._control_target('pause', agent_id, named=named)
+        if slot is None or info is None:
+            return
+        if info.status in (AgentStatus.ZOMBIE, AgentStatus.ABORTING):
+            self._refuse_control(
+                'pause',
+                agent_id,
+                named=named,
+                received=f'它当前是 {info.status.value}',
+                next_action=(
+                    'zombie 没有事件循环可停，而它的注册表状态正是复活它的凭据；'
+                    'aborting 正在收尾。要让它彻底不再被叫醒就用 despawn'
+                ),
+            )
+            return
+        # 先落注册表再落门：记不下 PAUSED 就不要真的停——那会停在一个谁都看不见的地方。
+        if not await self._switch(
+            agent_id,
+            new=AgentStatus.PAUSED,
+            allowed=(AgentStatus.IDLE, AgentStatus.RUNNING, AgentStatus.WAITING),
+        ):
+            self._refuse_control(
+                'pause',
+                agent_id,
+                named=named,
+                received='转到 paused 的 CAS 被拒，它的状态刚刚被别人改过',
+                next_action='用 find() 重读它的状态再决定；不要在读到的旧状态上重试',
+            )
+            return
+        slot.control.pause()
+
+    async def _resume_one(self, agent_id: str, *, named: bool) -> None:
+        slot, info = await self._control_target('resume', agent_id, named=named)
+        if slot is None or info is None:
+            return
+        slot.control.resume()
+        back_to = AgentStatus.RUNNING if slot.control.in_run else AgentStatus.IDLE
+        if not await self._switch(agent_id, new=back_to, allowed=(AgentStatus.PAUSED,)):
+            logger.info(
+                '期望: agent %s 在注册表里是 paused，可由本进程转回 %s。'
+                ' 实际: 这次 CAS 被拒，它此刻不是 paused——'
+                '它可能已经自己往下走了，也可能状态归了别人。'
+                ' 下一步: 门已经抬起，这个 Agent 可以继续跑；'
+                '用 find() 重读它的状态，不要在读到的旧状态上重试。',
+                agent_id,
+                back_to.value,
+            )
+
+    async def _control_target(
+        self, operation: str, agent_id: str, *, named: bool
+    ) -> tuple[_Slot | None, AgentInfo | None]:
+        """取出控制面操作的目标；取不到时按 named 决定抛还是记日志。"""
+        slot = self._slots.get(agent_id)
+        info = await self.registry.get(agent_id)
+        if slot is not None and info is not None:
+            return slot, info
+        self._refuse_control(
+            operation,
+            agent_id,
+            named=named,
+            received=(
+                '注册表里没有这个条目' if info is None else '本进程没有它的实例——它由别的进程持有'
+            ),
+            next_action=(
+                '确认 agent_id 是 spawn 的返回值；'
+                '被 despawn 或以 ExitMode.EXIT 结束的 Agent 已被销毁，只能重新 spawn。'
+                '若它由其他进程持有，在那个进程上操作它'
+            ),
+        )
+        return None, None
+
+    def _refuse_control(
+        self, operation: str, agent_id: str, *, named: bool, received: str, next_action: str
+    ) -> None:
+        """点名的目标抛异常，遍历到的子代只记日志。"""
+        if not named:
+            logger.info(
+                '%s 跳过子代 %s：%s。这是尽力而为的遍历，不因此中断。',
+                operation,
+                agent_id,
+                received,
+            )
+            return
+        raise ContractViolation(
+            expected=f'agent {agent_id!r} 处在可以 {operation} 的状态',
+            received=received,
+            next_action=next_action,
+        )
+
+    async def _descendants(self, agent_id: str) -> list[str]:
+        """广度优先列出全部子代，浅的在前。
+
+        `visited` 不是防御性编程：`children_of` 读的是注册表，而注册表可以是远端的、可以被别的
+        进程写过；一个环会让这个遍历永不返回，而它是 pause / abort / despawn 三条路的公共前置。
+        """
+        found: list[str] = []
+        visited = {agent_id}
+        frontier = [agent_id]
+        while frontier:
+            following: list[str] = []
+            for parent in frontier:
+                for child in await self.registry.children_of(parent):
+                    if child in visited:
+                        continue
+                    visited.add(child)
+                    found.append(child)
+                    following.append(child)
+            frontier = following
+        return found
 
     async def find(self, agent_id: str) -> AgentInfo | None:
         """只读路径，绝不激活任何 Agent。"""
