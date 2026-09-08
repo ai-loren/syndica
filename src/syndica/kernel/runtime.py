@@ -50,6 +50,12 @@ children 上摘掉、不动自己的子代，于是删掉一个有子代的父�
 到（`children_of` 只能从父往下问）。钉住期间 `spawn` 拒绝往树上挂新子代、`ensure_active` 拒绝复活
 树里的节点——后者若放行，复活出来的驱动会在条目被摘掉时失去句柄，成为永不被取消的孤儿。
 
+**钉住按「一次调用」计，不是进程级的一个开关。** 同一个节点可以同时落在多条在飞级联的钉住范围里
+（拆除中途重入的 hook、两次重叠的 `despawn`、`ExitMode.EXIT` 撞上一次外部 `despawn`），而释放写在
+`finally` 里、因此**一个节点都没拆就退出时照样执行**。无条件释放于是会撤掉别人放上去的那一份：这棵
+树重新开放挂子代，而新子代不在别人早已冻结好的拆除名单里，它的 `parent_id` 永久指向一个已被注销
+的父。
+
 **`_slots` 的键恒为实例表键的子集。** EXIT 把队列、注册表条目、实例表条目与 slot 一起摘掉，于是
 本类持有的每一份 Context 都对应一个仍可寻址的 Agent，随时间无界增长的只有活着的 Agent 数。代价
 写在 `wait` 的契约里：被 reap 的 Agent 没有 waitpid 可言。
@@ -79,7 +85,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -204,7 +210,10 @@ class Runtime:
         # 此刻有收尾在飞的 Agent。一个 Agent 同时只有一次收尾：两次并发的收尾会各自走一遍级联，
         # 而它们在拆同一个节点时都会先看到「它还在」，于是同一个 Agent 被报两遍 despawn。
         self._reaping: set[str] = set()
-        self._doomed: set[str] = set()
+        # 「正在被拆的那些条目」→ **有几条在飞的级联把它钉住了**。计数而不是集合：一个节点可以
+        # 同时落在多条级联的钉住范围里，而释放必须只撤掉本次调用自己放上去的那一份（理由见模块
+        # 文档）。成员判定仍是 `agent_id in self._doomed`。
+        self._doomed: dict[str, int] = {}
         self._closed = False
         # 「队列不存在」是懒启动与 ZOMBIE 复活的唯一触发点（spec §4.4）。接在这里，而不是让每个
         # 调用方自己先判断再激活——那样「复活」就有了 N 份实现。
@@ -763,14 +772,14 @@ class Runtime:
         """
         descendants: list[str] = []
         seen = {agent_id}
-        self._doomed.add(agent_id)
+        self._pin(seen)
         try:
             while fresh := [
                 found for found in await self._descendants(agent_id) if found not in seen
             ]:
                 seen.update(fresh)
                 descendants.extend(fresh)
-                self._doomed.update(fresh)
+                self._pin(fresh)
             # 抛在动手之前：等自己就是永久挂死，而半棵拆掉的树没有人能收拾。
             for descendant in descendants:
                 self._refuse_self(operation, descendant)
@@ -789,7 +798,26 @@ class Runtime:
                     )
             await self._destroy(agent_id)
         finally:
-            self._doomed.difference_update(seen)
+            self._unpin(seen)
+
+    def _pin(self, agent_ids: Iterable[str]) -> None:
+        """记下「本次级联把这些条目钉住了」，每个加上本次调用自己的那一份。"""
+        for agent_id in agent_ids:
+            self._doomed[agent_id] = self._doomed.get(agent_id, 0) + 1
+
+    def _unpin(self, agent_ids: Iterable[str]) -> None:
+        """只撤掉本次调用放上去的那一份，别人的留着。
+
+        写在 `finally` 里的释放**也在一个节点都没拆就退出时执行**（预检查抛、遍历抛），所以无条件
+        清掉标记会在另一条级联还在拆这棵树的时候把它整个放开——那正是本级联存在的理由被绕过的
+        样子（理由见模块文档）。
+        """
+        for agent_id in agent_ids:
+            holders = self._doomed[agent_id] - 1
+            if holders:
+                self._doomed[agent_id] = holders
+            else:
+                del self._doomed[agent_id]
 
     async def _destroy(self, agent_id: str) -> None:
         """拆掉一个 Agent 的全部痕迹。幂等。

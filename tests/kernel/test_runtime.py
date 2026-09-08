@@ -4414,3 +4414,80 @@ async def test_an_agent_that_was_killed_and_brought_back_can_be_killed_again():
         'assistant',
     ]
     await runtime.shutdown()
+
+
+async def test_a_cascade_that_dies_after_marking_leaves_the_other_cascades_pins_alone():
+    """钉住标记按调用计数，否则一条中途夭折的级联会把别人还在拆的树整个放开。
+
+    撤标记写在 `finally` 里，所以它**也在一个节点都没拆就退出时执行**：`_refuse_self` 的预检查在
+    一个 Agent 从自己的工具里 despawn 祖先时必然抛，而它在抛之前已经把整棵树标记过一遍。撤标记若
+    不分是谁放的，此刻往树上挂的子代就不再被拒——而它不在外层早已冻结好的拆除名单里，于是它的
+    parent_id 永久指向一个已被注销的父，`children_of` 从此永远找不到它。
+
+    纯公开路径：`despawn` + Agent 工具里的 `despawn(祖先)` + `spawn`，唯一的额外元素是一个会
+    `await` 的可观察 hook（可观察切点本来就允许做异步工作）。另一棵独立的树必须整棵原样活着。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    entered = asyncio.Event()
+    released = asyncio.Event()
+    meddled = asyncio.Event()
+    holder: dict[str, str] = {}
+    seen: dict[str, object] = {}
+
+    class _Meddle(Tool):
+        async def execute(self, note: str) -> ToolResult:
+            """记下 note，等测试放行，然后 despawn 自己的祖先并往树上挂一个新子代。"""
+            entered.set()
+            await released.wait()
+            try:
+                await runtime.despawn(holder['root'])
+            except ContractViolation as error:
+                seen['refusal'] = error.received
+            try:
+                seen['newborn'] = await _resident(runtime, broker, parent_id=holder['bravo'])
+            except ContractViolation as error:
+                seen['spawn_refused'] = error.expected
+            meddled.set()
+            return ToolResult(output='meddled')
+
+    async def open_the_window(**kwargs: Any) -> HookResult:
+        if kwargs['agent_id'] == holder.get('first_torn_down'):
+            released.set()
+            await asyncio.wait_for(meddled.wait(), _TIMEOUT)
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, open_the_window)
+    root = await _resident(runtime, broker)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Meddle', arguments='{"note":"bye"}')]),
+            ScriptedTurn(content='still alive'),
+        ]
+    )
+    meddler = await runtime.spawn(
+        _factory(llm, tools={'Meddle': _Meddle()}), query='go', parent_id=root
+    )
+    bravo = await _resident(runtime, broker, parent_id=root)
+    charlie = await _resident(runtime, broker, parent_id=root)
+    delta = await _resident(runtime, broker, parent_id=bravo)
+    other_root = await _resident(runtime, broker)
+    other_child = await _resident(runtime, broker, parent_id=other_root)
+    other_leaf = await _resident(runtime, broker, parent_id=other_child)
+    holder.update(root=root, bravo=bravo, first_torn_down=delta)
+    await asyncio.wait_for(entered.wait(), _TIMEOUT)
+
+    await asyncio.wait_for(runtime.despawn(root), _TIMEOUT)
+
+    assert seen['refusal'] is not None
+    assert seen.get('newborn') is None
+    assert seen['spawn_refused'] == f'parent_id {bravo!r} 不在被拆的过程中'
+    doomed = (root, meddler, bravo, charlie, delta)
+    assert [await runtime.find(agent_id) for agent_id in doomed] == [None] * 5
+    assert await _dangling_parents(registry) == []
+    # 每一份钉住都还给了：留一份下去，这棵树的位置从此挂不上任何新子代。
+    assert runtime._doomed == {}
+    survivors = (other_root, other_child, other_leaf)
+    assert [await _status(runtime, agent_id) for agent_id in survivors] == [AgentStatus.IDLE] * 3
+    await runtime.shutdown()
