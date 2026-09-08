@@ -11,8 +11,9 @@
 路径分开写必然分叉，而分叉出来的差异只在有人插话时才现身。
 
 **每一处状态转换都只走 CAS，且失败都必须留痕。** `_switch` 逐个试 CAS 而不是「读一次再写」：读与
-写之间的窗口正是 CAS 存在的理由。周期边界上的 IDLE↔RUNNING 走 `_oscillate`，它的 `allowed` 覆盖
-控制面能在周期之间留下的**每一个**活状态（pause / wait_for / abort 各自留下的那些），因此被拒只剩
+写之间的窗口正是 CAS 存在的理由。周期边界上的转换一律走 `_oscillate`（开周期是 RUNNING，停在邮箱
+上报什么状态见 `_parked_status`），它的 `allowed` 覆盖控制面能在周期之间留下的**每一个**活状态
+（pause / wait_for / abort 各自留下的那些），因此被拒只剩
 一种解释：条目已被摘掉，或已被别人送进终态。接管失败意味着这个 Agent 已归别人所有，本进程既不跑它
 也不替它清理；其余各处失败意味着循环还在跑而注册表说着另一套——丢掉这个结论就是丢掉「它为什么是
 compare-and-set」，而那次真的丢失的转换零痕迹。
@@ -114,6 +115,17 @@ _PAUSABLE_STATUSES: tuple[AgentStatus, ...] = (
     AgentStatus.WAITING,
 )
 
+# 中止兑现在门上，所以这里列的是**事件循环还够得着一道门**的那些状态：RUNNING / WAITING 的下一道
+# 门在轮边界，PAUSED 的执行体要么已经停在门上（`request_abort` 的唤醒边沿当场送到），要么在一轮
+# 之内到得了。IDLE 不在内——那时循环阻塞在邮箱上，那条边沿谁也收不到，位会一直 armed 到下一条消息
+# 把它引爆，而那条消息本该得到一个完整的周期。与 `_PAUSABLE_STATUSES` 同理，这一个元组同时决定
+# `abort` 的早退拒绝与它那次 CAS 的 expected 集合。
+_ABORTABLE_STATUSES: tuple[AgentStatus, ...] = (
+    AgentStatus.RUNNING,
+    AgentStatus.WAITING,
+    AgentStatus.PAUSED,
+)
+
 
 @dataclass
 class _Slot:
@@ -128,6 +140,15 @@ class _Slot:
     control: ControlBlock
     gate: BrokerTurnGate
     owned: bool = False
+
+
+def _parked_status(slot: _Slot) -> AgentStatus:
+    """事件循环停到邮箱上时，注册表该说的那个状态。
+
+    门落着就说 PAUSED：一次穿透挂起门的 `abort` 会把状态从 ABORTING 带回这一点，而此刻写 IDLE
+    等于宣布「它能处理消息」——门还落着，它一条都不会处理，而 `send` 照答 ok=True。
+    """
+    return AgentStatus.PAUSED if slot.control.paused else AgentStatus.IDLE
 
 
 def _already_shut_down() -> ContractViolation:
@@ -243,7 +264,7 @@ class Runtime:
         """IDLE↔RUNNING：等一条消息，跑一个周期，再等下一条。"""
         while True:
             if query is None and slot.control.deferred_count == 0:
-                await self._oscillate(agent_id, new=AgentStatus.IDLE)
+                await self._oscillate(agent_id, new=_parked_status(slot))
                 # timeout=None 是刻意的：这个循环的退出路径是取消（kill / shutdown）与队列消失，
                 # 不是超时。答 False 只有一个原因——邮箱已经被摘掉了。
                 if not await self.broker.wait_for_messages(agent_id, None):
@@ -283,7 +304,9 @@ class Runtime:
         return await self._has_queued_message(agent_id)
 
     async def _oscillate(self, agent_id: str, *, new: AgentStatus) -> None:
-        """周期边界上的 IDLE↔RUNNING 转换。失败不改变循环的走向，但必须留痕。
+        """周期边界上的状态转换（停在邮箱上、开周期，见 `_parked_status`）。
+
+        失败不改变循环的走向，但必须留痕。
 
         `allowed` 是除目标状态之外的全部活状态：控制面在周期之间能留下的每一个状态都在内，所以
         被拒只剩一种解释——条目已被摘掉，或已被别人送进终态。
@@ -561,6 +584,66 @@ class Runtime:
             for descendant in reversed(await self._descendants(agent_id)):
                 await self._resume_one(descendant, named=False)
         await self._resume_one(agent_id, named=True)
+
+    async def abort(self, agent_id: str, *, recursive: bool = False) -> None:
+        """协作式中止：置位中止位、把状态转成 ABORTING，然后立刻返回。
+
+        中止**在轮与轮之间兑现**（spec §5.1 第 1 步）：这一次工作以 `StopReason.ABORTED` 收场，
+        轨迹配对完整、可以直接 resume。要立刻停下、不惜留下不配对的调用，那是 `kill`——两者的
+        区别正是 `ABORTED` 存在的理由，不要合并。
+
+        位是**一次性**的：这一个周期结束，事件循环照常回去等下一条消息（`exit_mode` 决定它还在
+        不在）。abort 是「停下手上这一件事」，不是「从此不再干活」。**暂存的延迟消息不在被停的
+        范围里**——它们排的是下一件事的队，那一件还没开始。
+
+        只允许从 RUNNING / WAITING / PAUSED 发起（见 `_ABORTABLE_STATUSES`）：这三个状态下事件
+        循环都够得着一道门，位因此在一轮之内被消费掉。IDLE 与 ZOMBIE 报错并指向 `kill` /
+        `despawn`——调用方在那两种状态下想要的多半是「别再理它」，而那是另一件事。
+
+        对 PAUSED 允许，且中止**穿透挂起门**：先挂起再中止是真实顺序，若中止要等解除挂起才被
+        看见，这个 Agent 会永远停在那里而调用方毫无反馈。**穿透不等于解除**：门原样落着，兑现
+        之后它回到挂起态等 `resume`。
+
+        `recursive=True` 时**父先于子**，理由同 `pause`：先掐掉还会派出新活的那一头。父只在下一个
+        轮边界停下，因此它仍可能在遍历期间生出新的子代——父先于子把这个窗口收窄到**一次在飞的
+        轮**，并不是消除它。要一棵完整中止的子树只能再走一遍。
+        """
+        await self._abort_one(agent_id, named=True)
+        if recursive:
+            for descendant in await self._descendants(agent_id):
+                await self._abort_one(descendant, named=False)
+
+    async def _abort_one(self, agent_id: str, *, named: bool) -> None:
+        slot, info = await self._control_target('abort', agent_id, named=named)
+        if slot is None or info is None:
+            return
+        # 已经是 ABORTING 的一并放行：后置条件已经成立的操作成功返回。
+        if info.status not in (*_ABORTABLE_STATUSES, AgentStatus.ABORTING):
+            self._refuse_control(
+                'abort',
+                agent_id,
+                named=named,
+                received=f'它当前是 {info.status.value}，手上没有正在进行的工作',
+                next_action=(
+                    f'只有 {" / ".join(status.value for status in _ABORTABLE_STATUSES)} 能中止——'
+                    'abort 停的是「手上这一件事」，而只有这三个状态下的事件循环够得着一道门。'
+                    'idle 停在邮箱上，中止位要等下一条消息才被看见，而那条消息本该跑完一个周期；'
+                    'zombie 连事件循环都没有。'
+                    '要让一个空闲的 Agent 停止事件循环用 kill；要连注册表条目一起去掉用 despawn'
+                ),
+            )
+            return
+        # 先落注册表再落位：记不下 ABORTING 就不要真的置位——那会停掉一件谁都看不出被停了的活。
+        if not await self._switch(agent_id, new=AgentStatus.ABORTING, allowed=_ABORTABLE_STATUSES):
+            self._refuse_control(
+                'abort',
+                agent_id,
+                named=named,
+                received='转到 aborting 的 CAS 被拒，它的状态刚刚被别人改过',
+                next_action='用 find() 重读它的状态再决定；不要在读到的旧状态上重试',
+            )
+            return
+        slot.control.request_abort()
 
     async def _pause_one(self, agent_id: str, *, named: bool) -> None:
         slot, info = await self._control_target('pause', agent_id, named=named)
