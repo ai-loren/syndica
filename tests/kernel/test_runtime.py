@@ -1632,17 +1632,33 @@ async def test_ensure_active_refuses_an_agent_this_process_does_not_hold(
 
 
 async def test_ensure_active_refuses_after_shutdown(caplog: pytest.LogCaptureFixture):
-    """shutdown 是终态：此后 spawn 报错，激活同样不再发生。"""
+    """shutdown 是终态：此后 spawn 报错，激活同样不再发生。
+
+    两种停驻分开断言，否则「投递也失败了」看起来像 `send` 守住了终态，实际是队列已经不在。
+    ZOMBIE 的队列在 `_finish` 里摘过，投递因此拿到诚实的失败；停在邮箱上的那个是被取消的，
+    而取消不做收尾，邮箱还在，投递照答 `ok=True`——消息落进一个再没有消费者的地方。
+    `ensure_active` 两边都答 False，是 `send` 不看它的答案。
+    """
     broker = _SpyBroker()
     runtime = Runtime(broker=broker)
-    agent_id = await runtime.spawn(_factory(_done()), query='go')
-    await runtime.wait(agent_id)
+    zombied = await runtime.spawn(_factory(_done()), query='go')
+    parked = await runtime.spawn(_factory(_done()), exit_mode=ExitMode.IDLE)
+    await runtime.wait(zombied)
+    await asyncio.wait_for(broker.reach(parked, 1), _TIMEOUT)
     await runtime.shutdown()
 
-    assert await runtime.ensure_active(agent_id) is False
+    assert [await runtime.ensure_active(agent_id) for agent_id in (zombied, parked)] == [
+        False,
+        False,
+    ]
 
-    assert (await runtime.send(agent_id, 'wake up')).ok is False
-    assert broker.parks(agent_id) == 0
+    assert [(await runtime.send(agent_id, 'wake up')).ok for agent_id in (zombied, parked)] == [
+        False,
+        True,
+    ]
+    assert [message.content for message in await broker.consume(zombied)] == []
+    assert [message.content for message in await broker.consume(parked)] == ['wake up']
+    assert [broker.parks(agent_id) for agent_id in (zombied, parked)] == [0, 1]
     assert caplog.records == []
 
 
@@ -1651,6 +1667,11 @@ async def test_two_concurrent_activations_of_one_zombie_start_exactly_one_driver
 
     复检若隔着挂起点，第二次会撞上实例表拒绝替换未结束任务，把一个只答不抛的问句变成抛异常，
     同时丢下一个无人认领的驱动任务。
+
+    第二次激活要等第一次已经钉在 `ensure_queue` 上再发起：那时状态稳定在 idle，它的 `_switch`
+    与注册表挂不挂起无关。两个一起 gather 的话，换一个同样合规、但 CAS 会挂起的注册表
+    （任何远端实现都挂起）就只有一个到得了 `ensure_queue`，握手在上界处超时——而它要断言的那条
+    不变式仍然成立。
     """
     broker = _HeldBroker()
     runtime = Runtime(broker=broker)
@@ -1659,11 +1680,16 @@ async def test_two_concurrent_activations_of_one_zombie_start_exactly_one_driver
     await runtime.wait(agent_id)
 
     broker.ensures.close()
-    both = asyncio.gather(runtime.ensure_active(agent_id), runtime.ensure_active(agent_id))
+    first = asyncio.create_task(runtime.ensure_active(agent_id))
+    await asyncio.wait_for(broker.ensures.reach(1), _TIMEOUT)
+    second = asyncio.create_task(runtime.ensure_active(agent_id))
     await asyncio.wait_for(broker.ensures.reach(2), _TIMEOUT)
     broker.ensures.open()
 
-    assert await asyncio.wait_for(both, _TIMEOUT) == [True, True]
+    assert [
+        await asyncio.wait_for(first, _TIMEOUT),
+        await asyncio.wait_for(second, _TIMEOUT),
+    ] == [True, True]
     # 快照取在两次激活都返回的那一刻：多出来的那个驱动没人持有，只会停在同一个邮箱上不动。
     live = [task for task in asyncio.all_tasks() if task.get_name() == f'agent:{agent_id}']
     assert live == [runtime._table.get_task(agent_id)]
