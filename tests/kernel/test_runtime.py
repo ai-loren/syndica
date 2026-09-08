@@ -928,6 +928,8 @@ async def test_lost_transition_into_running_stops_the_drive_before_it_calls_the_
     assert await _mailbox_exists(broker, agent_id) is True
     assert [record.levelname for record in caplog.records] == ['ERROR']
     assert agent_id in caplog.text
+    # 条目还在，所以「读它的 status 与 owner」这个下一步是够得着的——条目已被注销那一支不是。
+    assert 'find()' in caplog.text
     await runtime.shutdown()
 
 
@@ -4971,6 +4973,71 @@ async def test_a_despawn_whose_registry_keeps_the_entry_reports_it_instead_of_th
     message = caplog.records[0].getMessage()
     assert caplog.records[0].args == (delta,)
     _assert_three_part(message)
+    await runtime.shutdown()
+
+
+async def test_unpinning_a_mark_that_is_no_longer_there_still_takes_the_rest_off():
+    """撤钉住跑在 `finally` 里：一个 KeyError 会同时吃掉在飞的异常、并让这一批里剩下的 id 一份
+    都撤不掉，那些位置于是永久挂不上新子代。
+
+    基数取到 3，且缺的那一份排在**中间**：排在末位时「剩下的还撤不撤」与「就此中断」是同一个
+    答案。
+    """
+    runtime = Runtime()
+    runtime._pin(['bravo', 'charlie'])
+
+    runtime._unpin(['bravo', 'alpha', 'charlie'])
+
+    assert runtime._doomed == {}
+    await runtime.shutdown()
+
+
+async def test_unpinning_a_mark_that_is_no_longer_there_is_reported(
+    caplog: pytest.LogCaptureFixture,
+):
+    """配平被破坏是一次静默的丢失：此后往这些位置 spawn 子代会被误拒或误放行，而没有别的痕迹。"""
+    runtime = Runtime()
+
+    runtime._unpin(['alpha'])
+
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    assert caplog.records[0].args == ('alpha',)
+    _assert_three_part(caplog.records[0].getMessage())
+    await runtime.shutdown()
+
+
+async def test_a_drive_that_finds_its_entry_gone_says_so_instead_of_blaming_another_owner(
+    caplog: pytest.LogCaptureFixture,
+):
+    """IDLE -> RUNNING 被拒的两种情形下一步不是同一件事。
+
+    条目已被注销时，「用 find() 读它的 status 与 owner」答 `None`，读不出任何东西；而本进程还
+    留着它的 slot 与实例，收掉它们的是 `despawn`（它的痕迹检查看的是全部痕迹）。措辞相同的一条
+    记录把两种情形合并，等于在其中一种上给了一个够不着的下一步。
+    """
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert await runtime.ensure_active(agent_id) is True
+    # 这两句之间没有挂起点（内存 store 全程不挂起），复活出来的驱动因此还没跑起来。
+    await registry.unregister(agent_id)
+    revived = runtime._table.get_task(agent_id)
+    assert revived is not None
+    await asyncio.wait_for(asyncio.wait({revived}), _TIMEOUT)
+
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    message = caplog.records[0].getMessage()
+    assert '条目已经不在注册表里' in message
+    assert 'despawn()' in message
+    assert 'find()' not in message
+    _assert_three_part(message)
+    # 那条记录说的下一步真的够得着：痕迹检查看的是全部痕迹，不只是注册表条目。
+    await runtime.despawn(agent_id)
+    assert agent_id not in runtime._slots
+    assert runtime._table.get(agent_id) is None
     await runtime.shutdown()
 
 

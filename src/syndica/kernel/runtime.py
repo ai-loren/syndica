@@ -98,7 +98,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -349,12 +349,7 @@ class Runtime:
         if not await self.registry.compare_and_set_status(
             agent_id, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
         ):
-            logger.error(
-                '期望: agent %s 在注册表里是 IDLE，可由本进程接管。'
-                ' 实际: IDLE -> RUNNING 被拒，它当前的状态不是 IDLE，说明已被别人拿走。'
-                ' 下一步: 用 find() 读它的 status 与 owner；本进程不跑它，也不清理它。',
-                agent_id,
-            )
+            await self._report_lost_takeover(agent_id)
             return
         slot.owned = True
         cancelled = False
@@ -374,6 +369,30 @@ class Runtime:
         finally:
             if not cancelled:
                 await self._finish(agent_id, slot)
+
+    async def _report_lost_takeover(self, agent_id: str) -> None:
+        """IDLE -> RUNNING 被拒的两种情形，下一步不是同一件事。
+
+        条目已被注销时，「用 find() 读它的 status 与 owner」答 `None`——读不出任何东西，而本进程
+        还留着它的 slot 与实例（`despawn` 收得掉，它的痕迹检查看的是全部痕迹）。措辞相同的一条
+        记录把这两种情形合并，就等于在其中一种上给了一个够不着的下一步。
+        """
+        if await self.registry.get(agent_id) is None:
+            logger.error(
+                '期望: agent %s 在注册表里是 IDLE，可由本进程接管。'
+                ' 实际: IDLE -> RUNNING 被拒，因为条目已经不在注册表里——'
+                '它在驱动任务跑起来之前就被销毁了（一条 despawn 级联，或别的执行体注销了它）。'
+                ' 下一步: 它已经不可寻址，本进程不跑它；'
+                '用 despawn() 收掉本进程为它留下的 slot 与实例，要再跑就重新 spawn 一个。',
+                agent_id,
+            )
+            return
+        logger.error(
+            '期望: agent %s 在注册表里是 IDLE，可由本进程接管。'
+            ' 实际: IDLE -> RUNNING 被拒，它当前的状态不是 IDLE，说明已被别人拿走。'
+            ' 下一步: 用 find() 读它的 status 与 owner；本进程不跑它，也不清理它。',
+            agent_id,
+        )
 
     async def _cycles(
         self, agent_id: str, agent: BaseAgent, query: str | None, slot: _Slot
@@ -879,22 +898,39 @@ class Runtime:
         finally:
             self._unpin(seen)
 
-    def _pin(self, agent_ids: Iterable[str]) -> None:
-        """记下「本次级联把这些条目钉住了」，每个加上本次调用自己的那一份。"""
+    def _pin(self, agent_ids: Collection[str]) -> None:
+        """记下「本次级联把这些条目钉住了」，每个加上本次调用自己的那一份。
+
+        形参是 `Collection` 而不是 `Iterable`：`_pin` 与 `_unpin` 必须走**同一批** id，而单趟
+        迭代器会被 `_pin` 耗干、`_unpin` 一个都减不到，而失衡的表现是这棵子树永久挂不上新子代。
+        """
         for agent_id in agent_ids:
             self._doomed[agent_id] = self._doomed.get(agent_id, 0) + 1
 
-    def _unpin(self, agent_ids: Iterable[str]) -> None:
+    def _unpin(self, agent_ids: Collection[str]) -> None:
         """只撤掉本次调用放上去的那一份，别人的留着。
 
         写在 `finally` 里的释放**也在一个节点都没拆就退出时执行**（预检查抛、遍历抛），所以无条件
         清掉标记会在另一条级联还在拆这棵树的时候把它整个放开——那正是本级联存在的理由被绕过的
         样子（理由见模块文档）。
+
+        没有对应钉住的 id 记一条 ERROR 而不是抛：本方法跑在 `finally` 里，一个 KeyError 会同时
+        吃掉在飞的异常、并让这一批里剩下的 id 一份都撤不掉，那些位置于是永久挂不上新子代。
         """
         for agent_id in agent_ids:
-            holders = self._doomed[agent_id] - 1
-            if holders:
-                self._doomed[agent_id] = holders
+            holders = self._doomed.get(agent_id)
+            if holders is None:
+                logger.error(
+                    '期望: agent %s 的钉住标记还在，可以撤掉本次级联放上去的那一份。'
+                    ' 实际: 表里没有它的标记——钉住与撤销失去了配平，'
+                    '本次放上去的那一份已经被别处撤掉了。'
+                    ' 下一步: 用 find() 确认这棵子树的末态；'
+                    '此后往这些位置 spawn 子代会被误拒或误放行，重建这棵树最省事。',
+                    agent_id,
+                )
+                continue
+            if holders > 1:
+                self._doomed[agent_id] = holders - 1
             else:
                 del self._doomed[agent_id]
 
