@@ -109,7 +109,8 @@ class _RecordingRegistry:
     实现细节，走过的状态路径才是行为。
 
     `hold_before` 把「转去某个状态」的 CAS 停在 `switches` 这道闸上：`_finish` 摘完队列、还没
-    转 ZOMBIE 的那一刻，在 Runtime 外面没有别的观测点。
+    转 ZOMBIE 的那一刻，在 Runtime 外面没有别的观测点。它可以在构造之后再装上，用来只拦住某个
+    时间点之后发生的转换——「驱动任务还活着、但还没接管成功」同样没有别的构造方式。
 
     `deny_for` 把拒绝收窄到一个 agent。递归操作对「被点名的那一个」与「遍历到的子代」处理不同，
     而只按 (expected, new) 拒绝会同时打中两者，那条子代分支于是永远走不到。
@@ -124,7 +125,7 @@ class _RecordingRegistry:
     ) -> None:
         self._inner = InMemoryAgentRegistry()
         self._deny = deny
-        self._hold_before = hold_before
+        self.hold_before = hold_before
         self.deny_for = deny_for
         self.switches = _Hold()
         self.transitions: list[tuple[str, AgentStatus, AgentStatus]] = []
@@ -139,7 +140,7 @@ class _RecordingRegistry:
     async def compare_and_set_status(
         self, agent_id: str, *, expected: AgentStatus, new: AgentStatus
     ) -> bool:
-        if new is self._hold_before:
+        if new is self.hold_before:
             await self.switches.passing(agent_id)
         self.transitions.append((agent_id, expected, new))
         if self._deny == (expected, new) and self.deny_for in (None, agent_id):
@@ -3384,6 +3385,52 @@ async def test_a_descendant_with_nothing_to_stop_is_left_alone_without_a_record(
         False,
     ]
     assert caplog.records == []
+    for blocker in blockers:
+        blocker.release.set()
+    await runtime.shutdown()
+
+
+async def test_a_recursive_abort_never_writes_aborting_on_a_descendant_it_never_took_over(
+    caplog: pytest.LogCaptureFixture,
+):
+    """所有权凭据在**遍历找到的**主体上是第二次独立的应用，被点名的那一次替不了它。
+
+    树在共享注册表里，本进程接管过哪些不影响树的形状；而替一个本进程按不住的条目写下 ABORTING
+    比写下 PAUSED 更糟——`ensure_active` 对 aborting 有专门的拒绝分支，连真正的持有者也再叫不醒
+    它。这个子代的驱动任务**还活着**（停在它的第一次 CAS 上），因此「它已经没有事件循环了」这条
+    通道救不了它，只有所有权凭据本身能。三个子代跨两代，被跳过的那一个在广度优先序里排第四、
+    后面还有两个，遍历必须走过它继续往下。
+    """
+    caplog.set_level(logging.INFO)
+    registry = _RecordingRegistry()
+    runtime = Runtime(registry=registry)
+    blockers: list[_Block] = []
+    root = await _running(runtime, blockers)
+    bravo, alpha, charlie = [await _running(runtime, blockers, parent_id=root) for _ in range(3)]
+    delta = await _running(runtime, blockers, parent_id=alpha)
+    echo = await _running(runtime, blockers, parent_id=charlie)
+    # 闸只拦「转去 RUNNING」，而这六个都已经停在各自的工具里，不会再要这个转换。
+    registry.hold_before = AgentStatus.RUNNING
+    registry.switches.close()
+    stranded = await runtime.spawn(_factory(_done()), query='go', parent_id=bravo)
+    await asyncio.wait_for(registry.switches.reach(1), _TIMEOUT)
+    assert runtime._slots[stranded].owned is False
+
+    await runtime.abort(root, recursive=True)
+
+    walked = (root, bravo, alpha, charlie, delta, echo)
+    assert [await _status(runtime, agent_id) for agent_id in walked] == [AgentStatus.ABORTING] * 6
+    assert [runtime._slots[agent_id].control.abort_requested for agent_id in walked] == [True] * 6
+    # 状态没被动过，它就仍然叫得醒；写下 aborting 的话这个条目对每一个进程都失联。
+    assert await _status(runtime, stranded) is AgentStatus.IDLE
+    assert runtime._slots[stranded].control.abort_requested is False
+
+    assert [record.levelname for record in caplog.records] == ['INFO']
+    skipped = caplog.records[0].getMessage()
+    assert 'abort' in skipped and stranded in skipped
+    assert all(agent_id not in skipped for agent_id in walked)
+
+    registry.switches.open()
     for blocker in blockers:
         blocker.release.set()
     await runtime.shutdown()
