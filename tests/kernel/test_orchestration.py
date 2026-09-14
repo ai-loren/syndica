@@ -277,6 +277,51 @@ async def test_a_child_that_left_text_before_running_out_of_budget_is_still_repo
     await runtime.shutdown()
 
 
+async def test_killing_the_child_releases_a_parent_that_is_waiting_on_it():
+    """这次等待没有墙钟上限（登记 D-47），而「被等的那一方在本 Runtime 手里」是那条裁决的全部
+    依据——所以那三条出路里至少要有一条被真的走过一遍，否则依据就只是一句断言。
+
+    硬终止不产生 `stop_reason`，于是那张终局表里 `None` 那一格也在这条路上被走到。
+    """
+    blocker = _Block()
+    runtime = Runtime(
+        agents={
+            'Worker': _worker(
+                [_call('Block', '{}'), ScriptedTurn(content='never reached')], {'Block': blocker}
+            )
+        }
+    )
+    parent = await _idle_parent(runtime)
+    delegating = asyncio.ensure_future(
+        Delegate(runtime, parent).execute(agent='Worker', query='slow job')
+    )
+    await asyncio.wait_for(blocker.entered.wait(), timeout=_TIMEOUT)
+    child_id = next(iter(set(runtime._slots) - {parent}))
+
+    await runtime.kill(child_id)
+    result = await asyncio.wait_for(delegating, timeout=_TIMEOUT)
+
+    assert result.meta == {'agent_id': child_id, 'stop_reason': None}
+    assert all(part in str(result.output) for part in _THREE_PART)
+    assert '硬终止' in str(result.output)
+    await runtime.shutdown()
+
+
+async def test_a_child_that_died_of_an_exception_is_reported_as_having_failed():
+    runtime = Runtime(
+        agents={'Worker': _worker([ScriptedTurn(raises=RuntimeError('provider is down'))])}
+    )
+    parent = await _idle_parent(runtime)
+
+    result = await asyncio.wait_for(
+        Delegate(runtime, parent).execute(agent='Worker', query='x'), timeout=_TIMEOUT
+    )
+
+    assert result.meta['stop_reason'] == 'error'
+    assert '错误' in str(result.output)
+    await runtime.shutdown()
+
+
 async def test_a_child_that_touched_untrusted_content_hands_an_untrusted_result_to_the_parent():
     """标记必须随衍生内容传递：子 Agent 的结论是它读过的东西的衍生物（spec §12.2）。"""
     child_script = [
