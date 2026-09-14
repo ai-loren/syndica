@@ -56,7 +56,11 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 产出的，本批中途出现的不可信结果影响不了它；逐次重算会让同一条命令的处置取决于它排在批里第几个，
 分段并发之后连这个位置都不确定。**`PRE_TOOL_USE` hook 写过参数时前提就不成立了**——它能把本批刚落
 进轨迹的不可信输出展开进参数——那时重取一次并取两者中更严的（spec §13：溯源失败时按最坏情况处理）。
-这次重取看不到**同段**里其它调用的产出：它们的 block 要等整段跑完才落进轨迹。
+**在多元素段里这次重取本身就是一次失败的溯源**：hook 能从旁路拿到同段兄弟的产出，而兄弟的 block 要
+等整段跑完才落进轨迹，重取在轨迹里一个字都看不到；因此那里直接按最坏情况取 `UNTRUSTED`，不再重取。
+代价是「hook 改写参数 ∧ 多元素段」这个交集上多判（B-18），而少判的后果是那道关不掉的升级与 §12.2
+低风险那一格的记录义务**静默**失效——**同一批输入在 `max_concurrency=1` 与 `=N` 下必须得出同一个
+安全结论**，一个调度配置项改不掉安全结论。
 当前形态是「这份轨迹里出现过 `trust=UNTRUSTED` 的 block」——它是上界而非因果链，完整的溯源要接产物
 溯源（spec §7.3）与 trace 因果链（§11.1）。**它不交 `None`**：`None` 是「没溯源过」，留在生产路径上
 那道升级就恒不命中，而调用方以为有它。
@@ -435,16 +439,39 @@ def _report_allowed_low_risk_from_untrusted(call: ToolCall, verdict: DangerVerdi
     """
     logger.warning(
         '期望: 能溯源到不可信内容的调用要么不命中危险规则，要么由人看一眼。'
-        ' 实际: %s（id=%s）命中规则 %s（风险等级 %s），而本次调用之前的轨迹里有 %s 的内容；'
+        ' 实际: %s（id=%s）命中规则 %s（风险等级 %s），而本次调用的溯源结论是 %s；'
         '按 spec §12.2 的处置矩阵，低风险这一格是放行并记录，调用已经放行，'
         '本条是它留下的全部痕迹。'
-        ' 下一步: 复核这次调用的参数是不是来自那段不可信内容；'
+        ' 下一步: 复核这次调用的参数是不是来自不可信内容；'
         '要让这一类调用改为拦下，给 ToolExecutor 换一个把低风险也判 BLOCK 的 DangerPolicy。',
         call.name,
         call.id,
         verdict.rule_id,
         verdict.level.value,
         TrustLevel.UNTRUSTED.value,
+    )
+
+
+def _report_unanswered_concurrency(tool: Tool, call: ToolCall, exc: Exception) -> None:
+    """工具的 `is_concurrency_safe` 自己坏掉时留下的唯一痕迹。
+
+    判定不得抛出，所以答不上来一律判不安全——而串行既不报错也不改结果，这个工具于是**永久**串行，
+    没有这条记录，一次声明违约（抛出、或签名根本不收 `args`）留下的痕迹是零。
+
+    危险判定抛出时**不**走这里：那次失败会在闸上原样再现，而那里有配对的 block 与一次上抛。
+
+    WARNING 而非 INFO：root logger 默认停在 WARNING，INFO 的记录根本不会被创建。
+    """
+    logger.warning(
+        '期望: 工具的 is_concurrency_safe 是纯函数：收下这次调用的 args，交回 True 或 False。'
+        ' 实际: %s.is_concurrency_safe 在 %s（id=%s）上抛出 %s；判定坐在任何 block 落地之前、'
+        '因此不得抛出，这次调用于是被判不安全，该工具在本批里只会单独跑。'
+        ' 下一步: 让它收一个 dict 参数并且不抛出——它现在坐在每次工具调用的必经之路上，'
+        '也会被问到本批里根本不会执行的调用；确认不了本次调用不写任何共享状态就交回 False。',
+        type(tool).__name__,
+        call.name,
+        call.id,
+        type(exc).__name__,
     )
 
 
@@ -541,14 +568,14 @@ class ToolExecutor:
         """
         if len(calls) == 1:
             try:
-                return [await self._execute_one(ctx, calls[0], provenance)]
+                return [await self._execute_one(ctx, calls[0], provenance, has_siblings=False)]
             # 收进结果列表的只有 Exception，取消沿这条路直接上抛。并发那条路做不到这件事
             # （gather 把子协程的取消一并收进列表），所以两条路都还要过 `_without_cancellation`
             # ——「取消不写 block」这条只由它保证。
             except Exception as exc:
                 return [exc]
         return await asyncio.gather(
-            *(self._execute_one(ctx, call, provenance) for call in calls),
+            *(self._execute_one(ctx, call, provenance, has_siblings=True) for call in calls),
             return_exceptions=True,
         )
 
@@ -557,7 +584,9 @@ class ToolExecutor:
 
         判定坐在任何 block 落地之前，因此**不得抛出**：一抛就是整批一个 block 都没有，配对不变式
         被工具或危险判定里的一个异常击穿。答不上来一律判不安全——危险判定的那次失败会在闸上原样
-        再现（那里有配对的 block），工具自己答不上来则只是被串行执行。
+        再现（那里有配对的 block），工具自己答不上来则只是被串行执行并留下一条 WARNING。
+
+        这里兜住的是危险判定那次抛出，不出声：它会在闸上原样再现，那里有配对的 block 与一次上抛。
         """
         try:
             return self._joinable(call)
@@ -565,20 +594,33 @@ class ToolExecutor:
             return False
 
     def _joinable(self, call: ToolCall) -> bool:
-        """从严的四道关，逐条见模块 docstring。
-
-        只有 `True` 才算安全：`is_concurrency_safe` 由工具实现，一个真值对象在这里被读成「可以并
-        发」，而这个方向的错是不可逆的。
-        """
+        """从严的四道关，逐条见模块 docstring。"""
         tool = self._tools.get(call.name)
         if tool is None:
             return False
         args = _parsed_arguments(call)
         if args is None:
             return False
+        # 判定必须先于工具的自我声明：命中危险规则的调用无论工具怎么答都不安全，先问工具就是让
+        # 第三方代码（会计数、会抛）跑在一次答案用不上的判断上。
         if self._judge.judge(tool, args).level is not RiskLevel.NONE:
             return False
-        return cast('object', tool.is_concurrency_safe(args)) is True
+        return self._tool_says_safe(tool, call, args)
+
+    def _tool_says_safe(self, tool: Tool, call: ToolCall, args: dict[str, Any]) -> bool:
+        """问工具自己这次调用能不能并发。
+
+        只有 `True` 才算安全：`is_concurrency_safe` 由工具实现，一个真值对象在这里被读成「可以并
+        发」，而这个方向的错是不可逆的。
+
+        它坏掉时判不安全（串行），方向是安全的那一侧；但串行不报错也不改结果，所以那条 WARNING
+        是这次声明违约留下的全部痕迹。
+        """
+        try:
+            return cast('object', tool.is_concurrency_safe(args)) is True
+        except Exception as exc:
+            _report_unanswered_concurrency(tool, call, exc)
+            return False
 
     def _append_not_executed(
         self, ctx: Context, pending: list[ToolCall], failed: ToolCall, exc: BaseException
@@ -600,8 +642,14 @@ class ToolExecutor:
         )
 
     async def _execute_one(
-        self, ctx: Context, call: ToolCall, provenance: TrustLevel
+        self, ctx: Context, call: ToolCall, provenance: TrustLevel, *, has_siblings: bool
     ) -> ToolResult:
+        """跑一次调用。
+
+        `has_siblings` 没有默认值：它决定 hook 改写参数之后这次调用按什么溯源结论过闸，漏传一处
+        就是那道关不掉的升级在那条路上静默失效，而默认值会把这件事变成静态检查看不见的疏漏。它由
+        `_run_segment` 从决定要不要进 `gather` 的那同一个 `len(calls)` 判断算出，两者不可能错位。
+        """
         tool = self._tools.get(call.name)
         if tool is None:
             misregistered = _misregistered(self._tools, call.name)
@@ -631,7 +679,15 @@ class ToolExecutor:
         # 不可信输出展开进参数。看 `rewrites` 而不只比对象身份——交回同一个 dict 对象的 hook 同样
         # 是作者，身份比对看不见它。
         if pre.rewrites('args') or rewritten_args is not args:
-            provenance = _strictest_trust(provenance, _provenance(ctx))
+            # 多元素段里这次重取**结构上就是一次失败的溯源**：hook 能从旁路拿到同段兄弟的产出并
+            # 展开进参数，而兄弟的 block 要等整段跑完才落进轨迹，重取在轨迹里一个字都看不到。
+            # spec §13：溯源失败时按最坏情况处理。少判的方向不可回收——那道关不掉的升级会静默失
+            # 效，§12.2 低风险那一格的记录义务也会一起无声消失。
+            provenance = (
+                TrustLevel.UNTRUSTED
+                if has_siblings
+                else _strictest_trust(provenance, _provenance(ctx))
+            )
         args = cast(dict[str, Any], rewritten_args)
 
         gated = await self._gated(call, tool, args, provenance)

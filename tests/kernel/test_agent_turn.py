@@ -612,7 +612,11 @@ async def test_a_tool_concurrency_declared_on_the_options_reaches_the_executor()
     assert await _peak_concurrency(max_tool_concurrency=1) == 1
 
 
-@pytest.mark.parametrize('limit', [0, -1, True, '4'], ids=['zero', 'negative', 'bool', 'string'])
+@pytest.mark.parametrize(
+    'limit',
+    [0, -1, True, '4', 2.5, 4.0, float('inf')],
+    ids=['zero', 'negative', 'bool', 'string', 'fraction', 'whole-float', 'infinity'],
+)
 def test_the_options_refuse_a_tool_concurrency_the_executor_could_not_use(limit):
     """报出的名字必须是宿主写下的那个：executor 那道校验说的是 `max_concurrency`，指着一个宿主
     没写过的参数等于让它去猜。"""
