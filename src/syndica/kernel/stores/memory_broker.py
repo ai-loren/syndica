@@ -95,12 +95,16 @@ class InMemoryMessageBroker:
         mailbox = self._mailboxes.get(agent_id)
         if mailbox is None:
             return False
-        # 非空时不能落到下面等：asyncio.wait_for 对 timeout <= 0 一律判超时，纯轮询
-        # （timeout=0）会因此误报空邮箱。
+        # 非空时不能落到下面等：超时域对 timeout <= 0 一律当即到期，纯轮询（timeout=0）会因此
+        # 误报空邮箱。
         if mailbox.messages:
             return True
         try:
-            await asyncio.wait_for(mailbox.nonempty.wait(), timeout=timeout)
+            # `asyncio.timeout` 而不是 `asyncio.wait_for`：后者在 3.11 上把内层协程包成 Task，
+            # 内层已经就绪时到达的取消会被它当成「结果已到」吃掉（`if fut.done(): return
+            # fut.result()`），于是 `task.cancel()` 静默失效、调用方再也取消不掉这次等待。
+            async with asyncio.timeout(timeout):
+                await mailbox.nonempty.wait()
         except TimeoutError:
             return False
         if not self._is_live(agent_id, mailbox):
@@ -128,7 +132,13 @@ class InMemoryMessageBroker:
             if remaining is not None and remaining <= 0:
                 return None
             try:
-                await asyncio.wait_for(mailbox.arrival.wait(), timeout=remaining)
+                # 取消必须当场生效（见 protocols/broker.py 的模块 docstring）。`asyncio.wait_for`
+                # 在 3.11 上做不到：它把内层协程包成 Task，内层那个 future 已经就绪时（一条**不
+                # 匹配**的消息 publish 之后 arrival 即已置位）到达的取消被它吃掉并返回内层结果，
+                # 于是 `while True` 照常往下转，这次取此后不可取消——`abort` / `shutdown` /
+                # `despawn` 全都要挂满整个 waiter 超时，而超时可以是几小时。
+                async with asyncio.timeout(remaining):
+                    await mailbox.arrival.wait()
             except TimeoutError:
                 return None
             if not self._is_live(agent_id, mailbox):

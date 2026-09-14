@@ -18,11 +18,23 @@
 - **回调列表每次 publish 现读**：在首次 publish 时把它冻结成快照的实现满足上面每一条，却让此后
   注册的回调永远不被调用。共享 broker 上这意味着第一次 missing-queue publish 之后构造的
   Runtime 复活不了自己的 ZOMBIE。
-- **取消一次 `take_by_correlation` 不得吃掉匹配的那条消息**：要么它已经把消息交回调用方，要么消息
-  仍在邮箱里等下一次取，没有第三种结局。先把消息摘出邮箱、再 await（ack、回执、审计写入）然后才
-  返回的实现满足上面每一条，却会在取消落进那个窗口时静默销毁一条答复——而 `Runtime.wait_for` 正是
-  在被中止或被顶掉时取消这次取（中止落在轮的中间，那次等待必须当场返回）。最省的满足方式是**摘掉
-  与返回之间不留挂起点**；做不到就用「读了但未确认即可重取」的语义（Redis 消费组的 pending entry）。
+- **取消一次 `take_by_correlation` 必须当场生效**：`cancel()` 之后这次调用要么已经返回，要么当场以
+  `CancelledError` 结束，不得接着等到自己的超时。`Runtime.wait_for` 在等待被中止或被顶掉时正是取消
+  它，而中止落在轮的中间——取消不当场生效，`abort` / `shutdown` / `despawn` 就全都要挂满整个 waiter
+  超时，而超时可以是几小时。**内层等待要用 `asyncio.timeout`，不要用 `asyncio.wait_for`**：3.11 的
+  `wait_for` 把内层协程包成 Task，内层那个 future 已经就绪时到达的取消被它当成「结果已到」吃掉
+  （`except CancelledError: if fut.done(): return fut.result()`），这次取此后不可取消。一条**不
+  匹配**的消息投进来之后到达的取消确定命中这个窗口，不是概率事件。
+- **取消一次 `take_by_correlation` 不得吃掉匹配的那条消息**：要么它已经把消息交回调用方，要么这条
+  消息仍在**普通消费路径**上——即 `consume` 与 `wait_for_messages` 看得见它，没有第三种结局。内核
+  依赖的是这一条而不是「再 take 一次还取得到」：被中止的那次等待返回之后，这条答复退回成一条普通
+  消息，由门在下一轮开始前 `consume` 进上下文；只对 take 可见的实现会让 `wait_for_messages` 答
+  False、`consume` 交出空列表，那条答复于是静默消失，而 `publish` 早已回过 `ok=True`。先把消息摘出
+  邮箱、再 await（ack、回执、审计写入）然后才返回的实现满足上面每一条，却会在取消落进那个窗口时
+  销毁一条答复。最省的满足方式是**摘掉与返回之间不留挂起点**。Redis Streams 排不出这个写法
+  （`XREADGROUP` 与 `XACK` 之间天然隔着一次往返），只能用「读了但未确认即可重取」的 pending entry
+  语义，而那时**该实现的 `consume` 与 `wait_for_messages` 必须先读自己的 pending**
+  （`XREADGROUP ... STREAMS key 0`，或 `XAUTOCLAIM`），未确认的条目才真的回到了普通消费路径上。
 - **等待上限是方法参数，不是让调用方在外面套 `asyncio.timeout`**：远端实现要把它下推给服务端
   （Redis `XREAD BLOCK`），在本地包一层取消域只会把已经阻塞住的服务端连接留在那里。ruff 的
   ASYNC109 因此在本模块与内存实现里按文件豁免（见 pyproject）。
@@ -99,8 +111,10 @@ class MessageBroker(Protocol):
         邮箱不存在时立刻返回 None，不等待；等待期间邮箱被 remove_queue 删掉时同样返回 None。
         与 wait_for_messages 一致：问句答不出就答 None，不抛异常，也不另造第三种返回值。
 
-        本调用被取消时匹配的消息必须仍可再取一次（见模块 docstring）：调用方会在等待被中断时取消
-        它，摘掉与返回之间留了挂起点的实现在那一刻静默销毁一条答复。
+        **本调用被取消时，取消要当场生效，且匹配的那条消息必须仍在普通消费路径上**（`consume` 与
+        `wait_for_messages` 看得见它）——两条都见模块 docstring。调用方在等待被中止或被顶掉时取消
+        它：取消被内层的 `asyncio.wait_for` 吃掉就是挂满整个超时，而摘掉与返回之间留了挂起点就是
+        静默销毁一条答复。
         """
         ...
 

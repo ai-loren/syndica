@@ -61,6 +61,34 @@ def _msg(content: str = 'hi', *, correlation_id: str | None = None) -> Message:
     return Message(sender='s', receiver='a1', content=content, correlation_id=correlation_id)
 
 
+async def _cancel_must_take_effect(task: asyncio.Task[Any], call: str, budget: float) -> None:
+    """取消一个还停在等待点上的调用，它必须当场以取消收场。
+
+    「已经先返回了」也算合格：`cancel()` 对一个已完成的调用本来就是 no-op，而带网络往返的后端
+    可以在取消到达之前就拿到答案。不合格的只有第三种——取消到了、却换来一个正常的返回值。
+    """
+    answered_first = task.done()
+    task.cancel()
+    ended, _ = await asyncio.wait({task}, timeout=_MAX_PROMPT_REPLY)
+    # 先收干净再断言：断言红的时候那次调用还在跑，留着它就是一个悬空任务。
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert ended, (
+        f'期望 {call} 被 cancel() 之后 {_MAX_PROMPT_REPLY}s 内结束。'
+        f' 实际它还在跑，而交给它的超时是 {budget}s——取消被吃掉了。'
+        ' 内层等待改用 `asyncio.timeout` 而不是 `asyncio.wait_for`：'
+        '后者在内层 future 已经就绪时把到达的取消当成「结果已到」吞掉，'
+        '而调用方正是靠取消让一次被中止的等待当场返回。'
+    )
+    assert answered_first or task.cancelled(), (
+        f'期望 {call} 要么在取消到达之前就已经答完，要么以取消收场。'
+        f' 实际取消到了、它却交回了 {task.result()!r}——这次 cancel() 静默失效了，'
+        '调用方以为自己停掉了它，而它接着往下跑。'
+        ' 内层等待改用 `asyncio.timeout` 而不是 `asyncio.wait_for`。'
+    )
+
+
 async def _answered_without_waiting(call: Awaitable[_T], label: str) -> _T:
     """断言 call 没有停下来等就给出答案。
 
@@ -291,14 +319,51 @@ class MessageBrokerContract(ContractSuite):
         assert got is not None and got.content == 'answer'
         await task
 
+    async def test_cancelling_take_by_correlation_ends_it_instead_of_burning_its_timeout(
+        self, broker: MessageBroker
+    ) -> None:
+        """取消要当场生效：调用方靠它让一次被中止的等待立刻返回。
+
+        噪声消息是关键——它让实现内层那个「等新消息入队」的 future 就绪，而这次取还得继续等。
+        `asyncio.wait_for` 恰在这个形状下把到达的取消当成「结果已到」吃掉，于是这次取此后不可
+        取消，`abort` / `shutdown` / `despawn` 都要挂满交给它的整个超时。
+        """
+        await broker.ensure_queue('a1')
+        taking = asyncio.create_task(
+            broker.take_by_correlation('a1', 'c1', timeout=_TIMEOUT_NEVER_REACHED)
+        )
+        await _park(taking, 'take_by_correlation')
+        await broker.publish('a1', _msg('noise'))
+        await _cancel_must_take_effect(taking, 'take_by_correlation', _TIMEOUT_NEVER_REACHED)
+
+    async def test_cancelling_wait_for_messages_ends_it_instead_of_burning_its_timeout(
+        self, broker: MessageBroker
+    ) -> None:
+        """同一条义务落在另一个阻塞方法上。
+
+        `asyncio.wait_for` 的那个陷阱与方法无关：内层 future 已经就绪时到达的取消一律被它吃掉，
+        而这里吃掉的后果不是挂满超时而是**更隐蔽的那一种**——这次调用照常交回 True，于是
+        `kill` / `shutdown` 取消不掉停在这里的执行体，它接着往下跑。
+        """
+        await broker.ensure_queue('a1')
+        waiting = asyncio.create_task(
+            broker.wait_for_messages('a1', timeout=_TIMEOUT_NEVER_REACHED)
+        )
+        await _park(waiting, 'wait_for_messages')
+        await broker.publish('a1', _msg())
+        await _cancel_must_take_effect(waiting, 'wait_for_messages', _TIMEOUT_NEVER_REACHED)
+
     async def test_cancelling_take_by_correlation_leaves_the_match_takeable(
         self, broker: MessageBroker
     ) -> None:
-        """取消一次取，那条匹配的消息要么已经交回，要么还在邮箱里——不存在第三种结局。
+        """取消一次取，那条匹配的消息要么已经交回，要么还能再取一次——不存在第三种结局。
 
         逐个取消点扫一遍而不是只取消一次：能吃掉消息的窗口在「已摘出邮箱、还没返回」之间，而它落在
         第几个调度步上是实现的自由度。这里数的步数只决定这一遍**扫到哪里**，每一步上的断言本身与
         步数无关，因此结论不随解释器版本变化。
+
+        摘掉与返回之间不留挂起点的实现走不进「被取消」那一支（取消永远落在一个已完成的任务上），
+        因此本用例对它只执行另一支；这条义务真的还活着由一个刻意在那个窗口里挂起的实现来证明。
         """
         await broker.ensure_queue('a1')
         for steps in range(1, _CANCEL_SWEEP + 1):
@@ -327,6 +392,47 @@ class MessageBrokerContract(ContractSuite):
                 f'期望第 {steps} 轮结束时邮箱回到空：一条消息只该被交付一次。'
                 ' 实际邮箱里还有东西，说明这一轮既交回了消息、又把它留在了邮箱里。'
                 ' 让取出即移出邮箱（consume 恰好一次）。'
+            )
+
+    async def test_a_cancelled_take_leaves_the_match_on_the_ordinary_consume_path(
+        self, broker: MessageBroker
+    ) -> None:
+        """「仍在邮箱里」指的是 `consume` 与 `wait_for_messages` 看得见它，不只是「再 take 一次」。
+
+        内核依赖的正是这一条：被中止的那次等待返回之后，这条答复退回成一条普通消息，由门在下一轮
+        开始前 `consume` 进上下文。只对 take 可见的实现（未确认条目不进普通消费路径）会让
+        `wait_for_messages` 答 False、`consume` 交出空列表，那条答复于是静默消失，而 `publish`
+        早已回过 `ok=True`。
+        """
+        await broker.ensure_queue('a1')
+        for steps in range(1, _CANCEL_SWEEP + 1):
+            await broker.publish('a1', _msg('answer', correlation_id='c1'))
+            taking = asyncio.create_task(
+                broker.take_by_correlation('a1', 'c1', timeout=_WAKE_TIMEOUT)
+            )
+            for _ in range(steps):
+                if taking.done():
+                    break
+                await asyncio.sleep(0)
+            taking.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await taking
+            if not taking.cancelled():
+                assert taking.result() is not None
+                continue
+            assert await broker.wait_for_messages('a1', 0) is True, (
+                f'期望 take_by_correlation 被取消（第 {steps} 个调度步）之后，'
+                'wait_for_messages 看得见那条没人收下的答复。'
+                ' 实际它答 False：这条消息只对 take 可见（未确认条目没回到普通消费路径），'
+                '而门靠 wait_for_messages 与 consume 把它注入下一轮。'
+                ' 让 consume / wait_for_messages 先读自己的 pending'
+                '（`XREADGROUP ... STREAMS key 0` 或 `XAUTOCLAIM`）。'
+            )
+            assert [message.content for message in await broker.consume('a1')] == ['answer'], (
+                f'期望 take_by_correlation 被取消（第 {steps} 个调度步）之后，'
+                'consume 交出那条没人收下的答复。'
+                ' 实际它没交出来：那条答复静默消失了，而 publish 早已回过 ok=True。'
+                ' 让 consume 先读自己的 pending，未确认的条目才真的回到了普通消费路径上。'
             )
 
     async def test_take_by_correlation_on_unknown_queue_answers_none_without_waiting(

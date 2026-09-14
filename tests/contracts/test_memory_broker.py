@@ -37,6 +37,120 @@ def _msg(content: str = 'hi', *, correlation_id: str | None = None) -> Message:
     return Message(sender='s', receiver='a1', content=content, correlation_id=correlation_id)
 
 
+class _AcksAfterTaking(InMemoryMessageBroker):
+    """刻意不合规：摘掉与返回之间留一个挂起点（ack / 审计写入的位置）。
+
+    取消落进那个窗口就销毁一条答复，而这正是那两条契约用例要挡的东西。摘掉与返回之间不留挂起点的
+    实现走不进它们的「被取消」那一支，于是那一支的断言对合规实现从不执行——义务本身还活着没有任何
+    东西证明。这个类就是那个证明：它必须让那两条用例变红。
+    """
+
+    async def take_by_correlation(
+        self,
+        agent_id: str,
+        correlation_id: str,
+        timeout: float | None,  # noqa: ASYNC109
+    ) -> Message | None:
+        taken = await super().take_by_correlation(agent_id, correlation_id, timeout)
+        if taken is not None:
+            await asyncio.sleep(0)
+        return taken
+
+
+class _KeepsThePendingEntryAwayFromConsume(InMemoryMessageBroker):
+    """刻意不合规，而且是**合法替换**那一型：既不抛也不说谎，只是另一种选择。
+
+    被取消的那次取把消息挪进一份 pending，此后只对 `take_by_correlation` 与 `wait_for_messages`
+    可见——Redis 消费组的 pending entry 原样照抄就是这个形状。它满足「取消之后那条消息还能再取一次」
+    的每一个字，而门靠 `consume` 把它注入下一轮，于是那条答复静默消失、`publish` 早已回过 ok=True。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending: dict[str, list[Message]] = {}
+
+    async def take_by_correlation(
+        self,
+        agent_id: str,
+        correlation_id: str,
+        timeout: float | None,  # noqa: ASYNC109
+    ) -> Message | None:
+        held = self._pending.get(agent_id, [])
+        for index, message in enumerate(held):
+            if message.correlation_id == correlation_id:
+                return held.pop(index)
+        taken = await super().take_by_correlation(agent_id, correlation_id, timeout)
+        if taken is None:
+            return None
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            self._pending.setdefault(agent_id, []).append(taken)
+            raise
+        return taken
+
+    async def wait_for_messages(
+        self,
+        agent_id: str,
+        timeout: float | None,  # noqa: ASYNC109
+    ) -> bool:
+        if self._pending.get(agent_id):
+            return True
+        return await super().wait_for_messages(agent_id, timeout)
+
+
+class _SwallowsTheCancel(InMemoryMessageBroker):
+    """刻意不合规：两个阻塞方法的内层等待都用 `asyncio.wait_for`，即本实现修掉之前的写法。
+
+    内层 future 已经就绪时到达的取消被 `wait_for` 当成「结果已到」吃掉：`take_by_correlation` 因此
+    挂满整个超时，而 `wait_for_messages` 更隐蔽——它照常交回 True，取消静默失效。
+    """
+
+    async def wait_for_messages(
+        self,
+        agent_id: str,
+        timeout: float | None,  # noqa: ASYNC109
+    ) -> bool:
+        mailbox = self._mailboxes.get(agent_id)
+        if mailbox is None:
+            return False
+        if mailbox.messages:
+            return True
+        try:
+            await asyncio.wait_for(mailbox.nonempty.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        if self._mailboxes.get(agent_id) is not mailbox:
+            return False
+        return bool(mailbox.messages)
+
+    async def take_by_correlation(
+        self,
+        agent_id: str,
+        correlation_id: str,
+        timeout: float | None,  # noqa: ASYNC109
+    ) -> Message | None:
+        mailbox = self._mailboxes.get(agent_id)
+        if mailbox is None:
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        while True:
+            mailbox.arrival.clear()
+            for index, message in enumerate(mailbox.messages):
+                if message.correlation_id == correlation_id:
+                    return mailbox.messages.pop(index)
+            remaining = None if deadline is None else deadline - loop.time()
+            if remaining is not None and remaining <= 0:
+                return None
+            try:
+                await asyncio.wait_for(mailbox.arrival.wait(), timeout=remaining)
+            except TimeoutError:
+                return None
+            if self._mailboxes.get(agent_id) is not mailbox:
+                return None
+
+
 class TestInMemoryMessageBroker(MessageBrokerContract):
     @pytest.fixture
     def broker(self) -> MessageBroker:
@@ -103,3 +217,54 @@ class TestInMemoryMessageBroker(MessageBrokerContract):
         await broker.remove_queue('a1')
         assert await waiting is None
         assert time.monotonic() - started < _MAX_WAKE_LATENCY
+
+
+async def test_the_cancel_sweep_catches_a_broker_that_destroys_the_match():
+    with pytest.raises(AssertionError) as info:
+        await MessageBrokerContract().test_cancelling_take_by_correlation_leaves_the_match_takeable(
+            _AcksAfterTaking()
+        )
+    assert '仍能再取一次' in str(info.value)
+
+
+async def test_the_consume_path_case_catches_a_broker_that_destroys_the_match():
+    suite = MessageBrokerContract()
+    case = suite.test_a_cancelled_take_leaves_the_match_on_the_ordinary_consume_path
+    with pytest.raises(AssertionError) as info:
+        await case(_AcksAfterTaking())
+    assert 'consume' in str(info.value)
+
+
+async def test_the_prompt_cancel_case_catches_a_broker_that_swallows_the_cancel():
+    suite = MessageBrokerContract()
+    with pytest.raises(AssertionError) as info:
+        await suite.test_cancelling_take_by_correlation_ends_it_instead_of_burning_its_timeout(
+            _SwallowsTheCancel()
+        )
+    assert 'asyncio.timeout' in str(info.value)
+
+
+async def test_the_prompt_cancel_case_catches_a_wait_for_messages_that_swallows_the_cancel():
+    suite = MessageBrokerContract()
+    with pytest.raises(AssertionError) as info:
+        await suite.test_cancelling_wait_for_messages_ends_it_instead_of_burning_its_timeout(
+            _SwallowsTheCancel()
+        )
+    assert '静默失效' in str(info.value)
+
+
+async def test_the_consume_path_case_catches_a_pending_entry_consume_cannot_see():
+    """「仍在邮箱里」若只定义成「再 take 一次还取得到」，这个实现整套契约全绿。
+
+    它就是评审那条 Critical 的形状：接进 Runtime 之后，一次被中止的等待返回 ABORTED，而那条答复
+    既不在 `consume` 里、也不在轨迹里、零 ERROR，`send` 却早已回过 ok=True。
+    """
+    suite = MessageBrokerContract()
+    broker = _KeepsThePendingEntryAwayFromConsume()
+    # 先证明它确实是「合法替换」而不是一个坏得显眼的实现：旧的那条义务它满足。
+    await suite.test_cancelling_take_by_correlation_leaves_the_match_takeable(broker)
+
+    case = suite.test_a_cancelled_take_leaves_the_match_on_the_ordinary_consume_path
+    with pytest.raises(AssertionError) as info:
+        await case(_KeepsThePendingEntryAwayFromConsume())
+    assert 'consume 交出' in str(info.value)
