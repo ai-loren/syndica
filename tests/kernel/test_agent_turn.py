@@ -2115,3 +2115,27 @@ async def test_a_rejected_second_gate_leaves_the_first_one_driving_the_turns(via
     await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
 
     assert (first.turns, second.turns) == ([1], [])
+
+
+async def test_the_query_block_carries_the_trust_level_the_caller_declared():
+    """门那条路早就带着信任级别（`Message.trust` 经 `_inject` 原样落进块），直接输入这条也必须
+    能表达同一件事：派活与分叉交给子 Agent 的第一条输入是模型写的文字，标记丢在这里，子 Agent
+    的高风险调用就绕过了 spec §12.2 第 3 条那道关不掉的升级。
+    """
+    agent, _ = _agent([ScriptedTurn(content='ok')])
+
+    ctx = await asyncio.wait_for(agent.run('go', trust=TrustLevel.UNTRUSTED), timeout=_TIMEOUT)
+
+    assert [block.trust for block in ctx.current_traj if block.role == 'user'] == [
+        TrustLevel.UNTRUSTED
+    ]
+
+
+async def test_a_query_is_trusted_unless_the_caller_says_otherwise():
+    agent, _ = _agent([ScriptedTurn(content='ok')])
+
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert [block.trust for block in ctx.current_traj if block.role == 'user'] == [
+        TrustLevel.TRUSTED
+    ]

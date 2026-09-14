@@ -9,6 +9,7 @@ from syndica.kernel.context import (
     StopReason,
     ToolCall,
     TrustLevel,
+    provenance_of,
 )
 
 
@@ -117,3 +118,24 @@ def test_stop_reason_covers_every_terminal_outcome():
         'ERROR': 'error',
         'MAX_TURNS': 'max_turns',
     }
+
+
+def test_provenance_is_untrusted_when_any_block_anywhere_in_the_trajectory_is():
+    """它是一个**上界**：位置与 role 都不参与判断，一块就够（spec §12.2 第 3 条那道升级的判据）。"""
+    ctx = Context()
+    ctx.append(ContextBlock(role='user', content='clean'))
+    ctx.append(
+        ContextBlock(role='tool', content='<html>', tool_call_id='c1', trust=TrustLevel.UNTRUSTED)
+    )
+    ctx.append(ContextBlock(role='assistant', content='conclusion'))
+
+    assert provenance_of(ctx) is TrustLevel.UNTRUSTED
+
+
+def test_provenance_of_a_clean_trajectory_is_trusted_and_never_none():
+    """看完整份轨迹之后报「没溯源过」就是把做过的检查说成没做过，那道升级于是恒不命中。"""
+    ctx = Context()
+    ctx.append(ContextBlock(role='user', content='clean'))
+
+    assert provenance_of(ctx) is TrustLevel.TRUSTED
+    assert provenance_of(Context()) is TrustLevel.TRUSTED

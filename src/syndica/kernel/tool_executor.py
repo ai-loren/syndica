@@ -105,7 +105,14 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any, cast
 
-from syndica.kernel.context import Context, ContextBlock, ToolCall, TrustLevel
+from syndica.kernel.context import (
+    Context,
+    ContextBlock,
+    ToolCall,
+    TrustLevel,
+    provenance_of,
+    strictest_trust,
+)
 from syndica.kernel.danger import (
     BlockHighRisk,
     DangerJudge,
@@ -381,24 +388,6 @@ class _JudgeFailure(Exception):
         self.original = original
 
 
-def _provenance(ctx: Context) -> TrustLevel:
-    """这一批调用的参数能不能溯源到不可信内容。
-
-    交回 `TrustLevel` 而不是 `TrustLevel | None`：`None` 在 `DangerRequest` 上表示「没溯源过」，
-    而这里刚刚看完整份轨迹，报 `None` 就是把做过的检查说成没做过，那道强制升级于是恒不命中。
-    """
-    if any(block.trust is TrustLevel.UNTRUSTED for block in ctx.current_traj):
-        return TrustLevel.UNTRUSTED
-    return TrustLevel.TRUSTED
-
-
-def _strictest_trust(first: TrustLevel, second: TrustLevel) -> TrustLevel:
-    """两个溯源结论里更严的那个。批快照是**下界**：一次重算不得洗掉它已经查到的不可信内容。"""
-    if TrustLevel.UNTRUSTED in (first, second):
-        return TrustLevel.UNTRUSTED
-    return TrustLevel.TRUSTED
-
-
 def _gated_result(call: ToolCall, verdict: DangerVerdict, disposition: Disposition) -> ToolResult:
     """被闸拦下的调用交给模型的那一块。
 
@@ -535,7 +524,7 @@ class ToolExecutor:
         self._max_concurrency = max_concurrency
 
     async def execute_tool_calls(self, ctx: Context, tool_calls: list[ToolCall]) -> None:
-        provenance = _provenance(ctx)
+        provenance = provenance_of(ctx)
         safety = [self._concurrency_safe(call) for call in tool_calls]
         handled = 0
         failure: Exception | None = None
@@ -701,7 +690,7 @@ class ToolExecutor:
             provenance = (
                 TrustLevel.UNTRUSTED
                 if has_siblings
-                else _strictest_trust(provenance, _provenance(ctx))
+                else strictest_trust(provenance, provenance_of(ctx))
             )
         # 拆掉只读视图：闸、工具与 POST 切点拿到的永远是一份普通 dict。留着它，一个 POST hook 的
         # 就地写会撞上一条指名 pre_tool_use 的错误——而那个切点根本不读 modified['args']。

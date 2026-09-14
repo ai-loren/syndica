@@ -20,6 +20,8 @@ __all__ = [
     'StopReason',
     'ToolCall',
     'TrustLevel',
+    'provenance_of',
+    'strictest_trust',
 ]
 
 Role = Literal['system', 'user', 'assistant', 'tool']
@@ -82,3 +84,32 @@ class Context:
 
     def append(self, block: ContextBlock) -> None:
         self._blocks.append(block)
+
+
+def provenance_of(ctx: Context) -> TrustLevel:
+    """这份轨迹能不能溯源到不可信内容——spec §12.2 第 3 条那道强制升级的判据。
+
+    当前形态是「轨迹里出现过 `trust=UNTRUSTED` 的 block」，它是**上界**而不是因果链：只会多判，
+    不会少判，而少判才是那道升级要防的方向。完整的溯源要接产物溯源（spec §7.3）与 trace 因果链
+    （§11.1）。
+
+    **永不交 `None`。** 看完整份轨迹之后报「没溯源过」就是把做过的检查说成没做过，那道升级于是
+    恒不命中而调用方以为有它。
+
+    定义只有这一份：闸（这次调用该不该升级处置）与编排工具（派出去的活该不该带着标记）问的是
+    同一个问题，两份实现会在其中一处收紧时静默分叉，而分叉出来的那一侧就是洗白路径。
+    """
+    if any(block.trust is TrustLevel.UNTRUSTED for block in ctx.current_traj):
+        return TrustLevel.UNTRUSTED
+    return TrustLevel.TRUSTED
+
+
+def strictest_trust(first: TrustLevel, second: TrustLevel) -> TrustLevel:
+    """两个信任级别里更严的那个。
+
+    合并两份溯源结论时**只能往严的方向**走：标记只会因为没查到而丢，不会因为查到了而多出来，
+    所以任何一侧报不可信就是不可信。反过来取松的那个等于让其中一次检查作废。
+    """
+    if TrustLevel.UNTRUSTED in (first, second):
+        return TrustLevel.UNTRUSTED
+    return TrustLevel.TRUSTED

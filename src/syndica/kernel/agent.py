@@ -76,7 +76,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
-from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall
+from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall, TrustLevel
 from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
 from syndica.kernel.danger import DangerJudge, DangerPolicy, validate_danger_options
 from syndica.kernel.errors import ContractViolation, LLMResponseError
@@ -447,12 +447,19 @@ class BaseAgent:
         """必须逐轮返回字节一致的结果：SP 变一个字节，该会话此后所有请求缓存全失效。"""
         return self.options.system_prompt
 
-    async def run(self, query: str | None = None) -> Context:
+    async def run(
+        self, query: str | None = None, *, trust: TrustLevel = TrustLevel.TRUSTED
+    ) -> Context:
         """跑一个工作周期。
 
         `query=None` 表示「这一次的输入从门里来」——事件循环被一条消息唤醒时走的就是这条路，
         消息由门在第一轮开始前消费并注入。**只有一条消费路径**：中途插话与唤醒用的是同一段代码，
         两者的行为因此不会分叉。
+
+        `trust` 是 `query` 那一块的信任级别。门那条路早就带着它（`Message.trust` 经 `_inject`
+        原样落进块），这一条也必须能表达同一件事：派活与分叉交给子 Agent 的第一条输入是模型写下
+        的文字，而模型读过什么决定了那段文字是什么的衍生物（spec §12.2 第 2 条）。标记丢在这里，
+        子 Agent 的高风险调用就绕过了 §12.2 第 3 条那道关不掉的升级。
         """
         if self._running:
             raise _concurrent_run(self.agent_id)
@@ -460,16 +467,16 @@ class BaseAgent:
         # BaseException：取消之后这个实例仍要能被 resume（入口的修复正是为它准备的）。
         self._running = True
         try:
-            return await self._run(query)
+            return await self._run(query, trust)
         finally:
             self._running = False
 
-    async def _run(self, query: str | None) -> Context:
+    async def _run(self, query: str | None, trust: TrustLevel) -> Context:
         ctx = self._context
         ctx.stop_reason = None
         _repair_interrupted_batch(ctx)
         if query is not None:
-            ctx.append(ContextBlock(role='user', content=query))
+            ctx.append(ContextBlock(role='user', content=query, trust=trust))
         await self._emit('agent_start', {})
         await self._hooks.trigger(Junction.AGENT_START, ctx=ctx)
         # Exception 而非 BaseException：取消既不是正常结束也不是失败，展开的路上不再触发切点、
