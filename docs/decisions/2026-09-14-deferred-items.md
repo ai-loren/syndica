@@ -41,17 +41,11 @@
 
 ## 有主待做（里程碑 1 内）
 
-### 归计划 2 Task 15（余下三个编排工具）
-
-| # | 内容 |
-|---|---|
-| D-45 | **本任务新增的名字，哪些计入公开面。** 原文只写了三个（`wait_in_turn` / `InTurnWaitResult` / `validate_agent_factories`），而后两个根本不在 `Runtime` 上；真正让 `Runtime` 的公开方法数从 spec §4.2 刻意收紧的 11 涨到 16 的那四个（`agent_names` / `agent_factory` / `factory_of` / `provenance_of`）一个都没登记进来 | Task 14 修复轮裁决并落地，**不留给 Task 16**：`wait_in_turn` / `InTurnWaitResult` / `factory_of` / `provenance_of` 降为 `Runtime._wait_in_turn` / `_InTurnWaitResult` / `_factory_of` / `_provenance_of`。依据是逐个查过调用方——五个新名字**全都只有一个内核内调用方、零个宿主侧调用方**（`_wait_in_turn` ← `_collected`；`_factory_of` ← `Fork`；`_provenance_of` ← `Delegate`；`agent_factory` / `agent_names` ← `Delegate`），而 `Delegate` / `Fork` 住在 `syndica.kernel.tools`、本来就在内核里。**加一个公开方法不是破坏性变更，去掉一个是**，所以「先私有、有第三方要再放出来」严格优于「先公开、Task 16 再收」。留在公开面的是 11 + `shutdown` + `plugins` + 角色表读面两项（`agent_factory` / `agent_names`）——后两项是 spec §4.7 拓扑那一侧真正的新能力，不混进 §4.2 的等待面计数。`context.provenance_of` / `context.strictest_trust` 是**模块级函数**、判据的单一定义落点，保持可用；`validate_agent_factories` 与 `validate_tool_names` / `validate_danger_options` / `validate_max_concurrency` 同族，留在 `runtime.__all__`。**守卫**：`test_public_api.test_the_runtime_surface_is_exactly_this` 按一个真实实例枚举 `dir()` 里的非下划线名字并逐字比对（按实例而不是按类——`registry` / `broker` / `events` / `hooks` 是 `__init__` 里赋的实例属性，宿主读写的正是这四个）。它是唯一会因为「顺手加一个公开方法」而变红的东西：`kernel.__all__` 只导出 `Runtime` 这一个名字，对它上面新增的方法完全无感（实测把 `_wait_in_turn` 放回公开面，这条守卫变红）。**仍归 Task 16** 的是另一件事：`Delegate` / `Fork` 以及 `validate_agent_factories` 尚未进 `kernel.__all__`，与 D-24 / D-30 / D-41 同型。**Task 15 把这份清单扩到七个**：`SendMessage` / `QueryAgent` / `KillAgent` / `orchestration_tools` 同样只在 `syndica.kernel.tools` 里，只用公开包面的宿主装不出那五件套、也写不出工具的类型标注；而 `Runtime(orchestration=True)` 已经是公开构造签名的一部分——又一处「公开面自相矛盾」 |
-| D-49 | **`validate_tool_names` 收到一个非 Mapping 时撞裸 `AttributeError`**（`'list' object has no attribute 'items'`），三件套零条。与本轮修掉的 `validate_agent_factories`（M-2）逐字同型，而 spec §4.6 的声明式清单里 `tools: [Read, Grep, Glob]` 正是它的明文写法，所以触发面与角色表一样顺手。`validate_danger_options` / `validate_max_concurrency` 不收映射，不在此列 | 归**计划 3（声明式 Agent 定义 —— 工具注册层）**：清单会在那里被转成 tools dict，是这条检查唯一的收口点。修法与 `validate_agent_factories` 相同（`isinstance(..., Mapping)` 在遍历之前，三件套点名该写成什么）。**本轮刻意只修角色表那一半**：`Runtime(agents=...)` 是本任务引入的入口，而工具表那一半是存量违反，跨模块同步收紧属计划 3 的范围 |
-
 ### 归计划 3（声明式 Agent 定义 —— 工具注册层）
 
 | # | 内容 |
 |---|---|
+| D-49 | **`validate_tool_names` 收到一个非 Mapping 时撞裸 `AttributeError`**（`'list' object has no attribute 'items'`），三件套零条。与本轮修掉的 `validate_agent_factories`（M-2）逐字同型，而 spec §4.6 的声明式清单里 `tools: [Read, Grep, Glob]` 正是它的明文写法，所以触发面与角色表一样顺手。`validate_danger_options` / `validate_max_concurrency` 不收映射，不在此列 | 归**计划 3（声明式 Agent 定义 —— 工具注册层）**：清单会在那里被转成 tools dict，是这条检查唯一的收口点。修法与 `validate_agent_factories` 相同（`isinstance(..., Mapping)` 在遍历之前，三件套点名该写成什么）。**本轮刻意只修角色表那一半**：`Runtime(agents=...)` 是本任务引入的入口，而工具表那一半是存量违反，跨模块同步收紧属计划 3 的范围 |
 | D-08 | 手写 schema 的 `name` 键可与 `tool.name` 分叉（模型按前者调用、注册表按后者索引）。当前行为已钉住，但守卫属**注册层**——声明式清单会从 manifest 构造 tools dict，那里是唯一收口点 |
 
 ### 归计划 4（第一个 backend + provider）
@@ -94,6 +88,7 @@
 
 | # | 内容 |
 |---|---|
+| D-45 | **本任务新增的名字，哪些计入公开面。** 原文只写了三个（`wait_in_turn` / `InTurnWaitResult` / `validate_agent_factories`），而后两个根本不在 `Runtime` 上；真正让 `Runtime` 的公开方法数从 spec §4.2 刻意收紧的 11 涨到 16 的那四个（`agent_names` / `agent_factory` / `factory_of` / `provenance_of`）一个都没登记进来 | Task 14 修复轮裁决并落地，**不留给 Task 16**：`wait_in_turn` / `InTurnWaitResult` / `factory_of` / `provenance_of` 降为 `Runtime._wait_in_turn` / `_InTurnWaitResult` / `_factory_of` / `_provenance_of`。依据是逐个查过调用方——五个新名字**全都只有一个内核内调用方、零个宿主侧调用方**（`_wait_in_turn` ← `_collected`；`_factory_of` ← `Fork`；`_provenance_of` ← `Delegate`；`agent_factory` / `agent_names` ← `Delegate`），而 `Delegate` / `Fork` 住在 `syndica.kernel.tools`、本来就在内核里。**加一个公开方法不是破坏性变更，去掉一个是**，所以「先私有、有第三方要再放出来」严格优于「先公开、Task 16 再收」。留在公开面的是 11 + `shutdown` + `plugins` + 角色表读面两项（`agent_factory` / `agent_names`）——后两项是 spec §4.7 拓扑那一侧真正的新能力，不混进 §4.2 的等待面计数。`context.provenance_of` / `context.strictest_trust` 是**模块级函数**、判据的单一定义落点，保持可用；`validate_agent_factories` 与 `validate_tool_names` / `validate_danger_options` / `validate_max_concurrency` 同族，留在 `runtime.__all__`。**守卫**：`test_public_api.test_the_runtime_surface_is_exactly_this` 按一个真实实例枚举 `dir()` 里的非下划线名字并逐字比对（按实例而不是按类——`registry` / `broker` / `events` / `hooks` 是 `__init__` 里赋的实例属性，宿主读写的正是这四个）。它是唯一会因为「顺手加一个公开方法」而变红的东西：`kernel.__all__` 只导出 `Runtime` 这一个名字，对它上面新增的方法完全无感（实测把 `_wait_in_turn` 放回公开面，这条守卫变红）。**仍归 Task 16** 的是另一件事：`Delegate` / `Fork` 以及 `validate_agent_factories` 尚未进 `kernel.__all__`，与 D-24 / D-30 / D-41 同型。**Task 15 把这份清单扩到七个**：`SendMessage` / `QueryAgent` / `KillAgent` / `orchestration_tools` 同样只在 `syndica.kernel.tools` 里，只用公开包面的宿主装不出那五件套、也写不出工具的类型标注；而 `Runtime(orchestration=True)` 已经是公开构造签名的一部分——又一处「公开面自相矛盾」 |
 | D-24 | **`waiting` 的六个名字尚未进 `kernel.__all__`**（`Waiter` / `UserInput` / `Confirmation` / `Reply` / `WaitResult` / `WaitState`）。后果不只是导出面不全——只用公开包面的人**调不了** `Runtime.wait_for`（构造不出入参）。计划 Task 16 的 59 项清单已含它们，但 `test_public_api.py` 逐字写死，忘了改**不会**变红 |
 | D-25 | `__all__` 内容全仓无测试覆盖（子模块级）。计划 1 的 Task 4 与 Task 9 各挂过一次，是同一条。`kernel.__all__` 有守卫，子模块没有 |
 | D-26 | **`ABORTING` 分支扩大了 `wait_for` 的成功面**：`kill` 之后（`_reap` 未跑完那段）调 `wait_for` 现在交回 `ABORTED` 而不再拒绝。计划 2 Task 9 判断这是对的，但它是新行为 |
