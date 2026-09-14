@@ -74,7 +74,7 @@ from typing import Any, cast
 
 from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall
 from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
-from syndica.kernel.danger import DangerJudge, DangerPolicy
+from syndica.kernel.danger import DangerJudge, DangerPolicy, validate_danger_options
 from syndica.kernel.errors import ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
@@ -94,7 +94,8 @@ class AgentOptions:
     executor 里，宿主才能在声明的那一行拿到错误。**不替换成副本**：executor 与本字段共享同一个
     dict 对象，热插拔靠的就是这个。
 
-    `danger_judge` / `danger_policy` 为 `None` 时用内核默认（默认规则表 + 高风险阻断）。字段顺序
+    `danger_judge` / `danger_policy` 为 `None` 时用内核默认（默认规则表 + 高风险阻断）。两者与
+    `tools` 相反：**executor 在构造时把它们取走**，此后改本字段对已经建好的 Agent 无效。字段顺序
     计入公开 API，新字段只能追加在末尾。
     """
 
@@ -109,6 +110,7 @@ class AgentOptions:
 
     def __post_init__(self) -> None:
         validate_tool_names(self.tools)
+        validate_danger_options(self.danger_judge, self.danger_policy)
 
 
 def _is_empty(block: ContextBlock) -> bool:

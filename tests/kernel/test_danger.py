@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import os
 from collections.abc import Iterator
 from collections.abc import Set as AbstractSet
 from pathlib import Path
@@ -1059,11 +1060,16 @@ def test_the_forced_escalation_runs_before_the_return_value_is_even_needed():
 # 逐字写死：这条约束只在 docstring 里说过，typing 看不见、运行期不警告，本扫描是它唯一的守卫。
 _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica'
 _DECIDE_CALLERS: tuple[str, ...] = ('kernel/danger.py',)
+# 内核唯一的处置调用点。守卫必须证明自己看过它，否则把扫描范围收窄到只剩期望答案就能让守卫永远绿。
+_GATE_CALL_SITE = 'kernel/tool_executor.py'
 
 
-def _modules_calling_decide() -> list[str]:
+def _modules_calling_decide() -> tuple[list[str], list[str]]:
+    """(调 `.decide(` 的文件, 本次真的扫过的文件)。"""
     callers: list[str] = []
+    scanned: list[str] = []
     for path in sorted(_PACKAGE.rglob('*.py')):
+        scanned.append(path.relative_to(_PACKAGE).as_posix())
         tree = ast.parse(path.read_text(encoding='utf-8'))
         if any(
             isinstance(node, ast.Call)
@@ -1072,7 +1078,29 @@ def _modules_calling_decide() -> list[str]:
             for node in ast.walk(tree)
         ):
             callers.append(path.relative_to(_PACKAGE).as_posix())
-    return callers
+    return callers, scanned
+
+
+def _package_python_files() -> set[str]:
+    """包里全部 `.py`，用 `os.walk` 独立走一遍。
+
+    与守卫自己的 `rglob` 是两套遍历：范围被收窄时，两份清单只有同时改才对得上。
+    """
+    found: set[str] = set()
+    for root, _, names in os.walk(_PACKAGE):
+        for name in names:
+            if name.endswith('.py'):
+                found.add((Path(root) / name).relative_to(_PACKAGE).as_posix())
+    return found
+
+
+def test_the_policy_call_site_scan_really_covers_the_whole_package():
+    """守卫的自检。期望值写死挡得住「扫描根写错」（清单会空掉），挡不住**把范围收窄到只剩期望
+    答案**：`rglob('danger.py')` 让调用者清单仍然逐字等于写死的期望值、全绿，而此后它对包里任何
+    别的文件都是瞎的——而它唯一的价值正是抓那些还没有行为用例覆盖的新文件。"""
+    _, scanned = _modules_calling_decide()
+    assert _GATE_CALL_SITE in scanned
+    assert set(scanned) == _package_python_files()
 
 
 def test_disposition_of_is_the_only_place_in_the_package_that_consults_a_policy():
@@ -1081,7 +1109,7 @@ def test_disposition_of_is_the_only_place_in_the_package_that_consults_a_policy(
     扫描而不是靠约定：调用方看不出区别（两者都交回一个 `Disposition`），症状是**放行**，而且只在
     「高风险 + 可溯源到不可信」同时成立时才现身。
     """
-    callers = _modules_calling_decide()
+    callers, _ = _modules_calling_decide()
     assert callers == list(_DECIDE_CALLERS), (
         f'期望 src/syndica 里只有 {list(_DECIDE_CALLERS)} 调 DangerPolicy.decide。'
         f' 实际调它的是 {callers}。'

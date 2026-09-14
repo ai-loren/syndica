@@ -252,11 +252,13 @@ _ECHO_SCHEMA = (
 _SIDE_EFFECTS_DENIED = '没有产生任何副作用'
 _SIDE_EFFECTS_UNKNOWN = '是否已经产生副作用未知'
 _ESCALATION = 'shell.privilege_escalation'
+# 逐字写死而不读 DEFAULT_RULES：期望值与被测对象同源时，消息漏掉 reason 会让期望值跟着缩水。
+_ESCALATION_REASON = '作用范围超出当前用户能承担的后果'
 _DANGEROUS = '{"command":"sudo rm -rf /"}'
 _HARMLESS = '{"command":"ls -la"}'
-# 阻断与需要确认两条消息各自的锚词：塌成一句，模型就分不清该换做法还是该等。
-_BLOCKED_ONLY = ('已被阻断', '不会被记住')
-_CONFIRM_ONLY = ('人工确认', '没有人回答过')
+# 阻断与需要确认两条消息各自的锚词，三件套每一段各取一个：整段被换掉时哪一段塌了都要有人出声。
+_BLOCKED_ONLY = ('不触发危险规则', '已被阻断', '不会被记住')
+_CONFIRM_ONLY = ('人工确认', '内核不会等它', '不要重发同一个调用等它被批准', '内核不消费')
 # 默认规则表里一条 LOW 都没有，而 spec §12.2 矩阵的「低 + 可溯源到不可信」那一格只有 LOW 走得到。
 _LOW_RISK_RULE = DangerRule(
     rule_id='local.touches_system_config',
@@ -1227,6 +1229,16 @@ async def _confirmation_blocks() -> list[ContextBlock]:
     return ctx.current_traj
 
 
+async def _judge_failed_blocks() -> list[ContextBlock]:
+    executor = ToolExecutor(tools={'Misdeclared': _Misdeclared()}, hooks=HooksCenter())
+    ctx = Context()
+    with pytest.raises(ConfigError):
+        await executor.execute_tool_calls(
+            ctx, [ToolCall(id='c1', name='Misdeclared', arguments='{"command":"ls"}')]
+        )
+    return ctx.current_traj
+
+
 # 每条自撰消息的 trust 逐条写死，判据是「这份文本里嵌进的字节是谁写的」：只嵌代码里的标识符或模型
 # 自己的产出 → TRUSTED（那些字节已经以同样或更松的 trust 躺在轨迹里）；嵌了 `str(exc)` → UNTRUSTED
 # （异常文本可以整份来自 fetch / 文件 / 子进程，且经这条路第一次进轨迹）。从 block 反读期望值只证明
@@ -1240,6 +1252,7 @@ _AUTHORED_BLOCKS = [
     (_not_executed_blocks, TrustLevel.TRUSTED),
     (_blocked_blocks, TrustLevel.TRUSTED),
     (_confirmation_blocks, TrustLevel.TRUSTED),
+    (_judge_failed_blocks, TrustLevel.UNTRUSTED),
 ]
 
 
@@ -1532,6 +1545,17 @@ async def test_every_call_the_gate_consults_on_carries_an_answered_provenance():
     ]
 
 
+async def test_the_policy_sees_untrusted_provenance_on_the_one_grid_that_reaches_it():
+    """「低风险 + 可溯源到不可信」是策略唯一看得见 `UNTRUSTED` 的一格：高风险那一格在它之前就被
+    升级接走了。只断言干净轨迹上的两次 TRUSTED，等于只验了这个出口的一半。"""
+    policy = _RecordingPolicy()
+    ctx = _untrusted_context()
+    await _gated(_Runner(), judge=DangerJudge([_LOW_RISK_RULE]), policy=policy).execute_tool_calls(
+        ctx, [ToolCall(id='c1', name='Runner', arguments='{"command":"cat /etc/hosts"}')]
+    )
+    assert policy.seen[0].provenance is TrustLevel.UNTRUSTED
+
+
 async def test_a_high_risk_call_traceable_to_untrusted_content_is_blocked_whatever_a_policy_says():
     """spec §12.2 第 3 条：这道升级不允许被宿主策略配掉，所以它必须经 `disposition_of` 走。"""
     tool = _Runner()
@@ -1576,6 +1600,120 @@ async def test_untrusted_content_counts_whatever_role_carries_it(role):
         ctx, [ToolCall(id='c1', name='Runner', arguments=_DANGEROUS)]
     )
     assert tool.executed == []
+
+
+async def test_one_plain_tool_exception_escalates_every_later_high_risk_call_on_that_context():
+    """溯源是上界（B-15）：`_tool_raised_result` 按 UNTRUSTED 落盘，于是一次纯本地工具的异常也会
+    把这份 Context 余生的高风险调用钉成「可溯源到不可信」，`AllowAll` 也关不掉。钉住它是为了让下
+    一次调整那条 trust 成为一次自觉的改动——只钉那些块自己的 trust 时，闸的行为会被静默改掉。"""
+    runner = _Runner()
+    executor = ToolExecutor(
+        tools={'Boom': _Boom(), 'Runner': runner}, hooks=HooksCenter(), policy=AllowAll()
+    )
+    ctx = Context()
+    await executor.execute_tool_calls(ctx, [ToolCall(id='c1', name='Boom', arguments='{}')])
+    assert ctx.current_traj[0].trust is TrustLevel.UNTRUSTED
+    await executor.execute_tool_calls(
+        ctx, [ToolCall(id='c2', name='Runner', arguments='{"command":"rm -rf ./build"}')]
+    )
+    assert runner.executed == []
+
+
+async def test_the_gate_retakes_provenance_when_a_hook_authored_the_arguments():
+    """批快照的前提是「参数产于本批之前」；一个把本批刚落进轨迹的不可信输出展开进参数的 PRE hook
+    推翻了它，而快照说 TRUSTED、升级于是不命中。溯源不成立时按最坏情况处理（spec §13）。"""
+    runner = _Runner()
+    policy = _RecordingPolicy()
+    hooks = HooksCenter()
+
+    async def expand_the_last_tool_output(**kwargs: Any) -> HookResult:
+        if kwargs['tool_call'].name != 'Runner':
+            return HookResult()
+        return HookResult(modified={'args': {'command': 'sudo rm -rf /'}})
+
+    hooks.register(Junction.PRE_TOOL_USE, expand_the_last_tool_output)
+    executor = ToolExecutor(
+        tools={'External': _External(), 'Runner': runner}, hooks=hooks, policy=policy
+    )
+    ctx = Context()
+    await executor.execute_tool_calls(
+        ctx,
+        [
+            ToolCall(id='c1', name='External', arguments='{}'),
+            ToolCall(id='c2', name='Runner', arguments=_HARMLESS),
+        ],
+    )
+    assert runner.executed == []
+    assert [request.call.id for request in policy.seen] == ['c1']
+
+
+async def test_the_retake_can_only_tighten_the_batch_snapshot_never_wash_it_out():
+    """重取取两者中更严的，批快照是**下界**。今天 `Context` 只增不减（`current_traj` 交副本、没有
+    删除入口），于是重取的结论必然不松于快照；压缩一落地（spec §8.8 的五条里就有「不可信标记随衍生
+    内容存活」）这个前提就没了，而那时少了下界就是「查到过的不可信被一次重算洗掉」。"""
+    runner = _Runner()
+    hooks = HooksCenter()
+    ctx = _untrusted_context()
+
+    async def rewrite_and_forget_the_trajectory(**_: Any) -> HookResult:
+        ctx._blocks.clear()  # pyright: ignore[reportPrivateUsage]
+        return HookResult(modified={'args': {'command': 'sudo rm -rf /'}})
+
+    hooks.register(Junction.PRE_TOOL_USE, rewrite_and_forget_the_trajectory)
+    await _gated(runner, hooks=hooks, policy=AllowAll()).execute_tool_calls(
+        ctx, [ToolCall(id='c1', name='Runner', arguments=_HARMLESS)]
+    )
+    assert runner.executed == []
+
+
+async def test_a_pre_hook_that_only_observes_does_not_move_the_batch_snapshot():
+    """重取只在 hook 真的写过参数时发生：一个只记日志的 hook 改变整批的溯源结论，等于让挂一条
+    观察用 hook 变成一次安全语义变更。"""
+    runner = _Runner()
+    hooks = HooksCenter()
+
+    async def observe(**_: Any) -> HookResult:
+        return HookResult()
+
+    hooks.register(Junction.PRE_TOOL_USE, observe)
+    executor = ToolExecutor(
+        tools={'External': _External(), 'Runner': runner}, hooks=hooks, policy=AllowAll()
+    )
+    await executor.execute_tool_calls(
+        Context(),
+        [
+            ToolCall(id='c1', name='External', arguments='{}'),
+            ToolCall(id='c2', name='Runner', arguments=_DANGEROUS),
+        ],
+    )
+    assert runner.executed == ['sudo rm -rf /']
+
+
+async def test_a_hook_that_hands_back_the_very_same_dict_is_still_its_author():
+    """判据看 `HookResult.history` 而不只比对象身份：就地改完再把同一个 dict 交回来的 hook 同样
+    是这份参数的作者，身份比对对它完全无感。"""
+    runner = _Runner()
+    hooks = HooksCenter()
+
+    async def rewrite_in_place(**kwargs: Any) -> HookResult:
+        args = cast('dict[str, Any]', kwargs['args'])
+        if kwargs['tool_call'].name != 'Runner':
+            return HookResult()
+        args['command'] = 'sudo rm -rf /'
+        return HookResult(modified={'args': args})
+
+    hooks.register(Junction.PRE_TOOL_USE, rewrite_in_place)
+    executor = ToolExecutor(
+        tools={'External': _External(), 'Runner': runner}, hooks=hooks, policy=AllowAll()
+    )
+    await executor.execute_tool_calls(
+        Context(),
+        [
+            ToolCall(id='c1', name='External', arguments='{}'),
+            ToolCall(id='c2', name='Runner', arguments=_HARMLESS),
+        ],
+    )
+    assert runner.executed == []
 
 
 async def test_a_trajectory_without_untrusted_content_leaves_the_high_risk_call_to_the_policy():
@@ -1685,9 +1823,52 @@ async def test_an_allowed_call_does_not_fire_the_confirmation_junction():
     assert seen == []
 
 
+_GATED_MESSAGES = [
+    (_blocked_blocks, Disposition.BLOCK),
+    (_confirmation_blocks, Disposition.CONFIRM),
+]
+
+
+@pytest.mark.parametrize(
+    ('produce', 'disposition'),
+    _GATED_MESSAGES,
+    ids=[disposition.value for _, disposition in _GATED_MESSAGES],
+)
+async def test_a_gated_call_is_told_which_rule_at_which_level_why_and_that_nothing_ran(
+    produce, disposition
+):
+    """两种处置都要带全判定结论：少了规则 ID 模型不知道自己碰了哪条线，少了 reason 它只能猜着换
+    做法。「没有产生任何副作用」是闸与中止路径唯一能断言的差别，resume 按它决定要不要重做。"""
+    content = _text((await produce())[0])
+    assert _ESCALATION in content
+    assert RiskLevel.HIGH.value in content
+    assert _ESCALATION_REASON in content
+    assert _SIDE_EFFECTS_DENIED in content
+
+
+async def test_the_unconfirmed_message_claims_only_what_the_kernel_knows():
+    """内核知道的是「它不消费这个切点的答复」，不是「没有人会看到它」：`TOOL_CONFIRMATION_REQUIRED`
+    上可以挂着观察者，此刻它已经被叫到过。说没人看见，挂了 hook 的宿主就对着一条假消息排查。"""
+    hooks = HooksCenter()
+    seen: list[str] = []
+
+    async def observe(**kwargs: Any) -> None:
+        seen.append(kwargs['tool_call'].id)
+
+    hooks.register(Junction.TOOL_CONFIRMATION_REQUIRED, observe)
+    ctx = Context()
+    await _gated(
+        _Runner(), policy=_RecordingPolicy(Disposition.CONFIRM), hooks=hooks
+    ).execute_tool_calls(ctx, [ToolCall(id='c1', name='Runner', arguments=_DANGEROUS)])
+    content = _text(ctx.current_traj[0])
+    assert seen == ['c1']
+    assert '没有人会看到' not in content
+    assert '内核不消费' in content
+
+
 async def test_the_blocked_and_the_unconfirmed_messages_are_not_interchangeable():
-    """阻断是确定的否（换做法），需要确认是还没有人回答（这个 Runtime 上没有确认通道）。塌成
-    一句，模型就分不清该换做法还是该等。"""
+    """阻断是确定的否（换做法），需要确认是还没有人回答（内核不收确认答复）。塌成一句，模型就
+    分不清该换做法还是该等。"""
     blocked = _text((await _blocked_blocks())[0])
     unconfirmed = _text((await _confirmation_blocks())[0])
     assert all(anchor in blocked for anchor in _BLOCKED_ONLY)
@@ -1732,7 +1913,8 @@ async def test_a_gate_that_cannot_answer_still_leaves_one_block_per_call(policy,
 
 async def test_a_judge_that_refuses_a_tools_declaration_still_leaves_one_block_per_call():
     """`__tool_command_args__` 写错名字时判定抛 ConfigError——那条声明落在一个永不存在的 key 上，
-    闸会一句不说地消失。"""
+    闸会一句不说地消失。判定无副作用且坐在执行之前，所以这条路上「有没有副作用」是已知的：说
+    「未知」会让 resume 把一件确实没发生的事当成可能发生过。"""
     executor = ToolExecutor(
         tools={'Echo': _Echo(), 'Misdeclared': _Misdeclared()}, hooks=HooksCenter()
     )
@@ -1747,6 +1929,54 @@ async def test_a_judge_that_refuses_a_tools_declaration_still_leaves_one_block_p
             ],
         )
     assert [block.tool_call_id for block in ctx.current_traj] == ['c1', 'c2', 'c3']
+    assert _SIDE_EFFECTS_DENIED in _text(ctx.current_traj[1])
+    assert _SIDE_EFFECTS_UNKNOWN not in _text(ctx.current_traj[1])
+
+
+async def test_a_policy_that_raises_still_says_side_effects_are_unknown():
+    """处置由第三方实现、可以做任何事，所以它抛出时「没有副作用」是内核给不出的断言。与判定那条
+    路的差别只在这一句上，合成一句就等于替第三方作保。"""
+    ctx = Context()
+    with pytest.raises(RuntimeError):
+        await _gated(
+            _Runner(), policy=_ExplodingPolicy(RuntimeError('policy backend down'))
+        ).execute_tool_calls(ctx, [ToolCall(id='c1', name='Runner', arguments=_DANGEROUS)])
+    assert _SIDE_EFFECTS_UNKNOWN in _text(ctx.current_traj[0])
+
+
+_MISCONFIGURED_DANGER: list[tuple[dict[str, Any], str, str, str]] = [
+    ({'policy': object()}, 'danger_policy', 'object 类型', 'BlockHighRisk()'),
+    ({'policy': AllowAll}, 'danger_policy', '少了一对括号', 'BlockHighRisk()'),
+    ({'judge': object()}, 'danger_judge', 'object 类型', 'DangerJudge(())'),
+    ({'judge': DangerJudge}, 'danger_judge', '少了一对括号', 'DangerJudge(())'),
+]
+
+
+@pytest.mark.parametrize(
+    ('danger', 'field', 'received', 'next_action'),
+    _MISCONFIGURED_DANGER,
+    ids=['policy-not-a-policy', 'policy-is-the-class', 'judge-not-a-judge', 'judge-is-the-class'],
+)
+async def test_the_executor_refuses_a_danger_option_it_cannot_call(
+    danger, field, received, next_action
+):
+    """不校验的症状落在第一次工具调用上、且指着**工具**：`AttributeError` 经中止路径变成一条说
+    「本次调用中止于 …，是否已产生副作用未知」的 tool block，而错在声明它的那一行。少一对括号要
+    单独挡——`DangerPolicy` 是 runtime_checkable 的 Protocol，类对象上 `decide` 属性也在。"""
+    with pytest.raises(ConfigError) as excinfo:
+        ToolExecutor(tools={}, hooks=HooksCenter(), **danger)
+    assert field in excinfo.value.expected
+    assert received in excinfo.value.received
+    assert next_action in excinfo.value.next_action
+
+
+async def test_the_executor_takes_none_for_either_danger_option_as_use_the_kernel_default():
+    """`None` 是「用内核默认」，不是「不装闸」；校验把它连带拒掉会让零配置的宿主起不来。"""
+    tool = _Runner()
+    await ToolExecutor(
+        tools={'Runner': tool}, hooks=HooksCenter(), judge=None, policy=None
+    ).execute_tool_calls(Context(), [ToolCall(id='c1', name='Runner', arguments=_DANGEROUS)])
+    assert tool.executed == []
 
 
 async def test_a_low_risk_call_traceable_to_untrusted_content_is_allowed_and_recorded(

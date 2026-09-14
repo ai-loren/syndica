@@ -53,6 +53,7 @@ __all__ = [
     'Disposition',
     'RiskLevel',
     'disposition_of',
+    'validate_danger_options',
 ]
 
 
@@ -637,7 +638,7 @@ def _matched(rule: DangerRule, text: str) -> bool:
 
 
 class DangerJudge:
-    """按规则表给一次调用下结论。无状态、无副作用。"""
+    """按规则表给一次调用下结论。无状态、无副作用——它抛出时调用方**知道**什么都没发生。"""
 
     def __init__(self, rules: Sequence[DangerRule] | None = None) -> None:
         # `None` 用默认规则表，`()` 是「我自己在别处做了闸」——两者不能合并，否则宿主没法关掉
@@ -691,6 +692,47 @@ class AllowAll:
 
     def decide(self, request: DangerRequest) -> Disposition:
         return Disposition.ALLOW
+
+
+def _received_instead(value: object) -> str:
+    """`received` 那一栏；类对象单独点名，它与实例只差一对括号。"""
+    if isinstance(value, type):
+        return f'收到类对象 {value.__name__} 本身而不是它的实例——少了一对括号'
+    return f'收到 {type(value).__name__} 类型的 {value!r}'
+
+
+def validate_danger_options(judge: object, policy: object) -> None:
+    """校验宿主交来的判定与处置；`None` 是「用内核默认」。收下这两者的每一处都要过它。
+
+    参数标注为 `object`：要挡的正是违反标注的运行时取值。不校验的症状落在**第一次工具调用**上，
+    而且指着工具——`policy` 少一对括号时 `decide` 少一个 `self` 实参、`policy` 根本没有 `decide`
+    时是 `AttributeError`，两者都经中止路径变成一条说「本次调用中止于 …，是否已产生副作用未知」
+    的 tool block，而错在声明它的那一行。
+
+    `policy` 是类对象这一种要单独挡：`DangerPolicy` 是 `runtime_checkable` 的 Protocol，只查
+    `decide` 属性在不在，而类对象上它也在，`isinstance` 因此对少一对括号完全无感。
+    """
+    if judge is not None and not isinstance(judge, DangerJudge):
+        raise ConfigError(
+            expected='danger_judge 是 DangerJudge 实例，或 None（用内核默认规则表）',
+            received=_received_instead(judge),
+            next_action=(
+                'DangerJudge() 用默认规则表，DangerJudge(rules) 用自己的规则表，'
+                'DangerJudge(()) 表示「我自己在别处做了闸」'
+            ),
+        )
+    if policy is not None and (isinstance(policy, type) or not isinstance(policy, DangerPolicy)):
+        raise ConfigError(
+            expected=(
+                'danger_policy 是有 decide(request) -> Disposition 方法的实例，'
+                '或 None（用内核默认 BlockHighRisk）'
+            ),
+            received=_received_instead(policy),
+            next_action=(
+                '传 BlockHighRisk() / AllowAll()，或自己实现一个带 '
+                'decide(self, request: DangerRequest) -> Disposition 的类并传它的实例'
+            ),
+        )
 
 
 def disposition_of(policy: DangerPolicy, request: DangerRequest) -> Disposition:

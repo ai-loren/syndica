@@ -540,6 +540,19 @@ async def test_a_host_judge_declared_on_the_options_reaches_the_executor():
     assert await _commands_that_ran(danger_judge=DangerJudge(())) == ['sudo rm -rf /']
 
 
+@pytest.mark.parametrize(
+    'danger',
+    [{'danger_policy': object()}, {'danger_policy': AllowAll}, {'danger_judge': object()}],
+    ids=['policy-not-a-policy', 'policy-is-the-class', 'judge-not-a-judge'],
+)
+def test_the_options_refuse_a_danger_field_the_executor_could_not_call(danger):
+    """校验在声明的那一行，与 `validate_tool_names` 同一个理由：不校验时错误在第一次工具调用上
+    现身，还指着工具（「中止于 AttributeError…是否已产生副作用未知」），而错在 options 这一行。"""
+    with pytest.raises(ConfigError) as excinfo:
+        AgentOptions(name='Worker', llm=ScriptedLLM([]), **danger)
+    assert next(iter(danger)) in excinfo.value.expected
+
+
 async def test_an_agent_that_declared_no_budget_still_stops_and_sends_an_empty_system_prompt():
     """默认预算是唯一挡住失控 Agent 的东西，而它失效时不报错，只是一直烧钱。"""
     llm = ScriptedLLM([ScriptedTurn(tool_calls=[_call(f'c{index}')]) for index in range(50)])

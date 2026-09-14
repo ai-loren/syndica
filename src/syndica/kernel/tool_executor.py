@@ -25,11 +25,13 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 什么都没执行，因此没有可判的东西。处置**只经 `danger.disposition_of` 取**，不直接问 policy：spec
 §12.2 第 3 条的强制升级坐在咨询 policy 之前，绕过它这条升级就在整条生产路径上从不运行。
 
-**溯源一批只算一次，在这一批开始之前。** 这批调用的参数是模型在此之前一次产出的，本批中途出现的
-不可信结果影响不了它们；逐次重算会让同一条命令的处置取决于它排在批里第几个。当前形态是「这份轨迹
-里出现过 `trust=UNTRUSTED` 的 block」——它是上界而非因果链，完整的溯源要接产物溯源（spec §7.3）与
-trace 因果链（§11.1）。**它不交 `None`**：`None` 是「没溯源过」，留在生产路径上那道升级就恒不命中，
-而调用方以为有它。
+**溯源按批快照算一次，而这个快照只对模型产出的那一份参数成立。** 那一份是模型在本批开始之前一次
+产出的，本批中途出现的不可信结果影响不了它；逐次重算会让同一条命令的处置取决于它排在批里第几个，
+分段并发之后连这个位置都不确定。**`PRE_TOOL_USE` hook 写过参数时前提就不成立了**——它能把本批刚落
+进轨迹的不可信输出展开进参数——那时重取一次并取两者中更严的（spec §13：溯源失败时按最坏情况处理）。
+当前形态是「这份轨迹里出现过 `trust=UNTRUSTED` 的 block」——它是上界而非因果链，完整的溯源要接产物
+溯源（spec §7.3）与 trace 因果链（§11.1）。**它不交 `None`**：`None` 是「没溯源过」，留在生产路径上
+那道升级就恒不命中，而调用方以为有它。
 
 **被阻断的调用仍然产出恰好一个 role='tool' block。** 阻断不是失败，是一次「这条路走不通」的回答，
 模型据此换一种做法。它写给模型看，因此按三件套写。阻断与需要确认两种措辞**不可互换**：阻断是确定的
@@ -74,6 +76,7 @@ from syndica.kernel.danger import (
     Disposition,
     RiskLevel,
     disposition_of,
+    validate_danger_options,
 )
 from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
@@ -201,6 +204,25 @@ def _aborted_result(call: ToolCall, exc: BaseException) -> ToolResult:
     )
 
 
+def _judge_failed_result(call: ToolCall, exc: Exception) -> ToolResult:
+    """危险判定抛出时，失败的那个调用自己的 block。
+
+    与 `_aborted_result` 分开只为一件事：判定无状态、无副作用且坐在执行之前，所以这条路上「有没有
+    产生副作用」是**已知**的，说「未知」比事实弱，而 resume 正是按这句话决定要不要重做。处置
+    （`DangerPolicy.decide`）不在此列——它由第三方实现，可以做任何事，走的仍是 `_aborted_result`。
+    """
+    return ToolResult(
+        output=(
+            f'期望: {call.name}（id={call.id}）产出一个结果。'
+            f' 实际: 危险判定在这次调用上抛出 {_described(exc)}；判定坐在执行之前，'
+            '工具没有运行，本次调用也没有产生任何副作用。'
+            ' 下一步: 本批调用已在此停下，错误已交给上层处理；'
+            '不要重复同一调用，先按那条错误修判定报的那处声明或参数。'
+        ),
+        trust=TrustLevel.UNTRUSTED,
+    )
+
+
 def _not_executed_result(call: ToolCall, failed: ToolCall, exc: BaseException) -> ToolResult:
     return ToolResult(
         output=(
@@ -211,6 +233,14 @@ def _not_executed_result(call: ToolCall, failed: ToolCall, exc: BaseException) -
             '如仍然需要它，在下一轮重新发起。'
         )
     )
+
+
+class _JudgeFailure(Exception):
+    """危险判定自己抛出时的内部信号，只决定失败那条 block 的措辞，不出 `execute_tool_calls`。"""
+
+    def __init__(self, original: Exception) -> None:
+        super().__init__(original)
+        self.original = original
 
 
 def _provenance(ctx: Context) -> TrustLevel:
@@ -224,11 +254,21 @@ def _provenance(ctx: Context) -> TrustLevel:
     return TrustLevel.TRUSTED
 
 
+def _strictest_trust(first: TrustLevel, second: TrustLevel) -> TrustLevel:
+    """两个溯源结论里更严的那个。批快照是**下界**：一次重算不得洗掉它已经查到的不可信内容。"""
+    if TrustLevel.UNTRUSTED in (first, second):
+        return TrustLevel.UNTRUSTED
+    return TrustLevel.TRUSTED
+
+
 def _gated_result(call: ToolCall, verdict: DangerVerdict, disposition: Disposition) -> ToolResult:
     """被闸拦下的调用交给模型的那一块。
 
     两种措辞不可互换：阻断是**确定的否**（换做法），需要确认是**还没有人回答**（这个 Runtime 上
-    没有确认通道）。塌成一句，模型就分不清该换做法还是该等。
+    内核不收确认答复）。塌成一句，模型就分不清该换做法还是该等。
+
+    需要确认这条只断言内核知道的那件事：**内核不消费确认切点的答复**。「没有人会看到它」是内核
+    不知道的——`TOOL_CONFIRMATION_REQUIRED` 上可以挂着观察者，而且此刻它已经被叫到过了。
 
     两条都说「没有产生任何副作用」：闸坐在执行之前，这是它与中止路径唯一能断言的差别。
     """
@@ -237,10 +277,11 @@ def _gated_result(call: ToolCall, verdict: DangerVerdict, disposition: Dispositi
             output=(
                 f'期望: {call.name}（id={call.id}）在执行前得到人工确认。'
                 f' 实际: 规则 {verdict.rule_id} 判定风险等级 {verdict.level.value}'
-                f'（{verdict.reason}），处置是等人确认，而这个 Runtime 没有装人工确认通道，'
-                '于是没有人回答过这次请求；本次调用没有执行、也没有产生任何副作用。'
+                f'（{verdict.reason}），处置是等人确认；这次判定已经报给确认切点的观察者，'
+                '但这个 Runtime 上没有把答复接回内核的通道，内核不会等它。'
+                '本次调用没有执行、也没有产生任何副作用。'
                 ' 下一步: 换一种不触发该规则的做法，或把这一步留给能确认它的人；'
-                '不要重发同一个调用等它被批准，这里没有人会看到它。'
+                '不要重发同一个调用等它被批准——内核不消费这次确认的答复，重发只会再落回这里。'
             )
         )
     return ToolResult(
@@ -322,23 +363,36 @@ class ToolExecutor:
         policy: DangerPolicy | None = None,
     ) -> None:
         validate_tool_names(tools)
+        validate_danger_options(judge, policy)
         self._tools = tools
         self._hooks = hooks
+        # 两者构造时快照，与活表 `tools` 不同：构造之后改 options 上的字段对本 executor 无效。
         self._judge = judge if judge is not None else DangerJudge()
         self._policy: DangerPolicy = policy if policy is not None else BlockHighRisk()
 
     async def execute_tool_calls(self, ctx: Context, tool_calls: list[ToolCall]) -> None:
         provenance = _provenance(ctx)
         for index, call in enumerate(tool_calls):
+            pending = tool_calls[index + 1 :]
             try:
-                result = await self._execute_one(call, provenance)
+                result = await self._execute_one(ctx, call, provenance)
+            # 判定抛出这条路单独接：它是唯一能断言「工具没运行」的抛出点。
+            except _JudgeFailure as signal:
+                self._append(ctx, call, _judge_failed_result(call, signal.original))
+                self._append_not_executed(ctx, pending, call, signal.original)
+                raise signal.original from None
             # Exception 而非 BaseException：取消不该在展开的路上再往轨迹里写东西。
             except Exception as exc:
                 self._append(ctx, call, _aborted_result(call, exc))
-                for pending in tool_calls[index + 1 :]:
-                    self._append(ctx, pending, _not_executed_result(pending, call, exc))
+                self._append_not_executed(ctx, pending, call, exc)
                 raise
             self._append(ctx, call, result)
+
+    def _append_not_executed(
+        self, ctx: Context, pending: list[ToolCall], failed: ToolCall, exc: BaseException
+    ) -> None:
+        for call in pending:
+            self._append(ctx, call, _not_executed_result(call, failed, exc))
 
     def _append(self, ctx: Context, call: ToolCall, result: ToolResult) -> None:
         # 两个可变容器都拷一份：block 会被持久化，活得比这个 ToolResult 长。
@@ -353,7 +407,9 @@ class ToolExecutor:
             )
         )
 
-    async def _execute_one(self, call: ToolCall, provenance: TrustLevel) -> ToolResult:
+    async def _execute_one(
+        self, ctx: Context, call: ToolCall, provenance: TrustLevel
+    ) -> ToolResult:
         tool = self._tools.get(call.name)
         if tool is None:
             misregistered = _misregistered(self._tools, call.name)
@@ -379,6 +435,11 @@ class ToolExecutor:
         rewritten_args = pre.get('args', args)
         if not isinstance(rewritten_args, dict):
             raise _rewrite_rejected(Junction.PRE_TOOL_USE, 'args', dict, rewritten_args)
+        # hook 写过这一份参数，批快照的前提（参数产于本批之前）就不成立了：它能把本批刚落进轨迹的
+        # 不可信输出展开进参数。看 `rewrites` 而不只比对象身份——交回同一个 dict 对象的 hook 同样
+        # 是作者，身份比对看不见它。
+        if pre.rewrites('args') or rewritten_args is not args:
+            provenance = _strictest_trust(provenance, _provenance(ctx))
         args = cast(dict[str, Any], rewritten_args)
 
         gated = await self._gated(call, tool, args, provenance)
@@ -417,7 +478,10 @@ class ToolExecutor:
         处置经 `disposition_of` 取——它先施加 spec §12.2 第 3 条那道关不掉的升级，再咨询宿主
         策略。直接调 `self._policy.decide` 会把升级整个绕过去，而 typing 与运行期都不出声。
         """
-        verdict = self._judge.judge(tool, args)
+        try:
+            verdict = self._judge.judge(tool, args)
+        except Exception as exc:
+            raise _JudgeFailure(exc) from exc
         disposition = disposition_of(
             self._policy, DangerRequest(verdict=verdict, call=call, provenance=provenance)
         )
