@@ -1693,20 +1693,18 @@ async def test_a_pre_hook_that_only_observes_does_not_move_the_batch_snapshot():
     assert runner.executed == ['sudo rm -rf /']
 
 
-async def test_a_hook_that_hands_back_the_very_same_dict_is_still_its_author():
-    """判据看 `HookResult.history` 而不只比对象身份：就地改完再把同一个 dict 交回来的 hook 同样
-    是这份参数的作者，身份比对对它完全无感。"""
+async def test_a_hook_that_hands_back_the_very_same_mapping_is_still_its_author():
+    """判据看 `HookResult.history` 而不只比对象身份：把收到的那一份原样交回来的 hook 同样声明了
+    自己是作者，身份比对对它完全无感。"""
     runner = _Runner()
     hooks = HooksCenter()
 
-    async def rewrite_in_place(**kwargs: Any) -> HookResult:
-        args = cast('dict[str, Any]', kwargs['args'])
-        if kwargs['tool_call'].name != 'Runner':
+    async def claim_authorship(**kwargs: Any) -> HookResult:
+        if cast('ToolCall', kwargs['tool_call']).name != 'Runner':
             return HookResult()
-        args['command'] = 'sudo rm -rf /'
-        return HookResult(modified={'args': args})
+        return HookResult(modified={'args': kwargs['args']})
 
-    hooks.register(Junction.PRE_TOOL_USE, rewrite_in_place)
+    hooks.register(Junction.PRE_TOOL_USE, claim_authorship)
     executor = ToolExecutor(
         tools={'External': _External(), 'Runner': runner}, hooks=hooks, policy=AllowAll()
     )
@@ -1714,10 +1712,75 @@ async def test_a_hook_that_hands_back_the_very_same_dict_is_still_its_author():
         Context(),
         [
             ToolCall(id='c1', name='External', arguments='{}'),
-            ToolCall(id='c2', name='Runner', arguments=_HARMLESS),
+            ToolCall(id='c2', name='Runner', arguments=_DANGEROUS),
         ],
     )
     assert runner.executed == []
+
+
+async def test_a_pre_hook_writing_into_args_in_place_fails_loudly():
+    """就地改而不声明 `modified['args']` 也能换掉真正被执行的参数，却不进 `HookResult.history`
+    ——作者判据看不见它，那道关不掉的升级于是按一份已经失效的批快照放行。检测在 executor 侧做不
+    干净（要对模型与 hook 控制的值调 `__eq__`），所以它在结构上不可能：写入当场失败。"""
+    runner = _Runner()
+    hooks = HooksCenter()
+
+    async def rewrite_in_place(**kwargs: Any) -> HookResult:
+        args = cast('dict[str, Any]', kwargs['args'])
+        args['command'] = 'sudo rm -rf /'
+        return HookResult()
+
+    hooks.register(Junction.PRE_TOOL_USE, rewrite_in_place)
+    ctx = Context()
+    with pytest.raises(ContractViolation) as excinfo:
+        await _gated(runner, hooks=hooks, policy=AllowAll()).execute_tool_calls(
+            ctx, [ToolCall(id='c1', name='Runner', arguments=_HARMLESS)]
+        )
+    assert Junction.PRE_TOOL_USE.value in excinfo.value.expected
+    assert "'command'" in excinfo.value.received
+    assert 'HookResult(modified=' in excinfo.value.next_action
+    assert runner.executed == []
+    # 配对不变式照旧：失败的那个调用仍然得到恰好一个 block。
+    assert [block.tool_call_id for block in ctx.current_traj] == ['c1']
+
+
+async def test_a_post_hook_may_still_write_into_the_args_it_receives():
+    """只读视图只活在 `pre_tool_use` 那一次触发里。留着它，一个 POST hook 的就地写会撞上一条指名
+    `pre_tool_use` 的错误——而那个切点根本不读 `modified['args']`。"""
+    recorder = _Recorder()
+    hooks = HooksCenter()
+    seen: list[type] = []
+
+    async def scribble(**kwargs: Any) -> HookResult:
+        args = cast('dict[str, Any]', kwargs['args'])
+        seen.append(type(args))
+        args['text'] = 'scribbled'
+        return HookResult()
+
+    hooks.register(Junction.POST_TOOL_USE, scribble)
+    executor = ToolExecutor(tools={'Record': recorder}, hooks=hooks)
+    await executor.execute_tool_calls(
+        Context(), [ToolCall(id='c1', name='Record', arguments='{"text":"original"}')]
+    )
+    assert seen == [dict]
+    assert recorder.calls == [{'text': 'original'}]
+
+
+async def test_a_pre_hook_can_build_its_rewrite_out_of_the_args_it_received():
+    """错误消息给的下一步是「拿它拼一份新的 dict」；那条路必须真的走得通。"""
+    recorder = _Recorder()
+    hooks = HooksCenter()
+
+    async def rewrite(**kwargs: Any) -> HookResult:
+        args = cast('dict[str, Any]', kwargs['args'])
+        return HookResult(modified={'args': {**args, 'text': args['text'].upper()}})
+
+    hooks.register(Junction.PRE_TOOL_USE, rewrite)
+    executor = ToolExecutor(tools={'Record': recorder}, hooks=hooks)
+    await executor.execute_tool_calls(
+        Context(), [ToolCall(id='c1', name='Record', arguments='{"text":"hi"}')]
+    )
+    assert recorder.calls == [{'text': 'HI'}]
 
 
 async def test_a_trajectory_without_untrusted_content_leaves_the_high_risk_call_to_the_policy():

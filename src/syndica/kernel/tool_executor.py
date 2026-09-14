@@ -12,8 +12,8 @@
 批可分），因此它看的是**模型发出来的**那份参数；闸看的是 `PRE_TOOL_USE` 改写之后、真正会被执行的那
 份。后果是改写参数的 hook 不会让批次重新分段，这是安全的那一侧：被闸拦下的调用根本不执行，所以
 「它曾经和别人并发过」产生不了任何副作用。**闸不复用分段那次判定的结论**——「参数有没有被 hook 改
-过」这个判据本身不完备（就地改而不声明 `modified['args']` 看不见），复用一次过时的结论就等于让闸去
-判一份不会被执行的参数。
+过」这个判据本身不完备（顶层的就地改已被只读视图挡住，嵌套容器里的仍然看不见），复用一次过时的结论
+就等于让闸去判一份不会被执行的参数。
 
 **分段只问判定，不问处置。** 判定是纯规则、无副作用，问几遍都一样；`DangerPolicy` 由宿主实现，可以
 计数、可以记录，一次调用问它两遍（而且两遍看的参数还不同）就是在骗它。判据因此取「命中任何危险规则
@@ -81,6 +81,11 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 （异常类名、工具名、调用 id）或模型自己的产出（`call.name` / `call.arguments`）不算：后者已经以同样
 或更松的 trust 躺在轨迹里，回显它不会让任何新字节洗成可信。
 
+**交给 `PRE_TOOL_USE` 的那份 `args` 是只读视图，就地写当场失败。** 就地改而不声明
+`modified['args']` 也能改变真正被执行的参数，却不进 `HookResult.history`——于是上面那个「hook 是
+这份参数的作者」的判据看不见它，重取不发生，那道关不掉的升级按一份已经失效的批快照放行。视图只护
+住顶层：`args['config']['x'] = 1` 仍然逃得掉，见 `hooks.readonly`。
+
 `modified` 通道改写的是 kwargs，类型必须与传进去的一致（`args` 是 dict，`result` 是 ToolResult）；
 不合就是 hook 的编程错误，报 ContractViolation 而不是静默丢弃作者的意图。工具自己返回非 ToolResult
 是另一件事，必须报另一条消息：混成一条会让零 hook 的调用方被指去修一个不存在的 hook。`skip` 带出的
@@ -113,7 +118,7 @@ from syndica.kernel.danger import (
     validate_danger_options,
 )
 from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
-from syndica.kernel.hooks import HookResult, HooksCenter, Junction
+from syndica.kernel.hooks import HookResult, HooksCenter, Junction, ReadOnlyKwarg
 from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
 
 __all__ = ['DEFAULT_MAX_TOOL_CONCURRENCY', 'ToolExecutor', 'validate_max_concurrency']
@@ -669,16 +674,22 @@ class ToolExecutor:
                 )
             args = cast(dict[str, Any], decoded)
 
-        pre = await self._hooks.trigger(Junction.PRE_TOOL_USE, tool_call=call, tool=tool, args=args)
+        # 只读视图只活在这一次触发里：就地改一份没有声明的参数躲得过下面那个作者判据，而那正是
+        # 决定要不要重算溯源的依据。只包最初这一份就够——一旦链上有人声明过改写，重取已经触发，
+        # 此后再有人就地改也改不掉那个结论。
+        handed = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', args)
+        pre = await self._hooks.trigger(
+            Junction.PRE_TOOL_USE, tool_call=call, tool=tool, args=handed
+        )
         if pre.skip:
             return _skipped_result(call, pre.result)
-        rewritten_args = pre.get('args', args)
+        rewritten_args = pre.get('args', handed)
         if not isinstance(rewritten_args, dict):
             raise _rewrite_rejected(Junction.PRE_TOOL_USE, 'args', dict, rewritten_args)
         # hook 写过这一份参数，批快照的前提（参数产于本批之前）就不成立了：它能把本批刚落进轨迹的
         # 不可信输出展开进参数。看 `rewrites` 而不只比对象身份——交回同一个 dict 对象的 hook 同样
         # 是作者，身份比对看不见它。
-        if pre.rewrites('args') or rewritten_args is not args:
+        if pre.rewrites('args') or rewritten_args is not handed:
             # 多元素段里这次重取**结构上就是一次失败的溯源**：hook 能从旁路拿到同段兄弟的产出并
             # 展开进参数，而兄弟的 block 要等整段跑完才落进轨迹，重取在轨迹里一个字都看不到。
             # spec §13：溯源失败时按最坏情况处理。少判的方向不可回收——那道关不掉的升级会静默失
@@ -688,7 +699,9 @@ class ToolExecutor:
                 if has_siblings
                 else _strictest_trust(provenance, _provenance(ctx))
             )
-        args = cast(dict[str, Any], rewritten_args)
+        # 拆掉只读视图：闸、工具与 POST 切点拿到的永远是一份普通 dict。留着它，一个 POST hook 的
+        # 就地写会撞上一条指名 pre_tool_use 的错误——而那个切点根本不读 modified['args']。
+        args = dict(cast(dict[str, Any], rewritten_args))
 
         gated = await self._gated(call, tool, args, provenance)
         if gated is not None:
