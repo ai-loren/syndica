@@ -587,9 +587,20 @@ def test_writing_to_a_pseudo_device_is_not_a_raw_device_write(command: str):
     assert _judge(command) == NO_RULE_MATCHED
 
 
-def test_a_real_block_device_is_still_a_raw_device_write():
-    """伪设备白名单是收紧，收紧的反方向是漏报，所以真设备那侧要一起钉住。"""
-    assert _judge('dd if=/dev/zero of=/dev/sda').rule_id == 'shell.raw_device_write'
+@pytest.mark.parametrize(
+    'command',
+    [
+        'dd if=/dev/zero of=/dev/sda',
+        'dd if=/dev/zero of=/dev/nvme0n1',
+        'dd if=/dev/zero of=/dev/ttyS0',
+    ],
+)
+def test_a_real_device_is_still_a_raw_device_write(command: str):
+    """伪设备白名单是收紧，收紧的反方向是漏报，所以真设备那侧要一起钉住。
+
+    白名单按整个路径比，不按前缀：`/dev/ttyS0` 以 `/dev/tty` 开头，却是另一个设备。
+    """
+    assert _judge(command).rule_id == 'shell.raw_device_write'
 
 
 def test_the_dd_output_operand_is_read_case_insensitively():
