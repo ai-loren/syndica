@@ -6,20 +6,23 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.agent_types import AgentStatus, ExitMode
-from syndica.kernel.context import ContextBlock, StopReason, ToolCall, TrustLevel
+from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall, TrustLevel
 from syndica.kernel.danger import AllowAll, DangerPolicy
 from syndica.kernel.errors import ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
-from syndica.kernel.runtime import AgentFactory, Runtime
+from syndica.kernel.runtime import AgentFactory, Runtime, _InTurnWaitResult
 from syndica.kernel.tool import Tool, ToolResult
+from syndica.kernel.tool_executor import DEFAULT_MAX_TOOL_CONCURRENCY
 from syndica.kernel.tools import Delegate, Fork
+from syndica.kernel.tools.orchestration import _INTERRUPTED, _UNFINISHED
 from syndica.kernel.waiting import WaitState
 
 # 每个等待都设上限：回归应当让用例变红，而不是把 CI 挂住。
@@ -28,6 +31,8 @@ _THREE_PART: tuple[str, ...] = ('期望: ', ' 实际: ', ' 下一步: ')
 # 一条命中默认规则表里 shell.privilege_escalation 的命令。闸有没有被 §12.2 第 3 条那道升级接走，
 # 只有「它到底执行了没有」答得出。
 _DANGEROUS = '{"command":"sudo rm -rf /"}'
+# 同一批输入在 limit=1 与 limit=N 下必须得出同一个安全结论，所以每条接到闸上的用例都按它参数化。
+_LIMITS: tuple[int, ...] = (1, DEFAULT_MAX_TOOL_CONCURRENCY)
 
 
 class _Tainted(Tool):
@@ -77,6 +82,7 @@ def _worker(
     name: str = 'Worker',
     max_turns: int | None = 50,
     policy: DangerPolicy | None = None,
+    limit: int = DEFAULT_MAX_TOOL_CONCURRENCY,
 ) -> AgentFactory:
     """一个角色的工厂。
 
@@ -95,6 +101,7 @@ def _worker(
                 system_prompt='SP',
                 max_turns=max_turns,
                 danger_policy=policy,
+                max_tool_concurrency=limit,
             ),
             hooks=hooks,
             events=events,
@@ -109,12 +116,13 @@ def _orchestrator(
     extra: dict[str, Tool] | None = None,
     *,
     policy: DangerPolicy | None = None,
+    limit: int = DEFAULT_MAX_TOOL_CONCURRENCY,
 ) -> AgentFactory:
     """装上编排工具的 Agent 工厂。
 
     `agent_id` 在 `BaseAgent.__init__` 里才生成，所以工具只能在建好实例之后挂进那张**活表**
-    （`AgentOptions.tools` 刻意不换成副本）。派活因此真的从一次工具调用内部发起——这是
-    `wait_in_turn` 唯一能被打断的位置。脚本共用一个游标，理由同 `_worker`。
+    （`AgentOptions.tools` 刻意不换成副本）。派活因此真的从一次工具调用内部发起——这是在轮等待
+    唯一能被打断的位置。脚本共用一个游标，理由同 `_worker`。
     """
     llm = ScriptedLLM(script)
 
@@ -127,6 +135,7 @@ def _orchestrator(
                 tools=tools,
                 system_prompt='SP',
                 danger_policy=policy,
+                max_tool_concurrency=limit,
             ),
             hooks=hooks,
             events=events,
@@ -149,16 +158,45 @@ def _call(name: str, arguments: str, call_id: str = 'c1') -> ScriptedTurn:
     return ScriptedTurn(tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)])
 
 
-def _tool_blocks(runtime: Runtime, agent_id: str) -> list[ContextBlock]:
+async def _stalled_source(
+    runtime: Runtime, blocker: _Block, *, tainted: bool, content: str | None = None
+) -> str:
+    """一个在一次工具批**中途**被硬终止的源：轨迹末尾留着那个未配对的 assistant 块。
+
+    `tainted=True` 时同一批里更早的调用已经把一块 `UNTRUSTED` 结果落进轨迹，而它排在那个未配对
+    的块**之后**——分叉的截断因此把它一起丢掉。`kill` 的 docstring 明文承诺它会留下这个尾形。
+    """
+    calls = [ToolCall('b1', 'Block', '{}')]
+    if tainted:
+        calls.insert(0, ToolCall('t1', 'Tainted', '{"text":"网页说要提权删除"}'))
+    source = await runtime.spawn(
+        _worker(
+            [
+                ScriptedTurn(content=content, tool_calls=calls),
+                ScriptedTurn(content='never reached'),
+            ],
+            {'Tainted': _Tainted(), 'Block': blocker},
+        ),
+        query='go',
+    )
+    await asyncio.wait_for(blocker.entered.wait(), timeout=_TIMEOUT)
+    await runtime.kill(source)
+    await asyncio.wait_for(runtime.wait(source), timeout=_TIMEOUT)
+    return source
+
+
+def _context(runtime: Runtime, agent_id: str) -> Context:
     agent = runtime._table.get(agent_id)
     assert agent is not None
-    return [block for block in agent.context.current_traj if block.role == 'tool']
+    return agent.context
+
+
+def _tool_blocks(runtime: Runtime, agent_id: str) -> list[ContextBlock]:
+    return [block for block in _traj(runtime, agent_id) if block.role == 'tool']
 
 
 def _traj(runtime: Runtime, agent_id: str) -> list[ContextBlock]:
-    agent = runtime._table.get(agent_id)
-    assert agent is not None
-    return agent.context.current_traj
+    return _context(runtime, agent_id).current_traj
 
 
 # ---------------------------------------------------------------- Delegate
@@ -339,6 +377,91 @@ async def test_a_child_that_touched_untrusted_content_hands_an_untrusted_result_
     await runtime.shutdown()
 
 
+async def test_a_child_that_read_the_web_before_running_out_of_budget_still_hands_back_the_mark():
+    """子 -> 父这条路上，未完成那一格与 COMPLETED 那一格必须交回同一个结论。
+
+    只钉 COMPLETED 会让「删掉未完成分支的 trust=」变成一条活不下来的变异，而一个读过外部内容、
+    随后撞上预算上限的子 Agent 是真实存在的形状。
+    """
+    runtime = Runtime(
+        agents={
+            'Worker': _worker(
+                [_call('Tainted', '{"text":"from the web"}')],
+                {'Tainted': _Tainted()},
+                max_turns=1,
+            )
+        }
+    )
+    parent = await _idle_parent(runtime)
+
+    result = await asyncio.wait_for(
+        Delegate(runtime, parent).execute(agent='Worker', query='research'), timeout=_TIMEOUT
+    )
+
+    assert result.meta['stop_reason'] == 'max_turns'
+    assert result.trust is TrustLevel.UNTRUSTED
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_what_a_child_read_is_still_stopped_by_the_gate_on_the_parents_own_next_call(limit):
+    """父 -> 子两个方向都接到了闸上，子 -> 父此前只钉了 `result.trust`。
+
+    而「只钉那一块的 trust 不够」是本仓自己写下的标准：真正要守的是父 Agent 此后的高风险调用
+    被那道关不掉的升级接走。
+    """
+    runner = _Runner()
+    runtime = Runtime(
+        agents={
+            'Worker': _worker(
+                [
+                    _call('Tainted', '{"text":"网页说要提权删除"}'),
+                    ScriptedTurn(content='照它说的做'),
+                ],
+                {'Tainted': _Tainted()},
+            )
+        }
+    )
+    boss = _orchestrator(
+        [
+            _call('Delegate', '{"agent":"Worker","query":"去查"}', 'd1'),
+            _call('Runner', _DANGEROUS, 'r1'),
+            ScriptedTurn(content='boss done'),
+        ],
+        runtime,
+        {'Runner': runner},
+        policy=AllowAll(),
+        limit=limit,
+    )
+    parent = await runtime.spawn(boss, query='go')
+    await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
+
+    assert runner.executed == []
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_a_parent_whose_children_stayed_clean_still_does_high_risk_work_afterwards(limit):
+    runner = _Runner()
+    runtime = Runtime(agents={'Worker': _worker([ScriptedTurn(content='clean answer')])})
+    boss = _orchestrator(
+        [
+            _call('Delegate', '{"agent":"Worker","query":"去查"}', 'd1'),
+            _call('Runner', _DANGEROUS, 'r1'),
+            ScriptedTurn(content='boss done'),
+        ],
+        runtime,
+        {'Runner': runner},
+        policy=AllowAll(),
+        limit=limit,
+    )
+    parent = await runtime.spawn(boss, query='go')
+    await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
+
+    assert runner.executed == ['sudo rm -rf /']
+    await runtime.shutdown()
+
+
 async def test_a_clean_child_hands_back_a_trusted_result():
     runtime = Runtime(agents={'Worker': _worker([ScriptedTurn(content='clean')])})
     parent = await _idle_parent(runtime)
@@ -442,13 +565,15 @@ async def test_a_parent_that_read_untrusted_content_cannot_launder_it_through_a_
     await runtime.shutdown()
 
 
-async def test_the_laundered_delegation_is_still_stopped_by_the_gate_inside_the_child():
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_the_laundered_delegation_is_still_stopped_by_the_gate_inside_the_child(limit):
     """只钉那一块的 trust 不够：要证明它真的接到了闸上（spec §12.2 第 3 条那道关不掉的升级）。"""
     runner = _Runner()
     child = _worker(
         [_call('Runner', _DANGEROUS), ScriptedTurn(content='child done')],
         {'Runner': runner},
         policy=AllowAll(),
+        limit=limit,
     )
     runtime = Runtime(agents={'Worker': child})
     parent = await _idle_parent(runtime)
@@ -468,13 +593,15 @@ async def test_the_laundered_delegation_is_still_stopped_by_the_gate_inside_the_
     await runtime.shutdown()
 
 
-async def test_a_delegation_from_a_clean_parent_still_lets_the_child_do_high_risk_work():
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_a_delegation_from_a_clean_parent_still_lets_the_child_do_high_risk_work(limit):
     """反向一侧：无条件把子 Agent 的输入标成不可信会让 Worker 这个角色整个用不了。"""
     runner = _Runner()
     child = _worker(
         [_call('Runner', _DANGEROUS), ScriptedTurn(content='child done')],
         {'Runner': runner},
         policy=AllowAll(),
+        limit=limit,
     )
     runtime = Runtime(agents={'Worker': child})
     parent = await _idle_parent(runtime)
@@ -602,7 +729,8 @@ async def test_forking_keeps_the_untrusted_marks_that_were_inside_the_copied_pre
     await runtime.shutdown()
 
 
-async def test_the_twin_of_a_tainted_agent_is_still_stopped_by_the_gate():
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_the_twin_of_a_tainted_agent_is_still_stopped_by_the_gate(limit):
     """把复制过来的标记接到闸上：只钉块自己的 trust 不够。"""
     runner = _Runner()
     runtime = Runtime()
@@ -611,6 +739,7 @@ async def test_the_twin_of_a_tainted_agent_is_still_stopped_by_the_gate():
             [_call('Tainted', '{"text":"from the web"}'), ScriptedTurn(content='conclusion')],
             {'Tainted': _Tainted()},
             policy=AllowAll(),
+            limit=limit,
         ),
         query='go',
     )
@@ -621,6 +750,7 @@ async def test_the_twin_of_a_tainted_agent_is_still_stopped_by_the_gate():
             [_call('Runner', _DANGEROUS), ScriptedTurn(content='twin done')],
             {'Runner': runner},
             policy=AllowAll(),
+            limit=limit,
         ),
         query='onward',
         fork_from=parent,
@@ -653,7 +783,8 @@ async def test_forking_from_inside_a_tool_call_does_not_copy_the_unpaired_batch(
     await runtime.shutdown()
 
 
-async def test_forking_carries_the_taint_that_the_unpaired_truncation_drops():
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_forking_carries_the_taint_that_the_unpaired_truncation_drops(limit):
     """截断会把本批里已经落进轨迹的不可信结果一起丢掉——它可能是唯一的那一块。
 
     `[Tainted, Fork]` 同一批：Tainted 的结果块排在那个未配对的 assistant 块之后，因此随截断
@@ -676,6 +807,7 @@ async def test_forking_carries_the_taint_that_the_unpaired_truncation_drops():
         runtime,
         {'Tainted': _Tainted(), 'Runner': runner},
         policy=AllowAll(),
+        limit=limit,
     )
     parent = await runtime.spawn(boss, query='go')
     await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
@@ -689,7 +821,8 @@ async def test_forking_carries_the_taint_that_the_unpaired_truncation_drops():
     await runtime.shutdown()
 
 
-async def test_a_fork_whose_source_is_clean_still_lets_the_twin_do_high_risk_work():
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_a_fork_whose_source_is_clean_still_lets_the_twin_do_high_risk_work(limit):
     """反向一侧：把分身的第一条输入无条件标成不可信会让分叉在 `AllowAll` 下整个用不了。"""
     runner = _Runner()
     runtime = Runtime()
@@ -703,11 +836,284 @@ async def test_a_fork_whose_source_is_clean_still_lets_the_twin_do_high_risk_wor
         runtime,
         {'Runner': runner},
         policy=AllowAll(),
+        limit=limit,
     )
     parent = await runtime.spawn(boss, query='go')
     await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
 
     assert runner.executed == ['sudo rm -rf /']
+    await runtime.shutdown()
+
+
+async def test_a_fork_keeps_the_conclusion_the_model_wrote_on_the_very_block_that_forked():
+    """模型最常见的输出形态是在同一块 assistant 上先写下结论、再发起分叉。
+
+    配对不变式要求丢掉的是那些没有结果的 `tool_calls`，**不是 `content`**；连 content 一起截掉
+    就删掉了这份轨迹里唯一的那句结论，而 `Fork` 交给模型的 description 逐字写着「分身看得到你到
+    此刻为止的轨迹，因此不必重复前提」。
+    """
+    runtime = Runtime()
+    boss = _orchestrator(
+        [
+            ScriptedTurn(
+                content='my hard-won conclusion',
+                tool_calls=[ToolCall('f1', 'Fork', '{"query":"keep going"}')],
+            ),
+            ScriptedTurn(content='fork done'),
+            ScriptedTurn(content='boss done'),
+        ],
+        runtime,
+    )
+    parent = await runtime.spawn(boss, query='go')
+    await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
+
+    child_id = _tool_blocks(runtime, parent)[0].extra['tool_meta']['agent_id']
+    forked = _traj(runtime, child_id)
+    assert [(block.role, block.content) for block in forked[:3]] == [
+        ('user', 'go'),
+        ('assistant', 'my hard-won conclusion'),
+        ('user', 'keep going'),
+    ]
+    assert [call.id for block in forked for call in block.tool_calls] == []
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize('content', [None, ''], ids=['no-content', 'empty-string-content'])
+async def test_a_forking_block_that_carries_no_text_is_dropped_whole_rather_than_left_empty(
+    content,
+):
+    """既无 content 又无 tool_calls 的块会污染此后每一次请求的前缀，所以剥空之后不能留着它。
+
+    两档取值都要：provider 对「只发了工具调用」这一轮既可能回 `null` 也可能回 `""`，而判据写成
+    `content is None` 时后者会留下一个空块。
+    """
+    runtime = Runtime()
+    boss = _orchestrator(
+        [
+            ScriptedTurn(
+                content=content,
+                tool_calls=[ToolCall('f1', 'Fork', '{"query":"twin work"}')],
+            ),
+            ScriptedTurn(content='fork done'),
+            ScriptedTurn(content='boss done'),
+        ],
+        runtime,
+    )
+    parent = await runtime.spawn(boss, query='go')
+    await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
+
+    child_id = _tool_blocks(runtime, parent)[0].extra['tool_meta']['agent_id']
+    forked = _traj(runtime, child_id)
+    assert [block.role for block in forked] == ['user', 'user', 'assistant']
+    assert all(block.content for block in forked)
+    await runtime.shutdown()
+
+
+async def test_stripping_the_unpaired_calls_copies_that_block_instead_of_writing_into_the_source():
+    """截断跑在**源 Agent 自己的块**上（深拷在它之后），所以剥 `tool_calls` 必须剥到一份副本上。
+
+    就地剥掉，源的轨迹里那一批声明过的调用就没了：它被复活时 `_repair_interrupted_batch` 再也
+    找不到要补的东西，而「这些调用发生过、副作用未知」是那次修复的全部依据。
+
+    交给分身的那一份则**除 `tool_calls` 之外逐字段照抄**：`trust` 漏掉是一次少判，`content`
+    漏掉就删掉了模型写下的结论。
+    """
+    blocker = _Block()
+    runtime = Runtime()
+    source = await _stalled_source(runtime, blocker, tainted=True, content='源自己写下的那一句')
+    head = _traj(runtime, source)[1]
+    head.trust = TrustLevel.UNTRUSTED
+    head.extra['marked_by'] = 'a hook'
+
+    twin = await runtime.spawn(
+        _worker([ScriptedTurn(content='twin')]), query='onward', fork_from=source
+    )
+
+    assert [
+        (block.role, [call.id for call in block.tool_calls]) for block in _traj(runtime, source)
+    ] == [('user', []), ('assistant', ['t1', 'b1']), ('tool', [])]
+    inherited = _traj(runtime, twin)[1]
+    assert (inherited.role, inherited.content, inherited.trust, inherited.extra) == (
+        'assistant',
+        '源自己写下的那一句',
+        TrustLevel.UNTRUSTED,
+        {'marked_by': 'a hook'},
+    )
+    assert inherited.tool_calls == []
+    blocker.release.set()
+    await runtime.shutdown()
+
+
+async def test_a_source_that_stopped_after_a_paired_batch_hands_that_whole_batch_to_the_twin():
+    """末尾的批次配对完整时整批照抄：撞 `max_turns` 或轮边界中止都会留下这个尾形。
+
+    无条件截断最后一个带 `tool_calls` 的批次会让整批静默消失，而 spec §5.2 纪律 4 的缓存亲和
+    正是分叉的全部意义——分身的第一次请求于是从那一批开始全量 miss。
+    """
+    runtime = Runtime()
+    parent = await runtime.spawn(
+        _worker(
+            [_call('Tainted', '{"text":"from the web"}')],
+            {'Tainted': _Tainted()},
+            max_turns=1,
+        ),
+        query='go',
+    )
+    ctx = await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
+    assert ctx.stop_reason is StopReason.MAX_TURNS
+    source = _traj(runtime, parent)
+    assert [block.role for block in source] == ['user', 'assistant', 'tool']
+
+    child_id = await runtime.spawn(
+        _worker([ScriptedTurn(content='twin')]), query='onward', fork_from=parent
+    )
+
+    forked = _traj(runtime, child_id)
+    assert [
+        (block.role, block.content, [call.id for call in block.tool_calls])
+        for block in forked[: len(source)]
+    ] == [(block.role, block.content, [call.id for call in block.tool_calls]) for block in source]
+    await runtime.shutdown()
+
+
+# ------------------------------------ Fork：query=None（lazy boot）那一格的标记
+
+
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_a_lazy_booted_twin_of_a_tainted_source_is_still_stopped_by_the_gate(limit):
+    """`query=None` 是 spec §4.7 明文支持的 lazy boot，而它没有 query 可挂那个补偿。
+
+    截断丢掉了这份轨迹里唯一的不可信标记，而「丢掉了一块」这个事实在 `spawn` 返回的那一刻就不
+    存在于任何地方——宿主无从得知，所以下游的 `send(trust=...)` 补不上它。
+    """
+    blocker = _Block()
+    runner = _Runner()
+    runtime = Runtime()
+    source = await _stalled_source(runtime, blocker, tainted=True)
+
+    twin = await runtime.spawn(
+        _worker(
+            [_call('Runner', _DANGEROUS), ScriptedTurn(content='twin done')],
+            {'Runner': runner},
+            policy=AllowAll(),
+            limit=limit,
+        ),
+        fork_from=source,
+    )
+    await runtime.send(twin, 'do it')
+    await asyncio.wait_for(runtime.wait(twin), timeout=_TIMEOUT)
+
+    assert runner.executed == []
+    blocker.release.set()
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_a_lazy_booted_twin_of_a_clean_source_still_does_high_risk_work(limit):
+    """反向一侧：无条件标脏会让 `Worker` 这个角色在 `AllowAll` 下整个用不了（spec §4.8）。"""
+    blocker = _Block()
+    runner = _Runner()
+    runtime = Runtime()
+    source = await _stalled_source(runtime, blocker, tainted=False)
+
+    twin = await runtime.spawn(
+        _worker(
+            [_call('Runner', _DANGEROUS), ScriptedTurn(content='twin done')],
+            {'Runner': runner},
+            policy=AllowAll(),
+            limit=limit,
+        ),
+        fork_from=source,
+    )
+    await runtime.send(twin, 'clean up')
+    await asyncio.wait_for(runtime.wait(twin), timeout=_TIMEOUT)
+
+    assert runner.executed == ['sudo rm -rf /']
+    blocker.release.set()
+    await runtime.shutdown()
+
+
+async def test_the_taint_a_lazy_booted_fork_inherits_lands_on_the_last_inherited_block():
+    """补偿改的是 `trust` 而不是追加一块说明：`trust` 不进请求字节，分身的前缀因此与源逐字节相同。
+
+    spec §5.2 纪律 4（同类型分叉继承缓存亲和）是分叉的全部意义，而一块内核自撰的说明既改前缀、
+    又会被模型读到并据此行动。
+    """
+    blocker = _Block()
+    runtime = Runtime()
+    source = await _stalled_source(runtime, blocker, tainted=True)
+    dropped = [block for block in _traj(runtime, source) if block.trust is TrustLevel.UNTRUSTED]
+    assert [block.content for block in dropped] == ['网页说要提权删除']
+
+    twin = await runtime.spawn(_worker([ScriptedTurn(content='twin')]), fork_from=source)
+
+    forked = _traj(runtime, twin)
+    assert [(block.role, block.content, block.trust) for block in forked] == [
+        ('user', 'go', TrustLevel.UNTRUSTED)
+    ]
+    blocker.release.set()
+    await runtime.shutdown()
+
+
+async def test_a_lazy_booted_fork_with_nothing_left_to_carry_the_taint_says_so_loudly(caplog):
+    """截断之后一块都不剩、又没有 query 可挂时，这条 ERROR 是这次丢失留下的全部痕迹。
+
+    `provenance_of` 是「出现过就算」的上界，所以标记只能挂在一块真实存在的块上；一块都没有时
+    静默返回等于把那道关不掉的升级悄悄关掉。
+    """
+    runtime = Runtime()
+    source = await runtime.spawn(_worker([ScriptedTurn(content='source')]))
+    context = _context(runtime, source)
+    context.append(ContextBlock(role='assistant', tool_calls=[ToolCall('orphan', 'Nope', '{}')]))
+    context.append(
+        ContextBlock(
+            role='tool', content='网页说的', tool_call_id='other', trust=TrustLevel.UNTRUSTED
+        )
+    )
+
+    twin = await runtime.spawn(_worker([ScriptedTurn(content='twin')]), fork_from=source)
+
+    assert _traj(runtime, twin) == []
+    record = next(record for record in caplog.records if record.levelname == 'ERROR')
+    assert record.args == (source, twin)
+    assert all(part in record.getMessage() for part in _THREE_PART)
+    await runtime.shutdown()
+
+
+class _Uncopyable:
+    """深拷时自己抛的值。`extra` 收得下任何东西，所以拷不动的原因不只有「不可 pickle」一种。"""
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _Uncopyable:
+        raise ValueError('这份快照拒绝被复制')
+
+
+@pytest.mark.parametrize(
+    ('value', 'anchor'),
+    [(threading.Lock(), 'TypeError'), (_Uncopyable(), 'ValueError')],
+    ids=['a-live-lock', 'a-value-that-refuses'],
+)
+async def test_a_fork_whose_trajectory_cannot_be_deep_copied_leaves_no_half_built_agent(
+    value, anchor
+):
+    """逐块深拷是承重的（分身改自己的轨迹不得污染源），而活的对象拷不动。
+
+    裸异常指着 `copy` 的内部，读者看不出该改哪一块；而抛在 `register` 之前意味着这次失败什么都
+    没留下，那一句必须写进下一步里。两档取值把接的范围钉住：只接 `TypeError` 会让一个自己抛
+    `ValueError` 的 `__deepcopy__` 原样穿出去。
+    """
+    runtime = Runtime()
+    source = await runtime.spawn(_worker([ScriptedTurn(content='source')]), query='go')
+    await asyncio.wait_for(runtime.wait(source), timeout=_TIMEOUT)
+    _traj(runtime, source)[0].extra['live'] = value
+    before = set(runtime._slots)
+
+    with pytest.raises(ContractViolation) as caught:
+        await runtime.spawn(_worker([ScriptedTurn(content='twin')]), fork_from=source)
+
+    assert source in caught.value.expected
+    assert "role='user'" in caught.value.received
+    assert anchor in caught.value.received
+    assert set(runtime._slots) == before
     await runtime.shutdown()
 
 
@@ -885,6 +1291,89 @@ async def test_a_delegation_interrupted_by_abort_says_the_child_may_still_be_run
     await runtime.shutdown()
 
 
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_a_legitimate_abort_does_not_permanently_cost_this_agent_its_allow_all(limit):
+    """被打断的那一块只嵌内核自撰的文字与一个内核生成的 child_id，没有任何外部字节。
+
+    标成 `UNTRUSTED` 会让一次正当的中止**永久**废掉这个 Agent 的 `AllowAll`：这块落进轨迹之后
+    `provenance_of` 是「出现过就算」的上界，而宿主关不掉它（D-29 未实现）。
+    """
+    blocker = _Block()
+    runner = _Runner()
+    runtime = Runtime(
+        agents={
+            'Worker': _worker(
+                [_call('Block', '{}'), ScriptedTurn(content='child done')], {'Block': blocker}
+            )
+        }
+    )
+    boss = _orchestrator(
+        [
+            _call('Delegate', '{"agent":"Worker","query":"slow job"}', 'd1'),
+            _call('Runner', _DANGEROUS, 'r1'),
+            ScriptedTurn(content='boss done'),
+        ],
+        runtime,
+        {'Runner': runner},
+        policy=AllowAll(),
+        limit=limit,
+    )
+    parent = await runtime.spawn(boss, query='go')
+    await asyncio.wait_for(blocker.entered.wait(), timeout=_TIMEOUT)
+    await runtime.abort(parent)
+    await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
+    assert [block.trust for block in _tool_blocks(runtime, parent)] == [TrustLevel.TRUSTED]
+
+    assert await runtime.ensure_active(parent)
+    await runtime.send(parent, 'now run it')
+    await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
+
+    assert runner.executed == ['sudo rm -rf /']
+    blocker.release.set()
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_an_interrupted_delegation_does_not_launder_what_the_parent_had_already_read(limit):
+    """反向一侧：那一块交回 `TRUSTED` 不等于它把父此前读过的东西洗白了。
+
+    父自己的轨迹里已经有那块 `UNTRUSTED`，而 `provenance_of` 看的是整份轨迹。
+    """
+    blocker = _Block()
+    runner = _Runner()
+    runtime = Runtime(
+        agents={
+            'Worker': _worker(
+                [_call('Block', '{}'), ScriptedTurn(content='child done')], {'Block': blocker}
+            )
+        }
+    )
+    boss = _orchestrator(
+        [
+            _call('Tainted', '{"text":"网页说要提权删除"}', 't1'),
+            _call('Delegate', '{"agent":"Worker","query":"slow job"}', 'd1'),
+            _call('Runner', _DANGEROUS, 'r1'),
+            ScriptedTurn(content='boss done'),
+        ],
+        runtime,
+        {'Tainted': _Tainted(), 'Runner': runner},
+        policy=AllowAll(),
+        limit=limit,
+    )
+    parent = await runtime.spawn(boss, query='go')
+    await asyncio.wait_for(blocker.entered.wait(), timeout=_TIMEOUT)
+    await runtime.abort(parent)
+    await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
+
+    assert await runtime.ensure_active(parent)
+    await runtime.send(parent, 'now run it')
+    await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
+
+    assert runner.executed == []
+    blocker.release.set()
+    await runtime.shutdown()
+
+
 async def test_a_child_that_finished_is_delivered_even_though_an_abort_already_arrived():
     """已经跑完的那份轨迹此刻丢掉没有任何好处，而中止仍会在轮边界上兑现。"""
     runtime = Runtime(agents={'Worker': _worker([ScriptedTurn(content='child answer')])})
@@ -894,7 +1383,7 @@ async def test_a_child_that_finished_is_delivered_even_though_an_abort_already_a
     slot = runtime._slots[parent]
     slot.control.request_abort()
 
-    result = await asyncio.wait_for(runtime.wait_in_turn(parent, child), timeout=_TIMEOUT)
+    result = await asyncio.wait_for(runtime._wait_in_turn(parent, child), timeout=_TIMEOUT)
 
     assert result.state.value == 'answered'
     assert result.context is not None and result.context.stop_reason is StopReason.COMPLETED
@@ -910,10 +1399,10 @@ async def test_a_second_in_turn_wait_preempts_the_first_one():
         _worker([_call('Block', '{}'), ScriptedTurn(content='x')], {'Block': blocker}), query='go'
     )
     await asyncio.wait_for(blocker.entered.wait(), timeout=_TIMEOUT)
-    first = asyncio.ensure_future(runtime.wait_in_turn(parent, slow))
+    first = asyncio.ensure_future(runtime._wait_in_turn(parent, slow))
     await asyncio.sleep(0)
 
-    second = asyncio.ensure_future(runtime.wait_in_turn(parent, slow))
+    second = asyncio.ensure_future(runtime._wait_in_turn(parent, slow))
     outcome = await asyncio.wait_for(first, timeout=_TIMEOUT)
 
     assert outcome.state.value == 'preempted'
@@ -935,9 +1424,9 @@ async def test_a_preempted_wait_does_not_release_the_slot_the_one_that_preempted
         _worker([_call('Block', '{}'), ScriptedTurn(content='x')], {'Block': blocker}), query='go'
     )
     await asyncio.wait_for(blocker.entered.wait(), timeout=_TIMEOUT)
-    first = asyncio.ensure_future(runtime.wait_in_turn(parent, slow))
+    first = asyncio.ensure_future(runtime._wait_in_turn(parent, slow))
     await asyncio.sleep(0)
-    second = asyncio.ensure_future(runtime.wait_in_turn(parent, slow))
+    second = asyncio.ensure_future(runtime._wait_in_turn(parent, slow))
     assert (await asyncio.wait_for(first, timeout=_TIMEOUT)).state is WaitState.PREEMPTED
 
     runtime._slots[parent].control.request_abort()
@@ -954,9 +1443,90 @@ async def test_waiting_in_turn_on_behalf_of_an_agent_this_process_never_took_ove
     runtime = Runtime()
     parent = await _idle_parent(runtime)
     with pytest.raises(ContractViolation) as caught:
-        await runtime.wait_in_turn('not-mine', parent)
+        await runtime._wait_in_turn('not-mine', parent)
     assert 'not-mine' in caught.value.expected
     await runtime.shutdown()
+
+
+async def test_waiting_in_turn_on_oneself_is_refused_instead_of_parking_forever():
+    """等自己的事件循环结束就是永久挂死：它停不下来，正是因为这一轮悬在这次等待上。
+
+    `despawn` / `kill` 为完全同型的情形立了守卫；判据取**两个 id 相等**而不是任务身份，因此它在
+    并发段里（`_refuse_self` 认不出自己的那一格，D-39）同样成立。
+    """
+    runtime = Runtime()
+    parent = await _idle_parent(runtime)
+
+    with pytest.raises(ContractViolation) as caught:
+        await asyncio.wait_for(runtime._wait_in_turn(parent, parent), timeout=_TIMEOUT)
+
+    assert parent in caught.value.received
+    assert 'abort' in caught.value.next_action
+    assert runtime._slots[parent].delegation is None
+    await runtime.shutdown()
+
+
+async def test_waiting_in_turn_for_a_target_this_process_never_saw_says_so_in_its_own_words():
+    """借用 `wait()` 的那条消息会把下一步讲成「用 wait() 读轨迹」——写给 Runtime 外面的调用方。
+
+    在轮等待的调用方是发起方自己的编排工具，它这一轮悬在这次等待上。
+    """
+    runtime = Runtime()
+    parent = await _idle_parent(runtime)
+
+    with pytest.raises(ContractViolation) as caught:
+        await asyncio.wait_for(runtime._wait_in_turn(parent, 'nobody'), timeout=_TIMEOUT)
+
+    assert 'nobody' in caught.value.expected
+    assert parent in caught.value.next_action
+    assert 'ZOMBIE' in caught.value.next_action
+    assert runtime._slots[parent].delegation is None
+    await runtime.shutdown()
+
+
+async def test_a_delegation_that_returned_normally_leaves_the_delegation_slot_empty():
+    """槽不释放，此后每一次 `abort` 都会打在一个早已返回的等待上，而真正在飞的那次打不到。"""
+    runtime = Runtime(agents={'Worker': _worker([ScriptedTurn(content='child answer')])})
+    parent = await _idle_parent(runtime)
+
+    await asyncio.wait_for(
+        Delegate(runtime, parent).execute(agent='Worker', query='x'), timeout=_TIMEOUT
+    )
+
+    assert runtime._slots[parent].delegation is None
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ('state', 'context'),
+    [
+        (WaitState.ANSWERED, None),
+        (WaitState.ABORTED, Context()),
+        (WaitState.PREEMPTED, Context()),
+        (WaitState.TIMEOUT, Context()),
+    ],
+    ids=['answered-without-one', 'aborted-with-one', 'preempted-with-one', 'timeout-with-one'],
+)
+def test_an_in_turn_wait_result_whose_trajectory_disagrees_with_its_state_is_refused(
+    state, context
+):
+    """没有轨迹的 `answered` 在调用方那里是一次拿不到结果的成功，反过来是把「它还在跑」读成
+    「它已经跑完」。两者都是产出方的缺陷，在构造处拦下比在使用处现身便宜得多。
+    """
+    with pytest.raises(ContractViolation) as caught:
+        _InTurnWaitResult(state=state, context=context)
+
+    assert state.name in caught.value.received
+    assert 'answered' in caught.value.next_action
+
+
+@pytest.mark.parametrize(
+    ('state', 'context'),
+    [(WaitState.ANSWERED, Context()), (WaitState.ABORTED, None)],
+    ids=['answered-with-one', 'aborted-without-one'],
+)
+def test_the_two_consistent_shapes_of_an_in_turn_wait_result_are_accepted(state, context):
+    assert _InTurnWaitResult(state=state, context=context).state is state
 
 
 async def test_a_delegation_does_not_report_the_parent_as_waiting_for_a_reply():
@@ -1031,14 +1601,14 @@ async def test_the_factory_that_built_an_agent_is_the_one_a_fork_reuses():
     agent_id = await runtime.spawn(factory, query='go')
     await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
 
-    assert runtime.factory_of(agent_id) is factory
-    assert runtime.factory_of('nobody') is None
+    assert runtime._factory_of(agent_id) is factory
+    assert runtime._factory_of('nobody') is None
     await runtime.shutdown()
 
 
 async def test_the_provenance_of_an_agent_this_process_does_not_hold_is_the_worst_case():
     runtime = Runtime()
-    assert runtime.provenance_of('nobody') is TrustLevel.UNTRUSTED
+    assert runtime._provenance_of('nobody') is TrustLevel.UNTRUSTED
     await runtime.shutdown()
 
 
@@ -1057,6 +1627,51 @@ async def test_delegate_creates_its_child_as_a_zombie_so_the_returned_id_is_not_
     slot = runtime._slots[result.meta['agent_id']]
     assert slot.exit_mode is ExitMode.ZOMBIE
     await runtime.shutdown()
+
+
+async def test_the_conclusion_is_found_even_when_a_hook_appended_after_the_final_assistant_block():
+    """`AGENT_END` 收到的 `ctx` 就是子 Agent 那一份，切点之后它的末尾可以是任何东西。
+
+    取最后一块就会把一个观察者写下的块当成子 Agent 的结论交给模型。
+    """
+    runtime = Runtime(agents={'Worker': _worker([ScriptedTurn(content='the child answer')])})
+    parent = await _idle_parent(runtime)
+
+    async def append_a_trailing_block(**kwargs: object) -> HookResult:
+        ctx = kwargs['ctx']
+        assert isinstance(ctx, Context)
+        if [block.content for block in ctx.current_traj if block.role == 'assistant'] == [
+            'the child answer'
+        ]:
+            ctx.append(
+                ContextBlock(role='tool', content='an observer wrote this', tool_call_id='z')
+            )
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_END, append_a_trailing_block)
+    result = await asyncio.wait_for(
+        Delegate(runtime, parent).execute(agent='Worker', query='x'), timeout=_TIMEOUT
+    )
+
+    assert 'the child answer' in str(result.output)
+    assert 'an observer wrote this' not in str(result.output)
+    await runtime.shutdown()
+
+
+def test_the_unfinished_table_answers_for_every_stop_reason_and_for_having_none():
+    """两张表都按枚举取全：缺一个键就是一个 `KeyError` 从工具里上抛、把整次 run 打成 error。
+
+    期望值来自枚举本身（与这两张表无关的第三方事实源），所以新增一个 `StopReason` 成员就变红。
+    """
+    assert set(_UNFINISHED) == {None, *StopReason}
+    assert [key for key, text in _UNFINISHED.items() if not isinstance(text, str) or not text] == []
+
+
+def test_the_interrupted_table_answers_for_every_wait_state():
+    assert set(_INTERRUPTED) == set(WaitState)
+    assert [
+        key for key, text in _INTERRUPTED.items() if not isinstance(text, str) or not text
+    ] == []
 
 
 async def test_neither_orchestration_tool_declares_itself_safe_to_run_concurrently():

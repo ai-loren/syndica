@@ -115,7 +115,7 @@ import inspect
 import logging
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from syndica.kernel.agent import BaseAgent
@@ -139,7 +139,7 @@ from syndica.kernel.protocols import AgentRegistry, MessageBroker
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.waiting import Waiter, WaitResult, WaitState, correlation_of
 
-__all__ = ['AgentFactory', 'InTurnWaitResult', 'Runtime', 'validate_agent_factories']
+__all__ = ['AgentFactory', 'Runtime', 'validate_agent_factories']
 
 logger = logging.getLogger(__name__)
 
@@ -173,17 +173,23 @@ _PAUSABLE_STATUSES: tuple[AgentStatus, ...] = (
 
 
 def _forkable_prefix(blocks: list[ContextBlock]) -> list[ContextBlock]:
-    """分叉出去的那份轨迹，截到最后一个**未配对**的 assistant 块之前。
+    """分叉出去的那份轨迹：末尾那个**未配对**的批次只丢掉它的 `tool_calls`。
 
     分叉是从一次工具调用**内部**发起的，此刻源 Agent 的轨迹末尾正是一个已声明、尚未配对的
     assistant 块——发起分叉的那次调用自己。原样拷过去，分身一进 `run` 就会把它当成「上一次被中断
     的批次」，给每个未配对的调用补一块「副作用未知」的说明：一段凭空捏造的历史。那次调用是源
     Agent 的事，分身不需要知道。
 
+    **要丢的是 `tool_calls`，不是 `content`。** 模型最常见的输出形态是在同一块上先写下结论再发起
+    分叉，整块截掉就把这份轨迹里唯一的那句结论一起删了——而 `Fork` 交给模型的 description 逐字
+    写着「分身看得到你到此刻为止的轨迹，因此不必重复前提」。配对不变式只要求那些没有结果的调用
+    消失。`content` 为空时那一块整个丢掉：既无 `content` 又无 `tool_calls` 的块会污染此后每一次
+    请求的前缀。
+
     截断连带丢掉排在那个 assistant 块之后的结果块（同一批里更早的段已经落下的那些）——它们配对的
-    正是被丢掉的那个 assistant 块，留着就是一串孤儿 tool 块，而 provider 会拒掉整条消息。**它们
-    可能携带这份轨迹里唯一的不可信标记**，所以 `spawn` 另外把源 Agent 的溯源结论带到分身的第一条
-    输入上（见 `spawn` 的 `query_trust`）。
+    正是被丢掉的那些调用，留着就是一串孤儿 tool 块，而 provider 会拒掉整条消息。**它们可能携带
+    这份轨迹里唯一的不可信标记**，所以 `spawn` 另外把源 Agent 的溯源结论带到分身身上（见 `spawn`
+    的 `query_trust` 与 `_carry_truncated_taint`）。
     """
     index = len(blocks) - 1
     while index >= 0 and blocks[index].role == 'tool':
@@ -193,7 +199,22 @@ def _forkable_prefix(blocks: list[ContextBlock]) -> list[ContextBlock]:
     answered = {block.tool_call_id for block in blocks[index + 1 :]}
     if all(call.id in answered for call in blocks[index].tool_calls):
         return list(blocks)
-    return blocks[:index]
+    head = blocks[index]
+    if not head.content:
+        return blocks[:index]
+    return [*blocks[:index], replace(head, tool_calls=[])]
+
+
+def _not_a_role_table(agents: object) -> ConfigError:
+    return ConfigError(
+        expected='agents 是「角色名 -> 工厂」的映射：模型按名字派活，所以名字必须是键',
+        received=f'收到 {type(agents).__name__} 类型的 {agents!r}，它没有 items()',
+        next_action=(
+            '把 Runtime(agents=...) 改成 {名字: 工厂} 的 dict。'
+            '声明式清单里 `agents: [Worker, Planner]` 是一个列表，那里只有名字、没有工厂；'
+            '要按名字派活就写成 `agents: {Worker: ..., Planner: ...}`'
+        ),
+    )
 
 
 def _bad_role_name(name: object) -> ConfigError:
@@ -231,7 +252,10 @@ def validate_agent_factories(agents: Mapping[str, AgentFactory]) -> None:
     **能查的只有形状，不是身份。** 「忘了加括号」传进来一个工厂生成器同样收两个位置参数、同样
     可调用，任何签名检查都放行它；抓得住它的是工厂**交回了什么**，那道检查在 `spawn` 里。
     """
-    for name, factory in cast('Mapping[object, object]', agents).items():
+    table = cast('object', agents)
+    if not isinstance(table, Mapping):
+        raise _not_a_role_table(table)
+    for name, factory in cast('Mapping[object, object]', table).items():
         if not isinstance(name, str) or not name.strip():
             raise _bad_role_name(name)
         if not callable(factory):
@@ -276,14 +300,57 @@ def _cannot_fork_from(fork_from: str) -> ContractViolation:
     )
 
 
+def _cannot_fork_a_block(
+    fork_from: str, position: int, role: str, exc: Exception
+) -> ContractViolation:
+    return ContractViolation(
+        expected=f'分叉源 {fork_from!r} 的每一块轨迹都可深拷：分身改自己的轨迹不得污染源',
+        received=f'第 {position} 块（role={role!r}）拷不动：{type(exc).__name__}: {exc}',
+        next_action=(
+            '把这一块的 extra / content 里活的对象（线程锁、连接、文件句柄）换成一段可深拷的'
+            '描述再分叉——轨迹要持久化、要经压缩重写，活的对象在那两条路上同样过不去。'
+            '本次分叉什么都没发生：分身既没有注册，也没有驱动任务'
+        ),
+    )
+
+
 def _cannot_wait_in_turn(agent_id: str, received: str) -> ContractViolation:
     return ContractViolation(
         expected=f'agent {agent_id!r} 的事件循环由本进程接管着，可以代表它等另一个 Agent',
         received=received,
         next_action=(
-            'wait_in_turn 由该 Agent 自己的编排工具在轮中发起，等的是另一个 Agent 的事件循环；'
+            '在轮等待由该 Agent 自己的编排工具在轮中发起，等的是另一个 Agent 的事件循环；'
             '要从 Runtime 外面等一个 Agent 结束就用 wait()。'
             '确认 agent_id 是 spawn 的返回值，并用 find() 读它当前的 status 与 owner'
+        ),
+    )
+
+
+def _cannot_wait_on_itself(agent_id: str) -> ContractViolation:
+    """判据是**两个 id 相等**，不是任务身份。
+
+    `_refuse_self` 比对 `current_task()`，而一个声明了可并发的工具跑在 `gather` 建的子任务里、
+    认不出自己（D-39）。这里两个 id 相等本身就无法满足，因此判据不依赖调用方跑在哪个任务上。
+    """
+    return ContractViolation(
+        expected='在轮等待的目标是**另一个** Agent 的事件循环',
+        received=f'agent_id 与 target_id 都是 {agent_id!r}',
+        next_action=(
+            '等自己的事件循环结束就是永久挂死：它停不下来，正是因为这一轮悬在这次等待上。'
+            '要等一个子 Agent 就传 spawn 交回的那个 id；要让自己这一轮停下来用 abort'
+        ),
+    )
+
+
+def _unknown_in_turn_target(agent_id: str, target_id: str, known: list[str]) -> ContractViolation:
+    return ContractViolation(
+        expected=f'在轮等待的目标 {target_id!r} 由本进程 spawn，且结束后仍留在本进程里',
+        received=f'本进程没有它的运行记录（已知: {known}）：它不是本进程 spawn 的，或已被销毁',
+        next_action=(
+            f'传 spawn 交回的那个 agent_id——agent {agent_id!r} 这一轮悬在这次等待上，'
+            '目标不存在时没有任何东西能把它叫回来。'
+            '以 ExitMode.EXIT 结束的 Agent 连 Context 一起被销毁、等不到，改用 ZOMBIE spawn 它；'
+            '目标由别的进程持有就在那个进程上等它'
         ),
     )
 
@@ -301,11 +368,14 @@ class _Seed:
 
 
 @dataclass(frozen=True)
-class InTurnWaitResult:
-    """`wait_in_turn` 的结局。字段顺序计入公开 API。
+class _InTurnWaitResult:
+    """`Runtime._wait_in_turn` 的结局。
+
+    **刻意不进公开面**：唯一的消费者是本包里的编排工具，而加一个公开名字不是破坏性变更、去掉一个
+    是。第三方要它时再放出来。
 
     只出现三态：`ANSWERED`（被等的那个事件循环结束了）、`ABORTED`、`PREEMPTED`。没有 `TIMEOUT`
-    ——这次等待没有上限，理由见 `Runtime.wait_in_turn`。
+    ——这次等待没有上限，理由见 `Runtime._wait_in_turn`。
 
     **只有 `ANSWERED` 带 `context`，且 `ANSWERED` 必须带。** 被打断的等待没有轨迹可交，硬凑一份
     会让调用方把「它还在跑」读成「它已经跑完」；而没有轨迹的 `ANSWERED` 在调用方那里表现为一次
@@ -571,20 +641,25 @@ class Runtime:
         """
         return self._agents.get(name)
 
-    def factory_of(self, agent_id: str) -> AgentFactory | None:
+    def _factory_of(self, agent_id: str) -> AgentFactory | None:
         """造出这个 Agent 的那个工厂；本进程不持有它则 None。
 
         `Fork` 要照着源 Agent 再造一个**同类型**的：spec §5.2 纪律 4 说同类型分叉继承缓存亲和，
         而「同类型」在这里的实际含义就是同一个工厂——同一份 System Prompt、同一套工具与次序。
+
+        **私有**：唯一的消费者是本包里的 `Fork`，理由同 `_InTurnWaitResult`。
         """
         slot = self._slots.get(agent_id)
         return slot.factory if slot is not None else None
 
-    def provenance_of(self, agent_id: str) -> TrustLevel:
+    def _provenance_of(self, agent_id: str) -> TrustLevel:
         """这个 Agent 的轨迹能不能溯源到不可信内容（spec §12.2）。只读，绝不激活。
 
         本进程手里没有它的实例时答 `UNTRUSTED`：唯一的消费者是「派出去的那件活该不该带着不可信
         标记」，而答不出来就按最坏情况处理（spec §13）——少判的后果是那道关不掉的升级静默失效。
+
+        **私有**：唯一的消费者是本包里的 `Delegate`，理由同 `_InTurnWaitResult`。判据本身
+        （`context.provenance_of`）是模块级函数、单一定义，宿主要问同一个问题就用它。
         """
         agent = self._table.get(agent_id)
         if agent is None:
@@ -611,10 +686,11 @@ class Runtime:
         给出：派活的 `query` 是父 Agent 的模型写的，而模型读过什么决定了那段文字是什么的衍生物。
 
         `fork_from` 让新 Agent 继承那个 Agent 到此刻为止的轨迹（逐块深拷，`trust` 一并带着）。
-        末尾未配对的批次会被截掉（见 `_forkable_prefix`），而**被截掉的那些块可能携带这份轨迹里
-        唯一的不可信标记**，所以这里把源 Agent 的溯源结论并进 `query_trust`：截断是本方法自己的
-        动作，补偿它的责任也在这里。`query=None` 时无处可放——那条输入将由一条消息带来，标记随
-        `Message.trust` 走。
+        末尾未配对的那些调用会被截掉（见 `_forkable_prefix`），而**被截掉的那些块可能携带这份
+        轨迹里唯一的不可信标记**，所以这里把源 Agent 的溯源结论并进 `query_trust`：截断是本方法
+        自己的动作，补偿它的责任也在这里。`query=None`（spec §4.7 的 lazy boot）没有 query 可挂，
+        改挂到继承来的最后一块上（见 `_carry_truncated_taint`）——**两条路都必须补**：那个事实在
+        本方法返回之后就不存在于任何地方了，宿主无从得知，下游也无从补救。
 
         工厂收下本 Runtime 的 hooks 与事件总线：Agent 自己新建一份，宿主注册的切点与订阅就都落空了。
         """
@@ -637,9 +713,15 @@ class Runtime:
             if source is None:
                 raise _cannot_fork_from(fork_from)
             # 溯源结论在截断**之前**取：被截掉的块可能是这份轨迹里唯一不可信的那一块。
-            query_trust = strictest_trust(query_trust, provenance_of(source.context))
-            for block in _forkable_prefix(source.context.current_traj):
-                agent.context.append(copy.deepcopy(block))
+            source_trust = provenance_of(source.context)
+            query_trust = strictest_trust(query_trust, source_trust)
+            for position, block in enumerate(_forkable_prefix(source.context.current_traj)):
+                try:
+                    agent.context.append(copy.deepcopy(block))
+                except Exception as exc:
+                    raise _cannot_fork_a_block(fork_from, position, block.role, exc) from exc
+            if query is None:
+                self._carry_truncated_taint(agent, fork_from, source_trust)
         await self.registry.register(
             AgentInfo(
                 agent_id=agent_id,
@@ -681,6 +763,39 @@ class Runtime:
         self._table.set_task(agent_id, task)
         await self.hooks.trigger(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)
         return agent_id
+
+    def _carry_truncated_taint(
+        self, agent: BaseAgent, fork_from: str, source_trust: TrustLevel
+    ) -> None:
+        """`query=None` 的分叉：把源 Agent 的溯源结论挂到继承来的最后一块上。
+
+        `query_trust` 是另一条路上的落点，而 lazy boot 没有 query 可挂。补偿必须留在**丢弃发生的
+        这一处**：「截断丢掉了一个不可信块」这个事实在 `spawn` 返回的那一刻就不存在于任何地方，
+        宿主与下游都无从得知，因此 `send(trust=...)` 这类下游入口补不上它。
+
+        判据仍是 `context.provenance_of` 那个上界（「轨迹里出现过 `UNTRUSTED` 的块」），所以收紧
+        一块继承来的 `trust` 就够，不引入第二套启发式。改的是 `trust` 而不是追加一块说明：`trust`
+        不进请求字节，分身的前缀因此与源逐字节相同（spec §5.2 纪律 4 的缓存亲和是分叉的全部意义），
+        而一块内核自撰的说明既改前缀、又会被模型读到并据此行动。
+        """
+        if source_trust is not TrustLevel.UNTRUSTED:
+            return
+        blocks = agent.context.current_traj
+        if blocks:
+            # `current_traj` 只拷列表、不拷块，所以这一句落在轨迹里那一块上。
+            blocks[-1].trust = TrustLevel.UNTRUSTED
+            return
+        logger.error(
+            '期望: 从 agent %s 分叉出来的 %s 带着源的溯源结论 untrusted——'
+            '截断丢掉的块可能携带那份轨迹里唯一的不可信标记。'
+            ' 实际: 截断之后一块都没剩下，而这次分叉没有 query 可挂，标记无处安放：'
+            '分身的轨迹于是干净得像什么都没读过，它此后的高风险调用会绕过 spec §12.2 第 3 条'
+            '那道强制升级。'
+            ' 下一步: 给这次分叉传一个 query（它会带上合并后的 query_trust），'
+            '或者别让分身继承一份只剩未配对批次的轨迹——先让源 Agent 跑完那一批再分叉。',
+            fork_from,
+            agent.agent_id,
+        )
 
     async def _unbuild(self, agent_id: str) -> None:
         """把 `spawn` 已经建好的两样按逆序还回去，不留半个 Agent。
@@ -902,7 +1017,7 @@ class Runtime:
         return self._finished_context(agent_id)
 
     def _finished_context(self, agent_id: str) -> Context:
-        """一个事件循环已经停下的 Agent 的轨迹。`wait` 与 `wait_in_turn` 的共同出口。
+        """一个事件循环已经停下的 Agent 的轨迹。`wait` 与 `_wait_in_turn` 的共同出口。
 
         两条路各写一份，迟早会在「接管失败算不算等到了」这种地方分叉，而分叉出来的差异只在
         接管真的失败时才现身。
@@ -922,11 +1037,13 @@ class Runtime:
             )
         return agent.context
 
-    async def wait_in_turn(self, agent_id: str, target_id: str) -> InTurnWaitResult:
+    async def _wait_in_turn(self, agent_id: str, target_id: str) -> _InTurnWaitResult:
         """代表一个正在干活的 Agent 等另一个 Agent 的事件循环结束（供编排工具使用）。
 
+        **私有**：唯一的消费者是本包里的 `Delegate` / `Fork`，理由同 `_InTurnWaitResult`。
+
         与 `wait` 的区别只有一条：**这次等待打断得了**。`wait` 从 Runtime 外面调，调用方自己套
-        取消；`wait_in_turn` 从一次工具调用内部发起，此刻 `agent_id` 正卡在一轮的中间——而中止位
+        取消；这里从一次工具调用内部发起，此刻 `agent_id` 正卡在一轮的中间——而中止位
         只在轮的边界上被读到，不打断这次等待，一次 `abort(agent_id)` 要等被等的那个 Agent 自己
         干完才兑现。这与 `wait_for` 上那条裁决同型，令牌也是同一个机制。
 
@@ -945,6 +1062,9 @@ class Runtime:
 
         **被等的那一方真的结束了就交回它的轨迹，即便中断也已经到达。** 此刻丢掉一份已经跑完的
         结果没有任何好处，而中止仍会在下一个轮边界上兑现。
+
+        **目标的两道守卫都在装令牌之前**：等自己是永久挂死，而目标不存在时这一轮悬在一次没有任何
+        东西能解开的等待上。被拒的调用因此不在这个 Agent 的槽里留下任何痕迹。
         """
         slot = self._slots.get(agent_id)
         if slot is None:
@@ -958,6 +1078,10 @@ class Runtime:
                 'IDLE -> RUNNING 的转换被拒（它已被别人拿走），或任务在这之前就被取消'
                 '——本进程手上没有一轮可以挂起',
             )
+        if target_id == agent_id:
+            raise _cannot_wait_on_itself(agent_id)
+        if target_id not in self._slots or self._table.get(target_id) is None:
+            raise _unknown_in_turn_target(agent_id, target_id, sorted(self._slots))
         token = _WaitToken()
         previous = slot.delegation
         slot.delegation = token
@@ -980,10 +1104,10 @@ class Runtime:
             # 而中断胜出只是**它没结束**的那一格。写成「令牌被打过就交回中断」会让一份已经跑完的
             # 轨迹在中断也到达时被丢掉。
             if target is None or target.done():
-                return InTurnWaitResult(
+                return _InTurnWaitResult(
                     state=WaitState.ANSWERED, context=self._finished_context(target_id)
                 )
-            return InTurnWaitResult(state=token.raised.result())
+            return _InTurnWaitResult(state=token.raised.result())
         finally:
             # `is token`：被顶掉的那次等待先返回时，槽里装的是顶掉它的那个令牌，而那次等待还挂着。
             if slot.delegation is token:

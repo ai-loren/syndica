@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -6502,6 +6503,33 @@ def test_a_role_whose_value_cannot_be_called_as_a_factory_is_refused_where_it_wa
     assert 'agents' in caught.value.next_action
 
 
+@pytest.mark.parametrize(
+    'agents',
+    [['Worker', 'Planner'], ('Worker',), {'Worker'}, 'Worker'],
+    ids=['list', 'tuple', 'set', 'bare-string'],
+)
+def test_a_role_table_that_is_not_a_mapping_is_refused_instead_of_a_bare_attribute_error(agents):
+    """声明式清单里 `agents: [Worker, Planner]` 最顺手，而那里只有名字、没有工厂。
+
+    不拦的话报出的是 `'list' object has no attribute 'items'`——它既不说该写成什么，
+    也不说这个参数叫什么。
+    """
+    with pytest.raises(ConfigError) as caught:
+        Runtime(agents=agents)  # pyright: ignore[reportArgumentType]
+
+    assert type(agents).__name__ in caught.value.received
+    assert 'agents' in caught.value.next_action
+
+
+def test_a_role_table_that_is_a_mapping_but_not_a_dict_is_accepted():
+    """放宽方向也要钉：收窄成只认 `dict` 会把一个只读映射拒掉，而声明式清单最自然的产物之一
+    就是把宿主那份表包成 `MappingProxyType` 交进来。
+    """
+    runtime = Runtime(agents=MappingProxyType({'Worker': _factory(_done())}))
+
+    assert runtime.agent_names == ('Worker',)
+
+
 @pytest.mark.parametrize('name', ['', '   '], ids=['empty', 'blank'])
 def test_a_blank_role_name_is_refused_because_nothing_can_ever_address_it(name):
     with pytest.raises(ConfigError) as caught:
@@ -6565,7 +6593,7 @@ async def test_waiting_in_turn_for_an_agent_whose_drive_never_took_over_is_refus
     target = await runtime.spawn(_factory(_done()), query='go')
 
     with pytest.raises(ContractViolation) as caught:
-        await runtime.wait_in_turn(stranded, target)
+        await runtime._wait_in_turn(stranded, target)
 
     assert stranded in caught.value.expected
     assert '接管' in caught.value.received

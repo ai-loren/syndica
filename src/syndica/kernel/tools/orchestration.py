@@ -11,9 +11,14 @@
 已有 Agent 能继续同一工作时用 `SendMessage`，不要新建；**能直接做完的有界工作不该委派**。
 
 **两者都阻塞发起方的这一轮。** 它们要等子 Agent 做完才拿得到结果，而工具是在轮里跑的。这是有意
-的：派活出去却不等结果，父 Agent 就得自己再发明一套轮询。等待经 `Runtime.wait_in_turn`，因此
+的：派活出去却不等结果，父 Agent 就得自己再发明一套轮询。等待经 `Runtime._wait_in_turn`，因此
 `abort(发起方)` 打断得了它；发起方此刻仍是 `RUNNING` 而不是 `WAITING`——`WAITING` 说的是「这一轮
 悬在一条匹配的答复上」，等一个子 Agent 干活是这一轮的工作本身。
+
+**本模块读 `Runtime` 上三个带下划线的接缝**（`_wait_in_turn` / `_factory_of` / `_provenance_of`）。
+它们刻意不进公开面：加一个公开方法不是破坏性变更，去掉一个是，所以先私有、真有第三方要再放出来。
+这些工具与 `Runtime` 同在内核里，因此每个读点单独豁免 `reportPrivateUsage`，而不是整文件关掉它
+——关掉之后，此后任何一处真正不该有的私有访问都不会再有人出声。
 
 **子 Agent 的 `agent_id` 必须进 `output`，不能只进 `meta`。** `meta` 落在 block 的 `extra` 里、
 不进模型上下文，只放那里等于模型拿不到 id：它于是既不能让这个 ZOMBIE 带着上下文继续干，也不能
@@ -41,7 +46,9 @@ __all__ = ['Delegate', 'Fork']
 def _final_text(ctx: Context) -> str | None:
     """子 Agent 最后一次留下的文字。
 
-    从后往前找而不是取最后一块：`_finish` 之后的轨迹末尾可以是工具结果块。
+    从后往前找而不是取最后一块：`COMPLETED` 那一块 assistant 之后，`AGENT_END` / `TURN_END` 上
+    的 hook 还能往这份轨迹里追加任何东西（切点收到的 `ctx` 就是这一份），取最后一块于是会把一个
+    观察者写下的块当成子 Agent 的结论。
     """
     for block in reversed(ctx.current_traj):
         if block.role == 'assistant' and isinstance(block.content, str) and block.content:
@@ -49,6 +56,8 @@ def _final_text(ctx: Context) -> str | None:
     return None
 
 
+# 两张表都按枚举**取全**，缺一个键就是一个 KeyError 从工具里上抛、把整次 run 打成 error。
+# 因此它们的完备性由用例按枚举断言，而不是靠「今天这一格到不了」。
 _UNFINISHED: dict[StopReason | None, str] = {
     None: '它在给出结论之前被硬终止了（kill / 关机），轨迹可能停在一轮的中间',
     StopReason.ERROR: '它以错误结束',
@@ -61,7 +70,7 @@ _INTERRUPTED: dict[WaitState, str] = {
     WaitState.ABORTED: '你这一轮被中止了，因此这次等待提前结束',
     WaitState.PREEMPTED: '你身上一次更晚发起的等待顶掉了这一次',
     WaitState.TIMEOUT: '这次等待以超时结束',
-    WaitState.ANSWERED: '这次等待已经拿到结果',
+    WaitState.ANSWERED: '这次等待报告拿到了结果，却没有交出那份轨迹',
 }
 
 
@@ -102,6 +111,12 @@ def _interrupted(child_id: str, state: WaitState) -> ToolResult:
 
     **不说子 Agent 怎么样了**：它此刻可能还在跑、也可能刚好跑完，而这次等待没有读到它的轨迹。
     两个方向都不许断言——声称它没做完会让模型重复派同一件活，声称它做完了更糟。
+
+    `trust` 是 `TRUSTED`：这一块只嵌内核自撰的文字与一个内核生成的 `child_id`，没有任何来自子
+    Agent 或外部的字节（判据见 `tool_executor` 模块 docstring）。标成 `UNTRUSTED` 会让一次正当的
+    `abort` 永久废掉这个 Agent 的 `AllowAll`——这块落进轨迹之后，`provenance_of` 是「出现过就算」
+    的上界，而宿主关不掉它（D-29 未实现）。**日后往这段话里加入子 Agent 的部分产出，就必须改回
+    读子 Agent 的真实溯源**。
     """
     return ToolResult(
         output=(
@@ -113,13 +128,13 @@ def _interrupted(child_id: str, state: WaitState) -> ToolResult:
             '不要重新派同一件活——那会多出一个干着同一件事的 Agent。'
         ),
         meta={'agent_id': child_id, 'stop_reason': None},
-        trust=TrustLevel.UNTRUSTED,
+        trust=TrustLevel.TRUSTED,
     )
 
 
 async def _collected(runtime: Runtime, agent_id: str, child_id: str) -> ToolResult:
     """等这个子 Agent 干完，把它的终局翻译给模型。`Delegate` 与 `Fork` 的共同出口。"""
-    outcome = await runtime.wait_in_turn(agent_id, child_id)
+    outcome = await runtime._wait_in_turn(agent_id, child_id)  # pyright: ignore[reportPrivateUsage]
     if outcome.context is None:
         return _interrupted(child_id, outcome.state)
     return _delivered(child_id, outcome.context)
@@ -158,13 +173,14 @@ class Delegate(Tool):
                     '没有合适的角色就自己做这件事。'
                 )
             )
+        # `query` 是本 Agent 的模型写下的文字，而模型读过什么决定了那段文字是什么的衍生物
+        # （spec §12.2 第 2 条）。丢掉这一步，任何不可信内容都能经一次派活洗成子 Agent 的可信
+        # 输入，而子 Agent 的高风险调用于是绕过那道关不掉的升级。
+        trust = self._runtime._provenance_of(self._agent_id)  # pyright: ignore[reportPrivateUsage]
         child_id = await self._runtime.spawn(
             factory,
             query=query,
-            # `query` 是本 Agent 的模型写下的文字，而模型读过什么决定了那段文字是什么的衍生物
-            # （spec §12.2 第 2 条）。丢掉这一步，任何不可信内容都能经一次派活洗成子 Agent 的
-            # 可信输入，而子 Agent 的高风险调用于是绕过那道关不掉的升级。
-            query_trust=self._runtime.provenance_of(self._agent_id),
+            query_trust=trust,
             parent_id=self._agent_id,
             # ZOMBIE 而不是 EXIT：EXIT 会让子 Agent 做完即连同条目一起消失，而这次调用交回的
             # 那个 agent_id 就成了悬空引用。
@@ -194,7 +210,7 @@ class Fork(Tool):
         返回的第一行带着分身的 agent_id——它做完之后仍然留在注册表里可寻址。
         query: 交给分身的任务描述；它已经看得到你到此刻为止的轨迹，不必重复前提
         """
-        factory = self._runtime.factory_of(self._agent_id)
+        factory = self._runtime._factory_of(self._agent_id)  # pyright: ignore[reportPrivateUsage]
         if factory is None:
             return ToolResult(
                 output=(
@@ -206,7 +222,8 @@ class Fork(Tool):
                 )
             )
         # 不传 query_trust：分叉的信任级别由 `spawn` 从源 Agent 的轨迹算出来，它才知道自己截掉了
-        # 哪些块——而被截掉的那些可能携带这份轨迹里唯一的不可信标记。
+        # 哪些块——而被截掉的那些可能携带这份轨迹里唯一的不可信标记。本工具恒带 query，所以走的是
+        # `query_trust` 那条落点，不是 `_carry_truncated_taint`。
         child_id = await self._runtime.spawn(
             factory,
             query=query,
