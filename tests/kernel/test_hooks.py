@@ -1,6 +1,8 @@
 import asyncio
 import dataclasses
 import logging
+from collections.abc import Callable
+from typing import cast
 
 import pytest
 
@@ -8,10 +10,12 @@ from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.hooks import (
     INTERCEPTABLE,
     OBSERVABLE,
+    HookCallback,
     HookResult,
     HooksCenter,
     Junction,
     JunctionKind,
+    ReadOnlyKwarg,
 )
 from syndica.kernel.hooks import center as center_module
 
@@ -129,8 +133,16 @@ async def test_observable_hooks_run_concurrently():
     await asyncio.wait_for(center.trigger(Junction.TURN_START, turn=1), timeout=_TIMEOUT)
 
 
-async def test_an_observable_hooks_returned_result_is_discarded():
-    """回调类型对所有切点都是 `HookResult | None`，在可观察切点上返回它不报错也不生效。"""
+def _reported_callback(record: logging.LogRecord) -> object:
+    """诊断记录里被点名的那个回调。"""
+    return cast('tuple[object, ...]', record.args)[1]
+
+
+async def test_an_observable_hooks_returned_result_is_discarded_but_leaves_a_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+):
+    """回调类型对所有切点都是 `HookResult | None`，在可观察切点上返回它不报错也不生效——typing
+    看不见，`register` 时也还不知道回调会返回什么，所以这条记录是这次丢弃留下的全部痕迹。"""
     center = HooksCenter()
     calls: list[str] = []
 
@@ -146,6 +158,119 @@ async def test_an_observable_hooks_returned_result_is_discarded():
     result = await center.trigger(Junction.TURN_START, turn=1)
     assert sorted(calls) == ['after', 'opinionated']
     assert (result.skip, result.modified, result.result) == (False, {}, None)
+    (record,) = caplog.records
+    assert record.levelno == logging.ERROR
+    assert record.args == (
+        'turn_start',
+        (
+            'test_an_observable_hooks_returned_result_is_discarded_but_leaves_a_diagnostic'
+            '.<locals>.opinionated'
+        ),
+        "HookResult(skip=True, modified=['turn'], result='substitute')",
+    )
+
+
+async def test_an_observer_that_answers_the_confirmation_junction_is_told_it_was_discarded(
+    caplog: pytest.LogCaptureFixture,
+):
+    """`tool_confirmation_required` 是第一个「hook 作者会真心想回答」的可观察切点：它报告的是
+    「这次调用等人确认」，挂上去的人最自然的写法就是返回一个批准。那个批准照旧被整个丢弃。"""
+    center = HooksCenter()
+
+    async def approve(**_: object) -> HookResult:
+        return HookResult(skip=True, result='approved')
+
+    center.register(Junction.TOOL_CONFIRMATION_REQUIRED, approve)
+    await center.trigger(Junction.TOOL_CONFIRMATION_REQUIRED, tool_call=None)
+    (record,) = caplog.records
+    assert record.levelno == logging.ERROR
+    assert record.args == (
+        'tool_confirmation_required',
+        (
+            'test_an_observer_that_answers_the_confirmation_junction_is_told_it_was_discarded'
+            '.<locals>.approve'
+        ),
+        "HookResult(skip=True, modified=[], result='approved')",
+    )
+
+
+@pytest.mark.parametrize(
+    'outcome',
+    [
+        HookResult(skip=True),
+        HookResult(modified={'turn': 99}),
+        HookResult(result='substitute'),
+        'not a HookResult at all',
+    ],
+    ids=['skip', 'modified', 'result', 'off-contract'],
+)
+async def test_every_slot_a_discarded_return_could_have_used_is_reported(
+    outcome: object, caplog: pytest.LogCaptureFixture
+):
+    """三个槽位各自单独出现时都要报：只认其中一个，另外两种意图就仍然静默丢失。"""
+    center = HooksCenter()
+
+    async def opinionated(**_: object) -> HookResult | None:
+        # 标注是契约，`off-contract` 这一档刻意违反它：要挡的正是运行期真会出现的取值。
+        return cast('HookResult | None', outcome)
+
+    center.register(Junction.TURN_START, opinionated)
+    await center.trigger(Junction.TURN_START, turn=1)
+    assert [record.levelno for record in caplog.records] == [logging.ERROR]
+
+
+@pytest.mark.parametrize('outcome', [None, HookResult()], ids=['none', 'empty-hook-result'])
+async def test_an_observable_hook_that_discards_nothing_leaves_no_diagnostic(
+    outcome: HookResult | None, caplog: pytest.LogCaptureFixture
+):
+    """记录说的是一次**丢失**。`HookCallback` 对两类切点是同一个类型，`return HookResult()` 因此
+    是类型正确的写法，而空结论在可拦截切点上也什么都不做——报它就是让唯一的那份证据说谎。"""
+    center = HooksCenter()
+
+    async def observer(**_: object) -> HookResult | None:
+        return outcome
+
+    center.register(Junction.TURN_START, observer)
+    await center.trigger(Junction.TURN_START, turn=1)
+    assert caplog.records == []
+
+
+async def test_an_interceptable_hooks_opinion_is_never_reported_as_discarded(
+    caplog: pytest.LogCaptureFixture,
+):
+    """可拦截切点读这些槽位，报它等于把「用对了」说成一次丢失。"""
+    center = HooksCenter()
+
+    async def rewrite(**_: object) -> HookResult:
+        return HookResult(skip=True, modified={'args': {}}, result='substitute')
+
+    center.register(Junction.PRE_TOOL_USE, rewrite)
+    await center.trigger(Junction.PRE_TOOL_USE, args={})
+    assert caplog.records == []
+
+
+async def test_each_discarding_observable_hook_gets_its_own_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+):
+    """记录点名的是**哪个回调**，所以它必须逐个配对，而不是整批报一条。"""
+    center = HooksCenter()
+
+    async def first(**_: object) -> HookResult:
+        return HookResult(skip=True)
+
+    async def quiet(**_: object) -> None:
+        return None
+
+    async def second(**_: object) -> HookResult:
+        return HookResult(modified={'turn': 99})
+
+    for cb in (first, quiet, second):
+        center.register(Junction.TURN_START, cb)
+    await center.trigger(Junction.TURN_START, turn=1)
+    assert [_reported_callback(record) for record in caplog.records] == [
+        'test_each_discarding_observable_hook_gets_its_own_diagnostic.<locals>.first',
+        'test_each_discarding_observable_hook_gets_its_own_diagnostic.<locals>.second',
+    ]
 
 
 async def test_an_observable_hook_that_raises_does_not_break_trigger(
@@ -762,7 +887,9 @@ async def test_an_observable_extension_hook_that_raises_does_not_break_trigger(
     assert 'metrics:sampled' in record.getMessage()
 
 
-async def test_an_observable_extension_hooks_returned_result_is_discarded():
+async def test_an_observable_extension_hooks_returned_result_is_discarded_with_a_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+):
     center = HooksCenter()
     center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
 
@@ -772,6 +899,16 @@ async def test_an_observable_extension_hooks_returned_result_is_discarded():
     center.register('metrics:sampled', opinionated)
     result = await center.trigger('metrics:sampled', value=1)
     assert (result.skip, result.modified, result.result) == (False, {}, None)
+    (record,) = caplog.records
+    assert record.levelno == logging.ERROR
+    assert record.args == (
+        'metrics:sampled',
+        (
+            'test_an_observable_extension_hooks_returned_result_is_discarded_with_a_diagnostic'
+            '.<locals>.opinionated'
+        ),
+        "HookResult(skip=True, modified=['value'], result='substitute')",
+    )
 
 
 async def test_a_hook_registered_by_an_interceptable_extension_hook_waits_for_the_next_trigger():
@@ -1027,3 +1164,362 @@ def test_extension_junctions_are_not_shared_between_centers():
 
     with pytest.raises(ContractViolation):
         HooksCenter().register('artifact:created', cb)
+
+
+def _appender(log: list[str], label: str) -> HookCallback:
+    async def record(**_: object) -> None:
+        log.append(label)
+
+    return record
+
+
+async def test_the_inner_layers_hooks_run_before_the_outer_ones():
+    """spec §5.3：Agent 局部先于 Runtime 级。基数 3，且顺序既非升序亦非降序、也不等于反转。"""
+    log: list[str] = []
+    outer = HooksCenter()
+    inner = HooksCenter(outer=outer)
+    inner.register(Junction.PRE_TOOL_USE, _appender(log, 'beta'))
+    outer.register(Junction.PRE_TOOL_USE, _appender(log, 'alpha'))
+    outer.register(Junction.PRE_TOOL_USE, _appender(log, 'gamma'))
+    await inner.trigger(Junction.PRE_TOOL_USE, args={})
+    assert log == ['beta', 'alpha', 'gamma']
+
+
+async def test_three_layers_run_from_the_innermost_outwards():
+    """装配链可以比两层长（一个 Agent 的外层还有外层）；顺序仍是由内向外。"""
+    log: list[str] = []
+    outermost = HooksCenter()
+    middle = HooksCenter(outer=outermost)
+    innermost = HooksCenter(outer=middle)
+    middle.register(Junction.PRE_TOOL_USE, _appender(log, 'middle'))
+    outermost.register(Junction.PRE_TOOL_USE, _appender(log, 'outermost'))
+    innermost.register(Junction.PRE_TOOL_USE, _appender(log, 'innermost'))
+    await innermost.trigger(Junction.PRE_TOOL_USE, args={})
+    assert log == ['innermost', 'middle', 'outermost']
+
+
+async def test_the_outer_center_never_sees_the_inner_ones_hooks():
+    """外层不知道内层的存在：一个插件的行为不该因为某个 Agent 挂了局部钩子而改变。"""
+    log: list[str] = []
+    outer = HooksCenter()
+    inner = HooksCenter(outer=outer)
+    inner.register(Junction.PRE_TOOL_USE, _appender(log, 'inner'))
+    outer.register(Junction.PRE_TOOL_USE, _appender(log, 'outer'))
+    await outer.trigger(Junction.PRE_TOOL_USE, args={})
+    assert log == ['outer']
+
+
+async def test_two_inner_centers_sharing_an_outer_do_not_see_each_other():
+    """两个 Agent 共用一个 Runtime 中心；一个挂的局部钩子跑进另一个的链里就是串线。"""
+    log: list[str] = []
+    outer = HooksCenter()
+    first = HooksCenter(outer=outer)
+    second = HooksCenter(outer=outer)
+    first.register(Junction.PRE_TOOL_USE, _appender(log, 'first'))
+    second.register(Junction.PRE_TOOL_USE, _appender(log, 'second'))
+    outer.register(Junction.PRE_TOOL_USE, _appender(log, 'shared'))
+    await first.trigger(Junction.PRE_TOOL_USE, args={})
+    assert log == ['first', 'shared']
+
+
+async def test_an_inner_hooks_modification_becomes_the_outer_hooks_input():
+    """两层是一条链而不是两条：跑两遍的话外层看到的是原始参数，一次局部改写就白做了。"""
+    outer = HooksCenter()
+    inner = HooksCenter(outer=outer)
+    seen: list[object] = []
+
+    async def rewrite(**_: object) -> HookResult:
+        return HookResult(modified={'args': {'command': 'rewritten'}})
+
+    async def observe(**kwargs: object) -> HookResult:
+        seen.append(kwargs.get('args'))
+        return HookResult()
+
+    inner.register(Junction.PRE_TOOL_USE, rewrite)
+    outer.register(Junction.PRE_TOOL_USE, observe)
+    result = await inner.trigger(Junction.PRE_TOOL_USE, args={'command': 'original'})
+    assert seen == [{'command': 'rewritten'}]
+    assert result.modified == {'args': {'command': 'rewritten'}}
+
+
+async def test_an_inner_skip_terminates_the_outer_layers_hooks_too():
+    """skip 只终止本层的话，Runtime 级的 hook 会跑在一个已经被顶替掉的操作上。"""
+    log: list[str] = []
+    outer = HooksCenter()
+    inner = HooksCenter(outer=outer)
+
+    async def veto(**_: object) -> HookResult:
+        log.append('veto')
+        return HookResult(skip=True, result='vetoed')
+
+    inner.register(Junction.PRE_TOOL_USE, veto)
+    outer.register(Junction.PRE_TOOL_USE, _appender(log, 'outer'))
+    result = await inner.trigger(Junction.PRE_TOOL_USE, args={})
+    assert log == ['veto']
+    assert (result.skip, result.result) == (True, 'vetoed')
+
+
+async def test_an_outer_skip_carries_out_the_inner_layers_modifications():
+    outer = HooksCenter()
+    inner = HooksCenter(outer=outer)
+
+    async def redact(**_: object) -> HookResult:
+        return HookResult(modified={'args': 'redacted'})
+
+    async def veto(**_: object) -> HookResult:
+        return HookResult(skip=True, modified={'audited': True}, result='vetoed')
+
+    inner.register(Junction.PRE_TOOL_USE, redact)
+    outer.register(Junction.PRE_TOOL_USE, veto)
+    result = await inner.trigger(Junction.PRE_TOOL_USE, args='original')
+    assert result.skip is True
+    assert result.modified == {'args': 'redacted', 'audited': True}
+
+
+async def test_the_chain_records_every_value_a_key_was_given_across_both_layers():
+    """只能单向收紧的量（trust）看 last-wins 的结论会漏掉链中间那次收紧——分层之后那次收紧可能
+    落在内层，而后写的外层 hook 交出的是一个带默认值的新结果。"""
+    outer = HooksCenter()
+    inner = HooksCenter(outer=outer)
+
+    async def tighten(**_: object) -> HookResult:
+        return HookResult(modified={'result': 'untrusted'})
+
+    async def summarise(**_: object) -> HookResult:
+        return HookResult(modified={'result': 'summarised'})
+
+    inner.register(Junction.POST_TOOL_USE, tighten)
+    outer.register(Junction.POST_TOOL_USE, summarise)
+    result = await inner.trigger(Junction.POST_TOOL_USE, result='original')
+    assert result.modified == {'result': 'summarised'}
+    assert result.rewrites('result') == ['untrusted', 'summarised']
+
+
+async def test_an_orphan_result_from_an_outer_hook_is_rejected_by_the_inner_trigger():
+    """`result` 不带 `skip` 谁都读不到，这条与 hook 挂在哪一层无关。"""
+    outer = HooksCenter()
+    inner = HooksCenter(outer=outer)
+
+    async def substitute(**_: object) -> HookResult:
+        return HookResult(result='substitute')
+
+    outer.register(Junction.PRE_TOOL_USE, substitute)
+    with pytest.raises(ContractViolation) as excinfo:
+        await inner.trigger(Junction.PRE_TOOL_USE, args={})
+    assert 'substitute' in excinfo.value.received
+
+
+async def test_both_layers_observable_hooks_run_concurrently():
+    """分层不得把可观察切点串起来：一条链跑完才跑另一条会卡死在栅栏上。"""
+    outer = HooksCenter()
+    inner = HooksCenter(outer=outer)
+    both_started = asyncio.Barrier(2)
+
+    async def wait_for_the_other(**_: object) -> None:
+        await both_started.wait()
+
+    inner.register(Junction.TURN_START, wait_for_the_other)
+    outer.register(Junction.TURN_START, wait_for_the_other)
+    await asyncio.wait_for(inner.trigger(Junction.TURN_START, turn=1), timeout=_TIMEOUT)
+
+
+async def test_an_extension_junction_declared_on_the_outer_center_can_be_hooked_from_the_inner():
+    """分类由声明者给出，而声明在外层——局部注册必须能沿装配链找到它，否则 register 就报错。"""
+    outer = HooksCenter()
+    outer.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    inner = HooksCenter(outer=outer)
+    log: list[str] = []
+
+    async def local(**_: object) -> HookResult:
+        log.append('local')
+        return HookResult()
+
+    inner.register('artifact:created', local)
+    await inner.trigger('artifact:created', artifact='raw')
+    assert log == ['local']
+
+
+async def test_an_extension_junction_declared_on_the_outer_keeps_its_kind_in_the_inner_layer():
+    """分类沿链取：内层若按默认或按本层的空表重新推断，可拦截 hook 会按可观察跑，异常被吞掉。"""
+    outer = HooksCenter()
+    outer.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    inner = HooksCenter(outer=outer)
+    boom = RuntimeError('artifact policy blew up')
+
+    async def explodes(**_: object) -> HookResult:
+        raise boom
+
+    inner.register('artifact:created', explodes)
+    with pytest.raises(RuntimeError) as excinfo:
+        await inner.trigger('artifact:created', artifact='raw')
+    assert excinfo.value is boom
+
+
+def test_redeclaring_an_outer_extension_junction_with_a_different_kind_is_rejected():
+    """冲突检查只看本层的话，同一个名字在两层上有两套执行语义，而 hook 按哪套跑取决于它挂在哪。"""
+    outer = HooksCenter()
+    outer.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    inner = HooksCenter(outer=outer)
+    with pytest.raises(ContractViolation):
+        inner.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
+
+
+def test_redeclaring_an_outer_extension_junction_with_the_same_kind_is_accepted():
+    outer = HooksCenter()
+    outer.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    inner = HooksCenter(outer=outer)
+    inner.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+
+
+def test_the_undeclared_extension_message_lists_the_whole_chains_declarations():
+    """读者要看的是「我能挂哪些」，而答案分散在两层上；只列本层等于把外层声明的那些说成不存在。"""
+    outer = HooksCenter()
+    outer.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
+    inner = HooksCenter(outer=outer)
+    inner.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+
+    async def cb(**_: object) -> None:
+        return None
+
+    with pytest.raises(ContractViolation) as excinfo:
+        inner.register('artifact:removed', cb)
+    assert "['artifact:created', 'metrics:sampled']" in excinfo.value.received
+
+
+def test_an_extension_junction_declared_on_the_inner_center_stays_invisible_to_the_outer():
+    outer = HooksCenter()
+    inner = HooksCenter(outer=outer)
+    inner.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
+
+    async def cb(**_: object) -> None:
+        return None
+
+    with pytest.raises(ContractViolation):
+        outer.register('artifact:created', cb)
+
+
+def _writes_via_setitem(args: ReadOnlyKwarg) -> None:
+    args['command'] = 'sudo rm -rf /'
+
+
+def _writes_via_delitem(args: ReadOnlyKwarg) -> None:
+    del args['command']
+
+
+def _writes_via_ior(args: ReadOnlyKwarg) -> None:
+    # 拒绝写入面意味着 `__ior__` 交回 NoReturn，于是这句在静态检查眼里「赋不回去」——而它恰恰是
+    # hook 作者会写下的那一句，运行期必须拒。
+    args |= {'command': 'sudo rm -rf /'}  # pyright: ignore[reportOperatorIssue]
+
+
+def _writes_via_clear(args: ReadOnlyKwarg) -> None:
+    args.clear()
+
+
+def _writes_via_pop(args: ReadOnlyKwarg) -> None:
+    args.pop('command')
+
+
+def _writes_via_pop_with_default(args: ReadOnlyKwarg) -> None:
+    args.pop('absent', None)
+
+
+def _writes_via_popitem(args: ReadOnlyKwarg) -> None:
+    args.popitem()
+
+
+def _writes_via_setdefault(args: ReadOnlyKwarg) -> None:
+    args.setdefault('command', 'sudo rm -rf /')
+
+
+def _writes_via_update(args: ReadOnlyKwarg) -> None:
+    args.update({'command': 'sudo rm -rf /'})
+
+
+def _writes_via_update_kwargs(args: ReadOnlyKwarg) -> None:
+    args.update(command='sudo rm -rf /')
+
+
+@pytest.mark.parametrize(
+    'write',
+    [
+        _writes_via_setitem,
+        _writes_via_delitem,
+        _writes_via_ior,
+        _writes_via_clear,
+        _writes_via_pop,
+        _writes_via_pop_with_default,
+        _writes_via_popitem,
+        _writes_via_setdefault,
+        _writes_via_update,
+        _writes_via_update_kwargs,
+    ],
+    ids=[
+        'setitem',
+        'delitem',
+        'ior',
+        'clear',
+        'pop',
+        'pop-with-default',
+        'popitem',
+        'setdefault',
+        'update',
+        'update-kwargs',
+    ],
+)
+def test_every_write_entry_point_of_a_read_only_kwarg_is_refused(
+    write: Callable[[ReadOnlyKwarg], None],
+):
+    """整个写入面都要拒。漏掉一个入口，就地改就沿那个入口原样回来，而它躲得过作者判据。"""
+    args = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', {'command': 'ls -la'})
+    with pytest.raises(ContractViolation) as excinfo:
+        write(args)
+    assert Junction.PRE_TOOL_USE.value in excinfo.value.expected
+    assert 'HookResult(modified=' in excinfo.value.next_action
+    assert args == {'command': 'ls -la'}
+
+
+def test_the_read_surface_of_a_read_only_kwarg_is_untouched():
+    """读要一字不改地照常：hook 得能看参数、能拿它拼出新的一份。键序取基数 3。"""
+    args = ReadOnlyKwarg(
+        Junction.PRE_TOOL_USE, 'args', {'command': 'ls -la', 'cwd': '/tmp', 'shell': 'bash'}
+    )
+    assert isinstance(args, dict)
+    assert args == {'command': 'ls -la', 'cwd': '/tmp', 'shell': 'bash'}
+    assert args['command'] == 'ls -la'
+    assert args.get('absent', 'fallback') == 'fallback'
+    assert 'cwd' in args
+    assert len(args) == 3
+    assert list(args) == ['command', 'cwd', 'shell']
+    assert list(args.items()) == [('command', 'ls -la'), ('cwd', '/tmp'), ('shell', 'bash')]
+
+
+@pytest.mark.parametrize('copy', [dict, lambda args: {**args}], ids=['dict', 'splat'])
+def test_a_copy_taken_out_of_a_read_only_kwarg_is_a_plain_writable_dict(
+    copy: Callable[[ReadOnlyKwarg], dict[str, object]],
+):
+    """错误消息给的下一步是「拼一份新的 dict 再交出去」；那条路不通的话这条消息就是空话。"""
+    args = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', {'command': 'ls -la'})
+    copied = copy(args)
+    assert type(copied) is dict
+    copied['command'] = 'rewritten'
+    assert copied == {'command': 'rewritten'}
+    assert args == {'command': 'ls -la'}
+
+
+def test_a_read_only_kwarg_names_the_junction_and_the_key_it_guards():
+    """两者都进消息：读者要知道该在哪个切点、用哪个键写回去。"""
+    args = ReadOnlyKwarg('artifact:created', 'artifact', {'path': 'a.md'})
+    with pytest.raises(ContractViolation) as excinfo:
+        args['path'] = 'b.md'
+    assert 'artifact:created' in excinfo.value.expected
+    assert "'artifact'" in excinfo.value.expected
+    assert "'path'" in excinfo.value.received
+
+
+def test_an_outer_that_is_not_a_hooks_center_is_rejected_at_construction():
+    """错配的症状否则是第一次 trigger 抛一条指着 HooksCenter 内部的 AttributeError，而那时调用栈
+    里已经没有写下这个参数的那一行。"""
+    with pytest.raises(ConfigError) as excinfo:
+        HooksCenter(outer=object())  # pyright: ignore[reportArgumentType]
+    assert 'HooksCenter' in excinfo.value.expected

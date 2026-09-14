@@ -6,6 +6,7 @@ from syndica.kernel.hooks.junctions import (
     JunctionKind,
     JunctionRef,
 )
+from syndica.kernel.hooks.readonly import ReadOnlyKwarg
 from syndica.kernel.hooks.result import HookResult
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     'JunctionKind',
     'JunctionRef',
     'OBSERVABLE',
+    'ReadOnlyKwarg',
 ]

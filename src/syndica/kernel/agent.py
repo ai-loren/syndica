@@ -62,6 +62,10 @@ block——provider 会拒掉这样的消息。本类是那份 Context 此后唯
 
 `max_turns` 约束整个任务而非单个周期。剩余额度为零（`max_turns` 是 0，或已用满）时不调用 LLM，直接
 以 MAX_TURNS 停下——这就是预算耗尽的自然终态。
+
+**本类自己持有一层 hook 中心，外层是宿主交来的那个**（spec §5.3 的前两层）。`register_hook` 挂进
+本层，本层先于外层执行，而外层看不见本层——一个 Runtime 级插件的行为因此不会因为某个 Agent 挂了
+局部钩子而改变。
 """
 
 from __future__ import annotations
@@ -77,7 +81,7 @@ from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
 from syndica.kernel.danger import DangerJudge, DangerPolicy, validate_danger_options
 from syndica.kernel.errors import ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
-from syndica.kernel.hooks import HookResult, HooksCenter, Junction
+from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction, JunctionRef
 from syndica.kernel.llm import LLM, ContextOverflowError
 from syndica.kernel.tool import Tool, validate_tool_names
 from syndica.kernel.tool_executor import (
@@ -364,11 +368,12 @@ class BaseAgent:
         # 全量 uuid4 hex 而非截断：id 撞车不是软失败——AgentRegistry.register 拒绝重复 id，
         # 撞上的那个 Agent 直接注册不进去。
         self.agent_id: str = uuid.uuid4().hex
-        self._hooks = hooks
+        # 本 Agent 自己的一层，外层是宿主交来的那个中心。两层合成一条链，本层在前（spec §5.3）。
+        self._hooks = HooksCenter(outer=hooks)
         self._events = events
         self._executor = ToolExecutor(
             tools=options.tools,
-            hooks=hooks,
+            hooks=self._hooks,
             judge=options.danger_judge,
             policy=options.danger_policy,
             max_concurrency=options.max_tool_concurrency,
@@ -382,6 +387,15 @@ class BaseAgent:
     @property
     def context(self) -> Context:
         return self._context
+
+    def register_hook(self, junction: JunctionRef, cb: HookCallback) -> None:
+        """给**这一个** Agent 挂一个 hook（spec §5.3 的第一层）。
+
+        它先于 Runtime 级插件执行：局部增强要能先看到、先改，跨 Agent 的通用逻辑在它之后收口。
+        两层是一条链，因此局部 hook 的 `modified` 会成为插件看到的入参，它的 `skip` 会连插件的
+        hook 一起终止。反过来不成立——宿主从 Runtime 的中心触发时看不到这里挂的任何东西。
+        """
+        self._hooks.register(junction, cb)
 
     def attach_gate(self, gate: TurnGate) -> None:
         """装上控制面的门。
