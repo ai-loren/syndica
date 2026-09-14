@@ -1047,6 +1047,79 @@ async def test_despawning_yourself_from_inside_a_concurrent_segment_is_still_ref
     await runtime.shutdown()
 
 
+async def test_an_agent_spawned_from_inside_a_tool_does_not_inherit_its_parents_identity():
+    """`spawn` 从驱动任务内部建子 Agent 的驱动任务，而 `asyncio.Task` 建立时复制 contextvars。
+
+    `_drive` 不**无条件**覆写的话，子 Agent 的守卫指着它的父：它 despawn 自己会被放行，而那次
+    拆除要取消并等待它自己正跑在里面的那个驱动任务——于是这次工具调用既没被拒、也没有结果。
+    """
+    runtime = Runtime()
+    holder: dict[str, str] = {}
+    outcomes: list[str] = []
+
+    class _SelfDespawn(Tool):
+        __tool_command_args__ = ()
+
+        def __init__(self) -> None:
+            self.agent_id = ''
+
+        async def execute(self) -> ToolResult:
+            """试着销毁自己。"""
+            try:
+                await runtime.despawn(self.agent_id)
+            except ContractViolation:
+                outcomes.append('refused')
+                return ToolResult(output='refused')
+            outcomes.append('not refused')
+            return ToolResult(output='not refused')
+
+    def child_factory(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        tool = _SelfDespawn()
+        agent = BaseAgent(
+            AgentOptions(
+                name='Child',
+                llm=ScriptedLLM(
+                    [
+                        ScriptedTurn(
+                            tool_calls=[ToolCall(id='c1', name='SelfDespawn', arguments='{}')]
+                        ),
+                        ScriptedTurn(content='child done'),
+                    ]
+                ),
+                tools={'SelfDespawn': tool},
+                system_prompt=_SYSTEM_PROMPT,
+            ),
+            hooks=hooks,
+            events=events,
+        )
+        tool.agent_id = agent.agent_id
+        return agent
+
+    class _SpawnChild(Tool):
+        __tool_command_args__ = ()
+
+        async def execute(self) -> ToolResult:
+            """从这一轮里面派一个子 Agent 出去。"""
+            holder['child'] = await runtime.spawn(child_factory, query='go')
+            return ToolResult(output='spawned')
+
+    parent_llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='p1', name='SpawnChild', arguments='{}')]),
+            ScriptedTurn(content='parent done'),
+        ]
+    )
+    parent = await runtime.spawn(
+        _factory(parent_llm, tools={'SpawnChild': _SpawnChild()}), query='go'
+    )
+    await asyncio.wait_for(runtime.wait(parent), _TIMEOUT)
+    await asyncio.wait_for(runtime.wait(holder['child']), _TIMEOUT)
+
+    assert outcomes == ['refused']
+    assert await runtime.find(holder['child']) is not None
+    await runtime.shutdown()
+
+
 async def test_a_reaper_does_not_inherit_the_driving_agent_of_whoever_called_kill():
     """收尾刻意跑在事件循环之外，而它是 `kill` 在**调用方的上下文**里建的任务。
 

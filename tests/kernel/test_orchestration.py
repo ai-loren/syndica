@@ -162,6 +162,22 @@ async def _idle_parent(runtime: Runtime) -> str:
     return parent
 
 
+# `KillAgent` 的三条拒绝各有各的下一步，所以「拒了」不等于「拒对了」：少一道守卫时，剩下的那道
+# 照样交回一条三件套齐全、带着同一个 id 的拒绝，只是指着错的原因。每条挑一个不可替换的锚词。
+_KILL_REFUSALS: dict[str, str] = {
+    'self': '你自己的 id',
+    'missing': '它已经不在了',
+    'stranger': '不在你这棵子树里',
+}
+
+
+def _refusal_kind(output: str | list[object]) -> str:
+    """这次拒绝走的是哪一条。**数命中数**而不是取第一个命中：零个是措辞漂了，两个是锚词不互斥。"""
+    matched = [kind for kind, anchor in _KILL_REFUSALS.items() if anchor in str(output)]
+    assert len(matched) == 1, matched
+    return matched[0]
+
+
 def _owner(tool: Tool) -> str:
     """这个工具实例代表谁在调 Runtime 的控制面。"""
     assert isinstance(tool, _AgentTool)
@@ -1897,7 +1913,11 @@ async def test_send_message_reports_an_unknown_target_without_raising():
 
 
 async def test_send_message_rejects_an_unknown_trigger_and_lists_every_valid_one():
-    """期望值来自 `Trigger` 枚举本身，与这条消息的措辞无关：新增一个取值而忘了改它就变红。"""
+    """期望值来自 `Trigger` 枚举本身，与这条消息的措辞无关：新增一个取值而忘了改它就变红。
+
+    断言落在**「期望」那一栏**上：下一步那一栏另有一份手写的取值说明，拿整条消息去搜会让
+    「期望栏只列一个」这个变异被那份手写文字喂饱。
+    """
     runtime = Runtime()
     sender = await _idle_parent(runtime)
 
@@ -1908,7 +1928,8 @@ async def test_send_message_rejects_an_unknown_trigger_and_lists_every_valid_one
 
     assert result.meta == {'ok': False, 'agent_id': sender}
     assert isinstance(result.output, str)
-    assert all(trigger.value in result.output for trigger in Trigger)
+    expected_slot = result.output.split(_THREE_PART[1])[0]
+    assert all(trigger.value in expected_slot for trigger in Trigger)
     assert all(part in result.output for part in _THREE_PART)
     assert 'later' in result.output
     await runtime.shutdown()
@@ -2216,6 +2237,7 @@ async def test_kill_agent_refuses_anything_that_is_not_your_own_descendant(relat
 
     assert isinstance(result.output, str)
     assert all(part in result.output for part in _THREE_PART)
+    assert _refusal_kind(result.output) == 'stranger'
     assert target in result.output
     assert 'QueryAgent' in result.output
     info = await runtime.find(target)
@@ -2226,8 +2248,9 @@ async def test_kill_agent_refuses_anything_that_is_not_your_own_descendant(relat
 async def test_killing_yourself_is_refused_by_comparing_ids_not_task_identity():
     """判据是两个 id 相等，因此它对「调用方跑在哪个任务上」完全免疫（D-39 的那一格）。
 
-    改成比对 `asyncio.current_task()`，从测试任务里发起的这一次就认不出自己、真的把它杀掉——
-    所以断言必须落在「它还在跑」上，而不是「条目还在」（`kill` 本来就留着条目）。
+    改成比对 `asyncio.current_task()`，从测试任务里发起的这一次就认不出自己——而此后它**仍然**
+    被拒（自己不是自己的后代），只是指着错的原因。所以断言必须落在「走的是哪一条拒绝」上，而不是
+    「拒了没有」；也不能落在「条目还在」上，`kill` 本来就留着条目。
     """
     runtime = Runtime()
     parent = await _idle_parent(runtime)
@@ -2239,13 +2262,17 @@ async def test_killing_yourself_is_refused_by_comparing_ids_not_task_identity():
 
     assert isinstance(result.output, str)
     assert all(part in result.output for part in _THREE_PART)
-    assert 'abort' not in result.output
+    assert _refusal_kind(result.output) == 'self'
     info = await runtime.find(agent_id)
     assert info is not None and info.status is AgentStatus.IDLE
     await runtime.shutdown()
 
 
 async def test_killing_an_agent_that_is_already_gone_is_reported_without_raising():
+    """「这个 id 不存在」与「它不是你的」下一步不是同一件事：前者核对 id，后者找共同的父。
+
+    少了注册表那道检查，一个过时的 id 会换来一条说它「属于别人」的拒绝——指着一个不存在的主体。
+    """
     runtime = Runtime()
     killer = await _idle_parent(runtime)
 
@@ -2255,6 +2282,7 @@ async def test_killing_an_agent_that_is_already_gone_is_reported_without_raising
 
     assert isinstance(result.output, str)
     assert all(part in result.output for part in _THREE_PART)
+    assert _refusal_kind(result.output) == 'missing'
     assert 'nope' in result.output
     await runtime.shutdown()
 
@@ -2305,6 +2333,17 @@ async def test_three_killers_each_stop_only_their_own_child():
 
 
 # ---------------------------------------------------------------- 自动装配
+
+
+def _nothing_was_built(runtime: Runtime) -> bool:
+    """被拒的 spawn 没有留下任何半个 Agent——那句话逐字写在拒绝消息的下一步里。
+
+    注册表条目单独看：只看 `_slots` 的话，把装配挪到 `register` 之后的改动会留下一个注册了、
+    有邮箱、却永远没有驱动任务的条目，而 `send` 对它照答 `ok=True`。
+    """
+    return (
+        runtime._slots == {} and runtime._table.agent_ids() == [] and runtime.registry._infos == {}  # pyright: ignore[reportAttributeAccessIssue]
+    )
 
 
 async def test_orchestration_is_off_by_default_because_five_descriptions_cost_every_turn():
@@ -2395,8 +2434,7 @@ async def test_installing_orchestration_over_a_tool_of_the_same_name_is_refused(
     assert 'Delegate' in caught.value.received
     assert 'Worker' in caught.value.received
     assert 'orchestration' in caught.value.next_action
-    assert runtime._slots == {}
-    assert await runtime.registry.children_of('') == []
+    assert _nothing_was_built(runtime)
     await runtime.shutdown()
 
 
@@ -2420,5 +2458,5 @@ async def test_a_mis_keyed_tool_added_after_construction_is_caught_when_orchestr
         await runtime.spawn(build, query='go')
 
     assert 'Typo' in caught.value.received
-    assert runtime._slots == {}
+    assert _nothing_was_built(runtime)
     await runtime.shutdown()
