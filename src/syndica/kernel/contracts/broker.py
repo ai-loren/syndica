@@ -39,6 +39,10 @@ _WAKE_TIMEOUT = 5.0
 # 非匹配噪声的间隔，必须显著小于 _BLOCK_TIMEOUT，等待者才会在一个超时窗口里被反复唤醒。
 _NOISE_INTERVAL = 0.005
 
+# 「取消不吃掉消息」扫多少个取消点。取到个位数即可：要打的窗口紧跟在「把消息摘出邮箱」之后，而
+# 那一步之前的挂起点是取回消息所需的网络往返，一两个就到。
+_CANCEL_SWEEP = 8
+
 # 邮箱不存在时必须「答而不等」。交给调用的超时取 _TIMEOUT_NEVER_REACHED，白等满窗口的实现会
 # 远远越过 _MAX_PROMPT_REPLY；上限取秒级而非微秒级，一次网络往返与负载抖动都远在它之下。
 _TIMEOUT_NEVER_REACHED = 30.0
@@ -286,6 +290,44 @@ class MessageBrokerContract(ContractSuite):
         got = await broker.take_by_correlation('a1', 'c1', timeout=1.0)
         assert got is not None and got.content == 'answer'
         await task
+
+    async def test_cancelling_take_by_correlation_leaves_the_match_takeable(
+        self, broker: MessageBroker
+    ) -> None:
+        """取消一次取，那条匹配的消息要么已经交回，要么还在邮箱里——不存在第三种结局。
+
+        逐个取消点扫一遍而不是只取消一次：能吃掉消息的窗口在「已摘出邮箱、还没返回」之间，而它落在
+        第几个调度步上是实现的自由度。这里数的步数只决定这一遍**扫到哪里**，每一步上的断言本身与
+        步数无关，因此结论不随解释器版本变化。
+        """
+        await broker.ensure_queue('a1')
+        for steps in range(1, _CANCEL_SWEEP + 1):
+            await broker.publish('a1', _msg('answer', correlation_id='c1'))
+            taking = asyncio.create_task(
+                broker.take_by_correlation('a1', 'c1', timeout=_WAKE_TIMEOUT)
+            )
+            for _ in range(steps):
+                if taking.done():
+                    break
+                await asyncio.sleep(0)
+            taking.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await taking
+            if taking.cancelled():
+                assert await broker.take_by_correlation('a1', 'c1', timeout=_WAKE_TIMEOUT), (
+                    f'期望 take_by_correlation 被取消（第 {steps} 个调度步）之后，'
+                    'correlation_id=c1 的那条消息仍能再取一次。'
+                    ' 实际它消失了：这次取把消息摘出了邮箱，却在返回之前被取消，谁都没收到它。'
+                    ' 让「摘掉」与「返回」之间不留挂起点，或改用读了未确认即可重取的语义；'
+                    '调用方会在等待被中止或被顶掉时取消这次取。'
+                )
+            else:
+                assert taking.result() is not None
+            assert await broker.wait_for_messages('a1', 0) is False, (
+                f'期望第 {steps} 轮结束时邮箱回到空：一条消息只该被交付一次。'
+                ' 实际邮箱里还有东西，说明这一轮既交回了消息、又把它留在了邮箱里。'
+                ' 让取出即移出邮箱（consume 恰好一次）。'
+            )
 
     async def test_take_by_correlation_on_unknown_queue_answers_none_without_waiting(
         self, broker: MessageBroker

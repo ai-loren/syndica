@@ -14,18 +14,30 @@ import pytest
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
 from syndica.kernel.context import StopReason, ToolCall
-from syndica.kernel.errors import ContractViolation
+from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.protocols import AgentRegistry, MissingQueueCallback
-from syndica.kernel.runtime import _LIVE_STATUSES, AgentFactory, Runtime
+from syndica.kernel.runtime import _LIVE_STATUSES, AgentFactory, Runtime, _WaitToken
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
+from syndica.kernel.waiting import (
+    Confirmation,
+    Reply,
+    UserInput,
+    Waiter,
+    WaitResult,
+    WaitState,
+)
 
 # 每个等待都设上限：回归应当让用例变红，而不是把 CI 挂住。
 _TIMEOUT = 1.0
+# 一次要真的跑满的等待上限，以及一次「本次用例期间绝不会到期」的等待上限。后者必须远大于 _TIMEOUT
+# ——它要挡的回归是「明明没等到也没被打断，却提前返回了」，而那种返回会被误读成超时。
+_BRIEF_WAIT = 0.05
+_UNREACHED_WAIT = 30.0
 _SYSTEM_PROMPT = 'You are a worker.'
 # 注册顺序既非升序（Concat / Echo / Upper）亦非降序，反转后同样两者都不是：n=1 或恰好有序时，
 # 「保持注册顺序」与「排序」「反转」是同一个答案，而工具顺序逐字进请求前缀（spec §5.2）。
@@ -104,6 +116,36 @@ class _Retaliate(Tool):
         return ToolResult(output='retaliated')
 
 
+class _Waiting(Tool):
+    """在轮的中间发起一次 `wait_for`，那正是它唯一的真实调用点。
+
+    从测试任务里直接调 `wait_for` 只走到同一批状态转换，但 turn 循环并没有真的挂在那次等待上——
+    「轮被挂起」与「事件循环在等」的区别正是 `WAITING` 存在的理由，用假停点搭出来的树对它无感。
+
+    等待返回之后停在 `release` 上：这一刻是「轮还在往前走、而等待已经结束」的唯一观测点，注册表
+    在它之后就被下一个周期边界改掉了。
+    """
+
+    def __init__(self, waiter: Waiter) -> None:
+        self.entered = asyncio.Event()
+        self.returned = asyncio.Event()
+        self.release = asyncio.Event()
+        self.waiter = waiter
+        self.runtime: Runtime | None = None
+        self.agent_id: str | None = None
+        self.results: list[WaitResult] = []
+
+    async def execute(self) -> ToolResult:
+        """等一条匹配的答复，把结局记下来，然后等测试放行本轮。"""
+        self.entered.set()
+        assert self.runtime is not None and self.agent_id is not None
+        result = await self.runtime.wait_for(self.agent_id, self.waiter)
+        self.results.append(result)
+        self.returned.set()
+        await self.release.wait()
+        return ToolResult(output=result.state.value)
+
+
 class _Gate(Tool):
     """每次调用停在自己的那道闸上：一个周期里需要两个可控停点时用它。
 
@@ -131,6 +173,10 @@ class _RecordingRegistry:
     转换记录是「注册表看到了什么」的唯一证据：EXIT 的条目紧接着被 unregister 抹掉，只看注册表
     的最终内容分不出它中途走过哪些状态。尝试与生效分开记：`_switch` 逐个试 CAS，失败的那些是
     实现细节，走过的状态路径才是行为。
+
+    `hold_after` 把一次**已经生效**的转换停在 `settles` 这道闸上：远端注册表可以先写进去再返回，
+    而「转换已生效、发起它的那一方还没往下走」这段窗口在进程内注册表下根本不存在——一次落在这段
+    窗口里的控制面操作看到的是转换之后的状态，却看不到发起方接下来才装上的东西。
 
     `hold_before` 把「转去某个状态」的 CAS 停在 `switches` 这道闸上：`_finish` 摘完队列、还没
     转 ZOMBIE 的那一刻，在 Runtime 外面没有别的观测点。它可以在构造之后再装上，用来只拦住某个
@@ -168,6 +214,8 @@ class _RecordingRegistry:
         self._deny = deny
         self.hold_before = hold_before
         self.deny_for = deny_for
+        self.hold_after: AgentStatus | None = None
+        self.settles = _Hold()
         self.hold_children_of: str | None = None
         self.hold_get_of: str | None = None
         self.fail_unregister: str | None = None
@@ -198,6 +246,8 @@ class _RecordingRegistry:
         applied = await self._inner.compare_and_set_status(agent_id, expected=expected, new=new)
         if applied:
             self.applied.append((agent_id, expected, new))
+        if applied and new is self.hold_after:
+            await self.settles.passing(agent_id)
         return applied
 
     async def update(self, agent_id: str, **fields: Any) -> None:
@@ -243,6 +293,11 @@ class _SpyBroker:
     `hold_removal_of` 把**某一个** agent 的摘队列停在半路。这是拆除写下第一样东西之前的最后一个
     停点，因此「另一条级联此刻正拆着这个节点、什么都还没摘掉」在 Runtime 外面没有别的观测点；
     按 agent 而不是按全局停，才能让一条收尾走完而另一条停着。
+
+    `takes` 与 `reach_take` 是「一次等待真的挂上去了」的观测点：`wait_for` 先把注册表转成 WAITING
+    再去问 broker，因此 broker 被问到的那一刻状态与槽里的令牌都已经就位。轮询注册表分不出「还没
+    被调度到」与「转换被拒」。`hold_take_of` 把这一问停在**进入 broker 之前**，用来在等待还挂着的
+    时候动别的东西（摘掉邮箱、投一条答复、中止它）。
     """
 
     def __init__(self, registry: AgentRegistry | None = None) -> None:
@@ -252,15 +307,23 @@ class _SpyBroker:
         self._parked = asyncio.Event()
         self._parks: dict[str, int] = {}
         self._consumes: dict[str, int] = {}
+        self._took = asyncio.Event()
+        self._takes: dict[str, int] = {}
         self.removals: list[tuple[str, AgentStatus | None]] = []
         self.hold_removal_of: str | None = None
         self.removal_hold = _Hold()
+        self.hold_take_of: str | None = None
+        self.take_hold = _Hold()
+        self.fail_take_of: str | None = None
 
     def parks(self, agent_id: str) -> int:
         return self._parks.get(agent_id, 0)
 
     def consumes(self, agent_id: str) -> int:
         return self._consumes.get(agent_id, 0)
+
+    def takes(self, agent_id: str) -> int:
+        return self._takes.get(agent_id, 0)
 
     async def reach(self, agent_id: str, parks: int) -> None:
         """等到该 agent 第 `parks` 次停到邮箱上。上界由调用方套一层 `wait_for` 给。"""
@@ -269,6 +332,14 @@ class _SpyBroker:
             if self.parks(agent_id) >= parks:
                 return
             await self._parked.wait()
+
+    async def reach_take(self, agent_id: str, takes: int) -> None:
+        """等到该 agent 第 `takes` 次按关联 ID 取消息。上界由调用方套一层 `wait_for` 给。"""
+        while True:
+            self._took.clear()
+            if self.takes(agent_id) >= takes:
+                return
+            await self._took.wait()
 
     async def ensure_queue(self, agent_id: str) -> None:
         await self._inner.ensure_queue(agent_id)
@@ -298,6 +369,12 @@ class _SpyBroker:
         correlation_id: str,
         timeout: float | None,  # noqa: ASYNC109
     ) -> Message | None:
+        self._takes[agent_id] = self.takes(agent_id) + 1
+        self._took.set()
+        if agent_id == self.hold_take_of:
+            await self.take_hold.passing(agent_id)
+        if agent_id == self.fail_take_of:
+            raise RuntimeError(f'取 {agent_id} 的答复失败')
         return await self._inner.take_by_correlation(agent_id, correlation_id, timeout)
 
     async def remove_queue(self, agent_id: str) -> None:
@@ -601,6 +678,42 @@ async def _running(
     blockers.append(blocker)
     agent_id = await runtime.spawn(_blocking(blocker), query='go', parent_id=parent_id)
     await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    return agent_id
+
+
+async def _armed(runtime: Runtime, broker: _SpyBroker, tool: _Waiting) -> str:
+    """起一个等待型 Agent，停在邮箱上、工具已经拿到自己的 agent_id，但还没开始跑。
+
+    懒启动而不是 spawn 时带 query：工具要拿自己的 agent_id 才能发起等待，而它只在 spawn 返回之后
+    才存在——带 query 的 spawn 会让第一轮赶在赋值之前跑起来。
+    """
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Waiting', arguments='{}')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    agent_id = await runtime.spawn(_factory(llm, tools={'Waiting': tool}))
+    await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
+    tool.runtime = runtime
+    tool.agent_id = agent_id
+    return agent_id
+
+
+async def _started(runtime: Runtime, broker: _SpyBroker, tool: _Waiting, agent_id: str) -> None:
+    """把它叫起来，等到它真的把 turn 循环挂在自己那次 `wait_for` 上。
+
+    握手用 broker 被问到的那一刻：`wait_for` 先把注册表转成 WAITING 再去取消息，因此这时状态与
+    槽里的令牌都已经就位。
+    """
+    assert (await runtime.send(agent_id, 'go')).ok
+    await asyncio.wait_for(tool.entered.wait(), _TIMEOUT)
+    await asyncio.wait_for(broker.reach_take(agent_id, 1), _TIMEOUT)
+
+
+async def _waiting(runtime: Runtime, broker: _SpyBroker, tool: _Waiting) -> str:
+    agent_id = await _armed(runtime, broker, tool)
+    await _started(runtime, broker, tool, agent_id)
     return agent_id
 
 
@@ -5405,4 +5518,532 @@ async def test_despawn_clears_the_context_of_an_agent_whose_entry_someone_else_a
     assert agent_id not in runtime._slots
     assert runtime._table.get(agent_id) is None
     assert seen == [agent_id]
+    await runtime.shutdown()
+
+
+async def test_a_matching_reply_answers_the_wait_and_never_reaches_the_turn_loop():
+    """答复由 take_by_correlation 从邮箱取走，因此不会再作为普通消息注入一遍。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(Reply(timeout=_UNREACHED_WAIT, correlation_id='r1'))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    assert (await runtime.send(agent_id, 'the answer', correlation_id='r1')).ok
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+
+    assert [result.state for result in tool.results] == [WaitState.ANSWERED]
+    answered = tool.results[0].message
+    assert answered is not None and answered.content == 'the answer'
+    tool.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == ['go']
+    assert ctx.stop_reason is StopReason.COMPLETED
+    await runtime.shutdown()
+
+
+async def test_the_registry_says_waiting_while_the_turn_is_suspended_and_running_again_after():
+    """WAITING 是「轮被挂起」：注册表要在这一整段里说 waiting，等待一结束就回 running。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(UserInput(timeout=_BRIEF_WAIT))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    assert await _status(runtime, agent_id) is AgentStatus.WAITING
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+
+    assert [result.state for result in tool.results] == [WaitState.TIMEOUT]
+    assert tool.results[0].message is None
+    assert await _status(runtime, agent_id) is AgentStatus.RUNNING
+    tool.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert ctx.stop_reason is StopReason.COMPLETED
+    await runtime.shutdown()
+
+
+async def test_a_second_wait_preempts_the_first_and_stays_waiting_after_it_returns():
+    """恢复 RUNNING 归**当下**那个等待者。
+
+    被顶掉的那次先返回，它若也去恢复，注册表就在顶掉它的那次等待还挂着的时候宣布这个 Agent 在跑
+    ——而它悬在一次等待上，只有一条匹配的答复救得回来。
+    """
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(UserInput(timeout=_UNREACHED_WAIT, request_id='req-1'))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    second = asyncio.create_task(
+        runtime.wait_for(agent_id, UserInput(timeout=_UNREACHED_WAIT, request_id='req-2'))
+    )
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+
+    assert [result.state for result in tool.results] == [WaitState.PREEMPTED]
+    assert await _status(runtime, agent_id) is AgentStatus.WAITING
+    assert (await runtime.send(agent_id, 'late answer', correlation_id='req-2')).ok
+    assert (await asyncio.wait_for(second, _TIMEOUT)).state is WaitState.ANSWERED
+    assert await _status(runtime, agent_id) is AgentStatus.RUNNING
+    tool.release.set()
+    await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    await runtime.shutdown()
+
+
+async def test_abort_while_waiting_reports_aborted_rather_than_hanging_to_the_timeout():
+    """中止位只在轮的边界上被读到，而这次等待卡在轮的中间，超时可以是几小时。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(UserInput(timeout=_UNREACHED_WAIT))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    await runtime.abort(agent_id)
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+
+    assert [result.state for result in tool.results] == [WaitState.ABORTED]
+    assert await _status(runtime, agent_id) is AgentStatus.ABORTING
+    tool.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert ctx.stop_reason is StopReason.ABORTED
+    await runtime.shutdown()
+
+
+async def test_an_answer_that_lands_together_with_an_abort_is_reported_answered():
+    """消息已经离开邮箱了，此刻丢掉它就是真的丢了；中止照旧在下一个轮边界兑现。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(Reply(timeout=_UNREACHED_WAIT, correlation_id='r1'))
+    agent_id = await _armed(runtime, broker, tool)
+    broker.hold_take_of = agent_id
+    broker.take_hold.close()
+    await _started(runtime, broker, tool, agent_id)
+
+    assert (await runtime.send(agent_id, 'the answer', correlation_id='r1')).ok
+    broker.take_hold.open()
+    await runtime.abort(agent_id)
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+
+    assert [result.state for result in tool.results] == [WaitState.ANSWERED]
+    answered = tool.results[0].message
+    assert answered is not None and answered.content == 'the answer'
+    tool.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert ctx.stop_reason is StopReason.ABORTED
+    await runtime.shutdown()
+
+
+async def test_an_aborted_wait_leaves_the_unclaimed_answer_in_the_mailbox():
+    """被中断的等待取消那次取，而取消不得吃掉消息——它退回成一条普通消息等下一轮。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(Reply(timeout=_UNREACHED_WAIT, correlation_id='r1'))
+    agent_id = await _armed(runtime, broker, tool)
+    broker.hold_take_of = agent_id
+    broker.take_hold.close()
+    await _started(runtime, broker, tool, agent_id)
+
+    assert (await runtime.send(agent_id, 'the answer', correlation_id='r1')).ok
+    await runtime.abort(agent_id)
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+
+    assert [result.state for result in tool.results] == [WaitState.ABORTED]
+    assert await broker.wait_for_messages(agent_id, 0) is True
+    assert [
+        task.get_name() for task in asyncio.all_tasks() if task.get_name().startswith('wait:')
+    ] == []
+    await runtime.shutdown()
+
+
+async def test_a_refused_wait_leaves_the_one_already_in_flight_alone():
+    """拒绝意味着什么都没发生：进不去 WAITING 的调用不该顶掉在飞的那个等待。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(Reply(timeout=_UNREACHED_WAIT, correlation_id='r1'))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    await runtime.pause(agent_id)
+    with pytest.raises(ContractViolation) as info:
+        # 套一层上限：拒绝丢掉的话这次调用会真的等满 _UNREACHED_WAIT，回归表现成挂死而不是红色断言。
+        await asyncio.wait_for(
+            runtime.wait_for(agent_id, UserInput(timeout=_UNREACHED_WAIT)), _TIMEOUT
+        )
+    assert AgentStatus.PAUSED.value in info.value.received
+    assert 'resume' in info.value.next_action
+
+    assert tool.results == []
+    assert (await runtime.send(agent_id, 'the answer', correlation_id='r1')).ok
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+    assert [result.state for result in tool.results] == [WaitState.ANSWERED]
+    await runtime.shutdown()
+
+
+async def test_pause_does_not_cut_a_wait_short_and_resume_puts_it_back_into_waiting():
+    """挂起在轮的边界上兑现，而这次等待在轮的中间；解除挂起要回到 waiting，不是 running。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(Reply(timeout=_UNREACHED_WAIT, correlation_id='r1'))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    await runtime.pause(agent_id)
+    assert await _status(runtime, agent_id) is AgentStatus.PAUSED
+    await runtime.resume(agent_id)
+
+    assert await _status(runtime, agent_id) is AgentStatus.WAITING
+    assert tool.results == []
+    assert (await runtime.send(agent_id, 'the answer', correlation_id='r1')).ok
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+    assert [result.state for result in tool.results] == [WaitState.ANSWERED]
+    assert await _status(runtime, agent_id) is AgentStatus.RUNNING
+    tool.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert ctx.stop_reason is StopReason.COMPLETED
+    await runtime.shutdown()
+
+
+async def test_a_wait_that_ends_while_paused_leaves_the_agent_paused():
+    """等待结束不代表挂起结束：强行恢复 running 等于抹掉 pause 写下的那次转换。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(Reply(timeout=_UNREACHED_WAIT, correlation_id='r1'))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    await runtime.pause(agent_id)
+    assert (await runtime.send(agent_id, 'the answer', correlation_id='r1')).ok
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+
+    assert [result.state for result in tool.results] == [WaitState.ANSWERED]
+    assert await _status(runtime, agent_id) is AgentStatus.PAUSED
+    tool.release.set()
+    control = runtime._slots[agent_id].control
+    assert await asyncio.wait_for(control.wait_until_parked(_TIMEOUT), _TIMEOUT) is True
+    await runtime.resume(agent_id)
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert ctx.stop_reason is StopReason.COMPLETED
+    await runtime.shutdown()
+
+
+async def test_waiting_for_an_agent_that_is_not_running_is_refused():
+    """`wait_for` 是「代表一个正在干活的 Agent 等」；从外面等它结束是 `wait()`。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    agent_id = await _resident(runtime, broker)
+
+    with pytest.raises(ContractViolation) as info:
+        await asyncio.wait_for(
+            runtime.wait_for(agent_id, UserInput(timeout=_UNREACHED_WAIT)), _TIMEOUT
+        )
+
+    assert 'wait()' in info.value.next_action
+    assert AgentStatus.IDLE.value in info.value.received
+    assert await _status(runtime, agent_id) is AgentStatus.IDLE
+    assert runtime._slots[agent_id].waiter is None
+    await runtime.shutdown()
+
+
+async def test_waiting_for_an_agent_this_process_never_took_over_is_refused():
+    """替一个别人持有的条目写下 waiting，谁的 `ensure_active` 都转不回 idle。"""
+    registry = _RecordingRegistry()
+    runtime = Runtime(registry=registry)
+    registry.hold_before = AgentStatus.RUNNING
+    registry.switches.close()
+    stranded = await runtime.spawn(_factory(_done()), query='go')
+    await asyncio.wait_for(registry.switches.reach(1), _TIMEOUT)
+    assert runtime._slots[stranded].owned is False
+    # 状态摆成 running：所有权凭据是本次拒绝唯一的依据，靠状态挡不住它。写内层注册表是因为外层
+    # 那道闸拦的正是「转去 running」，而这里要的就是把状态摆成 running。
+    assert await registry._inner.compare_and_set_status(
+        stranded, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
+    )
+
+    with pytest.raises(ContractViolation) as info:
+        await asyncio.wait_for(
+            runtime.wait_for(stranded, UserInput(timeout=_UNREACHED_WAIT)), _TIMEOUT
+        )
+
+    assert 'IDLE -> RUNNING' in info.value.received
+    assert 'wait()' in info.value.next_action
+    assert await _status(runtime, stranded) is AgentStatus.RUNNING
+    assert runtime._slots[stranded].waiter is None
+    registry.switches.open()
+    await runtime.shutdown()
+
+
+async def test_waiting_for_an_agent_this_process_does_not_hold_is_refused():
+    runtime = Runtime()
+    with pytest.raises(ContractViolation) as info:
+        await runtime.wait_for('nobody', UserInput(timeout=_UNREACHED_WAIT))
+    assert '本进程没有它的实例' in info.value.received
+    assert 'wait()' in info.value.next_action
+    await runtime.shutdown()
+
+
+async def test_a_waiter_correlation_of_refuses_never_moves_the_agent_into_waiting():
+    """校验在改状态之前：非法的 Waiter 换来一次什么都没发生的拒绝，而不是一个停在 waiting 的
+    Agent——它此后没有任何答复解得开，只有 abort 救得回来。
+    """
+
+    class _Unregistered(Waiter):
+        """名单之外的等待类型：`correlation_of` 当场报错，而不是去等一个不会来的答复。"""
+
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    blockers: list[_Block] = []
+    agent_id = await _running(runtime, blockers)
+
+    with pytest.raises(ContractViolation):
+        await asyncio.wait_for(
+            runtime.wait_for(agent_id, _Unregistered(timeout=_UNREACHED_WAIT)), _TIMEOUT
+        )
+    assert await _status(runtime, agent_id) is AgentStatus.RUNNING
+
+    smuggled = Confirmation(timeout=_UNREACHED_WAIT, tool_call_id='call-7')
+    object.__setattr__(smuggled, 'tool_call_id', '   ')
+    with pytest.raises(ConfigError):
+        await asyncio.wait_for(runtime.wait_for(agent_id, smuggled), _TIMEOUT)
+
+    assert await _status(runtime, agent_id) is AgentStatus.RUNNING
+    assert runtime._slots[agent_id].waiter is None
+    assert broker.takes(agent_id) == 0
+    for blocker in blockers:
+        blocker.release.set()
+    await runtime.shutdown()
+
+
+async def test_a_reply_nobody_is_waiting_for_becomes_an_ordinary_message():
+    """关联 ID 只是匹配用的；没人在等它时它就是一条普通消息，不会凭空消失。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    agent_id = await _resident(runtime, broker)
+
+    assert (await runtime.send(agent_id, 'unclaimed answer', correlation_id='r9')).ok
+    await asyncio.wait_for(broker.reach(agent_id, 2), _TIMEOUT)
+
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert [block.content for block in agent.context.current_traj if block.role == 'user'] == [
+        'unclaimed answer'
+    ]
+    await runtime.shutdown()
+
+
+async def test_a_wait_whose_mailbox_vanished_says_so_instead_of_passing_it_off_as_a_timeout(
+    caplog: pytest.LogCaptureFixture,
+):
+    """`take_by_correlation` 在截止时刻之前答「没有」只有一个原因：邮箱不在了。
+
+    四态由 spec 定死，所以这一支并入 timeout；而交回的 timeout 会被读成「等满了那么久」，一次零秒
+    的等待于是看着像一次几十秒的等待——那条 ERROR 是这个区别留下的全部痕迹。
+    """
+    caplog.set_level(logging.ERROR)
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(UserInput(timeout=_UNREACHED_WAIT, request_id='req-1'))
+    agent_id = await _armed(runtime, broker, tool)
+    broker.hold_take_of = agent_id
+    broker.take_hold.close()
+    await _started(runtime, broker, tool, agent_id)
+
+    await broker.remove_queue(agent_id)
+    broker.take_hold.open()
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+
+    assert [result.state for result in tool.results] == [WaitState.TIMEOUT]
+    assert [record.levelname for record in caplog.records] == ['ERROR']
+    reported_args = caplog.records[0].args
+    assert isinstance(reported_args, tuple)
+    assert reported_args[:3] == (agent_id, 'req-1', _UNREACHED_WAIT)
+    remaining = reported_args[3]
+    # 严格小于：报出的必须是**还剩多少**，把超时预算原样回声一遍就把这次「零秒等待」说成等满了。
+    assert isinstance(remaining, float) and 0 < remaining < _UNREACHED_WAIT
+    reported = caplog.records[0].getMessage()
+    _assert_three_part(reported)
+    assert 'remove_queue' in reported and 'find()' in reported
+    await runtime.shutdown()
+
+
+async def test_a_wait_that_runs_its_timeout_out_reports_no_vanished_mailbox(
+    caplog: pytest.LogCaptureFixture,
+):
+    """真的等满超时的那一次不该报「邮箱没了」——否则那条记录在每次超时上都是误报。"""
+    caplog.set_level(logging.ERROR)
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(UserInput(timeout=_BRIEF_WAIT))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+
+    assert [result.state for result in tool.results] == [WaitState.TIMEOUT]
+    assert caplog.records == []
+    tool.release.set()
+    await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    await runtime.shutdown()
+
+
+async def test_a_broker_that_raises_during_a_wait_reaches_the_caller_and_still_restores_running():
+    """协作者抛异常这条路也得把状态带回来：留在 waiting 的 Agent 没有任何答复解得开。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    blockers: list[_Block] = []
+    agent_id = await _running(runtime, blockers)
+    broker.fail_take_of = agent_id
+
+    with pytest.raises(RuntimeError):
+        await runtime.wait_for(agent_id, UserInput(timeout=_UNREACHED_WAIT))
+
+    assert await _status(runtime, agent_id) is AgentStatus.RUNNING
+    assert runtime._slots[agent_id].waiter is None
+    for blocker in blockers:
+        blocker.release.set()
+    await runtime.shutdown()
+
+
+async def test_a_cancelled_wait_collects_its_helper_task_and_leaves_the_registry_alone():
+    """取消路径上不写注册表：归宿由发起取消的那一方在取消之外给出（见 `_reap`）。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    blockers: list[_Block] = []
+    agent_id = await _running(runtime, blockers)
+    waiting = asyncio.create_task(runtime.wait_for(agent_id, UserInput(timeout=_UNREACHED_WAIT)))
+    await asyncio.wait_for(broker.reach_take(agent_id, 1), _TIMEOUT)
+
+    waiting.cancel()
+    await asyncio.gather(waiting, return_exceptions=True)
+
+    assert [
+        task.get_name() for task in asyncio.all_tasks() if task.get_name().startswith('wait:')
+    ] == []
+    assert runtime._slots[agent_id].waiter is None
+    assert await _status(runtime, agent_id) is AgentStatus.WAITING
+    for blocker in blockers:
+        blocker.release.set()
+    await runtime.shutdown()
+
+
+async def test_a_wait_cut_short_by_shutdown_leaves_the_registry_where_the_cancel_found_it():
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(UserInput(timeout=_UNREACHED_WAIT))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    await runtime.shutdown()
+
+    assert await _status(runtime, agent_id) is AgentStatus.WAITING
+    assert tool.results == []
+    assert runtime._slots[agent_id].waiter is None
+
+
+async def test_killing_a_waiting_agent_still_reaches_zombie_and_drops_its_token():
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(UserInput(timeout=_UNREACHED_WAIT))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    await runtime.kill(agent_id)
+    await asyncio.wait_for(_reaped(runtime), _TIMEOUT)
+
+    assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
+    assert runtime._slots[agent_id].waiter is None
+    assert tool.results == []
+    await runtime.shutdown()
+
+
+async def test_despawning_a_waiting_agent_removes_the_entry():
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    tool = _Waiting(UserInput(timeout=_UNREACHED_WAIT))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    await runtime.despawn(agent_id)
+
+    assert await runtime.find(agent_id) is None
+    assert agent_id not in runtime._slots
+    assert runtime._table.get(agent_id) is None
+    assert tool.results == []
+    await runtime.shutdown()
+
+
+async def test_one_agents_preemption_and_abort_leave_another_agents_wait_alone():
+    """令牌按 agent 分槽：一次抢占或中止只落在被点名的那个 Agent 上。"""
+    broker = _SpyBroker()
+    runtime = Runtime(broker=broker)
+    theirs = _Waiting(Reply(timeout=_UNREACHED_WAIT, correlation_id='r1'))
+    ours = _Waiting(Reply(timeout=_UNREACHED_WAIT, correlation_id='r2'))
+    left = await _waiting(runtime, broker, theirs)
+    right = await _waiting(runtime, broker, ours)
+
+    preemptor = asyncio.create_task(runtime.wait_for(left, UserInput(timeout=_UNREACHED_WAIT)))
+    await asyncio.wait_for(theirs.returned.wait(), _TIMEOUT)
+    await runtime.abort(left)
+
+    assert [result.state for result in theirs.results] == [WaitState.PREEMPTED]
+    assert (await asyncio.wait_for(preemptor, _TIMEOUT)).state is WaitState.ABORTED
+    assert ours.results == []
+    assert await _status(runtime, right) is AgentStatus.WAITING
+    assert (await runtime.send(right, 'ours', correlation_id='r2')).ok
+    await asyncio.wait_for(ours.returned.wait(), _TIMEOUT)
+    assert [result.state for result in ours.results] == [WaitState.ANSWERED]
+    assert await _status(runtime, right) is AgentStatus.RUNNING
+    theirs.release.set()
+    ours.release.set()
+    assert (await asyncio.wait_for(runtime.wait(left), _TIMEOUT)).stop_reason is StopReason.ABORTED
+    assert (await asyncio.wait_for(runtime.wait(right), _TIMEOUT)).stop_reason is (
+        StopReason.COMPLETED
+    )
+    await runtime.shutdown()
+
+
+async def test_a_wait_token_keeps_the_first_interrupt_and_drops_the_second():
+    """直接打令牌：换令牌与打旧令牌之间没有挂起点，所以这条性质只有令牌自己答得出。"""
+    token = _WaitToken()
+    token.interrupt(WaitState.PREEMPTED)
+    token.interrupt(WaitState.ABORTED)
+    assert await asyncio.wait_for(token.raised, _TIMEOUT) is WaitState.PREEMPTED
+
+
+async def test_an_abort_the_registry_refuses_leaves_the_wait_in_flight():
+    """记不下 aborting 就不要真的打断那次等待——那会停掉一件谁都看不出被停了的活。"""
+    registry = _RecordingRegistry(deny=(AgentStatus.WAITING, AgentStatus.ABORTING))
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    tool = _Waiting(Reply(timeout=_UNREACHED_WAIT, correlation_id='r1'))
+    agent_id = await _waiting(runtime, broker, tool)
+
+    with pytest.raises(ContractViolation):
+        await runtime.abort(agent_id)
+
+    # 令牌本身没被动过。这一问是同步的，因此它答的是「这次调用有没有打断它」；等那次等待自己
+    # 返回再看结局的话，答案取决于答复与中断谁先被调度到。
+    still_waiting = runtime._slots[agent_id].waiter
+    assert still_waiting is not None and not still_waiting.raised.done()
+    assert tool.results == []
+    assert runtime._slots[agent_id].control.abort_requested is False
+    assert (await runtime.send(agent_id, 'the answer', correlation_id='r1')).ok
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+    assert [result.state for result in tool.results] == [WaitState.ANSWERED]
+    tool.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert ctx.stop_reason is StopReason.COMPLETED
+    await runtime.shutdown()
+
+
+async def test_an_abort_landing_while_the_wait_installs_itself_still_cuts_it_short():
+    """转 waiting 的 CAS 可以在生效之后才返回，那段窗口里的 abort 看不到还没装上的令牌。"""
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    tool = _Waiting(UserInput(timeout=_UNREACHED_WAIT))
+    agent_id = await _armed(runtime, broker, tool)
+    registry.hold_after = AgentStatus.WAITING
+    registry.settles.close()
+    assert (await runtime.send(agent_id, 'go')).ok
+    await asyncio.wait_for(tool.entered.wait(), _TIMEOUT)
+    await asyncio.wait_for(registry.settles.reach(1), _TIMEOUT)
+    assert await _status(runtime, agent_id) is AgentStatus.WAITING
+    assert runtime._slots[agent_id].waiter is None
+
+    await runtime.abort(agent_id)
+    registry.settles.open()
+
+    await asyncio.wait_for(tool.returned.wait(), _TIMEOUT)
+    assert [result.state for result in tool.results] == [WaitState.ABORTED]
+    tool.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    assert ctx.stop_reason is StopReason.ABORTED
     await runtime.shutdown()

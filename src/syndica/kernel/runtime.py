@@ -90,6 +90,14 @@ ERROR——**返回即意味着「它不在了」或者「有一条 ERROR 说清
 停在邮箱上的 Agent 是 IDLE，而 IDLE -> RUNNING 的 CAS 对第二个驱动任务照样成功，拿状态当所有权凭据
 会让同一个邮箱被两道门 consume，而 consume 恰好一次——输的那道门静默收不到任何消息。
 
+**`WAITING` 是「轮被挂起」，不是「事件循环在等」。** `wait_for` 从一次工具调用内部发起，此刻 Agent
+正在一轮的中间：turn 循环挂在 `wait_for` 上、注册表说 `WAITING`，而它的邮箱仍由门在下一轮开始前
+消费——被等到的那条答复由 `take_by_correlation` 从邮箱取走，因此不会再作为普通消息注入一遍。一个
+Agent 同时只有一个等待者（`_Slot.waiter`），新的顶掉旧的。**只有当下那个等待者负责把状态带回
+`RUNNING`**：被顶掉的那个也去恢复的话，注册表会在新的等待还挂着的时候宣布这个 Agent 在跑，而它悬在
+一次等待上、只有一条匹配的答复救得回来。同理 `resume` 回到哪个状态要看在飞的等待，不只看
+`in_run`。
+
 **`shutdown` 是终态。** 关闭后的事件总线静默丢弃 emit，此后 spawn 出来的 Agent 会照常干完活却完全
 不可观测，因此 spawn 在关闭后报错。
 """
@@ -114,6 +122,7 @@ from syndica.kernel.local_table import LocalAgentTable
 from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.protocols import AgentRegistry, MessageBroker
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
+from syndica.kernel.waiting import Waiter, WaitResult, WaitState, correlation_of
 
 __all__ = ['AgentFactory', 'Runtime']
 
@@ -148,6 +157,23 @@ _PAUSABLE_STATUSES: tuple[AgentStatus, ...] = (
 )
 
 
+class _WaitToken:
+    """一次等待的中断句柄。抢占与中止都经它送达。
+
+    **先到者胜**：一次等待只返回一个结果，而两种结局的后续动作不同（被顶掉的可以重来，被中止的
+    不该重来），所以第一个说法就是最终说法。
+
+    结局与唤醒是同一个 Future，因此「被唤醒了却说不出结局」这个状态表示不出来。
+    """
+
+    def __init__(self) -> None:
+        self.raised: asyncio.Future[WaitState] = asyncio.get_running_loop().create_future()
+
+    def interrupt(self, state: WaitState) -> None:
+        if not self.raised.done():
+            self.raised.set_result(state)
+
+
 @dataclass
 class _Slot:
     """本进程为一个 Agent 额外持有的东西。
@@ -161,6 +187,9 @@ class _Slot:
     control: ControlBlock
     gate: BrokerTurnGate
     owned: bool = False
+    # 此刻代表这个 Agent 在等答复的那一个。一个 Agent 是一份注意力，因此这里是一个而不是一组；
+    # 按 agent 分槽而不是放在 Runtime 上，一次抢占或中止才只落在被点名的那个 Agent 上。
+    waiter: _WaitToken | None = None
     # 事件循环此刻停在邮箱上（>0）还是在往前走（0）。注册表答不出这件事：停在邮箱上的 PAUSED
     # 与停在挂起门上的 PAUSED 是同一个取值，而只有后者收得到唤醒边沿。读它与改它都是同步的，
     # 因此控制面在一段不含 await 的代码里读到的答案与驱动任务此刻的位置严格一致。
@@ -188,6 +217,45 @@ def _parked_status(slot: _Slot) -> AgentStatus:
     等于宣布「它能处理消息」——门还落着，它一条都不会处理，而 `send` 照答 ok=True。
     """
     return AgentStatus.PAUSED if slot.control.paused else AgentStatus.IDLE
+
+
+def _resumed_status(slot: _Slot) -> AgentStatus:
+    """解除挂起时该回到的状态。
+
+    在飞的等待优先于 `in_run`：挂起期间发起的等待此刻仍挂着，写 RUNNING 等于宣布这一轮在往前走，
+    而它悬在一次等待上、只有一条匹配的答复救得回来。
+    """
+    if slot.waiter is not None:
+        return AgentStatus.WAITING
+    return AgentStatus.RUNNING if slot.control.in_run else AgentStatus.IDLE
+
+
+def _cannot_wait_for(agent_id: str, received: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'agent {agent_id!r} 的事件循环由本进程接管着，可以代表它等一条答复',
+        received=received,
+        next_action=(
+            'wait_for 由该 Agent 自己的工具在轮中发起，等的是一条匹配的答复；'
+            '要从外面等它这次工作结束用 wait()。'
+            '确认 agent_id 是 spawn 的返回值，并用 find() 读它当前的 status 与 owner；'
+            '它由别的进程持有就在那个进程上等它'
+        ),
+    )
+
+
+def _not_running_to_wait(agent_id: str, info: AgentInfo | None) -> ContractViolation:
+    return ContractViolation(
+        expected=f'agent {agent_id!r} 正在 running：只有手上有活的 Agent 才谈得上等一条答复',
+        received=(
+            f'它当前是 {info.status.value}' if info is not None else '注册表里已经没有这个条目'
+        ),
+        next_action=(
+            'wait_for 由该 Agent 自己的工具在轮中发起；'
+            '要从外面等它这次工作结束用 wait()，要让它停下来用 pause / abort。'
+            '它停在邮箱上（idle）时先 send 一条消息把它叫起来，'
+            '再由它的工具发起等待；paused 的先 resume'
+        ),
+    )
 
 
 def _parent_being_destroyed(parent_id: str) -> ContractViolation:
@@ -731,9 +799,10 @@ class Runtime:
     async def resume(self, agent_id: str, *, recursive: bool = False) -> None:
         """解除挂起，注册表从 PAUSED 转回它该在的地方。
 
-        **回到哪里由控制块说了算**：它在一次 `run()` 之内就回 RUNNING，否则回 IDLE。只有持有
-        事件循环的进程知道这件事，而注册表上没有「挂起之前是什么」——记一份就多出一个必须与真相
-        保持一致的东西，且它在挂起期间还会被 `wait_for` 改。
+        **回到哪里由控制块与在飞的等待说了算**：还悬在一次 `wait_for` 上就回 WAITING，否则在一次
+        `run()` 之内回 RUNNING、不在则回 IDLE。只有持有事件循环的进程知道这三件事，而注册表上没有
+        「挂起之前是什么」——记一份就多出一个必须与真相保持一致的东西，而挂起期间一次 `wait_for`
+        的开始与结束都会改动它。
 
         **门无条件抬起，注册表那一步尽力而为。** 只有本组方法抬得起这道门，因此「记不下就不抬」
         会把这个 Agent 永久停在门上；过时的状态可以用 `find` 重读，没人能抬起的门谁都救不回来。
@@ -771,6 +840,9 @@ class Runtime:
         对 PAUSED 允许，且中止**穿透挂起门**：先挂起再中止是真实顺序，若中止要等解除挂起才被
         看见，这个 Agent 会永远停在那里而调用方毫无反馈。**穿透不等于解除**：门原样落着，兑现
         之后它回到挂起态等 `resume`。
+
+        **同样穿透一次在飞的 `wait_for`**，那次等待当场以 `WaitState.ABORTED` 返回：中止位只在轮的
+        边界上被读到，而等待卡在轮的中间，不打断它就要等那次等待自己超时才兑现。
 
         `recursive=True` 时**父先于子**，理由同 `pause`：先掐掉还会派出新活的那一头。父只在下一个
         轮边界停下，因此它仍可能在遍历期间生出新的子代——父先于子把这个窗口收窄到**一次在飞的
@@ -1062,6 +1134,11 @@ class Runtime:
             )
             return
         slot.control.request_abort()
+        waiter = slot.waiter
+        if waiter is not None:
+            # 中止位只在轮的边界上被读到，而此刻这个 Agent 卡在一轮中间的一次等待里：不打断它，
+            # 中止要等那次等待自己超时才兑现，而超时可以是几小时。
+            waiter.interrupt(WaitState.ABORTED)
 
     async def _pause_one(self, agent_id: str, *, named: bool) -> None:
         slot, info = await self._control_target('pause', agent_id, named=named)
@@ -1098,7 +1175,7 @@ class Runtime:
         if slot is None or info is None:
             return
         slot.control.resume()
-        back_to = AgentStatus.RUNNING if slot.control.in_run else AgentStatus.IDLE
+        back_to = _resumed_status(slot)
         if not await self._switch(agent_id, new=back_to, allowed=(AgentStatus.PAUSED,)):
             # WARNING 而不是 INFO：root logger 默认停在 WARNING，INFO 的记录根本不会被创建，而
             # 本模块的不变式是「每一处状态转换失败都必须留痕」。也不是 ERROR：门已经抬起、这个
@@ -1200,6 +1277,152 @@ class Runtime:
                     following.append(child)
             frontier = following
         return found
+
+    async def wait_for(self, agent_id: str, waiter: Waiter) -> WaitResult:
+        """代表一个正在干活的 Agent 等一条匹配的答复（spec §4.2，供工具使用）。
+
+        **它在轮里面等，不在事件循环里等。** 一次 `Confirmation` 等待从工具调用内部发起，所以此刻
+        这个 Agent 正在一轮的中间：turn 循环挂在这里，注册表说 `WAITING`。它的邮箱仍由门在下一轮
+        开始前消费，两件事各等各的——被等到的那条答复由 `take_by_correlation` 从邮箱里取走，因此
+        不会再作为普通消息注入一遍。没人在等的答复就是一条普通消息，照常在下一轮进上下文。
+
+        **一个 Agent 同时只有一个等待者，新的顶掉旧的，旧的收到 `preempted`。** 一个 Agent 是一个
+        进程、一份注意力；两个并发的等待里必然有一个的答复没人会来。让旧的挂到超时是最坏的选择
+        ——发起它的那次工具调用会一直占着位置，而「一次调用恰好一个结果块」这条不变式要求它必须能
+        返回点什么。被拒的等待**不**顶掉在飞的那个：拒绝意味着什么都没发生。
+
+        **答复优先于中断**：两者同时就绪时返回 `answered`。消息已经离开邮箱了，此刻丢掉它就是真的
+        丢了。
+
+        **关联 ID 是一个扁平命名空间，本方法不给它加前缀。** `Confirmation` 等的是模型厂商生成的
+        `tool_call_id`，`Reply` 等的是 `send(correlation_id=...)` 写进消息的那个串，两者共用同一个
+        字符串空间，因此一条对派活的回复原则上能解掉一次工具确认的等待。加前缀要求发答复的那一侧
+        用同一套编码，而两侧的编码只要有一处不一致，症状就是答复躺在邮箱里、等待跑满超时、零日志
+        ——比当前的碰撞风险更难查。
+
+        **等待上限来自 `Waiter` 自己**（spec §4.2）：本方法不 clamp，因此一个荒谬的大超时实质上是
+        永久挂起，只有 `abort` 救得回来。
+
+        `waiter` 不是三种登记类型之一（或同时是两种）抛 `ContractViolation`；它的关联 ID 本身不合法
+        抛 `ConfigError`。两者都在**改动状态之前**抛出，被拒的调用因此不会把这个 Agent 留在
+        `WAITING`。
+
+        **装上令牌之后复检中止位**：转 WAITING 的那次 CAS 可以在生效之后才返回，而那段窗口里的一次
+        `abort` 看不到还没装上的令牌。
+
+        只允许从 RUNNING 发起，且只作用于本进程接管过的 Agent：替一个别人持有的条目写下 WAITING
+        之后，谁的 `ensure_active` 都转不回 IDLE（它的 `allowed` 只有 ZOMBIE），而 `send` 仍旧照答
+        ok=True。
+        """
+        slot = self._slots.get(agent_id)
+        if slot is None:
+            raise _cannot_wait_for(agent_id, '本进程没有它的实例——它由别的进程持有，或它已被销毁')
+        if not slot.owned:
+            raise _cannot_wait_for(
+                agent_id,
+                '本进程 spawn 过它，但驱动任务没有接管：'
+                'IDLE -> RUNNING 的转换被拒（它已被别人拿走），或任务在这之前就被取消'
+                '——本进程手上没有一轮可以挂起',
+            )
+        # 校验在改状态之前：一个非法的 Waiter 换来的应当是一次什么都没发生的拒绝，而不是一个停在
+        # WAITING、再没有任何答复能解开的 Agent。
+        correlation = correlation_of(waiter)
+        if not await self._switch(
+            agent_id, new=AgentStatus.WAITING, allowed=(AgentStatus.RUNNING,)
+        ):
+            raise _not_running_to_wait(agent_id, await self.registry.get(agent_id))
+        token = _WaitToken()
+        previous = slot.waiter
+        slot.waiter = token
+        if previous is not None:
+            previous.interrupt(WaitState.PREEMPTED)
+        if slot.control.abort_requested:
+            # 上面那次 CAS 可以在**生效之后**才返回（远端注册表就是这样），而那段窗口里的一次 abort
+            # 看不到还没装上的令牌，于是这次等待会一直挂到自己超时——中止的整个意义就没了。复检的是
+            # 中止位本身而不是一个信号，且**只读不取**：位由轮边界的 `hold_until_runnable` 消费，在
+            # 这里取走它，这一轮就不会以 ABORTED 收场了。
+            token.interrupt(WaitState.ABORTED)
+        cancelled = False
+        try:
+            return await self._awaited(agent_id, correlation, waiter.timeout, token)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            # `is token` 两处都要：被顶掉的那个等待先返回时，槽里装的是顶掉它的那个令牌，而那次
+            # 等待还挂着——此刻恢复 RUNNING 会让注册表宣布一个正悬在等待里的 Agent 在跑。
+            if slot.waiter is token:
+                slot.waiter = None
+                if not cancelled:
+                    # 回不去 RUNNING 是正常的：abort 已经把它转成 ABORTING、pause 转成了 PAUSED，
+                    # 强行覆盖等于抹掉别人的转换。取消路径上一律不写注册表——归宿由发起取消的那一方
+                    # 在取消之外给出（见 `_reap`），而这个 await 落在一个正在被取消的任务里，远端
+                    # 注册表下就是写了一半。
+                    await self._switch(
+                        agent_id, new=AgentStatus.RUNNING, allowed=(AgentStatus.WAITING,)
+                    )
+
+    async def _awaited(
+        self,
+        agent_id: str,
+        correlation: str,
+        timeout: float,  # noqa: ASYNC109
+        token: _WaitToken,
+    ) -> WaitResult:
+        """等到答复、中断或超时，三者取先到的那一个。
+
+        取消一次在飞的 `take_by_correlation` **不得吃掉已经取出的那条消息**——那是
+        `MessageBroker` 的明文契约并由契约套件强制。少了它，被中断的等待会静默销毁一条答复。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        taking = asyncio.create_task(
+            self.broker.take_by_correlation(agent_id, correlation, timeout),
+            name=f'wait:{agent_id}:{correlation}',
+        )
+        try:
+            await asyncio.wait({taking, token.raised}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # 只取消 taking：`token.raised` 归令牌所有，取消它会让此后的 `interrupt` 静默落空。
+            # 不 gather 就是把 broker 抛出的异常留在一个无人取回的任务里，只在 GC 时变成一行日志。
+            taking.cancel()
+            await asyncio.gather(taking, return_exceptions=True)
+        if taking.done() and not taking.cancelled():
+            failure = taking.exception()
+            if failure is not None:
+                raise failure
+            message = taking.result()
+            if message is not None:
+                return WaitResult(state=WaitState.ANSWERED, message=message)
+            self._report_unwaited_timeout(agent_id, correlation, timeout, deadline - loop.time())
+        if token.raised.done():
+            return WaitResult(state=token.raised.result())
+        return WaitResult(state=WaitState.TIMEOUT)
+
+    def _report_unwaited_timeout(
+        self, agent_id: str, correlation: str, timeout: float, remaining: float
+    ) -> None:
+        """`take_by_correlation` 在截止时刻之前就答了「没有」——它只在邮箱不在时这么答。
+
+        `WaitState` 由 spec §4.2 定死四态，而这一支与超时的下一步是同一件事（回去重读这个 Agent 的
+        状态），所以它并入 `timeout`。**区别只剩这条记录**：交回的 `timeout` 说的是「没等到」，而
+        调用方会读成「等满了那么久」，一次零秒的等待于是看着像一次几十秒的等待。
+        """
+        if remaining <= 0:
+            return
+        logger.error(
+            '期望: agent %s 上等 %r 的这次等待，要么等到一条匹配的答复，要么等满 %.3fs 的超时。'
+            ' 实际: broker 在还剩 %.3fs 时就答了「没有匹配项」，它只在邮箱不存在时这样答——'
+            '邮箱已被 remove_queue 摘掉或从未建起来，此后不会有任何答复到达；'
+            '本次交回 timeout，但它并没有等满。'
+            ' 下一步: 用 find() 读这个 agent 当前的状态；'
+            '不要在同一个关联 ID 上重试等待——邮箱没了，重试还是这个答案。'
+            '条目还在就先 ensure_active 把邮箱建回来，再重发那条请求。',
+            agent_id,
+            correlation,
+            timeout,
+            remaining,
+        )
 
     async def find(self, agent_id: str) -> AgentInfo | None:
         """只读路径，绝不激活任何 Agent。"""
