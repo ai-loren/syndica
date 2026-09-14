@@ -223,10 +223,12 @@ class WaitResult:
 
 # 名单：`Waiter` 的密封就是这份表。字段名必须与各子类 `_validate` 里校验的那个逐字一致，否则
 # `correlation_of` 交出的是一个从未被校验过的值。表的**顺序不影响任何结果**：下面数的是命中数。
+# 顺序跟文件里的定义顺序，刻意不按字典序——歧义错误里的类型名靠 `sorted` 稳定，名单本身若已是
+# 字典序，那个 `sorted` 就成了删掉也没人出声的死代码。
 _CORRELATION_FIELDS: tuple[tuple[type[Waiter], str], ...] = (
+    (UserInput, 'request_id'),
     (Confirmation, 'tool_call_id'),
     (Reply, 'correlation_id'),
-    (UserInput, 'request_id'),
 )
 
 
