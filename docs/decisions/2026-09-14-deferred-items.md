@@ -30,6 +30,12 @@
 
 ## 有主待做（里程碑 1 内）
 
+### 归计划 2 Task 11（工具执行接处置）
+
+| # | 内容 |
+|---|---|
+| D-28 | **没有任何东西计算 `DangerRequest.provenance`。** spec §12.2 第 3 条的强制升级已在 `danger.disposition_of` 里结构性落地（高风险 + `UNTRUSTED` → 阻断，且不咨询 policy），但「这次调用的参数能不能溯源到不可信内容」还没有生产者，字段现在只有调用方显式传 `None`（= 没溯源过）这一种实际取值。Task 10 只钉了签名与升级本身：`DangerPolicy` 由第三方实现，方法签名发布后就改不动，而升级**逻辑**不在 spec §15 的里程碑 1 判据内。**Task 11 把处置接进 `ToolExecutor` 时必须一并算出 provenance 并传进去**；最小正确形态是「本轮上下文里出现过 `trust=UNTRUSTED` 的 block」，完整形态要接产物溯源（§7.3）与 trace 因果链（§11.1）。漏做的症状是那道升级恒不命中而调用方以为有它 |
+
 ### 归计划 2 Task 13（三层装配 —— hooks 层）
 
 | # | 内容 |
@@ -67,6 +73,7 @@
 | D-21 | 「子类新增必填 kwarg 须自行覆写 `__reduce__`」这条约束只在报告里，未落进代码注释——按本仓「注释只写代码表达不了的硬约束」的规矩，它正该是一行注释 |
 | D-22 | `errors` 的类型错误抛 `ValueError` 而非 `TypeError`，调用方无法区分「类型不对」与「内容为空」 |
 | D-23 | 多字段同时非法时先点名谁，无用例钉住 |
+| D-29 | **`untrusted_high_risk` flag 未实现**。spec §12.2 的处置矩阵把「高风险 + 可溯源到不可信」交给这条 flag（`reject` 默认 / `ask` / `allow`），而 `danger.disposition_of` 现在把 `reject` 写死。写死的是**默认值**，不是能力边界：`disposition_of` 是内核自己的函数（第三方只调不实现），加一个带默认值的参数对任何调用方都不破坏。做这条时一并给 `ask` 找落点——`Disposition.CONFIRM` 的交互通道在计划 6 |
 
 ### 归计划 2 Task 16（公开面收口）
 
@@ -75,11 +82,13 @@
 | D-24 | **`waiting` 的六个名字尚未进 `kernel.__all__`**（`Waiter` / `UserInput` / `Confirmation` / `Reply` / `WaitResult` / `WaitState`）。后果不只是导出面不全——只用公开包面的人**调不了** `Runtime.wait_for`（构造不出入参）。计划 Task 16 的 59 项清单已含它们，但 `test_public_api.py` 逐字写死，忘了改**不会**变红 |
 | D-25 | `__all__` 内容全仓无测试覆盖（子模块级）。计划 1 的 Task 4 与 Task 9 各挂过一次，是同一条。`kernel.__all__` 有守卫，子模块没有 |
 | D-26 | **`ABORTING` 分支扩大了 `wait_for` 的成功面**：`kill` 之后（`_reap` 未跑完那段）调 `wait_for` 现在交回 `ABORTED` 而不再拒绝。计划 2 Task 9 判断这是对的，但它是新行为 |
+| D-30 | **`danger` 的公开名字尚未进 `kernel.__all__`**（`RiskLevel` / `Disposition` / `DangerVerdict` / `DangerRule` / `DEFAULT_RULES` / `NO_RULE_MATCHED` / `DangerJudge` / `DangerRequest` / `DangerPolicy` / `BlockHighRisk` / `AllowAll` / `disposition_of`）。与 D-24 同型，但 Task 16 的 59 项清单成文于 `danger` 之前、**不含**这些名字；只用公开包面的宿主因此写不出自己的 `DangerPolicy`。`test_public_api.py` 逐字写死，漏掉它们**不会**变红 |
 
 ### 归里程碑 1 收口审计
 
 | # | 内容 |
 |---|---|
+| D-31 | **`disposition_of` 是强制升级的唯一收口，而绕过它直接调 `DangerPolicy.decide` 就绕过了这一条** —— typing 看不见、运行期不警告，只有 docstring 写着。与 D-07 同型（契约只在文档里失败）。内核自己的唯一调用点在 Task 11 的 executor；发布前确认没有第二条路径，并考虑这条约束要不要有机器守卫 |
 | D-27 | **三条「唯一证据型」ERROR**（`_report_abandoned_input` / `_report_unwaited_timeout` / `_report_discarded_take_failure`）都断 `record.args`，但共同依赖「root logger 默认 WARNING」这个前提；宿主把级别调高则三条一起静默。这是既有模式，发布前确认一次 |
 
 ## 明确不在里程碑 1（BEYOND-M1）
@@ -92,4 +101,6 @@
 | B-04 | `WaitResult` 的成功路径不可哈希（`hash(WaitResult(ANSWERED, msg))` 抛） | 根因是 `Message` 可变，归 `message.py` 的裁决。已写进 `WaitResult` docstring（不可哈希恰好落在成功路径上，别当 dict 键） |
 | B-05 | `__cause__` / `__context__` / `__traceback__` 不能活过 copy/pickle 往返 | C 级槽位不在 `__dict__`，与标准库一致、非本仓回归 |
 | B-06 | `ConfigError` 被借用于「调用方误用」（`register` / `wait_for` 同型借用） | 是否给 `errors.py` 加专门成员是跨点改动，等第三个站点出现再定，不在单点发明 |
+| B-08 | 危险规则表不认「经中间工具转手执行」（`xargs ... sh -c`、`find -exec`）与「下载落盘后再单独执行」（`curl -o f; sh f`） | 规则表不完备是**声明过的**（`RiskLevel.NONE` 是「没有规则命中」而非「已确认安全」），这两类是**另外的形态**而不是同一形态的平凡改写——后者（多一段管道 / 标志换位置 / 加一对引号 / 带路径前缀）必须命中且已由用例钉住。补这两类要么按语义解析 `sh -c` 的实参、要么跨命令跟踪文件，代价远高于它挡住的那部分；当前边界写在 `danger` 模块 docstring 里并各有一条用例钉住，不会悄悄漂移 |
+| B-09 | **未声明 `__tool_command_args__` 的工具，读不出文本的参数值（自定义对象）仍然静默跳过** | 声明过的那条路上已经响亮失败（`ContractViolation`）。未声明这条路按定义就是「不知道哪些参数会被执行」，在它每一个 `int` 参数上抛异常会让整批工具用不了；强化它的正解是让工具**声明**，而不是把猜测路径也变成报错路径。两条路的保证强弱差异写在 `Tool.__tool_command_args__` 的声明处 |
 | B-07 | 关联 ID 是一个扁平命名空间（`tool_call_id` 由模型厂商生成、`correlation_id` 由 `Runtime.send` 写入，都不带前缀），一条对派活的回复原则上能解掉一次工具确认的等待 | 计划 2 Task 9 裁决**不加前缀**并写进 docstring：加前缀要求发答复的那一侧用同一套编码，两侧不一致的症状是答复躺在邮箱里、等待跑满超时、零日志，比当前无已知来源的碰撞风险更难查；而 `Confirmation` 等的是模型厂商生成的 ID，前缀会变成必须对外公开的编码契约 |

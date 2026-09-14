@@ -830,3 +830,26 @@ def test_validation_names_the_disagreeing_tool_rather_than_the_first_one():
         validate_tool_names(tools)
     assert "'wrong'" in excinfo.value.received
     assert "'declared'" in excinfo.value.received
+
+
+def test_command_arguments_are_undeclared_by_default():
+    """默认 None 而不是 ()：没声明必须按最坏情况处理，声明「我什么都不执行」得是显式动作。"""
+
+    class _Plain(Tool):
+        async def execute(self, text: str) -> ToolResult:
+            """回显 text。"""
+            return ToolResult(output=text)
+
+    assert _Plain.__tool_command_args__ is None
+
+
+def test_a_declared_empty_tuple_is_not_the_same_object_as_the_undeclared_default():
+    class _Inert(Tool):
+        __tool_command_args__ = ()
+
+        async def execute(self, text: str) -> ToolResult:
+            """回显 text。"""
+            return ToolResult(output=text)
+
+    assert _Inert.__tool_command_args__ == ()
+    assert _Inert.__tool_command_args__ is not None

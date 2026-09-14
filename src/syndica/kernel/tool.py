@@ -154,6 +154,14 @@ class Tool(ABC):
     __tool_name__: ClassVar[str | None] = None
     __tool_schema__: ClassVar[dict[str, Any] | None] = None
     __tool_model__: ClassVar[type[BaseModel] | None] = None
+    # 这个工具的哪些参数会被**执行**（交给 shell、解释器、远端命令通道）。危险判定只看这些参数。
+    #
+    # `None` 是「没声明」，判定按最坏情况看待——检查全部参数。`()` 是「我什么都不执行」，判定于是
+    # 完全跳过它。两者不能合并：写文档的工具若被当成执行工具，一篇讲 `rm -rf` 的文档就会被阻断；
+    # 执行工具若因为忘了声明被跳过，那道闸等于不存在。默认取不安全的那一侧。
+    #
+    # 名字必须是 `execute` 收得到的参数名，否则那条声明静默落空——校验在 `danger` 的判定入口。
+    __tool_command_args__: ClassVar[tuple[str, ...] | None] = None
 
     @property
     def name(self) -> str:
