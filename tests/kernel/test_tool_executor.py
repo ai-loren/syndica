@@ -30,7 +30,11 @@ from syndica.kernel.errors import (
 from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ContextOverflowError
 from syndica.kernel.tool import Tool, ToolResult
-from syndica.kernel.tool_executor import ToolExecutor
+from syndica.kernel.tool_executor import (
+    DEFAULT_MAX_TOOL_CONCURRENCY,
+    ToolExecutor,
+    _segments,
+)
 
 
 class _Echo(Tool):
@@ -2050,3 +2054,634 @@ async def test_a_low_risk_call_the_host_policy_blocked_is_not_recorded_as_allowe
     )
     assert tool.executed == []
     assert caplog.records == []
+
+
+class _Probe(Tool):
+    """并发探针：进来记一笔在飞集合，让出一次，再记下让出那一刻同时在跑的是谁。
+
+    让出恰好一次，且不能不让：协程不让出就一路跑到底，同段的同伴根本没机会进来，于是真并发与真
+    串行留下同样的快照。快照由工具在自己的时间点取而不是由测试取——测试什么时候被唤醒是调度的
+    函数，而「谁和谁同时在跑」不该是。
+    """
+
+    __tool_command_args__ = ()
+
+    def __init__(self) -> None:
+        self._inflight: set[str] = set()
+        self.together: dict[str, frozenset[str]] = {}
+
+    @property
+    def peak(self) -> int:
+        return max((len(seen) for seen in self.together.values()), default=0)
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+        return True
+
+    async def execute(self, label: str = 'anonymous') -> ToolResult:
+        """回显 label。"""
+        self._inflight.add(label)
+        await asyncio.sleep(0)
+        self.together[label] = frozenset(self._inflight)
+        self._inflight.discard(label)
+        return ToolResult(output=label)
+
+
+class _ReadOnlyOnly(Tool):
+    """只有只读的那一份参数才可并发；`is_concurrency_safe` 收 args 正是为了这个。"""
+
+    __tool_name__ = 'Store'
+    __tool_command_args__ = ()
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+        return args.get('mode') == 'read'
+
+    async def execute(self, mode: str) -> ToolResult:
+        """按 mode 读或写。"""
+        return ToolResult(output=mode)
+
+
+class _Chained(Tool):
+    """等 waits_for 完成之后才完成，用来把完成顺序与调用顺序拧反。"""
+
+    __tool_command_args__ = ()
+
+    def __init__(self) -> None:
+        self._gates: dict[str, asyncio.Event] = {}
+
+    def _gate(self, label: str) -> asyncio.Event:
+        return self._gates.setdefault(label, asyncio.Event())
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+        return True
+
+    async def execute(self, label: str, waits_for: str = '') -> ToolResult:
+        """等 waits_for 完成后回显 label。"""
+        if waits_for:
+            await self._gate(waits_for).wait()
+        self._gate(label).set()
+        return ToolResult(output=label)
+
+
+class _LateBomb(Tool):
+    """等 waits_for 炸完之后自己炸，用来把失败顺序与调用顺序拧反。"""
+
+    __tool_name__ = 'Bomb'
+    __tool_command_args__ = ()
+
+    def __init__(self) -> None:
+        self._gates: dict[str, asyncio.Event] = {}
+
+    def _gate(self, label: str) -> asyncio.Event:
+        return self._gates.setdefault(label, asyncio.Event())
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+        return True
+
+    async def execute(self, label: str, waits_for: str = '') -> ToolResult:
+        """等 waits_for 炸完之后自己炸。"""
+        if waits_for:
+            await self._gate(waits_for).wait()
+        self._gate(label).set()
+        raise ContractViolation(expected=label, received='boom', next_action=f'fix {label}')
+
+
+class _Parked(Tool):
+    """停在一个测试永不放开的事件上，用来看取消有没有传到段内每一个调用。"""
+
+    __tool_command_args__ = ()
+
+    def __init__(self, quorum: int) -> None:
+        self._quorum = quorum
+        self._parked = asyncio.Event()
+        self.entered: list[str] = []
+        self.cancelled: list[str] = []
+        self.all_in = asyncio.Event()
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+        return True
+
+    async def execute(self, label: str) -> ToolResult:
+        """停住，直到被取消。"""
+        self.entered.append(label)
+        if len(self.entered) >= self._quorum:
+            self.all_in.set()
+        try:
+            await self._parked.wait()
+        except asyncio.CancelledError:
+            self.cancelled.append(label)
+            raise
+        return ToolResult(output=label)
+
+
+class _EagerRunner(Tool):
+    """声称自己可并发的执行类工具：从严判定必须先于工具的自我声明。"""
+
+    __tool_name__ = 'Runner'
+    __tool_command_args__ = ('command',)
+
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+        return True
+
+    async def execute(self, command: str) -> ToolResult:
+        """执行 command。"""
+        self.executed.append(command)
+        return ToolResult(output=f'ran {command}')
+
+
+class _EagerRaising(Tool):
+    """可并发地抛出构造时给定的异常。"""
+
+    __tool_name__ = 'Raise'
+    __tool_command_args__ = ()
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+        return True
+
+    async def execute(self) -> ToolResult:
+        """总是抛出预置的异常。"""
+        raise self._error
+
+
+class _Unanswering(Tool):
+    """`is_concurrency_safe` 自己坏掉的工具。"""
+
+    __tool_name__ = 'Hostile'
+    __tool_command_args__ = ()
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+        raise RuntimeError('cannot tell')
+
+    async def execute(self) -> ToolResult:
+        """照常跑完。"""
+        return ToolResult(output='hostile ran')
+
+
+class _Truthy(Tool):
+    """`is_concurrency_safe` 交回一个真值，但它不是 True。"""
+
+    __tool_command_args__ = ()
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> Any:
+        return 'yes'
+
+    async def execute(self) -> ToolResult:
+        """照常跑完。"""
+        return ToolResult(output='truthy ran')
+
+
+# 既非升序亦非降序：n=2 时任何顺序都是某种自然排序，反转 / 排序类变异一条都挡不住。
+_LABELS: tuple[str, ...] = ('beta', 'alpha', 'gamma', 'delta', 'epsilon')
+# 上界只用来把「并发根本没发生」从一次挂死变成一条红色断言。用 asyncio.timeout 而不是
+# asyncio.wait_for：后者会把被等的协程包成 Task 多插一次调度，也会吃掉到达的取消。
+_SEGMENT_DEADLINE = 1.0
+
+
+def _probe_call(index: int, label: str) -> ToolCall:
+    return ToolCall(id=f'c{index}', name='Probe', arguments=f'{{"label":"{label}"}}')
+
+
+def _probe_calls(count: int) -> list[ToolCall]:
+    return [_probe_call(index, label) for index, label in enumerate(_LABELS[:count], start=1)]
+
+
+def _concurrent(tools: dict[str, Tool], limit: int = 4, **danger: Any) -> ToolExecutor:
+    return ToolExecutor(tools=tools, hooks=HooksCenter(), max_concurrency=limit, **danger)
+
+
+def test_segments_split_on_every_unsafe_call_and_cut_the_rest_by_the_limit():
+    """基数 6、安全位既非全真亦非全假，不安全的那位也不在两端。"""
+    assert _segments([True, True, False, True, True, True], 2) == [[0, 1], [2], [3, 4], [5]]
+
+
+def test_an_unsafe_call_at_either_end_still_gets_a_segment_of_its_own():
+    assert _segments([False, True, True, False], 4) == [[0], [1, 2], [3]]
+
+
+def test_two_adjacent_unsafe_calls_never_share_a_segment():
+    assert _segments([False, False, False], 4) == [[0], [1], [2]]
+
+
+def test_an_all_safe_batch_is_cut_only_by_the_limit():
+    assert _segments([True] * 5, 2) == [[0, 1], [2, 3], [4]]
+
+
+def test_a_limit_of_one_cuts_even_an_all_safe_batch_into_singletons():
+    assert _segments([True, True, True], 1) == [[0], [1], [2]]
+
+
+def test_a_single_unsafe_call_still_gets_its_own_segment():
+    assert _segments([False], 4) == [[0]]
+
+
+def test_an_empty_batch_produces_no_segments():
+    assert _segments([], 4) == []
+
+
+@pytest.mark.parametrize('limit', [1, 2, 3, 7])
+@pytest.mark.parametrize(
+    'safety',
+    [
+        [True, True, False, True, True, True],
+        [False, True, True, False],
+        [True] * 5,
+        [False] * 3,
+        [True, False, True, True, False, True, True, True],
+        [],
+    ],
+)
+def test_every_call_lands_in_exactly_one_segment_and_the_original_order_survives(safety, limit):
+    """`execute_tool_calls` 拿「已经写过 block 的调用数」当尚未执行那一段的起点，这条切分性质是
+    那笔账唯一的依据：漏一个下标、重一个下标、段内或段间乱序，都会让未执行的 block 指错调用。"""
+    segments = _segments(safety, limit)
+    assert [index for segment in segments for index in segment] == list(range(len(safety)))
+    assert all(len(segment) <= limit for segment in segments)
+    mixed = [segment for segment in segments if not all(safety[index] for index in segment)]
+    assert all(len(segment) == 1 for segment in mixed)
+
+
+async def test_three_safe_calls_within_the_limit_really_run_at_the_same_time():
+    probe = _Probe()
+    ctx = Context()
+    await _concurrent({'Probe': probe}).execute_tool_calls(ctx, _probe_calls(3))
+    assert probe.peak == 3
+    assert [_text(block) for block in ctx.current_traj] == ['beta', 'alpha', 'gamma']
+
+
+async def test_the_concurrency_limit_cuts_a_batch_that_is_otherwise_all_safe():
+    probe = _Probe()
+    ctx = Context()
+    await _concurrent({'Probe': probe}, limit=2).execute_tool_calls(ctx, _probe_calls(3))
+    assert probe.peak == 2
+    assert probe.together['gamma'] == frozenset({'gamma'})
+    assert [_text(block) for block in ctx.current_traj] == ['beta', 'alpha', 'gamma']
+
+
+async def test_a_limit_of_one_runs_the_whole_batch_serially():
+    probe = _Probe()
+    await _concurrent({'Probe': probe}, limit=1).execute_tool_calls(Context(), _probe_calls(3))
+    assert probe.peak == 1
+
+
+async def test_the_default_limit_is_the_one_a_host_that_says_nothing_gets():
+    """默认值失效不报错，只是让每一批要么白白串行、要么并发得比宿主以为的多。"""
+    probe = _Probe()
+    await ToolExecutor(tools={'Probe': probe}, hooks=HooksCenter()).execute_tool_calls(
+        Context(), _probe_calls(5)
+    )
+    assert probe.peak == DEFAULT_MAX_TOOL_CONCURRENCY
+
+
+@pytest.mark.parametrize(
+    'middle',
+    [
+        ToolCall(id='c2', name='Nope', arguments='{}'),
+        ToolCall(id='c2', name='Probe', arguments='{not json'),
+        ToolCall(id='c2', name='Probe', arguments='["label"]'),
+    ],
+    ids=['unknown-tool', 'unparsable-arguments', 'arguments-that-are-not-an-object'],
+)
+async def test_a_call_the_executor_cannot_reason_about_keeps_its_two_sides_apart(middle):
+    """从严三条里的头两条。不安全的那个可能正是要改它们都会读的东西，因此它把批次切开。"""
+    probe = _Probe()
+    ctx = Context()
+    await _concurrent({'Probe': probe}).execute_tool_calls(
+        ctx, [_probe_call(1, 'beta'), middle, _probe_call(3, 'gamma')]
+    )
+    assert probe.peak == 1
+    assert [block.tool_call_id for block in ctx.current_traj] == ['c1', 'c2', 'c3']
+
+
+@pytest.mark.parametrize('arguments', ['', '{}'], ids=['absent', 'empty-object'])
+async def test_a_call_without_arguments_can_still_join_a_segment(arguments):
+    """「没有参数」与「参数解析不出来」是两件事。混同的症状是每一个不收参数的工具都被永久串行，
+    而这不报任何错。"""
+    probe = _Probe()
+    await _concurrent({'Probe': probe}).execute_tool_calls(
+        Context(),
+        [
+            _probe_call(1, 'beta'),
+            ToolCall(id='c2', name='Probe', arguments=arguments),
+            _probe_call(3, 'gamma'),
+        ],
+    )
+    assert probe.peak == 3
+
+
+@pytest.mark.parametrize(('mode', 'peak'), [('write', 1), ('read', 2)], ids=['write', 'read'])
+async def test_the_tool_is_asked_about_this_calls_arguments_not_about_an_empty_dict(mode, peak):
+    """`is_concurrency_safe` 收 args 就是为了让答案随这一次的参数变。问它一个空 dict，一个只有
+    只读调用才可并发的工具要么把写入调用一起放进同一段，要么连只读调用都并发不了。"""
+    probe = _Probe()
+    await _concurrent({'Probe': probe, 'Store': _ReadOnlyOnly()}).execute_tool_calls(
+        Context(),
+        [
+            _probe_call(1, 'beta'),
+            ToolCall(id='c2', name='Store', arguments=f'{{"mode":"{mode}"}}'),
+            _probe_call(3, 'gamma'),
+        ],
+    )
+    assert probe.peak == peak
+
+
+async def test_a_call_that_hits_a_danger_rule_is_never_run_alongside_its_neighbours():
+    """从严三条里的第三条。工具声称自己可并发也不算数：判定先于工具的自我声明。"""
+    probe = _Probe()
+    runner = _EagerRunner()
+    ctx = Context()
+    await _concurrent({'Probe': probe, 'Runner': runner}).execute_tool_calls(
+        ctx,
+        [
+            _probe_call(1, 'beta'),
+            ToolCall(id='c2', name='Runner', arguments=_DANGEROUS),
+            _probe_call(3, 'gamma'),
+        ],
+    )
+    assert probe.peak == 1
+    assert runner.executed == []
+    assert [block.tool_call_id for block in ctx.current_traj] == ['c1', 'c2', 'c3']
+
+
+async def test_a_harmless_call_from_that_same_tool_still_joins_its_neighbours():
+    """两个方向都要有用例：收紧过头就是把每一批都打回串行，而那同样不报任何错。"""
+    probe = _Probe()
+    runner = _EagerRunner()
+    await _concurrent({'Probe': probe, 'Runner': runner}).execute_tool_calls(
+        Context(),
+        [
+            _probe_call(1, 'beta'),
+            ToolCall(id='c2', name='Runner', arguments=_HARMLESS),
+            _probe_call(3, 'gamma'),
+        ],
+    )
+    assert probe.peak == 2
+    assert runner.executed == ['ls -la']
+
+
+async def test_a_low_risk_call_the_policy_lets_through_still_keeps_its_neighbours_apart():
+    """判据是「命中任何危险规则」而不是「处置不是放行」：处置由宿主实现，一次调用问它两遍、而且
+    两遍看的参数还不同，就是在骗它。多串行一次的代价只是慢一点。"""
+    probe = _Probe()
+    runner = _EagerRunner()
+    await _concurrent(
+        {'Probe': probe, 'Runner': runner}, judge=DangerJudge([_LOW_RISK_RULE])
+    ).execute_tool_calls(
+        Context(),
+        [
+            _probe_call(1, 'beta'),
+            ToolCall(id='c2', name='Runner', arguments='{"command":"cat /etc/hosts"}'),
+            _probe_call(3, 'gamma'),
+        ],
+    )
+    assert probe.peak == 1
+    assert runner.executed == ['cat /etc/hosts']
+
+
+async def test_each_allowed_low_risk_call_in_a_batch_leaves_exactly_one_record(
+    caplog: pytest.LogCaptureFixture,
+):
+    """spec §12.2 那一格的记录是这次放行留下的全部痕迹：分段也问判定，多记一条与少记一条都让
+    这份痕迹对不上真正发生过的调用数。"""
+    runner = _EagerRunner()
+    ctx = _untrusted_context()
+    await _concurrent({'Runner': runner}, judge=DangerJudge([_LOW_RISK_RULE])).execute_tool_calls(
+        ctx,
+        [
+            ToolCall(id='c1', name='Runner', arguments='{"command":"cat /etc/hosts"}'),
+            ToolCall(id='c2', name='Runner', arguments='{"command":"cat /etc/passwd"}'),
+        ],
+    )
+    assert runner.executed == ['cat /etc/hosts', 'cat /etc/passwd']
+    recorded = [cast('tuple[Any, ...]', record.args) for record in caplog.records]
+    assert [args[1] for args in recorded] == ['c1', 'c2']
+
+
+async def test_segmenting_does_not_consult_the_host_policy_a_second_time():
+    policy = _RecordingPolicy()
+    await _concurrent({'Probe': _Probe()}, policy=policy).execute_tool_calls(
+        Context(), _probe_calls(2)
+    )
+    assert [request.call.id for request in policy.seen] == ['c1', 'c2']
+
+
+async def test_the_gate_rejudges_the_rewritten_arguments_rather_than_reusing_the_segment_verdict():
+    """分段看模型发出来的参数，闸看 hook 改写之后那份。复用分段那次结论就等于让闸去判一份不会
+    被执行的参数，而「参数有没有被改过」这个判据本身不完备。"""
+    runner = _EagerRunner()
+    hooks = HooksCenter()
+
+    async def escalate(**_: Any) -> HookResult:
+        return HookResult(modified={'args': {'command': 'sudo rm -rf /'}})
+
+    hooks.register(Junction.PRE_TOOL_USE, escalate)
+    ctx = Context()
+    await ToolExecutor(tools={'Runner': runner}, hooks=hooks, max_concurrency=4).execute_tool_calls(
+        ctx, [ToolCall(id='c1', name='Runner', arguments=_HARMLESS)]
+    )
+    assert runner.executed == []
+    assert _ESCALATION in _text(ctx.current_traj[0])
+
+
+async def test_result_blocks_follow_call_order_even_when_completion_order_is_reversed():
+    """一次调用恰好一个结果块，位置由调用顺序决定——配对靠的是相邻性。"""
+    ctx = Context()
+    await _concurrent({'Chained': _Chained()}).execute_tool_calls(
+        ctx,
+        [
+            ToolCall(id='c1', name='Chained', arguments='{"label":"beta","waits_for":"alpha"}'),
+            ToolCall(id='c2', name='Chained', arguments='{"label":"alpha","waits_for":"gamma"}'),
+            ToolCall(id='c3', name='Chained', arguments='{"label":"gamma"}'),
+        ],
+    )
+    assert [block.tool_call_id for block in ctx.current_traj] == ['c1', 'c2', 'c3']
+    assert [_text(block) for block in ctx.current_traj] == ['beta', 'alpha', 'gamma']
+
+
+async def test_a_failure_does_not_take_down_the_calls_that_shared_its_segment():
+    """gather 不取消兄弟：一个失败其余照跑到完，所以它们的结果是真的，不能写成「没有执行」。"""
+    probe = _Probe()
+    ctx = Context()
+    with pytest.raises(ContractViolation):
+        await _concurrent({'Probe': probe, 'Bomb': _LateBomb()}).execute_tool_calls(
+            ctx,
+            [
+                _probe_call(1, 'beta'),
+                ToolCall(id='c2', name='Bomb', arguments='{"label":"alpha"}'),
+                _probe_call(3, 'gamma'),
+            ],
+        )
+    blocks = ctx.current_traj
+    assert [block.tool_call_id for block in blocks] == ['c1', 'c2', 'c3']
+    assert [_text(blocks[0]), _text(blocks[2])] == ['beta', 'gamma']
+    assert _SIDE_EFFECTS_UNKNOWN in _text(blocks[1])
+    assert _SIDE_EFFECTS_DENIED not in _text(blocks[1])
+
+
+async def test_a_later_segment_never_runs_after_a_failure_and_its_block_says_so():
+    probe = _Probe()
+    ctx = Context()
+    with pytest.raises(ContractViolation):
+        await _concurrent({'Probe': probe, 'Bomb': _LateBomb()}, limit=2).execute_tool_calls(
+            ctx,
+            [
+                _probe_call(1, 'beta'),
+                ToolCall(id='c2', name='Bomb', arguments='{"label":"alpha"}'),
+                _probe_call(3, 'gamma'),
+            ],
+        )
+    blocks = ctx.current_traj
+    assert [block.tool_call_id for block in blocks] == ['c1', 'c2', 'c3']
+    assert 'gamma' not in probe.together
+    never_ran = _text(blocks[2])
+    assert _SIDE_EFFECTS_DENIED in never_ran
+    assert 'c2' in never_ran
+
+
+async def test_the_failure_that_propagates_is_the_first_by_call_order_not_the_first_to_fail():
+    """同一批调用跑两次必须留下同一份轨迹，而谁先炸不由调用方决定。"""
+    ctx = Context()
+    with pytest.raises(ContractViolation) as excinfo:
+        await _concurrent({'Bomb': _LateBomb(), 'Probe': _Probe()}, limit=3).execute_tool_calls(
+            ctx,
+            [
+                ToolCall(id='c1', name='Bomb', arguments='{"label":"beta","waits_for":"alpha"}'),
+                ToolCall(id='c2', name='Bomb', arguments='{"label":"alpha"}'),
+                _probe_call(3, 'gamma'),
+                _probe_call(4, 'delta'),
+            ],
+        )
+    assert excinfo.value.expected == 'beta'
+    blocks = ctx.current_traj
+    assert [block.tool_call_id for block in blocks] == ['c1', 'c2', 'c3', 'c4']
+    assert _SIDE_EFFECTS_UNKNOWN in _text(blocks[0])
+    assert _SIDE_EFFECTS_UNKNOWN in _text(blocks[1])
+    assert 'c1' in _text(blocks[3])
+
+
+async def test_a_cancellation_inside_a_concurrent_segment_writes_no_block_at_all():
+    """`gather(return_exceptions=True)` 把子协程自己抛的 `CancelledError` 收进结果列表而不是上
+    抛；照结果处理就等于把一次取消写成一块工具结果。"""
+    probe = _Probe()
+    ctx = Context()
+    with pytest.raises(asyncio.CancelledError):
+        await _concurrent(
+            {'Probe': probe, 'Raise': _EagerRaising(asyncio.CancelledError())}
+        ).execute_tool_calls(
+            ctx,
+            [
+                _probe_call(1, 'beta'),
+                ToolCall(id='c2', name='Raise', arguments='{}'),
+                _probe_call(3, 'gamma'),
+            ],
+        )
+    assert ctx.current_traj == []
+    assert probe.peak == 2
+
+
+async def test_cancelling_the_caller_cancels_every_call_in_the_segment_it_was_waiting_on():
+    """快照在被测调用返回的那一刻取：被丢下的任务不会当场死掉，事件循环转下去它照样跑完，在
+    await 之后断言测的是调度顺序而不是等待语义。"""
+    parked = _Parked(quorum=2)
+    ctx = Context()
+    calls = [
+        ToolCall(id='c1', name='Parked', arguments='{"label":"beta"}'),
+        ToolCall(id='c2', name='Parked', arguments='{"label":"alpha"}'),
+    ]
+    task = asyncio.create_task(_concurrent({'Parked': parked}).execute_tool_calls(ctx, calls))
+    try:
+        async with asyncio.timeout(_SEGMENT_DEADLINE):
+            await parked.all_in.wait()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert parked.entered == ['beta', 'alpha']
+    assert sorted(parked.cancelled) == ['alpha', 'beta']
+    assert ctx.current_traj == []
+    assert [
+        pending for pending in asyncio.all_tasks() if pending is not asyncio.current_task()
+    ] == []
+
+
+async def test_a_tool_that_cannot_say_whether_it_is_concurrency_safe_is_run_alone():
+    """这个判断坐在任何 block 落地之前：让它抛出去，整批一个 block 都没有。"""
+    ctx = Context()
+    probe = _Probe()
+    await _concurrent({'Hostile': _Unanswering(), 'Probe': probe}).execute_tool_calls(
+        ctx,
+        [
+            _probe_call(1, 'beta'),
+            ToolCall(id='c2', name='Hostile', arguments='{}'),
+            _probe_call(3, 'gamma'),
+        ],
+    )
+    assert probe.peak == 1
+    assert [block.tool_call_id for block in ctx.current_traj] == ['c1', 'c2', 'c3']
+    assert _text(ctx.current_traj[1]) == 'hostile ran'
+
+
+async def test_only_a_literal_true_from_the_tool_counts_as_concurrency_safe():
+    """一个真值对象在这里被读成「可以并发」，而这个方向的错不可逆。"""
+    probe = _Probe()
+    await _concurrent({'Truthy': _Truthy(), 'Probe': probe}).execute_tool_calls(
+        Context(),
+        [
+            _probe_call(1, 'beta'),
+            ToolCall(id='c2', name='Truthy', arguments='{}'),
+            _probe_call(3, 'gamma'),
+        ],
+    )
+    assert probe.peak == 1
+
+
+async def test_a_judge_that_refuses_a_declaration_does_not_wipe_the_whole_batchs_blocks():
+    """分段也要问判定，而判定会抛（声明写错的参数名、读不完的参数）。它坐在任何 block 落地之
+    前，一抛就是整批一个 block 都没有。"""
+    probe = _Probe()
+    ctx = Context()
+    with pytest.raises(ConfigError):
+        await _concurrent({'Probe': probe, 'Misdeclared': _Misdeclared()}).execute_tool_calls(
+            ctx,
+            [
+                _probe_call(1, 'beta'),
+                ToolCall(id='c2', name='Misdeclared', arguments='{"command":"ls"}'),
+                _probe_call(3, 'gamma'),
+            ],
+        )
+    blocks = ctx.current_traj
+    assert [block.tool_call_id for block in blocks] == ['c1', 'c2', 'c3']
+    assert _text(blocks[0]) == 'beta'
+    assert '工具没有运行' in _text(blocks[1])
+    assert _SIDE_EFFECTS_DENIED in _text(blocks[2])
+
+
+@pytest.mark.parametrize(
+    ('limit', 'received_anchor', 'next_action_anchor'),
+    [
+        (0, 'max_concurrency=0', '>= 1 的值'),
+        (-1, 'max_concurrency=-1', '>= 1 的值'),
+        (True, '布尔值', 'yes / on / true'),
+        ('4', 'str', '传成 int'),
+    ],
+    ids=['zero', 'negative', 'bool', 'string'],
+)
+def test_the_executor_refuses_a_concurrency_limit_it_could_not_use(
+    limit, received_anchor, next_action_anchor
+):
+    """`bool` 单独挡且挡在数值检查之前：它是 int 的子类，而 YAML 把 yes / on / true 读成 True，
+    于是 `max_concurrency: yes` 静默变成全串行。"""
+    with pytest.raises(ConfigError) as excinfo:
+        ToolExecutor(tools={}, hooks=HooksCenter(), max_concurrency=cast('int', limit))
+    assert 'max_concurrency' in excinfo.value.expected
+    assert received_anchor in excinfo.value.received
+    assert next_action_anchor in excinfo.value.next_action
+
+
+def test_a_concurrency_limit_of_one_is_accepted():
+    """1 是「完全串行」而不是非法值：拒了它，宿主就没有关掉并发的写法。"""
+    assert ToolExecutor(tools={}, hooks=HooksCenter(), max_concurrency=1) is not None

@@ -27,6 +27,7 @@ from syndica.kernel.llm import ContextOverflowError, ScriptedLLM, ScriptedTurn
 from syndica.kernel.message import Message, Trigger
 from syndica.kernel.stores import InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
+from syndica.kernel.tool_executor import DEFAULT_MAX_TOOL_CONCURRENCY
 
 # 每个等待都设上限：回归应当让用例变红，而不是把 CI 挂住。
 _TIMEOUT = 1.0
@@ -105,6 +106,35 @@ class _Runner(Tool):
         """执行 command。"""
         self.executed.append(command)
         return ToolResult(output=f'ran {command}')
+
+
+class _Probe(Tool):
+    """并发探针：进来记一笔在飞集合，让出一次，再记下让出那一刻同时在跑的是谁。
+
+    让出恰好一次，且不能不让：协程不让出就一路跑到底，同段的同伴根本没机会进来，于是真并发与真
+    串行留下同样的快照。
+    """
+
+    __tool_command_args__ = ()
+
+    def __init__(self) -> None:
+        self._inflight: set[str] = set()
+        self._together: list[int] = []
+
+    @property
+    def peak(self) -> int:
+        return max(self._together, default=0)
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+        return True
+
+    async def execute(self, label: str) -> ToolResult:
+        """回显 label。"""
+        self._inflight.add(label)
+        await asyncio.sleep(0)
+        self._together.append(len(self._inflight))
+        self._inflight.discard(label)
+        return ToolResult(output=label)
 
 
 class _Fatal(Tool):
@@ -502,6 +532,7 @@ def test_the_options_field_order_is_part_of_the_public_api():
         'max_turns',
         'danger_judge',
         'danger_policy',
+        'max_tool_concurrency',
     )
 
 
@@ -551,6 +582,45 @@ def test_the_options_refuse_a_danger_field_the_executor_could_not_call(danger):
     with pytest.raises(ConfigError) as excinfo:
         AgentOptions(name='Worker', llm=ScriptedLLM([]), **danger)
     assert next(iter(danger)) in excinfo.value.expected
+
+
+async def _peak_concurrency(**options: Any) -> int:
+    """让 Agent 跑一轮三个可并发的调用，交回同时在跑的最大数。"""
+    probe = _Probe()
+    calls = [
+        ToolCall(id=f'c{index}', name='Probe', arguments=f'{{"label":"{label}"}}')
+        for index, label in enumerate(('beta', 'alpha', 'gamma'), start=1)
+    ]
+    agent_options = AgentOptions(
+        name='Worker',
+        llm=ScriptedLLM([ScriptedTurn(tool_calls=calls), ScriptedTurn(content='done')]),
+        tools={'Probe': probe},
+        **options,
+    )
+    await BaseAgent(agent_options, hooks=HooksCenter(), events=EventBus()).run('go')
+    return probe.peak
+
+
+async def test_an_agent_that_declared_no_tool_concurrency_still_runs_a_safe_batch_together():
+    options = AgentOptions(name='Worker', llm=ScriptedLLM([]))
+    assert options.max_tool_concurrency == DEFAULT_MAX_TOOL_CONCURRENCY
+    assert await _peak_concurrency() == 3
+
+
+async def test_a_tool_concurrency_declared_on_the_options_reaches_the_executor():
+    """「配了没生效」那类缺陷：宿主把并发关成串行，而工具照样并发跑，且没有任何提示。"""
+    assert await _peak_concurrency(max_tool_concurrency=1) == 1
+
+
+@pytest.mark.parametrize('limit', [0, -1, True, '4'], ids=['zero', 'negative', 'bool', 'string'])
+def test_the_options_refuse_a_tool_concurrency_the_executor_could_not_use(limit):
+    """报出的名字必须是宿主写下的那个：executor 那道校验说的是 `max_concurrency`，指着一个宿主
+    没写过的参数等于让它去猜。"""
+    with pytest.raises(ConfigError) as excinfo:
+        AgentOptions(name='Worker', llm=ScriptedLLM([]), max_tool_concurrency=limit)
+    assert 'max_tool_concurrency' in excinfo.value.expected
+    assert 'max_concurrency' not in excinfo.value.expected
+    assert 'max_tool_concurrency' in excinfo.value.next_action
 
 
 async def test_an_agent_that_declared_no_budget_still_stops_and_sends_an_empty_system_prompt():

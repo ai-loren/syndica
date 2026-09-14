@@ -1,18 +1,45 @@
 """工具执行。
 
-本计划只做串行；分段并行随计划 2 补入。
+**一轮内的多个调用分段执行：段内并发，段与段之间串行。** 只有**相邻**的安全调用会被并到一段；一个
+不安全的调用把批次切开，它两侧的调用因此不会跨过它一起跑——不安全的那个可能正是要改它们都会读的
+东西。段的大小另有上限（`max_concurrency`）。
+
+**安全判定从严（spec §5.6）**：工具不存在、参数解析失败、命中任何危险规则——一律判不安全，排除这
+三种之后才轮到工具自己回答。代价不对称：并发跑两个改同一份文件的工具、或并发跑一条本该有人看一眼
+的危险命令，后果不可逆；串行的代价只是慢一点。
+
+**分段是调度决策，闸是安全决策，两者看的参数不同。** 分段必须在任何 hook 跑之前算完（那时才有一整
+批可分），因此它看的是**模型发出来的**那份参数；闸看的是 `PRE_TOOL_USE` 改写之后、真正会被执行的那
+份。后果是改写参数的 hook 不会让批次重新分段，这是安全的那一侧：被闸拦下的调用根本不执行，所以
+「它曾经和别人并发过」产生不了任何副作用。**闸不复用分段那次判定的结论**——「参数有没有被 hook 改
+过」这个判据本身不完备（就地改而不声明 `modified['args']` 看不见），复用一次过时的结论就等于让闸去
+判一份不会被执行的参数。
+
+**分段只问判定，不问处置。** 判定是纯规则、无副作用，问几遍都一样；`DangerPolicy` 由宿主实现，可以
+计数、可以记录，一次调用问它两遍（而且两遍看的参数还不同）就是在骗它。判据因此取「命中任何危险规则
+即不安全」，它严于「需要人工授权」，且在 `AllowAll` 这类宿主下仍然起作用。
+
+**结果块始终按调用顺序落进轨迹，与完成顺序无关。** 配对靠的是相邻性，而 provider 会拒掉配对断裂的
+消息。
 
 **一次工具调用恰好产出一个 role='tool' block。** provider 会拒掉一个声明了 N 个调用、后面却跟着少于
 N 条结果的 assistant 消息，所以工具不存在、参数非法、执行抛异常、异常上抛这四条路都必须产出 block。
 上抛前尚未执行的调用同样各得一个 block，如实写明「没有执行」——轨迹会被持久化，伪造结果会让 resume
 与读轨迹的父 Agent 都按一件没发生过的事往下走。反方向也是撒谎：中止的那个调用可能在工具跑完之后才
 失败（POST hook 抛异常就走这条路），因此它的 block 只说副作用未知，不得声称没有副作用；两条消息不可
-互换，resume 正是按它们决定要不要重做。
+互换，resume 正是按它们决定要不要重做。**分段判定本身因此不得抛出**：它坐在任何 block 落地之前，一
+抛就是整批一个 block 都没有。答不上来的一律判不安全。
+
+**同段里失败的每一个都如实说自己中止了。** `asyncio.gather(return_exceptions=True)` 不取消兄弟——一
+个失败其余照跑到完，所以它们真的跑过、副作用未知，与「从未执行」两条消息不可互换。上抛的是**调用
+顺序**最靠前的那个失败，不是最先失败的那个：同一批调用跑两次必须留下同一份轨迹。
 
 **被取消的一批不补 block。** `CancelledError` 这类 BaseException 在批中途到达时直接上抛，展开路上不
 再写轨迹，于是这一批留下的 block **少于** assistant 声明的调用数。消费持久化轨迹的一方（resume、读
 轨迹的父 Agent）必须自己收拾这段不配对的 assistant 消息——取消可以落在 execute_tool_calls 被进入之
-前，这个洞在本层补不上。
+前，这个洞在本层补不上。**并发段要先整段扫一遍取消再写任何 block**：`gather(return_exceptions=True)`
+把子协程自己抛的 `CancelledError` 收进结果列表而不是上抛，照结果处理就等于把一次取消写成一块工具
+结果。
 
 **SyndicaError 上抛给 agent loop，其余异常转成 output 给模型（spec §10）。** 分界是「这条消息写给
 谁」：SyndicaError 的三件套写给程序员或运维，模型执行不了它的 next_action；工具自身逻辑里逃出来的
@@ -29,6 +56,7 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 产出的，本批中途出现的不可信结果影响不了它；逐次重算会让同一条命令的处置取决于它排在批里第几个，
 分段并发之后连这个位置都不确定。**`PRE_TOOL_USE` hook 写过参数时前提就不成立了**——它能把本批刚落
 进轨迹的不可信输出展开进参数——那时重取一次并取两者中更严的（spec §13：溯源失败时按最坏情况处理）。
+这次重取看不到**同段**里其它调用的产出：它们的 block 要等整段跑完才落进轨迹。
 当前形态是「这份轨迹里出现过 `trust=UNTRUSTED` 的 block」——它是上界而非因果链，完整的溯源要接产物
 溯源（spec §7.3）与 trace 因果链（§11.1）。**它不交 `None`**：`None` 是「没溯源过」，留在生产路径上
 那道升级就恒不命中，而调用方以为有它。
@@ -61,8 +89,10 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any, cast
 
@@ -82,9 +112,108 @@ from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
 
-__all__ = ['ToolExecutor']
+__all__ = ['DEFAULT_MAX_TOOL_CONCURRENCY', 'ToolExecutor', 'validate_max_concurrency']
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_TOOL_CONCURRENCY = 4
+
+
+def validate_max_concurrency(value: object, field: str) -> None:
+    """校验一段里最多同时跑几个工具。收下这个上限的每一处都要过它。
+
+    `field` 由调用方给出：`AgentOptions` 上它叫 `max_tool_concurrency`，`ToolExecutor` 上叫
+    `max_concurrency`。报错指着另一个名字，宿主会去找一个自己没写过的参数。
+
+    参数标注为 `object`：要挡的正是违反标注的运行时取值。`bool` 单独挡，且挡在数值检查**之前**
+    ——`bool` 是 `int` 的子类，而 YAML 1.1 把 `yes` / `on` / `true` 读成 `True`，于是 `True` 会被
+    当成 1，一份声明式配置里的 `max_tool_concurrency: yes` 静默变成全串行且不报任何错。
+    """
+    if isinstance(value, bool):
+        raise ConfigError(
+            expected=f'{field} 是正整数：一段里最多同时跑几个工具',
+            received=f'收到布尔值 {value!r}',
+            next_action=(
+                f'传一个 >= 1 的 int，要完全串行就传 1；'
+                f'bool 是 int 的子类而 YAML 把 yes / on / true 读成 True，'
+                f'不挡的话 {field}: yes 会静默变成全串行'
+            ),
+        )
+    if not isinstance(value, int):
+        raise ConfigError(
+            expected=f'{field} 是正整数：一段里最多同时跑几个工具',
+            received=f'收到 {value!r}，类型是 {type(value).__name__}',
+            next_action=f'把 {field} 传成 int；要完全串行就传 1',
+        )
+    if value < 1:
+        raise ConfigError(
+            expected=f'{field} 是正整数：一段里最多同时跑几个工具',
+            received=f'收到 {field}={value}',
+            next_action=f'把 {field} 传成 >= 1 的值；要完全串行就传 1，0 与负数不表示「不限」',
+        )
+
+
+def _parsed_arguments(call: ToolCall) -> dict[str, Any] | None:
+    """解析一次调用的参数；解析不出来交回 None。
+
+    分段与执行各解析一次而不共享一份：分段的产物只用来决定「谁能和谁一起跑」，执行路径必须从原始
+    字符串重新走一遍完整的错误分支——不同的失败要给模型不同的措辞。
+    """
+    if not call.arguments.strip():
+        return {}
+    try:
+        decoded = cast('object', json.loads(call.arguments))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    return cast('dict[str, Any]', decoded)
+
+
+def _segments(safety: Sequence[bool], limit: int) -> list[list[int]]:
+    """把一批调用切成可以一起跑的段，交回逐段的下标列表。
+
+    纯函数，于是「怎么切」这件事可以脱离工具、hook 与事件循环单独验证。
+
+    每个下标恰好落进一段，段内与段间都保持原序：`execute_tool_calls` 靠这一条把「已经写过 block
+    的调用数」当成尚未执行那一段的起点。
+    """
+    segments: list[list[int]] = []
+    current: list[int] = []
+    for index, is_safe in enumerate(safety):
+        if not is_safe:
+            if current:
+                segments.append(current)
+                current = []
+            segments.append([index])
+            continue
+        current.append(index)
+        if len(current) == limit:
+            segments.append(current)
+            current = []
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _without_cancellation(
+    outcomes: Sequence[ToolResult | BaseException],
+) -> list[ToolResult | Exception]:
+    """整段扫一遍取消：非 `Exception` 的 `BaseException` 直接上抛，展开路上一个 block 都不补。
+
+    `asyncio.gather(return_exceptions=True)` 把子协程自己抛的 `CancelledError` **收进结果列表**而
+    不是上抛（3.11 收到的还是一个丢了原消息的新实例）。照结果处理就等于把一次取消写成一块工具
+    结果，而取消的语义恰恰是「这一批没跑完」。
+    """
+    settled: list[ToolResult | Exception] = []
+    for outcome in outcomes:
+        if isinstance(outcome, Exception):
+            settled.append(outcome)
+        elif isinstance(outcome, BaseException):
+            raise outcome
+        else:
+            settled.append(outcome)
+    return settled
 
 
 def _described(exc: BaseException) -> str:
@@ -348,7 +477,7 @@ def _skipped_result(call: ToolCall, substitute: object) -> ToolResult:
 
 
 class ToolExecutor:
-    """串行执行一批工具调用，把每个调用的结果作为 role='tool' block 追加进 ctx。
+    """分段执行一批工具调用，把每个调用的结果作为 role='tool' block 追加进 ctx。
 
     `tools` 每次调用时查表，不在构造时快照——因此构造时的身份轴校验只覆盖当时表里的条目，此后塞进
     来的条目由查表落空那条路上的 `_misregistered` 兜住。
@@ -361,32 +490,95 @@ class ToolExecutor:
         *,
         judge: DangerJudge | None = None,
         policy: DangerPolicy | None = None,
+        max_concurrency: int = DEFAULT_MAX_TOOL_CONCURRENCY,
     ) -> None:
         validate_tool_names(tools)
         validate_danger_options(judge, policy)
+        validate_max_concurrency(max_concurrency, 'max_concurrency')
         self._tools = tools
         self._hooks = hooks
-        # 两者构造时快照，与活表 `tools` 不同：构造之后改 options 上的字段对本 executor 无效。
+        # 三者构造时快照，与活表 `tools` 不同：构造之后改 options 上的字段对本 executor 无效。
         self._judge = judge if judge is not None else DangerJudge()
         self._policy: DangerPolicy = policy if policy is not None else BlockHighRisk()
+        self._max_concurrency = max_concurrency
 
     async def execute_tool_calls(self, ctx: Context, tool_calls: list[ToolCall]) -> None:
         provenance = _provenance(ctx)
-        for index, call in enumerate(tool_calls):
-            pending = tool_calls[index + 1 :]
+        safety = [self._concurrency_safe(call) for call in tool_calls]
+        handled = 0
+        failure: Exception | None = None
+        failed_call: ToolCall | None = None
+        for segment in _segments(safety, self._max_concurrency):
+            calls = [tool_calls[index] for index in segment]
+            outcomes = _without_cancellation(await self._run_segment(ctx, calls, provenance))
+            for call, outcome in zip(calls, outcomes, strict=True):
+                # 判定抛出这条路单独接：它是唯一能断言「工具没运行」的抛出点。
+                if isinstance(outcome, _JudgeFailure):
+                    self._append(ctx, call, _judge_failed_result(call, outcome.original))
+                    if failure is None:
+                        failure, failed_call = outcome.original, call
+                elif isinstance(outcome, Exception):
+                    self._append(ctx, call, _aborted_result(call, outcome))
+                    if failure is None:
+                        failure, failed_call = outcome, call
+                else:
+                    self._append(ctx, call, outcome)
+                handled += 1
+            if failure is not None:
+                break
+        if failure is not None and failed_call is not None:
+            self._append_not_executed(ctx, tool_calls[handled:], failed_call, failure)
+            raise failure
+
+    async def _run_segment(
+        self, ctx: Context, calls: list[ToolCall], provenance: TrustLevel
+    ) -> list[ToolResult | BaseException]:
+        """跑一段：段内并发，交回与 `calls` 同序的结果或异常。
+
+        单元素的段**不进 `asyncio.gather`**：那会把协程包成 Task，于是这次调用换了取消域、也拿到
+        一份 contextvars 的副本。默认工具都不可并发（`Tool.is_concurrency_safe` 交回 False），单
+        元素段是最常见的形态，不该因为引入分段就改掉它的执行环境。
+        """
+        if len(calls) == 1:
             try:
-                result = await self._execute_one(ctx, call, provenance)
-            # 判定抛出这条路单独接：它是唯一能断言「工具没运行」的抛出点。
-            except _JudgeFailure as signal:
-                self._append(ctx, call, _judge_failed_result(call, signal.original))
-                self._append_not_executed(ctx, pending, call, signal.original)
-                raise signal.original from None
-            # Exception 而非 BaseException：取消不该在展开的路上再往轨迹里写东西。
+                return [await self._execute_one(ctx, calls[0], provenance)]
+            # 收进结果列表的只有 Exception，取消沿这条路直接上抛。并发那条路做不到这件事
+            # （gather 把子协程的取消一并收进列表），所以两条路都还要过 `_without_cancellation`
+            # ——「取消不写 block」这条只由它保证。
             except Exception as exc:
-                self._append(ctx, call, _aborted_result(call, exc))
-                self._append_not_executed(ctx, pending, call, exc)
-                raise
-            self._append(ctx, call, result)
+                return [exc]
+        return await asyncio.gather(
+            *(self._execute_one(ctx, call, provenance) for call in calls),
+            return_exceptions=True,
+        )
+
+    def _concurrency_safe(self, call: ToolCall) -> bool:
+        """这次调用能不能与同一批里相邻的调用一起跑。
+
+        判定坐在任何 block 落地之前，因此**不得抛出**：一抛就是整批一个 block 都没有，配对不变式
+        被工具或危险判定里的一个异常击穿。答不上来一律判不安全——危险判定的那次失败会在闸上原样
+        再现（那里有配对的 block），工具自己答不上来则只是被串行执行。
+        """
+        try:
+            return self._joinable(call)
+        except Exception:
+            return False
+
+    def _joinable(self, call: ToolCall) -> bool:
+        """从严的四道关，逐条见模块 docstring。
+
+        只有 `True` 才算安全：`is_concurrency_safe` 由工具实现，一个真值对象在这里被读成「可以并
+        发」，而这个方向的错是不可逆的。
+        """
+        tool = self._tools.get(call.name)
+        if tool is None:
+            return False
+        args = _parsed_arguments(call)
+        if args is None:
+            return False
+        if self._judge.judge(tool, args).level is not RiskLevel.NONE:
+            return False
+        return cast('object', tool.is_concurrency_safe(args)) is True
 
     def _append_not_executed(
         self, ctx: Context, pending: list[ToolCall], failed: ToolCall, exc: BaseException

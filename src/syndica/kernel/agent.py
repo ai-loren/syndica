@@ -80,7 +80,11 @@ from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import LLM, ContextOverflowError
 from syndica.kernel.tool import Tool, validate_tool_names
-from syndica.kernel.tool_executor import ToolExecutor
+from syndica.kernel.tool_executor import (
+    DEFAULT_MAX_TOOL_CONCURRENCY,
+    ToolExecutor,
+    validate_max_concurrency,
+)
 
 __all__ = ['AgentOptions', 'BaseAgent']
 
@@ -94,9 +98,12 @@ class AgentOptions:
     executor 里，宿主才能在声明的那一行拿到错误。**不替换成副本**：executor 与本字段共享同一个
     dict 对象，热插拔靠的就是这个。
 
-    `danger_judge` / `danger_policy` 为 `None` 时用内核默认（默认规则表 + 高风险阻断）。两者与
-    `tools` 相反：**executor 在构造时把它们取走**，此后改本字段对已经建好的 Agent 无效。字段顺序
-    计入公开 API，新字段只能追加在末尾。
+    `danger_judge` / `danger_policy` 为 `None` 时用内核默认（默认规则表 + 高风险阻断）。这两者与
+    `max_tool_concurrency` 都与 `tools` 相反：**executor 在构造时把它们取走**，此后改本字段对已经
+    建好的 Agent 无效。字段顺序计入公开 API，新字段只能追加在末尾。
+
+    `max_tool_concurrency` 是一段里最多同时跑几个工具（spec §5.6「并发上限可配」），传 1 即完全
+    串行。
     """
 
     name: str
@@ -107,10 +114,14 @@ class AgentOptions:
     max_turns: int | None = 50
     danger_judge: DangerJudge | None = None
     danger_policy: DangerPolicy | None = None
+    max_tool_concurrency: int = DEFAULT_MAX_TOOL_CONCURRENCY
 
     def __post_init__(self) -> None:
         validate_tool_names(self.tools)
         validate_danger_options(self.danger_judge, self.danger_policy)
+        # 报出的名字必须是宿主写下的那个：executor 那道校验说的是 `max_concurrency`，而宿主写的是
+        # `max_tool_concurrency`，指着一个它没写过的参数等于让它去猜。
+        validate_max_concurrency(self.max_tool_concurrency, 'max_tool_concurrency')
 
 
 def _is_empty(block: ContextBlock) -> bool:
@@ -360,6 +371,7 @@ class BaseAgent:
             hooks=hooks,
             judge=options.danger_judge,
             policy=options.danger_policy,
+            max_concurrency=options.max_tool_concurrency,
         )
         self._context = Context()
         self._current_turn = 0
