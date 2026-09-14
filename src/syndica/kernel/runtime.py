@@ -111,7 +111,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -125,6 +125,7 @@ from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter, Junction
 from syndica.kernel.local_table import LocalAgentTable
 from syndica.kernel.message import DeliveryResult, Message, Trigger
+from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.waiting import Waiter, WaitResult, WaitState, correlation_of
@@ -317,18 +318,28 @@ def _already_shut_down() -> ContractViolation:
 
 
 class Runtime:
-    """Agent 的生命周期驱动与控制面。"""
+    """Agent 的生命周期驱动与控制面。
+
+    `plugins` 是扩展装配的第二层（spec §5.3）：它们挂在本 Runtime 的 hook 中心上，对每个 Agent
+    都生效，并且**在那个 Agent 自己的局部钩子之后**执行。
+    """
 
     def __init__(
         self,
         *,
         registry: AgentRegistry | None = None,
         broker: MessageBroker | None = None,
+        plugins: Sequence[Plugin] | None = None,
     ) -> None:
         self.registry: AgentRegistry = registry or InMemoryAgentRegistry()
         self.broker: MessageBroker = broker or InMemoryMessageBroker()
         self.events: EventBus = EventBus()
         self.hooks: HooksCenter = HooksCenter()
+        # 装配在挂 on_missing_queue 之前：一次被拒的装配不该在共享 broker 上留下一条指向构造失败
+        # 的 Runtime 的回调。
+        self._plugin_names: tuple[str, ...] = install_plugins(
+            self.hooks, () if plugins is None else plugins
+        )
         self._table: LocalAgentTable[BaseAgent] = LocalAgentTable()
         self._slots: dict[str, _Slot] = {}
         # 收尾在事件循环之外做，因此它自己是一个任务；不在实例表里，`shutdown` 的取消名单看不见
@@ -349,6 +360,15 @@ class Runtime:
         # 「队列不存在」是懒启动与 ZOMBIE 复活的唯一触发点（spec §4.4）。接在这里，而不是让每个
         # 调用方自己先判断再激活——那样「复活」就有了 N 份实现。
         self.broker.on_missing_queue(self._on_missing_queue)
+
+    @property
+    def plugins(self) -> tuple[str, ...]:
+        """已装插件的名字，按装配顺序。
+
+        交回元组而不是列表：这是一份快照，而调用方拿它去排障（「装了哪些、按什么顺序」）。交出
+        内部列表的话，第一个读者一次 `append` 就改了后来每个读者看到的答案。
+        """
+        return self._plugin_names
 
     async def spawn(
         self,
