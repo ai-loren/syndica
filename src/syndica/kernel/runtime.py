@@ -18,6 +18,11 @@
 也不替它清理；其余各处失败意味着循环还在跑而注册表说着另一套——丢掉这个结论就是丢掉「它为什么是
 compare-and-set」，而那次真的丢失的转换零痕迹。
 
+**留痕只有一个例外：`wait_for` 返回时那次恢复 `RUNNING` 的 CAS。** 它被拒是常态而不是异常——
+`abort` 已经把它转成 `ABORTING`、`pause` 转成 `PAUSED`，而一次在挂起期间开始的等待从头到尾没写过
+`WAITING`。在这里留痕会让每一次被中止或被挂起的等待都产出一条误报的记录，而真正丢失的转换由下一个
+周期边界的 `_oscillate` 报出来。
+
 **`_finish` 先摘队列再改状态。** 这两步之间落进来的 `send` 会拿到 `ok=False`（队列没了），调用方
 于是收到一次诚实的失败；反过来先改状态，那条消息会成功投进一个即将消失的队列，静默丢掉。
 **丢数据是静默的、灾难性的；失败是显式的、可恢复的。**
@@ -224,6 +229,12 @@ def _resumed_status(slot: _Slot) -> AgentStatus:
 
     在飞的等待优先于 `in_run`：挂起期间发起的等待此刻仍挂着，写 RUNNING 等于宣布这一轮在往前走，
     而它悬在一次等待上、只有一条匹配的答复救得回来。
+
+    这一问是同步的，但它与 `_resume_one` 那次 CAS 之间隔着一次 await：恰好在那段窗口里结束的等待会
+    让注册表停在 `WAITING` 而槽里已经没有 waiter。**刻意留着这个短暂的谎**——下一个轮边界的
+    `_oscillate` 会把它改回去（它的 `allowed` 含 `WAITING`），而「CAS 之后复检 waiter、发现没了就
+    改成 RUNNING」这个修法自己会制造更糟的缺陷：那次复检与改写之间同样有窗口，一次刚装上的新等待
+    会被它抹成 RUNNING——正是 `is token` 守卫存在的那个后果。
     """
     if slot.waiter is not None:
         return AgentStatus.WAITING
@@ -244,16 +255,20 @@ def _cannot_wait_for(agent_id: str, received: str) -> ContractViolation:
 
 
 def _not_running_to_wait(agent_id: str, info: AgentInfo | None) -> ContractViolation:
+    """拒绝只留给「本进程真的答不出这个问题」：手上没有一轮活可以挂起。
+
+    `paused` 与 `aborting` 都**不**走这条路——那两个状态下这个 Agent 手上仍有一轮，而一次拒绝换来的
+    是 `ContractViolation` 从工具里原样上抛、把整个 run 打成 `error`。
+    """
     return ContractViolation(
-        expected=f'agent {agent_id!r} 正在 running：只有手上有活的 Agent 才谈得上等一条答复',
+        expected=f'agent {agent_id!r} 手上有一轮活可以挂起（running 或已经悬在另一次等待上）',
         received=(
             f'它当前是 {info.status.value}' if info is not None else '注册表里已经没有这个条目'
         ),
         next_action=(
-            'wait_for 由该 Agent 自己的工具在轮中发起；'
-            '要从外面等它这次工作结束用 wait()，要让它停下来用 pause / abort。'
-            '它停在邮箱上（idle）时先 send 一条消息把它叫起来，'
-            '再由它的工具发起等待；paused 的先 resume'
+            'wait_for 由该 Agent 自己的工具在轮中发起；要从外面等它这次工作结束用 wait()。'
+            '它停在邮箱上（idle）时先 send 一条消息把它叫起来，再由它的工具发起等待；'
+            'zombie 的先 ensure_active 复活它；条目已经不在就重新 spawn 一个'
         ),
     )
 
@@ -1301,7 +1316,8 @@ class Runtime:
         ——比当前的碰撞风险更难查。
 
         **等待上限来自 `Waiter` 自己**（spec §4.2）：本方法不 clamp，因此一个荒谬的大超时实质上是
-        永久挂起，只有 `abort` 救得回来。
+        永久挂起，只有 `abort` 救得回来。交给 broker 的就是 `waiter.timeout` 本身——在这里悄悄夹一道
+        宿主级上限，一次四小时的人工确认会静默变成一小时，而症状只在长跑里现身。
 
         `waiter` 不是三种登记类型之一（或同时是两种）抛 `ContractViolation`；它的关联 ID 本身不合法
         抛 `ConfigError`。两者都在**改动状态之前**抛出，被拒的调用因此不会把这个 Agent 留在
@@ -1310,9 +1326,19 @@ class Runtime:
         **装上令牌之后复检中止位**：转 WAITING 的那次 CAS 可以在生效之后才返回，而那段窗口里的一次
         `abort` 看不到还没装上的令牌。
 
-        只允许从 RUNNING 发起，且只作用于本进程接管过的 Agent：替一个别人持有的条目写下 WAITING
-        之后，谁的 `ensure_active` 都转不回 IDLE（它的 `allowed` 只有 ZOMBIE），而 `send` 仍旧照答
-        ok=True。
+        **拒绝只留给「本进程真的答不出这个问题」**：没有实例、驱动任务没接管、手上没有一轮活可以
+        挂起（idle / zombie / 条目已不在）。控制面留下的两个状态各有归宿而**不是**拒绝——
+        `ContractViolation` 从工具里原样上抛会把整个 run 打成 `error`，`abort` 承诺的 `ABORTED`
+        与 `pause` 之后的 `resume` 都因此丢掉：
+
+        - `aborting`：直接交回 `WaitState.ABORTED`，**不写注册表**。后置条件本来就是这个，而这一轮
+          已经以中止收场，此刻开始一次等待也解不开它。
+        - `paused`：照常等，但**不写注册表**。轮已经被挂起门按住了，而 `resume` 的 CAS 只收
+          `PAUSED`——写下 `WAITING` 会让它失败，用户再也 resume 不回来。挂起请求仍在控制块里，因此
+          这一轮照旧在下一个轮边界上停下。
+
+        只作用于本进程接管过的 Agent：替一个别人持有的条目写下 WAITING 之后，谁的 `ensure_active`
+        都转不回 IDLE（它的 `allowed` 只有 ZOMBIE），而 `send` 仍旧照答 ok=True。
         """
         slot = self._slots.get(agent_id)
         if slot is None:
@@ -1330,7 +1356,12 @@ class Runtime:
         if not await self._switch(
             agent_id, new=AgentStatus.WAITING, allowed=(AgentStatus.RUNNING,)
         ):
-            raise _not_running_to_wait(agent_id, await self.registry.get(agent_id))
+            info = await self.registry.get(agent_id)
+            status = None if info is None else info.status
+            if status is AgentStatus.ABORTING:
+                return WaitResult(state=WaitState.ABORTED)
+            if status is not AgentStatus.PAUSED:
+                raise _not_running_to_wait(agent_id, info)
         token = _WaitToken()
         previous = slot.waiter
         slot.waiter = token
@@ -1344,6 +1375,10 @@ class Runtime:
             token.interrupt(WaitState.ABORTED)
         cancelled = False
         try:
+            if token.raised.done():
+                # 令牌已经被打过了：向 broker 发一次注定要被取消的请求只是多一次往返。这条路上
+                # 匹配的答复留在邮箱里退回成一条普通消息，与被中断的等待是同一个归宿。
+                return WaitResult(state=token.raised.result())
             return await self._awaited(agent_id, correlation, waiter.timeout, token)
         except asyncio.CancelledError:
             cancelled = True
@@ -1371,8 +1406,13 @@ class Runtime:
     ) -> WaitResult:
         """等到答复、中断或超时，三者取先到的那一个。
 
-        取消一次在飞的 `take_by_correlation` **不得吃掉已经取出的那条消息**——那是
-        `MessageBroker` 的明文契约并由契约套件强制。少了它，被中断的等待会静默销毁一条答复。
+        取消一次在飞的 `take_by_correlation` 必须**当场生效**，且**不得吃掉已经取出的那条消息**
+        （消息要留在 `consume` 看得见的地方）——两条都是 `MessageBroker` 的明文契约并由契约套件
+        强制。少了后者，被中断的等待会静默销毁一条答复。
+
+        **下面那条收回 `taking` 的等待边，长度由 broker 决定。** 它沿着自己 `create_task` 出来的
+        后代走，因此不可能成环；但取消不当场生效时它是**无界**的——`abort` / `shutdown` /
+        `despawn` 全都排在它后面，于是「不成环」并不等于「有界」。
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -1384,20 +1424,47 @@ class Runtime:
             await asyncio.wait({taking, token.raised}, return_when=asyncio.FIRST_COMPLETED)
         finally:
             # 只取消 taking：`token.raised` 归令牌所有，取消它会让此后的 `interrupt` 静默落空。
-            # 不 gather 就是把 broker 抛出的异常留在一个无人取回的任务里，只在 GC 时变成一行日志。
             taking.cancel()
-            await asyncio.gather(taking, return_exceptions=True)
-        if taking.done() and not taking.cancelled():
-            failure = taking.exception()
-            if failure is not None:
-                raise failure
-            message = taking.result()
-            if message is not None:
-                return WaitResult(state=WaitState.ANSWERED, message=message)
-            self._report_unwaited_timeout(agent_id, correlation, timeout, deadline - loop.time())
+            await asyncio.wait({taking})
+        # 无论谁胜出都读一次异常。读它是取回的动作本身：不读就是把 broker 抛出的东西留在一个无人
+        # 认领的任务里，只在 GC 时变成一行看不出主体的日志。
+        failure = None if taking.cancelled() else taking.exception()
+        answer = None if taking.cancelled() or failure is not None else taking.result()
+        if answer is not None:
+            # 答复优先于中断：消息已经离开邮箱了，此刻丢掉就是真的丢了。
+            return WaitResult(state=WaitState.ANSWERED, message=answer)
         if token.raised.done():
-            return WaitResult(state=token.raised.result())
+            state = token.raised.result()
+            if failure is not None:
+                self._report_discarded_take_failure(agent_id, correlation, state, failure)
+            return WaitResult(state=state)
+        if failure is not None:
+            raise failure
+        # 只在真的交回 timeout 的那条路上报告。中断胜出时交回的是中断状态，此处报一条说「本次
+        # 交回 timeout」的 ERROR 就是让唯一的那份证据说谎。
+        self._report_unwaited_timeout(agent_id, correlation, timeout, deadline - loop.time())
         return WaitResult(state=WaitState.TIMEOUT)
+
+    def _report_discarded_take_failure(
+        self, agent_id: str, correlation: str, state: WaitState, failure: BaseException
+    ) -> None:
+        """中断先到，而在飞的那次取消息抛了异常——这条记录是那次故障留下的全部痕迹。
+
+        交回的 `state` 说的是「这次等待被打断了」，broker 坏掉这件事在四态里表示不出来，而这个
+        异常此后再没有调用方。丢掉它就是把一次真实故障静默丢掉，然后下一次等待撞上同一个故障。
+        """
+        logger.error(
+            '期望: agent %s 上按 %r 取消息的那次调用，要么交回一条答复，要么被取消后安静退出。'
+            ' 实际: 它抛了 %s: %s，而这次等待已经先以 %s 收场——'
+            '这个异常此后没有调用方，本条记录是它留下的全部痕迹。'
+            ' 下一步: 按这个异常修 broker（连接、鉴权、序列化都走这条路）；'
+            '在同一个关联 ID 上重试等待之前先确认它已经能取到消息，否则下一次撞上同一个故障。',
+            agent_id,
+            correlation,
+            type(failure).__name__,
+            failure,
+            state.value,
+        )
 
     def _report_unwaited_timeout(
         self, agent_id: str, correlation: str, timeout: float, remaining: float
