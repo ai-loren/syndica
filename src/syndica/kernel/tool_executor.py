@@ -689,6 +689,10 @@ class ToolExecutor:
         # hook 写过这一份参数，批快照的前提（参数产于本批之前）就不成立了：它能把本批刚落进轨迹的
         # 不可信输出展开进参数。看 `rewrites` 而不只比对象身份——交回同一个 dict 对象的 hook 同样
         # 是作者，身份比对看不见它。
+        # 反过来身份比对现在单独命中不了：`_trigger_serial` 在同一个循环里填 `modified` 与
+        # `history`，于是「`modified['args']` 有值」与「`rewrites('args')` 为真」同真同假。留着它是
+        # 因为那条同源关系不在本文件里——`history` 一旦不再随 `modified` 同步填，`rewrites` 就会漏
+        # 掉一次真实改写，而漏掉的后果是溯源不重取。
         if pre.rewrites('args') or rewritten_args is not handed:
             # 多元素段里这次重取**结构上就是一次失败的溯源**：hook 能从旁路拿到同段兄弟的产出并
             # 展开进参数，而兄弟的 block 要等整段跑完才落进轨迹，重取在轨迹里一个字都看不到。

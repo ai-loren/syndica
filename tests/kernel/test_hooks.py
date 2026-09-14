@@ -1,6 +1,8 @@
 import asyncio
+import copy
 import dataclasses
 import logging
+import pickle
 from collections.abc import Callable
 from typing import cast
 
@@ -200,14 +202,30 @@ async def test_an_observer_that_answers_the_confirmation_junction_is_told_it_was
         HookResult(skip=True),
         HookResult(modified={'turn': 99}),
         HookResult(result='substitute'),
+        HookResult(result=False),
+        HookResult(result=0),
+        HookResult(result=''),
+        HookResult(result=[]),
         'not a HookResult at all',
     ],
-    ids=['skip', 'modified', 'result', 'off-contract'],
+    ids=[
+        'skip',
+        'modified',
+        'result',
+        'result-false',
+        'result-zero',
+        'result-empty-string',
+        'result-empty-list',
+        'off-contract',
+    ],
 )
 async def test_every_slot_a_discarded_return_could_have_used_is_reported(
     outcome: object, caplog: pytest.LogCaptureFixture
 ):
-    """三个槽位各自单独出现时都要报：只认其中一个，另外两种意图就仍然静默丢失。"""
+    """三个槽位各自单独出现时都要报：只认其中一个，另外两种意图就仍然静默丢失。
+
+    `result` 按取值族取到 falsy-but-not-None：`tool_confirmation_required` 上「否决这次确认」最自然
+    的写法就是 `HookResult(result=False)`，判据按真值取就把整个否决族静默放过。"""
     center = HooksCenter()
 
     async def opinionated(**_: object) -> HookResult | None:
@@ -247,6 +265,80 @@ async def test_an_interceptable_hooks_opinion_is_never_reported_as_discarded(
     center.register(Junction.PRE_TOOL_USE, rewrite)
     await center.trigger(Junction.PRE_TOOL_USE, args={})
     assert caplog.records == []
+
+
+async def test_the_discarded_return_diagnostic_names_every_junction_the_hook_could_move_to(
+    caplog: pytest.LogCaptureFixture,
+):
+    """这条记录是这次丢弃留下的全部痕迹，而它唯一可执行的内容是「改挂到哪去」。可拦截切点少列一个，
+    作者就以为那里同样读不到自己的返回值；三件套的标签少一个，读者就得自己找哪段是下一步。"""
+    center = HooksCenter()
+
+    async def opinionated(**_: object) -> HookResult:
+        return HookResult(skip=True)
+
+    center.register(Junction.TURN_START, opinionated)
+    await center.trigger(Junction.TURN_START, turn=1)
+    (record,) = caplog.records
+    message = record.getMessage()
+    assert [junction.value for junction in INTERCEPTABLE if junction.value not in message] == []
+    assert '返回 None' in message
+    assert [label for label in ('期望:', '实际:', '下一步:') if label not in message] == []
+
+
+_INTENT_PROBES: list[object] = [
+    None,
+    HookResult(),
+    HookResult(skip=True),
+    HookResult(modified={'turn': 99}),
+    HookResult(result='substitute'),
+    HookResult(result=False),
+    HookResult(result=0),
+    HookResult(history={'turn': [99]}),
+    HookResult(skip=True, modified={'turn': 99}, result='substitute'),
+    'not a HookResult at all',
+]
+
+
+@pytest.mark.parametrize(
+    'outcome',
+    _INTENT_PROBES,
+    ids=[
+        'none',
+        'empty',
+        'skip',
+        'modified',
+        'result',
+        'result-false',
+        'result-zero',
+        'history-only',
+        'every-slot',
+        'off-contract',
+    ],
+)
+async def test_a_discarded_return_is_reported_exactly_when_the_serial_chain_would_read_it(
+    outcome: object,
+):
+    """判据的派生源是 `_trigger_serial` 的读取集，不是 `HookResult` 的字段清单：加第五个槽位时改的
+    是那条链，而它一旦开始读，这条记录就得跟着报。两侧逐取值相等，任一侧单独漂移即红。
+
+    `history` 那一档是这条派生源与字段清单的分界：它是字段，而链忽略 hook 自填的那一份、按
+    `modified` 自己累积，按字段清单派生就会为它报一次没发生的丢失。"""
+    center = HooksCenter()
+
+    async def cb(**_: object) -> HookResult | None:
+        # 标注是契约，`off-contract` 那一档刻意违反它：要挡的正是运行期真会出现的取值。
+        return cast('HookResult | None', outcome)
+
+    center.register(Junction.PRE_TOOL_USE, cb)
+    try:
+        merged = await center.trigger(Junction.PRE_TOOL_USE, args={})
+    except Exception:
+        # 链读它的槽位时抛出，本身就是一次可观察效果。
+        reaches_the_chain = True
+    else:
+        reaches_the_chain = merged != HookResult()
+    assert center_module._carries_intent(outcome) is reaches_the_chain
 
 
 async def test_each_discarding_observable_hook_gets_its_own_diagnostic(
@@ -1492,19 +1584,74 @@ def test_the_read_surface_of_a_read_only_kwarg_is_untouched():
     assert len(args) == 3
     assert list(args) == ['command', 'cwd', 'shell']
     assert list(args.items()) == [('command', 'ls -la'), ('cwd', '/tmp'), ('shell', 'bash')]
+    assert list(args.keys()) == ['command', 'cwd', 'shell']
+    assert list(args.values()) == ['ls -la', '/tmp', 'bash']
+    assert list(reversed(args)) == ['shell', 'cwd', 'command']
 
 
-@pytest.mark.parametrize('copy', [dict, lambda args: {**args}], ids=['dict', 'splat'])
+@pytest.mark.parametrize(
+    'duplicate',
+    [
+        dict,
+        lambda args: {**args},
+        lambda args: args.copy(),
+        copy.copy,
+        copy.deepcopy,
+        lambda args: pickle.loads(pickle.dumps(args)),
+        lambda args: args | {},
+        lambda args: {} | args,
+    ],
+    ids=['dict', 'splat', 'copy-method', 'copy', 'deepcopy', 'pickle', 'or', 'ror'],
+)
 def test_a_copy_taken_out_of_a_read_only_kwarg_is_a_plain_writable_dict(
-    copy: Callable[[ReadOnlyKwarg], dict[str, object]],
+    duplicate: Callable[[ReadOnlyKwarg], dict[str, object]],
 ):
-    """错误消息给的下一步是「拼一份新的 dict 再交出去」；那条路不通的话这条消息就是空话。"""
+    """错误消息给的下一步是「拼一份新的 dict 再交出去」；那条路不通的话这条消息就是空话。
+
+    协议层（`copy` / `deepcopy` / `pickle`）与下标一样是**读**，而 `copy._reconstruct` 往新建的那
+    一份里逐键赋值：只拦 `__setitem__` 的包装会把它们拒掉，并报出一条说作者就地写了的假消息。"""
     args = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', {'command': 'ls -la'})
-    copied = copy(args)
+    copied = duplicate(args)
     assert type(copied) is dict
     copied['command'] = 'rewritten'
     assert copied == {'command': 'rewritten'}
     assert args == {'command': 'ls -la'}
+
+
+def test_a_deep_copy_of_a_read_only_kwarg_is_independent_all_the_way_down():
+    """视图只护顶层，`{**args}` 又是浅拷贝，所以 hook 作者要自己补上嵌套那道缺口时唯一的写法就是
+    `copy.deepcopy(args)`。拒掉它等于把唯一的自助路堵死。"""
+    args = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', {'config': {'flags': ['-f']}})
+    copied = copy.deepcopy(args)
+    copied['config']['flags'].append('--force')
+    assert args == {'config': {'flags': ['-f']}}
+    assert copied == {'config': {'flags': ['-f', '--force']}}
+
+
+def test_a_shallow_copy_of_a_read_only_kwarg_still_shares_its_nested_containers():
+    """深浅两条路都从同一个重建钩子走，所以「浅拷贝仍然共享嵌套容器」这件事要单独钉住：`copy.copy`
+    悄悄变深会让 D-40 那道嵌套缺口看起来已经关掉。"""
+    args = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', {'config': {'flags': ['-f']}})
+    assert copy.copy(args)['config'] is args['config']
+
+
+def test_fromkeys_on_a_read_only_kwarg_hands_back_a_plain_dict():
+    """继承来的 `fromkeys` 拿 `cls()` 建实例，撞上三参构造报一条指着 junction / key 缺失的
+    TypeError——而调用方要的只是一份新映射。"""
+    made = ReadOnlyKwarg.fromkeys(['command', 'cwd'])
+    assert type(made) is dict
+    made['command'] = 'ls'
+    assert made == {'command': 'ls', 'cwd': None}
+
+
+def test_a_read_only_kwarg_keeps_no_attribute_dict_for_a_hook_to_repoint_it():
+    """错误消息点名的切点与 kwarg 决定读者去查哪一处。它们可写的话，一个 hook 能把这条诊断指向另一个
+    切点，而这条消息是这次违反留下的全部痕迹。"""
+    args = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', {'command': 'ls -la'})
+    with pytest.raises(TypeError):
+        vars(args)
+    with pytest.raises(AttributeError):
+        args._other = 'anything'  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_a_read_only_kwarg_names_the_junction_the_kwarg_and_the_attempted_key():

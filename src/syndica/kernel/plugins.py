@@ -6,8 +6,13 @@
 
 **插件列表的次序是配置的一部分。** 可拦截切点按注册先后串行，因此换个次序就换了行为。
 
-**校验全部做完才开始注册。** 被拒的装配必须什么都没发生：装到一半才发现重名，宿主手里就是一个
-构造失败、却已经改过 hook 中心的 Runtime，而它没有任何拆除入口。
+**一次被拒的装配不在 hook 中心上留下任何 hook 或分类声明。** 装到一半失败的话，宿主手里就是一个
+构造失败、却已经改过 hook 中心的 Runtime，而 `HooksCenter` 没有任何拆除入口。两道防线：校验全部做完
+才开始注册（内核自己判得出的那些错——重名、不是实例、缺 name/register），以及注册期按快照回滚（插件
+自己的 `register` 抛出，那是第三方代码，校验判不出来）。
+
+保证只覆盖**这个中心**：`register` 是第三方代码，它在中心之外做的事（起任务、写文件、往别的中心
+注册）回滚不到，那些得由插件自己保证。
 """
 
 from __future__ import annotations
@@ -105,12 +110,15 @@ def _validated_sequence(plugins: object) -> Sequence[object]:
     return cast('Sequence[object]', plugins)
 
 
-def _validated(plugin: object, index: int) -> Plugin:
+def _validated(plugin: object, index: int) -> tuple[Plugin, str]:
     """逐项检查，而不是 `isinstance(plugin, Plugin)`：错在哪一项、缺的是哪一样都要说出来。
 
     `runtime_checkable` 的 Protocol 对**类对象**无感——类上 `name` 与 `register` 都取得到，于是
     「忘了加括号」会通过检查，再在 `register(hooks)` 把 hooks 绑到 self 上时炸在插件自己的签名上。
     因此类对象单独挡，且挡在取 name 之前。
+
+    **交回校验过的那个 name**，`name` 因此全程只读一次：它可以是每次交回不同值的 property，再读一遍
+    就是再取一个未经校验的值——查重比对的、最终交给宿主排障的会与校验过的那个不是同一个。
     """
     if isinstance(plugin, type):
         raise _is_a_class(plugin, index)
@@ -120,7 +128,7 @@ def _validated(plugin: object, index: int) -> Plugin:
     if not callable(getattr(plugin, 'register', None)):
         raise _has_no_register(plugin, index, name)
     # 上面三道检查就是这次转换的全部依据：Plugin 是 Protocol，运行时没有更强的检查可做。
-    return cast(Plugin, plugin)
+    return cast(Plugin, plugin), name
 
 
 def install_plugins(hooks: HooksCenter, plugins: Sequence[Plugin]) -> tuple[str, ...]:
@@ -128,15 +136,22 @@ def install_plugins(hooks: HooksCenter, plugins: Sequence[Plugin]) -> tuple[str,
 
     参数标注为 `Sequence[Plugin]` 而运行期仍检查：要挡的就是违反标注的运行时取值（配置里读来的
     清单、忘了包 list 的单个插件）。
+
+    任一插件的 `register` 抛出时，中心还原到进来时的样子再上抛（见模块 docstring 的两道防线）。
     """
     checked: list[Plugin] = []
     installed: list[str] = []
     for index, plugin in enumerate(_validated_sequence(plugins)):
-        candidate = _validated(plugin, index)
-        if candidate.name in installed:
-            raise _duplicate_name(index, candidate.name)
+        candidate, name = _validated(plugin, index)
+        if name in installed:
+            raise _duplicate_name(index, name)
         checked.append(candidate)
-        installed.append(candidate.name)
-    for plugin in checked:
-        plugin.register(hooks)
+        installed.append(name)
+    snapshot = hooks._assembly_snapshot()  # pyright: ignore[reportPrivateUsage]
+    try:
+        for plugin in checked:
+            plugin.register(hooks)
+    except BaseException:
+        hooks._assembly_restore(snapshot)  # pyright: ignore[reportPrivateUsage]
+        raise
     return tuple(installed)

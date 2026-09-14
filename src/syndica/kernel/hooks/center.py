@@ -78,11 +78,15 @@ def _orphan_result(
 
 
 def _carries_intent(outcome: object) -> bool:
-    """这个返回值里有没有东西**因为落在可观察切点上而丢失**。
+    """`_trigger_serial` 会从这个返回值里读出东西吗。
 
-    判据不是「返回了非 None」：`HookCallback` 对两类切点是同一个类型，`return HookResult()` 因此
-    是类型正确的写法，而一个空结论在可拦截切点上也什么都不做——报它就是让这条记录说一件没发生的
-    丢失。不是 `HookResult` 的返回值一律报：那个值没有任何槽位可读，本中心读不出它想做什么。
+    **判据的派生源是 `_trigger_serial` 的读取集，不是 `HookResult` 的字段清单。** 加第五个槽位不会
+    自动让它被报出来——让它被报出来的是 `_trigger_serial` 开始读它。反过来，`history` 是字段而
+    `_trigger_serial` 完全忽略 hook 自填的那一份（它按 `modified` 自己累积），所以报它就是一次误报。
+
+    因此判据不是「返回了非 None」：`HookCallback` 对两类切点是同一个类型，`return HookResult()` 是
+    类型正确的写法，而空结论经可拦截链什么也不做。不是 `HookResult` 的返回值一律报：
+    `_trigger_serial` 读它的第一个槽位就抛。
     """
     if outcome is None:
         return False
@@ -288,7 +292,6 @@ class HooksCenter:
                 ),
             )
         self._extension_kinds[validated] = checked
-        self._hooks.setdefault(validated, [])
 
     def register(self, junction: JunctionRef, cb: HookCallback) -> None:
         """挂一个 hook。同一切点上按注册先后执行。
@@ -334,6 +337,27 @@ class HooksCenter:
         await self._trigger_parallel(resolved, hooks, **kwargs)
         return HookResult()
 
+    def _assembly_snapshot(
+        self,
+    ) -> tuple[dict[JunctionRef, list[HookCallback]], dict[str, JunctionKind]]:
+        """本中心此刻的全部可写状态，供一次失败的装配还原（见 `plugins.install_plugins`）。
+
+        槽位列表逐个浅拷：还原要换掉列表**内容**，只留住 dict 的话插件 append 上去的回调会活下来。
+
+        新增任何可写状态都要一并进这里，否则那次还原就是一句假承诺。它刻意留在本类里而不是由调用方
+        伸手取两个私有字段——那样加状态的人改不到还原的那一处。
+        """
+        return (
+            {junction: list(cbs) for junction, cbs in self._hooks.items()},
+            dict(self._extension_kinds),
+        )
+
+    def _assembly_restore(
+        self, snapshot: tuple[dict[JunctionRef, list[HookCallback]], dict[str, JunctionKind]]
+    ) -> None:
+        """还原一份快照。**本中心就此接管它**，同一份快照不得还原两遍。"""
+        self._hooks, self._extension_kinds = snapshot
+
     def _collect(self, junction: JunctionRef) -> list[HookCallback]:
         """这个切点上要跑的整条链：本层在前，外层在后。"""
         own = list(self._hooks.get(junction, []))
@@ -344,8 +368,11 @@ class HooksCenter:
     def _declared_kind(self, name: str) -> JunctionKind | None:
         """沿装配链取这个扩展切点的分类；没人声明过交回 None。
 
-        本层优先只是查找顺序，不是覆盖：分类冲突在 `declare_extension_junction` 就被拒了，因此
-        一条链上同一个名字至多有一种分类。
+        本层优先只是查找顺序，不是覆盖。**冲突只沿「向外」的方向查得到**：`declare_extension_junction`
+        问的是本层与外层，而外层没有指向内层的引用，因此一个**后声明的外层**可以把内层已经声明过的
+        名字分叉成另一种分类。危险的那个方向被挡住了（内层想把外层的可拦截切点重声明成可观察会被拒，
+        策略 hook 因此落不进吞异常那一侧）；开着的是反方向，症状是同一个回调在两层的 `trigger` 下按
+        两套语义跑。
         """
         own = self._extension_kinds.get(name)
         if own is not None:
@@ -407,6 +434,9 @@ class HooksCenter:
             )
         declared = self._declared_kind(junction)
         if declared is None:
+            # `trigger` 到不了这里（`_resolved` 已经拒过未声明的名字）。这道检查守的是 `_resolved`
+            # 与 `_kind` 被分开调用的那条路：没有它，未归类的切点交回 None，`is
+            # JunctionKind.INTERCEPTABLE` 为假，于是静默落进「并行 + 吞异常」那一侧。
             raise ContractViolation(
                 expected=f'扩展切点 {junction} 在本层或外层已经声明过',
                 received='沿装配链找不到它的分类',

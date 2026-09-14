@@ -92,6 +92,26 @@ from syndica.kernel.tool_executor import (
 
 __all__ = ['AgentOptions', 'BaseAgent']
 
+_RUNTIME_ONLY: frozenset[Junction] = frozenset(
+    {Junction.RUNTIME_SHUTDOWN, Junction.AGENT_SPAWN, Junction.AGENT_DESPAWN}
+)
+"""只从 `Runtime` 的 hook 中心触发的切点：Agent 局部层上挂它们等于挂一个永不触发的 hook。
+
+新增切点若也只由 `Runtime` 触发，要一并进这里，否则宿主会在这一层静默挂空。
+"""
+
+
+def _runtime_only_junction(junction: Junction) -> ContractViolation:
+    return ContractViolation(
+        expected=f'挂在 Agent 局部层的切点由本 Agent 自己触发；{junction.value} 不是其中之一',
+        received=f'收到把 {junction.value} 挂到单个 Agent 上的请求',
+        next_action=(
+            f'改挂到 Runtime 的中心：runtime.hooks.register(Junction.{junction.name}, cb)。'
+            f'{junction.value} 只从那里触发，而外层的 trigger 看不到 Agent 局部层的 hook——'
+            '挂在这里的回调一次都不会跑'
+        ),
+    )
+
 
 @dataclass
 class AgentOptions:
@@ -394,7 +414,12 @@ class BaseAgent:
         它先于 Runtime 级插件执行：局部增强要能先看到、先改，跨 Agent 的通用逻辑在它之后收口。
         两层是一条链，因此局部 hook 的 `modified` 会成为插件看到的入参，它的 `skip` 会连插件的
         hook 一起终止。反过来不成立——宿主从 Runtime 的中心触发时看不到这里挂的任何东西。
+
+        `_RUNTIME_ONLY` 那三个切点在这一层上响亮失败：正因为外层看不见内层，它们只从 `Runtime` 的
+        中心触发，挂在这里的回调**结构上永不触发**。
         """
+        if junction in _RUNTIME_ONLY:
+            raise _runtime_only_junction(junction)
         self._hooks.register(junction, cb)
 
     def attach_gate(self, gate: TurnGate) -> None:

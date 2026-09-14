@@ -13,6 +13,12 @@
 **只护住顶层。** `args['config']['x'] = 1` 仍然逃得掉——嵌套容器不是本视图持有的东西，逐层包起来
 要深拷或代理整棵树，而那要在每次工具调用上做。这是一个**残留缺口**，不是已关闭的洞。
 
+**凡是「另给我一份」的协议一律交回普通 `dict`**：`copy` / `deepcopy` / `pickle` / `fromkeys`，与
+`dict(args)` / `{**args}` / `.copy()` / `|` 已有的行为一致。它们**是读**，不是写：
+`copy._reconstruct` 往新建的那一份里逐键 `y[key] = value`，只拦 `__setitem__` 的包装会把它们拒掉，
+还报出一条说作者就地写了的假消息。`deepcopy` 尤其不能拒——顶层之外那道缺口，hook 作者唯一的自助
+补法就是它。代价是往返之后类型退化成 `dict`，而本视图只活在一次触发里，没有任何判据读它的类型。
+
 是 `dict` 的子类而不是另一种 Mapping：`isinstance(value, dict)` 是触发方与 hook 作者都会写的形状
 检查，换成 Mapping 会让一条「改写后的 args 仍是 dict」的守卫在这里误报。
 """
@@ -33,6 +39,9 @@ def _label(junction: JunctionRef) -> str:
 
 class ReadOnlyKwarg(dict[str, Any]):
     """一份传给 hook 的 kwarg：读随便，写当场失败。"""
+
+    # 错误消息点名的切点与 kwarg 不留写入面：没有 __dict__，一个 hook 因此改不掉这条诊断指向谁。
+    __slots__ = ('_junction', '_key')
 
     def __init__(self, junction: JunctionRef, key: str, values: dict[str, Any]) -> None:
         super().__init__(values)
@@ -77,3 +86,18 @@ class ReadOnlyKwarg(dict[str, Any]):
 
     def update(self, *args: Any, **kwargs: Any) -> NoReturn:
         self._refuse('update()')
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """`copy` / `deepcopy` / `pickle` 三条路都从这里取重建方式，交回的是**普通 dict**。
+
+        交回本类会让 pickle 撞成一条裸 `AttributeError`：它先灌键值再装状态，`__setitem__` 那道拒绝
+        跑在 `_junction` 存在之前。而 `copy` / `deepcopy` 没有各自的钩子正是因为这一个就够——单独给
+        它们写一份，没有任何输入能区分两种写法。
+        """
+        return (dict, (list(self.items()),))
+
+    @classmethod
+    def fromkeys(cls, iterable: Any, value: Any = None) -> dict[str, Any]:  # pyright: ignore[reportIncompatibleMethodOverride]
+        # 不经本类的三参构造：继承来的实现会拿 cls() 建实例，报一条指着 junction / key 缺失的
+        # TypeError，而调用方要的只是一份新映射。
+        return dict.fromkeys(iterable, value)
