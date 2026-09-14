@@ -1,31 +1,43 @@
-"""编排工具：让 Agent 自己派活与分叉（spec §5.6）。
+"""编排工具：让 Agent 自己派活、分叉、通信、查询与终止（spec §5.6）。
 
 它们是 Runtime 控制面方法的薄封装，但**读者不同，因此错误处理相反**：控制面方法对**程序员**报
 `ContractViolation`（三件套写给能改代码的人），而这些工具的调用方是**模型**——同一条消息交给它
-毫无用处。所以「这个角色名不存在」这类模型改得动的情况写进 `output`，只让真正的程序错误上抛。
-上抛的那些都是模型无从应对的：Runtime 已经关机、发起方自己正在被销毁、工厂违约、外部执行体把
-这个子 Agent 拆掉了。
+毫无用处。所以「这个角色名不存在」「这个 id 不是你派出去的」这类模型改得动的情况写进 `output`，
+只让真正的程序错误上抛。上抛的那些都是模型无从应对的：Runtime 已经关机、发起方自己正在被销毁、
+工厂违约、外部执行体把这个子 Agent 拆掉了。
 
 **边界写进每个工具的 `description`**，因为那是编排者派活的唯一依据（spec §4.6）：`Delegate`
 冷启动、不继承上下文，用于需要独立视角的工作；`Fork` 继承上下文，用于已有结论有价值的延续；
 已有 Agent 能继续同一工作时用 `SendMessage`，不要新建；**能直接做完的有界工作不该委派**。
 
-**两者都阻塞发起方的这一轮。** 它们要等子 Agent 做完才拿得到结果，而工具是在轮里跑的。这是有意
-的：派活出去却不等结果，父 Agent 就得自己再发明一套轮询。等待经 `Runtime._wait_in_turn`，因此
-`abort(发起方)` 打断得了它；发起方此刻仍是 `RUNNING` 而不是 `WAITING`——`WAITING` 说的是「这一轮
-悬在一条匹配的答复上」，等一个子 Agent 干活是这一轮的工作本身。
+**`Delegate` 与 `Fork` 阻塞发起方的这一轮，`SendMessage` 不阻塞。** 前两者要等子 Agent 做完才拿
+得到结果，而工具是在轮里跑的。这是有意的：派活出去却不等结果，父 Agent 就得自己再发明一套轮询。
+等待经 `Runtime._wait_in_turn`，因此 `abort(发起方)` 打断得了它；发起方此刻仍是 `RUNNING` 而不是
+`WAITING`——`WAITING` 说的是「这一轮悬在一条匹配的答复上」，等一个子 Agent 干活是这一轮的工作本身。
 
-**本模块读 `Runtime` 上三个带下划线的接缝**（`_wait_in_turn` / `_factory_of` / `_provenance_of`）。
-它们刻意不进公开面：加一个公开方法不是破坏性变更，去掉一个是，所以先私有、真有第三方要再放出来。
-这些工具与 `Runtime` 同在内核里，因此每个读点单独豁免 `reportPrivateUsage`，而不是整文件关掉它
-——关掉之后，此后任何一处真正不该有的私有访问都不会再有人出声。
+**模型写下的每一段文字进另一个 Agent 的上下文时都带着发起方的溯源结论**（`Delegate` 的 `query`、
+`SendMessage` 的 `content`）。发起方读过的不可信内容只要被它复述进去，在接收方那里必须仍然不可信，
+否则一次派活或一条消息就把标记洗掉了，而接收方的高风险调用于是绕过 spec §12.2 第 3 条那道关不掉
+的升级。判据是 `context.provenance_of` 这一个定义，经 `Runtime._provenance_of` 读。
+
+**`KillAgent` 的目标限制在发起方的后代。** 注册表是全局的，而模型只要顺着 `QueryAgent` 报出的
+`parent` 往上走就能寻址到自己的父与根协调者——不限制的话，一个被说服的子 Agent 能停掉正等着它的
+父。`Runtime.kill` 本身不限制是对的（宿主可信），限制属于工具这一层，因为模型不可信。判据沿用
+`despawn` 级联用的同一次遍历：`KillAgent` 停得掉的，正是 `despawn(发起方)` 会一起带走的那些。
+**`SendMessage` 刻意不受同一条限制**：子 Agent 向父汇报是 spec §4.5 的正常用法，而消息落进对方
+上下文时带着发起方的溯源结论、对方自己的闸照常生效——它是加内容，不是拆东西。
+
+**本模块读 `Runtime` 上四个带下划线的接缝**（`_wait_in_turn` / `_factory_of` / `_provenance_of` /
+`_descendants`）。它们刻意不进公开面：加一个公开方法不是破坏性变更，去掉一个是，所以先私有、真有
+第三方要再放出来。这些工具与 `Runtime` 同在内核里，因此每个读点单独豁免 `reportPrivateUsage`，
+而不是整文件关掉它——关掉之后，此后任何一处真正不该有的私有访问都不会再有人出声。
 
 **子 Agent 的 `agent_id` 必须进 `output`，不能只进 `meta`。** `meta` 落在 block 的 `extra` 里、
 不进模型上下文，只放那里等于模型拿不到 id：它于是既不能让这个 ZOMBIE 带着上下文继续干，也不能
 停掉它，而 ZOMBIE 留在注册表本来就是为了前者（spec §4.1）。
 
-**两者都不声明自己可并发**（`Tool.is_concurrency_safe` 默认 False，不覆写）。它们写共享状态
-（注册表、实例表、邮箱），而并发段还会让 `Runtime._refuse_self` 认不出「自己」。
+**五个都不声明自己可并发**（`Tool.is_concurrency_safe` 默认 False，不覆写）。它们写共享状态
+（注册表、实例表、邮箱），而 `QueryAgent` 虽是只读，交回的答案也会随并发段里兄弟的动作而变。
 """
 
 from __future__ import annotations
@@ -34,13 +46,25 @@ from typing import TYPE_CHECKING
 
 from syndica.kernel.agent_types import ExitMode
 from syndica.kernel.context import Context, StopReason, TrustLevel, provenance_of
+from syndica.kernel.message import Trigger
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.waiting import WaitState
 
 if TYPE_CHECKING:
     from syndica.kernel.runtime import Runtime
 
-__all__ = ['Delegate', 'Fork']
+__all__ = [
+    'Delegate',
+    'Fork',
+    'KillAgent',
+    'QueryAgent',
+    'SendMessage',
+    'orchestration_tools',
+]
+
+# 交给模型的合法 trigger 取值，从枚举派生：写死一份会在新增成员时静默过期，而这行字是模型改这个
+# 参数的唯一依据。
+_TRIGGERS: str = ' / '.join(trigger.value for trigger in Trigger)
 
 
 def _final_text(ctx: Context) -> str | None:
@@ -140,7 +164,22 @@ async def _collected(runtime: Runtime, agent_id: str, child_id: str) -> ToolResu
     return _delivered(child_id, outcome.context)
 
 
-class Delegate(Tool):
+class _AgentTool(Tool):
+    """编排工具的共同构造：一个工具实例代表**某一个** Agent 对 Runtime 控制面的调用权。
+
+    `agent_id` 在 `BaseAgent.__init__` 里才生成，所以这些工具只能在实例建好之后挂进它那张活的
+    工具表——两个 Agent 各有各的实例，共用一份会让一次派活挂到别人名下。
+
+    **每个子类自己声明 `__tool_command_args__`，基类不替它声明。** 继承一个 `()` 会让日后某个真
+    会执行东西的子类静默失去那道闸，而漏声明本该是响亮的（登记 D-34）。
+    """
+
+    def __init__(self, runtime: Runtime, agent_id: str) -> None:
+        self._runtime = runtime
+        self._agent_id = agent_id
+
+
+class Delegate(_AgentTool):
     """派活：冷启动一个角色，等它做完，取回结果。
 
     **模型看到的描述来自 `execute` 的 docstring 摘要，不是本段。** 反射出的 schema 取
@@ -149,10 +188,6 @@ class Delegate(Tool):
     """
 
     __tool_command_args__ = ()
-
-    def __init__(self, runtime: Runtime, agent_id: str) -> None:
-        self._runtime = runtime
-        self._agent_id = agent_id
 
     async def execute(self, agent: str, query: str) -> ToolResult:
         """把一件独立的工作派给一个 Agent 角色，等它做完并取回它的结果。
@@ -189,17 +224,13 @@ class Delegate(Tool):
         return await _collected(self._runtime, self._agent_id, child_id)
 
 
-class Fork(Tool):
+class Fork(_AgentTool):
     """分叉：造一个继承了当前轨迹的同类型 Agent，等它做完。
 
     模型看到的描述来自 `execute` 的 docstring 摘要，理由见 `Delegate`。
     """
 
     __tool_command_args__ = ()
-
-    def __init__(self, runtime: Runtime, agent_id: str) -> None:
-        self._runtime = runtime
-        self._agent_id = agent_id
 
     async def execute(self, query: str) -> ToolResult:
         """分叉出一个继承了你当前上下文的 Agent，交给它一件延续性的工作，等它做完。
@@ -232,3 +263,174 @@ class Fork(Tool):
             fork_from=self._agent_id,
         )
         return await _collected(self._runtime, self._agent_id, child_id)
+
+
+class SendMessage(_AgentTool):
+    """通信：给一个已有的 Agent 投一条消息，不等它回话。
+
+    模型看到的描述来自 `execute` 的 docstring 摘要，理由见 `Delegate`。
+    """
+
+    __tool_command_args__ = ()
+
+    async def execute(self, agent_id: str, content: str, trigger: str = 'pending') -> ToolResult:
+        """给一个**已有的** Agent 发一条消息，不等它回话；它没在跑就把它叫醒。
+        已有 Agent 能继续同一工作时用这个，不要新建
+        ——新建会丢掉它已经攒下的全部上下文，而做完一件活的 Agent 仍然留在注册表里可寻址。
+        要一个不受你影响的独立视角用 Delegate，要在你自己的结论之上并行推进用 Fork。
+        agent_id: 收件人的 id（Delegate / Fork 交回的那一个）
+        content: 消息正文；它看得到的只有这段话，所以要自带全部前提
+        trigger: pending 表示它下一轮开始前就读到，deferred 表示等它手上这件活做完再读
+        """
+        try:
+            when = Trigger(trigger)
+        except ValueError:
+            return ToolResult(
+                output=(
+                    f'期望: trigger 是 {_TRIGGERS} 之一。'
+                    f' 实际: 收到 {trigger!r}。'
+                    ' 下一步: 要它尽快看到就用 pending，'
+                    '要等它把手上这件活做完再看就用 deferred。'
+                ),
+                meta={'ok': False, 'agent_id': agent_id},
+            )
+        # `content` 是本 Agent 的模型写下的文字，而模型读过什么决定了那段文字是什么的衍生物
+        # （spec §12.2 第 2 条）。丢掉这一步，任何不可信内容都能经一条消息洗成收件人的可信输入，
+        # 而收件人的高风险调用于是绕过那道关不掉的升级。
+        trust = self._runtime._provenance_of(self._agent_id)  # pyright: ignore[reportPrivateUsage]
+        delivered = await self._runtime.send(
+            agent_id, content, trigger=when, sender=self._agent_id, trust=trust
+        )
+        if not delivered.ok:
+            return ToolResult(
+                output=(
+                    f'期望: 这条消息进 agent {agent_id!r} 的邮箱。'
+                    f' 实际: 投递失败——{delivered.reason or "broker 没有给出原因"}。'
+                    f' 下一步: 用 QueryAgent({agent_id}) 看它还在不在；'
+                    '它还在就重发一次，已经不在就用 Delegate 派一个新的来做这件事。'
+                ),
+                meta={'ok': False, 'agent_id': agent_id},
+            )
+        return ToolResult(
+            output=(
+                f'已投递给 agent {agent_id}（trigger={when.value}）。'
+                '它会在自己的下一轮读到它；这次调用不等它回话。'
+            ),
+            meta={'ok': True, 'agent_id': agent_id, 'message_id': delivered.message_id},
+        )
+
+
+class QueryAgent(_AgentTool):
+    """查询：读一个 Agent 的状态。**只读，绝不激活。**
+
+    模型看到的描述来自 `execute` 的 docstring 摘要，理由见 `Delegate`。
+    """
+
+    __tool_command_args__ = ()
+
+    async def execute(self, agent_id: str) -> ToolResult:
+        """读一个 Agent 的名字、状态、父与子代数量；**只看不碰**，不会把它叫醒。
+        派出去的活做完没有、还在不在，用它来问。
+        要让一个停下来的 Agent 继续干用 SendMessage，不再需要它就用 KillAgent。
+        agent_id: 要查的 Agent 的 id
+        """
+        info = await self._runtime.find(agent_id)
+        if info is None:
+            return ToolResult(
+                output=(
+                    f'期望: agent {agent_id!r} 在注册表里。'
+                    ' 实际: 没有这个条目——它从未存在，或已被销毁。'
+                    ' 下一步: 核对 id（Delegate / Fork 交回的那一个）；'
+                    '确实需要这件工作就用 Delegate 派一个新的。'
+                ),
+                meta={'agent_id': agent_id, 'status': None},
+            )
+        return ToolResult(
+            output=(
+                f'agent {agent_id}: name={info.name} status={info.status.value} '
+                f'parent={info.parent_id} children={len(info.children)}'
+            ),
+            meta={
+                'agent_id': agent_id,
+                'status': info.status.value,
+                'children': list(info.children),
+            },
+        )
+
+
+class KillAgent(_AgentTool):
+    """终止：停掉一个后代 Agent 的事件循环，条目留在注册表里。
+
+    模型看到的描述来自 `execute` 的 docstring 摘要，理由见 `Delegate`。
+    """
+
+    __tool_command_args__ = ()
+
+    async def execute(self, agent_id: str) -> ToolResult:
+        """终止一个**你派出去的** Agent 的事件循环，让它立刻停下手上的活。
+        只停得了你自己派出去的那些（Delegate / Fork 造出来的，以及它们的后代）。
+        它仍留在注册表里可寻址，一条 SendMessage 就能让它带着原有上下文继续。
+        agent_id: 要终止的 Agent 的 id
+        """
+        if agent_id == self._agent_id:
+            # 判据是**两个 id 相等**而不是任务身份：`Runtime._refuse_self` 比对 `current_task()`，
+            # 而一个声明了可并发的工具跑在 `gather` 建的子任务里认不出自己。id 相等无法被执行位置
+            # 改变。
+            return ToolResult(
+                output=(
+                    '期望: KillAgent 的目标是别人。'
+                    ' 实际: 收到的是你自己的 id。'
+                    ' 下一步: 杀自己会在这次工具调用返回之前就把你取消掉，'
+                    '这一批调用因此不会有结果、轨迹会停在半路。'
+                    '想结束当前工作就直接给出最终回复；由别人来停你则请你的父 Agent 动手。'
+                )
+            )
+        if await self._runtime.find(agent_id) is None:
+            return ToolResult(
+                output=(
+                    f'期望: agent {agent_id!r} 在注册表里。'
+                    ' 实际: 没有这个条目，它已经不在了。'
+                    ' 下一步: 核对 id；已经不在的 Agent 不需要再终止一次。'
+                )
+            )
+        descendants = await self._runtime._descendants(  # pyright: ignore[reportPrivateUsage]
+            self._agent_id
+        )
+        if agent_id not in descendants:
+            return ToolResult(
+                output=(
+                    '期望: KillAgent 的目标是你派出去的 Agent'
+                    '（Delegate / Fork 造出来的，以及它们的后代）。'
+                    f' 实际: agent {agent_id!r} 不在你这棵子树里——'
+                    '它是你的父、你的同辈，或别人派出去的。'
+                    ' 下一步: 只停你自己派出去的那些；'
+                    f'用 QueryAgent({agent_id}) 看它的 parent 是谁，'
+                    '要停它就把这件事交给你们共同的父 Agent。'
+                )
+            )
+        await self._runtime.kill(agent_id)
+        return ToolResult(
+            output=(
+                f'已终止 agent {agent_id} 的事件循环。它仍留在注册表里，'
+                '一条 SendMessage 就能让它带着原有上下文继续。'
+            ),
+            meta={'agent_id': agent_id},
+        )
+
+
+def orchestration_tools(runtime: Runtime, agent_id: str) -> dict[str, Tool]:
+    """给一个 Agent 造一套编排工具。
+
+    **次序固定且不是字母序**：工具表的迭代顺序逐字进请求前缀（spec §5.2），重排不报错，只让整条
+    会话的缓存静默失效。这个次序照 spec §5.6 的清单：先派活、再分叉、再通信、再查询、最后终止。
+
+    每个 Agent 各造一套：工具实例绑着发起方的 `agent_id`，共用一套会让所有 Agent 的派活、投递与
+    终止都记在同一个主体名下。
+    """
+    return {
+        'Delegate': Delegate(runtime, agent_id),
+        'Fork': Fork(runtime, agent_id),
+        'SendMessage': SendMessage(runtime, agent_id),
+        'QueryAgent': QueryAgent(runtime, agent_id),
+        'KillAgent': KillAgent(runtime, agent_id),
+    }

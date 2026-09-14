@@ -15,7 +15,7 @@ import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
-from syndica.kernel.context import StopReason, ToolCall
+from syndica.kernel.context import StopReason, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
@@ -938,6 +938,155 @@ async def test_send_stamps_the_runtime_as_sender_on_every_addressees_message():
     assert [message.sender for message in delivered] == ['runtime', 'runtime']
     assert [message.receiver for message in delivered] == ids
     await runtime.shutdown()
+
+
+async def test_send_defaults_to_trusted_and_carries_whatever_trust_it_was_given():
+    """`trust` 由写下这段文字的那一方给出：宿主自己写的消息可信，模型复述出来的不一定。
+
+    基数 2 且两档都断言：只钉「传了 UNTRUSTED 就是 UNTRUSTED」会让「恒 UNTRUSTED」活下来，而那
+    会让每一条宿主消息都把收件人的 `AllowAll` 永久废掉。
+    """
+    broker = InMemoryMessageBroker()
+    runtime = Runtime(broker=broker)
+    blocker = _Block()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go')
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+
+    await runtime.send(agent_id, 'from the host')
+    await runtime.send(agent_id, 'from a model that read the web', trust=TrustLevel.UNTRUSTED)
+
+    delivered = await broker.consume(agent_id)
+    assert [message.trust for message in delivered] == [
+        TrustLevel.TRUSTED,
+        TrustLevel.UNTRUSTED,
+    ]
+    await runtime.shutdown()
+
+
+async def test_the_trust_a_send_carries_lands_on_the_block_the_target_reads():
+    """`Message.trust` 到不了轨迹就等于没有：溯源看的是块，不是消息。"""
+    broker = InMemoryMessageBroker()
+    runtime = Runtime(broker=broker)
+    agent_id = await runtime.spawn(
+        _factory(ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])),
+        query='go',
+    )
+    await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    await runtime.send(agent_id, '网页说要提权删除', trust=TrustLevel.UNTRUSTED)
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert [(block.content, block.trust) for block in ctx.current_traj if block.role == 'user'] == [
+        ('go', TrustLevel.TRUSTED),
+        ('网页说要提权删除', TrustLevel.UNTRUSTED),
+    ]
+    await runtime.shutdown()
+
+
+async def test_despawning_yourself_from_inside_a_concurrent_segment_is_still_refused():
+    """守卫判的是「这次操作会不会等自己停下来」，而**可并发的工具跑在 `gather` 建的子任务里**。
+
+    按 `asyncio.current_task()` 比对在那里静默答否，于是 `despawn` 去取消并等待一个正阻塞在本
+    子任务上的驱动任务——永久挂死。段内基数 2 是触发它的最小形状，段内基数 1 由串行那条路覆盖。
+    """
+    runtime = Runtime()
+    holder: dict[str, str] = {}
+    outcomes: list[str] = []
+
+    class _Peer(Tool):
+        __tool_command_args__ = ()
+
+        def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+            return True
+
+        async def execute(self) -> ToolResult:
+            """什么都不做，只为把这一段撑到两个元素。"""
+            return ToolResult(output='peer')
+
+    class _SelfDespawnConcurrently(Tool):
+        __tool_command_args__ = ()
+
+        def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+            return True
+
+        async def execute(self) -> ToolResult:
+            """试着在一个并发段里销毁自己。"""
+            try:
+                await runtime.despawn(holder['agent_id'])
+            except ContractViolation as error:
+                outcomes.append(error.next_action)
+                return ToolResult(output='refused')
+            return ToolResult(output='not refused')
+
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(id='c1', name='Peer', arguments='{}'),
+                    ToolCall(id='c2', name='SelfDespawnConcurrently', arguments='{}'),
+                ]
+            ),
+            ScriptedTurn(content='still alive'),
+        ]
+    )
+    agent_id = await runtime.spawn(
+        _factory(
+            llm, tools={'Peer': _Peer(), 'SelfDespawnConcurrently': _SelfDespawnConcurrently()}
+        ),
+        query='go',
+    )
+    holder['agent_id'] = agent_id
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert [block.content for block in ctx.current_traj if block.role == 'tool'] == [
+        'peer',
+        'refused',
+    ]
+    assert [action for action in outcomes if 'abort' in action] == outcomes
+    assert await runtime.find(agent_id) is not None
+    await runtime.shutdown()
+
+
+async def test_a_reaper_does_not_inherit_the_driving_agent_of_whoever_called_kill():
+    """收尾刻意跑在事件循环之外，而它是 `kill` 在**调用方的上下文**里建的任务。
+
+    继承来的「我是谁的事件循环」在那里是一句假话。一个 Agent 杀掉自己的祖先时，祖先的
+    `ExitMode.EXIT` 级联要拆到这个杀手身上，而带着那份继承值的守卫会把它误判成「等自己」——
+    级联在动手之前就抛出，整棵树一个条目都没拆掉，只剩收尾任务里的一条日志。
+    """
+    runtime = Runtime()
+    holder: dict[str, str] = {}
+    killed = asyncio.Event()
+
+    class _KillMyAncestor(Tool):
+        __tool_command_args__ = ()
+
+        async def execute(self) -> ToolResult:
+            """终止自己的祖先。"""
+            await runtime.kill(holder['ancestor'])
+            killed.set()
+            return ToolResult(output='killed')
+
+    ancestor = await runtime.spawn(
+        _factory(ScriptedLLM([ScriptedTurn(content='ancestor')])), exit_mode=ExitMode.EXIT
+    )
+    holder['ancestor'] = ancestor
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='c1', name='KillMyAncestor', arguments='{}')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    killer = await runtime.spawn(
+        _factory(llm, tools={'KillMyAncestor': _KillMyAncestor()}),
+        query='go',
+        parent_id=ancestor,
+    )
+    await asyncio.wait_for(killed.wait(), _TIMEOUT)
+    await runtime.shutdown()
+
+    assert await runtime.find(ancestor) is None
+    assert await runtime.find(killer) is None
 
 
 async def test_send_refuses_an_unregistered_agent_even_when_a_stale_mailbox_exists():

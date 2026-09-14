@@ -137,6 +137,8 @@ from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
+from syndica.kernel.tool import validate_tool_names
+from syndica.kernel.tools import orchestration_tools
 from syndica.kernel.waiting import Waiter, WaitResult, WaitState, correlation_of
 
 __all__ = ['AgentFactory', 'Runtime', 'validate_agent_factories']
@@ -150,6 +152,18 @@ AgentFactory = Callable[[HooksCenter, EventBus], BaseAgent]
 # 代价是 broker 必须让回调看得见调用方 publish 时的上下文；这条已经是 MessageBroker 的明文契约
 # 并由契约套件强制，见 protocols/broker.py。
 _ACTIVATION_ALLOWED: ContextVar[bool] = ContextVar('syndica_activation_allowed', default=True)
+
+# 「此刻这段代码跑在谁的事件循环里」。`_drive` 在入口无条件置位，其余一律读它。
+#
+# 用 ContextVar 而不是比对 `asyncio.current_task()`：一个声明了可并发的工具跑在 `gather` 建的
+# 子任务里，`current_task()` 于是不再是驱动任务，而那个驱动任务正**阻塞在**这个子任务上——按任务
+# 身份判「这次操作会不会等自己停下来」会静默答否，换来一次永久挂死。`asyncio.Task` 建立时复制一份
+# contextvars，子任务因此读得到驱动任务写下的值。
+#
+# **无条件置位是承重的**：`spawn` 从驱动任务内部建子 Agent 的驱动任务，它会继承父写下的值；只靠
+# `default=None` 会让子 Agent 的守卫指着它的父。反过来 `_reap` 不是任何人的事件循环（它刻意跑在
+# 事件循环之外），继承来的值在那里是一句假话，所以它进门先清掉。
+_DRIVING_AGENT: ContextVar[str | None] = ContextVar('syndica_driving_agent', default=None)
 
 # 本进程的事件循环认得的活状态：从其中任何一个都可以被它转去另一个活状态或 ZOMBIE。不在这里的
 # 就是终态，本进程不得把它带回来。周期边界的 `allowed` 由本元组派生，漏一个就是「某个状态下
@@ -288,6 +302,18 @@ def _bad_factory_return(factory: AgentFactory, produced: object) -> ContractViol
             '（`spawn(make_worker)` 应为 `spawn(make_worker(...))`）。'
             '它来自 Runtime(agents=...) 的角色表就改那一行。'
             '不拦的话，下一步是 agent.agent_id 撞出的 AttributeError，指着 runtime.py'
+        ),
+    )
+
+
+def _orchestration_name_clash(name: str, clashes: list[str]) -> ConfigError:
+    return ConfigError(
+        expected='Runtime(orchestration=True) 装上的编排工具名与这个 Agent 自己的工具都不重名',
+        received=f'agent {name!r} 自己的工具表里已经有 {clashes}',
+        next_action=(
+            '给自己的那个工具换个名字，或者关掉 Runtime(orchestration=True) 手工装配编排工具。'
+            '静默覆盖会让它自己那一个永远调不到——模型按同一个名字发起的调用全落到编排工具上，'
+            '而 run 照常以 COMPLETED 返回。本次 spawn 什么都没发生'
         ),
     )
 
@@ -569,6 +595,9 @@ class Runtime:
 
     `plugins` 是扩展装配的第二层（spec §5.3）：它们挂在本 Runtime 的 hook 中心上，对每个 Agent
     都生效，并且**在那个 Agent 自己的局部钩子之后**执行。
+
+    `orchestration=True` 给每个 spawn 出来的 Agent 装上 spec §5.6 的五个编排工具。**默认关**：
+    五个工具的 `description` 逐轮进请求前缀，每一轮都付这份 token，而多数 Agent 不派活。
     """
 
     def __init__(
@@ -578,6 +607,7 @@ class Runtime:
         broker: MessageBroker | None = None,
         plugins: Sequence[Plugin] | None = None,
         agents: Mapping[str, AgentFactory] | None = None,
+        orchestration: bool = False,
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
@@ -594,6 +624,7 @@ class Runtime:
         # 宿主此后每一次 append 都改掉了早先每个读者看到的那个答案。与 `AgentOptions.tools` 相反
         # ——那里共用是为了热插拔，而角色表的载入与同名覆盖归计划 3，在那一层收口。
         self._agents: dict[str, AgentFactory] = dict(agents or {})
+        self._orchestration = orchestration
         self._table: LocalAgentTable[BaseAgent] = LocalAgentTable()
         self._slots: dict[str, _Slot] = {}
         # 收尾在事件循环之外做，因此它自己是一个任务；不在实例表里，`shutdown` 的取消名单看不见
@@ -708,6 +739,7 @@ class Runtime:
         control = ControlBlock()
         gate = BrokerTurnGate(agent_id, self.broker, control)
         agent.attach_gate(gate)
+        self._install_orchestration(agent, agent_id)
         if fork_from is not None:
             source = self._table.get(fork_from)
             if source is None:
@@ -764,6 +796,26 @@ class Runtime:
         await self.hooks.trigger(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)
         return agent_id
 
+    def _install_orchestration(self, agent: BaseAgent, agent_id: str) -> None:
+        """把 spec §5.6 的五个编排工具挂进这个 Agent 的工具表。
+
+        **同名工具报错而不是覆盖**：静默覆盖会让这个 Agent 自己那一个永远调不到，而 run 照常以
+        COMPLETED 返回——失败被当成成功上报。抛在 `register` 之前，被拒的 spawn 什么都没发生。
+
+        `agent.options.tools` 是**活的** dict，executor 与它共享同一个对象，因此这次更新立刻对
+        本 Agent 生效，不需要重建 executor。更新之后整张表重过一遍身份轴校验：工厂可以在
+        `AgentOptions` 构造之后再往这张活表里塞条目，那些条目没有人校验过（编排工具自己的键则由
+        `orchestration_tools` 写死，一个拼错的键会让模型的每一次调用都落空）。
+        """
+        if not self._orchestration:
+            return
+        installed = orchestration_tools(self, agent_id)
+        clashes = sorted(set(installed) & set(agent.options.tools))
+        if clashes:
+            raise _orchestration_name_clash(agent.options.name, clashes)
+        agent.options.tools.update(installed)
+        validate_tool_names(agent.options.tools)
+
     def _carry_truncated_taint(
         self, agent: BaseAgent, fork_from: str, source_trust: TrustLevel
     ) -> None:
@@ -807,6 +859,7 @@ class Runtime:
         await self.registry.unregister(agent_id)
 
     async def _drive(self, agent_id: str, agent: BaseAgent, seed: _Seed | None) -> None:
+        _DRIVING_AGENT.set(agent_id)
         # `get` 而不是下标：任务是 create_task 排上去的，在它真正跑起来之前 slot 可能已经被摘掉。
         # 那时该静默退出，而不是让一个 KeyError 变成无人认领的任务异常。
         slot = self._slots.get(agent_id)
@@ -1137,12 +1190,19 @@ class Runtime:
         activate: bool = True,
         sender: str = 'runtime',
         correlation_id: str | None = None,
+        trust: TrustLevel = TrustLevel.TRUSTED,
     ) -> DeliveryResult:
         """投递一条消息到目标邮箱。
 
         **默认激活目标**：绝大多数调用方要的语义是「发消息，它没在跑就叫醒它」（spec §4.2）。
         要严格的「仅入队」语义就传 `activate=False`——此时目标若已经进了 ZOMBIE（队列已摘），
         投递返回 `ok=False`，而不是把消息塞进一个没人消费的地方。
+
+        `trust` 是这段 `content` 的信任级别（spec §12.2 第 2 条），由**写下这段文字的那一方**给
+        出，经 `Message.trust` 与 `BaseAgent._inject` 原样落进收件人的 user 块。默认可信：宿主自己
+        写的消息就是可信的。**内容来自一个模型时必须传它**——模型读过什么决定了那段文字是什么的
+        衍生物，标记丢在这里，收件人的高风险调用就绕过了那道关不掉的升级（`SendMessage` 传的是
+        发送方的溯源结论）。
 
         **投递失败返回结构化结果而不抛异常**，调用方才能识别可重试的瞬时错误。
 
@@ -1164,6 +1224,7 @@ class Runtime:
             content=content,
             trigger=trigger,
             correlation_id=correlation_id,
+            trust=trust,
         )
         token = _ACTIVATION_ALLOWED.set(activate)
         try:
@@ -1509,9 +1570,10 @@ class Runtime:
             if not await self._has_traces(agent_id):
                 return
             task = self._table.get_task(agent_id)
-            # `is not current_task()`：`ExitMode.EXIT` 是在驱动任务自己的 finally 里走到这条路的，
-            # 取消并 await 自己就是永久挂死。等一个子代的驱动任务停下来是往自己子树里等，不成环。
-            if task is not None and task is not asyncio.current_task():
+            # 读 `_DRIVING_AGENT` 而不是比对任务身份：`ExitMode.EXIT` 是在驱动任务自己的 finally
+            # 里走到这条路的，取消并 await 自己就是永久挂死，而可并发的工具跑在 `gather` 的子任务
+            # 里、按任务身份认不出这一格。等一个子代的驱动任务停下来是往自己子树里等，不成环。
+            if task is not None and _DRIVING_AGENT.get() != agent_id:
                 task.cancel()
                 await asyncio.wait({task})
             await self.broker.remove_queue(agent_id)
@@ -1566,6 +1628,10 @@ class Runtime:
         异常在这里收口：收割任务没有调用方，逃出去的异常无人取回，只会在 GC 时变成一行看不出主体
         的日志。
         """
+        # 本任务由 `kill` 建，可能建在某个 Agent 的驱动任务里，于是继承了它的 `_DRIVING_AGENT`。
+        # 收尾刻意跑在事件循环之外，那个值在这里是假的：留着它，一次落在那个 Agent 身上的拆除会被
+        # 误判成「等自己」而拒掉，被杀的 Agent 于是停在 aborting、再也复活不了。
+        _DRIVING_AGENT.set(None)
         try:
             task = self._table.get_task(agent_id)
             if task is not None:
@@ -1585,9 +1651,12 @@ class Runtime:
         """拒绝一个要等目标停下、而目标就是调用者自己的操作。
 
         这不是「冲突」而是意图无法表达，所以遍历找到的主体上照样抛：等自己就是永久挂死。
+
+        判据是 `_DRIVING_AGENT` 而不是 `asyncio.current_task()`：可并发的工具跑在 `gather` 建的
+        子任务里，而那个驱动任务正阻塞在它上面——按任务身份比对会静默放行，换来的正是这里要挡的
+        那次挂死。
         """
-        task = self._table.get_task(agent_id)
-        if task is None or task is not asyncio.current_task():
+        if _DRIVING_AGENT.get() != agent_id:
             return
         raise ContractViolation(
             expected=f'{operation} 的目标子树里不含发起这次调用的那个 Agent 自己',

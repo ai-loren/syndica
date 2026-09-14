@@ -14,15 +14,23 @@ from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.agent_types import AgentStatus, ExitMode
 from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall, TrustLevel
 from syndica.kernel.danger import AllowAll, DangerPolicy
-from syndica.kernel.errors import ContractViolation
+from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
+from syndica.kernel.message import Trigger
 from syndica.kernel.runtime import AgentFactory, Runtime, _InTurnWaitResult
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tool_executor import DEFAULT_MAX_TOOL_CONCURRENCY
-from syndica.kernel.tools import Delegate, Fork
-from syndica.kernel.tools.orchestration import _INTERRUPTED, _UNFINISHED
+from syndica.kernel.tools import (
+    Delegate,
+    Fork,
+    KillAgent,
+    QueryAgent,
+    SendMessage,
+    orchestration_tools,
+)
+from syndica.kernel.tools.orchestration import _INTERRUPTED, _UNFINISHED, _AgentTool
 from syndica.kernel.waiting import WaitState
 
 # 每个等待都设上限：回归应当让用例变红，而不是把 CI 挂住。
@@ -152,6 +160,12 @@ async def _idle_parent(runtime: Runtime) -> str:
     parent = await runtime.spawn(_worker([ScriptedTurn(content='parent idle')]), query='go')
     await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
     return parent
+
+
+def _owner(tool: Tool) -> str:
+    """这个工具实例代表谁在调 Runtime 的控制面。"""
+    assert isinstance(tool, _AgentTool)
+    return tool._agent_id  # pyright: ignore[reportPrivateUsage]
 
 
 def _call(name: str, arguments: str, call_id: str = 'c1') -> ScriptedTurn:
@@ -1674,11 +1688,15 @@ def test_the_interrupted_table_answers_for_every_wait_state():
     ] == []
 
 
-async def test_neither_orchestration_tool_declares_itself_safe_to_run_concurrently():
-    """两者都写共享状态（注册表、实例表），而并发段还会让 `_refuse_self` 认不出「自己」。"""
+async def test_no_orchestration_tool_declares_itself_safe_to_run_concurrently():
+    """它们都写共享状态（注册表、实例表、邮箱），而并发段还会让 `_refuse_self` 认不出「自己」。
+
+    `QueryAgent` 只读也不例外：同段兄弟的动作会改掉它交回的那个答案。
+    """
     runtime = Runtime()
-    assert Delegate(runtime, 'a').is_concurrency_safe({}) is False
-    assert Fork(runtime, 'a').is_concurrency_safe({}) is False
+    assert [
+        tool.is_concurrency_safe({}) for tool in orchestration_tools(runtime, 'a').values()
+    ] == [False] * 5
     await runtime.shutdown()
 
 
@@ -1690,4 +1708,717 @@ async def test_both_tools_describe_when_not_to_use_them_because_that_is_all_the_
     assert 'Delegate' in Fork(runtime, 'a').description
     assert set(Delegate(runtime, 'a').parameters['required']) == {'agent', 'query'}
     assert set(Fork(runtime, 'a').parameters['required']) == {'query'}
+    await runtime.shutdown()
+
+
+# ---------------------------------------------------------------- 五件套的形状
+
+
+def test_the_five_orchestration_tools_come_in_a_fixed_order():
+    """工具表的迭代顺序逐字进请求前缀：重排不报错，只让整条会话的缓存静默失效（spec §5.2）。
+
+    这个次序照 spec §5.6 的清单，既非升序亦非降序、也不等于自己的反转，基数 5。
+    """
+    tools = orchestration_tools(Runtime(), 'a1')
+
+    assert list(tools) == ['Delegate', 'Fork', 'SendMessage', 'QueryAgent', 'KillAgent']
+    assert [tool.name for tool in tools.values()] == list(tools)
+
+
+@pytest.mark.parametrize(
+    'cls',
+    [Delegate, Fork, SendMessage, QueryAgent, KillAgent],
+    ids=['Delegate', 'Fork', 'SendMessage', 'QueryAgent', 'KillAgent'],
+)
+def test_every_orchestration_tool_declares_its_own_command_args(cls):
+    """声明写在**每个类自己**身上，不从共同基类继承下来。
+
+    继承一个 `()` 会让日后某个真会执行东西的子类静默失去那道闸，而漏声明本该是响亮的（D-34）。
+    """
+    assert '__tool_command_args__' in vars(cls)
+    assert cls.__tool_command_args__ == ()
+
+
+@pytest.mark.parametrize(
+    ('cls', 'mentions', 'required'),
+    [
+        (SendMessage, ('Delegate', 'Fork'), {'agent_id', 'content'}),
+        (QueryAgent, ('SendMessage', 'KillAgent'), {'agent_id'}),
+        (KillAgent, ('Delegate', 'Fork'), {'agent_id'}),
+    ],
+    ids=['SendMessage', 'QueryAgent', 'KillAgent'],
+)
+def test_the_three_new_tools_describe_their_boundary_where_the_model_can_read_it(
+    cls, mentions, required
+):
+    """反射出的 schema 取 `execute` docstring 的摘要，**类 docstring 里的字一个也到不了模型手上**。
+
+    `模型看到的描述` 这句话只在类 docstring 里，所以它出现在 description 里就意味着取错了那一级。
+    """
+    tool = cls(Runtime(), 'a1')
+
+    assert all(name in tool.description for name in mentions)
+    assert '模型看到的描述' not in tool.description
+    assert set(tool.parameters['required']) == required
+
+
+def test_the_valid_triggers_a_send_message_offers_are_exactly_the_enum():
+    """取值表从枚举派生：写死一份会在新增成员时静默过期，而这行字是模型改这个参数的唯一依据。"""
+    described = SendMessage(Runtime(), 'a1').parameters['properties']['trigger']['description']
+
+    assert all(trigger.value in described for trigger in Trigger)
+
+
+async def test_each_agent_gets_its_own_five_tools_bound_to_its_own_id():
+    """共用一套会让三个 Agent 的派活、投递与终止全记在同一个主体名下。基数 3。"""
+    runtime = Runtime()
+    sets = [orchestration_tools(runtime, agent_id) for agent_id in ('a1', 'a2', 'a3')]
+
+    owners = [{name: _owner(tool) for name, tool in tools.items()} for tools in sets]
+    assert owners == [
+        dict.fromkeys(['Delegate', 'Fork', 'SendMessage', 'QueryAgent', 'KillAgent'], agent_id)
+        for agent_id in ('a1', 'a2', 'a3')
+    ]
+    await runtime.shutdown()
+
+
+# ---------------------------------------------------------------- SendMessage
+
+
+async def test_send_message_reaches_a_zombie_and_wakes_it_up():
+    runtime = Runtime()
+    target = await runtime.spawn(
+        _worker([ScriptedTurn(content='first'), ScriptedTurn(content='second')]), query='go'
+    )
+    await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+    sender = await _idle_parent(runtime)
+
+    result = await asyncio.wait_for(
+        SendMessage(runtime, sender).execute(agent_id=target, content='carry on'),
+        timeout=_TIMEOUT,
+    )
+
+    assert result.meta['ok'] is True
+    assert result.meta['message_id'] is not None
+    ctx = await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
+        'go',
+        'carry on',
+    ]
+    await runtime.shutdown()
+
+
+async def test_a_message_says_who_sent_it_so_the_receiver_can_answer_the_right_agent():
+    """`sender` 默认是 `'runtime'`；落下宿主的名字，收件人就回不到发信的那个 Agent 身上。"""
+    runtime = Runtime()
+    target = await runtime.spawn(
+        _worker([ScriptedTurn(content='first'), ScriptedTurn(content='second')]), query='go'
+    )
+    await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+    sender = await _idle_parent(runtime)
+
+    await asyncio.wait_for(
+        SendMessage(runtime, sender).execute(agent_id=target, content='carry on'),
+        timeout=_TIMEOUT,
+    )
+    ctx = await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+
+    assert [block.extra['sender'] for block in ctx.current_traj if block.extra.get('sender')] == [
+        sender
+    ]
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ('trigger', 'expected'),
+    [
+        ('pending', ['go', 'later please', 'finished what I was doing']),
+        (
+            'deferred',
+            ['go', 'finished what I was doing', 'later please', 'now the message'],
+        ),
+    ],
+)
+async def test_the_trigger_decides_whether_the_message_interrupts_the_work_in_flight(
+    trigger, expected
+):
+    """spec §4.5：PENDING 下一轮就读到，DEFERRED 等手上这件活做完。
+
+    只断言「投递成功」会让「恒 PENDING」活下来，而那正好抹掉 DEFERRED 存在的全部理由。
+    """
+    blocker = _Block()
+    runtime = Runtime()
+    target = await runtime.spawn(
+        _worker(
+            [
+                _call('Block', '{}'),
+                ScriptedTurn(content='finished what I was doing'),
+                ScriptedTurn(content='now the message'),
+            ],
+            {'Block': blocker},
+        ),
+        query='go',
+    )
+    await asyncio.wait_for(blocker.entered.wait(), timeout=_TIMEOUT)
+    sender = await _idle_parent(runtime)
+
+    result = await asyncio.wait_for(
+        SendMessage(runtime, sender).execute(
+            agent_id=target, content='later please', trigger=trigger
+        ),
+        timeout=_TIMEOUT,
+    )
+    assert result.meta['ok'] is True
+    blocker.release.set()
+    ctx = await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+
+    assert [
+        block.content
+        for block in ctx.current_traj
+        if block.role in ('user', 'assistant') and block.content is not None
+    ] == expected
+    await runtime.shutdown()
+
+
+async def test_send_message_reports_an_unknown_target_without_raising():
+    """模型改得动的错误进 `output`：它手上那个 id 可能只是过时了。"""
+    runtime = Runtime()
+    sender = await _idle_parent(runtime)
+
+    result = await asyncio.wait_for(
+        SendMessage(runtime, sender).execute(agent_id='nope', content='x'), timeout=_TIMEOUT
+    )
+
+    assert result.meta == {'ok': False, 'agent_id': 'nope'}
+    assert isinstance(result.output, str)
+    assert all(part in result.output for part in _THREE_PART)
+    assert 'nope' in result.output
+    await runtime.shutdown()
+
+
+async def test_send_message_rejects_an_unknown_trigger_and_lists_every_valid_one():
+    """期望值来自 `Trigger` 枚举本身，与这条消息的措辞无关：新增一个取值而忘了改它就变红。"""
+    runtime = Runtime()
+    sender = await _idle_parent(runtime)
+
+    result = await asyncio.wait_for(
+        SendMessage(runtime, sender).execute(agent_id=sender, content='x', trigger='later'),
+        timeout=_TIMEOUT,
+    )
+
+    assert result.meta == {'ok': False, 'agent_id': sender}
+    assert isinstance(result.output, str)
+    assert all(trigger.value in result.output for trigger in Trigger)
+    assert all(part in result.output for part in _THREE_PART)
+    assert 'later' in result.output
+    await runtime.shutdown()
+
+
+async def test_an_unknown_trigger_does_not_deliver_anything_at_all():
+    """非法取值换来的应当是一次什么都没发生的拒绝，而不是一条按默认 trigger 投出去的消息。"""
+    runtime = Runtime()
+    target = await runtime.spawn(
+        _worker([ScriptedTurn(content='first'), ScriptedTurn(content='second')]), query='go'
+    )
+    await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+    sender = await _idle_parent(runtime)
+
+    await asyncio.wait_for(
+        SendMessage(runtime, sender).execute(agent_id=target, content='x', trigger='later'),
+        timeout=_TIMEOUT,
+    )
+
+    info = await runtime.find(target)
+    assert info is not None and info.status is AgentStatus.ZOMBIE
+    assert (await runtime.send(target, 'probe', activate=False)).ok is False
+    await runtime.shutdown()
+
+
+async def test_three_agents_sending_at_once_each_reach_only_their_own_addressee():
+    """按 agent_id 索引的东西都要证明互不串线；基数 3，内容既非升序亦非降序。"""
+    runtime = Runtime()
+    contents = ('beta note', 'alpha note', 'gamma note')
+    targets = [
+        await runtime.spawn(
+            _worker([ScriptedTurn(content='ready'), ScriptedTurn(content='read it')]), query='go'
+        )
+        for _ in contents
+    ]
+    for target in targets:
+        await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+    senders = [await _idle_parent(runtime) for _ in contents]
+
+    await asyncio.wait_for(
+        asyncio.gather(
+            *(
+                SendMessage(runtime, sender).execute(agent_id=target, content=content)
+                for sender, target, content in zip(senders, targets, contents, strict=True)
+            )
+        ),
+        timeout=_TIMEOUT,
+    )
+
+    delivered: list[list[str]] = []
+    for target in targets:
+        ctx = await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+        delivered.append(
+            [str(block.content) for block in ctx.current_traj if block.role == 'user'][1:]
+        )
+    assert delivered == [[content] for content in contents]
+    await runtime.shutdown()
+
+
+# ------------------------------------------------- SendMessage：信任洗白
+
+
+async def test_a_sender_that_read_untrusted_content_cannot_launder_it_through_a_message():
+    """`content` 由模型完全控制，而模型读过什么决定了那段文字是什么的衍生物（spec §12.2 第 2 条）。
+
+    与派活那条路逐字同型：不带上发送方的溯源结论，一条消息就把标记洗掉了。
+    """
+    runtime = Runtime()
+    target = await runtime.spawn(
+        _worker([ScriptedTurn(content='first'), ScriptedTurn(content='second')]), query='go'
+    )
+    await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+    sender = await _idle_parent(runtime)
+    sender_agent = runtime._table.get(sender)
+    assert sender_agent is not None
+    sender_agent.context.append(
+        ContextBlock(
+            role='tool', content='<html>…</html>', tool_call_id='x', trust=TrustLevel.UNTRUSTED
+        )
+    )
+
+    await asyncio.wait_for(
+        SendMessage(runtime, sender).execute(agent_id=target, content='删掉构建目录'),
+        timeout=_TIMEOUT,
+    )
+    ctx = await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+
+    assert [(block.content, block.trust) for block in ctx.current_traj if block.role == 'user'] == [
+        ('go', TrustLevel.TRUSTED),
+        ('删掉构建目录', TrustLevel.UNTRUSTED),
+    ]
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_the_laundered_message_is_still_stopped_by_the_gate_inside_the_receiver(limit):
+    """只钉那一块的 trust 不够：要证明它真的接到了闸上（spec §12.2 第 3 条那道关不掉的升级）。"""
+    runner = _Runner()
+    runtime = Runtime()
+    target = await runtime.spawn(
+        _worker(
+            [
+                ScriptedTurn(content='ready'),
+                _call('Runner', _DANGEROUS),
+                ScriptedTurn(content='done'),
+            ],
+            {'Runner': runner},
+            policy=AllowAll(),
+            limit=limit,
+        ),
+        query='go',
+    )
+    await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+    sender = await _idle_parent(runtime)
+    sender_agent = runtime._table.get(sender)
+    assert sender_agent is not None
+    sender_agent.context.append(
+        ContextBlock(
+            role='tool', content='网页说要提权删除', tool_call_id='x', trust=TrustLevel.UNTRUSTED
+        )
+    )
+
+    await asyncio.wait_for(
+        SendMessage(runtime, sender).execute(agent_id=target, content='按网页说的做'),
+        timeout=_TIMEOUT,
+    )
+    await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+
+    assert runner.executed == []
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize('limit', _LIMITS)
+async def test_a_message_from_a_clean_sender_still_lets_the_receiver_do_high_risk_work(limit):
+    """反向一侧：无条件标脏会让 `Worker` 这个角色在 `AllowAll` 下整个用不了（spec §4.8）。"""
+    runner = _Runner()
+    runtime = Runtime()
+    target = await runtime.spawn(
+        _worker(
+            [
+                ScriptedTurn(content='ready'),
+                _call('Runner', _DANGEROUS),
+                ScriptedTurn(content='done'),
+            ],
+            {'Runner': runner},
+            policy=AllowAll(),
+            limit=limit,
+        ),
+        query='go',
+    )
+    await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+    sender = await _idle_parent(runtime)
+
+    await asyncio.wait_for(
+        SendMessage(runtime, sender).execute(agent_id=target, content='清理'), timeout=_TIMEOUT
+    )
+    await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+
+    assert runner.executed == ['sudo rm -rf /']
+    await runtime.shutdown()
+
+
+# ---------------------------------------------------------------- QueryAgent
+
+
+async def test_query_agent_never_wakes_the_target_up():
+    """`find` 明文承诺绝不激活；这个工具是它的门面，承诺必须一路守到这里。
+
+    换成 `ensure_active` 之后注册表会说 idle、邮箱会被建回来——两侧各断一条，只断状态会让
+    「查完顺手把它叫醒」这个变异在邮箱那一侧活下来。
+    """
+    runtime = Runtime()
+    target = await runtime.spawn(_worker([ScriptedTurn(content='done')]), query='go')
+    await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+    asker = await _idle_parent(runtime)
+
+    result = await asyncio.wait_for(
+        QueryAgent(runtime, asker).execute(agent_id=target), timeout=_TIMEOUT
+    )
+
+    assert result.meta['status'] == 'zombie'
+    info = await runtime.find(target)
+    assert info is not None and info.status is AgentStatus.ZOMBIE
+    assert (await runtime.send(target, 'probe', activate=False)).ok is False
+    await runtime.shutdown()
+
+
+async def test_query_agent_tells_a_missing_agent_apart_from_a_sleeping_one():
+    """查询类工具必须能把「不存在」与「存在但没在跑」分开回答——那正是 `find` 不激活的理由。"""
+    runtime = Runtime()
+    target = await runtime.spawn(_worker([ScriptedTurn(content='done')]), query='go')
+    await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+    asker = await _idle_parent(runtime)
+
+    missing = await asyncio.wait_for(
+        QueryAgent(runtime, asker).execute(agent_id='nope'), timeout=_TIMEOUT
+    )
+    sleeping = await asyncio.wait_for(
+        QueryAgent(runtime, asker).execute(agent_id=target), timeout=_TIMEOUT
+    )
+
+    assert missing.meta == {'agent_id': 'nope', 'status': None}
+    assert all(part in str(missing.output) for part in _THREE_PART)
+    assert sleeping.meta['status'] == 'zombie'
+    await runtime.shutdown()
+
+
+async def test_query_agent_reports_the_name_the_parent_and_the_children_of_its_target():
+    """交回的东西全是元数据：没有轨迹内容，所以它不是一条读别人上下文的路。"""
+    runtime = Runtime(agents={'Worker': _worker([ScriptedTurn(content='child answer')])})
+    parent = await _idle_parent(runtime)
+    delegated = await asyncio.wait_for(
+        Delegate(runtime, parent).execute(agent='Worker', query='x'), timeout=_TIMEOUT
+    )
+    child = delegated.meta['agent_id']
+
+    result = await asyncio.wait_for(
+        QueryAgent(runtime, parent).execute(agent_id=parent), timeout=_TIMEOUT
+    )
+
+    assert result.meta == {'agent_id': parent, 'status': 'zombie', 'children': [child]}
+    output = str(result.output)
+    assert f'name={"Worker"}' in output
+    assert f'parent={None}' in output
+    assert 'children=1' in output
+    assert 'child answer' not in output
+    await runtime.shutdown()
+
+
+# ---------------------------------------------------------------- KillAgent
+
+
+async def _resident(runtime: Runtime, parent_id: str | None = None) -> str:
+    """一个常驻等消息的 Agent。**IDLE 而不是 ZOMBIE**：被杀与没被杀才区分得开。"""
+    agent_id = await runtime.spawn(
+        _worker([ScriptedTurn(content='x')]), exit_mode=ExitMode.IDLE, parent_id=parent_id
+    )
+    await _wait_for_registry_status(runtime, agent_id, AgentStatus.IDLE)
+    return agent_id
+
+
+async def _wait_for_registry_status(runtime: Runtime, agent_id: str, status: AgentStatus) -> None:
+    """轮询等到注册表里的状态到达；超时抛 TimeoutError，让回归表现为失败而不是挂死。"""
+
+    async def _poll() -> None:
+        while True:
+            info = await runtime.find(agent_id)
+            if info is not None and info.status is status:
+                return
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(_poll(), timeout=_TIMEOUT)
+
+
+async def test_kill_agent_stops_a_resident_descendant_but_keeps_it_addressable():
+    runtime = Runtime()
+    killer = await _idle_parent(runtime)
+    target = await _resident(runtime, killer)
+
+    result = await asyncio.wait_for(
+        KillAgent(runtime, killer).execute(agent_id=target), timeout=_TIMEOUT
+    )
+
+    assert result.meta == {'agent_id': target}
+    await _wait_for_registry_status(runtime, target, AgentStatus.ZOMBIE)
+    await runtime.shutdown()
+
+
+async def test_kill_agent_reaches_a_grandchild_because_the_rule_is_descendants_not_children():
+    """`Delegate` 派出去的 Agent 自己还能再派，而停得掉它们是「派出去的活停得下来」的全部含义。
+
+    判据写成「target.parent_id == 我」会让这一条变红：它只覆盖直接子代，而那棵树是递归长出来的。
+    """
+    runtime = Runtime()
+    root = await _idle_parent(runtime)
+    child = await _resident(runtime, root)
+    grandchild = await _resident(runtime, child)
+
+    result = await asyncio.wait_for(
+        KillAgent(runtime, root).execute(agent_id=grandchild), timeout=_TIMEOUT
+    )
+
+    assert result.meta == {'agent_id': grandchild}
+    await _wait_for_registry_status(runtime, grandchild, AgentStatus.ZOMBIE)
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize('relation', ['parent', 'sibling', 'stranger'])
+async def test_kill_agent_refuses_anything_that_is_not_your_own_descendant(relation):
+    """注册表是全局的，而模型顺着 `QueryAgent` 报出的 parent 就能寻址到自己的父与根协调者。
+
+    不限制的话，一个被说服的子 Agent 能停掉正等着它干活的父。三种关系都要：只挡住「父」会让
+    「兄弟之间照杀」活下来，而它们之间同样没有负责关系。
+    """
+    runtime = Runtime()
+    parent = await _resident(runtime)
+    killer = await _resident(runtime, parent)
+    sibling = await _resident(runtime, parent)
+    stranger = await _resident(runtime)
+    target = {'parent': parent, 'sibling': sibling, 'stranger': stranger}[relation]
+
+    result = await asyncio.wait_for(
+        KillAgent(runtime, killer).execute(agent_id=target), timeout=_TIMEOUT
+    )
+
+    assert isinstance(result.output, str)
+    assert all(part in result.output for part in _THREE_PART)
+    assert target in result.output
+    assert 'QueryAgent' in result.output
+    info = await runtime.find(target)
+    assert info is not None and info.status is AgentStatus.IDLE
+    await runtime.shutdown()
+
+
+async def test_killing_yourself_is_refused_by_comparing_ids_not_task_identity():
+    """判据是两个 id 相等，因此它对「调用方跑在哪个任务上」完全免疫（D-39 的那一格）。
+
+    改成比对 `asyncio.current_task()`，从测试任务里发起的这一次就认不出自己、真的把它杀掉——
+    所以断言必须落在「它还在跑」上，而不是「条目还在」（`kill` 本来就留着条目）。
+    """
+    runtime = Runtime()
+    parent = await _idle_parent(runtime)
+    agent_id = await _resident(runtime, parent)
+
+    result = await asyncio.wait_for(
+        KillAgent(runtime, agent_id).execute(agent_id=agent_id), timeout=_TIMEOUT
+    )
+
+    assert isinstance(result.output, str)
+    assert all(part in result.output for part in _THREE_PART)
+    assert 'abort' not in result.output
+    info = await runtime.find(agent_id)
+    assert info is not None and info.status is AgentStatus.IDLE
+    await runtime.shutdown()
+
+
+async def test_killing_an_agent_that_is_already_gone_is_reported_without_raising():
+    runtime = Runtime()
+    killer = await _idle_parent(runtime)
+
+    result = await asyncio.wait_for(
+        KillAgent(runtime, killer).execute(agent_id='nope'), timeout=_TIMEOUT
+    )
+
+    assert isinstance(result.output, str)
+    assert all(part in result.output for part in _THREE_PART)
+    assert 'nope' in result.output
+    await runtime.shutdown()
+
+
+async def test_a_killed_descendant_comes_back_with_its_context_on_a_single_message():
+    """条目留在注册表里是承诺的一半，另一半是「一条 SendMessage 就能让它继续」。"""
+    blocker = _Block()
+    runtime = Runtime()
+    killer = await _idle_parent(runtime)
+    target = await runtime.spawn(
+        _worker([_call('Block', '{}'), ScriptedTurn(content='came back')], {'Block': blocker}),
+        query='original work',
+        parent_id=killer,
+    )
+    await asyncio.wait_for(blocker.entered.wait(), timeout=_TIMEOUT)
+
+    await asyncio.wait_for(KillAgent(runtime, killer).execute(agent_id=target), timeout=_TIMEOUT)
+    await _wait_for_registry_status(runtime, target, AgentStatus.ZOMBIE)
+    await asyncio.wait_for(
+        SendMessage(runtime, killer).execute(agent_id=target, content='keep going'),
+        timeout=_TIMEOUT,
+    )
+    ctx = await asyncio.wait_for(runtime.wait(target), timeout=_TIMEOUT)
+
+    assert [block.content for block in ctx.current_traj if block.role == 'user'] == [
+        'original work',
+        'keep going',
+    ]
+    assert 'came back' in [block.content for block in ctx.current_traj]
+    blocker.release.set()
+    await runtime.shutdown()
+
+
+async def test_three_killers_each_stop_only_their_own_child():
+    """按 agent_id 索引的东西都要证明互不串线；基数 3。"""
+    runtime = Runtime()
+    killers = [await _idle_parent(runtime) for _ in range(3)]
+    children = [await _resident(runtime, killer) for killer in killers]
+
+    await asyncio.wait_for(
+        KillAgent(runtime, killers[1]).execute(agent_id=children[1]), timeout=_TIMEOUT
+    )
+    await _wait_for_registry_status(runtime, children[1], AgentStatus.ZOMBIE)
+
+    statuses = [(await runtime.find(child)).status for child in children]  # pyright: ignore[reportOptionalMemberAccess]
+    assert statuses == [AgentStatus.IDLE, AgentStatus.ZOMBIE, AgentStatus.IDLE]
+    await runtime.shutdown()
+
+
+# ---------------------------------------------------------------- 自动装配
+
+
+async def test_orchestration_is_off_by_default_because_five_descriptions_cost_every_turn():
+    runtime = Runtime()
+    agent_id = await runtime.spawn(_worker([ScriptedTurn(content='x')]), query='go')
+    await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+
+    agent = runtime._table.get(agent_id)
+    assert agent is not None and list(agent.options.tools) == []
+    await runtime.shutdown()
+
+
+async def test_orchestration_tools_are_installed_on_every_spawned_agent_when_enabled():
+    """装配次序与 `orchestration_tools` 同序，理由同样是请求前缀（spec §5.2）。"""
+    runtime = Runtime(orchestration=True)
+    agent_id = await runtime.spawn(
+        _worker([ScriptedTurn(content='x')], {'Tainted': _Tainted()}), query='go'
+    )
+    await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    assert list(agent.options.tools) == [
+        'Tainted',
+        'Delegate',
+        'Fork',
+        'SendMessage',
+        'QueryAgent',
+        'KillAgent',
+    ]
+    await runtime.shutdown()
+
+
+async def test_the_installed_tools_belong_to_the_agent_they_were_installed_on():
+    """一套工具共用会让三个 Agent 的派活全记在同一个主体名下。基数 3，走真实 spawn。"""
+    runtime = Runtime(orchestration=True)
+    ids = [await runtime.spawn(_worker([ScriptedTurn(content='x')]), query='go') for _ in range(3)]
+    for agent_id in ids:
+        await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+
+    owners = []
+    for agent_id in ids:
+        agent = runtime._table.get(agent_id)
+        assert agent is not None
+        owners.append(_owner(agent.options.tools['Delegate']))
+    assert owners == ids
+    await runtime.shutdown()
+
+
+async def test_an_auto_installed_agent_can_actually_delegate():
+    """`options.tools` 是活表、executor 与它共享同一个对象——装完不重建 executor 就靠这一条。"""
+    runtime = Runtime(
+        orchestration=True,
+        agents={'Worker': _worker([ScriptedTurn(content='the child answer')])},
+    )
+    boss = await runtime.spawn(
+        _worker(
+            [
+                _call('Delegate', '{"agent":"Worker","query":"do it"}', 'd1'),
+                ScriptedTurn(content='boss done'),
+            ],
+            name='Boss',
+        ),
+        query='go',
+    )
+    await asyncio.wait_for(runtime.wait(boss), timeout=_TIMEOUT)
+
+    assert 'the child answer' in str(_tool_blocks(runtime, boss)[0].content)
+    await runtime.shutdown()
+
+
+async def test_installing_orchestration_over_a_tool_of_the_same_name_is_refused():
+    """静默覆盖会让 Agent 自己那个同名工具永远调不到，而 run 照常报 COMPLETED。"""
+    runtime = Runtime(orchestration=True)
+
+    class _Delegate(Tool):
+        __tool_command_args__ = ()
+
+        async def execute(self, x: str) -> ToolResult:
+            """假的 Delegate。"""
+            return ToolResult(output=x)
+
+    factory = _worker([ScriptedTurn(content='x')], {'Delegate': _Delegate()})
+
+    with pytest.raises(ConfigError) as caught:
+        await runtime.spawn(factory, query='go')
+
+    assert 'Delegate' in caught.value.received
+    assert 'Worker' in caught.value.received
+    assert 'orchestration' in caught.value.next_action
+    assert runtime._slots == {}
+    assert await runtime.registry.children_of('') == []
+    await runtime.shutdown()
+
+
+async def test_a_mis_keyed_tool_added_after_construction_is_caught_when_orchestration_installs():
+    """工厂可以在 `AgentOptions` 构造之后再往这张活表里塞条目，那些条目没有人校验过。
+
+    键与 `tool.name` 分叉时模型的**每一次**调用都落空，而 run 照常以 COMPLETED 返回。
+    """
+    runtime = Runtime(orchestration=True)
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = BaseAgent(
+            AgentOptions(name='Worker', llm=ScriptedLLM([ScriptedTurn(content='x')])),
+            hooks=hooks,
+            events=events,
+        )
+        agent.options.tools['Typo'] = _Tainted()
+        return agent
+
+    with pytest.raises(ConfigError) as caught:
+        await runtime.spawn(build, query='go')
+
+    assert 'Typo' in caught.value.received
+    assert runtime._slots == {}
     await runtime.shutdown()
