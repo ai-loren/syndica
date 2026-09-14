@@ -110,17 +110,26 @@ Agent 同时只有一个等待者（`_Slot.waiter`），新的顶掉旧的。**�
 from __future__ import annotations
 
 import asyncio
+import copy
+import inspect
 import logging
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from syndica.kernel.agent import BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
-from syndica.kernel.context import Context, StopReason
+from syndica.kernel.context import (
+    Context,
+    ContextBlock,
+    StopReason,
+    TrustLevel,
+    provenance_of,
+    strictest_trust,
+)
 from syndica.kernel.control import BrokerTurnGate, ControlBlock
-from syndica.kernel.errors import ContractViolation
+from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter, Junction
 from syndica.kernel.local_table import LocalAgentTable
@@ -130,7 +139,7 @@ from syndica.kernel.protocols import AgentRegistry, MessageBroker
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.waiting import Waiter, WaitResult, WaitState, correlation_of
 
-__all__ = ['AgentFactory', 'Runtime']
+__all__ = ['AgentFactory', 'InTurnWaitResult', 'Runtime', 'validate_agent_factories']
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +172,165 @@ _PAUSABLE_STATUSES: tuple[AgentStatus, ...] = (
 )
 
 
+def _forkable_prefix(blocks: list[ContextBlock]) -> list[ContextBlock]:
+    """分叉出去的那份轨迹，截到最后一个**未配对**的 assistant 块之前。
+
+    分叉是从一次工具调用**内部**发起的，此刻源 Agent 的轨迹末尾正是一个已声明、尚未配对的
+    assistant 块——发起分叉的那次调用自己。原样拷过去，分身一进 `run` 就会把它当成「上一次被中断
+    的批次」，给每个未配对的调用补一块「副作用未知」的说明：一段凭空捏造的历史。那次调用是源
+    Agent 的事，分身不需要知道。
+
+    截断连带丢掉排在那个 assistant 块之后的结果块（同一批里更早的段已经落下的那些）——它们配对的
+    正是被丢掉的那个 assistant 块，留着就是一串孤儿 tool 块，而 provider 会拒掉整条消息。**它们
+    可能携带这份轨迹里唯一的不可信标记**，所以 `spawn` 另外把源 Agent 的溯源结论带到分身的第一条
+    输入上（见 `spawn` 的 `query_trust`）。
+    """
+    index = len(blocks) - 1
+    while index >= 0 and blocks[index].role == 'tool':
+        index -= 1
+    if index < 0 or blocks[index].role != 'assistant' or not blocks[index].tool_calls:
+        return list(blocks)
+    answered = {block.tool_call_id for block in blocks[index + 1 :]}
+    if all(call.id in answered for call in blocks[index].tool_calls):
+        return list(blocks)
+    return blocks[:index]
+
+
+def _bad_role_name(name: object) -> ConfigError:
+    return ConfigError(
+        expected='角色名是非空白字符串：模型按名字派活，没有名字的角色它寻址不到',
+        received=f'agents 里有一个键是 {name!r}，类型是 {type(name).__name__}',
+        next_action=(
+            '把 Runtime(agents=...) 里这个键改成非空白字符串。'
+            '声明式清单来自 YAML / JSON，那里的键可以是任何标量，而派活按逐字节相等匹配'
+        ),
+    )
+
+
+def _bad_agent_factory(name: str, factory: object, received: str) -> ConfigError:
+    return ConfigError(
+        expected=(
+            f'角色 {name!r} 的取值是一个工厂：收下 (hooks, events) 两个位置参数，交回一个 BaseAgent'
+        ),
+        received=received,
+        next_action=(
+            f'把 Runtime(agents=...) 里 {name!r} 的取值改成这样的工厂'
+            '（类式 Agent 要包一层：`lambda hooks, events: MyAgent(options, hooks=hooks,'
+            ' events=events)`）。不校验的话，它要到某次 Delegate 真的派活时才被调用，'
+            '报出的是 runtime.py 里那一行的 TypeError，指着一个没问题的地方'
+        ),
+    )
+
+
+def validate_agent_factories(agents: Mapping[str, AgentFactory]) -> None:
+    """校验角色表。收下角色表的每一处都必须调它。
+
+    **参数标注为 `Mapping[str, AgentFactory]`，而要挡的正是违反这个标注的运行时取值**：角色表
+    的现实来源是声明式清单与宿主配置，那里没有类型检查。
+
+    **能查的只有形状，不是身份。** 「忘了加括号」传进来一个工厂生成器同样收两个位置参数、同样
+    可调用，任何签名检查都放行它；抓得住它的是工厂**交回了什么**，那道检查在 `spawn` 里。
+    """
+    for name, factory in cast('Mapping[object, object]', agents).items():
+        if not isinstance(name, str) or not name.strip():
+            raise _bad_role_name(name)
+        if not callable(factory):
+            raise _bad_agent_factory(
+                name, factory, f'收到 {factory!r}，类型是 {type(factory).__name__}，它不可调用'
+            )
+        try:
+            signature = inspect.signature(factory)
+        except (TypeError, ValueError):
+            # 问不出签名（部分 C 实现、`__signature__` 自己抛）就不判：把「答不出来」变成拒绝会
+            # 挡掉一个合法的可调用对象，而它交回什么仍由 `spawn` 那道检查兜住。
+            continue
+        try:
+            signature.bind(None, None)
+        except TypeError as exc:
+            raise _bad_agent_factory(
+                name, factory, f'收到 {factory!r}，它收不下 (hooks, events) 两个位置参数：{exc}'
+            ) from exc
+
+
+def _bad_factory_return(factory: AgentFactory, produced: object) -> ContractViolation:
+    return ContractViolation(
+        expected='工厂交回一个 BaseAgent',
+        received=(
+            f'{getattr(factory, "__qualname__", repr(factory))} 交回了'
+            f' {type(produced).__name__} 类型的 {produced!r}'
+        ),
+        next_action=(
+            '这多半是「忘了加括号」：传进去的是一个**造工厂的函数**而不是工厂本身'
+            '（`spawn(make_worker)` 应为 `spawn(make_worker(...))`）。'
+            '它来自 Runtime(agents=...) 的角色表就改那一行。'
+            '不拦的话，下一步是 agent.agent_id 撞出的 AttributeError，指着 runtime.py'
+        ),
+    )
+
+
+def _cannot_fork_from(fork_from: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'分叉源 {fork_from!r} 的实例在本进程手里，它的轨迹才拷得到',
+        received='本进程没有它——它不是本进程 spawn 的，或已被销毁',
+        next_action=('在持有它的进程上分叉；要冷启动一个不继承上下文的 Agent 就不要传 fork_from'),
+    )
+
+
+def _cannot_wait_in_turn(agent_id: str, received: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'agent {agent_id!r} 的事件循环由本进程接管着，可以代表它等另一个 Agent',
+        received=received,
+        next_action=(
+            'wait_in_turn 由该 Agent 自己的编排工具在轮中发起，等的是另一个 Agent 的事件循环；'
+            '要从 Runtime 外面等一个 Agent 结束就用 wait()。'
+            '确认 agent_id 是 spawn 的返回值，并用 find() 读它当前的 status 与 owner'
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class _Seed:
+    """第一个周期的输入。
+
+    `trust` 与 `text` 同生同死：只有存在一条 query 时才有「它是什么的衍生物」这个问题，于是
+    「复活出来的循环没有 query」这件事在类型上就等于「没有 trust 可言」，不必传一个读不到的值。
+    """
+
+    text: str
+    trust: TrustLevel
+
+
+@dataclass(frozen=True)
+class InTurnWaitResult:
+    """`wait_in_turn` 的结局。字段顺序计入公开 API。
+
+    只出现三态：`ANSWERED`（被等的那个事件循环结束了）、`ABORTED`、`PREEMPTED`。没有 `TIMEOUT`
+    ——这次等待没有上限，理由见 `Runtime.wait_in_turn`。
+
+    **只有 `ANSWERED` 带 `context`，且 `ANSWERED` 必须带。** 被打断的等待没有轨迹可交，硬凑一份
+    会让调用方把「它还在跑」读成「它已经跑完」；而没有轨迹的 `ANSWERED` 在调用方那里表现为一次
+    拿不到结果的成功。两者都是产出方的缺陷，在构造处拦下比在使用处现身便宜得多。
+    """
+
+    state: WaitState
+    context: Context | None = None
+
+    def __post_init__(self) -> None:
+        answered = self.state is WaitState.ANSWERED
+        if answered != (self.context is not None):
+            raise ContractViolation(
+                expected='context 与 state 一致：answered 带上被等到的那份轨迹，其余两种不带',
+                received=(
+                    f'收到 state={self.state.name}，context='
+                    f'{"一份轨迹" if self.context is not None else "None"}'
+                ),
+                next_action=(
+                    'state 是 answered 就把那个 Agent 的 Context 交出来；被中止或被顶掉时把'
+                    ' context 留空——调用方按 state 分支，一份对不上的轨迹会被当成结果读下去'
+                ),
+            )
+
+
 class _WaitToken:
     """一次等待的中断句柄。抢占与中止都经它送达。
 
@@ -185,17 +353,26 @@ class _Slot:
     """本进程为一个 Agent 额外持有的东西。
 
     实例与任务在 `LocalAgentTable`，可序列化状态在 `AgentRegistry`；这里放的是两边都不该管的
-    第三样：这轮工作结束后该去哪（`exit_mode`）、控制块与门，以及**本进程的驱动任务到底接管过
-    它没有**（`owned`——接管失败与从未 spawn 是两回事，`wait` 要分开答）。
+    第三样：这轮工作结束后该去哪（`exit_mode`）、控制块与门、造出它的那个工厂，以及**本进程的
+    驱动任务到底接管过它没有**（`owned`——接管失败与从未 spawn 是两回事，`wait` 要分开答）。
+
+    `factory` 留着是为了分叉：`Fork` 要照着源 Agent 再造一个**同类型**的，而「同类型」的实际
+    含义就是同一个工厂——同一份 System Prompt、同一套工具与次序（spec §5.2 纪律 4：同类型分叉
+    继承缓存亲和）。
     """
 
     exit_mode: ExitMode
     control: ControlBlock
     gate: BrokerTurnGate
+    factory: AgentFactory
     owned: bool = False
     # 此刻代表这个 Agent 在等答复的那一个。一个 Agent 是一份注意力，因此这里是一个而不是一组；
     # 按 agent 分槽而不是放在 Runtime 上，一次抢占或中止才只落在被点名的那个 Agent 上。
     waiter: _WaitToken | None = None
+    # 此刻代表这个 Agent 在等另一个 Agent 干完活的那一个（派活 / 分叉）。与 `waiter` **分开**：
+    # `_resumed_status` 拿 `waiter` 当「这一轮悬在一条匹配的答复上」的凭据，派活期间复用它会让
+    # 一次 resume 把注册表写成 WAITING，而那一轮其实在往前走。
+    delegation: _WaitToken | None = None
     # 事件循环此刻停在邮箱上（>0）还是在往前走（0）。注册表答不出这件事：停在邮箱上的 PAUSED
     # 与停在挂起门上的 PAUSED 是同一个取值，而只有后者收得到唤醒边沿。读它与改它都是同步的，
     # 因此控制面在一段不含 await 的代码里读到的答案与驱动任务此刻的位置严格一致。
@@ -330,7 +507,10 @@ class Runtime:
         registry: AgentRegistry | None = None,
         broker: MessageBroker | None = None,
         plugins: Sequence[Plugin] | None = None,
+        agents: Mapping[str, AgentFactory] | None = None,
     ) -> None:
+        # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
+        validate_agent_factories(agents or {})
         self.registry: AgentRegistry = registry or InMemoryAgentRegistry()
         self.broker: MessageBroker = broker or InMemoryMessageBroker()
         self.events: EventBus = EventBus()
@@ -340,6 +520,10 @@ class Runtime:
         self._plugin_names: tuple[str, ...] = install_plugins(
             self.hooks, () if plugins is None else plugins
         )
+        # 快照而不是共用宿主那一份：`agent_names` 是调用方拿去排障与拼错误消息的答案，共用则
+        # 宿主此后每一次 append 都改掉了早先每个读者看到的那个答案。与 `AgentOptions.tools` 相反
+        # ——那里共用是为了热插拔，而角色表的载入与同名覆盖归计划 3，在那一层收口。
+        self._agents: dict[str, AgentFactory] = dict(agents or {})
         self._table: LocalAgentTable[BaseAgent] = LocalAgentTable()
         self._slots: dict[str, _Slot] = {}
         # 收尾在事件循环之外做，因此它自己是一个任务；不在实例表里，`shutdown` 的取消名单看不见
@@ -370,13 +554,52 @@ class Runtime:
         """
         return self._plugin_names
 
+    @property
+    def agent_names(self) -> tuple[str, ...]:
+        """已登记的角色名，按登记顺序。
+
+        顺序计入公开面：`Delegate` 在「这个角色名不存在」那条消息里逐字列出它，模型照着挑。交回
+        元组而不是 `keys()` 视图——视图随这张表变，而调用方拿它去拼一条要交给模型的消息。
+        """
+        return tuple(self._agents)
+
+    def agent_factory(self, name: str) -> AgentFactory | None:
+        """按角色名取工厂；没有就 None（问句只答不抛）。
+
+        这是「派活给谁」的最小落点。**声明式定义、加载源与同名覆盖归计划 3**——那里会在这张表
+        之上加载入与覆盖记录，本方法的返回语义不变。
+        """
+        return self._agents.get(name)
+
+    def factory_of(self, agent_id: str) -> AgentFactory | None:
+        """造出这个 Agent 的那个工厂；本进程不持有它则 None。
+
+        `Fork` 要照着源 Agent 再造一个**同类型**的：spec §5.2 纪律 4 说同类型分叉继承缓存亲和，
+        而「同类型」在这里的实际含义就是同一个工厂——同一份 System Prompt、同一套工具与次序。
+        """
+        slot = self._slots.get(agent_id)
+        return slot.factory if slot is not None else None
+
+    def provenance_of(self, agent_id: str) -> TrustLevel:
+        """这个 Agent 的轨迹能不能溯源到不可信内容（spec §12.2）。只读，绝不激活。
+
+        本进程手里没有它的实例时答 `UNTRUSTED`：唯一的消费者是「派出去的那件活该不该带着不可信
+        标记」，而答不出来就按最坏情况处理（spec §13）——少判的后果是那道关不掉的升级静默失效。
+        """
+        agent = self._table.get(agent_id)
+        if agent is None:
+            return TrustLevel.UNTRUSTED
+        return provenance_of(agent.context)
+
     async def spawn(
         self,
         factory: AgentFactory,
         *,
         query: str | None = None,
+        query_trust: TrustLevel = TrustLevel.TRUSTED,
         exit_mode: ExitMode = ExitMode.ZOMBIE,
         parent_id: str | None = None,
+        fork_from: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
         """建一个 Agent 并启动它的事件循环，返回它的 agent_id。
@@ -384,17 +607,39 @@ class Runtime:
         `query=None` 就是「起来等消息」（spec §4.7 的 lazy boot）：事件循环直接进 IDLE，第一条
         消息才是它的第一个周期。
 
+        `query_trust` 是那条 query 的信任级别（spec §12.2 第 2 条）。它由**写下这段文字的那一方**
+        给出：派活的 `query` 是父 Agent 的模型写的，而模型读过什么决定了那段文字是什么的衍生物。
+
+        `fork_from` 让新 Agent 继承那个 Agent 到此刻为止的轨迹（逐块深拷，`trust` 一并带着）。
+        末尾未配对的批次会被截掉（见 `_forkable_prefix`），而**被截掉的那些块可能携带这份轨迹里
+        唯一的不可信标记**，所以这里把源 Agent 的溯源结论并进 `query_trust`：截断是本方法自己的
+        动作，补偿它的责任也在这里。`query=None` 时无处可放——那条输入将由一条消息带来，标记随
+        `Message.trust` 走。
+
         工厂收下本 Runtime 的 hooks 与事件总线：Agent 自己新建一份，宿主注册的切点与订阅就都落空了。
         """
         if self._closed:
             raise _already_shut_down()
         if parent_id is not None and parent_id in self._doomed:
             raise _parent_being_destroyed(parent_id)
-        agent = factory(self.hooks, self.events)
+        # cast 到 object 是因为要挡的正是违反 `AgentFactory` 标注的运行时取值；不擦掉静态类型，
+        # 下面的 isinstance 就成了 pyright 眼里的死代码。
+        produced = cast('object', factory(self.hooks, self.events))
+        if not isinstance(produced, BaseAgent):
+            raise _bad_factory_return(factory, produced)
+        agent = produced
         agent_id = agent.agent_id
         control = ControlBlock()
         gate = BrokerTurnGate(agent_id, self.broker, control)
         agent.attach_gate(gate)
+        if fork_from is not None:
+            source = self._table.get(fork_from)
+            if source is None:
+                raise _cannot_fork_from(fork_from)
+            # 溯源结论在截断**之前**取：被截掉的块可能是这份轨迹里唯一不可信的那一块。
+            query_trust = strictest_trust(query_trust, provenance_of(source.context))
+            for block in _forkable_prefix(source.context.current_traj):
+                agent.context.append(copy.deepcopy(block))
         await self.registry.register(
             AgentInfo(
                 agent_id=agent_id,
@@ -428,8 +673,11 @@ class Runtime:
         # put 先于 create_task：put 被拒时还没有任务可泄漏。两者之间没有挂起点，任务因此不会在
         # set_task 之前就跑起来。
         self._table.put(agent_id, agent)
-        self._slots[agent_id] = _Slot(exit_mode=exit_mode, control=control, gate=gate)
-        task = asyncio.create_task(self._drive(agent_id, agent, query), name=f'agent:{agent_id}')
+        self._slots[agent_id] = _Slot(
+            exit_mode=exit_mode, control=control, gate=gate, factory=factory
+        )
+        seed = None if query is None else _Seed(text=query, trust=query_trust)
+        task = asyncio.create_task(self._drive(agent_id, agent, seed), name=f'agent:{agent_id}')
         self._table.set_task(agent_id, task)
         await self.hooks.trigger(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)
         return agent_id
@@ -443,7 +691,7 @@ class Runtime:
         await self.broker.remove_queue(agent_id)
         await self.registry.unregister(agent_id)
 
-    async def _drive(self, agent_id: str, agent: BaseAgent, query: str | None) -> None:
+    async def _drive(self, agent_id: str, agent: BaseAgent, seed: _Seed | None) -> None:
         # `get` 而不是下标：任务是 create_task 排上去的，在它真正跑起来之前 slot 可能已经被摘掉。
         # 那时该静默退出，而不是让一个 KeyError 变成无人认领的任务异常。
         slot = self._slots.get(agent_id)
@@ -457,7 +705,7 @@ class Runtime:
         slot.owned = True
         cancelled = False
         try:
-            await self._cycles(agent_id, agent, query, slot)
+            await self._cycles(agent_id, agent, seed, slot)
         except asyncio.CancelledError:
             cancelled = True
             raise
@@ -498,11 +746,11 @@ class Runtime:
         )
 
     async def _cycles(
-        self, agent_id: str, agent: BaseAgent, query: str | None, slot: _Slot
+        self, agent_id: str, agent: BaseAgent, seed: _Seed | None, slot: _Slot
     ) -> None:
         """IDLE↔RUNNING：等一条消息，跑一个周期，再等下一条。"""
         while True:
-            if query is None and slot.control.deferred_count == 0:
+            if seed is None and slot.control.deferred_count == 0:
                 # 这三句之间没有挂起点，因此它们对控制面是一次原子的「我要去停在邮箱上了」：
                 # 到这里手上已经没有在飞的轮，一个还没被消费的中止位没有东西可停，作废它；
                 # 紧随其后的 `_oscillate` 把注册表从 ABORTING 带回停泊态。置位在两个 await
@@ -519,20 +767,23 @@ class Runtime:
                     slot.parked_on_mailbox -= 1
             if await slot.control.hold_until_runnable():
                 # 中止落在周期之间：这一轮不开始，位已消费，回去继续等。
-                query = None
+                seed = None
                 continue
             # 挂起窗口或并发的 despawn 可能已经把邮箱摘掉：此刻开周期就会写下一块没有前置
             # user 块的 assistant 块。回去等，让「邮箱没了」在它唯一的观测点上被答出来。
-            if query is None and not await self._has_unhandled_input(agent_id, slot):
+            if seed is None and not await self._has_unhandled_input(agent_id, slot):
                 continue
             await self._oscillate(agent_id, new=AgentStatus.RUNNING)
             slot.gate.begin_cycle()
             slot.control.enter_run()
             try:
-                await agent.run(query)
+                if seed is None:
+                    await agent.run(None)
+                else:
+                    await agent.run(seed.text, trust=seed.trust)
             finally:
                 slot.control.leave_run()
-            query = None
+            seed = None
             # 预算耗尽这条路无条件退出，即便还有已收下的输入：没有轮次可用，再开一个周期只会
             # 被同一条消息反复唤醒又立刻返回。丢下的那些由 `_finish` 记成 ERROR。
             if agent.context.stop_reason is StopReason.MAX_TURNS:
@@ -648,6 +899,14 @@ class Runtime:
         task = self._table.get_task(agent_id)
         if task is not None:
             await asyncio.wait({task})
+        return self._finished_context(agent_id)
+
+    def _finished_context(self, agent_id: str) -> Context:
+        """一个事件循环已经停下的 Agent 的轨迹。`wait` 与 `wait_in_turn` 的共同出口。
+
+        两条路各写一份，迟早会在「接管失败算不算等到了」这种地方分叉，而分叉出来的差异只在
+        接管真的失败时才现身。
+        """
         slot = self._slots.get(agent_id)
         agent = self._table.get(agent_id)
         if slot is None or agent is None:
@@ -662,6 +921,73 @@ class Runtime:
                 next_action='用 find() 读它当前的 status 与 owner；确认它空闲后重新 spawn 一个',
             )
         return agent.context
+
+    async def wait_in_turn(self, agent_id: str, target_id: str) -> InTurnWaitResult:
+        """代表一个正在干活的 Agent 等另一个 Agent 的事件循环结束（供编排工具使用）。
+
+        与 `wait` 的区别只有一条：**这次等待打断得了**。`wait` 从 Runtime 外面调，调用方自己套
+        取消；`wait_in_turn` 从一次工具调用内部发起，此刻 `agent_id` 正卡在一轮的中间——而中止位
+        只在轮的边界上被读到，不打断这次等待，一次 `abort(agent_id)` 要等被等的那个 Agent 自己
+        干完才兑现。这与 `wait_for` 上那条裁决同型，令牌也是同一个机制。
+
+        **没有等待上限，与 `wait_for` 刻意不同。** `wait_for` 等的是本 Runtime 管不到的东西（一个
+        人、一条外部答复），没有上限就真的没有出路；这里等的是本 Runtime 自己驱动的一个 Agent，
+        `abort(agent_id)` / `kill(target_id)` / `despawn(target_id)` 都让这次等待当场返回。凭空
+        发明一个上限会把一次正当的长派活静默截断，而那正是 `wait_for` 不 clamp 的同一条理由。
+        剩下的缺口是墙钟：被等的那一方卡在一次没有超时的 LLM 调用里时，只有上面那三条路救得回来。
+
+        **注册表不写 `WAITING`。** `WAITING` 说的是「这一轮悬在一条匹配的答复上」，而等一个子
+        Agent 干活是这一轮的工作本身；写下它会让 `resume` 的 CAS（只收 `PAUSED`）与
+        `_resumed_status` 一起把一个正在往前走的 Agent 报成在等答复。
+
+        **一个 Agent 同时只有一次在飞的在轮等待，新的顶掉旧的**（理由同 `wait_for`：被顶掉的
+        那次工具调用必须能返回点什么，而「一次调用恰好一个结果块」是承重不变式）。
+
+        **被等的那一方真的结束了就交回它的轨迹，即便中断也已经到达。** 此刻丢掉一份已经跑完的
+        结果没有任何好处，而中止仍会在下一个轮边界上兑现。
+        """
+        slot = self._slots.get(agent_id)
+        if slot is None:
+            raise _cannot_wait_in_turn(
+                agent_id, '本进程没有它的实例——它由别的进程持有，或它已被销毁'
+            )
+        if not slot.owned:
+            raise _cannot_wait_in_turn(
+                agent_id,
+                '本进程 spawn 过它，但驱动任务没有接管：'
+                'IDLE -> RUNNING 的转换被拒（它已被别人拿走），或任务在这之前就被取消'
+                '——本进程手上没有一轮可以挂起',
+            )
+        token = _WaitToken()
+        previous = slot.delegation
+        slot.delegation = token
+        if previous is not None:
+            previous.interrupt(WaitState.PREEMPTED)
+        if slot.control.abort_requested:
+            # 装上令牌之后复检：中止可能落在取出槽位与装上之间，而那时 `_abort_one` 看不到还没
+            # 装上的令牌，于是这次等待会一直挂到被等的那一方自己结束——中止的整个意义就没了。
+            # **只读不取**：位由轮边界的 `hold_until_runnable` 消费，在这里取走它，这一轮就不会
+            # 以 ABORTED 收场了。
+            token.interrupt(WaitState.ABORTED)
+        try:
+            target = self._table.get_task(target_id)
+            if target is not None and not target.done():
+                # 只等、不取消：`target` 是被等那一方的驱动任务（取消它就是一次没人要求的
+                # `kill`，而这次等待被打断不该改变被等那一方的归宿），`token.raised` 归令牌所有
+                # （取消它会让此后的 `interrupt` 静默落空）。
+                await asyncio.wait({target, token.raised}, return_when=asyncio.FIRST_COMPLETED)
+            # 「被等的那一方结束了没有」只判这一次，两条路（等过与没等过）因此给出同一个答案，
+            # 而中断胜出只是**它没结束**的那一格。写成「令牌被打过就交回中断」会让一份已经跑完的
+            # 轨迹在中断也到达时被丢掉。
+            if target is None or target.done():
+                return InTurnWaitResult(
+                    state=WaitState.ANSWERED, context=self._finished_context(target_id)
+                )
+            return InTurnWaitResult(state=token.raised.result())
+        finally:
+            # `is token`：被顶掉的那次等待先返回时，槽里装的是顶掉它的那个令牌，而那次等待还挂着。
+            if slot.delegation is token:
+                slot.delegation = None
 
     def _nothing_to_wait_for(self, agent_id: str) -> ContractViolation:
         return ContractViolation(
@@ -1169,11 +1495,12 @@ class Runtime:
             )
             return
         slot.control.request_abort()
-        waiter = slot.waiter
-        if waiter is not None:
-            # 中止位只在轮的边界上被读到，而此刻这个 Agent 卡在一轮中间的一次等待里：不打断它，
-            # 中止要等那次等待自己超时才兑现，而超时可以是几小时。
-            waiter.interrupt(WaitState.ABORTED)
+        # 中止位只在轮的边界上被读到，而此刻这个 Agent 可能卡在一轮中间的一次等待里：不打断它，
+        # 中止要等那次等待自己结束才兑现——等答复那条可以是几小时的超时，等子 Agent 干活那条
+        # 根本没有上限。两个槽都要打：它们是两种在轮等待，各有自己的令牌。
+        for interrupted in (slot.waiter, slot.delegation):
+            if interrupted is not None:
+                interrupted.interrupt(WaitState.ABORTED)
 
     async def _pause_one(self, agent_id: str, *, named: bool) -> None:
         slot, info = await self._control_target('pause', agent_id, named=named)

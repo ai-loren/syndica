@@ -6473,3 +6473,100 @@ async def test_an_abort_landing_while_the_wait_installs_itself_still_cuts_it_sho
     ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
     assert ctx.stop_reason is StopReason.ABORTED
     await asyncio.wait_for(runtime.shutdown(), _TIMEOUT)
+
+
+# ------------------------------------------------- 角色表的运行期校验
+
+
+@pytest.mark.parametrize(
+    ('agents', 'anchor'),
+    [
+        ({'Worker': 'not-a-factory'}, 'str'),
+        ({'Worker': BaseAgent}, 'BaseAgent'),
+        ({'Worker': lambda: None}, '<lambda>'),
+        ({'Worker': lambda hooks, events, extra: None}, '<lambda>'),
+    ],
+    ids=['plain-value', 'the-class-itself', 'takes-nothing', 'takes-three'],
+)
+def test_a_role_whose_value_cannot_be_called_as_a_factory_is_refused_where_it_was_declared(
+    agents, anchor
+):
+    """没有这道校验时，症状是一条指着**别处**的异常：取值要到某次 Delegate 真的派活时才被调用，
+    报出的是 runtime.py 里 `factory(hooks, events)` 的 TypeError。
+    """
+    with pytest.raises(ConfigError) as caught:
+        Runtime(agents=agents)
+
+    assert 'Worker' in caught.value.expected
+    assert anchor in caught.value.received
+    assert 'agents' in caught.value.next_action
+
+
+@pytest.mark.parametrize('name', ['', '   '], ids=['empty', 'blank'])
+def test_a_blank_role_name_is_refused_because_nothing_can_ever_address_it(name):
+    with pytest.raises(ConfigError) as caught:
+        Runtime(agents={name: _factory(_done())})
+
+    assert repr(name) in caught.value.received
+
+
+def test_a_role_name_that_is_not_a_string_is_refused():
+    """声明式清单来自 YAML / JSON，那里的键可以是任何标量。"""
+    with pytest.raises(ConfigError) as caught:
+        Runtime(agents={7: _factory(_done())})  # pyright: ignore[reportArgumentType]
+
+    assert 'int' in caught.value.received
+
+
+async def test_a_factory_maker_passed_without_calling_it_is_named_at_the_spawn_that_used_it():
+    """「忘了加括号」骗得过任何签名检查：一个收两个位置参数的工厂生成器长得就像工厂。
+
+    唯一抓得住它的地方是工厂**交回了什么**，而那条消息必须点名这个工厂——否则报出的是
+    `'function' object has no attribute 'agent_id'`，指着 runtime.py。
+    """
+
+    def make_worker(name: str, content: str) -> AgentFactory:
+        return _factory(_done(content), name=name)
+
+    runtime = Runtime(agents={'Worker': make_worker})  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ContractViolation) as caught:
+        await runtime.spawn(make_worker, query='go')  # pyright: ignore[reportArgumentType]
+
+    assert 'make_worker' in caught.value.received
+    assert 'function' in caught.value.received
+    assert 'BaseAgent' in caught.value.expected
+    await runtime.shutdown()
+
+
+async def test_a_factory_that_accepts_two_positional_arguments_is_accepted():
+    """放宽方向也要钉：收窄到只认函数会把一个合法的可调用对象拒掉。"""
+
+    class _Callable:
+        def __call__(self, hooks: HooksCenter, events: EventBus) -> BaseAgent:
+            return _factory(_done())(hooks, events)
+
+    runtime = Runtime(agents={'Worker': _Callable()})
+
+    assert runtime.agent_names == ('Worker',)
+    await runtime.shutdown()
+
+
+async def test_waiting_in_turn_for_an_agent_whose_drive_never_took_over_is_refused():
+    """控制面只作用于本进程接管过的 Agent：接管失败的条目归别人所有，本进程手上没有一轮可以挂起。
+
+    放行的话，一次派活会代表一个别人正在跑的 Agent 挂在这里，而没有任何东西能把它叫回来。
+    """
+    registry = _RecordingRegistry(deny=(AgentStatus.IDLE, AgentStatus.RUNNING))
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    stranded = await runtime.spawn(_factory(_done()), query='go')
+    with pytest.raises(ContractViolation):
+        await runtime.wait(stranded)
+    target = await runtime.spawn(_factory(_done()), query='go')
+
+    with pytest.raises(ContractViolation) as caught:
+        await runtime.wait_in_turn(stranded, target)
+
+    assert stranded in caught.value.expected
+    assert '接管' in caught.value.received
+    await runtime.shutdown()
