@@ -1507,13 +1507,15 @@ def test_a_copy_taken_out_of_a_read_only_kwarg_is_a_plain_writable_dict(
     assert args == {'command': 'ls -la'}
 
 
-def test_a_read_only_kwarg_names_the_junction_and_the_key_it_guards():
-    """两者都进消息：读者要知道该在哪个切点、用哪个键写回去。"""
+def test_a_read_only_kwarg_names_the_junction_the_kwarg_and_the_attempted_key():
+    """一个 hook 手里有好几个 kwarg，将来还会不止一个被护起来：不说清是哪一个被就地写了，作者
+    只能逐个试。切点进 expected，被护的那个 kwarg 两栏都要有，被写的那个键进 received。"""
     args = ReadOnlyKwarg('artifact:created', 'artifact', {'path': 'a.md'})
     with pytest.raises(ContractViolation) as excinfo:
         args['path'] = 'b.md'
     assert 'artifact:created' in excinfo.value.expected
     assert "'artifact'" in excinfo.value.expected
+    assert "'artifact'" in excinfo.value.received
     assert "'path'" in excinfo.value.received
 
 
