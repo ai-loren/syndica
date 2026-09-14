@@ -32,6 +32,10 @@
 `MESSAGE_INJECTED` 是可观察切点：它报告「这条消息已经进上下文了」这个既成事实，改不了任何东西。
 要在消息进上下文**之前**改写它，正确的位置是投递侧而不是这里。
 
+`TOOL_CONFIRMATION_REQUIRED` 同样可观察：它报告「这次调用的处置是等人确认」这个判定结果。做成
+可拦截等于让一个 hook 把闸放掉，而 hook 只能收紧不能放宽——与信任级别那条是同一条规则。
+**观察者也答不了这次确认**：可观察切点的返回值被整个丢弃，答复通道在 surface 侧。
+
 三个生命周期切点（`RUNTIME_SHUTDOWN` / `AGENT_SPAWN` / `AGENT_DESPAWN`）同样只报既成事实：
 Agent 已经建好、条目已经摘掉、关机已经开始，没有一处还能被 hook 改。`AGENT_DESPAWN` 在条目消失
 **之后**触发，因此想留下父子关系只能在 `AGENT_SPAWN` 上记（它带 `parent_id`）。`RUNTIME_START`
@@ -68,6 +72,7 @@ class Junction(Enum):
     MESSAGE_INJECTED = 'message_injected'
     PRE_TOOL_USE = 'pre_tool_use'
     POST_TOOL_USE = 'post_tool_use'
+    TOOL_CONFIRMATION_REQUIRED = 'tool_confirmation_required'
     PRE_LLM_REQUEST = 'pre_llm_request'
     POST_LLM_RESPONSE = 'post_llm_response'
     CONTEXT_OVERFLOW = 'context_overflow'
@@ -96,6 +101,7 @@ OBSERVABLE: frozenset[Junction] = frozenset(
         Junction.TURN_START,
         Junction.TURN_END,
         Junction.MESSAGE_INJECTED,
+        Junction.TOOL_CONFIRMATION_REQUIRED,
     }
 )
 

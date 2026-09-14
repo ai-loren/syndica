@@ -74,6 +74,7 @@ from typing import Any, cast
 
 from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall
 from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
+from syndica.kernel.danger import DangerJudge, DangerPolicy
 from syndica.kernel.errors import ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
@@ -92,6 +93,9 @@ class AgentOptions:
     `tool.name` 和 `schema['name']` 逐字相同（见 `validate_tool_names`）；校验在这里而不只在
     executor 里，宿主才能在声明的那一行拿到错误。**不替换成副本**：executor 与本字段共享同一个
     dict 对象，热插拔靠的就是这个。
+
+    `danger_judge` / `danger_policy` 为 `None` 时用内核默认（默认规则表 + 高风险阻断）。字段顺序
+    计入公开 API，新字段只能追加在末尾。
     """
 
     name: str
@@ -100,6 +104,8 @@ class AgentOptions:
     tools: dict[str, Tool] = field(default_factory=dict[str, Tool])
     system_prompt: str = ''
     max_turns: int | None = 50
+    danger_judge: DangerJudge | None = None
+    danger_policy: DangerPolicy | None = None
 
     def __post_init__(self) -> None:
         validate_tool_names(self.tools)
@@ -347,7 +353,12 @@ class BaseAgent:
         self.agent_id: str = uuid.uuid4().hex
         self._hooks = hooks
         self._events = events
-        self._executor = ToolExecutor(tools=options.tools, hooks=hooks)
+        self._executor = ToolExecutor(
+            tools=options.tools,
+            hooks=hooks,
+            judge=options.danger_judge,
+            policy=options.danger_policy,
+        )
         self._context = Context()
         self._current_turn = 0
         self._running = False

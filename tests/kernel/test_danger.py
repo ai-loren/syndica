@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 from collections.abc import Iterator
 from collections.abc import Set as AbstractSet
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -1051,4 +1053,39 @@ def test_the_forced_escalation_runs_before_the_return_value_is_even_needed():
     assert (
         disposition_of(_Stringly('allow'), _request(RiskLevel.HIGH, TrustLevel.UNTRUSTED))
         is Disposition.BLOCK
+    )
+
+
+# 逐字写死：这条约束只在 docstring 里说过，typing 看不见、运行期不警告，本扫描是它唯一的守卫。
+_PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica'
+_DECIDE_CALLERS: tuple[str, ...] = ('kernel/danger.py',)
+
+
+def _modules_calling_decide() -> list[str]:
+    callers: list[str] = []
+    for path in sorted(_PACKAGE.rglob('*.py')):
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'decide'
+            for node in ast.walk(tree)
+        ):
+            callers.append(path.relative_to(_PACKAGE).as_posix())
+    return callers
+
+
+def test_disposition_of_is_the_only_place_in_the_package_that_consults_a_policy():
+    """强制升级坐在 `disposition_of` 里；绕过它直接调 `decide`，那条升级在这条路径上就从不运行。
+
+    扫描而不是靠约定：调用方看不出区别（两者都交回一个 `Disposition`），症状是**放行**，而且只在
+    「高风险 + 可溯源到不可信」同时成立时才现身。
+    """
+    callers = _modules_calling_decide()
+    assert callers == list(_DECIDE_CALLERS), (
+        f'期望 src/syndica 里只有 {list(_DECIDE_CALLERS)} 调 DangerPolicy.decide。'
+        f' 实际调它的是 {callers}。'
+        ' 把新增的那处改成 disposition_of(policy, request)——spec §12.2 第 3 条那道'
+        '「高风险 + 可溯源到不可信 → 阻断」的升级只坐在 disposition_of 里，'
+        '直接问 policy 会让它被宿主策略静默配掉。'
     )

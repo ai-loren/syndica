@@ -20,6 +20,10 @@
 | D-03 | 函数局部定义的 `SyndicaError` 子类不被 copy/pickle 覆盖机制发现 | 按构造即不可 pickle，无现实风险 |
 | D-04 | 取消（`CancelledError`）会留下 block 数少于 call 数的轨迹 | 设计如此且在该处无法关闭（取消可能落在进入工具之前）。已在 `tool_executor` docstring 记明 resume 需修补，计划 1 Task 13 给「这份 Context 在轮中被打断」找到了落点（`extra['interrupted']`） |
 | D-05 | `_resume_one` 的读-改窗口：注册表短暂停在 `WAITING` 而槽里无 waiter | 计划 2 Task 9 明确留着，理由写进 `_resumed_status` docstring：自愈路径是下一个轮边界的 `_oscillate`（`allowed` 含 `WAITING`），而修法自己更糟——「CAS 后复检 waiter、没了就改 RUNNING」有同样窗口，会把刚装上的新等待抹成 RUNNING |
+| D-28 | `DangerRequest.provenance` 没有生产者 | 计划 2 Task 11：`tool_executor._provenance(ctx)` 在每批调用进入时算一次，交回 `TrustLevel`（**永不交 `None`**）。当前形态是「这份轨迹里出现过 `trust=UNTRUSTED` 的 block」，即 D-28 说的最小正确形态；完整的因果溯源见 B-15。用例钉住四面：升级对 `AllowAll` 也生效、不可信块在轨迹任意位置与任意 role 上都算、干净轨迹不触发升级、同一批里中途产出的不可信结果不改变本批的答案 |
+| D-31 | 绕过 `disposition_of` 直接调 `DangerPolicy.decide` 就绕过了强制升级，typing 看不见、运行期不警告 | 计划 2 Task 11：内核唯一调用点是 `ToolExecutor._gated`，走 `disposition_of`；并加了机器守卫 `test_disposition_of_is_the_only_place_in_the_package_that_consults_a_policy`——AST 扫 `src/syndica/**`，调 `.decide(` 的文件清单必须逐字等于 `['kernel/danger.py']`。实测把那一行换成 `self._policy.decide(...)`，守卫与四条行为用例一起变红 |
+| D-32 | `provenance is None`（没溯源过）与 `TRUSTED` 在 `disposition_of` 出口不可区分 | 计划 2 Task 11：内核生产路径上 `None` 不再出现——`_provenance` 看完整份轨迹才作答，报 `None` 就是把做过的检查说成没做过。用例 `test_every_call_the_gate_consults_on_carries_an_answered_provenance` 逐次断言策略收到的是 `TrustLevel` 成员。`None` 仍是 `DangerRequest` 的合法取值（它对第三方调用方的含义就是「还没走到溯源那一步」），`test_danger.py` 里把两者同结论钉成当前行为的那条用例继续守着漂移 |
+| D-33 | spec §12.2 矩阵里「低风险 + 可溯源到不可信 → 放行并记录」的记录没有落点 | 计划 2 Task 11：`tool_executor._report_allowed_low_risk_from_untrusted`，WARNING（root logger 默认停在 WARNING，INFO 的记录根本不会被创建）。断 `record.args` 的五个量：工具名、调用 id、规则 ID、风险等级、溯源结论。三条反向用例钉住不误报：低风险 + 干净轨迹、没有规则命中 + 不可信轨迹、以及被宿主策略拦下的低风险调用都不得留下记录 |
 
 ## 待审计核实（认为已被后续改动关闭）
 
@@ -30,20 +34,12 @@
 
 ## 有主待做（里程碑 1 内）
 
-### 归计划 2 Task 11（工具执行接处置）
-
-| # | 内容 |
-|---|---|
-| D-28 | **没有任何东西计算 `DangerRequest.provenance`。** spec §12.2 第 3 条的强制升级已在 `danger.disposition_of` 里结构性落地（高风险 + `UNTRUSTED` → 阻断，且不咨询 policy），但「这次调用的参数能不能溯源到不可信内容」还没有生产者，字段现在只有调用方显式传 `None`（= 没溯源过）这一种实际取值。Task 10 只钉了签名与升级本身：`DangerPolicy` 由第三方实现，方法签名发布后就改不动，而升级**逻辑**不在 spec §15 的里程碑 1 判据内。**Task 11 把处置接进 `ToolExecutor` 时必须一并算出 provenance 并传进去**；最小正确形态是「本轮上下文里出现过 `trust=UNTRUSTED` 的 block」，完整形态要接产物溯源（§7.3）与 trace 因果链（§11.1）。漏做的症状是那道升级恒不命中而调用方以为有它。**接进去时必须确认 `provenance` 不会以 `None` 长期存活**——见 D-32 |
-| D-32 | **`provenance is None`（没溯源过）与 `TRUSTED`（溯源过、来源可信）在 `disposition_of` 出口上不可区分。** 模块内部两处「我不知道」的默认方向相反：`__tool_command_args__ = None` 判成「按最坏情况处理」，`provenance = None` 判成「按最好情况处理」。当前语义有理由（冒充一份没做过的检查等于谎报），且 AGENTS.md「不确定性必须显式」那节的处方是「放行，但**显式标记**未验收」——现在只有放行、没有标记。已加用例把「两者产出同一个 `Disposition`」钉成当前行为，于是改动它是一次自觉的改动而非漂移。**Task 11 接上 provenance 生产者之后，`None` 就只应出现在「还没走到溯源那一步」的调用上**；若它在生产路径上长期存活，就要么给它一条显式的未验收标记、要么把默认方向改成从严 |
-| D-33 | **spec §12.2 处置矩阵里「低风险 + 可溯源到不可信 → 放行并记录」的「记录」没有落点。** `danger.py` 全文无 logging，而判定是纯函数、不该持有日志。落点在 Task 11 的 executor：它是唯一同时拿得到 verdict、provenance 与 trace 的地方。漏做的症状是矩阵里这一格与「低 + 不可溯源 → 放行」逐字节相同，那条记录义务无声消失 |
-
 ### 归计划 2 Task 13（三层装配 —— hooks 层）
 
 | # | 内容 |
 |---|---|
 | D-06 | **串联 POST hook 会把中间的 `UNTRUSTED` 标记从 executor 眼前藏掉。** `HooksCenter` 的合并语义只交出最后一个 `HookResult`，前一个 hook 的收紧因此丢失。这是信任单调性（只收紧不放松）这条硬约束的一个真实缺口，**正确修法在 hooks 层**，不在 executor |
-| D-07 | 可观察切点契约只在文档里失败：typing 看不见、运行期不警告，且两条既有用例把「观察者的返回值被忽略」当成了预期 |
+| D-07 | 可观察切点契约只在文档里失败：typing 看不见、运行期不警告，且两条既有用例把「观察者的返回值被忽略」当成了预期。**计划 2 Task 11 把这个面扩大了一格**：新增的 `TOOL_CONFIRMATION_REQUIRED` 是第一个「hook 作者会真心想回答」的可观察切点——它报告的是「这次调用等人确认」，而挂上去的人最自然的写法就是返回一个批准。返回值照旧被整个丢弃，且没有任何提示。切点自己的 docstring 写明了「观察者答不了这次确认」，但那正是 D-07 说的「只在文档里失败」 |
 
 ### 归计划 3（声明式 Agent 定义 —— 工具注册层）
 
@@ -85,14 +81,13 @@
 | D-24 | **`waiting` 的六个名字尚未进 `kernel.__all__`**（`Waiter` / `UserInput` / `Confirmation` / `Reply` / `WaitResult` / `WaitState`）。后果不只是导出面不全——只用公开包面的人**调不了** `Runtime.wait_for`（构造不出入参）。计划 Task 16 的 59 项清单已含它们，但 `test_public_api.py` 逐字写死，忘了改**不会**变红 |
 | D-25 | `__all__` 内容全仓无测试覆盖（子模块级）。计划 1 的 Task 4 与 Task 9 各挂过一次，是同一条。`kernel.__all__` 有守卫，子模块没有 |
 | D-26 | **`ABORTING` 分支扩大了 `wait_for` 的成功面**：`kill` 之后（`_reap` 未跑完那段）调 `wait_for` 现在交回 `ABORTED` 而不再拒绝。计划 2 Task 9 判断这是对的，但它是新行为 |
-| D-30 | **`danger` 的公开名字尚未进 `kernel.__all__`**（`RiskLevel` / `Disposition` / `DangerVerdict` / `DangerRule` / `DEFAULT_RULES` / `NO_RULE_MATCHED` / `DangerJudge` / `DangerRequest` / `DangerPolicy` / `BlockHighRisk` / `AllowAll` / `disposition_of`）。与 D-24 同型，但 Task 16 的 59 项清单成文于 `danger` 之前、**不含**这些名字；只用公开包面的宿主因此写不出自己的 `DangerPolicy`。`test_public_api.py` 逐字写死，漏掉它们**不会**变红 |
+| D-30 | **`danger` 的公开名字尚未进 `kernel.__all__`**（`RiskLevel` / `Disposition` / `DangerVerdict` / `DangerRule` / `DEFAULT_RULES` / `NO_RULE_MATCHED` / `DangerJudge` / `DangerRequest` / `DangerPolicy` / `BlockHighRisk` / `AllowAll` / `disposition_of`）。与 D-24 同型，但 Task 16 的 59 项清单成文于 `danger` 之前、**不含**这些名字；只用公开包面的宿主因此写不出自己的 `DangerPolicy`。`test_public_api.py` 逐字写死，漏掉它们**不会**变红。**计划 2 Task 11 之后这条从「不方便」变成「公开面自相矛盾」**：`AgentOptions` 已经有 `danger_judge: DangerJudge \| None` 与 `danger_policy: DangerPolicy \| None` 两个字段，而只用公开包面的宿主导不到这两个类型——一个导出的数据类有两个它填不出来的字段 |
 
 ### 归里程碑 1 收口审计
 
 | # | 内容 |
 |---|---|
-| D-31 | **`disposition_of` 是强制升级的唯一收口，而绕过它直接调 `DangerPolicy.decide` 就绕过了这一条** —— typing 看不见、运行期不警告，只有 docstring 写着。与 D-07 同型（契约只在文档里失败）。内核自己的唯一调用点在 Task 11 的 executor；发布前确认没有第二条路径，并考虑这条约束要不要有机器守卫 |
-| D-27 | **三条「唯一证据型」ERROR**（`_report_abandoned_input` / `_report_unwaited_timeout` / `_report_discarded_take_failure`）都断 `record.args`，但共同依赖「root logger 默认 WARNING」这个前提；宿主把级别调高则三条一起静默。这是既有模式，发布前确认一次 |
+| D-27 | **三条「唯一证据型」ERROR**（`_report_abandoned_input` / `_report_unwaited_timeout` / `_report_discarded_take_failure`）都断 `record.args`，但共同依赖「root logger 默认 WARNING」这个前提；宿主把级别调高则三条一起静默。这是既有模式，发布前确认一次。**计划 2 Task 11 又加了一条同族记录且更靠近那条线**：`tool_executor._report_allowed_low_risk_from_untrusted` 是 WARNING 而非 ERROR（它报的是一次放行，不是故障），于是宿主只要把级别提到 ERROR，spec §12.2 矩阵里那格唯一的痕迹就没了。发布前一并定这四条的级别与宿主配置指引 |
 
 ## 明确不在里程碑 1（BEYOND-M1）
 
@@ -111,4 +106,5 @@
 | B-12 | **不带 `functools.wraps` 的装饰器让 `execute` 的签名塌成 `(*a, **k)`，于是 `VAR_KEYWORD` 豁免落在一个本来有名单的工具上**，拼错的参数名照样被接受、那条声明静默落空 | 与 `**kwargs` 本身那个洞同源（换了个入口），已写进 `_declared_command_args` 的 docstring。堵它要么禁止无 `wraps` 的装饰器（管不了第三方），要么放弃 `**kwargs` 豁免（会让合法的 kwargs 工具全部报错）；两条都比它挡住的那部分贵 |
 | B-13 | **wrapper 兜底带来的一族误报**：C-2 的修法是「遇到 wrapper 之后不停止扫描，把该段剩余的非选项词全部收进候选」，于是「把危险词当普通实参传给 wrapper」会误报——`time which sudo`、`nohup echo sudo apt install`、`nohup cat /etc/mkfs.conf`、`nice -n 19 tar -rf a.tar rm`（`command -v sudo` 基线也命中，非本轮引入）。**刻意不为它们写「这是预期」的用例**：那会把一个误报固化成契约。**正解**：给 wrapper 建一张「哪些选项吃下一个词」的表，并**与现在的兜底并存**（表命中就精确、表没命中就退回收集全部），而不是二选一——只有表就退回 C-2 那条 Critical（漏一个选项 = 漏一道闸）。非 wrapper 段的行为一字未变（`echo sudo apt install` 仍不命中，有用例单独钉住这个边界） |
 | B-14 | **`_BOUNDARIES` 里的 `)` 零覆盖**：删掉它没有任何用例变红，且找不到一条既合法又自然的 shell 输入能区分。不构成已知缺陷，只是覆盖空白——记在这里是因为 AGENTS.md 的判据是「每个守卫都要有一条单独施加即变红的变异」，做不到就要说明白。同族：续行正则的精度只由 CRLF 那条用例锁住，`\` + 空格 / 制表符这类 escape 是整体近似处理，没有钉 |
+| B-15 | **溯源是「这份轨迹里有没有出现过不可信内容」这个上界，不是一条因果链。** 于是读过一次网页之后，本会话此后每一次高风险调用都判成可溯源到不可信内容（误报方向），而真正的「这次调用的这个参数来自那段内容」查不出来 | spec §15 把**不可信内容标记与溯源链**排在里程碑 5（与执行面完整化同期），它要接产物溯源（§7.3）与 trace 因果链（§11.1），两者在里程碑 1 都还不存在。当前上界是 D-28 声明的最小正确形态：它只会多判、不会少判，而少判才是那道升级要防的方向。收窄它的前提是溯源链本身可信——在此之前把上界换成任何「更准」的启发式，都是拿一份猜测冒充一次检查 |
 | B-07 | 关联 ID 是一个扁平命名空间（`tool_call_id` 由模型厂商生成、`correlation_id` 由 `Runtime.send` 写入，都不带前缀），一条对派活的回复原则上能解掉一次工具确认的等待 | 计划 2 Task 9 裁决**不加前缀**并写进 docstring：加前缀要求发答复的那一侧用同一套编码，两侧不一致的症状是答复躺在邮箱里、等待跑满超时、零日志，比当前无已知来源的碰撞风险更难查；而 `Confirmation` 等的是模型厂商生成的 ID，前缀会变成必须对外公开的编码契约 |

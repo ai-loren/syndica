@@ -19,6 +19,23 @@ N 条结果的 assistant 消息，所以工具不存在、参数非法、执行�
 RuntimeError / OSError 是那次操作的真实失败，模型换个方式可能绕开。按 `ToolFatalError` 划界不够——
 ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是它的**兄弟**而非子类。
 
+**危险判定的闸坐在 `PRE_TOOL_USE` 之后、执行之前。** 它必须看**真正会被执行的那份参数**——
+`PRE_TOOL_USE` 是参数的最后一个写者，把闸放在它之前，一个改写参数的 hook 就能绕过整道闸。放在它之
+后不会让 hook 有机会放宽：闸重新判定的正是 hook 自己的产出。`skip=True` 的 hook 顶替了这次调用、
+什么都没执行，因此没有可判的东西。处置**只经 `danger.disposition_of` 取**，不直接问 policy：spec
+§12.2 第 3 条的强制升级坐在咨询 policy 之前，绕过它这条升级就在整条生产路径上从不运行。
+
+**溯源一批只算一次，在这一批开始之前。** 这批调用的参数是模型在此之前一次产出的，本批中途出现的
+不可信结果影响不了它们；逐次重算会让同一条命令的处置取决于它排在批里第几个。当前形态是「这份轨迹
+里出现过 `trust=UNTRUSTED` 的 block」——它是上界而非因果链，完整的溯源要接产物溯源（spec §7.3）与
+trace 因果链（§11.1）。**它不交 `None`**：`None` 是「没溯源过」，留在生产路径上那道升级就恒不命中，
+而调用方以为有它。
+
+**被阻断的调用仍然产出恰好一个 role='tool' block。** 阻断不是失败，是一次「这条路走不通」的回答，
+模型据此换一种做法。它写给模型看，因此按三件套写。阻断与需要确认两种措辞**不可互换**：阻断是确定的
+否（换做法），需要确认是还没有人回答（这个 Runtime 上没有确认通道）。塌成一句，模型就分不清该换做法
+还是该等。
+
 **trust 只能收紧，不能放松。** hook 改写结果时最终 trust 取原结果与**链上每一次改写**里最严的那
 一个：ToolResult 上没有任何东西能区分「消毒之后刻意提升」与「忘了带 trust=」，而后者的后果是未标记
 的不可信内容进模型上下文（spec §12.2），比前者常见得多。刻意提升需要一个显式机制，目前不存在。看
@@ -43,15 +60,28 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from typing import Any, cast
 
 from syndica.kernel.context import Context, ContextBlock, ToolCall, TrustLevel
+from syndica.kernel.danger import (
+    BlockHighRisk,
+    DangerJudge,
+    DangerPolicy,
+    DangerRequest,
+    DangerVerdict,
+    Disposition,
+    RiskLevel,
+    disposition_of,
+)
 from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
 
 __all__ = ['ToolExecutor']
+
+logger = logging.getLogger(__name__)
 
 
 def _described(exc: BaseException) -> str:
@@ -183,6 +213,71 @@ def _not_executed_result(call: ToolCall, failed: ToolCall, exc: BaseException) -
     )
 
 
+def _provenance(ctx: Context) -> TrustLevel:
+    """这一批调用的参数能不能溯源到不可信内容。
+
+    交回 `TrustLevel` 而不是 `TrustLevel | None`：`None` 在 `DangerRequest` 上表示「没溯源过」，
+    而这里刚刚看完整份轨迹，报 `None` 就是把做过的检查说成没做过，那道强制升级于是恒不命中。
+    """
+    if any(block.trust is TrustLevel.UNTRUSTED for block in ctx.current_traj):
+        return TrustLevel.UNTRUSTED
+    return TrustLevel.TRUSTED
+
+
+def _gated_result(call: ToolCall, verdict: DangerVerdict, disposition: Disposition) -> ToolResult:
+    """被闸拦下的调用交给模型的那一块。
+
+    两种措辞不可互换：阻断是**确定的否**（换做法），需要确认是**还没有人回答**（这个 Runtime 上
+    没有确认通道）。塌成一句，模型就分不清该换做法还是该等。
+
+    两条都说「没有产生任何副作用」：闸坐在执行之前，这是它与中止路径唯一能断言的差别。
+    """
+    if disposition is Disposition.CONFIRM:
+        return ToolResult(
+            output=(
+                f'期望: {call.name}（id={call.id}）在执行前得到人工确认。'
+                f' 实际: 规则 {verdict.rule_id} 判定风险等级 {verdict.level.value}'
+                f'（{verdict.reason}），处置是等人确认，而这个 Runtime 没有装人工确认通道，'
+                '于是没有人回答过这次请求；本次调用没有执行、也没有产生任何副作用。'
+                ' 下一步: 换一种不触发该规则的做法，或把这一步留给能确认它的人；'
+                '不要重发同一个调用等它被批准，这里没有人会看到它。'
+            )
+        )
+    return ToolResult(
+        output=(
+            f'期望: {call.name}（id={call.id}）不触发危险规则。'
+            f' 实际: 规则 {verdict.rule_id} 判定风险等级 {verdict.level.value}'
+            f'（{verdict.reason}），本次调用已被阻断，没有执行、也没有产生任何副作用。'
+            ' 下一步: 换一种达成同一目标的做法——缩小作用范围、去掉提权、避开不可逆操作；'
+            '这次阻断不会被记住，也不存在「此后均可」的放行，同样的调用重来一次仍会被阻断。'
+        )
+    )
+
+
+def _report_allowed_low_risk_from_untrusted(call: ToolCall, verdict: DangerVerdict) -> None:
+    """spec §12.2 处置矩阵里「低风险 + 可溯源到不可信 → 放行并**记录**」的那条记录。
+
+    判定是纯函数、不持有日志出口，而这里是唯一同时拿得到结论与溯源的地方。没有它，这一格与
+    「低 + 不可溯源 → 放行」逐字节相同，那条记录义务无声消失。
+
+    WARNING 而非 INFO：root logger 默认停在 WARNING，INFO 的记录根本不会被创建，而这次放行除了
+    这条记录不留任何痕迹。
+    """
+    logger.warning(
+        '期望: 能溯源到不可信内容的调用要么不命中危险规则，要么由人看一眼。'
+        ' 实际: %s（id=%s）命中规则 %s（风险等级 %s），而本次调用之前的轨迹里有 %s 的内容；'
+        '按 spec §12.2 的处置矩阵，低风险这一格是放行并记录，调用已经放行，'
+        '本条是它留下的全部痕迹。'
+        ' 下一步: 复核这次调用的参数是不是来自那段不可信内容；'
+        '要让这一类调用改为拦下，给 ToolExecutor 换一个把低风险也判 BLOCK 的 DangerPolicy。',
+        call.name,
+        call.id,
+        verdict.rule_id,
+        verdict.level.value,
+        TrustLevel.UNTRUSTED.value,
+    )
+
+
 def _misregistered(tools: dict[str, Tool], requested: str) -> ConfigError | None:
     """查表落空时，找出一个「名字对得上、注册表键对不上」的工具。
 
@@ -218,15 +313,25 @@ class ToolExecutor:
     来的条目由查表落空那条路上的 `_misregistered` 兜住。
     """
 
-    def __init__(self, tools: dict[str, Tool], hooks: HooksCenter) -> None:
+    def __init__(
+        self,
+        tools: dict[str, Tool],
+        hooks: HooksCenter,
+        *,
+        judge: DangerJudge | None = None,
+        policy: DangerPolicy | None = None,
+    ) -> None:
         validate_tool_names(tools)
         self._tools = tools
         self._hooks = hooks
+        self._judge = judge if judge is not None else DangerJudge()
+        self._policy: DangerPolicy = policy if policy is not None else BlockHighRisk()
 
     async def execute_tool_calls(self, ctx: Context, tool_calls: list[ToolCall]) -> None:
+        provenance = _provenance(ctx)
         for index, call in enumerate(tool_calls):
             try:
-                result = await self._execute_one(call)
+                result = await self._execute_one(call, provenance)
             # Exception 而非 BaseException：取消不该在展开的路上再往轨迹里写东西。
             except Exception as exc:
                 self._append(ctx, call, _aborted_result(call, exc))
@@ -248,7 +353,7 @@ class ToolExecutor:
             )
         )
 
-    async def _execute_one(self, call: ToolCall) -> ToolResult:
+    async def _execute_one(self, call: ToolCall, provenance: TrustLevel) -> ToolResult:
         tool = self._tools.get(call.name)
         if tool is None:
             misregistered = _misregistered(self._tools, call.name)
@@ -276,6 +381,10 @@ class ToolExecutor:
             raise _rewrite_rejected(Junction.PRE_TOOL_USE, 'args', dict, rewritten_args)
         args = cast(dict[str, Any], rewritten_args)
 
+        gated = await self._gated(call, tool, args, provenance)
+        if gated is not None:
+            return gated
+
         # 守卫必须坐在 POST_TOOL_USE 之前：让它去看 post.get('result', result) 就分不出坏值来自
         # 工具还是来自 hook。cast 到 object 是因为要挡的正是违反 execute 标注的运行时取值，不擦
         # 掉静态类型，下面的 isinstance 就成了 pyright 眼里的死代码。
@@ -299,3 +408,29 @@ class ToolExecutor:
         if not isinstance(rewritten, ToolResult):
             raise _rewrite_rejected(Junction.POST_TOOL_USE, 'result', ToolResult, rewritten)
         return _tightened(_strictest(result, post.rewrites('result')), rewritten)
+
+    async def _gated(
+        self, call: ToolCall, tool: Tool, args: dict[str, Any], provenance: TrustLevel
+    ) -> ToolResult | None:
+        """闸：放行交回 None，拦下交回给模型的那一块。
+
+        处置经 `disposition_of` 取——它先施加 spec §12.2 第 3 条那道关不掉的升级，再咨询宿主
+        策略。直接调 `self._policy.decide` 会把升级整个绕过去，而 typing 与运行期都不出声。
+        """
+        verdict = self._judge.judge(tool, args)
+        disposition = disposition_of(
+            self._policy, DangerRequest(verdict=verdict, call=call, provenance=provenance)
+        )
+        if disposition is Disposition.ALLOW:
+            if verdict.level is RiskLevel.LOW and provenance is TrustLevel.UNTRUSTED:
+                _report_allowed_low_risk_from_untrusted(call, verdict)
+            return None
+        if disposition is Disposition.CONFIRM:
+            await self._hooks.trigger(
+                Junction.TOOL_CONFIRMATION_REQUIRED,
+                tool_call=call,
+                tool=tool,
+                args=args,
+                verdict=verdict,
+            )
+        return _gated_result(call, verdict, disposition)

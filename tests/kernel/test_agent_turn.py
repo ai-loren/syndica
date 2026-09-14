@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall, TrustLevel
 from syndica.kernel.control import BrokerTurnGate, ControlBlock, TurnGate, TurnGateDecision
+from syndica.kernel.danger import AllowAll, DangerJudge
 from syndica.kernel.errors import (
     ConfigError,
     ContractViolation,
@@ -63,6 +65,7 @@ _UPPER_SCHEMA: dict[str, Any] = {
     },
 }
 _TOOL_SCHEMAS: list[dict[str, Any]] = [_ECHO_SCHEMA, _CONCAT_SCHEMA, _UPPER_SCHEMA]
+_DANGEROUS = '{"command":"sudo rm -rf /"}'
 _LIFECYCLE: tuple[Junction, ...] = (
     Junction.AGENT_START,
     Junction.TURN_START,
@@ -88,6 +91,20 @@ class _Upper(Tool):
     async def execute(self, text: str) -> ToolResult:
         """把 text 转成大写。"""
         return ToolResult(output=text.upper())
+
+
+class _Runner(Tool):
+    """把 command 交给 shell 执行。"""
+
+    __tool_command_args__ = ('command',)
+
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+
+    async def execute(self, command: str) -> ToolResult:
+        """执行 command。"""
+        self.executed.append(command)
+        return ToolResult(output=f'ran {command}')
 
 
 class _Fatal(Tool):
@@ -473,6 +490,54 @@ async def test_max_turns_none_runs_past_the_default_cap():
 def test_the_options_defaults_are_no_tools_no_system_prompt_and_a_bounded_budget():
     options = AgentOptions(name='Worker', llm=ScriptedLLM([]))
     assert (options.tools, options.system_prompt, options.max_turns) == ({}, '', 50)
+
+
+def test_the_options_field_order_is_part_of_the_public_api():
+    """宿主按位置构造 options 时，插一个字段进中间就换掉了它每一个实参的含义。"""
+    assert tuple(field.name for field in dataclasses.fields(AgentOptions)) == (
+        'name',
+        'llm',
+        'tools',
+        'system_prompt',
+        'max_turns',
+        'danger_judge',
+        'danger_policy',
+    )
+
+
+async def _commands_that_ran(**danger: Any) -> list[str]:
+    """让 Agent 跑一轮 `sudo rm -rf /`，交回工具真正执行过的命令。"""
+    tool = _Runner()
+    options = AgentOptions(
+        name='Worker',
+        llm=ScriptedLLM(
+            [
+                ScriptedTurn(tool_calls=[ToolCall(id='c1', name='Runner', arguments=_DANGEROUS)]),
+                ScriptedTurn(content='done'),
+            ]
+        ),
+        tools={'Runner': tool},
+        **danger,
+    )
+    await BaseAgent(options, hooks=HooksCenter(), events=EventBus()).run('go')
+    return tool.executed
+
+
+async def test_an_agent_that_declared_no_danger_options_still_has_the_kernel_gate():
+    """两个字段默认 None 表示「用内核默认」，不是「不装闸」。"""
+    options = AgentOptions(name='Worker', llm=ScriptedLLM([]))
+    assert (options.danger_judge, options.danger_policy) == (None, None)
+    assert await _commands_that_ran() == []
+
+
+async def test_a_host_policy_declared_on_the_options_reaches_the_executor():
+    """宿主换了处置却不生效，是「配了没生效」那类缺陷——闸照常拦，而宿主以为自己关掉了它。"""
+    assert await _commands_that_ran(danger_policy=AllowAll()) == ['sudo rm -rf /']
+
+
+async def test_a_host_judge_declared_on_the_options_reaches_the_executor():
+    """换判定与换处置是两件事：空规则表是「我自己在别处做了闸」。"""
+    assert await _commands_that_ran(danger_judge=DangerJudge(())) == ['sudo rm -rf /']
 
 
 async def test_an_agent_that_declared_no_budget_still_stops_and_sends_an_empty_system_prompt():
