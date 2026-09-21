@@ -192,6 +192,16 @@ class AgentRegistryContract(ContractSuite):
         got = await registry.get('a1')
         assert got is not None and got.status is AgentStatus.IDLE
 
+    async def test_update_rejects_created_at(self, registry: AgentRegistry) -> None:
+        """created_at 是构造时戳；无条件写会把「活了多久」改成「刚才改过」。"""
+        await registry.register(_info())
+        before = await registry.get('a1')
+        assert before is not None
+        with _rejects('update 写 created_at'):
+            await registry.update('a1', created_at=before.created_at + 100.0)
+        got = await registry.get('a1')
+        assert got is not None and got.created_at == before.created_at
+
     async def test_rejected_update_writes_no_field(self, registry: AgentRegistry) -> None:
         await registry.register(_info())
         with _rejects('update 同时写一个可写字段与一个受保护字段'):

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -49,3 +50,6 @@ class AgentInfo:
     # 两者混同会让状态为 RUNNING 的孤儿一直「看起来正在运行」，从而挡住重新激活。
     owner: str | None = None
     heartbeat_at: float | None = None
+    # 条目诞生时盖时间戳，不由 store 盖：远端与内存实现不得各有一套时钟源。heartbeat_at 是租约
+    # 活性不是创建时间，拿它当年龄会把刚复活过的老 Agent 判成新的。
+    created_at: float = field(default_factory=time.time)

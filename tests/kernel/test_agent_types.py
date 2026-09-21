@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
@@ -59,6 +61,15 @@ def test_info_carries_lease_fields():
     )
     assert info.owner == 'proc-1'
     assert info.heartbeat_at == 123.0
+
+
+def test_created_at_is_stamped_at_construction_and_is_not_the_lease_heartbeat():
+    """heartbeat_at 是租约活性；回收策略要的年龄是 created_at。"""
+    before = time.time()
+    info = _info()
+    after = time.time()
+    assert before <= info.created_at <= after
+    assert info.heartbeat_at is None
 
 
 def test_default_containers_are_not_shared_between_infos():

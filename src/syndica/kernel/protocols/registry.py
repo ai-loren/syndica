@@ -37,7 +37,9 @@ UPDATE_WRITABLE_FIELDS: frozenset[str] = frozenset(
     {'agent_type', 'heartbeat_at', 'metadata', 'name', 'owner', 'session_id'}
 )
 # 受保护 = 另有专用机制拥有它，逐字段的机制与理由见 UPDATE_PROTECTED_FIELD_OWNERS。
-UPDATE_PROTECTED_FIELDS: frozenset[str] = frozenset({'agent_id', 'children', 'parent_id', 'status'})
+UPDATE_PROTECTED_FIELDS: frozenset[str] = frozenset(
+    {'agent_id', 'children', 'parent_id', 'status', 'created_at'}
+)
 # 拒绝写一个受保护字段时必须报出谁才是它的写入路径，否则调用方只知道被拒、不知道该走哪条路。
 # 键集必须与 UPDATE_PROTECTED_FIELDS 逐字段对齐。
 UPDATE_PROTECTED_FIELD_OWNERS: Mapping[str, str] = MappingProxyType(
@@ -46,6 +48,10 @@ UPDATE_PROTECTED_FIELD_OWNERS: Mapping[str, str] = MappingProxyType(
         'children': 'register / unregister——它们同时更新父与子两端',
         'parent_id': 'register / unregister——它们同时更新父与子两端',
         'status': 'compare_and_set_status——状态有并发写者，只能靠 CAS 不丢转换',
+        'created_at': (
+            'register——随条目诞生，不该被无条件写；heartbeat_at 是租约活性不是创建时间，'
+            '拿它当年龄会把刚复活过的老 Agent 判成新的'
+        ),
     }
 )
 
