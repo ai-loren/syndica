@@ -380,6 +380,7 @@ Task 3 压缩版（细节以计划 Task 3 节为准）：
 - **并发 CAS 用例挡不住「两个赢家都写同一个 new」**——三个目标状态不同才分得出。
 - **一次没复现的 despawn 级联泄漏**（审计故意不上报）：`p9_growth.py` 第一次跑在「父子级联」段留下 25 条注册表条目 + 25 个 `_slots`，此后九次重跑与 40 轮随机化全零。若将来看到「每次少拆一个」，怀疑 `_destroy_tree` 的 `while fresh :=` 与并发收割交互。
 - **本机 bash 没有 `declare -A`**。Task 1 变异跑手因此改成 Python dict。不要写 bash 关联数组。还原用 sha256 基线，不要 `git checkout`（会把未提交的测试也冲掉）。
+- **Task 3 会改同一份 `catalog.py`。** 计划原文写 Create，实际是 Modify。Task 2 的五个必写用例名必须继续绿。
 - **装门**：生产路径只有 `Runtime.spawn` → `agent._attach_gate`（测试可 `pyright: ignore[reportPrivateUsage]`）。宿主构造 `BaseAgent` 时不要传 `gate=`。
 
 ---
