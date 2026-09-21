@@ -220,6 +220,8 @@ _WITHHELD: tuple[str, ...] = (
     'disposition_of',
     'install_plugins',
     'parse_mapping',
+    'register_tool',
+    'resolve_tool_names',
     'tool_name_disagreement',
     'validate_agent_factories',
     'validate_danger_options',

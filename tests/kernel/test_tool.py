@@ -853,3 +853,15 @@ def test_a_declared_empty_tuple_is_not_the_same_object_as_the_undeclared_default
 
     assert _Inert.__tool_command_args__ == ()
     assert _Inert.__tool_command_args__ is not None
+
+
+def test_validate_tool_names_rejects_a_list_with_the_three_part_error():
+    names = ['Read', 'Grep', 'Glob']
+    with pytest.raises(ConfigError) as excinfo:
+        validate_tool_names(names)
+    error = excinfo.value
+    assert '映射' in error.expected
+    assert 'list' in error.received
+    assert 'items()' in error.received
+    assert '名字列表' in error.next_action
+    assert 'resolve_tool_names' in error.next_action

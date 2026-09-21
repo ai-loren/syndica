@@ -40,6 +40,8 @@
 | D-54 | **`agent._RUNTIME_ONLY` 与真实触发点会漂移**（计划 2 Task 13 引入并移交 Task 16，此前只挂在 gitignored 的执行台账里，本文件从未登记）。新增一个只由 `Runtime` 触发的切点若漏进这张表，`register_hook` 会静默收下一个结构上永不触发的 hook | 计划 2 Task 16：`test_the_runtime_only_table_matches_where_those_junctions_are_actually_triggered` 用 AST 扫 `src/syndica/**`，**只认 `....trigger(Junction.X, ...)` 的调用点**（`Junction.X` 在别处还会作为分类表与参数化清单出现，尤其 `agent.py` 里那张表自己就是一串 `Junction.X`——收进来期望值就由被测对象自己推导了），把「只在 `kernel/runtime.py` 里被触发」的成员集合与这张表逐字比对。两条自检按 D-31 的形态：`test_the_trigger_site_scan_really_covers_the_whole_package` 断言扫过 `kernel/agent.py` 与 `kernel/tool_executor.py`（实测把范围收窄到只剩 `runtime.py`：主断言**不红**，每个切点都成了「只在 runtime 里触发」而清单照样对得上，抓住它的只有这两条自检），并用一次独立的 `os.walk` 遍历证明范围没缩；`test_every_junction_has_a_trigger_site` 挡住「没有触发点的切点从两边同时掉出去」 |
 | D-60 | **`EventBus(capacity=True)` 原先静默退化成容量 1**（YAML 1.1 把 `yes` 读成 `True`，bool 是 int 子类）。横切审计收紧入口校验：bool / 非 int / 非正整数当场 `ConfigError` | 接受面收紧，不是放宽。今天它在静默丢数据（发 5 条只收到 `[4]`），当场报错是对的方向。记一次行为变更 |
 | D-52 | **`BaseAgent.attach_gate` 与 `BaseAgent.__init__(gate=...)` 是公开名字，而它们的参数类型 `TurnGate` 不在公开面。** 只看得见 `syndica.kernel` 的宿主调得到这两个入口、却写不出标注，也造不出除默认 `NullTurnGate` 之外的任何门 | 选「降私有」那条路：`attach_gate` → `_attach_gate`，构造器去掉 `gate=`。`Runtime.spawn` 是唯一生产者。`_BASE_AGENT_SURFACE` 不再含这个名字。B-02 依据 (b)（`ControlBlock` / `TurnGate` 不在公开面）因此不动 |
+| D-49 | **`validate_tool_names` 收到一个非 Mapping 时撞裸 `AttributeError`**（`'list' object has no attribute 'items'`），三件套零条。声明式清单里 `tools: [Read, Grep, Glob]` 正是它的明文写法 | 计划 3 Task 2：`validate_tool_names(tools: object)` 先挡 str/bytes 与非 Mapping，三件套点名该写成 `{名字: Tool}`、并指路 `resolve_tool_names`。证据：`test_validate_tool_names_rejects_a_list_with_the_three_part_error`。变异 drop-mapping-guard 只红这一条 |
+| D-08 | 手写 schema 的 `name` 键可与 `tool.name` 分叉（模型按前者调用、注册表按后者索引）。守卫属注册层 | 计划 3 Task 2：`register_tool` 是往目录插入的唯一正式入口，按 `tool.name` 建键；三轴不一致就拒。`table[k]=tool` 仍能绕过登记，但 `resolve_tool_names` 对产出立刻再跑 `validate_tool_names`，生插分叉在解析出口被拦。证据：`test_register_tool_rejects_disagreement_among_the_three_identity_axes`（登记口；`next_action` 同时含 `__tool_schema__` 与两个名字）；`test_resolve_rejects_a_catalog_entry_with_disagreeing_identity_axes`（生插后 resolve）。变异 register-renames-to-schema-name 只红登记口那条；删掉 resolve 末尾的 `validate_tool_names` 只红生插那条 |
 
 ## 待审计核实（认为已被后续改动关闭）
 
@@ -49,13 +51,6 @@
 | V-02 | 接管 CAS 在 `parked` 状态下不是有效的所有权守卫 | 计划 2 Task 4 的 `ensure_active`；Task 7 进一步改为**用注册表状态作所有权凭证** |
 
 ## 有主待做（里程碑 1 内）
-
-### 归计划 3（声明式 Agent 定义 —— 工具注册层）
-
-| # | 内容 |
-|---|---|
-| D-49 | **`validate_tool_names` 收到一个非 Mapping 时撞裸 `AttributeError`**（`'list' object has no attribute 'items'`），三件套零条。与本轮修掉的 `validate_agent_factories`（M-2）逐字同型，而 spec §4.6 的声明式清单里 `tools: [Read, Grep, Glob]` 正是它的明文写法，所以触发面与角色表一样顺手。`validate_danger_options` / `validate_max_concurrency` 不收映射，不在此列 | 归**计划 3（声明式 Agent 定义 —— 工具注册层）**：清单会在那里被转成 tools dict，是这条检查唯一的收口点。修法与 `validate_agent_factories` 相同（`isinstance(..., Mapping)` 在遍历之前，三件套点名该写成什么）。**本轮刻意只修角色表那一半**：`Runtime(agents=...)` 是本任务引入的入口，而工具表那一半是存量违反，跨模块同步收紧属计划 3 的范围 |
-| D-08 | 手写 schema 的 `name` 键可与 `tool.name` 分叉（模型按前者调用、注册表按后者索引）。当前行为已钉住，但守卫属**注册层**——声明式清单会从 manifest 构造 tools dict，那里是唯一收口点 |
 
 ### 归计划 4（第一个 backend + provider）
 

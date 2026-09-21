@@ -21,7 +21,7 @@ import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Annotated, Any, ClassVar, get_args, get_origin
+from typing import Annotated, Any, ClassVar, cast, get_args, get_origin
 
 from pydantic import BaseModel
 
@@ -331,9 +331,39 @@ def tool_name_disagreement(key: str, tool: Tool) -> ConfigError | None:
     )
 
 
-def validate_tool_names(tools: Mapping[str, Tool]) -> None:
-    """校验整张工具表的身份轴。收下工具表的每一处都必须调它。"""
-    for key, tool in tools.items():
+def validate_tool_names(tools: object) -> None:
+    """校验整张工具表的身份轴。收下工具表的每一处都必须调它。
+
+    参数标成 `object`：要挡的正是违反 Mapping 标注的运行时取值。声明式清单里
+    `tools: [Read, Grep]` 是名字列表，直接丢进来会撞裸 AttributeError，三件套零条。
+    """
+    if isinstance(tools, (str, bytes)) or not isinstance(tools, Mapping):
+        raise ConfigError(
+            expected=(
+                'tools 是「工具名 -> Tool」的映射：'
+                '模型按 schema["name"] 发起调用、executor 按键查表'
+            ),
+            received=f'收到 {type(tools).__name__} 类型的 {tools!r}，它没有 items()',
+            next_action=(
+                '把工具表改成 {名字: Tool} 的 dict。'
+                '声明式清单里 `tools: [Read, Grep]` 是名字列表，没有 Tool 实例；'
+                '先经 resolve_tool_names 把名字解析成映射，再交给这里'
+            ),
+        )
+    table = cast(Mapping[object, object], tools)
+    for key, tool in table.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ConfigError(
+                expected='工具表的键是非空白工具名 str',
+                received=f'键 {key!r}，类型是 {type(key).__name__}',
+                next_action='把键改成与 tool.name / schema["name"] 逐字相同的非空白字符串',
+            )
+        if not isinstance(tool, Tool):
+            raise ConfigError(
+                expected=f'工具表键 {key!r} 的取值是 Tool 实例',
+                received=f'收到 {tool!r}，类型是 {type(tool).__name__}',
+                next_action='传入 Tool 子类的实例，不要把工具名字符串放进映射的值',
+            )
         error = tool_name_disagreement(key, tool)
         if error is not None:
             raise error
