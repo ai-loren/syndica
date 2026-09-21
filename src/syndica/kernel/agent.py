@@ -120,7 +120,9 @@ class AgentOptions:
     `tools` 的**迭代顺序**逐字进请求前缀，因此它是配置的一部分而不只是一张查找表。它的键必须与
     `tool.name` 和 `schema['name']` 逐字相同（见 `validate_tool_names`）；校验在这里而不只在
     executor 里，宿主才能在声明的那一行拿到错误。**不替换成副本**：executor 与本字段共享同一个
-    dict 对象，热插拔靠的就是这个。
+    dict 对象，热插拔靠的就是这个。反过来，**内核不就地改这张表**——它可能是工厂在多次调用之间
+    复用的同一个 dict，写它等于把它变成「属于第一个 Agent」；驱动方要装工具走
+    `BaseAgent.install_runtime_tools`，它换上 Agent 自己的一份并让两侧一起换。
 
     `danger_judge` / `danger_policy` 为 `None` 时用内核默认（默认规则表 + 高风险阻断）。这两者与
     `max_tool_concurrency` 都与 `tools` 相反：**executor 在构造时把它们取走**，此后改本字段对已经
