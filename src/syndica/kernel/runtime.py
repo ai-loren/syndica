@@ -137,7 +137,6 @@ from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
-from syndica.kernel.tool import validate_tool_names
 from syndica.kernel.tools import orchestration_tools
 from syndica.kernel.waiting import Waiter, WaitResult, WaitState, correlation_of
 
@@ -797,15 +796,13 @@ class Runtime:
         return agent_id
 
     def _install_orchestration(self, agent: BaseAgent, agent_id: str) -> None:
-        """把 spec §5.6 的五个编排工具挂进这个 Agent 的工具表。
+        """把 spec §5.6 的五个编排工具挂进这个 Agent。
 
         **同名工具报错而不是覆盖**：静默覆盖会让这个 Agent 自己那一个永远调不到，而 run 照常以
         COMPLETED 返回——失败被当成成功上报。抛在 `register` 之前，被拒的 spawn 什么都没发生。
 
-        `agent.options.tools` 是**活的** dict，executor 与它共享同一个对象，因此这次更新立刻对
-        本 Agent 生效，不需要重建 executor。更新之后整张表重过一遍身份轴校验：工厂可以在
-        `AgentOptions` 构造之后再往这张活表里塞条目，那些条目没有人校验过（编排工具自己的键则由
-        `orchestration_tools` 写死，一个拼错的键会让模型的每一次调用都落空）。
+        装配经 `BaseAgent.install_runtime_tools`，**不就地改 `agent.options.tools`**：那张 dict 由
+        宿主的工厂持有，而工厂可以在多次调用之间复用同一个，就地写会把它变成「属于第一个 Agent」。
         """
         if not self._orchestration:
             return
@@ -813,8 +810,7 @@ class Runtime:
         clashes = sorted(set(installed) & set(agent.options.tools))
         if clashes:
             raise _orchestration_name_clash(agent.options.name, clashes)
-        agent.options.tools.update(installed)
-        validate_tool_names(agent.options.tools)
+        agent.install_runtime_tools(installed)
 
     def _carry_truncated_taint(
         self, agent: BaseAgent, fork_from: str, source_trust: TrustLevel

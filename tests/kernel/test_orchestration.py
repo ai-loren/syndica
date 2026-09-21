@@ -2460,3 +2460,105 @@ async def test_a_mis_keyed_tool_added_after_construction_is_caught_when_orchestr
     assert 'Typo' in caught.value.received
     assert _nothing_was_built(runtime)
     await runtime.shutdown()
+
+
+_FIVE: tuple[str, ...] = ('Delegate', 'Fork', 'SendMessage', 'QueryAgent', 'KillAgent')
+
+
+async def test_spawning_does_not_write_into_the_tools_table_the_host_handed_in():
+    """宿主交进来的那张 dict 在 spawn 前后逐键相同。
+
+    工厂在多次调用之间复用同一个 dict 是合法写法，于是就地装配会把它变成「属于第一个 Agent」：
+    此后每个从它造出来的 Agent 都继承到一套绑着别人 id 的工具。
+    """
+    shared: dict[str, Tool] = {'Tainted': _Tainted()}
+    before = dict(shared)
+    runtime = Runtime(orchestration=True)
+
+    agent_id = await runtime.spawn(_worker([ScriptedTurn(content='x')], shared), query='go')
+    await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+
+    assert list(shared) == list(before)
+    assert all(shared[key] is before[key] for key in before)
+    agent = runtime._table.get(agent_id)
+    assert agent is not None and list(agent.options.tools) == ['Tainted', *_FIVE]
+    await runtime.shutdown()
+
+
+async def test_two_agents_built_by_one_factory_each_get_five_tools_bound_to_themselves():
+    """「同一张工具表被装了几次」是一条独立的基数轴——Agent 数到 3 不代表它到了 2。"""
+    shared: dict[str, Tool] = {'Tainted': _Tainted()}
+    runtime = Runtime(orchestration=True)
+    factory = _worker([ScriptedTurn(content='a'), ScriptedTurn(content='b')], shared)
+
+    ids = [await runtime.spawn(factory, query='go') for _ in range(2)]
+    for agent_id in ids:
+        await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+
+    for agent_id in ids:
+        agent = runtime._table.get(agent_id)
+        assert agent is not None
+        assert [_owner(agent.options.tools[name]) for name in _FIVE] == [agent_id] * 5
+    await runtime.shutdown()
+
+
+async def test_delegating_to_the_same_role_twice_brings_back_both_answers():
+    """编排者对同一个角色的第二次派活。
+
+    `Delegate` 每次都走同一个工厂，所以就地装配下第二次 spawn 会撞上第一次留下的五个键，
+    整次 run 打成 ERROR，而那条 ConfigError 说的是宿主从未定义过的名字。
+    """
+    runtime = Runtime(
+        orchestration=True,
+        agents={
+            'Worker': _worker(
+                [ScriptedTurn(content='first answer'), ScriptedTurn(content='second answer')],
+                {'Tainted': _Tainted()},
+            )
+        },
+    )
+    boss = await runtime.spawn(
+        _worker(
+            [
+                _call('Delegate', '{"agent":"Worker","query":"one"}', 'd1'),
+                _call('Delegate', '{"agent":"Worker","query":"two"}', 'd2'),
+                ScriptedTurn(content='boss done'),
+            ],
+            name='Boss',
+        ),
+        query='go',
+    )
+    ctx = await asyncio.wait_for(runtime.wait(boss), timeout=_TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.COMPLETED
+    outputs = [str(block.content) for block in _tool_blocks(runtime, boss)]
+    assert len(outputs) == 2
+    assert 'first answer' in outputs[0]
+    assert 'second answer' in outputs[1]
+    await runtime.shutdown()
+
+
+async def test_a_tool_added_to_options_after_installing_still_reaches_the_executor():
+    """装配之后 `options.tools` 与 executor 仍是同一个对象。
+
+    只断「装进去的五个调得到」不够：给两侧各一份副本时那条断言照绿，而此后每一次热插拔只有
+    一侧看得到——模型按 description 发起的调用全部落空，run 照常 COMPLETED。
+    """
+    runner = _Runner()
+    runtime = Runtime(orchestration=True)
+    agent_id = await runtime.spawn(
+        _worker(
+            [_call('Runner', '{"command":"echo hi"}'), ScriptedTurn(content='done')],
+            {'Tainted': _Tainted()},
+        ),
+        query=None,
+    )
+    agent = runtime._table.get(agent_id)
+    assert agent is not None
+    agent.options.tools['Runner'] = runner
+
+    await runtime.send(agent_id, 'go')
+    await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+
+    assert runner.executed == ['echo hi']
+    await runtime.shutdown()

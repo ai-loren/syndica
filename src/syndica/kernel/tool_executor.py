@@ -523,6 +523,16 @@ class ToolExecutor:
         self._policy: DangerPolicy = policy if policy is not None else BlockHighRisk()
         self._max_concurrency = max_concurrency
 
+    def _retarget(self, tools: dict[str, Tool]) -> None:
+        """换掉查表用的那张表。
+
+        调用方必须让自己那一份与本 executor 指向**同一个** dict 对象。分成两份之后，此后往任一侧
+        塞条目只有那一侧看得到：模型按 description 发起的调用落进 `_misregistered` 那条路，而 run
+        照常以 COMPLETED 返回。
+        """
+        validate_tool_names(tools)
+        self._tools = tools
+
     async def execute_tool_calls(self, ctx: Context, tool_calls: list[ToolCall]) -> None:
         provenance = provenance_of(ctx)
         safety = [self._concurrency_safe(call) for call in tool_calls]

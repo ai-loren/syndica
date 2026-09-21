@@ -72,7 +72,7 @@ from __future__ import annotations
 
 import itertools
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
@@ -403,6 +403,30 @@ class BaseAgent:
         self._running = False
         self._gate: TurnGate = gate if gate is not None else NullTurnGate()
         self._gate_attached = gate is not None
+
+    def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
+        """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
+
+        只能在这里装，理由同 `attach_gate`：这些工具绑着 `agent_id`，而它在本类构造时才生成，
+        工厂手里没有它。
+
+        **不就地改宿主交进来的那张表。** `AgentOptions.tools` 可能是工厂在多次调用之间复用的同一个
+        dict，就地写会把它变成「属于第一个 Agent」：此后从同一个工厂造出来的每一个 Agent 都继承到
+        一套绑着别人 id 的工具，而跨 Runtime 时连一条日志都没有。所以这里换上本 Agent 自己的一份，
+        **两侧一起换**——换完 `self.options.tools` 与 executor 仍是同一个 dict 对象，`AgentOptions`
+        承诺的热插拔因此照常成立。
+
+        同名键被新装的覆盖，判重名是调用方的事：静默覆盖会让这个 Agent 自己那一个永远调不到，而
+        run 照常以 COMPLETED 返回。
+
+        合并后的**整张**表重过一遍身份轴校验（`AgentOptions.__post_init__`）：工厂可以在
+        `AgentOptions` 构造之后再往表里塞条目，那些条目没有人校验过。
+        """
+        merged = {**self.options.tools, **tools}
+        # 先构造再赋值：校验在 __post_init__ 里抛时 self.options 还没换过，这次装配什么都没发生。
+        options = replace(self.options, tools=merged)
+        self.options = options
+        self._executor._retarget(merged)  # pyright: ignore[reportPrivateUsage]
 
     @property
     def context(self) -> Context:
