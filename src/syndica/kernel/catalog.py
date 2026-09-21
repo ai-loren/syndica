@@ -5,29 +5,42 @@
 产出 dict 是目录的浅副本：改返回值或改目录互不影响。
 
 Agent 侧：`AgentCatalog` 加载清单、同名覆盖可查询。覆盖不改 `names()` 第一次见到的顺序。
-同一次 `load_json_directory` 内部撞名不是覆盖，整次加载都不写入。freeze 不在本模块这一层。
+同一次 `load_json_directory` 内部撞名不是覆盖，整次加载都不写入。
+`freeze` 在这一层：插值一次、按名字解析工具和模型、把清单收成 `AgentFactory`。
+工厂捕获工具表的副本，freeze 之后改目录进不了已冻结的工厂。
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, cast
 
-from syndica.kernel.agent import BaseAgent
+from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.events import EventBus
+from syndica.kernel.hooks import HooksCenter
+from syndica.kernel.llm import LLM
 from syndica.kernel.manifest import AgentManifest, ManifestSource, parse_mapping
+from syndica.kernel.runtime import AgentFactory, validate_agent_factories
 from syndica.kernel.tool import Tool, tool_name_disagreement, validate_tool_names
 
 __all__ = [
     'AgentCatalog',
+    'HostFacts',
     'OverrideRecord',
     'register_tool',
     'resolve_tool_names',
 ]
+
+_PROMPT_PLACEHOLDERS: tuple[str, ...] = ('os', 'platform', 'shell')
+_DEFAULT_MODEL_NAME = 'default'
+_DEFAULT_MAX_TURNS = 50
 
 
 @dataclass(frozen=True)
@@ -42,6 +55,29 @@ class OverrideRecord:
     displaced_source: ManifestSource
     displaced_at_index: int
     by_source: ManifestSource
+
+
+@dataclass(frozen=True)
+class HostFacts:
+    """宿主注入的静态环境事实。内核不读 os.environ / os.getcwd。
+
+    只有 os / platform / shell 能进 System Prompt。工作目录是动态事实，进历史块；
+    `{cwd}` 即使宿主后来知道 cwd 也拒绝。
+    """
+
+    os: str
+    platform: str
+    shell: str
+
+    def __post_init__(self) -> None:
+        for field_name in _PROMPT_PLACEHOLDERS:
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(
+                    expected=f'HostFacts.{field_name} 是非空白 str',
+                    received=f'{field_name}={value!r}，类型是 {type(value).__name__}',
+                    next_action='由宿主注入真实的 os / platform / shell；内核不会自己读环境',
+                )
 
 
 class AgentCatalog:
@@ -165,6 +201,25 @@ class AgentCatalog:
         """当前生效条目的 source。"""
         return self.get(name).source
 
+    def freeze(
+        self,
+        tools: object,
+        models: object,
+        host: object = None,
+    ) -> Mapping[str, AgentFactory]:
+        """插值一次并收成「hooks, events → BaseAgent」工厂。键序与 names() 相同。"""
+        host_facts = _host_facts(host)
+        model_table = _model_table(models)
+        self._reject_missing_models(model_table)
+        self._reject_missing_subagents()
+        factories: dict[str, AgentFactory] = {}
+        for name in self._order:
+            factories[name] = self._factory_for(
+                self._entries[name], tools=tools, models=model_table, host=host_facts
+            )
+        validate_agent_factories(factories)
+        return MappingProxyType(factories)
+
     def _put(self, manifest: AgentManifest) -> None:
         name = manifest.name
         current = self._entries.get(name)
@@ -182,6 +237,139 @@ class AgentCatalog:
             return
         self._entries[name] = manifest
         self._order.append(name)
+
+    def _factory_for(
+        self,
+        manifest: AgentManifest,
+        *,
+        tools: object,
+        models: Mapping[str, LLM],
+        host: HostFacts | None,
+    ) -> AgentFactory:
+        cls = self._resolve_class(manifest)
+        tool_names = self._union_tool_names(manifest)
+        captured_tools = dict(resolve_tool_names(tool_names, tools))
+        prompt = _interpolate_prompt(manifest.system_prompt, host, role=manifest.name)
+        options = AgentOptions(
+            name=manifest.name,
+            llm=models[manifest.model],
+            tools=captured_tools,
+            system_prompt=prompt,
+            max_turns=_max_turns(manifest),
+        )
+
+        def factory(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+            return cls(options, hooks=hooks, events=events)
+
+        return factory
+
+    def _resolve_class(self, manifest: AgentManifest) -> type[BaseAgent]:
+        ancestors = self._walk_extends(manifest)
+        if isinstance(manifest.impl, type):
+            return _base_agent_subclass(manifest.impl)
+        if isinstance(manifest.impl, str):
+            return _import_impl(manifest.impl)
+        if ancestors:
+            parent = ancestors[0]
+            if isinstance(parent.impl, type):
+                return _base_agent_subclass(parent.impl)
+            if isinstance(parent.impl, str):
+                return _import_impl(parent.impl)
+        return BaseAgent
+
+    def _walk_extends(self, start: AgentManifest) -> list[AgentManifest]:
+        chain: list[AgentManifest] = []
+        seen: set[str] = {start.name}
+        path: list[str] = [start.name]
+        current_name = start.extends
+        while current_name:
+            if current_name in seen:
+                cycle = [*path, current_name]
+                raise ConfigError(
+                    expected='extends 链是从声明式指向已登记的类式角色，不能成环',
+                    received=f'{start.name!r} 的 extends 链成环：{cycle}',
+                    next_action='打断环：每个声明式角色只 extends 一个已经 register_class 的名字',
+                )
+            parent = self._entries.get(current_name)
+            if parent is None:
+                known = list(self._order)
+                raise ConfigError(
+                    expected=f'{start.name!r} 的 extends={current_name!r} 已在目录里',
+                    received=f'目录现有 {known!r}，没有 {current_name!r}',
+                    next_action=(
+                        f'先 load / register_class 登记 {current_name!r}，再 freeze。'
+                        'extends 必须指向已经登记的类式角色'
+                    ),
+                )
+            if parent.impl is None:
+                raise ConfigError(
+                    expected='extends 只能指向已经登记的类式角色（impl 是 class 或 module:Class）',
+                    received=(
+                        f'{start.name!r} extends {current_name!r}，'
+                        f'而 {current_name!r} 是声明式（impl 为空）'
+                    ),
+                    next_action=(
+                        f'把 {current_name!r} 改成类式（register_class 或 impl 指向'
+                        ' BaseAgent 子类），或去掉这条 extends。声明式不能 extends 声明式'
+                    ),
+                )
+            seen.add(current_name)
+            path.append(current_name)
+            chain.append(parent)
+            current_name = parent.extends
+        return chain
+
+    def _union_tool_names(self, manifest: AgentManifest) -> tuple[str, ...]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for node in (manifest, *self._walk_extends(manifest)):
+            for name in node.tools:
+                if name not in seen:
+                    ordered.append(name)
+                    seen.add(name)
+        return tuple(ordered)
+
+    def _reject_missing_models(self, models: Mapping[str, LLM]) -> None:
+        missing: list[str] = []
+        roles: list[str] = []
+        seen: set[str] = set()
+        for name in self._order:
+            model_name = self._entries[name].model
+            if model_name in models:
+                continue
+            roles.append(name)
+            if model_name not in seen:
+                seen.add(model_name)
+                missing.append(model_name)
+        if not missing:
+            return
+        present = list(models)
+        raise ConfigError(
+            expected=f'模型表含清单点名的每一个模型：缺 {missing}',
+            received=f'模型表现有 {present!r}，角色 {roles} 还要点 {missing}',
+            next_action=(
+                f'把 {missing} 登记进 freeze(models=...)；缺省模型名是 {_DEFAULT_MODEL_NAME!r}。'
+                '清单 model 字段写的是名字，不是实例'
+            ),
+        )
+
+    def _reject_missing_subagents(self) -> None:
+        wanted: list[str] = []
+        seen: set[str] = set()
+        for name in self._order:
+            for sub in self._entries[name].subagents:
+                if sub not in seen:
+                    seen.add(sub)
+                    wanted.append(sub)
+        missing = [name for name in wanted if name not in self._entries]
+        if not missing:
+            return
+        known = list(self._order)
+        raise ConfigError(
+            expected=f'subagents 里的每一个名字都已在目录里：{wanted}',
+            received=f'目录现有 {known!r}，没有 {missing!r}',
+            next_action=f'先登记缺的 {missing}，再 freeze。subagents 不在 freeze 时自动创建',
+        )
 
 
 def register_tool(table: object, tool: object) -> None:
@@ -374,3 +562,146 @@ def _reject_duplicate_names_in_one_directory(
             '后一次加载才是覆盖，overrides() 才能查出被挤掉的那份'
         ),
     )
+
+
+def _host_facts(host: object) -> HostFacts | None:
+    if host is None:
+        return None
+    if isinstance(host, HostFacts):
+        return host
+    raise ConfigError(
+        expected='host 是 HostFacts（os / platform / shell）或省略',
+        received=f'收到 {type(host).__name__} 类型的 {host!r}',
+        next_action='构造 HostFacts(os=..., platform=..., shell=...)；不要传 os 模块或 cwd',
+    )
+
+
+def _model_table(models: object) -> dict[str, LLM]:
+    if isinstance(models, (str, bytes)) or not isinstance(models, Mapping):
+        raise ConfigError(
+            expected='models 是「模型名 -> LLM」的映射',
+            received=f'收到 {type(models).__name__} 类型的 {models!r}，它没有 items()',
+            next_action="传入一个 dict，例如 {'default': ScriptedLLM([])}",
+        )
+    table: dict[str, LLM] = {}
+    for raw_key, raw_value in cast(Mapping[object, object], models).items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise ConfigError(
+                expected='模型表的每个键是非空白 str',
+                received=f'键 {raw_key!r}，类型是 {type(raw_key).__name__}',
+                next_action='键写成清单 model 字段会引用的名字，缺省是 default',
+            )
+        if not isinstance(raw_value, LLM):
+            raise ConfigError(
+                expected=f'模型表键 {raw_key!r} 的取值是 LLM 实例',
+                received=f'收到 {raw_value!r}，类型是 {type(raw_value).__name__}',
+                next_action='传入 LLM 实例（测试用 ScriptedLLM），不要传类对象或名字字符串',
+            )
+        table[raw_key] = raw_value
+    return table
+
+
+def _max_turns(manifest: AgentManifest) -> int | None:
+    if manifest.budget is None:
+        return _DEFAULT_MAX_TURNS
+    return manifest.budget['turns']
+
+
+def _import_impl(path: str) -> type[BaseAgent]:
+    module_name, sep, qualname = path.partition(':')
+    if not sep or not module_name.strip() or not qualname.strip():
+        raise ConfigError(
+            expected='impl 字符串是 pkg.mod:Class',
+            received=f'impl={path!r}',
+            next_action='写成 syndica.kernel.agent:BaseAgent 这种 module:qualname，中间一个冒号',
+        )
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ConfigError(
+            expected=f'能 import {module_name!r}',
+            received=str(exc),
+            next_action='核对模块路径；类式角色也可以直接把 class 对象传给 impl',
+        ) from exc
+    obj: object = module
+    for part in qualname.split('.'):
+        if not hasattr(obj, part):
+            raise ConfigError(
+                expected=f'{module_name}:{qualname} 能解析到 BaseAgent 子类',
+                received=f'{type(obj).__name__} 上没有属性 {part!r}',
+                next_action='核对 Class 名与模块导出',
+            )
+        obj = getattr(obj, part)
+    return _base_agent_subclass(obj)
+
+
+def _interpolate_prompt(prompt: object, host: HostFacts | None, *, role: str) -> str:
+    if not isinstance(prompt, str):
+        raise ConfigError(
+            expected=f'{role!r} 的 system_prompt 是 str',
+            received=f'收到 {prompt!r}，类型是 {type(prompt).__name__}',
+            next_action='清单解析之后 prompt 必须已经是字符串',
+        )
+    out: list[str] = []
+    index = 0
+    length = len(prompt)
+    while index < length:
+        char = prompt[index]
+        if char == '{':
+            if index + 1 < length and prompt[index + 1] == '{':
+                out.append('{')
+                index += 2
+                continue
+            close = prompt.find('}', index + 1)
+            if close < 0:
+                raise ConfigError(
+                    expected=f'{role!r} 的 system_prompt 里每个 {{ 都有配对的 }}',
+                    received=f'未闭合的占位从 {prompt[index:]!r} 开始',
+                    next_action='写成 {os} / {platform} / {shell}，字面大括号用 {{ / }}',
+                )
+            name = prompt[index + 1 : close]
+            out.append(_placeholder_value(name, host, role=role, raw=prompt[index : close + 1]))
+            index = close + 1
+            continue
+        if char == '}':
+            if index + 1 < length and prompt[index + 1] == '}':
+                out.append('}')
+                index += 2
+                continue
+            raise ConfigError(
+                expected=f'{role!r} 的 system_prompt 里每个 }} 都来自占位或 }}',
+                received=f'单独的 }} 出现在 {prompt[index:]!r}',
+                next_action='字面右大括号写成 }}，占位写成 {os} / {platform} / {shell}',
+            )
+        out.append(char)
+        index += 1
+    return ''.join(out)
+
+
+def _placeholder_value(
+    name: str,
+    host: HostFacts | None,
+    *,
+    role: str,
+    raw: str,
+) -> str:
+    if name == 'cwd':
+        raise ConfigError(
+            expected='System Prompt 只允许 {os} / {platform} / {shell}，禁止 {cwd}',
+            received=f'{role!r} 的 prompt 含 {raw}',
+            next_action='把工作目录写进历史块，不要写进 System Prompt',
+        )
+    if name not in _PROMPT_PLACEHOLDERS:
+        allowed = ' / '.join('{' + item + '}' for item in _PROMPT_PLACEHOLDERS)
+        raise ConfigError(
+            expected=f'System Prompt 占位只允许 {allowed}',
+            received=f'{role!r} 的 prompt 含 {raw}',
+            next_action=f'改成 {allowed}，或把这段写成普通文本。不要用格式规格（{{os:posix}}）',
+        )
+    if host is None:
+        raise ConfigError(
+            expected=f'含占位的 prompt 在 freeze 时注入 HostFacts；{role!r} 用了 {raw}',
+            received='freeze(..., host=) 省略了 HostFacts',
+            next_action='传入 HostFacts(os=..., platform=..., shell=...)；空 prompt 才可以不传',
+        )
+    return getattr(host, name)

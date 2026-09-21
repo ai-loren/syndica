@@ -202,6 +202,7 @@ _WITHHELD: tuple[str, ...] = (
     'DEFAULT_MAX_TOOL_CONCURRENCY',
     'Delegate',
     'Fork',
+    'HostFacts',
     'INTERCEPTABLE',
     'KillAgent',
     'LocalAgentTable',

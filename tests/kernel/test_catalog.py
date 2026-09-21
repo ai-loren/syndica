@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,9 @@ from syndica.kernel.catalog import (
     resolve_tool_names,
 )
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.events import EventBus
+from syndica.kernel.hooks import HooksCenter
+from syndica.kernel.llm import ScriptedLLM
 from syndica.kernel.manifest import ManifestSource
 from syndica.kernel.tool import Tool, ToolResult
 
@@ -327,3 +331,195 @@ def test_directory_load_is_filename_order_then_later_directory_can_override(
     assert catalog.names() == ('Alpha', 'Middle', 'Zeta')
     assert catalog.get('Middle').description == '中2'
     assert catalog.overrides('Middle')[0].displaced_source.kind == 'json_directory'
+
+
+def _models() -> dict[str, ScriptedLLM]:
+    return {'default': ScriptedLLM([])}
+
+
+def _spawn(factory):
+    return factory(HooksCenter(), EventBus())
+
+
+def test_missing_model_name_is_rejected():
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Alpha', 'α', model='alpha-llm'))
+    catalog.load_mapping(_agent_body('Worker', '改文件时用我', model='gpt'))
+    catalog.load_mapping(_agent_body('Gamma', 'γ', model='claude'))
+    with pytest.raises(ConfigError) as excinfo:
+        catalog.freeze({}, _models())
+    error = excinfo.value
+    assert "'alpha-llm'" in error.received
+    assert "'gpt'" in error.received
+    assert "'claude'" in error.received
+    assert "'default'" in error.received
+    assert "'Alpha'" in error.received
+    assert "'Worker'" in error.received
+    assert "'Gamma'" in error.received
+    assert 'default' in error.next_action
+
+
+def test_extends_a_declarative_agent_is_rejected():
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Worker', '声明式工人'))
+    catalog.load_mapping(_agent_body('Scout', '侦察', extends='Worker'))
+    with pytest.raises(ConfigError) as excinfo:
+        catalog.freeze({}, _models())
+    error = excinfo.value
+    assert "'Scout'" in error.received
+    assert "'Worker'" in error.received
+    assert '声明式' in error.received
+    assert '类式' in error.expected or 'register_class' in error.next_action
+
+
+def test_extends_cycle_is_rejected():
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Alpha', '甲', impl=_StubAgent, extends='Beta'))
+    catalog.load_mapping(_agent_body('Beta', '乙', impl=_StubAgent, extends='Alpha'))
+    with pytest.raises(ConfigError) as excinfo:
+        catalog.freeze({}, _models())
+    error = excinfo.value
+    assert "'Alpha'" in error.received
+    assert "'Beta'" in error.received
+    assert '环' in error.expected or '环' in error.received
+
+
+def test_frozen_factory_does_not_see_later_catalog_tool_mutations():
+    tools = _catalog('Read')
+    original = tools['Read']
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Worker', '改文件时用我', tools=['Read']))
+    factories = catalog.freeze(tools, _models())
+    register_tool(tools, _Named('Read'))
+    agent = _spawn(factories['Worker'])
+    assert agent.options.tools['Read'] is original
+    assert agent.options.tools['Read'] is not tools['Read']
+
+
+def test_declarative_factory_signature_binds_hooks_and_events():
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Worker', '改文件时用我'))
+    factories = catalog.freeze({}, _models())
+    factory = factories['Worker']
+    assert list(inspect.signature(factory).parameters) == ['hooks', 'events']
+    inspect.signature(factory).bind(HooksCenter(), EventBus())
+    agent = _spawn(factory)
+    assert isinstance(agent, BaseAgent)
+    assert type(agent) is BaseAgent
+
+
+def test_freeze_returns_factories_in_first_seen_name_order():
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Zeta', '末'))
+    catalog.load_mapping(_agent_body('Alpha', '甲'))
+    catalog.load_mapping(_agent_body('Mu', '中'))
+    factories = catalog.freeze({}, _models())
+    assert list(factories) == ['Zeta', 'Alpha', 'Mu']
+
+
+def test_child_prompt_is_not_the_parent_prompt():
+    catalog = AgentCatalog()
+    catalog.load_mapping(
+        _agent_body('Planner', '规划范围时用我。', impl=_StubAgent, system_prompt='PARENT')
+    )
+    catalog.load_mapping(_agent_body('Scout', '侦察', extends='Planner'))
+    factories = catalog.freeze({}, _models())
+    child = _spawn(factories['Scout'])
+    parent = _spawn(factories['Planner'])
+    assert parent.options.system_prompt == 'PARENT'
+    assert child.options.system_prompt == ''
+
+
+def test_tool_names_union_child_first_then_parent_without_duplicates():
+    tools = _catalog('Read', 'Grep', 'Write')
+    catalog = AgentCatalog()
+    catalog.load_mapping(
+        _agent_body('Planner', '规划范围时用我。', impl=_StubAgent, tools=['Read', 'Grep'])
+    )
+    catalog.load_mapping(_agent_body('Scout', '侦察', extends='Planner', tools=['Grep', 'Write']))
+    factories = catalog.freeze(tools, _models())
+    scout = _spawn(factories['Scout'])
+    assert list(scout.options.tools) == ['Grep', 'Write', 'Read']
+    planner = _spawn(factories['Planner'])
+    assert list(planner.options.tools) == ['Read', 'Grep']
+
+
+def test_class_factory_constructs_the_registered_subclass():
+    catalog = AgentCatalog()
+    catalog.register_class('Planner', _StubAgent)
+    factories = catalog.freeze({}, _models())
+    agent = _spawn(factories['Planner'])
+    assert type(agent) is _StubAgent
+    assert list(inspect.signature(factories['Planner']).parameters) == ['hooks', 'events']
+
+
+def test_string_impl_imports_the_class():
+    catalog = AgentCatalog()
+    catalog.load_mapping(
+        _agent_body('Worker', '改文件时用我', impl='syndica.kernel.agent:BaseAgent')
+    )
+    factories = catalog.freeze({}, _models())
+    agent = _spawn(factories['Worker'])
+    assert type(agent) is BaseAgent
+
+
+def test_absent_budget_freezes_to_the_default_turn_limit():
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Worker', '改文件时用我'))
+    factories = catalog.freeze({}, _models())
+    assert _spawn(factories['Worker']).options.max_turns == 50
+
+
+def test_budget_turns_null_disables_the_turn_limit():
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Worker', '改文件时用我', budget={'turns': None}))
+    factories = catalog.freeze({}, _models())
+    assert _spawn(factories['Worker']).options.max_turns is None
+
+
+def test_missing_subagents_are_all_named():
+    catalog = AgentCatalog()
+    catalog.load_mapping(
+        _agent_body(
+            'Worker',
+            '改文件时用我',
+            subagents=['Beta', 'Gamma', 'Delta', 'Epsilon'],
+        )
+    )
+    catalog.load_mapping(_agent_body('Gamma', '已在'))
+    with pytest.raises(ConfigError) as excinfo:
+        catalog.freeze({}, _models())
+    error = excinfo.value
+    missing_part = error.received.split('没有', 1)[1]
+    assert "'Beta'" in missing_part
+    assert "'Delta'" in missing_part
+    assert "'Epsilon'" in missing_part
+    assert "'Gamma'" not in missing_part
+    assert 'Beta' in error.next_action
+    assert 'Delta' in error.next_action
+    assert 'Epsilon' in error.next_action
+
+
+def test_host_that_is_not_host_facts_is_rejected():
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Worker', '改文件时用我'))
+    duck = SimpleNamespace(os='darwin', platform='arm64', shell='zsh', cwd='/tmp')
+    with pytest.raises(ConfigError) as excinfo:
+        catalog.freeze({}, _models(), host=duck)
+    assert 'HostFacts' in excinfo.value.expected
+    assert type(duck).__name__ in excinfo.value.received
+
+
+def test_freeze_of_an_empty_catalog_returns_an_empty_mapping():
+    factories = AgentCatalog().freeze({}, _models())
+    assert dict(factories) == {}
+
+
+def test_extends_unknown_name_is_rejected():
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Scout', '侦察', extends='Ghost'))
+    with pytest.raises(ConfigError) as excinfo:
+        catalog.freeze({}, _models())
+    error = excinfo.value
+    assert "'Ghost'" in error.received
+    assert "'Scout'" in error.received
