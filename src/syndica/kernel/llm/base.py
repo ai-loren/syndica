@@ -8,8 +8,9 @@ API 密钥、base URL 这类部署事实由宿主填进 `client_args`。
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Protocol, Self, runtime_checkable
+from typing import Any, Protocol, Self, cast, runtime_checkable
 
 from syndica.kernel.context import ContextBlock
 from syndica.kernel.errors import ConfigError, SyndicaError
@@ -23,6 +24,20 @@ class ContextOverflowError(SyndicaError):
     它**不属于** LLMResponseError：超窗是请求侧、压缩后可重试的状况，LLMResponseError 说的是
     响应不可用。嵌进去会被先写的 `except LLMResponseError` 吞掉，压缩永不触发，只表现为任务失败。
     """
+
+
+def _copied_mapping(value: object, field: str) -> dict[str, Any]:
+    """两个 dict 字段只浅拷：嵌套活对象必须保住。
+
+    非映射在构造时拒绝，不要等 `dict()` 抛 TypeError。
+    """
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            expected=f'{field} 是映射（dict 或其子类）',
+            received=f'{field}={value!r}，类型是 {type(value).__name__}',
+            next_action=f'传一个 dict 给 {field}，或省略它用空 dict',
+        )
+    return dict(cast(Mapping[str, Any], value))
 
 
 def _validated_changes(cls: type[LLMConfig], changes: dict[str, Any]) -> dict[str, Any]:
@@ -60,8 +75,8 @@ class LLMConfig:
     context_window: int | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, 'client_args', dict(self.client_args))
-        object.__setattr__(self, 'request_args', dict(self.request_args))
+        object.__setattr__(self, 'client_args', _copied_mapping(self.client_args, 'client_args'))
+        object.__setattr__(self, 'request_args', _copied_mapping(self.request_args, 'request_args'))
 
     def derive(self, **changes: Any) -> Self:
         """派生必须走此方法：影响身份的参数直接改会让缓存键与计费归属静默错位。"""
@@ -91,5 +106,9 @@ class LLM(Protocol):
           block 整个 `asdict` 出去的实现会把这些全部灌进模型上下文。
         - `trust` 不进字节是分叉能复用前缀缓存的前提（spec §5.2 纪律 4）：内核会收紧一块继承来的
           `trust` 来补偿截断丢掉的标记，而分身的前缀必须与源逐字节相同。
+
+        实现必须在 `config.timeout` 内返回或抛出。违反后果：abort 不打断轮内调用，`create` 不返回
+        时唯一出路是 `kill`。不要在内核里包 `asyncio.timeout`：那会把取消域从 provider 手里拿走、
+        远端连接留在那里。
         """
         ...

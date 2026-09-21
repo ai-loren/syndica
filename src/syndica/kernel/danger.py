@@ -637,13 +637,45 @@ def _matched(rule: DangerRule, text: str) -> bool:
         ) from exc
 
 
+def _validated_rules(rules: object) -> tuple[DangerRule, ...]:
+    if isinstance(rules, str | bytes) or not isinstance(rules, Sequence):
+        raise ConfigError(
+            expected='rules 是 DangerRule 的序列，或 None 用默认表、() 关掉内核规则',
+            received=f'收到 {type(rules).__name__}：{rules!r}',
+            next_action=(
+                '传一个 DangerRule 列表。str / bytes 也是 Sequence，逐字符迭代之后报出的错误'
+                '会指着每一个字符而不是指着那次误传'
+            ),
+        )
+    typed = cast('Sequence[object]', rules)
+    validated: list[DangerRule] = []
+    for index, rule in enumerate(typed):
+        if not isinstance(rule, DangerRule):
+            raise ConfigError(
+                expected=f'rules[{index}] 是 DangerRule',
+                received=f'收到 {type(rule).__name__}：{rule!r}',
+                next_action='每一项都必须是 DangerRule；不要把字符串或其它对象塞进规则表',
+            )
+        if not callable(rule.matches):
+            raise ConfigError(
+                expected=f'rules[{index}].matches 可调用',
+                received=f'收到 {type(rule.matches).__name__}',
+                next_action='给这条规则一个 matches(text: str) -> bool 的纯函数',
+            )
+        validated.append(rule)
+    return tuple(validated)
+
+
 class DangerJudge:
     """按规则表给一次调用下结论。无状态、无副作用——它抛出时调用方**知道**什么都没发生。"""
 
-    def __init__(self, rules: Sequence[DangerRule] | None = None) -> None:
+    def __init__(self, rules: object = None) -> None:
         # `None` 用默认规则表，`()` 是「我自己在别处做了闸」——两者不能合并，否则宿主没法关掉
         # 内核规则，而空表与默认表长得一样。入参拷一份：交进来的 list 此后被改也改不动结论。
-        self._rules: tuple[DangerRule, ...] = tuple(DEFAULT_RULES if rules is None else rules)
+        # `str` / `bytes` 单独挡：它们也是 Sequence，逐字符迭代之后报出的是一串指着字符的错误。
+        self._rules: tuple[DangerRule, ...] = _validated_rules(
+            DEFAULT_RULES if rules is None else rules
+        )
 
     def judge(self, tool: Tool, args: Mapping[str, Any]) -> DangerVerdict:
         """取第一个命中的规则。

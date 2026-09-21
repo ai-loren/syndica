@@ -23,6 +23,38 @@ from syndica.kernel.errors import ConfigError, ContractViolation
 __all__ = ['Event', 'EventBus', 'Subscription']
 
 
+def validate_positive_int(value: object, field: str) -> int:
+    """公开入口的类型轴：先拒 bool（YAML 1.1 把 yes 读成 True），再判类型，再判值域。
+
+    bool 是 int 的子类：`True < 1` 为 False，于是 `capacity=True` 会静默退化成容量 1。
+    """
+    if isinstance(value, bool):
+        raise ConfigError(
+            expected=f'{field} 是正整数',
+            received=(
+                f'{field}={value!r}：bool 是 int 的子类，YAML 1.1 会把 yes 读成 True，'
+                'True 在数值比较里等于 1，于是缓冲容量静默退化成 1 条'
+            ),
+            next_action=f'传一个 >= 1 的整数 {field}，不要传布尔值',
+        )
+    if not isinstance(value, int):
+        raise ConfigError(
+            expected=f'{field} 是正整数',
+            received=f'{field}={value!r}，类型是 {type(value).__name__}',
+            next_action=f'传一个 >= 1 的整数 {field}',
+        )
+    if value < 1:
+        raise ConfigError(
+            expected=f'{field} 是正整数：每个订阅者最多缓冲多少条事件',
+            received=(
+                f'{field}={value!r}：容量不足 1 时每条事件入队即被挤掉，'
+                '订阅者永远收不到任何东西，且没有任何报错'
+            ),
+            next_action=f'传一个 >= 1 的 {field}，或省略它用默认容量',
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class Event:
     """一条事件记录。
@@ -57,14 +89,16 @@ def _snapshot(event: Event) -> Event:
         ) from exc
 
 
-def _why_copying_failed(payload: dict[str, Any], exc: Exception) -> str:
+def _why_copying_failed(
+    payload: dict[str, Any], exc: Exception, *, container: str = 'payload'
+) -> str:
     """指出是哪个键拷不动。逐键重试是拿到键名的唯一途径：copy 抛的异常里只有类型名。"""
     for key, value in payload.items():
         try:
             copy.deepcopy(value)
         except Exception:
-            return f'payload[{key!r}] 是 {type(value).__name__}，深拷贝失败：{exc}'
-    return f'payload 是 {type(payload).__name__}，深拷贝失败：{exc}'
+            return f'{container}[{key!r}] 是 {type(value).__name__}，深拷贝失败：{exc}'
+    return f'{container} 是 {type(payload).__name__}，深拷贝失败：{exc}'
 
 
 class _Buffer:
@@ -166,17 +200,8 @@ class EventBus:
     存；丢最旧则保证慢订阅者恢复消费后看到的是最近的窗口，而不是永远落后一整个缓冲。
     """
 
-    def __init__(self, *, capacity: int = 1024) -> None:
-        if capacity < 1:
-            raise ConfigError(
-                expected='capacity 是正整数：每个订阅者最多缓冲多少条事件',
-                received=(
-                    f'capacity={capacity!r}：容量不足 1 时每条事件入队即被挤掉，'
-                    '订阅者永远收不到任何东西，且没有任何报错'
-                ),
-                next_action='传一个 >= 1 的 capacity，或省略它用默认容量',
-            )
-        self._capacity = capacity
+    def __init__(self, *, capacity: object = 1024) -> None:
+        self._capacity = validate_positive_int(capacity, 'capacity')
         # 弱引用：消费者忘了退订时，缓冲随 Subscription 一并被回收，emit 不会一直往一个
         # 再也没人读的缓冲里写。它是兜底，确定的退订时机由 Subscription.close 给。
         self._buffers: weakref.WeakSet[_Buffer] = weakref.WeakSet()

@@ -49,6 +49,32 @@ def test_config_leaves_every_optional_field_unset_by_default():
     )
 
 
+def test_config_rejects_client_args_that_are_not_a_mapping():
+    with pytest.raises(ConfigError) as excinfo:
+        LLMConfig(provider='scripted', model='m1', client_args=42)  # pyright: ignore[reportArgumentType]
+    assert 'client_args' in excinfo.value.expected
+    assert '42' in excinfo.value.received
+    assert excinfo.value.next_action
+
+
+def test_config_rejects_request_args_that_are_not_a_mapping():
+    with pytest.raises(ConfigError) as excinfo:
+        LLMConfig(provider='scripted', model='m1', request_args=42)  # pyright: ignore[reportArgumentType]
+    assert 'request_args' in excinfo.value.expected
+    assert excinfo.value.next_action
+
+
+def test_config_accepts_mapping_client_and_request_args():
+    cfg = LLMConfig(
+        provider='scripted',
+        model='m1',
+        client_args={'base_url': 'http://host'},
+        request_args={'temperature': 0},
+    )
+    assert cfg.client_args == {'base_url': 'http://host'}
+    assert cfg.request_args == {'temperature': 0}
+
+
 def test_default_argument_dicts_are_not_shared_between_configs():
     first = LLMConfig(provider='scripted', model='m1')
     second = LLMConfig(provider='scripted', model='m1')

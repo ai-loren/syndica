@@ -310,6 +310,24 @@ def test_bus_rejects_a_capacity_that_cannot_hold_anything():
     assert 'capacity' in excinfo.value.next_action
 
 
+@pytest.mark.parametrize(
+    'capacity',
+    [True, 2.5, float('inf'), '4', None],
+    ids=['bool', 'float', 'inf', 'str', 'none'],
+)
+def test_bus_rejects_a_capacity_that_is_not_a_positive_int(capacity: object) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        EventBus(capacity=capacity)
+    assert 'capacity' in excinfo.value.expected
+    assert excinfo.value.received
+    assert excinfo.value.next_action
+
+
+def test_bus_accepts_a_positive_int_capacity() -> None:
+    bus = EventBus(capacity=4)
+    assert bus is not None
+
+
 async def test_close_wakes_a_subscriber_parked_on_an_empty_buffer(
     consumers: list[asyncio.Task[Any]],
 ):

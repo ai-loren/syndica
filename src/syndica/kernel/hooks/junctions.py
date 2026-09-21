@@ -39,7 +39,9 @@
 三个生命周期切点（`RUNTIME_SHUTDOWN` / `AGENT_SPAWN` / `AGENT_DESPAWN`）同样只报既成事实：
 Agent 已经建好、条目已经摘掉、关机已经开始，没有一处还能被 hook 改。`AGENT_DESPAWN` 在条目消失
 **之后**触发，因此想留下父子关系只能在 `AGENT_SPAWN` 上记（它带 `parent_id`）。`RUNTIME_START`
-不在这里：`Runtime.__init__` 是同步的，没有可以 await hook 的位置。
+不在这里：`Runtime` 没有任何异步启动入口（`__init__` 是同步的），没有可以 await hook 的位置。
+代价是第三方能力没地方做「Runtime 起来时初始化一次」——这是一次自觉的收窄，不是漏实现。不要
+为此加 `async def start()`：那会给每个宿主加一步必须调的初始化，且动公开面。
 
 ## 扩展切点
 

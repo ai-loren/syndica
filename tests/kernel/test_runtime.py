@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Awaitable, Callable
 from types import MappingProxyType
 from typing import Any
@@ -15,11 +16,11 @@ import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
-from syndica.kernel.context import StopReason, ToolCall, TrustLevel
+from syndica.kernel.context import ContextBlock, StopReason, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError, ContractViolation
-from syndica.kernel.events import EventBus
+from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
-from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
+from syndica.kernel.llm import LLMConfig, ScriptedLLM, ScriptedTurn
 from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.protocols import AgentRegistry, MissingQueueCallback
 from syndica.kernel.runtime import _LIVE_STATUSES, AgentFactory, Runtime, _WaitToken
@@ -95,6 +96,39 @@ class _Block(Tool):
         self.entered.set()
         await self.release.wait()
         return ToolResult(output='released')
+
+
+class _Wipe(Tool):
+    """记录被执行过的路径。第 9 步中止必须让这份清单保持空。"""
+
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
+    async def execute(self, path: str) -> ToolResult:
+        """记下 path。"""
+        self.paths.append(path)
+        return ToolResult(output=path)
+
+
+class _SlowWipeLLM:
+    """进入 create 后挂起，直到测试放行才交出一次 Wipe 调用。
+
+    abort 不取消正在飞的 LLM：create 必须返回，第 9 步才能读到中止位。
+    """
+
+    def __init__(self, entered: asyncio.Event, released: asyncio.Event) -> None:
+        self.config = LLMConfig(provider='scripted', model='slow-wipe')
+        self._entered = entered
+        self._released = released
+
+    async def create(self, messages: list[ContextBlock], **kwargs: object) -> ContextBlock:
+        self._entered.set()
+        await self._released.wait()
+        return ContextBlock(
+            role='assistant',
+            content='will wipe',
+            tool_calls=[ToolCall(id='c1', name='Wipe', arguments='{"path":"/data"}')],
+        )
 
 
 class _Retaliate(Tool):
@@ -4424,7 +4458,7 @@ async def test_despawn_removes_a_descendant_another_process_holds_instead_of_orp
     留下一个别的进程持有的子代，它的 parent_id 就指向一个已被注销的父。外人排在三个子代的
     **中间**，且它下面还挂着本进程的 Agent——排在末位时「走过它」与「走到它为止」是同一个答案。
     """
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)
     registry = InMemoryAgentRegistry()
     broker = _SpyBroker(registry)
     owner = Runtime(registry=registry, broker=broker)
@@ -4443,10 +4477,14 @@ async def test_despawn_removes_a_descendant_another_process_holds_instead_of_orp
     assert [await owner.find(agent_id) for agent_id in tree] == [None] * 5
     assert await _dangling_parents(registry) == []
 
-    # 别的进程的循环由它自己发现条目已经不在，本进程既停不了它、也不替它清理。
+    # 别的进程的循环由它自己发现条目已经不在。条目不在不是丢失，不报 ERROR。
     await asyncio.wait_for(asyncio.wait({stranded}), _TIMEOUT)
-    assert [record.levelname for record in caplog.records] == ['ERROR']
-    assert outsider in caplog.records[0].getMessage()
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+    assert any(
+        outsider in record.getMessage() and '已经被 despawn' in record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.DEBUG
+    )
     # 跳过一个子代留下的是永久孤儿，因此这条路上不该有一条「跳过」记录。
     assert [record.getMessage() for record in caplog.records if record.levelname == 'INFO'] == []
     await peer.shutdown()
@@ -6819,4 +6857,152 @@ async def test_waiting_in_turn_for_an_agent_whose_drive_never_took_over_is_refus
 
     assert stranded in caught.value.expected
     assert '接管' in caught.value.received
+    await runtime.shutdown()
+
+
+async def test_abort_during_llm_does_not_run_the_declared_tools():
+    """第 9 步：模型产出之后、工具执行之前兑现 abort。"""
+    entered = asyncio.Event()
+    released = asyncio.Event()
+    wipe = _Wipe()
+    llm = _SlowWipeLLM(entered, released)
+
+    def factory(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(
+                name='Worker',
+                llm=llm,  # pyright: ignore[reportArgumentType]
+                tools={'Wipe': wipe},
+                system_prompt=_SYSTEM_PROMPT,
+            ),
+            hooks=hooks,
+            events=events,
+        )
+
+    runtime = Runtime()
+    agent_id = await runtime.spawn(factory, query='go')
+    await asyncio.wait_for(entered.wait(), _TIMEOUT)
+    await runtime.abort(agent_id)
+    released.set()
+    ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.ABORTED
+    assert wipe.paths == []
+    await runtime.shutdown()
+
+
+def test_runtime_rejects_a_registry_class_object():
+    """漏括号把构造推迟到第一次 spawn 的裸 TypeError。"""
+    with pytest.raises(ConfigError) as caught:
+        Runtime(registry=InMemoryAgentRegistry)  # pyright: ignore[reportArgumentType]
+    assert '实例' in caught.value.expected
+    assert 'InMemoryAgentRegistry' in caught.value.received
+    assert '括号' in caught.value.next_action
+
+
+def test_runtime_rejects_a_broker_that_is_not_a_message_broker():
+    with pytest.raises(ConfigError) as caught:
+        Runtime(broker=object())  # pyright: ignore[reportArgumentType]
+    assert 'MessageBroker' in caught.value.expected
+    assert 'object' in caught.value.received
+    assert caught.value.next_action
+
+
+async def test_runtime_accepts_constructed_registry_and_broker_instances():
+    runtime = Runtime(registry=InMemoryAgentRegistry(), broker=InMemoryMessageBroker())
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    assert await runtime.find(agent_id) is not None
+    await runtime.shutdown()
+
+
+async def test_spawn_rejects_metadata_that_cannot_be_deepcopied():
+    runtime = Runtime()
+    try:
+        with pytest.raises(ContractViolation) as caught:
+            await runtime.spawn(
+                _factory(_done()),
+                query='go',
+                metadata={'conn': threading.Lock()},
+            )
+        assert "metadata['conn']" in caught.value.received
+        assert caught.value.next_action
+    finally:
+        await runtime.shutdown()
+
+
+async def test_shutdown_triggers_runtime_shutdown_only_once():
+    """拆除每一步都幂等；触发只报一次。"""
+    seen: list[str] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        seen.append('shutdown')
+        return HookResult()
+
+    runtime = Runtime()
+    runtime.hooks.register(Junction.RUNTIME_SHUTDOWN, record)
+    await runtime.shutdown()
+    await runtime.shutdown()
+    assert seen == ['shutdown']
+
+
+async def test_concurrent_shutdown_triggers_runtime_shutdown_only_once():
+    seen: list[str] = []
+
+    async def record(**kwargs: Any) -> HookResult:
+        seen.append('shutdown')
+        return HookResult()
+
+    runtime = Runtime()
+    runtime.hooks.register(Junction.RUNTIME_SHUTDOWN, record)
+    await asyncio.gather(runtime.shutdown(), runtime.shutdown(), runtime.shutdown())
+    assert seen == ['shutdown']
+
+
+async def test_second_shutdown_still_closes_the_bus_while_the_first_is_in_the_hook():
+    """第二次不得在方法开头见 `_closed` 就返回：那会把关闭总线这一步跳过。"""
+    entered = asyncio.Event()
+    hold = asyncio.Event()
+
+    async def stall(**kwargs: Any) -> HookResult:
+        entered.set()
+        await hold.wait()
+        return HookResult()
+
+    runtime = Runtime()
+    runtime.hooks.register(Junction.RUNTIME_SHUTDOWN, stall)
+    first = asyncio.create_task(runtime.shutdown())
+    await asyncio.wait_for(entered.wait(), _TIMEOUT)
+    await runtime.shutdown()
+    probe = runtime.events.subscribe()
+    await runtime.events.emit(Event(kind='probe', agent_id='none'))
+    got: list[Event] = []
+    try:
+        got.append(await asyncio.wait_for(anext(probe), timeout=_BRIEF_WAIT))
+    except (StopAsyncIteration, TimeoutError):
+        pass
+    assert got == []
+    hold.set()
+    await first
+
+
+async def test_kill_then_despawn_does_not_error_when_the_zombie_transition_loses_the_entry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """kill 立刻返回、收尾在后台、再 despawn：条目不在是正常顺序。"""
+    caplog.set_level(logging.DEBUG, logger='syndica.kernel.runtime')
+    blocker = _Block()
+    runtime = Runtime()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go')
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+    await runtime.kill(agent_id)
+    await runtime.despawn(agent_id)
+    await asyncio.wait_for(_reaped(runtime), _TIMEOUT)
+
+    assert await runtime.find(agent_id) is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert any('已经被 despawn 掉了' in message for message in messages)
+    assert not any(
+        record.levelno >= logging.ERROR and '已经被 despawn' in record.getMessage()
+        for record in caplog.records
+    )
     await runtime.shutdown()

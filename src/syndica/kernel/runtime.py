@@ -116,7 +116,7 @@ import logging
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from syndica.kernel.agent import BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
@@ -130,7 +130,10 @@ from syndica.kernel.context import (
 )
 from syndica.kernel.control import BrokerTurnGate, ControlBlock
 from syndica.kernel.errors import ConfigError, ContractViolation
-from syndica.kernel.events import EventBus
+from syndica.kernel.events import (
+    EventBus,
+    _why_copying_failed,  # pyright: ignore[reportPrivateUsage]
+)
 from syndica.kernel.hooks import HooksCenter, Junction
 from syndica.kernel.local_table import LocalAgentTable
 from syndica.kernel.message import DeliveryResult, Message, Trigger
@@ -145,6 +148,7 @@ __all__ = ['AgentFactory', 'Runtime', 'validate_agent_factories']
 logger = logging.getLogger(__name__)
 
 AgentFactory = Callable[[HooksCenter, EventBus], BaseAgent]
+_StoreT = TypeVar('_StoreT')
 
 # 「这一次 send 允不允许把目标叫醒」。用 ContextVar 而不是 Runtime 上的一个字段：它的作用域是
 # **这一次调用**，两个并发 send 的意图因此互不污染；放在实例上则第二个 send 会读到第一个的开关。
@@ -335,6 +339,21 @@ def _cannot_fork_a_block(
             '把这一块的 extra / content 里活的对象（线程锁、连接、文件句柄）换成一段可深拷的'
             '描述再分叉——轨迹要持久化、要经压缩重写，活的对象在那两条路上同样过不去。'
             '本次分叉什么都没发生：分身既没有注册，也没有驱动任务'
+        ),
+    )
+
+
+def _cannot_register_metadata(
+    agent_id: str, metadata: dict[str, Any], exc: Exception
+) -> ContractViolation:
+    return ContractViolation(
+        expected=f'agent {agent_id!r} 的 metadata 是纯数据，才能深拷进注册表',
+        received=_why_copying_failed(  # pyright: ignore[reportPrivateUsage]
+            metadata, exc, container='metadata'
+        ),
+        next_action=(
+            '把 metadata 里活的对象（线程锁、连接、文件句柄）换成一段可深拷的描述再 spawn。'
+            '本次 spawn 什么都没发生：条目没有注册，也没有驱动任务'
         ),
     )
 
@@ -589,6 +608,29 @@ def _already_shut_down() -> ContractViolation:
     )
 
 
+def _checked_store(value: object, protocol: type[_StoreT], field: str, constructed: str) -> _StoreT:
+    """registry / broker 必须是 Protocol 实例。类对象会通过鸭子检查（方法挂在类上），漏括号
+    `Runtime(registry=InMemoryAgentRegistry)` 会把构造推迟到第一次 spawn 的裸 TypeError。
+    """
+    if isinstance(value, type):
+        raise ConfigError(
+            expected=f'{field} 是 {protocol.__name__} **实例**',
+            received=f'收到类对象 {value.__name__} 本身',
+            next_action=(
+                f'加上括号：{constructed}。'
+                '类对象上的方法都取得到，因此鸭子检查放不倒它，'
+                f'而第一次真正调用会报出一条指着 {field} 自己签名的 TypeError'
+            ),
+        )
+    if not isinstance(value, protocol):
+        raise ConfigError(
+            expected=f'{field} 实现 {protocol.__name__}',
+            received=f'收到 {type(value).__name__}，没有 {protocol.__name__} 要求的方法',
+            next_action=f'传入一个 {protocol.__name__} 实例，或省略 {field} 用默认内存实现',
+        )
+    return value
+
+
 class Runtime:
     """Agent 的生命周期驱动与控制面。
 
@@ -602,16 +644,24 @@ class Runtime:
     def __init__(
         self,
         *,
-        registry: AgentRegistry | None = None,
-        broker: MessageBroker | None = None,
+        registry: object = None,
+        broker: object = None,
         plugins: Sequence[Plugin] | None = None,
         agents: Mapping[str, AgentFactory] | None = None,
         orchestration: bool = False,
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
-        self.registry: AgentRegistry = registry or InMemoryAgentRegistry()
-        self.broker: MessageBroker = broker or InMemoryMessageBroker()
+        self.registry: AgentRegistry = (
+            InMemoryAgentRegistry()
+            if registry is None
+            else _checked_store(registry, AgentRegistry, 'registry', 'InMemoryAgentRegistry()')
+        )
+        self.broker: MessageBroker = (
+            InMemoryMessageBroker()
+            if broker is None
+            else _checked_store(broker, MessageBroker, 'broker', 'InMemoryMessageBroker()')
+        )
         self.events: EventBus = EventBus()
         self.hooks: HooksCenter = HooksCenter()
         # 装配在挂 on_missing_queue 之前：一次被拒的装配不该在共享 broker 上留下一条指向构造失败
@@ -641,6 +691,7 @@ class Runtime:
         # 摘是幂等的，报不是。**不用它让谁等谁**（理由见模块文档）。
         self._destroying: dict[str, _Teardown] = {}
         self._closed = False
+        self._shutdown_reported = False
         # 「队列不存在」是懒启动与 ZOMBIE 复活的唯一触发点（spec §4.4）。接在这里，而不是让每个
         # 调用方自己先判断再激活——那样「复活」就有了 N 份实现。
         self.broker.on_missing_queue(self._on_missing_queue)
@@ -753,13 +804,17 @@ class Runtime:
                     raise _cannot_fork_a_block(fork_from, position, block.role, exc) from exc
             if query is None:
                 self._carry_truncated_taint(agent, fork_from, source_trust)
+        try:
+            owned_metadata = copy.deepcopy(metadata or {})
+        except Exception as exc:
+            raise _cannot_register_metadata(agent_id, metadata or {}, exc) from exc
         await self.registry.register(
             AgentInfo(
                 agent_id=agent_id,
                 name=agent.options.name,
                 agent_type=type(agent).__name__,
                 parent_id=parent_id,
-                metadata=metadata or {},
+                metadata=owned_metadata,
             )
         )
         await self.broker.ensure_queue(agent_id)
@@ -909,6 +964,29 @@ class Runtime:
             agent_id,
         )
 
+    async def _report_lost_zombie(self, agent_id: str) -> None:
+        """活状态 -> ZOMBIE 被拒的两种情形，下一步不是同一件事。
+
+        条目已被注销时，「用 find() 读它当前的状态」答 `None`——这是 kill 立刻返回、收尾在后台、
+        再 despawn 的正常顺序，不是丢失。措辞相同的一条 ERROR 把这两种情形合并，就等于在正常路径
+        上稳定误报。
+        """
+        if await self.registry.get(agent_id) is None:
+            logger.debug(
+                '期望: agent %s 在事件循环退出时仍可由本进程转去 zombie。'
+                ' 实际: 条目已经不在注册表里——它已经被 despawn 掉了。'
+                ' 这是 kill 立刻返回、收尾在后台、再 despawn 的正常顺序，不是丢失。'
+                ' 下一步: 不用找它；find() 会返回 None。',
+                agent_id,
+            )
+            return
+        logger.error(
+            '期望: agent %s 在注册表里仍是本进程认得的活状态，可由本进程转去 zombie。'
+            ' 实际: 转换被拒，它的状态在事件循环退出前被别人改成了别的东西。'
+            ' 下一步: 用 find() 读它当前的状态；本进程已经不再驱动它。',
+            agent_id,
+        )
+
     async def _cycles(
         self, agent_id: str, agent: BaseAgent, seed: _Seed | None, slot: _Slot
     ) -> None:
@@ -1010,12 +1088,7 @@ class Runtime:
             await self._destroy_tree(agent_id, operation='exit')
             return
         if not await self._switch(agent_id, new=AgentStatus.ZOMBIE, allowed=_LIVE_STATUSES):
-            logger.error(
-                '期望: agent %s 在注册表里仍是本进程认得的活状态，可由本进程转去 zombie。'
-                ' 实际: 转换被拒，它的状态在事件循环退出前被别人改成了别的东西。'
-                ' 下一步: 用 find() 读它当前的状态；本进程已经不再驱动它。',
-                agent_id,
-            )
+            await self._report_lost_zombie(agent_id)
 
     async def _report_abandoned_input(self, agent_id: str, slot: _Slot) -> None:
         """摘队列之前，把「拿过 ok=True 收据、却不会再被处理」的输入记下来。
@@ -1360,9 +1433,10 @@ class Runtime:
     async def abort(self, agent_id: str, *, recursive: bool = False) -> None:
         """协作式中止：置位中止位、把状态转成 ABORTING，然后立刻返回。
 
-        中止**在轮与轮之间兑现**（spec §5.1 第 1 步）：这一次工作以 `StopReason.ABORTED` 收场，
-        轨迹配对完整、可以直接 resume。要立刻停下、不惜留下不配对的调用，那是 `kill`——两者的
-        区别正是 `ABORTED` 存在的理由，不要合并。
+        中止**在轮开始前（spec §5.1 第 1 步）和模型已经产出之后、工具执行之前（第 9 步）兑现**：
+        这一次工作以 `StopReason.ABORTED` 收场，轨迹配对完整、可以直接 resume。第 9 步保留
+        assistant block，并为每个尚未执行的调用补一块如实说明「没有执行」的 tool block。要立刻
+        停下、不惜留下不配对的调用，那是 `kill`——两者的区别正是 `ABORTED` 存在的理由，不要合并。
 
         位是**一次性**的：这一个周期结束，事件循环照常回去等下一条消息（`exit_mode` 决定它还在
         不在）。abort 是「停下手上这一件事」，不是「从此不再干活」。**暂存的延迟消息不在被停的
@@ -1383,8 +1457,8 @@ class Runtime:
         看见，这个 Agent 会永远停在那里而调用方毫无反馈。**穿透不等于解除**：门原样落着，兑现
         之后它回到挂起态等 `resume`。
 
-        **同样穿透一次在飞的 `wait_for`**，那次等待当场以 `WaitState.ABORTED` 返回：中止位只在轮的
-        边界上被读到，而等待卡在轮的中间，不打断它就要等那次等待自己超时才兑现。
+        **同样穿透一次在飞的 `wait_for`**，那次等待当场以 `WaitState.ABORTED` 返回：中止位在轮
+        开始前和第 9 步被读到，而等待卡在轮的中间，不打断它就要等那次等待自己超时才兑现。
 
         `recursive=True` 时**父先于子**，理由同 `pause`：先掐掉还会派出新活的那一头。父只在下一个
         轮边界停下，因此它仍可能在遍历期间生出新的子代——父先于子把这个窗口收窄到**一次在飞的
@@ -1684,8 +1758,8 @@ class Runtime:
             )
             return
         slot.control.request_abort()
-        # 中止位只在轮的边界上被读到，而此刻这个 Agent 可能卡在一轮中间的一次等待里：不打断它，
-        # 中止要等那次等待自己结束才兑现——等答复那条可以是几小时的超时，等子 Agent 干活那条
+        # 中止位在轮开始前和第 9 步被读到，而此刻这个 Agent 可能卡在一轮中间的一次等待里：不打断
+        # 它，中止要等那次等待自己结束才兑现——等答复那条可以是几小时的超时，等子 Agent 干活那条
         # 根本没有上限。两个槽都要打：它们是两种在轮等待，各有自己的令牌。
         for interrupted in (slot.waiter, slot.delegation):
             if interrupted is not None:
@@ -2040,6 +2114,10 @@ class Runtime:
         一串 "Task was destroyed but it is pending"。
         """
         # 置位在 gather 之前：与本次关机并发的 spawn 既赶不上取消名单、事件又发不出去。
+        # 触发只报一次：拆除每一步都是幂等的，必须照常做完全部拆除（返回即意味着都停了）。不能在
+        # 方法开头 `if self._closed: return`——那会让第二次调用在第一次还没跑完时提前返回。
+        report = not self._shutdown_reported
+        self._shutdown_reported = True
         self._closed = True
         # 摘回调也在 gather 之前：链是 broker 的，活得比本 Runtime 长。不摘，共享 broker 上每个
         # 关停的 Runtime 都留一条永远答 False 的死回调，并靠那条引用把自己整个钉在内存里。
@@ -2060,5 +2138,6 @@ class Runtime:
             reapers = list(self._reapers)
             self._reapers.clear()
             await asyncio.gather(*reapers, return_exceptions=True)
-        await self.hooks.trigger(Junction.RUNTIME_SHUTDOWN)
+        if report:
+            await self.hooks.trigger(Junction.RUNTIME_SHUTDOWN)
         await self.events.close()

@@ -1117,3 +1117,36 @@ def test_disposition_of_is_the_only_place_in_the_package_that_consults_a_policy(
         '「高风险 + 可溯源到不可信 → 阻断」的升级只坐在 disposition_of 里，'
         '直接问 policy 会让它被宿主策略静默配掉。'
     )
+
+
+def test_judge_rejects_a_string_as_the_rule_table():
+    with pytest.raises(ConfigError) as excinfo:
+        DangerJudge('abc')
+    assert 'str' in excinfo.value.received
+    assert 'str / bytes 也是 Sequence' in excinfo.value.next_action
+
+
+def test_judge_rejects_bytes_as_the_rule_table():
+    with pytest.raises(ConfigError) as excinfo:
+        DangerJudge(b'abc')
+    assert 'bytes' in excinfo.value.received
+    assert excinfo.value.next_action
+
+
+def test_judge_rejects_an_item_that_is_not_a_rule():
+    with pytest.raises(ConfigError) as excinfo:
+        DangerJudge(['not a rule'])
+    assert 'DangerRule' in excinfo.value.expected
+    assert 'str' in excinfo.value.received
+    assert excinfo.value.next_action
+
+
+def test_judge_accepts_an_explicit_list_of_rules():
+    rule = DangerRule(
+        rule_id='never',
+        level=RiskLevel.HIGH,
+        reason='never',
+        matches=lambda text: False,
+    )
+    judge = DangerJudge([rule])
+    assert judge.judge(_Undeclared(), {'anything': 'hello'}) == NO_RULE_MATCHED

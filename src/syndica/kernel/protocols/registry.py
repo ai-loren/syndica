@@ -12,6 +12,11 @@ LocalAgentTable 回答。两者分离是存储层可替换的地基（spec §4.3
 操作成功返回**。`register` 重复 id 抛（调用方要的是「创建」），`update` 缺条目抛（没有东西可写），
 `unregister` 缺条目成功（「不在注册表里」已经成立）；`get` 与 `compare_and_set_status` 是提问
 不是要求，未知条目分别返回 `None` 与 `False`。
+
+**CAS 必须是原子的**（spec §4.4 / §13.3）：读状态与写状态之间不得插入一次让出。远端 store 的
+往返是必然的让出点，所以「读完再写」看起来对、并发下会丢转换（挂起与中止相撞就是这一条）。可接受
+的实现路径：Lua EVAL 把 GET+SET 收进一次脚本、WATCH / MULTI / EXEC 乐观锁、或一次把比较与赋值
+收成一趟往返的事务。内存实现必须把读与写放在同一次不让出的临界区里。
 """
 
 from __future__ import annotations
@@ -73,7 +78,11 @@ class AgentRegistry(Protocol):
     async def compare_and_set_status(
         self, agent_id: str, *, expected: AgentStatus, new: AgentStatus
     ) -> bool:
-        """状态转换。expected 不匹配或 agent 不存在时返回 False，不抛异常。"""
+        """状态转换。expected 不匹配或 agent 不存在时返回 False，不抛异常。
+
+        读与写必须是一次原子操作：两者之间让出控制权（`await`、远端往返）会让并发转换丢失。
+        可接受的实现路径：Lua EVAL、Redis WATCH、或一次事务。
+        """
         ...
 
     async def update(self, agent_id: str, **fields: Any) -> None:

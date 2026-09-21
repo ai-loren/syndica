@@ -5,10 +5,16 @@
 
 **运行前提**见 `syndica.kernel.contracts.base`：async 用例要有插件驱动，
 继承自 `ContractSuite` 的守卫会把配置缺失变成显式失败。
+
+**CAS 必须跨过「读然后写」那次必然的让出仍然恰好一个赢家**（spec §4.4 / §13.3）。远端 store
+在 GET 与 SET 之间必有一次往返；内存实现把两者放在同一次不让出的临界区里就能过，一个在中间
+`await asyncio.sleep(0)` 的实现会让并发转换丢失。可接受的实现路径：Lua EVAL、WATCH / MULTI /
+EXEC、或一次事务。基数取 3：n=2 下有退化解。
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import fields
@@ -152,6 +158,27 @@ class AgentRegistryContract(ContractSuite):
             )
             is False
         )
+
+    async def test_concurrent_transitions_from_the_same_state_have_exactly_one_winner(
+        self, registry: AgentRegistry
+    ) -> None:
+        """同一起点上的并发 CAS 恰好一个赢家。基数取 3：n=2 下有退化解。
+
+        读与写之间插入一次让出（远端 store 必然有的那次往返）必须仍然恰好一个 True，且末态与
+        那一个一致。可接受的实现路径：Lua EVAL、WATCH / MULTI / EXEC、或一次事务。
+        """
+        await registry.register(_info())
+        targets = (AgentStatus.RUNNING, AgentStatus.PAUSED, AgentStatus.WAITING)
+        results = await asyncio.gather(
+            *[
+                registry.compare_and_set_status('a1', expected=AgentStatus.IDLE, new=target)
+                for target in targets
+            ]
+        )
+        assert results.count(True) == 1
+        got = await registry.get('a1')
+        assert got is not None
+        assert got.status == targets[results.index(True)]
 
     async def test_update_writes_single_writer_fields(self, registry: AgentRegistry) -> None:
         await registry.register(_info())
