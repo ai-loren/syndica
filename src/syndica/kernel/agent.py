@@ -416,7 +416,9 @@ class BaseAgent:
         dict，就地写会把它变成「属于第一个 Agent」：此后从同一个工厂造出来的每一个 Agent 都继承到
         一套绑着别人 id 的工具，而跨 Runtime 时连一条日志都没有。所以这里换上本 Agent 自己的一份，
         **两侧一起换**——换完 `self.options.tools` 与 executor 仍是同一个 dict 对象，`AgentOptions`
-        承诺的热插拔因此照常成立。
+        承诺的热插拔因此照常成立。代价是宿主手里那张**原**表从此不再是本 Agent 的活表（要热插拔
+        就改 `agent.options.tools`）：共享它正是上面那个缺陷本身，但装过与没装过的 Agent 因此不
+        对称。
 
         同名键被新装的覆盖，判重名是调用方的事：静默覆盖会让这个 Agent 自己那一个永远调不到，而
         run 照常以 COMPLETED 返回。

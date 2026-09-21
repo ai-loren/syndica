@@ -100,6 +100,7 @@
 
 | # | 内容 |
 |---|---|
+| D-51 | **装过编排工具的 Agent 与没装过的，对「宿主手里那张原工具表」不对称。** C-1 的修法（Task 15 修复轮）让 `install_runtime_tools` 换上 Agent 自己的一份，于是 `orchestration=True` 的 Agent 此后不再共享工厂交进来的那张 dict，而 `orchestration=False` 的仍然共享。**不对称是修法的直接后果而不是疏漏**——共享它正是那条 Critical 本身（工厂复用同一张表时，第一次装配就把它变成「属于第一个 Agent」）；热插拔的入口仍在（改 `agent.options.tools`，executor 与它同对象，有用例钉住）。登记在这里是因为它是**公开字段上可观察的行为差异**：一个宿主如果按「我交进去的那张表就是它的活表」写代码，开不开 `orchestration` 会得到两种结果 | 发布前确认一次：要么把「收下之后内核可能换成自己的一份」写进 `AgentOptions.tools` 的公开契约（现在只写在 `install_runtime_tools` 上），要么让两条路一致（无条件在 `BaseAgent.__init__` 里取自己的一份——但那会打掉「工厂在构造之后往这张表里挂绑 `agent_id` 的工具」这个本仓自己在用的写法，见 `_AgentTool` 的 docstring） |
 | D-27 | **三条「唯一证据型」ERROR**（`_report_abandoned_input` / `_report_unwaited_timeout` / `_report_discarded_take_failure`）都断 `record.args`，但共同依赖「root logger 默认 WARNING」这个前提；宿主把级别调高则三条一起静默。这是既有模式，发布前确认一次。**计划 2 Task 11 又加了一条同族记录且更靠近那条线**：`tool_executor._report_allowed_low_risk_from_untrusted` 是 WARNING 而非 ERROR（它报的是一次放行，不是故障），于是宿主只要把级别提到 ERROR，spec §12.2 矩阵里那格唯一的痕迹就没了。发布前一并定这四条的级别与宿主配置指引。**计划 2 Task 13 又加了第五条 `hooks.center._report_discarded_return`，它是这一族里唯一「每次触发都可能重复」的**：前四条各自对应一次一过的丢失，而它按「切点 × 回调」计数，一个挂错层的观察者会在每一次触发上各产出一条。已量：单条 ERROR 332 字符；20 个观察者 × 3 次 trigger = 60 条 ≈ 19.5 KiB；`turn_start` 每轮触发一次，一个 500 轮长跑上 1 个挂错的观察者 ≈ 500 条 ≈ 162 KiB、20 个 ≈ 10 000 条 ≈ 3.2 MiB。**不改级别**（降级就等于把 D-07 那半重新静默掉，而它是这次丢弃的全部痕迹），发布前定的是宿主侧的去重 / 采样指引 |
 
 ## 明确不在里程碑 1（BEYOND-M1）
