@@ -2,7 +2,7 @@
 
 写于 2026-09-21。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
-**一句话现状：** 计划 1、计划 2（含横切审计与 Task 16 评审残留）的**代码已收口并 commit**；计划 3 **计划已写，Task 1（清单解析）与 Task 2（工具目录 / D-49 / D-08）已落地并 commit（`97c9edc` / `551b4d2`），Task 3–8 未做**；计划 4–6 未写未做。本地 `main` 比 `origin/main` 超前 17 个 commit，**未 push**。下一刀是计划 3 Task 3。
+**一句话现状：** 计划 1、计划 2（含横切审计与 Task 16 评审残留）的**代码已收口并 commit**；计划 3 **计划已写，Task 1–3 已落地并 commit（`97c9edc` / `551b4d2` / `7071eda`），Task 4–8 未做**；计划 4–6 未写未做。本地 `main` 比 `origin/main` 超前 20 个 commit，**未 push**。下一刀是计划 3 Task 4（插值 + freeze）。
 
 **先读顺序**
 
@@ -27,20 +27,23 @@
 | git | 本项目此前默认**改完即 commit、不 push**，除非用户再说「推」 |
 | 提交时 | `git -c trace2.eventtarget= -c trace2.eventnesting= commit`（本机 git 会被 trace2 塞 Co-authored-by: Cursor） |
 
-**本文对照的基线 HEAD：`551b4d2`。** 提交本文之后 `HEAD` 会再前进一步；动手前以 `git log -3 --oneline` 与 `git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
+**本文对照的基线 HEAD：`7071eda`。** 提交本文之后 `HEAD` 会再前进一步；动手前以 `git log -3 --oneline` 与 `git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
 
 ```
 $ git status -sb
-## main...origin/main [ahead 17]
-（工作区干净，无未提交改动——本文 commit 之后会变成 ahead 18）
+## main...origin/main [ahead 20]
+（工作区干净，无未提交改动——本文 commit 之后会变成 ahead 21）
 ```
 
-`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 从新到旧（相对 origin/main 的 17 个）：
+`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 从新到旧（相对 origin/main 的 20 个）：
 
 | sha | 内容 |
 |---|---|
+| `7071eda` | **计划 3 Task 3**：`AgentCatalog` 加载 / 覆盖可查询；同目录撞名整批拒绝；`get()` 也查不到未提交的名字 |
+| `cb08264` | 上一版交接补一句：Task 3 改的是已有 `catalog.py` |
+| `eb73b3b` | 更早一版交接（当时下一刀还是 Task 3；本文取代它） |
 | `551b4d2` | **计划 3 Task 2**：`validate_tool_names` 认 Mapping；`catalog.py` 的 `register_tool` / `resolve_tool_names`；关掉 D-49、D-08 |
-| `826ef59` | 上一版交接（当时下一刀还是 Task 2；本文取代它） |
+| `826ef59` | 交接（当时下一刀还是 Task 2） |
 | `97c9edc` | **计划 3 Task 1**：`AgentManifest` + `parse_mapping`；未知键当场拒绝；尚未导出 |
 | `d066f4c` | 更早一版交接（Task 1 还没写） |
 | `dbd7fd9` | 写出计划 3 文件（声明式 Agent、拓扑、四个内置） |
@@ -59,7 +62,7 @@ $ git status -sb
 
 更早的计划 2 Task 1–15 已在 `origin/main` 一侧。
 
-**本轮停笔时工作区干净。** `catalog.py` 与 `test_catalog.py` **已经存在并 commit**（`551b4d2`）。不要重做 Task 1 / Task 2。下一刀是 Task 3：在已有 `catalog.py` 上加 `AgentCatalog` 加载 / 覆盖，**改** `test_catalog.py`，不要当空白重写。
+**本轮停笔时工作区干净。** 不要重做 Task 1 / Task 2 / Task 3。下一刀是 Task 4：在已有 `catalog.py` / `manifest.py` 上加插值 + `freeze`，**改** `test_catalog.py`，新建 `tests/kernel/test_prompt_interpolation.py`。
 
 ---
 
@@ -87,12 +90,12 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | Runtime 创建多个 Agent、互发消息 | **已做** | 计划 2；`tests/integration/test_multi_agent_lifecycle.py` |
 | 各自跑通 LLM + 工具循环 | **已做（内核侧）** | 计划 1 turn 循环 + ScriptedLLM；真 LLM 在计划 4 |
 | 可终止与恢复 | **已做** | `kill` / `despawn` / `pause` / `resume` / `abort`；ZOMBIE 可寻址 |
-| 声明式 Agent 定义（§4.6） | **清单解析 + 工具目录已做；freeze / 内置未做** | 计划 3 Task 1–2 已 commit；还差 Task 3–4、7–8 |
+| 声明式 Agent 定义（§4.6） | **清单解析 + 工具目录 + 加载/覆盖已做；freeze / 内置未做** | 计划 3 Task 1–3 已 commit；还差 Task 4、7–8 |
 | 拓扑装配（§4.7） | **计划已写，代码未做** | 计划 3 Task 5–6、8 |
 | Tool 系统与 LLM 抽象 | **内核抽象已做** | Tool / ToolExecutor / DangerJudge / ScriptedLLM；OpenAI 兼容 provider 在计划 4 |
 | 最小本地执行（读写文件 + 跑命令） | **未做** | 计划 4（`Read`/`Write`/`Edit`/`Glob`/`Grep`/`Bash`…） |
 
-**结论：计划 2 + 横切审计 ≈ 内核控制面做完；计划 3 Task 1–2 把清单解析和工具目录钉住了。里程碑 1 本身没完。** 还缺 catalog 加载 / freeze / 拓扑 / 四个内置、本地执行。
+**结论：计划 2 + 横切审计 ≈ 内核控制面做完；计划 3 Task 1–3 把清单解析、工具目录、AgentCatalog 加载/覆盖钉住了。里程碑 1 本身没完。** 还缺 freeze / 拓扑 / 四个内置、本地执行。
 
 子计划边界（不要重新解释）：
 
@@ -100,7 +103,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 |---|---|---|
 | **1** | 单 Agent turn 循环 | **代码收口**，已在更早的历史上 |
 | **2** | 事件循环、生命周期、等待、危险判定、工具并发、插件、编排工具、公开面 | **代码收口**（含审计修复 + Task 16 残留） |
-| **3** | 声明式清单、目录、拓扑、四个内置角色 | **计划已写** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；**2/8 已执行**（Task 1 = `97c9edc`，Task 2 = `551b4d2`） |
+| **3** | 声明式清单、目录、拓扑、四个内置角色 | **计划已写** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；**3/8 已执行**（Task 1 = `97c9edc`，Task 2 = `551b4d2`，Task 3 = `7071eda`） |
 | **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | 未写未做 |
 | **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | 未写未做 |
 | **6** | CLI + L2 场景回放 + AskUser | 未写未做 |
@@ -205,7 +208,7 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 9. **变异（已杀死）：** 删未知键检查；只报第一个未知键；丢掉 Mapping 守卫让 tools dict 走别的错；`budget` 额外键放行；没有 origin 仍读已存在的文件。`..` 检查相对 `relative_to` 是纵深，单删 `.. in parts` 会被第二层挡住（存活，可接受）。
 10. **kernel 零 PyYAML。** 本模块没有 HostFacts（那是 Task 4）。
 
-`_WITHHELD` 现含 Task 1 三个名字 + Task 2 的 `register_tool` / `resolve_tool_names`，Task 8 再挪进 `kernel.__all__`。不要在 Task 3–7 里提前导出。
+`_WITHHELD` 现含 Task 1 三个名字 + Task 2 的 `register_tool` / `resolve_tool_names` + Task 3 的 `AgentCatalog` / `OverrideRecord`，Task 8 再挪进 `kernel.__all__`。不要在 Task 4–7 里提前导出。
 
 ### 3.7 计划 3 Task 2 —— 已落地，commit `551b4d2`
 
@@ -232,6 +235,32 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 7. **变异（已杀死，各只红一条）：** drop-mapping-guard；first-missing-only；resolve-catalog-order；register-renames-to-schema-name；return-the-catalog-object（红顺序 + 浅副本两条）；drop-validate-on-resolve（只红生插那条）。
 8. **Task 3 会改同一份 `catalog.py` / `test_catalog.py`。** 计划原文写「Create test_catalog.py」已经过时：文件在。加载 / 覆盖加在现有模块上，保留 Task 2 的五个必写用例名。
 
+### 3.8 计划 3 Task 3 —— 已落地，commit `7071eda`
+
+**不要重做。** 门禁：`uv run pytest tests/kernel/test_catalog.py tests/kernel/test_public_api.py tests/kernel/test_manifest.py -q` → **49 passed**；ruff / pyright 0 errors；`scripts/check_deps.py` 空。独立评审先 CHANGES_REQUESTED：撞名失败后只钉 `names()` 挡不住「Unique 写进 `_entries`、不改 `_order`」的漏写，补了 `get('Unique')` / `get('Worker')` 拒绝后再过。
+
+| 文件 | 角色 |
+|---|---|
+| `src/syndica/kernel/catalog.py` | 同一模块里工具目录 + `AgentCatalog` / `OverrideRecord`；字面 `__all__` 含四名 |
+| `tests/kernel/test_catalog.py` | 保留 Task 2 五个用例 + Task 3 五个必写 + 先见顺序 / 文件 origin / register_class docstring |
+| `tests/kernel/test_public_api.py` `_WITHHELD` | 扣留 `AgentCatalog`、`OverrideRecord` |
+| `src/syndica/kernel/__init__.py` | **没动**（等 Task 8） |
+
+执行时拍板、下一任不要改回去的细节：
+
+1. **覆盖记 `OverrideRecord`，`overrides(name)` 从旧到新。** `displaced_at_index` 是该名字第几次被挤掉（从 0 起），**不是** `names()` 下标。从未见过或从未覆盖 → `()`。
+2. **`names()` 是第一次见到该名的顺序**，覆盖不把名字挪到末尾，也**不是**排序。证据：`test_names_are_first_seen_not_sorted`（Zeta, Alpha, Mu）。
+3. **同一次 `load_json_directory` 内部撞名不是覆盖。** 先解析整批，再 `_reject_duplicate_names_in_one_directory`，再 `_put`。撞了 → ConfigError，**这一批一个都不写**。目录里先在的条目不动。
+4. **`names()` 不够钉「整批不写入」。** 必须 `get('Unique')` 与 `get('Worker')` 都 `ConfigError`（received 点名缺失的那个名字），`get('Alpha')` 仍是先在的。只污染 `_entries`、不改 `_order` 的突变体能让 19 个测试全绿。
+5. **只收下一层 `*.json`。** `suffix == '.json'`，不递归，不认 `notes.txt` / `worker.json.bak` / 子目录 `hidden.json`。`get('Bak')` / `get('Scout')` / `get('Hidden')` 的 received 必须点名缺失。
+6. **JSON 文件 `origin` = 父目录**；目录加载 `origin` = 目录路径，`kind=json_directory`。`system_prompt` 相对路径靠 origin。
+7. **`register_class` 不实例化。** description = 类 docstring 去掉首尾空白后的第一行；空白 docstring → ConfigError。
+8. **`register_builtin(data, *, location)`** 本任务就提供了（kind=builtin）。`get()` 找不到时 next_action 点名 `load_mapping` / `load_json_file` / `load_json_directory` / `register_class` / `register_builtin`。
+9. **`load_mapping` / `register_class` 的 `source`、`register_builtin` 的 `location` 签名收 `object`**，与 `parse_mapping` 同型，避免 pyright 把 `isinstance` 判成多余。None → 默认 `mapping` / `<mapping>`。
+10. **`get(name)` 永不返回 None**。没有这个名字就 ConfigError，received 列出 `names()` 现有名单。
+11. **freeze 不在本层。** 本任务只交 `get(name) -> AgentManifest`。
+12. **变异（8/8 已杀死）：** 不记 OverrideRecord；覆盖把名字挪到末尾；只留最后一次覆盖；跳过同目录撞名；`rglob('*.json')`；`names()` 排序；撞名后把 Unique 漏进 `_entries`；`'.json' in name` 当后缀。本机 bash 没有 `declare -A`，跑手是 `/tmp/syndica-t3-mutate.py`（不入库），sha256 还原。
+
 ---
 
 ## 4. 还没做完的（按动手顺序）
@@ -247,7 +276,7 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 | M-7 | spec `AgentInfo.type` 实现叫 `agent_type`（避开内置名） | 登记即可，不要改回去 |
 | M-8 | `WaitState.ABORTED` 自己的 docstring 仍只写「协作式中止落在等待上」 | 补枚举 docstring，把 D-26 契约写到宿主会读的那一行 |
 
-### 4.1 下一步：执行计划 3 Task 3–8（8 个任务，2 完成）
+### 4.1 下一步：执行计划 3 Task 4–8（8 个任务，3 完成）
 
 **已关：** D-49、D-08。**不要动：** D-58（禁止 `Runtime.start` / `Junction.RUNTIME_START`）。
 
@@ -273,8 +302,8 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 |---|---|---|---|---|
 | **1** | `AgentManifest` + `parse_mapping`（不含工具解析） | `manifest.py`、`test_manifest.py`；`__init__.py` 先不要导出；`_WITHHELD` 扣三个名字 | — | **已 commit `97c9edc`** |
 | **2** | `validate_tool_names` 认 Mapping + 名字列表→工具表 | 改 `tool.py`、`test_tool.py`；`catalog.py` 的 `resolve_tool_names` / `register_tool` | **D-49、D-08** | **已 commit `551b4d2`** |
-| **3** | `AgentCatalog`：加载、覆盖可查询、`get(name)` | **改**已有 `catalog.py`、`test_catalog.py`（不要当空白重写） | — | **下一刀** |
-| **4** | 插值 + `freeze` 成 `AgentFactory` | `catalog.py` / `manifest.py`、`test_prompt_interpolation.py` | — | 未做 |
+| **3** | `AgentCatalog`：加载、覆盖可查询、`get(name)` | **改**已有 `catalog.py`、`test_catalog.py`（不要当空白重写） | — | **已 commit `7071eda`** |
+| **4** | 插值 + `freeze` 成 `AgentFactory` | `catalog.py` / `manifest.py`、`test_prompt_interpolation.py` | — | **下一刀** |
 | **5** | `AgentSlot` / `Topology` 校验（还不接 Runtime） | `topology.py`、`test_topology.py` | — | 未做 |
 | **6** | `Runtime.assemble` / `resolve` / `occupy` / `send_to_slot` | `runtime.py`、`test_assemble.py`、`_RUNTIME_SURFACE` 加名字 | — | 未做 |
 | **7** | 四个内置角色 | `src/syndica/kernel/agents/{orchestrator.py,planner.json,explorer.json,worker.json,__init__.py}`、`test_builtin_agents.py` | — | 未做 |
@@ -332,7 +361,7 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 
 | 归属 | 条目 |
 |---|---|
-| **计划 3（还没关的）** | 无（D-49、D-08 已关）。剩下的是 Task 3–8 的功能，不是登记表 OPEN 项 |
+| **计划 3（还没关的）** | 无（D-49、D-08 已关）。剩下的是 Task 4–8 的功能，不是登记表 OPEN 项 |
 | **计划 4** | D-09、D-50、D-34、D-36、D-37、D-10–D-17、D-53、D-56、D-57 |
 | **计划 5** | D-18、D-47（墙钟）、D-19–D-23、D-29、D-55 |
 | **计划 6** | D-38 |
@@ -346,22 +375,25 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 在 `/Users/bytedance/Documents/syndica`：
 
 ```bash
-git status -sb          # 应是 main...origin/main [ahead 18]（本文 commit 之后），工作区干净
-git log -3 --oneline    # 第一条应是本文；第二条 `551b4d2` Task 2
+git status -sb          # 应是 main...origin/main [ahead 21]（本文 commit 之后），工作区干净
+git log -3 --oneline    # 第一条应是本文；第二条 `7071eda` Task 3
 ```
 
 然后：
 
-1. 打开 [`docs/plans/2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)，从 **Task 3** 开始。不要重做 Task 1 / Task 2，不要先写计划 4，不要加 `Runtime.start`。
-2. Task 3 必写用例名已经列在计划里。`catalog.py` 与 `test_catalog.py` **已经有** Task 2 的登记 / 解析；在上面加 `AgentCatalog`，保留 Task 2 用例。新公开名字进 `_WITHHELD`，`kernel.__all__` 仍然先不要动。
+1. 打开 [`docs/plans/2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)，从 **Task 4** 开始。不要重做 Task 1 / Task 2 / Task 3，不要先写计划 4，不要加 `Runtime.start`。
+2. Task 4 必写用例名已经列在计划里。`catalog.py` 与 `test_catalog.py` **已经有** Task 2 登记 / Task 3 加载覆盖；在上面加 `HostFacts` + 插值 + `freeze`。新建 `tests/kernel/test_prompt_interpolation.py`。新公开名字（至少 `HostFacts`）进 `_WITHHELD`，`kernel.__all__` 仍然先不要动。
 3. 每个任务走完变异 + 独立评审再 commit。**仍不要 push**，直到 M1 收口审计通过，或用户明确说推。
 
-Task 3 压缩版（细节以计划 Task 3 节为准）：
+Task 4 压缩版（细节以计划 Task 4 节为准）：
 
-- 改 `src/syndica/kernel/catalog.py`：`load_mapping` / `load_json_file` / `load_json_directory`（只 `*.json`，不递归子目录）；`register_class`；同名覆盖记 `OverrideRecord`；`overrides(name)` / `source_of(name)` / `names()`（第一次见到该名的顺序，覆盖不洗牌）。
-- 同一目录两个文件 `name` 相同 → ConfigError。至少 `get(name) -> AgentManifest`。工厂可以先交未解析 tools 的占位，freeze 在 Task 4。
-- 必写：`test_later_source_overrides_the_same_name_and_the_displaced_record_is_queryable`、`test_override_chain_keeps_every_displaced_source_oldest_first`、`test_names_keep_first_seen_order_when_overridden`、`test_two_json_files_in_one_directory_with_the_same_name_are_rejected`、`test_load_json_directory_ignores_non_json_and_does_not_recurse`。
-- 本机 bash **没有** `declare -A`，变异跑手用 Python。先清 `__pycache__`，sha256 还原（不要 `git checkout`）。基线必须覆盖 `catalog.py` 与 `test_catalog.py`（Task 2 已有的文件也要进基线）。
+- `HostFacts(os, platform, shell)`。插值白名单只有这三项；`{cwd}` 专用错误（next_action：把工作目录写进历史块，不要写进 System Prompt）。未知占位符拒绝。双花括号当字面量 `{`。
+- `catalog.freeze(tools, models, host) -> Mapping[str, AgentFactory]`：解析 tools/model/extends/subagents；闭包捕获副本；声明式工厂签名必须是 `(hooks, events) -> BaseAgent`。交出的 `AgentOptions.system_prompt` 已插值、`tools` 已是 dict、`max_turns` 已从 budget 映射。
+- extends 环、extends 指向声明式、extends 未知名 → ConfigError。freeze 后的工厂表交给 `validate_agent_factories`。
+- 类式：`impl` 是 type 则 `lambda hooks, events: cls(options, hooks=hooks, events=events)`；`impl` 是 str 则 importlib 加载，失败三件套。
+- 内核仍然不读 `os.environ` / `os.getcwd`。HostFacts 由宿主注入。
+- 必写十条用例名见计划 Task 4 节。Worker 在计划 4 之前 freeze 会因缺文件工具失败——那是约束，测试注入 stub。
+- 本机 bash **没有** `declare -A`，变异跑手用 Python。先清 `__pycache__`，sha256 还原（不要 `git checkout`）。基线必须覆盖 `catalog.py`、`manifest.py`、`test_catalog.py`、新建的 `test_prompt_interpolation.py`（新文件先 `git add`）。
 
 ---
 
@@ -380,7 +412,10 @@ Task 3 压缩版（细节以计划 Task 3 节为准）：
 - **并发 CAS 用例挡不住「两个赢家都写同一个 new」**——三个目标状态不同才分得出。
 - **一次没复现的 despawn 级联泄漏**（审计故意不上报）：`p9_growth.py` 第一次跑在「父子级联」段留下 25 条注册表条目 + 25 个 `_slots`，此后九次重跑与 40 轮随机化全零。若将来看到「每次少拆一个」，怀疑 `_destroy_tree` 的 `while fresh :=` 与并发收割交互。
 - **本机 bash 没有 `declare -A`**。Task 1 变异跑手因此改成 Python dict。不要写 bash 关联数组。还原用 sha256 基线，不要 `git checkout`（会把未提交的测试也冲掉）。
-- **Task 3 会改同一份 `catalog.py`。** 计划原文写 Create，实际是 Modify。Task 2 的五个必写用例名必须继续绿。
+- **Task 4 会改同一份 `catalog.py` / `manifest.py`。** 计划原文写 Create `test_prompt_interpolation.py`，实际 catalog 是 Modify。Task 2 / Task 3 的必写用例名必须继续绿。
+- **同目录撞名：`names()` 钉不住「整批不写入」。** 只把 Unique 塞进 `_entries`、不改 `_order` 时 `names()` 仍是 `('Alpha',)`。必须 `get('Unique')` / `get('Worker')` 都拒绝。
+- **后缀用 `suffix == '.json'`，不要 `'.json' in name`。** `worker.json.bak` 是诱饵。
+- **`displaced_at_index` 不是 `names()` 下标。** 它是该名字第几次被挤掉，从 0 起。
 - **装门**：生产路径只有 `Runtime.spawn` → `agent._attach_gate`（测试可 `pyright: ignore[reportPrivateUsage]`）。宿主构造 `BaseAgent` 时不要传 `gate=`。
 
 ---
@@ -395,6 +430,7 @@ Task 3 压缩版（细节以计划 Task 3 节为准）：
 | 角色表校验（D-49 的参照实现） | `runtime.py` `validate_agent_factories` / `_not_a_role_table` |
 | 声明式清单解析（Task 1 已做） | `src/syndica/kernel/manifest.py` `parse_mapping` |
 | 工具目录（Task 2 已做） | `src/syndica/kernel/catalog.py` `register_tool` / `resolve_tool_names`；`tool.py` `validate_tool_names` |
+| Agent 目录（Task 3 已做） | `src/syndica/kernel/catalog.py` `AgentCatalog` / `OverrideRecord` |
 | 公开面守卫 / `__init__` 签名 | `tests/kernel/test_public_api.py` |
 | 装门（仅内核） | `BaseAgent._attach_gate`；测试走 `_agent(..., gate=)` |
 | 多 Agent 取证 | `tests/integration/test_multi_agent_lifecycle.py` |
