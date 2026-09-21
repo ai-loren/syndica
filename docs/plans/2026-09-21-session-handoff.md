@@ -1,6 +1,6 @@
 # 会话交接：里程碑 1 做到哪、接着做什么
 
-写于 2026-09-21。上一轮 token 见底，横切审计修复已合入本地 `main`，计划 3 尚未动笔。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
+写于 2026-09-21。横切审计修复已合入本地 `main`，计划 3 **已写好、未执行**。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
 **先读顺序**：本文 → [`AGENTS.md`](../../AGENTS.md) → [`docs/design/2026-09-03-architecture.md`](../design/2026-09-03-architecture.md)（spec，§15 / §17） → [`docs/decisions/2026-09-08-m1-scope.md`](../decisions/2026-09-08-m1-scope.md) → [`docs/decisions/2026-09-14-deferred-items.md`](../decisions/2026-09-14-deferred-items.md) → 当前子计划。
 
@@ -17,7 +17,7 @@
 | git | 本项目此前默认**改完即 commit、不 push**，除非用户再说「推」 |
 | 提交时 | `git -c trace2.eventtarget= -c trace2.eventnesting= commit`（本机 git 会被 trace2 塞 Co-authored-by） |
 
-**写本文时的 HEAD（交接当时）**：`d4961c1`。此后又合入了交接文档本身（`0269add` / `a15c31b` / `5f808eb`）以及 **Task 16 评审残留 I-2/I-3/I-4 + M-1/M-2**（见 §2.5）。动手前以 `git log -5 --oneline` 为准。
+**写本文时的 HEAD（交接当时）**：`d4961c1`。此后又合入了交接文档本身（`0269add` / `a15c31b` / `5f808eb`）、**Task 16 评审残留**（`77f33fc`，见 §2.5）、以及计划 3 文件。动手前以 `git log -5 --oneline` 为准。
 
 ```
 $ git status -sb
@@ -28,7 +28,7 @@ $ git status -sb
 
 | sha | 内容 |
 |---|---|
-| （本轮） | `__init__` 签名守卫 / orchestration 两档 / `attach_gate` 降私有 / `__all__` 扫描 fail-loud / trigger 计数 / 关闭 D-52 |
+| `77f33fc` | `__init__` 签名守卫 / orchestration 两档 / `attach_gate` 降私有 / `__all__` 扫描 fail-loud / trigger 计数 / 关闭 D-52 |
 | `5f808eb` | 交接文档里 1020 那条 pytest 命令写完整 |
 | `a15c31b` | 交接文档补全量 1710 与 M-7/M-8 |
 | `0269add` | 记下里程碑 1 做到哪、还剩什么（本文） |
@@ -144,20 +144,20 @@ I-2 / I-3 / I-4 / M-1 / M-2 已落地；D-52 已关。还没做的 Minor：
 | M-7 | spec `AgentInfo.type` 实现叫 `agent_type`（避开内置名） | 登记即可，不要改回去 |
 | M-8 | `WaitState.ABORTED` 自己的 docstring 仍只写「协作式中止落在等待上」 | 补枚举 docstring，把 D-26 契约写到宿主会读的那一行 |
 
-### 3.1 然后：写并执行计划 3
+### 3.1 然后：执行计划 3（计划已写、未执行）
 
-范围见 [m1-scope](../decisions/2026-09-08-m1-scope.md) 表：
+计划文件：[`docs/plans/2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)（含 9 条设计裁决、8 个任务、自审）。范围见 [m1-scope](../decisions/2026-09-08-m1-scope.md) 表：
 
 - 声明式 Agent 定义（spec §4.6：清单十字段、加载与同名覆盖可查询、提示词插值白名单）
 - Topology 装配（§4.7：三档 cardinality、三档 boot、只增量增强）
 - 内核四个 Agent（§4.8：`Orchestrator` 类式，`Planner` / `Explorer` / `Worker` 声明式）
 
-挂在计划 3 上的登记：
+挂在计划 3 上的登记（执行时关掉）：
 
 - **D-49** `validate_tool_names` 非 Mapping 撞裸 `AttributeError`（与已修的 `validate_agent_factories` 同型；清单会在这里转成 tools dict）
 - **D-08** 手写 schema 的 `name` 与 `tool.name` 可分叉（收口在注册层）
 
-还没有计划文件。按「一个一个来」：**先写计划 3 并自己 review，再执行，不要直接开写代码。**
+**不要加 `Runtime.start()`**（D-58）。YAML 不进 kernel，收 Mapping / JSON。文件工具仍是计划 4，清单只点名。
 
 ### 3.2 计划 4（未写未做）
 
@@ -195,7 +195,7 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 
 在 `/Users/bytedance/Documents/syndica`、确认工作区干净之后：
 
-1. **写计划 3**（新文件 `docs/plans/2026-09-21-m1p3-declarative-agents.md`），结构对齐计划 2：Goal / Architecture / Global Constraints / 设计裁决 / 任务拆解。写完自己 review，**再开执行**。不要直接写代码。
+1. **执行计划 3**（已写好并自审）：[`docs/plans/2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)。Task 1 起，不要先写计划 4。关闭 D-49 / D-08；不要加 `Runtime.start`。
 2. 每个任务继续走：实现 → 自我变异（先清 `__pycache__`；新文件先 `git add`；sha256 基线必须覆盖本轮会改到的每个文件，见 AGENTS.md）→ 独立评审 → 修复 → 收口。
 3. 遗留项**同时**记进 [`docs/decisions/2026-09-14-deferred-items.md`](../decisions/2026-09-14-deferred-items.md)，不要只写 gitignored 的 `.superpowers/sdd/progress*.md`。
 4. **仍不要 push**，直到里程碑 1 收口审计通过，或用户明确说推。
