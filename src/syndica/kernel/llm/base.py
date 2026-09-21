@@ -79,5 +79,17 @@ class LLM(Protocol):
         ...
 
     async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
-        """返回一个 assistant block。超窗抛 ContextOverflowError。"""
+        """返回一个 assistant block。超窗抛 ContextOverflowError。
+
+        **进请求的只有 `role` / `content` / `tool_calls` / `tool_call_id` 这四个字段**；
+        `extra` / `trust` / `artifacts` 一律不进。它们是内核自己的旁路数据，模型看不到是内核
+        依赖的性质，不是巧合：
+
+        - `extra['tool_meta']` 装着每一次工具调用的 `meta`，而 spec §5.6 把「给模型看的」与
+          「给代码用的」分开正是为了不让结构化数据进上下文。内核据此把某些东西**只**放进 `meta`
+          （`QueryAgent` 报出的子代 id 就是一例：模型顺着它只能往上走，拿不到别人的子树）。把
+          block 整个 `asdict` 出去的实现会把这些全部灌进模型上下文。
+        - `trust` 不进字节是分叉能复用前缀缓存的前提（spec §5.2 纪律 4）：内核会收紧一块继承来的
+          `trust` 来补偿截断丢掉的标记，而分身的前缀必须与源逐字节相同。
+        """
         ...

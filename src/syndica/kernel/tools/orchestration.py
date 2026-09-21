@@ -27,6 +27,11 @@
 **`SendMessage` 刻意不受同一条限制**：子 Agent 向父汇报是 spec §4.5 的正常用法，而消息落进对方
 上下文时带着发起方的溯源结论、对方自己的闸照常生效——它是加内容，不是拆东西。
 
+**目标归别的执行体管时 `KillAgent` 不上抛。** 两个 Runtime 共享注册表与 broker 是
+`Runtime._control_target` 明文预期的拓扑，那时 `kill` 对**程序员**报 `ContractViolation`；而这
+件事模型应对得了（改用 `SendMessage`、或把它报给父 Agent），上抛则会打断整批调用、把调用者这次
+run 打成 ERROR——而 `QueryAgent` 对同一个目标答的是「一切正常」。
+
 **本模块读 `Runtime` 上四个带下划线的接缝**（`_wait_in_turn` / `_factory_of` / `_provenance_of` /
 `_descendants`）。它们刻意不进公开面：加一个公开方法不是破坏性变更，去掉一个是，所以先私有、真有
 第三方要再放出来。这些工具与 `Runtime` 同在内核里，因此每个读点单独豁免 `reportPrivateUsage`，
@@ -46,6 +51,7 @@ from typing import TYPE_CHECKING
 
 from syndica.kernel.agent_types import ExitMode
 from syndica.kernel.context import Context, StopReason, TrustLevel, provenance_of
+from syndica.kernel.errors import ContractViolation
 from syndica.kernel.message import Trigger
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.waiting import WaitState
@@ -336,6 +342,8 @@ class QueryAgent(_AgentTool):
         """
         info = await self._runtime.find(agent_id)
         if info is None:
+            # 两条路的 meta 键必须一样：少一个键，读 `meta['children']` 的 surface 在这条路上撞
+            # KeyError。「在不在」由 `status is None` 回答。
             return ToolResult(
                 output=(
                     f'期望: agent {agent_id!r} 在注册表里。'
@@ -343,7 +351,7 @@ class QueryAgent(_AgentTool):
                     ' 下一步: 核对 id（Delegate / Fork 交回的那一个）；'
                     '确实需要这件工作就用 Delegate 派一个新的。'
                 ),
-                meta={'agent_id': agent_id, 'status': None},
+                meta={'agent_id': agent_id, 'status': None, 'children': []},
             )
         return ToolResult(
             output=(
@@ -403,12 +411,28 @@ class KillAgent(_AgentTool):
                     '（Delegate / Fork 造出来的，以及它们的后代）。'
                     f' 实际: agent {agent_id!r} 不在你这棵子树里——'
                     '它是你的父、你的同辈，或别人派出去的。'
-                    ' 下一步: 只停你自己派出去的那些；'
-                    f'用 QueryAgent({agent_id}) 看它的 parent 是谁，'
-                    '要停它就把这件事交给你们共同的父 Agent。'
+                    ' 下一步: 只停你自己派出去的那些。'
+                    f'用 QueryAgent({agent_id}) 读它的 parent：那是派出它的一方，'
+                    '把「该停掉它」写进你的结论交给你的父 Agent 去找它；'
+                    '它的 parent 是 None（宿主直接建的根）就没有哪个 Agent 停得了它，'
+                    '如实报告这件事，不要重试。'
                 )
             )
-        await self._runtime.kill(agent_id)
+        try:
+            await self._runtime.kill(agent_id)
+        except ContractViolation as exc:
+            # `kill` 这条拒绝是写给**程序员**的（本进程没有它的实例、驱动任务还没接管）。对模型
+            # 它是可应对的：目标归别的执行体管，改用 SendMessage 或把这件事报上去。让它上抛会打断
+            # 整批调用、把调用者这次 run 打成 ERROR，而 QueryAgent 对同一个目标答的是「一切正常」。
+            return ToolResult(
+                output=(
+                    f'期望: 停下 agent {agent_id} 的事件循环。'
+                    f' 实际: 本进程停不了它——{exc.received}。'
+                    f' 下一步: 用 SendMessage({agent_id}, ...) 让它自己收手；'
+                    '要真的终止它，把这件事写进你的结论交给你的父 Agent——'
+                    '只有持有它那个执行体停得了它。'
+                )
+            )
         return ToolResult(
             output=(
                 f'已终止 agent {agent_id} 的事件循环。它仍留在注册表里，'

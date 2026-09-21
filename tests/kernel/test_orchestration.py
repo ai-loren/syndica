@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 
 import pytest
@@ -20,6 +21,7 @@ from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.message import Trigger
 from syndica.kernel.runtime import AgentFactory, Runtime, _InTurnWaitResult
+from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tool_executor import DEFAULT_MAX_TOOL_CONCURRENCY
 from syndica.kernel.tools import (
@@ -168,6 +170,7 @@ _KILL_REFUSALS: dict[str, str] = {
     'self': '你自己的 id',
     'missing': '它已经不在了',
     'stranger': '不在你这棵子树里',
+    'foreign': '本进程停不了它',
 }
 
 
@@ -1730,15 +1733,17 @@ async def test_both_tools_describe_when_not_to_use_them_because_that_is_all_the_
 # ---------------------------------------------------------------- 五件套的形状
 
 
-def test_the_five_orchestration_tools_come_in_a_fixed_order():
+async def test_the_five_orchestration_tools_come_in_a_fixed_order():
     """工具表的迭代顺序逐字进请求前缀：重排不报错，只让整条会话的缓存静默失效（spec §5.2）。
 
     这个次序照 spec §5.6 的清单，既非升序亦非降序、也不等于自己的反转，基数 5。
     """
-    tools = orchestration_tools(Runtime(), 'a1')
+    runtime = Runtime()
+    tools = orchestration_tools(runtime, 'a1')
 
     assert list(tools) == ['Delegate', 'Fork', 'SendMessage', 'QueryAgent', 'KillAgent']
     assert [tool.name for tool in tools.values()] == list(tools)
+    await runtime.shutdown()
 
 
 @pytest.mark.parametrize(
@@ -1764,25 +1769,29 @@ def test_every_orchestration_tool_declares_its_own_command_args(cls):
     ],
     ids=['SendMessage', 'QueryAgent', 'KillAgent'],
 )
-def test_the_three_new_tools_describe_their_boundary_where_the_model_can_read_it(
+async def test_the_three_new_tools_describe_their_boundary_where_the_model_can_read_it(
     cls, mentions, required
 ):
     """反射出的 schema 取 `execute` docstring 的摘要，**类 docstring 里的字一个也到不了模型手上**。
 
     `模型看到的描述` 这句话只在类 docstring 里，所以它出现在 description 里就意味着取错了那一级。
     """
-    tool = cls(Runtime(), 'a1')
+    runtime = Runtime()
+    tool = cls(runtime, 'a1')
 
     assert all(name in tool.description for name in mentions)
     assert '模型看到的描述' not in tool.description
     assert set(tool.parameters['required']) == required
+    await runtime.shutdown()
 
 
-def test_the_valid_triggers_a_send_message_offers_are_exactly_the_enum():
+async def test_the_valid_triggers_a_send_message_offers_are_exactly_the_enum():
     """取值表从枚举派生：写死一份会在新增成员时静默过期，而这行字是模型改这个参数的唯一依据。"""
-    described = SendMessage(Runtime(), 'a1').parameters['properties']['trigger']['description']
+    runtime = Runtime()
+    described = SendMessage(runtime, 'a1').parameters['properties']['trigger']['description']
 
     assert all(trigger.value in described for trigger in Trigger)
+    await runtime.shutdown()
 
 
 async def test_each_agent_gets_its_own_five_tools_bound_to_its_own_id():
@@ -2131,9 +2140,51 @@ async def test_query_agent_tells_a_missing_agent_apart_from_a_sleeping_one():
         QueryAgent(runtime, asker).execute(agent_id=target), timeout=_TIMEOUT
     )
 
-    assert missing.meta == {'agent_id': 'nope', 'status': None}
+    assert missing.meta == {'agent_id': 'nope', 'status': None, 'children': []}
     assert all(part in str(missing.output) for part in _THREE_PART)
     assert sleeping.meta['status'] == 'zombie'
+    await runtime.shutdown()
+
+
+async def test_both_query_agent_answers_carry_the_same_meta_keys():
+    """两条路的 `meta` 形状必须一样：少一个键，读 `meta['children']` 的 surface 在其中一条路上
+    撞 `KeyError`。「在不在」由 `status is None` 回答，不由某个键在不在回答。
+    """
+    runtime = Runtime()
+    asker = await _idle_parent(runtime)
+
+    missing = await asyncio.wait_for(
+        QueryAgent(runtime, asker).execute(agent_id='nope'), timeout=_TIMEOUT
+    )
+    found = await asyncio.wait_for(
+        QueryAgent(runtime, asker).execute(agent_id=asker), timeout=_TIMEOUT
+    )
+
+    assert list(missing.meta) == list(found.meta)
+    assert missing.meta['status'] is None and found.meta['status'] == 'zombie'
+    await runtime.shutdown()
+
+
+async def test_query_agent_counts_the_children_without_naming_them():
+    """子代 id 只进 `meta`，`meta` 落在 block 的 `extra` 里、不进模型上下文。
+
+    模型顺着 `QueryAgent` 只能往**上**走（它报 `parent`）。id 一旦进 output，被注入的 Agent
+    就能枚举整棵树并向任意节点 `SendMessage`——而「`KillAgent` 限后代、`SendMessage` 不限」这个
+    不对称的风险论证，前提正是它拿不到别人的子树。
+    """
+    runtime = Runtime()
+    asker = await _idle_parent(runtime)
+    target = await _idle_parent(runtime)
+    children = [await _resident(runtime, target) for _ in range(2)]
+
+    result = await asyncio.wait_for(
+        QueryAgent(runtime, asker).execute(agent_id=target), timeout=_TIMEOUT
+    )
+
+    output = str(result.output)
+    assert 'children=2' in output
+    assert [child for child in children if child in output] == []
+    assert sorted(result.meta['children']) == sorted(children)
     await runtime.shutdown()
 
 
@@ -2240,9 +2291,45 @@ async def test_kill_agent_refuses_anything_that_is_not_your_own_descendant(relat
     assert _refusal_kind(result.output) == 'stranger'
     assert target in result.output
     assert 'QueryAgent' in result.output
+    # 三种关系共用同一段文案，而其中 `stranger` 是一个 parent_id=None 的根：「交给你们共同的
+    # 父 Agent」对它够不着。文案必须把这一格也说清，否则它给的是一条具体但做不到的下一步。
+    assert 'parent 是 None' in result.output
     info = await runtime.find(target)
     assert info is not None and info.status is AgentStatus.IDLE
     await runtime.shutdown()
+
+
+async def test_killing_something_another_runtime_holds_is_answered_not_raised():
+    """共享注册表 + broker 是 `_control_target` 明文预期的拓扑。
+
+    `kill` 那条 `ContractViolation` 是写给程序员的，而 `tool_executor` 对 `SyndicaError` 是
+    `raise` 不是转结果块——上抛会打断整批调用、把调用者这次 run 打成 ERROR，而 `QueryAgent` 对
+    同一个目标答的是「一切正常」：两个工具对同一个事实给出相反的答案。
+    """
+    registry = InMemoryAgentRegistry()
+    broker = InMemoryMessageBroker()
+    here = Runtime(registry=registry, broker=broker)
+    elsewhere = Runtime(registry=registry, broker=broker)
+    killer = await _idle_parent(here)
+    target = await elsewhere.spawn(
+        _worker([ScriptedTurn(content='x')]), exit_mode=ExitMode.IDLE, parent_id=killer
+    )
+    await _wait_for_registry_status(elsewhere, target, AgentStatus.IDLE)
+
+    result = await asyncio.wait_for(
+        KillAgent(here, killer).execute(agent_id=target), timeout=_TIMEOUT
+    )
+    queried = await asyncio.wait_for(
+        QueryAgent(here, killer).execute(agent_id=target), timeout=_TIMEOUT
+    )
+
+    assert isinstance(result.output, str)
+    assert all(part in result.output for part in _THREE_PART)
+    assert _refusal_kind(result.output) == 'foreign'
+    assert 'SendMessage' in result.output
+    assert queried.meta['status'] == 'idle'
+    await elsewhere.shutdown()
+    await here.shutdown()
 
 
 async def test_killing_yourself_is_refused_by_comparing_ids_not_task_identity():
@@ -2329,6 +2416,75 @@ async def test_three_killers_each_stop_only_their_own_child():
 
     statuses = [(await runtime.find(child)).status for child in children]  # pyright: ignore[reportOptionalMemberAccess]
     assert statuses == [AgentStatus.IDLE, AgentStatus.ZOMBIE, AgentStatus.IDLE]
+    await runtime.shutdown()
+
+
+# ------------------------------------- 查询 / 通信 / 终止不标脏调用者
+
+
+_CONTROL_PLANE_ARGS: dict[str, dict[str, str]] = {
+    'QueryAgent': {'agent_id': ''},
+    'KillAgent': {'agent_id': ''},
+    'SendMessage': {'agent_id': '', 'content': 'keep going'},
+}
+
+
+@pytest.mark.parametrize('tool_name', sorted(_CONTROL_PLANE_ARGS))
+async def test_a_successful_control_plane_call_leaves_the_caller_trusted(tool_name):
+    """这三个工具的成功路径只嵌内核自撰的文字与内核生成的 id，没有一个字节来自外部。
+
+    标脏是「方向安全」的那一侧，而它的作用域是整份轨迹、宿主关不掉（`provenance_of` 是「出现过
+    就算」的上界，D-29 未实现）：一次调用就永久废掉调用者在 `AllowAll` 下的全部高风险能力。
+    """
+    runtime = Runtime()
+    caller = await _idle_parent(runtime)
+    target = await _resident(runtime, caller)
+    args = {**_CONTROL_PLANE_ARGS[tool_name], 'agent_id': target}
+
+    result = await asyncio.wait_for(
+        orchestration_tools(runtime, caller)[tool_name].execute(**args), timeout=_TIMEOUT
+    )
+
+    assert result.trust is TrustLevel.TRUSTED
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize('limit', _LIMITS)
+@pytest.mark.parametrize('tool_name', sorted(_CONTROL_PLANE_ARGS))
+async def test_a_control_plane_call_does_not_cost_the_caller_its_allow_all(tool_name, limit):
+    """接到闸上的那一半：调用之后那一次高风险调用**真的执行了**。
+
+    `result.trust` 只钉住这一块自己，而误报的代价发生在闸上——标脏之后同一份轨迹上此后每一次
+    高风险调用都被强制升级拦下，明确声明了 `AllowAll` 的宿主零提示地失去那个语义。
+    """
+    runner = _Runner()
+    runtime = Runtime(orchestration=True)
+    # 参数里要填的那个 id 只有 boss 建出来之后才存在（目标必须是它的后代，`KillAgent` 才不拒），
+    # 而脚本在建工厂时就定下了。所以先建个空参的调用，拿到 id 再补。
+    call = ToolCall(id='c1', name=tool_name, arguments='{}')
+    boss = await runtime.spawn(
+        _worker(
+            [
+                ScriptedTurn(tool_calls=[call]),
+                _call('Runner', _DANGEROUS, 'r1'),
+                ScriptedTurn(content='boss done'),
+            ],
+            {'Runner': runner},
+            name='Boss',
+            policy=AllowAll(),
+            limit=limit,
+        ),
+        query=None,
+    )
+    target = await _resident(runtime, boss)
+    args = {**_CONTROL_PLANE_ARGS[tool_name], 'agent_id': target}
+    call.arguments = json.dumps(args)
+
+    await runtime.send(boss, 'go')
+    await asyncio.wait_for(runtime.wait(boss), timeout=_TIMEOUT)
+
+    assert [block.trust for block in _tool_blocks(runtime, boss)][0] is TrustLevel.TRUSTED
+    assert runner.executed == ['sudo rm -rf /']
     await runtime.shutdown()
 
 
@@ -2535,6 +2691,37 @@ async def test_delegating_to_the_same_role_twice_brings_back_both_answers():
     assert len(outputs) == 2
     assert 'first answer' in outputs[0]
     assert 'second answer' in outputs[1]
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize('how', ['Delegate', 'Fork'])
+async def test_a_child_the_model_spawned_gets_five_tools_bound_to_itself(how):
+    """装配落在**每一个** spawn 出来的 Agent 上，不只是根。
+
+    `Delegate` 派给的角色可以再 `Delegate`（D-46），而 `Delegate` 交回的文案让模型用
+    `SendMessage` / `KillAgent` 去管这个子代。子 Agent 静默失去五件套的症状是模型按 description
+    发起的调用全部落空，而 run 照常以 COMPLETED 返回。
+    """
+    runtime = Runtime(
+        orchestration=True,
+        agents={'Worker': _worker([ScriptedTurn(content='child done')])},
+    )
+    script = (
+        [_call('Delegate', '{"agent":"Worker","query":"do it"}', 'd1')]
+        if how == 'Delegate'
+        else [_call('Fork', '{"query":"do it"}', 'f1'), ScriptedTurn(content='clone done')]
+    )
+    boss = await runtime.spawn(
+        _worker([*script, ScriptedTurn(content='boss done')], name='Boss'), query='go'
+    )
+    await asyncio.wait_for(runtime.wait(boss), timeout=_TIMEOUT)
+
+    info = await runtime.find(boss)
+    assert info is not None and len(info.children) == 1
+    child = info.children[0]
+    agent = runtime._table.get(child)
+    assert agent is not None
+    assert [_owner(agent.options.tools[name]) for name in _FIVE] == [child] * 5
     await runtime.shutdown()
 
 
