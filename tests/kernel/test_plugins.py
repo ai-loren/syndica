@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import os
+from pathlib import Path
 
 import pytest
 
@@ -504,6 +507,81 @@ def test_exactly_three_junctions_are_out_of_reach_from_the_agent_local_layer():
         'agent_spawn',
         'agent_despawn',
     }
+
+
+_PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica'
+# 除 `runtime.py` 之外的触发点所在的文件。守卫必须证明自己看过它们：把扫描范围收窄到只剩
+# `runtime.py`，「只在 runtime 里触发」这个集合仍然逐字等于 `_RUNTIME_ONLY`、全绿，而此后某个
+# 切点在别处多出一个触发点它再也看不见——那正是本守卫唯一要抓的漂移。
+_OTHER_TRIGGER_SITES: tuple[str, ...] = ('kernel/agent.py', 'kernel/tool_executor.py')
+_RUNTIME_MODULE = 'kernel/runtime.py'
+
+
+def _junction_trigger_sites() -> tuple[dict[str, set[str]], list[str]]:
+    """({切点名: 触发它的文件集合}, 本次真的扫过的文件)。
+
+    只认 `....trigger(Junction.X, ...)`：`_RUNTIME_ONLY` 说的是「谁触发它」，而 `Junction.X`
+    本身在别处还会作为分类表、参数化清单出现。尤其 `agent.py` 里那张表自己就是一串 `Junction.X`
+    ——把它们也收进来，期望值就由被测对象自己推导出来了。
+    """
+    sites: dict[str, set[str]] = {}
+    scanned: list[str] = []
+    for path in sorted(_PACKAGE.rglob('*.py')):
+        relative = path.relative_to(_PACKAGE).as_posix()
+        scanned.append(relative)
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != 'trigger' or not node.args:
+                continue
+            first = node.args[0]
+            if (
+                isinstance(first, ast.Attribute)
+                and isinstance(first.value, ast.Name)
+                and first.value.id == 'Junction'
+            ):
+                sites.setdefault(first.attr, set()).add(relative)
+    return sites, scanned
+
+
+def _package_python_files() -> set[str]:
+    """包里全部 `.py`，用 `os.walk` 独立走一遍：范围被收窄时两份清单只有同时改才对得上。"""
+    found: set[str] = set()
+    for root, _, names in os.walk(_PACKAGE):
+        for name in names:
+            if name.endswith('.py'):
+                found.add((Path(root) / name).relative_to(_PACKAGE).as_posix())
+    return found
+
+
+def test_the_trigger_site_scan_really_covers_the_whole_package():
+    """守卫的自检：它必须看过 `runtime.py` 以外的那些触发点，否则每个切点都「只在 runtime 里
+    触发」，而清单照样对得上。"""
+    _, scanned = _junction_trigger_sites()
+    assert set(_OTHER_TRIGGER_SITES) <= set(scanned)
+    assert set(scanned) == _package_python_files()
+
+
+def test_every_junction_has_a_trigger_site():
+    """没有触发点的切点在下面那条派生里既不算「只由 Runtime 触发」也不算别的——它会静默掉出两边。"""
+    sites, _ = _junction_trigger_sites()
+    assert sorted(sites) == sorted(junction.name for junction in Junction)
+
+
+def test_the_runtime_only_table_matches_where_those_junctions_are_actually_triggered():
+    """表与真实触发点会漂移：新增一个只由 Runtime 触发的切点若漏进表，`register_hook` 会静默收下
+    一个结构上永不触发的 hook，而上面那条写死的清单不会变红（它只钉住今天这三个）。
+
+    期望值从**源码里的触发点**推导，与这张表无关——它是第三方事实源。
+    """
+    sites, _ = _junction_trigger_sites()
+    triggered_only_by_the_runtime = {
+        name for name, files in sites.items() if files == {_RUNTIME_MODULE}
+    }
+    assert {
+        junction.name
+        for junction in agent_module._RUNTIME_ONLY  # pyright: ignore[reportPrivateUsage]
+    } == triggered_only_by_the_runtime
 
 
 @pytest.mark.parametrize(
