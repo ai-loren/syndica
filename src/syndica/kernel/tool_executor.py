@@ -368,15 +368,13 @@ def _judge_failed_result(call: ToolCall, exc: Exception) -> ToolResult:
     )
 
 
-def _not_executed_result(call: ToolCall, failed: ToolCall, exc: BaseException) -> ToolResult:
-    return ToolResult(
-        output=(
-            f'期望: {call.name}（id={call.id}）在本批调用里被执行。'
-            f' 实际: 没有执行——同批的 {failed.name}（id={failed.id}）'
-            f'中止于 {type(exc).__name__}，本批调用就此停下。'
-            ' 下一步: 这次调用没有执行、也没有产生任何副作用；'
-            '如仍然需要它，在下一轮重新发起。'
-        )
+def _unexecuted_output(call: ToolCall, why: str) -> str:
+    """从未执行的调用：配对完整、内容是真话。不得写成「副作用未知」——那是已经跑过的调用。"""
+    return (
+        f'期望: {call.name}（id={call.id}）在本批调用里被执行。'
+        f' 实际: 没有执行——{why}'
+        ' 下一步: 这次调用没有执行、也没有产生任何副作用；'
+        '如仍然需要它，在下一轮重新发起。'
     )
 
 
@@ -626,11 +624,29 @@ class ToolExecutor:
             _report_unanswered_concurrency(tool, call, exc)
             return False
 
+    def append_unexecuted(self, ctx: Context, calls: Sequence[ToolCall], *, why: str) -> None:
+        """给尚未落过结果的调用各补一块「没有执行」的 tool block。
+
+        已经有结果的 id 跳过：同一条调用不得写两块。不带 `extra['interrupted']`——那是
+        `_repair_interrupted_batch` 给「跑过、副作用未知」用的，resume 扫到它会把真话改成未知。
+        """
+        answered = {block.tool_call_id for block in ctx.current_traj if block.role == 'tool'}
+        for call in calls:
+            if call.id in answered:
+                continue
+            self._append(ctx, call, ToolResult(output=_unexecuted_output(call, why)))
+
     def _append_not_executed(
         self, ctx: Context, pending: list[ToolCall], failed: ToolCall, exc: BaseException
     ) -> None:
-        for call in pending:
-            self._append(ctx, call, _not_executed_result(call, failed, exc))
+        self.append_unexecuted(
+            ctx,
+            pending,
+            why=(
+                f'同批的 {failed.name}（id={failed.id}）'
+                f'中止于 {type(exc).__name__}，本批调用就此停下。'
+            ),
+        )
 
     def _append(self, ctx: Context, call: ToolCall, result: ToolResult) -> None:
         # 两个可变容器都拷一份：block 会被持久化，活得比这个 ToolResult 长。

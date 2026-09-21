@@ -285,8 +285,25 @@ async def test_both_gates_fit_where_a_turn_gate_is_expected():
 
 
 async def test_null_gate_never_aborts_and_never_injects():
-    decision = await asyncio.wait_for(NullTurnGate().before_turn(1), timeout=_TIMEOUT)
+    gate = NullTurnGate()
+    decision = await asyncio.wait_for(gate.before_turn(1), timeout=_TIMEOUT)
     assert decision == TurnGateDecision()
+    assert await asyncio.wait_for(gate.check_abort(), timeout=_TIMEOUT) is False
+
+
+async def test_check_abort_consumes_the_abort_without_consuming_the_mailbox():
+    """第 9 步必须消费中止位：peek 会让下一轮 before_turn 立刻再中止一次。"""
+    broker = InMemoryMessageBroker()
+    await broker.ensure_queue(_AGENT)
+    control = ControlBlock()
+    gate = BrokerTurnGate(_AGENT, broker, control)
+    await _publish(broker, 'pending', trigger=Trigger.PENDING)
+    control.request_abort()
+
+    assert await asyncio.wait_for(gate.check_abort(), timeout=_TIMEOUT) is True
+    assert await asyncio.wait_for(gate.check_abort(), timeout=_TIMEOUT) is False
+    remaining = await broker.consume(_AGENT)
+    assert [message.content for message in remaining] == ['pending']
 
 
 async def test_gate_injects_pending_and_stashes_deferred_after_the_cycle_started():

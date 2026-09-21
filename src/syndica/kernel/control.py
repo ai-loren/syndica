@@ -103,8 +103,9 @@ class ControlBlock:
     def take_abort(self) -> bool:
         """取走中止位并清位。一次 abort 只兑现一次。
 
-        `hold_until_runnable` 是唯一的预期消费者。中止位是一次性边沿，别处抢先取走会让停在挂起
-        门上的执行体收不到它、静默重新入园，而 `request_abort` 的调用方拿不到任何反馈。
+        `hold_until_runnable` 与 `TurnGate.check_abort` 是预期消费者。中止位是一次性边沿，
+        别处抢先取走会让停在挂起门上的执行体收不到它、静默重新入园，而 `request_abort` 的调用方
+        拿不到任何反馈。
         """
         taken = self._abort_requested
         self._abort_requested = False
@@ -187,12 +188,23 @@ class TurnGate(Protocol):
     """turn 循环与控制面之间的唯一接缝。
 
     spec §5.1 把每一轮的前三步定为「中止检查 → 挂起检查 → 消费待处理消息」，而这三件事的状态
-    全都不属于 Agent 自己（§4.3）。把它们收进一个方法，turn 循环就只需要在轮与轮之间问一句
+    全都不属于 Agent 自己（§4.3）。把它们收进 `before_turn`，turn 循环就只需要在轮与轮之间问一句
     「我还能往下走吗、有什么要先看的吗」，不必知道注册表、broker 或控制块的存在。
+
+    第 9 步（模型已经产出之后、工具执行之前）再问一次中止，必须走 `check_abort`：`before_turn`
+    会顺带 consume 邮箱，而本轮已经不会再用那些消息。
     """
 
     async def before_turn(self, turn: int) -> TurnGateDecision:
         """在第 `turn` 轮开始之前调用；返回是否应当中止，以及要注入的消息。"""
+        ...
+
+    async def check_abort(self) -> bool:
+        """第 9 步：模型已经产出之后、工具执行之前，再问一次是否应当中止。
+
+        必须消费中止位而不是偷看：留下的位会让下一周期的 `before_turn` 立刻再中止一次，而本轮
+        已经结束、那次中止没有对应的活可停。不得走 `before_turn`：它会顺带 consume 邮箱。
+        """
         ...
 
 
@@ -205,6 +217,9 @@ class NullTurnGate:
 
     async def before_turn(self, turn: int) -> TurnGateDecision:
         return TurnGateDecision()
+
+    async def check_abort(self) -> bool:
+        return False
 
 
 class BrokerTurnGate:
@@ -239,3 +254,6 @@ class BrokerTurnGate:
             else:
                 injected.append(message)
         return TurnGateDecision(messages=tuple(injected))
+
+    async def check_abort(self) -> bool:
+        return self._control.take_abort()

@@ -50,9 +50,10 @@ COMPLETED，且 Context 归 Agent 所有，这段坏前缀此后每一次请求�
 先看的」，`TurnGate` 之外的一切（注册表、broker、控制块）本类都不认识。没装门时用
 `NullTurnGate`，行为与计划 1 逐字一致。
 
-**`ABORTED` 只从这道门出来。** 它是**协作式**中止落在轮与轮之间的结果，此时轨迹是一致的、可以
-直接 resume；硬取消落在轮中间，可能留下不配对的调用，因此它**不设** `stop_reason`。合并两者会
-毁掉 resume 正需要的那个区分。
+**`ABORTED` 只从这道门出来。** 它是协作式中止落在轮开始前（第 1 步）或模型已经产出之后、工具
+执行之前（第 9 步）的结果。第 9 步保留 assistant block，并为每个尚未执行的调用补一块如实说明
+「没有执行」的 tool block，于是配对完整、可以直接 resume；硬取消落在轮中间，可能留下不配对的
+调用，因此它**不设** `stop_reason`。合并两者会毁掉 resume 正需要的那个区分。
 
 **入口修复上一次留下的不配对批次。** 硬取消落在轮中间时，ToolExecutor 按约定不在展开的路上写轨迹
 （见 tool_executor 模块 docstring），于是留下一个声明了 N 个调用、后面不足 N 条结果的 assistant
@@ -341,6 +342,9 @@ def _unpaired_calls(blocks: list[ContextBlock]) -> list[ToolCall]:
     return [call for call in blocks[index].tool_calls if call.id not in answered]
 
 
+_ABORT_AFTER_LLM_WHY = '中止在模型已经产出之后、任何工具执行之前被兑现，本批调用就此停下。'
+
+
 def _interrupted_output(call: ToolCall) -> str:
     """措辞与 ToolExecutor 的中止消息同源：只说副作用未知，两个方向都不许断言。"""
     return (
@@ -546,6 +550,19 @@ class BaseAgent:
             if response is None:
                 await self._end_turn(ctx, turn, None)
                 continue
+
+            # spec §5.1 第 9 步：模型已经产出之后、工具执行之前再问一次。必须消费中止位——留下
+            # 的位会让下一周期的 `before_turn` 立刻再中止一次，而本轮已经结束。不得走
+            # `before_turn`：它会顺带 consume 邮箱。
+            if await self._gate.check_abort():
+                ctx.append(response)
+                if response.tool_calls:
+                    self._executor.append_unexecuted(
+                        ctx, response.tool_calls, why=_ABORT_AFTER_LLM_WHY
+                    )
+                ctx.stop_reason = StopReason.ABORTED
+                await self._end_turn(ctx, turn, response)
+                return StopReason.ABORTED
 
             ctx.append(response)
             if not response.tool_calls:

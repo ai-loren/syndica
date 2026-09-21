@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from syndica.kernel.agent import AgentOptions, BaseAgent
+from syndica.kernel.agent import AgentOptions, BaseAgent, _repair_interrupted_batch, _unpaired_calls
 from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall, TrustLevel
 from syndica.kernel.control import BrokerTurnGate, ControlBlock, TurnGate, TurnGateDecision
 from syndica.kernel.danger import AllowAll, DangerJudge
@@ -25,6 +25,7 @@ from syndica.kernel.events import Event, EventBus, Subscription
 from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ContextOverflowError, ScriptedLLM, ScriptedTurn
 from syndica.kernel.message import Message, Trigger
+from syndica.kernel.runtime import _forkable_prefix
 from syndica.kernel.stores import InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tool_executor import DEFAULT_MAX_TOOL_CONCURRENCY
@@ -80,6 +81,16 @@ class _Echo(Tool):
     async def execute(self, text: str) -> ToolResult:
         """回显 text。"""
         return ToolResult(output=text)
+
+
+class _Wipe(Tool):
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
+    async def execute(self, path: str) -> ToolResult:
+        """记下被擦的路径。一次真实执行就会留下痕迹。"""
+        self.paths.append(path)
+        return ToolResult(output=path)
 
 
 class _Concat(Tool):
@@ -180,12 +191,28 @@ class _FixedGate:
         self.turns.append(turn)
         return self.decision
 
+    async def check_abort(self) -> bool:
+        return False
+
 
 class _BrokenGate:
     """问一句就抛的门，代表控制面自己出了故障。"""
 
     async def before_turn(self, turn: int) -> TurnGateDecision:
         raise RuntimeError('control plane unreachable')
+
+    async def check_abort(self) -> bool:
+        return False
+
+
+class _AbortAfterLLM:
+    """第 1 步放行、第 9 步中止：模型已经产出、工具尚未执行。"""
+
+    async def before_turn(self, turn: int) -> TurnGateDecision:
+        return TurnGateDecision()
+
+    async def check_abort(self) -> bool:
+        return True
 
 
 class _Publisher(Tool):
@@ -291,6 +318,10 @@ def _llm(agent: BaseAgent) -> ScriptedLLM:
 
 def _call(call_id: str = 'c1', text: str = 'hi') -> ToolCall:
     return ToolCall(id=call_id, name='Echo', arguments=f'{{"text":"{text}"}}')
+
+
+def _wipe_call(call_id: str = 'c1', path: str = '/data') -> ToolCall:
+    return ToolCall(id=call_id, name='Wipe', arguments=f'{{"path":"{path}"}}')
 
 
 def _overflow() -> ContextOverflowError:
@@ -2139,3 +2170,87 @@ async def test_a_query_is_trusted_unless_the_caller_says_otherwise():
     assert [block.trust for block in ctx.current_traj if block.role == 'user'] == [
         TrustLevel.TRUSTED
     ]
+
+
+async def test_abort_after_llm_keeps_the_assistant_and_pairs_never_executed_calls():
+    """第 9 步中止：保留模型产出，给每个声明的调用补一块「没有执行」而不是「副作用未知」。"""
+    wipe = _Wipe()
+    agent, _ = _agent(
+        [
+            ScriptedTurn(
+                content='will wipe',
+                tool_calls=[_wipe_call('c1', '/data'), _wipe_call('c2', '/tmp')],
+            )
+        ],
+        tools={**_tools(), 'Wipe': wipe},
+        gate=_AbortAfterLLM(),
+    )
+
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.ABORTED
+    assert wipe.paths == []
+    assert _roles(ctx.current_traj) == ['user', 'assistant', 'tool', 'tool']
+    assert ctx.current_traj[1].content == 'will wipe'
+    tool_blocks = [block for block in ctx.current_traj if block.role == 'tool']
+    assert [block.tool_call_id for block in tool_blocks] == ['c1', 'c2']
+    for block in tool_blocks:
+        assert block.content is not None
+        assert '没有执行' in block.content
+        assert '副作用未知' not in block.content
+        assert block.extra.get('interrupted') is not True
+    assert _unpaired_calls(ctx.current_traj) == []
+
+
+async def test_abort_after_llm_without_tool_calls_keeps_the_assistant_and_stops_aborted():
+    agent, _ = _agent([ScriptedTurn(content='done')], gate=_AbortAfterLLM())
+
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.ABORTED
+    assert _roles(ctx.current_traj) == ['user', 'assistant']
+    assert ctx.current_traj[-1].content == 'done'
+
+
+async def test_resume_does_not_rewrite_truthful_never_executed_blocks_into_unknown():
+    wipe = _Wipe()
+    agent, _ = _agent(
+        [ScriptedTurn(content='will wipe', tool_calls=[_wipe_call()])],
+        tools={**_tools(), 'Wipe': wipe},
+        gate=_AbortAfterLLM(),
+    )
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+    before = [block.content for block in ctx.current_traj]
+
+    _repair_interrupted_batch(ctx)
+
+    assert [block.content for block in ctx.current_traj] == before
+    tool = next(block for block in ctx.current_traj if block.role == 'tool')
+    assert tool.content is not None
+    assert '副作用未知' not in tool.content
+    assert tool.extra.get('interrupted') is not True
+
+
+async def test_forkable_prefix_includes_never_executed_pairs():
+    wipe = _Wipe()
+    agent, _ = _agent(
+        [ScriptedTurn(content='will wipe', tool_calls=[_wipe_call()])],
+        tools={**_tools(), 'Wipe': wipe},
+        gate=_AbortAfterLLM(),
+    )
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert _forkable_prefix(ctx.current_traj) == ctx.current_traj
+    assert _unpaired_calls(ctx.current_traj) == []
+
+
+async def test_abort_after_llm_still_fires_turn_end():
+    log: list[tuple[str, str]] = []
+    agent, hooks = _agent([ScriptedTurn(content='done')], gate=_AbortAfterLLM())
+    _record_lifecycle(hooks, log)
+
+    ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
+
+    assert ctx.stop_reason is StopReason.ABORTED
+    assert ('hook', Junction.TURN_START.value) in log
+    assert ('hook', Junction.TURN_END.value) in log
