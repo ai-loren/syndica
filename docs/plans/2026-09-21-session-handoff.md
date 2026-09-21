@@ -103,7 +103,7 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 
 验证过：
 
-- 受影响子集（本会话控制器跑的）：上面那组 `tests/kernel` + `tests/contracts/test_memory_registry.py` → **1020 passed**
+- 受影响子集（本会话控制器跑的）：`uv run pytest tests/kernel/test_{agent_turn,agent_types,control,danger,events,llm,runtime,public_api,tool_executor}.py tests/contracts/test_memory_registry.py -q` → **1020 passed**
 - 修复轮在 `d4961c1` 上跑的全量门禁：`uv run pytest -q` / `-W error` → **1710 passed**；`ruff check` / `ruff format --check` / `pyright` 0 errors / `scripts/check_deps.py` 空。审计探针当时在 `/tmp/synaudit/`，多半已经没了，不要依赖它们。
 
 ### 2.4 本会话**没有**做、也不该假装做完的
