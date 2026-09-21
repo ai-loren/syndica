@@ -2,7 +2,7 @@
 
 写于 2026-09-21。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
-**一句话现状：** 计划 1、计划 2（含横切审计与 Task 16 评审残留）的**代码已收口并 commit**；计划 3 **已经写成可执行计划、尚未写任何代码**；计划 4–6 未写未做。本地 `main` 比 `origin/main` 超前 13 个 commit，**未 push**。
+**一句话现状：** 计划 1、计划 2（含横切审计与 Task 16 评审残留）的**代码已收口并 commit**；计划 3 **计划已写，Task 1（`AgentManifest` + `parse_mapping`）已落地并 commit（`97c9edc`），Task 2–8 未做**；计划 4–6 未写未做。本地 `main` 比 `origin/main` 超前 15 个 commit，**未 push**。下一刀是计划 3 Task 2。
 
 **先读顺序**
 
@@ -27,19 +27,21 @@
 | git | 本项目此前默认**改完即 commit、不 push**，除非用户再说「推」 |
 | 提交时 | `git -c trace2.eventtarget= -c trace2.eventnesting= commit`（本机 git 会被 trace2 塞 Co-authored-by: Cursor） |
 
-**本文对照的基线 HEAD：`dbd7fd9`。** 提交本文之后 `HEAD` 会再前进一步；动手前以 `git log -3 --oneline` 与 `git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
+**本文对照的基线 HEAD：`97c9edc`。** 提交本文之后 `HEAD` 会再前进一步；动手前以 `git log -3 --oneline` 与 `git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
 
 ```
 $ git status -sb
-## main...origin/main [ahead 13]
-（工作区干净，无未提交改动）
+## main...origin/main [ahead 15]
+（工作区干净，无未提交改动——本文 commit 之后会变成 ahead 16）
 ```
 
-`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 从新到旧（相对 origin/main 的 13 个）：
+`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 从新到旧（相对 origin/main 的 15 个）：
 
 | sha | 内容 |
 |---|---|
-| `dbd7fd9` | 写出计划 3 文件（声明式 Agent、拓扑、四个内置）+ 把本文指针改到该计划 |
+| `97c9edc` | **计划 3 Task 1**：`AgentManifest` + `parse_mapping`；未知键当场拒绝；尚未导出 |
+| `d066f4c` | 上一版交接（当时 Task 1 还没写；本文取代它） |
+| `dbd7fd9` | 写出计划 3 文件（声明式 Agent、拓扑、四个内置） |
 | `77f33fc` | `__init__` 签名守卫 / orchestration 两档 / `attach_gate` 降私有 / `__all__` 扫描 fail-loud / trigger 计数 / 关闭 D-52 |
 | `5f808eb` | 交接文档里 1020 那条 pytest 命令写完整 |
 | `a15c31b` | 交接文档补全量 1710 与 M-7/M-8 |
@@ -55,7 +57,7 @@ $ git status -sb
 
 更早的计划 2 Task 1–15 已在 `origin/main` 一侧。
 
-**本轮停笔时没有未完成的代码：** `src/syndica/kernel/manifest.py` **还不存在**。计划 3 Task 1 一次都没落地。不要在工作区里找半成品。
+**本轮停笔时工作区干净。** `src/syndica/kernel/manifest.py` 与 `tests/kernel/test_manifest.py` **已经存在并 commit**（`97c9edc`）。不要重做 Task 1。下一刀是 Task 2：`validate_tool_names` 认 Mapping + `resolve_tool_names` / `register_tool`。
 
 ---
 
@@ -83,12 +85,12 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | Runtime 创建多个 Agent、互发消息 | **已做** | 计划 2；`tests/integration/test_multi_agent_lifecycle.py` |
 | 各自跑通 LLM + 工具循环 | **已做（内核侧）** | 计划 1 turn 循环 + ScriptedLLM；真 LLM 在计划 4 |
 | 可终止与恢复 | **已做** | `kill` / `despawn` / `pause` / `resume` / `abort`；ZOMBIE 可寻址 |
-| 声明式 Agent 定义（§4.6） | **计划已写，代码未做** | 计划 3 Task 1–4、7–8 |
+| 声明式 Agent 定义（§4.6） | **清单解析已做；目录 / freeze / 内置未做** | 计划 3 Task 1 已 commit；还差 Task 2–4、7–8 |
 | 拓扑装配（§4.7） | **计划已写，代码未做** | 计划 3 Task 5–6、8 |
 | Tool 系统与 LLM 抽象 | **内核抽象已做** | Tool / ToolExecutor / DangerJudge / ScriptedLLM；OpenAI 兼容 provider 在计划 4 |
 | 最小本地执行（读写文件 + 跑命令） | **未做** | 计划 4（`Read`/`Write`/`Edit`/`Glob`/`Grep`/`Bash`…） |
 
-**结论：计划 2 + 横切审计 ≈ 内核控制面做完；里程碑 1 本身没完。** 缺的三块是声明式角色、拓扑、本地执行。
+**结论：计划 2 + 横切审计 ≈ 内核控制面做完；计划 3 Task 1 把清单解析钉住了。里程碑 1 本身没完。** 还缺目录 / freeze / 拓扑 / 四个内置、本地执行。
 
 子计划边界（不要重新解释）：
 
@@ -96,7 +98,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 |---|---|---|
 | **1** | 单 Agent turn 循环 | **代码收口**，已在更早的历史上 |
 | **2** | 事件循环、生命周期、等待、危险判定、工具并发、插件、编排工具、公开面 | **代码收口**（含审计修复 + Task 16 残留） |
-| **3** | 声明式清单、目录、拓扑、四个内置角色 | **计划已写** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；**0/8 任务未执行** |
+| **3** | 声明式清单、目录、拓扑、四个内置角色 | **计划已写** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；**1/8 已执行**（Task 1 = `97c9edc`） |
 | **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | 未写未做 |
 | **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | 未写未做 |
 | **6** | CLI + L2 场景回放 + AskUser | 未写未做 |
@@ -177,7 +179,31 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 
 文件：[`docs/plans/2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)。含 Goal / Architecture / Global Constraints / **9 条设计裁决** / 8 个任务（必写用例名 + 变异点）/ 自我审查 / commit 粒度。
 
-**代码一行都没有。** 不要把「计划写好了」读成「声明式 Agent 能用了」。
+### 3.6 计划 3 Task 1 —— 已落地，commit `97c9edc`
+
+**不要重做。** 门禁：`uv run pytest tests/kernel/test_manifest.py tests/kernel/test_public_api.py -q` → **31 passed**；ruff / pyright 0 errors。
+
+| 文件 | 角色 |
+|---|---|
+| `src/syndica/kernel/manifest.py` | `AgentManifest`、`ManifestSource`、`parse_mapping` |
+| `tests/kernel/test_manifest.py` | 9 条必写用例 + 预算 / 字面提示词 / 路径逃逸补强 |
+| `tests/kernel/test_public_api.py` `_WITHHELD` | 扣留 `AgentManifest`、`ManifestSource`、`parse_mapping` |
+| `src/syndica/kernel/__init__.py` | **没动**（等 Task 8） |
+
+执行时拍板、下一任不要改回去的细节：
+
+1. **字段顺序（公开 API）**：`name`, `description`, `system_prompt`, `tools`, `subagents`, `model`, `extends`, `skills`, `budget`, `artifact_kinds`, `impl`, `source`。`ManifestSource` 是 `kind`, `location`, `origin`。
+2. **`origin` 是额外字段。** 计划原文只写了 kind + location；提示词何时当文件读必须有一个目录快照，所以加了 `origin: str | None`。纯 Mapping 不要设 origin，字符串就是提示词。不靠 `.md` 后缀、也不靠换行猜测。
+3. **`parse_mapping(data: object, *, source)`**：签名收 `object`，运行时先拒 str/bytes 再拒非 Mapping（与 `_not_a_role_table` 同型）。keyword-only 的 `source` 必填。
+4. **未知键一次列出全部**（集合，基数 ≥ 3：`zeta` / `class` / `alpha`）。`class:` 是未知键，判别字段是 `impl`。
+5. **`tools` 先拒 str/bytes，再拒 Mapping，再收 Sequence**。tuple 也收，存成 tuple。映射的 next_action 点名 AgentCatalog / 工具目录。
+6. **`budget` 只允许键 `turns`。** `{}` 拒绝（含糊：补 turns 还是省略 budget）。`turns: null` → 不限。bool 先拒（YAML `yes`）。存成 `MappingProxyType`，宿主改原 dict 不泄漏。
+7. **`impl` 缺省/None = 声明式**；`type` 必须是 `BaseAgent` 子类；`str` 原样保存、**本任务不 import**。
+8. **路径安全：** 相对路径含 `..` 或绝对路径不当文件读；`Path.relative_to(origin)` 再挡一层。没有 origin 时，就算字符串恰好是磁盘上一个文件也当字面量。
+9. **变异（已杀死）：** 删未知键检查；只报第一个未知键；丢掉 Mapping 守卫让 tools dict 走别的错；`budget` 额外键放行；没有 origin 仍读已存在的文件。`..` 检查相对 `relative_to` 是纵深，单删 `.. in parts` 会被第二层挡住（存活，可接受）。
+10. **kernel 零 PyYAML。** 本模块没有 HostFacts（那是 Task 4）。
+
+`_WITHHELD` 现含 Task 1 三个名字，Task 8 再挪进 `kernel.__all__`。不要在 Task 2–7 里提前导出。
 
 ---
 
@@ -194,7 +220,7 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 | M-7 | spec `AgentInfo.type` 实现叫 `agent_type`（避开内置名） | 登记即可，不要改回去 |
 | M-8 | `WaitState.ABORTED` 自己的 docstring 仍只写「协作式中止落在等待上」 | 补枚举 docstring，把 D-26 契约写到宿主会读的那一行 |
 
-### 4.1 下一步：执行计划 3（8 个任务，0 完成）
+### 4.1 下一步：执行计划 3 Task 2–8（8 个任务，1 完成）
 
 **关闭：** D-49、D-08。**不要动：** D-58（禁止 `Runtime.start` / `Junction.RUNTIME_START`）。
 
@@ -216,16 +242,16 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 
 #### 八个任务（建议 8 个 commit，不要 push）
 
-| Task | 标题 | 新建 / 改 | 关掉 |
-|---|---|---|---|
-| **1** | `AgentManifest` + `parse_mapping`（不含工具解析） | 新建 `src/syndica/kernel/manifest.py`、`tests/kernel/test_manifest.py`；`__init__.py` **先不要导出**；`test_public_api._WITHHELD` 加上模块 `__all__` 里的名字 | — |
-| **2** | `validate_tool_names` 认 Mapping + 名字列表→工具表 | 改 `tool.py`、`test_tool.py`；`resolve_tool_names` / `register_tool` 可先放 `catalog.py` | **D-49、D-08** |
-| **3** | `AgentCatalog`：加载、覆盖可查询、`get(name)` | `catalog.py`、`test_catalog.py` | — |
-| **4** | 插值 + `freeze` 成 `AgentFactory` | `catalog.py` / `manifest.py`、`test_prompt_interpolation.py` | — |
-| **5** | `AgentSlot` / `Topology` 校验（还不接 Runtime） | `topology.py`、`test_topology.py` | — |
-| **6** | `Runtime.assemble` / `resolve` / `occupy` / `send_to_slot` | `runtime.py`、`test_assemble.py`、`_RUNTIME_SURFACE` 加名字 | — |
-| **7** | 四个内置角色 | `src/syndica/kernel/agents/{orchestrator.py,planner.json,explorer.json,worker.json,__init__.py}`、`test_builtin_agents.py` | — |
-| **8** | 公开面收口 + 端到端一条拓扑 | `kernel/__init__.py`、`test_public_api.py`、`tests/integration/test_topology_lifecycle.py` | 把 Task 1 扣留的名字挪进承诺面 |
+| Task | 标题 | 新建 / 改 | 关掉 | 状态 |
+|---|---|---|---|---|
+| **1** | `AgentManifest` + `parse_mapping`（不含工具解析） | `manifest.py`、`test_manifest.py`；`__init__.py` 先不要导出；`_WITHHELD` 扣三个名字 | — | **已 commit `97c9edc`** |
+| **2** | `validate_tool_names` 认 Mapping + 名字列表→工具表 | 改 `tool.py`、`test_tool.py`；`resolve_tool_names` / `register_tool` 可先放 `catalog.py` | **D-49、D-08** | **下一刀** |
+| **3** | `AgentCatalog`：加载、覆盖可查询、`get(name)` | `catalog.py`、`test_catalog.py` | — | 未做 |
+| **4** | 插值 + `freeze` 成 `AgentFactory` | `catalog.py` / `manifest.py`、`test_prompt_interpolation.py` | — | 未做 |
+| **5** | `AgentSlot` / `Topology` 校验（还不接 Runtime） | `topology.py`、`test_topology.py` | — | 未做 |
+| **6** | `Runtime.assemble` / `resolve` / `occupy` / `send_to_slot` | `runtime.py`、`test_assemble.py`、`_RUNTIME_SURFACE` 加名字 | — | 未做 |
+| **7** | 四个内置角色 | `src/syndica/kernel/agents/{orchestrator.py,planner.json,explorer.json,worker.json,__init__.py}`、`test_builtin_agents.py` | — | 未做 |
+| **8** | 公开面收口 + 端到端一条拓扑 | `kernel/__init__.py`、`test_public_api.py`、`tests/integration/test_topology_lifecycle.py` | 把 Task 1 扣留的名字挪进承诺面 | 未做 |
 
 每个任务：实现 → 受影响测试绿 → **自我变异**（先清 `__pycache__`；新文件先 `git add`；sha256 基线必须覆盖本轮会改到的每个文件，见 AGENTS.md）→ 独立评审自创变异 → 修复 → commit。受影响测试：
 
@@ -293,15 +319,23 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 在 `/Users/bytedance/Documents/syndica`：
 
 ```bash
-git status -sb          # 应是 main...origin/main [ahead 13]，工作区干净
-git log -3 --oneline    # 第一条应是 dbd7fd9（或它的后代）
+git status -sb          # 应是 main...origin/main [ahead 16]（本文 commit 之后），工作区干净
+git log -3 --oneline    # 第一条应是本文；第二条 `97c9edc` Task 1
 ```
 
 然后：
 
-1. 打开 [`docs/plans/2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)，从 **Task 1** 开始。不要先写计划 4，不要加 `Runtime.start`。
-2. Task 1 必写用例名已经列在计划里（`test_the_manifest_field_order_is_exactly_this` 等 9 条）。`kernel.__all__` 先不要动；新模块 `__all__` 进 `_WITHHELD`。
+1. 打开 [`docs/plans/2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)，从 **Task 2** 开始。不要重做 Task 1，不要先写计划 4，不要加 `Runtime.start`。
+2. Task 2 必写用例名已经列在计划里。关掉 D-49、D-08，证据写进 `deferred-items.md`「已关闭」。`kernel.__all__` 仍然先不要动；`catalog.py` 若新建，其 `__all__` 进 `_WITHHELD`。
 3. 每个任务走完变异 + 独立评审再 commit。**仍不要 push**，直到 M1 收口审计通过，或用户明确说推。
+
+Task 2 压缩版（细节以计划 Task 2 节为准）：
+
+- 改 `src/syndica/kernel/tool.py` 的 `validate_tool_names`：非 Mapping 先拒，对齐 `_not_a_role_table`。
+- 新建 `src/syndica/kernel/catalog.py`：`resolve_tool_names(names, tools) -> dict[str, Tool]`（缺名 n=3：目录 A,C,E 要 B,C,D，消息含 B 与 D 不含 C；键序 = 清单序；然后 `validate_tool_names`）；`register_tool(table, tool)` 是唯一正式插入口，三轴不一致就拒，不要改键名悄悄修好。
+- 必写：`test_validate_tool_names_rejects_a_list_with_the_three_part_error`、`test_resolve_tool_names_preserves_manifest_order`、`test_resolve_tool_names_names_every_missing_tool`、`test_register_tool_rejects_disagreement_among_the_three_identity_axes`、`test_resolved_dict_shares_no_mutation_with_the_catalog`。
+- 变异：删 Mapping 守卫；缺名只报第一个；resolve 按目录迭代顺序而不是清单顺序；三轴不一致仍改键收下。
+- 本机 bash **没有** `declare -A`，变异跑手用 Python。先清 `__pycache__`，新文件先 `git add`，sha256 还原（不要 `git checkout`）。
 
 ---
 
@@ -319,6 +353,7 @@ git log -3 --oneline    # 第一条应是 dbd7fd9（或它的后代）
 - **abort 仍不取消 inflight `LLM.create`**。第 9 步只在 create 返回之后兑现。卡住的 Agent 仍然只有 `kill`（F-6 / D-56，计划 4）。
 - **并发 CAS 用例挡不住「两个赢家都写同一个 new」**——三个目标状态不同才分得出。
 - **一次没复现的 despawn 级联泄漏**（审计故意不上报）：`p9_growth.py` 第一次跑在「父子级联」段留下 25 条注册表条目 + 25 个 `_slots`，此后九次重跑与 40 轮随机化全零。若将来看到「每次少拆一个」，怀疑 `_destroy_tree` 的 `while fresh :=` 与并发收割交互。
+- **本机 bash 没有 `declare -A`**。Task 1 变异跑手因此改成 Python dict。不要写 bash 关联数组。还原用 sha256 基线，不要 `git checkout`（会把未提交的测试也冲掉）。
 - **装门**：生产路径只有 `Runtime.spawn` → `agent._attach_gate`（测试可 `pyright: ignore[reportPrivateUsage]`）。宿主构造 `BaseAgent` 时不要传 `gate=`。
 
 ---
@@ -331,6 +366,7 @@ git log -3 --oneline    # 第一条应是 dbd7fd9（或它的后代）
 | 门协议 | `src/syndica/kernel/control.py` `TurnGate` |
 | 生命周期 / spawn / shutdown | `src/syndica/kernel/runtime.py` |
 | 角色表校验（D-49 的参照实现） | `runtime.py` `validate_agent_factories` / `_not_a_role_table` |
+| 声明式清单解析（Task 1 已做） | `src/syndica/kernel/manifest.py` `parse_mapping` |
 | 工具名三轴（D-08） | `src/syndica/kernel/tool.py` `validate_tool_names` / `tool_name_disagreement` |
 | 公开面守卫 / `__init__` 签名 | `tests/kernel/test_public_api.py` |
 | 装门（仅内核） | `BaseAgent._attach_gate`；测试走 `_agent(..., gate=)` |
@@ -341,11 +377,15 @@ git log -3 --oneline    # 第一条应是 dbd7fd9（或它的后代）
 | 范围裁决 | `docs/decisions/2026-09-08-m1-scope.md` |
 | 硬约束 / 变异纪律 | `AGENTS.md` |
 
-计划 3 执行时会新建、今天还不存在的文件：
+计划 3 执行时会新建、今天**还不存在**的文件：
 
-- `src/syndica/kernel/manifest.py`
 - `src/syndica/kernel/catalog.py`
 - `src/syndica/kernel/topology.py`
 - `src/syndica/kernel/agents/`（`orchestrator.py` + 三份 JSON）
-- `tests/kernel/test_manifest.py` / `test_catalog.py` / `test_prompt_interpolation.py` / `test_topology.py` / `test_assemble.py` / `test_builtin_agents.py`
+- `tests/kernel/test_catalog.py` / `test_prompt_interpolation.py` / `test_topology.py` / `test_assemble.py` / `test_builtin_agents.py`
 - `tests/integration/test_topology_lifecycle.py`
+
+已经存在、不要当空白重写：
+
+- `src/syndica/kernel/manifest.py`
+- `tests/kernel/test_manifest.py`
