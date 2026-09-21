@@ -101,16 +101,10 @@ $ git status -sb
 
 D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；被等 Agent 卡在 `LLM.create` → 计划 4 / D-56。
 
-验证过（收口时）：
+验证过：
 
-```
-uv run pytest tests/kernel/test_agent_turn.py tests/kernel/test_agent_types.py \
-  tests/kernel/test_control.py tests/kernel/test_danger.py tests/kernel/test_events.py \
-  tests/kernel/test_llm.py tests/kernel/test_runtime.py \
-  tests/contracts/test_memory_registry.py tests/kernel/test_public_api.py \
-  tests/kernel/test_tool_executor.py -q
-# 1020 passed
-```
+- 受影响子集（本会话控制器跑的）：上面那组 `tests/kernel` + `tests/contracts/test_memory_registry.py` → **1020 passed**
+- 修复轮在 `d4961c1` 上跑的全量门禁：`uv run pytest -q` / `-W error` → **1710 passed**；`ruff check` / `ruff format --check` / `pyright` 0 errors / `scripts/check_deps.py` 空。审计探针当时在 `/tmp/synaudit/`，多半已经没了，不要依赖它们。
 
 ### 2.4 本会话**没有**做、也不该假装做完的
 
@@ -165,6 +159,8 @@ uv run pytest tests/kernel/test_agent_turn.py tests/kernel/test_agent_types.py \
 | M-4 | 端到端里 `status is WAITING` 调度余量恰好 1 跳 | 改成轮询到 WAITING 或超时；真正见证者是 `await_reply.states == [ANSWERED, ABORTED]` |
 | M-5 | D-53 正文夸大了「静默漂移」 | 契约套件**已经** import 三个 `UPDATE_*` 并划分 `AgentInfo` 字段；残留只是「新增受保护字段时第三方硬编码副本不会被逐条 reject 抓住」。改登记表措辞即可 |
 | M-6 | `send` 第二参 spec 叫 `message`、实现叫 `content`；`spawn.query` 收成 keyword-only | 登记为措辞差异，**不要改名**（改名立刻破调用方） |
+| M-7 | spec `AgentInfo.type` 实现叫 `agent_type`（避开内置名） | 公开 dataclass 字段名是永久承诺；D-55 没提这一处，登记即可，不要改回去 |
+| M-8 | `WaitState.ABORTED` 自己的 docstring 仍只写「协作式中止落在等待上」 | D-26 的契约（`ABORTING` 下一秒都没等、判据取注册表）写在 `wait_for` 四十行 docstring 里；宿主读枚举时看不到。补枚举 docstring 即可 |
 
 ### 3.1 然后：写并执行计划 3
 
@@ -215,7 +211,7 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 
 ## 4. 下一任 Agent 建议的第一条命令
 
-在 `/Users/bytedance/Documents/syndica`、确认 `git status` 干净且 `HEAD` 仍是（或快进过）`d4961c1` 之后：
+在 `/Users/bytedance/Documents/syndica`、确认 `git status` 干净且 `HEAD` 仍是（或快进过）交接文档那笔提交之后：
 
 1. **先做 §3.0**（Task 16 Important-2/3/4，建议顺手 M-1/M-2）。受影响测试：`tests/kernel/test_public_api.py`、`tests/kernel/test_agent_turn.py`。通过后再 commit，**仍不要 push**，除非用户说推。
 2. **再写计划 3**（新文件 `docs/plans/2026-09-xx-m1p3-….md`），结构对齐计划 2：Goal / Architecture / Global Constraints / 设计裁决 / 任务拆解。写完自己 review，再开执行。
@@ -233,6 +229,9 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 - **`shutdown` 不能 `if self._closed: return`**：第一次可能还堵在 `RUNTIME_SHUTDOWN` 钩子里，总线没关。收据只挡住「报」，拆照做。
 - **并发 commit 竞态**：本会话曾出现另一条本地提交把工作区拆成两截。`git add` 后立刻 `git status` / `git log -3`，确认 20 个文件都在历史上。
 - 变异验证：基线集合本身要被证明；只对「清单里的文件」做 sha256，清单漏了就会静默缩小范围（AGENTS.md 已记）。
+- **abort 仍不取消 inflight `LLM.create`**。第 9 步只在 create 返回之后兑现。卡住的 Agent 仍然只有 `kill`（F-6 / D-56，计划 4）。
+- **并发 CAS 用例挡不住「两个赢家都写同一个 new」**——三个目标状态不同才分得出；同目标并发仍可能被坏实现蒙混。
+- **一次没复现的 despawn 级联泄漏**（审计故意不上报）：`p9_growth.py` 第一次跑在「父子级联」段留下 25 条注册表条目 + 25 个 `_slots`，此后九次重跑与 40 轮随机化全零泄漏。若将来看到「每次少拆一个」，怀疑 `_destroy_tree` 的 `while fresh :=` 与并发收割交互。
 
 ---
 
