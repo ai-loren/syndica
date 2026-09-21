@@ -544,6 +544,27 @@ def _junction_trigger_sites() -> tuple[dict[str, set[str]], list[str]]:
     return sites, scanned
 
 
+def _trigger_call_counts() -> tuple[int, int]:
+    """(匹配器认出来的次数, 包里所有 `....trigger(` 调用次数)。"""
+    matched = 0
+    total = 0
+    for path in sorted(_PACKAGE.rglob('*.py')):
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != 'trigger':
+                continue
+            total += 1
+            first = node.args[0] if node.args else None
+            if (
+                isinstance(first, ast.Attribute)
+                and isinstance(first.value, ast.Name)
+                and first.value.id == 'Junction'
+            ):
+                matched += 1
+    return matched, total
+
+
 def _package_python_files() -> set[str]:
     """包里全部 `.py`，用 `os.walk` 独立走一遍：范围被收窄时两份清单只有同时改才对得上。"""
     found: set[str] = set()
@@ -560,6 +581,18 @@ def test_the_trigger_site_scan_really_covers_the_whole_package():
     _, scanned = _junction_trigger_sites()
     assert set(_OTHER_TRIGGER_SITES) <= set(scanned)
     assert set(scanned) == _package_python_files()
+
+
+def test_the_trigger_matcher_sees_every_trigger_call():
+    """匹配器只认 `....trigger(Junction.X, ...)`。`trigger(junction, ...)`、别名属性、
+    `trigger(junction=Junction.X)` 都是一次真实触发，而匹配器看不见它们——主断言把「只在
+    runtime 里触发」的集合跟 `_RUNTIME_ONLY` 对上，漏掉这些调用点等于把一个非 Runtime 触发
+    的切点静默算进那张表。
+
+    两边必须相等：每一次 `.trigger(` 调用要么被认出来，要么改匹配器。
+    """
+    matched, total = _trigger_call_counts()
+    assert matched == total
 
 
 def test_every_junction_has_a_trigger_site():

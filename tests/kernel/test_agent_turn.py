@@ -295,7 +295,10 @@ def _agent(
         max_turns=max_turns,
     )
     bus = events if events is not None else EventBus()
-    return BaseAgent(options, hooks=hooks, events=bus, gate=gate), hooks
+    agent = BaseAgent(options, hooks=hooks, events=bus)
+    if gate is not None:
+        agent._attach_gate(gate)
+    return agent, hooks
 
 
 async def _gate(control: ControlBlock) -> tuple[BrokerTurnGate, InMemoryMessageBroker]:
@@ -2118,7 +2121,7 @@ async def test_a_gate_attached_after_construction_drives_the_turns():
     control = ControlBlock()
     gate, _ = await _gate(control)
     agent, _ = _agent([ScriptedTurn(content='never reached')])
-    agent.attach_gate(gate)
+    agent._attach_gate(gate)
     control.request_abort()
 
     ctx = await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
@@ -2127,21 +2130,18 @@ async def test_a_gate_attached_after_construction_drives_the_turns():
     assert _llm(agent).calls == []
 
 
-@pytest.mark.parametrize('via_constructor', [False, True], ids=['attached', 'constructed'])
-async def test_a_rejected_second_gate_leaves_the_first_one_driving_the_turns(via_constructor):
-    """两道门就是两个消费同一个邮箱的人，`consume` 恰好一次，输的那个**静默**收不到消息。构造
-    参数与 attach_gate 是同一件事的两个入口，守卫必须认得两者。
+async def test_a_rejected_second_gate_leaves_the_first_one_driving_the_turns():
+    """两道门就是两个消费同一个邮箱的人，`consume` 恰好一次，输的那个**静默**收不到消息。
 
     抛出**之外**还要断言状态没动：捕获 `ContractViolation` 继续走的调用方（Runtime 的降级路径）
     会假定什么都没发生，而一个换完门再抛的实现此后由第二道门驱动，第一道门静默失联。
     """
     first = _FixedGate(TurnGateDecision())
     second = _FixedGate(TurnGateDecision())
-    agent, _ = _agent([ScriptedTurn(content='ok')], gate=first if via_constructor else None)
-    if not via_constructor:
-        agent.attach_gate(first)
+    agent, _ = _agent([ScriptedTurn(content='ok')])
+    agent._attach_gate(first)
     with pytest.raises(ContractViolation):
-        agent.attach_gate(second)
+        agent._attach_gate(second)
 
     await asyncio.wait_for(agent.run('go'), timeout=_TIMEOUT)
 

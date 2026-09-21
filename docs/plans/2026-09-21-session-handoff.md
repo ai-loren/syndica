@@ -17,17 +17,21 @@
 | git | 本项目此前默认**改完即 commit、不 push**，除非用户再说「推」 |
 | 提交时 | `git -c trace2.eventtarget= -c trace2.eventnesting= commit`（本机 git 会被 trace2 塞 Co-authored-by） |
 
-**写本文时的 HEAD**：`d4961c1`（`fix(kernel): 横切审计其余项——入口校验铺开、CAS 并发契约、关机收据`）
+**写本文时的 HEAD（交接当时）**：`d4961c1`。此后又合入了交接文档本身（`0269add` / `a15c31b` / `5f808eb`）以及 **Task 16 评审残留 I-2/I-3/I-4 + M-1/M-2**（见 §2.5）。动手前以 `git log -5 --oneline` 为准。
 
 ```
 $ git status -sb
-## main...origin/main [ahead 8]
+## main...origin/main [ahead N]
 ```
 
-工作区应是干净的。`origin/main` **还没有**下面这 8 个本地提交（从新到旧）：
+`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 从新到旧（交接当时 8 个；之后又加了交接文档与公开面残留）：
 
 | sha | 内容 |
 |---|---|
+| （本轮） | `__init__` 签名守卫 / orchestration 两档 / `attach_gate` 降私有 / `__all__` 扫描 fail-loud / trigger 计数 / 关闭 D-52 |
+| `5f808eb` | 交接文档里 1020 那条 pytest 命令写完整 |
+| `a15c31b` | 交接文档补全量 1710 与 M-7/M-8 |
+| `0269add` | 记下里程碑 1 做到哪、还剩什么（本文） |
 | `d4961c1` | 入口校验 / CAS 并发契约 / 关机收据 / lost-zombie 分档 / D-56..D-60 |
 | `504f488` | `AgentInfo.created_at` |
 | `df5db9f` | AGENTS.md 四条横切审计教训 |
@@ -37,7 +41,7 @@ $ git status -sb
 | `312cd59` | `_RUNTIME_ONLY` 触发点扫描守卫 |
 | `96c7cdd` | 公开面收口（27 进承诺、27 扣留） |
 
-更早的计划 2 Task 1–15 已在 `origin/main` 一侧。**未 push。**
+更早的计划 2 Task 1–15 已在 `origin/main` 一侧。
 
 ---
 
@@ -106,61 +110,39 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 - 受影响子集（本会话控制器跑的）：`uv run pytest tests/kernel/test_{agent_turn,agent_types,control,danger,events,llm,runtime,public_api,tool_executor}.py tests/contracts/test_memory_registry.py -q` → **1020 passed**
 - 修复轮在 `d4961c1` 上跑的全量门禁：`uv run pytest -q` / `-W error` → **1710 passed**；`ruff check` / `ruff format --check` / `pyright` 0 errors / `scripts/check_deps.py` 空。审计探针当时在 `/tmp/synaudit/`，多半已经没了，不要依赖它们。
 
-### 2.4 本会话**没有**做、也不该假装做完的
+### 2.4 本会话**没有**做、也不该假装做完的（已过时，见 §2.5）
 
-独立评审 Task 16 回来时是 **CHANGES_REQUESTED**（无 Critical，4 Important + 6 Minor）。其中 Important-1（`created_at`）已被横切审计修掉。**Important-2 / 3 / 4 和全部 Minor 都还没改代码**——下一节是第一优先，写计划 3 之前先做。
+独立评审 Task 16 回来时是 **CHANGES_REQUESTED**（无 Critical，4 Important + 6 Minor）。Important-1（`created_at`）当时已由横切审计修掉。I-2 / I-3 / I-4 与 M-1 / M-2 已在后续一轮落地（§2.5）。M-3…M-8 仍未改代码。
+
+### 2.5 Task 16 评审残留 I-2 / I-3 / I-4 + M-1 / M-2（已落地，未 push）
+
+验证：`uv run pytest tests/kernel/test_{public_api,agent_turn,plugins,runtime}.py tests/integration/test_multi_agent_lifecycle.py -q` → **224 + 237 passed**（两批分别跑）；`ruff check/format` 与 `pyright` 对改动文件 0 errors。
+
+| 项 | 做了什么 | 落点 |
+|---|---|---|
+| **I-2** | `Runtime.__init__` / `BaseAgent.__init__` 用 `inspect.signature` 钉参数名 + kind + 有无默认值 | `tests/kernel/test_public_api.py` `_RUNTIME_INIT` / `_BASE_AGENT_INIT` / `_init_shape` |
+| **I-3** | 公开面按 `orchestration=False/True` 两档参数化，必须相等 | `test_the_runtime_surface_is_exactly_this[False/True]` |
+| **I-4** | `attach_gate` → `_attach_gate`；构造器去掉 `gate=`；默认 `NullTurnGate()`；`Runtime.spawn` 调私有方法 | `src/syndica/kernel/agent.py`、`runtime.py`；`test_agent_turn.py` 的 `_agent(..., gate=)` 构造后再 `_attach_gate` |
+| **D-52** | 已关，进「已关闭」 | `docs/decisions/2026-09-14-deferred-items.md` |
+| **M-1** | `__all__` 扫描遇 Starred / AugAssign / `.append` / 非 List / 非字面量 elt 直接 `pytest.fail` | `_declared_exports` |
+| **M-2** | 包里每一次 `....trigger(` 调用必须被匹配器认成 `Junction.X` | `test_the_trigger_matcher_sees_every_trigger_call` |
 
 ---
 
 ## 3. 还没做完的（按建议动手顺序）
 
-### 3.0 先做：Task 16 评审残留（计划 3 之前）
+### 3.0 ~~先做：Task 16 评审残留~~ **已完成**（见 §2.5）
 
-评审自创 34 次变异、7 条存活，全集中在**守卫覆盖边界**，不是控制面行为。建议本轮就收，因为 `TurnGate` 还没进 `kernel.__all__`，现在改 Protocol / 降级 `attach_gate` 最便宜。
-
-#### Important-2 · 构造函数关键字参数零守卫
-
-`test_the_runtime_surface_is_exactly_this` 只枚举实例上的非下划线**名字**。往 `Runtime.__init__` / `BaseAgent.__init__` 加一个带默认值的 keyword 参数，三道守卫全绿，而它同样是永久承诺。
-
-**修法**：给两个 `__init__` 各加一条 `inspect.signature` 逐字比对（参数名 + 顺序 + kind + 有无默认值），形态对齐 `_AGENT_OPTIONS_FIELDS`。注意 PEP 563：运行时标注是字符串，测试文件必须有 `from __future__ import annotations`（AGENTS.md 已有教训）。
-
-#### Important-3 · 实例枚举只看默认构造
-
-`Runtime()` 与 `Runtime(orchestration=True)` 的公开面必须相同。只在 `orchestration=True` 下才赋的公开属性今天逃得出去。`BaseAgent` 不传 `gate` 同盲。
-
-**修法**：至少两档参数化，断言公开面相等。
-
-#### Important-4 · `attach_gate` 应本轮降私有（不要继续当 D-52 推迟）
-
-证据（评审实测）：
-
-1. `src/` 里唯一调用方是 `Runtime.spawn`（`runtime.py` 约 791 行）——与 D-45 降掉的那五个名字同形。
-2. 宿主造不出合规的门：`TurnGate` / `TurnGateDecision` 在 `_WITHHELD`；鸭子类型的门会撞裸 `AttributeError`（`None.abort`），违反错误三件套。
-3. spawn 已经装过门，宿主再调 `attach_gate` 必 `ContractViolation`。
-
-对照：`install_runtime_tools` **该留公开**（宿主真的要用它挑编排工具子集）。
-
-**建议修法**（评审原话）：
-
-- `attach_gate` → `_attach_gate`
-- 去掉 `BaseAgent.__init__(gate=...)` 这个公开参数；测试里构造后门用 `_attach_gate`
-- 更新 `_BASE_AGENT_SURFACE`、`tests/kernel/test_agent_turn.py` 里所有 `attach_gate` / `gate=`
-- **关闭 D-52**（不要只改文档）
-
-调用点速查：`src/syndica/kernel/{agent,runtime}.py`，`tests/kernel/test_agent_turn.py`（约 298、1004、1736、2121、2140–2144）。
-
-#### Minor（可与上面同一 commit，或登记后做）
+I-2 / I-3 / I-4 / M-1 / M-2 已落地；D-52 已关。还没做的 Minor：
 
 | # | 内容 | 建议 |
 |---|---|---|
-| M-1 | `_declared_exports` 对 `__all__ = [..., *_EXTRA]` 和 `__all__ += [...]` 失明 | 遇到非 `ast.Constant` 的 elt、或对 `__all__` 的 `AugAssign` / `.append` 直接 `pytest.fail` |
-| M-2 | `_RUNTIME_ONLY` 扫描不认变量 / `Junction as J` 别名 | 加一条：包里 `.trigger(` 调用点数 == 匹配器认出来的数量 |
-| M-3 | `provenance_of` / `strictest_trust` 不满足「公开签名需要它」 | 可扣留；已导出再拿掉是破坏性变更，要自觉取舍 |
+| M-3 | `provenance_of` / `strictest_trust` 不满足「公开签名需要它」 | 可扣留；已导出再拿掉是破坏性变更，要自觉取舍。**不要在计划 3 里顺手拿掉** |
 | M-4 | 端到端里 `status is WAITING` 调度余量恰好 1 跳 | 改成轮询到 WAITING 或超时；真正见证者是 `await_reply.states == [ANSWERED, ABORTED]` |
-| M-5 | D-53 正文夸大了「静默漂移」 | 契约套件**已经** import 三个 `UPDATE_*` 并划分 `AgentInfo` 字段；残留只是「新增受保护字段时第三方硬编码副本不会被逐条 reject 抓住」。改登记表措辞即可 |
-| M-6 | `send` 第二参 spec 叫 `message`、实现叫 `content`；`spawn.query` 收成 keyword-only | 登记为措辞差异，**不要改名**（改名立刻破调用方） |
-| M-7 | spec `AgentInfo.type` 实现叫 `agent_type`（避开内置名） | 公开 dataclass 字段名是永久承诺；D-55 没提这一处，登记即可，不要改回去 |
-| M-8 | `WaitState.ABORTED` 自己的 docstring 仍只写「协作式中止落在等待上」 | D-26 的契约（`ABORTING` 下一秒都没等、判据取注册表）写在 `wait_for` 四十行 docstring 里；宿主读枚举时看不到。补枚举 docstring 即可 |
+| M-5 | D-53 正文夸大了「静默漂移」 | 改登记表措辞即可 |
+| M-6 | `send` 第二参 spec 叫 `message`、实现叫 `content`；`spawn.query` 收成 keyword-only | 登记为措辞差异，**不要改名** |
+| M-7 | spec `AgentInfo.type` 实现叫 `agent_type`（避开内置名） | 登记即可，不要改回去 |
+| M-8 | `WaitState.ABORTED` 自己的 docstring 仍只写「协作式中止落在等待上」 | 补枚举 docstring，把 D-26 契约写到宿主会读的那一行 |
 
 ### 3.1 然后：写并执行计划 3
 
@@ -199,7 +181,7 @@ CLI（§9.1 名词+动词、默认 `run`、`chat` = `run --session`）；L2 声�
 
 ### 3.5 里程碑 1 收口审计（计划 6 之后）
 
-spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或按当时用户指示）。挂单：D-51、D-27、D-52（若 3.0 已关则从表里移到「已关闭」）、D-58、D-59、V-01、V-02。
+spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或按当时用户指示）。挂单：D-51、D-27、D-58、D-59、V-01、V-02。D-52 已关。
 
 ### 3.6 明确不在里程碑 1
 
@@ -211,12 +193,12 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 
 ## 4. 下一任 Agent 建议的第一条命令
 
-在 `/Users/bytedance/Documents/syndica`、确认 `git status` 干净且 `HEAD` 仍是（或快进过）交接文档那笔提交之后：
+在 `/Users/bytedance/Documents/syndica`、确认工作区干净之后：
 
-1. **先做 §3.0**（Task 16 Important-2/3/4，建议顺手 M-1/M-2）。受影响测试：`tests/kernel/test_public_api.py`、`tests/kernel/test_agent_turn.py`。通过后再 commit，**仍不要 push**，除非用户说推。
-2. **再写计划 3**（新文件 `docs/plans/2026-09-xx-m1p3-….md`），结构对齐计划 2：Goal / Architecture / Global Constraints / 设计裁决 / 任务拆解。写完自己 review，再开执行。
-3. 每个任务继续走：实现 → 自我变异（先清 `__pycache__`；新文件先 `git add`；sha256 基线必须覆盖本轮会改到的每个文件，见 AGENTS.md）→ 独立评审 → 修复 → 收口。
-4. 遗留项**同时**记进 [`docs/decisions/2026-09-14-deferred-items.md`](../decisions/2026-09-14-deferred-items.md)，不要只写 gitignored 的 `.superpowers/sdd/progress*.md`。
+1. **写计划 3**（新文件 `docs/plans/2026-09-21-m1p3-declarative-agents.md`），结构对齐计划 2：Goal / Architecture / Global Constraints / 设计裁决 / 任务拆解。写完自己 review，**再开执行**。不要直接写代码。
+2. 每个任务继续走：实现 → 自我变异（先清 `__pycache__`；新文件先 `git add`；sha256 基线必须覆盖本轮会改到的每个文件，见 AGENTS.md）→ 独立评审 → 修复 → 收口。
+3. 遗留项**同时**记进 [`docs/decisions/2026-09-14-deferred-items.md`](../decisions/2026-09-14-deferred-items.md)，不要只写 gitignored 的 `.superpowers/sdd/progress*.md`。
+4. **仍不要 push**，直到里程碑 1 收口审计通过，或用户明确说推。
 
 ---
 
@@ -242,7 +224,8 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 | turn 循环 / 第 9 步 abort | `src/syndica/kernel/agent.py` `_run_turns` |
 | 门协议 | `src/syndica/kernel/control.py` `TurnGate` |
 | 生命周期 / spawn / shutdown | `src/syndica/kernel/runtime.py` |
-| 公开面守卫 | `tests/kernel/test_public_api.py` |
+| 公开面守卫 / `__init__` 签名 | `tests/kernel/test_public_api.py` |
+| 装门（仅内核） | `BaseAgent._attach_gate`；测试走 `_agent(..., gate=)` |
 | 多 Agent 取证 | `tests/integration/test_multi_agent_lifecycle.py` |
 | 登记表 | `docs/decisions/2026-09-14-deferred-items.md` |
 | 计划 2 原文 | `docs/plans/2026-09-08-m1p2-control-plane.md` |

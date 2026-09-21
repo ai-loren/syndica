@@ -388,7 +388,6 @@ class BaseAgent:
         *,
         hooks: HooksCenter,
         events: EventBus,
-        gate: TurnGate | None = None,
     ) -> None:
         self.options: AgentOptions = options
         # 全量 uuid4 hex 而非截断：id 撞车不是软失败——AgentRegistry.register 拒绝重复 id，
@@ -407,13 +406,15 @@ class BaseAgent:
         self._context = Context()
         self._current_turn = 0
         self._running = False
-        self._gate: TurnGate = gate if gate is not None else NullTurnGate()
-        self._gate_attached = gate is not None
+        # 默认开着，但什么都不拦；真正的门由 `Runtime.spawn` 经 `_attach_gate` 装上。构造器不接
+        # `gate=`：那个参数的类型不在公开面，放在这里就等于给宿主一个写不出标注的入口。
+        self._gate: TurnGate = NullTurnGate()
+        self._gate_attached = False
 
     def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
         """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
 
-        只能在这里装，理由同 `attach_gate`：这些工具绑着 `agent_id`，而它在本类构造时才生成，
+        只能在这里装，理由同 `_attach_gate`：这些工具绑着 `agent_id`，而它在本类构造时才生成，
         工厂手里没有它。
 
         **不就地改宿主交进来的那张表。** `AgentOptions.tools` 可能是工厂在多次调用之间复用的同一个
@@ -454,7 +455,7 @@ class BaseAgent:
             raise _runtime_only_junction(junction)
         self._hooks.register(junction, cb)
 
-    def attach_gate(self, gate: TurnGate) -> None:
+    def _attach_gate(self, gate: TurnGate) -> None:
         """装上控制面的门。
 
         `Runtime` 只能在这里装：门要按 `agent_id` 认邮箱，而 `agent_id` 在本类构造时才生成，

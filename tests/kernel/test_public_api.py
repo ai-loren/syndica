@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import inspect
 import os
 from pathlib import Path
+
+import pytest
 
 import syndica.kernel as kernel
 import syndica.kernel.contracts as contracts
@@ -123,13 +126,29 @@ _RUNTIME_SURFACE: tuple[str, ...] = (
 # 一次「顺手加个公开方法」因此在这里之外没有任何东西会变红。
 _BASE_AGENT_SURFACE: tuple[str, ...] = (
     'agent_id',
-    'attach_gate',
     'context',
     'get_system_prompt',
     'install_runtime_tools',
     'options',
     'register_hook',
     'run',
+)
+# `Runtime.__init__` / `BaseAgent.__init__` 的参数名、种类、有没有默认值。`dir()` 看不见构造
+# 签名：加一个关键字参数、把必填改成可选、把 keyword-only 改成位置参数，公开面守卫全绿。
+# 第三列是「有没有默认值」而不是默认值本身——默认值改了是行为变更，这条守卫管的是形状。
+_RUNTIME_INIT: tuple[tuple[str, str, bool], ...] = (
+    ('self', 'POSITIONAL_OR_KEYWORD', False),
+    ('registry', 'KEYWORD_ONLY', True),
+    ('broker', 'KEYWORD_ONLY', True),
+    ('plugins', 'KEYWORD_ONLY', True),
+    ('agents', 'KEYWORD_ONLY', True),
+    ('orchestration', 'KEYWORD_ONLY', True),
+)
+_BASE_AGENT_INIT: tuple[tuple[str, str, bool], ...] = (
+    ('self', 'POSITIONAL_OR_KEYWORD', False),
+    ('options', 'POSITIONAL_OR_KEYWORD', False),
+    ('hooks', 'KEYWORD_ONLY', False),
+    ('events', 'KEYWORD_ONLY', False),
 )
 # `AgentOptions` 的公开面，理由同上；它是宿主唯一亲手填的那个数据类。
 _AGENT_OPTIONS_SURFACE: tuple[str, ...] = (
@@ -161,8 +180,8 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # 一个名字进公开面，当且仅当宿主拿不到它就用不了某个已经公开的入口。下面每一项都答「用得了」：
 #
 # - 门的四件套（`TurnGate` / `NullTurnGate` / `BrokerTurnGate` / `TurnGateDecision`）与
-#   `ControlBlock`：控制面自己的接缝，`Runtime` 是唯一的生产者、`BaseAgent` 是唯一的消费者，
-#   宿主不传 gate 时默认就是 `NullTurnGate`。
+#   `ControlBlock`：控制面自己的接缝，`Runtime` 是唯一的生产者、`BaseAgent` 是唯一的消费者。
+#   装门走 `_attach_gate`，不在公开面；宿主不传门时默认就是 `NullTurnGate`。
 # - 校验函数（`validate_*`、`tool_name_disagreement`）：收下配置的那一层自己调，宿主拿它没有用。
 # - `ToolExecutor` / `DEFAULT_MAX_TOOL_CONCURRENCY`：执行器由 `BaseAgent` 构造，上限的默认值经
 #   `AgentOptions` 的字段默认值就取得到。
@@ -211,6 +230,10 @@ def _declared_exports() -> tuple[dict[str, set[str]], list[str]]:
 
     期望值来自**文件树**，不是包自己的 re-export 面：拿 `dir(kernel)` 或任何一个 `__init__`
     去推，漏掉一个子模块的名字会让期望值跟着缩水。
+
+    `__all__` 必须是一份字面量字符串列表。`__all__ += [...]`、`__all__.extend(...)`、
+    `[*__all__, 'x']` 都会让扫描少看见名字，而主断言全绿——那些名字从此既不进承诺清单、
+    也不进扣留清单。
     """
     declared: dict[str, set[str]] = {}
     scanned: list[str] = []
@@ -218,18 +241,62 @@ def _declared_exports() -> tuple[dict[str, set[str]], list[str]]:
         relative = path.relative_to(_PACKAGE).as_posix()
         scanned.append(relative)
         for node in ast.parse(path.read_text(encoding='utf-8')).body:
-            if not isinstance(node, ast.Assign):
-                continue
-            if not any(
+            if (
+                isinstance(node, ast.AugAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == '__all__'
+            ):
+                pytest.fail(
+                    f'{relative}: `__all__` is mutated after assignment; '
+                    'the export scan cannot see the extra names'
+                )
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == '__all__'
+                and node.value.func.attr in {'append', 'extend', 'insert'}
+            ):
+                pytest.fail(
+                    f'{relative}: `__all__.{node.value.func.attr}(...)` mutates the export '
+                    'list after assignment; the export scan cannot see the extra names'
+                )
+            value: ast.expr | None = None
+            if isinstance(node, ast.Assign) and any(
                 isinstance(target, ast.Name) and target.id == '__all__' for target in node.targets
             ):
+                value = node.value
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == '__all__'
+            ):
+                if node.value is None:
+                    pytest.fail(f'{relative}: `__all__` is annotated but not assigned')
+                value = node.value
+            if value is None:
                 continue
-            if not isinstance(node.value, ast.List):
-                continue
-            for element in node.value.elts:
+            if not isinstance(value, ast.List):
+                pytest.fail(
+                    f'{relative}: `__all__` must be a list literal; got {type(value).__name__}'
+                )
+            for element in value.elts:
                 if isinstance(element, ast.Constant) and isinstance(element.value, str):
                     declared.setdefault(element.value, set()).add(relative)
+                    continue
+                pytest.fail(
+                    f'{relative}: `__all__` entries must be string literals; '
+                    f'got {type(element).__name__}'
+                )
     return declared, scanned
+
+
+def _init_shape(cls: type) -> tuple[tuple[str, str, bool], ...]:
+    return tuple(
+        (parameter.name, parameter.kind.name, parameter.default is not inspect.Parameter.empty)
+        for parameter in inspect.signature(cls.__init__).parameters.values()
+    )
 
 
 def _package_python_files() -> set[str]:
@@ -267,11 +334,15 @@ def test_the_contract_suite_surface_is_exactly_this():
     assert [name for name in contracts.__all__ if not hasattr(contracts, name)] == []
 
 
-def test_the_runtime_surface_is_exactly_this():
+@pytest.mark.parametrize('orchestration', [False, True], ids=['default', 'orchestration'])
+def test_the_runtime_surface_is_exactly_this(orchestration: bool):
     """按实例枚举而不是按类：`registry` / `broker` / `events` / `hooks` 是 `__init__` 里赋的
     实例属性，只看 `dir(Runtime)` 会漏掉它们，而宿主读写的正是这四个。
+
+    `orchestration=True` 必须交出同一张公开面：装配五个工具是 spawn 时的动作，不得在 Runtime
+    实例上多出一个名字。
     """
-    runtime = Runtime()
+    runtime = Runtime(orchestration=orchestration)
     assert sorted(name for name in dir(runtime) if not name.startswith('_')) == sorted(
         _RUNTIME_SURFACE
     )
@@ -294,6 +365,14 @@ def test_the_agent_options_surface_is_exactly_this():
 def test_the_agent_options_field_order_is_exactly_this():
     """新字段只能追加在末尾：插在中间会让每一个按位置传参的调用方静默改变含义。"""
     assert [field.name for field in dataclasses.fields(AgentOptions)] == list(_AGENT_OPTIONS_FIELDS)
+
+
+def test_the_runtime_constructor_shape_is_exactly_this():
+    assert _init_shape(Runtime) == _RUNTIME_INIT
+
+
+def test_the_base_agent_constructor_shape_is_exactly_this():
+    assert _init_shape(BaseAgent) == _BASE_AGENT_INIT
 
 
 def test_the_export_scan_really_covers_the_whole_package():

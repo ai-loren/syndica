@@ -788,7 +788,7 @@ class Runtime:
         agent_id = agent.agent_id
         control = ControlBlock()
         gate = BrokerTurnGate(agent_id, self.broker, control)
-        agent.attach_gate(gate)
+        agent._attach_gate(gate)  # pyright: ignore[reportPrivateUsage]
         self._install_orchestration(agent, agent_id)
         if fork_from is not None:
             source = self._table.get(fork_from)
