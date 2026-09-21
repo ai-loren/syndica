@@ -1286,6 +1286,20 @@ async def test_the_executor_refuses_a_tools_table_whose_key_disagrees_with_the_t
     assert "'Echo'" in excinfo.value.received
 
 
+async def test_retargeting_onto_a_table_whose_key_disagrees_with_the_tool_name_is_refused():
+    """换表与构造走同一道校验：换进来的那张表同样没有人替它对齐三条身份轴。
+
+    被拒的换表什么都没发生——校验在赋值之前，所以 executor 仍按原来那张表查。
+    """
+    executor = ToolExecutor(tools={'Echo': _Echo()}, hooks=HooksCenter())
+
+    with pytest.raises(ConfigError) as excinfo:
+        executor._retarget({'echo': _Echo()})  # pyright: ignore[reportPrivateUsage]
+
+    assert "'echo'" in excinfo.value.received
+    assert list(executor._tools) == ['Echo']  # pyright: ignore[reportPrivateUsage]
+
+
 async def test_a_tool_put_into_the_live_table_under_a_wrong_key_fails_loudly_on_the_first_call():
     """`tools` 是活表（每次调用时查，不快照），构造时的校验挡不住之后塞进来的条目。这条路必须上抛
     而不是写一条「工具名不存在」的 block：后者让每次调用都失败而调用方一无所知。"""

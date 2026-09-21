@@ -2332,6 +2332,34 @@ async def test_killing_something_another_runtime_holds_is_answered_not_raised():
     await here.shutdown()
 
 
+class _RegistryThatBreaksOnAborting(InMemoryAgentRegistry):
+    """一个只在「转去 aborting」那一步坏掉的注册表。接缝另一侧的协作方不是说谎，是坏掉了。"""
+
+    async def compare_and_set_status(
+        self, agent_id: str, *, expected: AgentStatus, new: AgentStatus
+    ) -> bool:
+        if new is AgentStatus.ABORTING:
+            raise RuntimeError('registry down')
+        return await super().compare_and_set_status(agent_id, expected=expected, new=new)
+
+
+async def test_kill_agent_lets_a_real_failure_through_instead_of_answering_the_model():
+    """被译成 `output` 的只有「本进程停不了它」那一条。
+
+    把 `kill` 抛出的**每一种**异常都译成一条给模型的话，一次真正的故障会变成「换个方式再试」，
+    而这次 run 照常以 COMPLETED 返回——失败被当成成功上报。
+    """
+    runtime = Runtime(registry=_RegistryThatBreaksOnAborting())
+    killer = await _idle_parent(runtime)
+    target = await _resident(runtime, killer)
+
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(
+            KillAgent(runtime, killer).execute(agent_id=target), timeout=_TIMEOUT
+        )
+    await runtime.shutdown()
+
+
 async def test_killing_yourself_is_refused_by_comparing_ids_not_task_identity():
     """判据是两个 id 相等，因此它对「调用方跑在哪个任务上」完全免疫（D-39 的那一格）。
 
