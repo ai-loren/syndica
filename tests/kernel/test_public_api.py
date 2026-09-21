@@ -195,6 +195,7 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 #   落点是随 wheel 发布的契约套件（见 D-53）。
 # - `correlation_of`：`Waiter` 密封分发的内部收口，`wait_for` 自己调。
 _WITHHELD: tuple[str, ...] = (
+    'AgentCatalog',
     'AgentManifest',
     'BrokerTurnGate',
     'ControlBlock',
@@ -207,6 +208,7 @@ _WITHHELD: tuple[str, ...] = (
     'ManifestSource',
     'NullTurnGate',
     'OBSERVABLE',
+    'OverrideRecord',
     'QueryAgent',
     'ReadOnlyKwarg',
     'SendMessage',
