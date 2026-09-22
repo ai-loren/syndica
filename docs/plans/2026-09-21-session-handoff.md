@@ -2,7 +2,9 @@
 
 写于 2026-09-21，2026-09-22 更新。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
-**一句话现状：** 计划 1、计划 2、计划 3 已收口；计划 4 **9/9 已落地**。计划 5–6 未写未做，里程碑 1 尚未完成。**下一步是先写计划 5，再按同等严格度执行**；不要重做计划 3–4，不要添加 `Runtime.start`。
+**一句话现状：** 计划 1、计划 2、计划 3 已收口；计划 4 **9/9 已落地**。计划 5
+[`2026-09-22-m1p5-runtime-modules.md`](./2026-09-22-m1p5-runtime-modules.md) 已写待执行，计划 6 未写未做，
+里程碑 1 尚未完成。**下一步是评审并执行计划 5**；不要重做计划 3–4，不要添加 `Runtime.start`。
 
 **先读顺序**
 
@@ -128,7 +130,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | **2** | 事件循环、生命周期、等待、危险判定、工具并发、插件、编排工具、公开面 | **代码收口**（含审计修复 + Task 16 残留） |
 | **3** | 声明式清单、目录、拓扑、四个内置角色 | **代码收口** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；Task 1 = `97c9edc`，Task 2 = `551b4d2`，Task 3 = `7071eda`，Task 4 = `73289a2`，Task 5 = `cb81e02`，Task 6 = `b508023`，Task 7 = `d0e6828`，Task 8 = `15436ed` |
 | **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | **代码收口**；Task 1–9 全部完成 |
-| **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | 未写未做 |
+| **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | 计划已写，待执行 |
 | **6** | CLI + L2 场景回放 + AskUser | 未写未做 |
 | **M1 收口审计** | spec §15 取证 + 遗留项清空 + **那时再 push** | 未做 |
 
@@ -486,11 +488,14 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 | 8 | 依赖门禁缺口、注释、公开面、关台账 | 已落地 `ade688f` |
 | 9 | publish 与 remove_queue 的回执窗口 | 已落地（本文同一提交） |
 
-计划 4 所属遗留项已经全部转入登记表「已关闭」。下一步先写计划 5，不要直接跨到计划 6。
+计划 4 所属遗留项已经全部转入登记表「已关闭」。下一步评审并执行计划 5，不要直接跨到计划 6。
 
-### 4.3 计划 5（未写未做）
+### 4.3 计划 5（已写待执行）
 
-Runtime Module + Flag（§5.5 四类注入）；重试 / 故障转移 Module（§5.7）；前缀漂移检测（§5.2）。
+计划文件：[`2026-09-22-m1p5-runtime-modules.md`](./2026-09-22-m1p5-runtime-modules.md)。
+
+范围：Runtime Module + Flag（§5.5 四类注入）；重试 / 故障转移 Module（§5.7）；前缀漂移检测
+（§5.2）。
 
 挂单：D-18、D-47（墙钟那一半）、D-19、D-20、D-21、D-22、D-23、D-29（`untrusted_high_risk` flag）、D-55（**`flags` 字段不要提前加**，没有读者会被当死代码删掉）。
 
@@ -540,8 +545,8 @@ git log -3 --oneline
 
 然后：
 
-1. **先写计划 5**：Runtime Module + Flag、重试 / 故障转移 Module、前缀漂移检测。
-2. 计划 5 的范围以 spec §5.2 / §5.5 / §5.7 与登记表 D-18、D-47、D-19–D-23、D-29、D-55 为准。
+1. **评审并执行计划 5**：[`2026-09-22-m1p5-runtime-modules.md`](./2026-09-22-m1p5-runtime-modules.md)。
+2. 范围仍以 spec §5.2 / §5.5 / §5.7 与登记表 D-18、D-47、D-19–D-23、D-29、D-55 为准。
 3. 每个任务走完变异 + 独立评审再 commit。**仍不要 push**，直到 M1 收口审计通过。
 
 ---
@@ -622,7 +627,7 @@ git log -3 --oneline
 | 计划 3（已收口，不要重做） | `docs/plans/2026-09-21-m1p3-declarative-agents.md` |
 | 计划 4（已收口） | `docs/plans/2026-09-22-m1p4-local-exec.md` |
 | 本地工具 | `src/syndica/kernel/tools/local.py`；`tests/kernel/test_local_tools_*.py` |
-| **下一步** | 写计划 5 |
+| **下一步** | 执行计划 5 |
 | 范围裁决 | `docs/decisions/2026-09-08-m1-scope.md` |
 | 硬约束 / 变异纪律 | `AGENTS.md` |
 
