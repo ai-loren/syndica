@@ -27,6 +27,52 @@ Four claims that shape the design:
 
 See [`docs/design/2026-09-03-architecture.md`](docs/design/2026-09-03-architecture.md).
 
+## CLI
+
+Install the package and its OpenAI-compatible backend:
+
+```bash
+python -m pip install -e '.[openai]'
+export OPENAI_BASE_URL=https://your-endpoint.example/v1
+export OPENAI_MODEL=your-model
+export OPENAI_API_KEY=your-key
+```
+
+Run a prompt directly, or inspect the built-in catalog:
+
+```bash
+syndica "write a short report"
+syndica run "inspect this repository" --agent Worker --max-turns 20
+syndica agents list
+syndica flags show untrusted_high_risk
+syndica doctor
+```
+
+The CLI reads `.syndica.yaml` from the current directory by default. Use `--config path.yaml`
+before the command to select another file. Configuration is a single safe YAML mapping:
+
+```yaml
+version: 1
+agents:
+  - name: Reviewer
+    description: Reviews a completed artifact.
+    model: review-model
+    tools: [Read, Grep, Glob]
+topologies:
+  review:
+    slots:
+      - name: root
+        agent: Reviewer
+        is_root: true
+        cardinality: singleton
+        boot: eager
+```
+
+`--flag` is repeatable and uses exact `key=value` syntax. Milestone 1 executes `--max-turns`;
+cost, token, and wall-clock budgets are accepted by the parser but fail explicitly until their
+budget engine is implemented. `chat` keeps sessions only inside its current process. Cross-process
+`--session` recovery and `sessions ...` require the later `SessionStore` milestone.
+
 ## License
 
 MIT

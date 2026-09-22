@@ -1,0 +1,92 @@
+version: 1
+name: rejected-confirmation-failure
+agents:
+  Coordinator:
+    manifest:
+      name: Coordinator
+      description: Coordinates the failure replay.
+      model: coordinator-model
+    instances:
+      - turns:
+          - tool_calls:
+              - id: delegate-1
+                name: Delegate
+                arguments:
+                  agent: Worker
+                  query: Exercise the failure path.
+          - content: failure observed
+  Worker:
+    manifest:
+      name: Worker
+      description: Exercises rejection and failure.
+      model: worker-model
+      tools: [Write, Bash]
+    instances:
+      - turns:
+          - tool_calls:
+              - id: write-1
+                name: Write
+                arguments:
+                  path: keep.txt
+                  content: keep me
+          - tool_calls:
+              - id: taint-1
+                name: Bash
+                arguments:
+                  command: printf taint
+          - tool_calls:
+              - id: dangerous-1
+                name: Bash
+                arguments:
+                  command: rm -rf -- keep.txt
+          - raises:
+              kind: runtime_error
+              message: injected LLM failure
+topology:
+  slots:
+    - name: root
+      agent: Coordinator
+      is_root: true
+      cardinality: singleton
+      boot: eager
+entry:
+  slot: root
+  prompt: Start the failure replay.
+responses:
+  - kind: confirmation
+    agent: "Worker[0]"
+    tool_call_id: dangerous-1
+    answer: reject
+expect:
+  final_output:
+    "Coordinator[0]": failure observed
+  tool_order:
+    "Coordinator[0]": [Delegate]
+    "Worker[0]": [Write, Bash, Bash]
+  stop_reasons:
+    "Coordinator[0]": completed
+    "Worker[0]": error
+  errors:
+    "Worker[0]": "RuntimeError: injected LLM failure"
+  statuses:
+    "Coordinator[0]": zombie
+    "Worker[0]": zombie
+  events:
+    - agent_start
+    - turn_start
+    - agent_start
+    - turn_start
+    - turn_end
+    - turn_start
+    - turn_end
+    - turn_start
+    - tool_confirmation_requested
+    - turn_end
+    - turn_start
+    - agent_error
+    - turn_end
+    - turn_start
+    - turn_end
+    - agent_end
+  workspace:
+    keep.txt: keep me

@@ -1,0 +1,109 @@
+version: 1
+name: delegated-human-confirmation
+agents:
+  Coordinator:
+    manifest:
+      name: Coordinator
+      description: Coordinates the workflow.
+      model: coordinator-model
+    instances:
+      - turns:
+          - tool_calls:
+              - id: delegate-1
+                name: Delegate
+                arguments:
+                  agent: Worker
+                  query: Complete the approved workflow.
+          - content: workflow complete
+  Worker:
+    manifest:
+      name: Worker
+      description: Writes and verifies the result.
+      model: worker-model
+      tools: [Write, Bash, Read]
+    instances:
+      - turns:
+          - tool_calls:
+              - id: write-1
+                name: Write
+                arguments:
+                  path: result.txt
+                  content: approved result
+          - tool_calls:
+              - id: ask-1
+                name: AskUser
+                arguments:
+                  question: Continue with cleanup?
+                  timeout: 30
+          - tool_calls:
+              - id: taint-1
+                name: Bash
+                arguments:
+                  command: printf taint && touch doomed.txt
+          - tool_calls:
+              - id: dangerous-1
+                name: Bash
+                arguments:
+                  command: rm -rf -- doomed.txt
+          - tool_calls:
+              - id: read-1
+                name: Read
+                arguments:
+                  path: result.txt
+          - content: worker complete
+topology:
+  slots:
+    - name: root
+      agent: Coordinator
+      is_root: true
+      cardinality: singleton
+      boot: eager
+entry:
+  slot: root
+  prompt: Start the workflow.
+responses:
+  - kind: user_input
+    agent: "Worker[0]"
+    answer: continue
+  - kind: confirmation
+    agent: "Worker[0]"
+    tool_call_id: dangerous-1
+    answer: approve
+expect:
+  final_output:
+    "Coordinator[0]": workflow complete
+    "Worker[0]": worker complete
+  tool_order:
+    "Coordinator[0]": [Delegate]
+    "Worker[0]": [Write, AskUser, Bash, Bash, Read]
+  stop_reasons:
+    "Coordinator[0]": completed
+    "Worker[0]": completed
+  statuses:
+    "Coordinator[0]": zombie
+    "Worker[0]": zombie
+  events:
+    - agent_start
+    - turn_start
+    - agent_start
+    - turn_start
+    - turn_end
+    - turn_start
+    - user_input_requested
+    - turn_end
+    - turn_start
+    - turn_end
+    - turn_start
+    - tool_confirmation_requested
+    - turn_end
+    - turn_start
+    - turn_end
+    - turn_start
+    - turn_end
+    - agent_end
+    - turn_end
+    - turn_start
+    - turn_end
+    - agent_end
+  workspace:
+    result.txt: approved result

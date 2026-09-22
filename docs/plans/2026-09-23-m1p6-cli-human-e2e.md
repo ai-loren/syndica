@@ -3,7 +3,7 @@
 > **执行者须知：本文件是需求，不是参考。** 公开命令名、事件 kind、工具名、Flag key 与场景格式一旦
 > 发布就是兼容承诺；执行中不得为了让测试变绿临时改名或缩小断言范围。
 
-**状态：执行中。**
+**状态：已完成。**
 
 **Goal:** 提供一个可安装、可脚本测试的 `syndica` CLI；让 Agent 能通过 `AskUser` /
 `AskUserQuestion` 等待人类答复，让交互式宿主能批准或拒绝单次危险调用；并提供 YAML 声明式 L2
@@ -282,7 +282,7 @@ expect:
 
 ### Task 8 — L2 E2E、文档与计划收口
 
-**状态：pending**
+**状态：completed**（3 条端到端验收；6 条真实变异；独立审查修复 2 项）
 
 **Files:** `tests/scenarios/*.yaml`、`tests/integration/test_cli_human_scenario.py`、README、
 `deferred-items.md`、handoff、本计划
@@ -381,6 +381,9 @@ expect:
   topology 路径从 `AgentManifest.budget` 与 `AgentOptions.max_turns` 纯计算，不额外构造 Agent。
 - Task 7：`Runtime.wait()` 会把 Agent 内部异常收成 `Context.stop_reason=error`；CLI host 必须检查
   stop reason，否则会把失败当成空输出并返回 exit 0。
+- Task 8：失败场景只断言通用 `error` 会假绿；删除指定 `raises` 后，脚本耗尽同样产生
+  `agent_error`。Runner 因此在 LLM failure hook 上记录异常类型与消息，并由 `expect.errors`
+  逐字断言。
 
 ## 文档更新清单
 
@@ -391,4 +394,9 @@ expect:
 
 ## 完成复盘
 
-- 待 Task 8 补。
+- CLI 的路由层保持零 kernel / backend / YAML 顶层依赖；`version` 子进程证明确实惰性。
+- `RuntimeCliHost` 统一承载 run/chat、配置、Flag、workspace、事件泵和资源清理；chat 普通输入只走
+  `RunRequest(session=...)`，并能切换到 Delegate 创建的子 Agent。
+- 两条 YAML L2 场景覆盖成功与失败路径；唯一替身是 ScriptedLLM，其余均为真实 Runtime、broker、
+  registry、工具、hooks 与 workspace。
+- D-38 已关闭：一次性批准只覆盖当前调用，且获批工具的 execute + POST hook 独占执行区间。

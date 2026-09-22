@@ -24,6 +24,7 @@ from syndica.kernel import (
     HooksCenter,
     HostFacts,
     HumanInteractionModule,
+    Junction,
     LLMResponseError,
     LocalWorkspace,
     MailboxConfirmationHandler,
@@ -83,7 +84,15 @@ _ENTRY_KEYS = frozenset({'slot', 'prompt'})
 _RESPONSE_KEYS = frozenset({'kind', 'agent', 'answer', 'tool_call_id'})
 _RESPONSE_KINDS = frozenset({'user_input', 'user_question', 'confirmation'})
 _EXPECT_KEYS = frozenset(
-    {'final_output', 'tool_order', 'stop_reasons', 'statuses', 'events', 'workspace'}
+    {
+        'final_output',
+        'tool_order',
+        'stop_reasons',
+        'errors',
+        'statuses',
+        'events',
+        'workspace',
+    }
 )
 
 
@@ -110,6 +119,7 @@ class ScenarioExpectation:
     final_output: Mapping[str, str]
     tool_order: Mapping[str, tuple[str, ...]]
     stop_reasons: Mapping[str, str]
+    errors: Mapping[str, str]
     statuses: Mapping[str, str]
     events: tuple[str, ...]
     workspace: Mapping[str, str]
@@ -144,6 +154,7 @@ class ScenarioResult:
     final_output: Mapping[str, str]
     tool_order: Mapping[str, tuple[str, ...]]
     stop_reasons: Mapping[str, str]
+    errors: Mapping[str, str]
     statuses: Mapping[str, str]
     events: tuple[ScenarioEvent, ...]
     workspace: Mapping[str, str]
@@ -565,6 +576,7 @@ def _expectation(value: object) -> ScenarioExpectation:
         final_output=_string_map(data.get('final_output', {}), 'expect.final_output'),
         tool_order=_tool_order(data.get('tool_order', {})),
         stop_reasons=_string_map(data.get('stop_reasons', {}), 'expect.stop_reasons'),
+        errors=_string_map(data.get('errors', {}), 'expect.errors'),
         statuses=_string_map(data.get('statuses', {}), 'expect.statuses'),
         events=events,
         workspace=_string_map(data.get('workspace', {}), 'expect.workspace'),
@@ -634,6 +646,7 @@ class ScenarioRunner:
         )
         policy = _ScenarioPolicy(confirmation_ids)
         selector_by_id: dict[str, str] = {}
+        errors: dict[str, str] = {}
         counters = {role: 0 for role in roles}
         factories = {
             role: self._factory(
@@ -643,6 +656,7 @@ class ScenarioRunner:
                 policy,
                 counters,
                 selector_by_id,
+                errors,
             )
             for role, agent in roles.items()
         }
@@ -766,6 +780,7 @@ class ScenarioRunner:
                 runtime,
                 selector_by_id,
                 events,
+                errors,
                 subscription,
                 root,
             )
@@ -802,6 +817,7 @@ class ScenarioRunner:
         policy: _ScenarioPolicy,
         counters: dict[str, int],
         selector_by_id: dict[str, str],
+        errors: dict[str, str],
     ) -> AgentFactory:
         template = base_factory(HooksCenter(), EventBus()).options
 
@@ -828,6 +844,13 @@ class ScenarioRunner:
             agent = BaseAgent(options, hooks=hooks, events=events)
             selector = f'{role}[{index}]'
             selector_by_id[agent.agent_id] = selector
+
+            async def capture_failure(**kwargs: object) -> None:
+                error = kwargs.get('error')
+                if isinstance(error, BaseException):
+                    errors.setdefault(selector, f'{type(error).__name__}: {error}')
+
+            agent.register_hook(Junction.LLM_FAILURE, capture_failure)
             return agent
 
         return build
@@ -838,6 +861,7 @@ class ScenarioRunner:
         runtime: Runtime,
         selector_by_id: Mapping[str, str],
         events: list[ScenarioEvent],
+        errors: Mapping[str, str],
         subscription: Subscription,
         root: Path,
     ) -> ScenarioResult:
@@ -888,6 +912,7 @@ class ScenarioRunner:
             final_output=MappingProxyType(final_output),
             tool_order=MappingProxyType(tool_order),
             stop_reasons=MappingProxyType(stop_reasons),
+            errors=MappingProxyType(dict(errors)),
             statuses=MappingProxyType(statuses),
             events=tuple(events),
             workspace=MappingProxyType(workspace),
@@ -898,6 +923,7 @@ class ScenarioRunner:
             ('final_output', dict(expected.final_output), dict(actual.final_output)),
             ('tool_order', dict(expected.tool_order), dict(actual.tool_order)),
             ('stop_reasons', dict(expected.stop_reasons), dict(actual.stop_reasons)),
+            ('errors', dict(expected.errors), dict(actual.errors)),
             ('statuses', dict(expected.statuses), dict(actual.statuses)),
             ('workspace', dict(expected.workspace), dict(actual.workspace)),
         )

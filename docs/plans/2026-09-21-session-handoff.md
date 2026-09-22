@@ -2,9 +2,8 @@
 
 写于 2026-09-21，2026-09-23 更新。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
-**一句话现状：** 计划 1–5 已收口。计划 6 未写未做，里程碑 1 尚未完成。**下一步是依据既定范围
-起草并评审计划 6（CLI + 人工确认交互 + L2 场景回放）**；不要重做计划 3–5，不要添加
-`Runtime.start`。
+**一句话现状：** 计划 1–6 已收口，CLI、人机交互、人工确认与 L2 场景回放均已落地。
+**下一步是执行里程碑 1 最终审计**；不要重做计划 3–6，不要添加 `Runtime.start`。
 
 **先读顺序**
 
@@ -95,8 +94,8 @@ $ git status -sb
 
 更早的计划 2 Task 1–15 已在 `origin/main` 一侧。
 
-**本轮停笔时工作区干净。** 不要重做计划 3–5。下一步是写计划 6；`assemble` 不是 `start()`，
-后续也不要加 `Runtime.start`。
+计划 1–6 的代码均已收口；当前工作区若有改动，只应是里程碑 1 最终审计。`assemble` 不是
+`start()`，后续也不要加 `Runtime.start`。
 
 ---
 
@@ -129,7 +128,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | Tool 系统与 LLM 抽象 | **内核抽象已做** | Tool / ToolExecutor / DangerJudge / ScriptedLLM；OpenAI 兼容 provider 在计划 4 |
 | 最小本地执行（读写文件 + 跑命令） | **已做** | 计划 4：八个本地工具、真实拓扑集成测试、OpenAI 兼容 provider |
 
-**结论：计划 1–5 已收口。里程碑 1 本身没完。** 还缺 CLI / 人工确认 / L2 场景层与最终收口审计。
+**结论：计划 1–6 已收口。** CLI / 人工确认 / L2 场景层已经完成，里程碑 1 只剩最终收口审计。
 
 子计划边界（不要重新解释）：
 
@@ -140,7 +139,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | **3** | 声明式清单、目录、拓扑、四个内置角色 | **代码收口** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；Task 1 = `97c9edc`，Task 2 = `551b4d2`，Task 3 = `7071eda`，Task 4 = `73289a2`，Task 5 = `cb81e02`，Task 6 = `b508023`，Task 7 = `d0e6828`，Task 8 = `15436ed` |
 | **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | **代码收口**；Task 1–9 全部完成 |
 | **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | **代码收口** [`2026-09-22-m1p5-runtime-modules.md`](./2026-09-22-m1p5-runtime-modules.md)；Task 1–8 全部完成 |
-| **6** | CLI + L2 场景回放 + AskUser | 未写未做 |
+| **6** | CLI + L2 场景回放 + AskUser | **代码收口** [`2026-09-23-m1p6-cli-human-e2e.md`](./2026-09-23-m1p6-cli-human-e2e.md) |
 | **M1 收口审计** | spec §15 取证 + 遗留项清空 + **那时再 push** | 未做 |
 
 ---
@@ -497,7 +496,7 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 | 8 | 依赖门禁缺口、注释、公开面、关台账 | 已落地 `ade688f` |
 | 9 | publish 与 remove_queue 的回执窗口 | 已落地（本文同一提交） |
 
-计划 4 所属遗留项已经全部转入登记表「已关闭」；计划 5 也已收口，下一步执行计划 6。
+计划 4–6 所属遗留项已经全部转入登记表「已关闭」，下一步执行里程碑 1 最终审计。
 
 ### 4.3 计划 5（已收口）
 
@@ -509,11 +508,15 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 
 挂单 D-18、D-47（墙钟）、D-19–D-23、D-29、D-55 已全部转入登记表“已关闭”。
 
-### 4.4 计划 6（未写未做）
+### 4.4 计划 6（已收口）
 
-CLI（§9.1 名词+动词、默认 `run`、`chat` = `run --session`）；L2 声明式场景回放（§13.1）；`AskUser` / `AskUserQuestion` 与人工确认。YAML → Mapping 也在这里。
+计划文件：[`2026-09-23-m1p6-cli-human-e2e.md`](./2026-09-23-m1p6-cli-human-e2e.md)。
 
-挂单：D-38（确认通道落地后，「需要授权的调用不与别人并发」必须重新成立）。
+范围已完成：CLI（§9.1 名词+动词、默认 `run`、`chat` 共用 `run_request`）；L2 声明式场景回放
+（§13.1）；`AskUser` / `AskUserQuestion` 与人工确认；YAML → Mapping。Task 1–7 提交为
+`d4d04bc`、`1397fa3`、`47a576c`、`ff36133`、`07e2a4d`、`33f464e`、`b9a652f`。
+
+挂单 D-38 已关闭：获批调用的 `execute + POST_TOOL_USE` 使用 writer-priority 执行门独占。
 
 ### 4.5 里程碑 1 收口审计（计划 6 之后）
 
@@ -538,7 +541,7 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 | **计划 3** | 无。D-49、D-08 已关，八个任务都已 commit |
 | **计划 4** | 无。Task 1–9 与所属登记项均已关闭 |
 | **计划 5** | 无。Task 1–8 与所属登记项均已关闭 |
-| **计划 6** | D-38 |
+| **计划 6** | 无。D-38 已关闭 |
 | **M1 收口审计** | D-51、D-27、D-58、D-59、V-01、V-02 |
 | **已关、不要重开** | D-01…D-08、D-24–D-26、D-28、D-30–D-33、D-35、D-39、D-41、D-44、D-45、D-48、D-49、D-52、D-54、D-60 等（见登记表「已关闭」） |
 
@@ -555,9 +558,9 @@ git log -3 --oneline
 
 然后：
 
-1. **起草并评审计划 6**：CLI、人工确认交互与 L2 声明式场景回放。
-2. 范围以 spec §9.1、§13.1、既定 M1 scope 与登记表 D-38 为准。
-3. 每个任务走完变异 + 独立评审再 commit。**仍不要 push**，直到 M1 收口审计通过。
+1. 审计 D-51、D-27、D-58、D-59、V-01、V-02，并逐项留下可执行证据。
+2. 按 spec §15 逐字核对里程碑 1 判据。
+3. 跑全量 pytest、Ruff、Pyright、依赖守卫与两条 L2 场景。**仍不要 push**。
 
 ---
 
@@ -637,7 +640,7 @@ git log -3 --oneline
 | 计划 3（已收口，不要重做） | `docs/plans/2026-09-21-m1p3-declarative-agents.md` |
 | 计划 4（已收口） | `docs/plans/2026-09-22-m1p4-local-exec.md` |
 | 本地工具 | `src/syndica/kernel/tools/local.py`；`tests/kernel/test_local_tools_*.py` |
-| **下一步** | 起草并执行计划 6 |
+| **下一步** | 执行里程碑 1 最终审计 |
 | 范围裁决 | `docs/decisions/2026-09-08-m1-scope.md` |
 | 硬约束 / 变异纪律 | `AGENTS.md` |
 

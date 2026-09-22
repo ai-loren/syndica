@@ -67,6 +67,7 @@
 | D-53 | 第三方 Registry 实现拿不到字段分类 | 计划 4 Task 7：三个 `UPDATE_*` 从 `syndica.kernel.contracts` 再导出并验证对象身份 |
 | D-56 | provider 未兑现 `LLMConfig.timeout` | 计划 4 Task 6：HTTPX 分段 timeout 与 provider 总墙钟同时生效，持续响应也不能越过总上限 |
 | D-57 | `AgentRegistry.update` 写入活引用 | 计划 4 Task 7：Protocol 明确深拷，契约覆盖嵌套快照和拷贝失败零部分写入 |
+| D-38 | 获批的 `CONFIRM` 工具可能与同批兄弟并发执行 | 计划 6 Task 4：writer-priority `_ExecutionGate` 让获批调用独占 `Tool.execute + POST_TOOL_USE`，确认前的 PRE / observer 仍可并发；取消会释放独占权。确定性并发回归覆盖前后兄弟、POST hook 与 writer cancellation，9 条真实变异和独立审查通过 |
 
 ## 待审计核实（认为已被后续改动关闭）
 
@@ -74,14 +75,6 @@
 |---|---|---|
 | V-01 | `ERROR_CLASSES` 是手工维护列表，跨模块子类（`llm.ContextOverflowError`）覆盖不到 | 计划 1 Task 10 改为从文件树独立推导期望值、动态收集 `SyndicaError` 子类 |
 | V-02 | 接管 CAS 在 `parked` 状态下不是有效的所有权守卫 | 计划 2 Task 4 的 `ensure_active`；Task 7 进一步改为**用注册表状态作所有权凭证** |
-
-## 有主待做（里程碑 1 内）
-
-### 归计划 6（CLI + 人工确认交互）
-
-| # | 内容 |
-|---|---|
-| D-38 | **并发分段用「命中任何危险规则」近似 spec §5.6 的「需要人工授权」。** 近似的理由是分段不该问处置：`DangerPolicy` 由宿主实现，可以计数、可以记录，而一次调用问它两遍、两遍看的参数还不同（分段看模型的、闸看 hook 改写后的）就是在骗它；判定则是纯规则，问几遍都一样。这个近似在默认处置下**更严**（LOW 也切段，而 LOW 是放行的），残留缺口是反方向：宿主策略对一条判定为 `NONE` 的调用给出 `BLOCK` / `CONFIRM` 时，批次不会因它切开。**今天这个缺口没有后果**——被闸拦下的调用**自己的工具**根本不执行，所以与它并发的邻居等价于它不在批里。措辞要准：被拦下调用的 **hook** 确实跑了（`PRE_TOOL_USE`，以及 `CONFIRM` 那一格的 `TOOL_CONFIRMATION_REQUIRED` 观察者），而且是与兄弟并发跑的；今天没有安全后果是因为 hook 是宿主自己的代码。**计划 6 落地人工确认通道之后就有后果了**：一次被批准的 `CONFIRM` 会真的执行，那时「需要人工授权的调用不与别人并发」必须重新成立。届时的修法不是在分段里加一次 `decide`，而是让确认通道自己把被批准的调用排成独立一段 |
 
 ### 归里程碑 1 收口审计
 
