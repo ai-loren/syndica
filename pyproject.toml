@@ -45,6 +45,7 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 # Portal.run 的 timeout 要下推给子进程；调用方套 asyncio.timeout 杀不掉已经拉起的进程组。
 "src/syndica/kernel/workspace.py" = ["ASYNC109"]
 "src/syndica/kernel/local_workspace.py" = ["ASYNC109"]
+"src/syndica/kernel/tools/local.py" = ["ASYNC109"]
 
 [tool.ruff.format]
 quote-style = "single"

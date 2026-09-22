@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from syndica.kernel.errors import ConfigError, ContractViolation
+from syndica.kernel.errors import ConfigError
 from syndica.kernel.local_workspace import LocalWorkspace
 
 
@@ -117,19 +117,16 @@ async def test_close_is_idempotent(tmp_path: Path) -> None:
     await workspace.close()
 
 
-async def test_exec_methods_name_task_4_until_implemented(tmp_path: Path) -> None:
+async def test_exec_methods_run_poll_and_kill_inside_the_workspace(tmp_path: Path) -> None:
     root = tmp_path / 'ws'
     root.mkdir()
     workspace = _workspace(root)
-    with pytest.raises(ContractViolation) as caught:
-        await workspace.run('true', timeout=1, cwd='.')
-    assert caught.value.next_action == 'Task 4 之前不要调用'
-    with pytest.raises(ContractViolation) as started:
-        await workspace.start('true', cwd='.')
-    assert started.value.next_action == 'Task 4 之前不要调用'
-    with pytest.raises(ContractViolation) as polled:
-        await workspace.poll('missing')
-    assert polled.value.next_action == 'Task 4 之前不要调用'
-    with pytest.raises(ContractViolation) as killed:
-        await workspace.kill('missing')
-    assert killed.value.next_action == 'Task 4 之前不要调用'
+    foreground = await workspace.run('printf direct', timeout=1, cwd='.')
+    assert foreground.stdout == 'direct'
+    assert foreground.running is False
+
+    handle = await workspace.start('sleep 5', cwd='.')
+    assert (await workspace.poll(handle)).running is True
+    await workspace.kill(handle)
+    assert (await workspace.poll(handle)).running is False
+    await workspace.close()

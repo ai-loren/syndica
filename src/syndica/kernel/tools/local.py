@@ -7,17 +7,66 @@
 
 from __future__ import annotations
 
+import math
+
+from syndica.kernel.context import TrustLevel
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.tool import Tool, ToolResult
-from syndica.kernel.workspace import Portal
+from syndica.kernel.workspace import ExecResult, Portal
 
-__all__ = ['Edit', 'Glob', 'Grep', 'Read', 'Write', 'local_tools']
+__all__ = [
+    'Bash',
+    'BashOutput',
+    'Edit',
+    'Glob',
+    'Grep',
+    'KillBash',
+    'Read',
+    'Write',
+    'local_tools',
+]
 
 _READ_LIMIT: int = 2000
 
 
 def _told(exc: ConfigError) -> ToolResult:
     return ToolResult(output=exc.message)
+
+
+def _shown(result: ExecResult) -> str:
+    return (
+        f'running: {str(result.running).lower()}\n'
+        f'exit_code: {result.exit_code}\n'
+        f'truncated: {str(result.truncated).lower()}\n'
+        f'stdout:\n{result.stdout}\n'
+        f'stderr:\n{result.stderr}'
+    )
+
+
+def _valid_timeout(value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ConfigError(
+            expected='timeout 是有限正数秒数',
+            received=f'timeout={value!r}，类型是 {type(value).__name__}',
+            next_action='传入大于 0 的 int 或 float，不要传布尔值',
+        )
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ConfigError(
+            expected='timeout 是有限正数秒数',
+            received=f'timeout={value!r}',
+            next_action='传入大于 0 的有限秒数；0、负数、inf 与 nan 都不合法',
+        )
+
+
+def _valid_background(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(
+            expected='run_in_background 是 bool',
+            received=f'run_in_background={value!r}，类型是 {type(value).__name__}',
+            next_action='传 True 启动后台命令，或传 False 等待前台命令完成',
+        )
+    return value
 
 
 class Read(Tool):
@@ -126,6 +175,91 @@ class Grep(Tool):
         return ToolResult(output=list(hits))
 
 
+class Bash(Tool):
+    """在工作区里运行一条 shell 命令。"""
+
+    __tool_name__ = 'Bash'
+    __tool_command_args__ = ('command',)
+
+    def __init__(self, portal: Portal) -> None:
+        self._portal = portal
+
+    async def execute(
+        self,
+        command: str,
+        timeout: float = 30.0,
+        cwd: str = '.',
+        run_in_background: bool = False,
+    ) -> ToolResult:
+        """在工作区目录内运行 shell 命令，可选择转入后台。
+        command: 要执行的 shell 命令
+        timeout: 前台运行的超时秒数，默认 30
+        cwd: 相对工作区根的工作目录，默认根目录
+        run_in_background: 是否立即返回后台句柄
+        """
+        try:
+            _valid_timeout(timeout)
+            background = _valid_background(run_in_background)
+            if background:
+                handle = await self._portal.start(command, cwd=cwd)
+                return ToolResult(
+                    output=f'后台命令已启动，handle={handle}',
+                    meta={'handle': handle},
+                )
+            result = await self._portal.run(command, timeout=timeout, cwd=cwd)
+        except ConfigError as exc:
+            return _told(exc)
+        return ToolResult(output=_shown(result), trust=TrustLevel.UNTRUSTED)
+
+
+class BashOutput(Tool):
+    """查询一个后台命令的状态与输出。"""
+
+    __tool_name__ = 'BashOutput'
+    __tool_command_args__ = ()
+
+    def __init__(self, portal: Portal) -> None:
+        self._portal = portal
+
+    async def execute(self, handle: str) -> ToolResult:
+        """查询后台命令；仍在运行时不等待它结束。
+        handle: Bash 启动后台命令后返回的句柄
+        """
+        try:
+            result = await self._portal.poll(handle)
+        except ConfigError as exc:
+            return _told(exc)
+        return ToolResult(
+            output=_shown(result),
+            meta={
+                'handle': handle,
+                'running': result.running,
+                'exit_code': result.exit_code,
+            },
+            trust=TrustLevel.UNTRUSTED,
+        )
+
+
+class KillBash(Tool):
+    """终止一个后台命令的整个进程组。"""
+
+    __tool_name__ = 'KillBash'
+    __tool_command_args__ = ()
+
+    def __init__(self, portal: Portal) -> None:
+        self._portal = portal
+
+    async def execute(self, handle: str) -> ToolResult:
+        """终止后台命令及其子进程。
+        handle: Bash 启动后台命令后返回的句柄
+        """
+        try:
+            await self._portal.kill(handle)
+        except ConfigError as exc:
+            return _told(exc)
+        return ToolResult(output=f'已终止后台命令，handle={handle}', meta={'handle': handle})
+
+
 def local_tools(portal: Portal) -> dict[str, Tool]:
     """按固定顺序交出本地工具。后续任务只追加键，不改已有键的相对顺序。"""
     read = Read(portal)
@@ -133,10 +267,16 @@ def local_tools(portal: Portal) -> dict[str, Tool]:
     edit = Edit(portal)
     glob = Glob(portal)
     grep = Grep(portal)
+    bash = Bash(portal)
+    bash_output = BashOutput(portal)
+    kill_bash = KillBash(portal)
     return {
         read.name: read,
         write.name: write,
         edit.name: edit,
         glob.name: glob,
         grep.name: grep,
+        bash.name: bash,
+        bash_output.name: bash_output,
+        kill_bash.name: kill_bash,
     }

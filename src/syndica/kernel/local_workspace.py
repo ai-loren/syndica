@@ -7,13 +7,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import math
+import os
 import re
+import signal
 import stat
+import uuid
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from syndica.kernel.errors import ConfigError, ContractViolation
+from syndica.kernel.errors import ConfigError
 from syndica.kernel.workspace import ExecResult, Portal
 
 __all__ = ['LocalWorkspace']
@@ -22,12 +28,10 @@ __all__ = ['LocalWorkspace']
 _MAX_READ_BYTES: int = 1024 * 1024
 
 
-def _not_yet(name: str) -> ContractViolation:
-    return ContractViolation(
-        expected=f'{name} 由本地工作区执行',
-        received=f'{name} 还没有实现',
-        next_action='Task 4 之前不要调用',
-    )
+@dataclass
+class _ProcessRecord:
+    process: asyncio.subprocess.Process
+    communicating: asyncio.Task[tuple[bytes, bytes]]
 
 
 class LocalWorkspace:
@@ -37,6 +41,10 @@ class LocalWorkspace:
         self._root = _existing_absolute_dir(root)
         self._shell = _executable(shell)
         self._env = _copied_env(env)
+        self._processes: dict[str, _ProcessRecord] = {}
+        self._process_lock = asyncio.Lock()
+        self._closing: asyncio.Task[None] | None = None
+        self._closed = False
 
     @property
     def root(self) -> str:
@@ -170,28 +178,128 @@ class LocalWorkspace:
         return tuple(hits)
 
     async def run(self, command: str, *, timeout: float, cwd: str) -> ExecResult:
-        del command, timeout, cwd
-        raise _not_yet('run')
+        self._ensure_open()
+        seconds = _positive_timeout(timeout)
+        record = await self._spawn_process(command, cwd)
+        try:
+            async with asyncio.timeout(seconds):
+                stdout, stderr = await asyncio.shield(record.communicating)
+        except TimeoutError as exc:
+            await _kill_process(record)
+            raise ConfigError(
+                expected=f'命令在 {seconds:g} 秒内完成',
+                received=f'命令超时：运行超过 {seconds:g} 秒，已终止整个进程组',
+                next_action='缩小命令范围、改为后台运行，或传入更大的正数 timeout',
+            ) from exc
+        except BaseException:
+            await _kill_process(record)
+            raise
+        return ExecResult(
+            exit_code=record.process.returncode,
+            stdout=_decoded(stdout),
+            stderr=_decoded(stderr),
+            truncated=False,
+            running=False,
+        )
 
     async def start(self, command: str, *, cwd: str) -> str:
-        del command, cwd
-        raise _not_yet('start')
+        async with self._process_lock:
+            self._ensure_open()
+            record = await self._spawn_process(command, cwd)
+            handle = uuid.uuid4().hex
+            self._processes[handle] = record
+            return handle
 
     async def poll(self, handle: str) -> ExecResult:
-        del handle
-        raise _not_yet('poll')
+        self._ensure_open()
+        record = self._record(handle)
+        if not record.communicating.done():
+            return ExecResult(
+                exit_code=None,
+                stdout='',
+                stderr='',
+                truncated=False,
+                running=True,
+            )
+        stdout, stderr = await record.communicating
+        return ExecResult(
+            exit_code=record.process.returncode,
+            stdout=_decoded(stdout),
+            stderr=_decoded(stderr),
+            truncated=False,
+            running=False,
+        )
 
     async def kill(self, handle: str) -> None:
-        del handle
-        raise _not_yet('kill')
+        self._ensure_open()
+        await _kill_process(self._record(handle))
 
     async def close(self) -> None:
-        # 没有后台进程可停时，关闭必须成功，并且可以重复调用。
-        pass
+        if self._closed:
+            return
+        async with self._process_lock:
+            if self._closed:
+                return
+            if self._closing is None:
+                self._closing = asyncio.create_task(self._close_processes())
+            closing = self._closing
+        await asyncio.shield(closing)
+
+    async def _spawn_process(self, command: str, cwd: str) -> _ProcessRecord:
+        working_directory = self._directory(cwd)
+        process = await asyncio.create_subprocess_exec(
+            self._shell,
+            '-c',
+            command,
+            cwd=str(working_directory),
+            env=dict(self._env),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        return _ProcessRecord(
+            process=process,
+            communicating=asyncio.create_task(process.communicate()),
+        )
+
+    async def _close_processes(self) -> None:
+        try:
+            for record in tuple(self._processes.values()):
+                await _kill_process(record)
+        finally:
+            self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed or self._closing is not None:
+            raise ConfigError(
+                expected='工作区仍然打开，可以执行或查询命令',
+                received='工作区已关闭或正在关闭',
+                next_action='新建一个 LocalWorkspace；close() 之后同一个工作区不再接收进程操作',
+            )
+
+    def _record(self, handle: str) -> _ProcessRecord:
+        record = self._processes.get(handle)
+        if record is None:
+            raise ConfigError(
+                expected='handle 是本工作区 start() 返回的后台命令句柄',
+                received=f'收到未知 handle={handle!r}',
+                next_action='使用 Bash 启动后台命令后返回的 handle，不要复用其他工作区的句柄',
+            )
+        return record
 
     def _inside(self, path: str) -> Path:
         real = self._resolved(path)
         self._must_stay(real)
+        return real
+
+    def _directory(self, path: str) -> Path:
+        real = self._inside(path)
+        if not real.is_dir():
+            raise ConfigError(
+                expected='cwd 指向工作区根目录内的目录',
+                received=f'cwd={path!r} 不是目录',
+                next_action='传入工作区根目录内的相对目录，或用 "." 表示根目录',
+            )
         return real
 
     def _resolved(self, path: str) -> Path:
@@ -227,6 +335,41 @@ def _read_utf8(path: Path, received: str) -> str:
             received=f'path={received!r} 不是 utf-8',
             next_action='换一个 utf-8 文本文件',
         ) from exc
+
+
+def _positive_timeout(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ConfigError(
+            expected='timeout 是有限正数秒数',
+            received=f'timeout={value!r}，类型是 {type(value).__name__}',
+            next_action='传入大于 0 的 int 或 float，不要传布尔值',
+        )
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ConfigError(
+            expected='timeout 是有限正数秒数',
+            received=f'timeout={value!r}',
+            next_action='传入大于 0 的有限秒数；0、负数、inf 与 nan 都不合法',
+        )
+    return seconds
+
+
+def _decoded(value: bytes) -> str:
+    return value.decode('utf-8', errors='replace')
+
+
+async def _kill_process(record: _ProcessRecord) -> None:
+    if record.process.returncode is None:
+        try:
+            os.killpg(record.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.shield(record.communicating)
+    except asyncio.CancelledError:
+        if not record.communicating.done():
+            record.communicating.cancel()
+        raise
 
 
 def _existing_absolute_dir(root: object) -> Path:
