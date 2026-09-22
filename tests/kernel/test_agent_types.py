@@ -1,4 +1,5 @@
 import time
+from dataclasses import fields
 
 import pytest
 
@@ -49,6 +50,7 @@ def test_info_defaults_to_no_session_and_empty_metadata():
     info = _info()
     assert info.session_id is None
     assert info.metadata == {}
+    assert info.flags == {}
 
 
 def test_info_starts_with_no_lease_holder():
@@ -86,8 +88,10 @@ def test_default_containers_are_not_shared_between_infos():
     second = _info()
     first.children.append('child-1')
     first.metadata['origin'] = 'first'
+    first.flags['mode'] = 'first'
     assert second.children == []
     assert second.metadata == {}
+    assert second.flags == {}
 
 
 def test_info_requires_agent_id_name_and_agent_type():
@@ -98,3 +102,20 @@ def test_info_requires_agent_id_name_and_agent_type():
         AgentInfo(agent_id='a1', agent_type='declarative')  # pyright: ignore[reportCallIssue]
     with pytest.raises(TypeError):
         AgentInfo(agent_id='a1', name='Worker')  # pyright: ignore[reportCallIssue]
+
+
+def test_agent_info_field_order_is_public_and_flags_are_appended_last():
+    assert [field.name for field in fields(AgentInfo)] == [
+        'agent_id',
+        'name',
+        'agent_type',
+        'status',
+        'parent_id',
+        'children',
+        'session_id',
+        'metadata',
+        'owner',
+        'heartbeat_at',
+        'created_at',
+        'flags',
+    ]

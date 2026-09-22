@@ -126,14 +126,16 @@ class AgentRegistryContract(ContractSuite):
     async def test_register_stores_snapshot_not_caller_reference(
         self, registry: AgentRegistry
     ) -> None:
-        info = _info()
+        info = _info(flags={'mode': 'original'})
         await registry.register(info)
         info.status = AgentStatus.ABORTING
         info.metadata['leaked'] = True
+        info.flags['mode'] = 'mutated'
         got = await registry.get('a1')
         assert got is not None
         assert got.status is AgentStatus.IDLE
         assert got.metadata == {}
+        assert got.flags == {'mode': 'original'}
 
     async def test_cas_succeeds_when_expectation_matches(self, registry: AgentRegistry) -> None:
         await registry.register(_info())
@@ -265,12 +267,34 @@ class AgentRegistryContract(ContractSuite):
         got = await registry.get('a1')
         assert got is not None and got.created_at == before.created_at
 
+    async def test_update_rejects_flags_and_names_spawn_as_the_owner(
+        self, registry: AgentRegistry
+    ) -> None:
+        assert (
+            UPDATE_PROTECTED_FIELD_OWNERS['flags']
+            == 'Runtime.spawn——Flag 在 Agent 创建时解析成快照，此后不可无条件改写'
+        )
+        await registry.register(_info(flags={'mode': 'original'}))
+        try:
+            await registry.update('a1', flags={'mode': 'mutated'})
+        except SyndicaError as exc:
+            assert 'Runtime.spawn' in exc.next_action
+        else:
+            raise AssertionError(
+                '期望 update 拒绝写 flags。'
+                ' 实际调用成功返回。'
+                ' 把 flags 归入受保护字段，并指向 Runtime.spawn 这条专用写入路径。'
+            )
+        got = await registry.get('a1')
+        assert got is not None and got.flags == {'mode': 'original'}
+
     async def test_rejected_update_writes_no_field(self, registry: AgentRegistry) -> None:
-        await registry.register(_info())
+        await registry.register(_info(flags={'mode': 'original'}))
         with _rejects('update 同时写一个可写字段与一个受保护字段'):
-            await registry.update('a1', session_id='s1', status=AgentStatus.RUNNING)
+            await registry.update('a1', session_id='s1', flags={'mode': 'mutated'})
         got = await registry.get('a1')
         assert got is not None and got.session_id is None
+        assert got.flags == {'mode': 'original'}
 
     async def test_children_of_reflects_parent_links(self, registry: AgentRegistry) -> None:
         await registry.register(_info('root'))
@@ -303,14 +327,16 @@ class AgentRegistryContract(ContractSuite):
         self, registry: AgentRegistry
     ) -> None:
         """内存实现放行调用方改存储、远端实现不放行，分叉只在换后端时才暴露。"""
-        await registry.register(_info())
+        await registry.register(_info(flags={'mode': 'original'}))
         listed = await registry.list()
         assert len(listed) == 1
         listed[0].status = AgentStatus.ABORTING
         listed[0].metadata['leaked'] = True
+        listed[0].flags['mode'] = 'mutated'
         again = await registry.list()
         assert again[0].status is AgentStatus.IDLE
         assert again[0].metadata == {}
+        assert again[0].flags == {'mode': 'original'}
 
     async def test_unregister_removes_entry(self, registry: AgentRegistry) -> None:
         await registry.register(_info())
@@ -330,12 +356,14 @@ class AgentRegistryContract(ContractSuite):
 
     async def test_get_returns_snapshot_not_live_reference(self, registry: AgentRegistry) -> None:
         """调用方改动返回值不得影响存储——否则远端实现与内存实现行为不一致。"""
-        await registry.register(_info())
+        await registry.register(_info(flags={'mode': 'original'}))
         got = await registry.get('a1')
         assert got is not None
         got.status = AgentStatus.ABORTING
         got.metadata['leaked'] = True
+        got.flags['mode'] = 'mutated'
         again = await registry.get('a1')
         assert again is not None
         assert again.status is AgentStatus.IDLE
         assert again.metadata == {}
+        assert again.flags == {'mode': 'original'}

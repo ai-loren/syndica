@@ -8,11 +8,17 @@ from typing import Any, cast
 
 import pytest
 
-from syndica.kernel.errors import ConfigError
-from syndica.kernel.events import Event
-from syndica.kernel.hooks import HookResult, Junction
+from syndica.kernel.agent import AgentOptions, BaseAgent
+from syndica.kernel.agent_types import AgentInfo
+from syndica.kernel.context import ContextBlock
+from syndica.kernel.errors import ConfigError, ContractViolation
+from syndica.kernel.events import Event, EventBus
+from syndica.kernel.hooks import HookResult, HooksCenter, Junction
+from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.modules import FlagDeclaration, RuntimeModule
 from syndica.kernel.runtime import Runtime
+from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
+from syndica.kernel.tool import Tool, ToolResult
 
 
 def _noop(*_: object) -> None:
@@ -37,6 +43,64 @@ def _wrapped_shutdown(_: object) -> Awaitable[None]:
 
 def _empty_tools(*_: object) -> Mapping[str, Any]:
     return {}
+
+
+class _HookPlugin:
+    def __init__(self, name: str, callback: Callable[..., Awaitable[HookResult]]) -> None:
+        self._name = name
+        self._callback = callback
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def register(self, hooks: HooksCenter) -> None:
+        hooks.register(Junction.PRE_LLM_REQUEST, self._callback)
+
+
+class _InjectedTool(Tool):
+    __tool_name__ = 'Injected'
+    __tool_schema__ = {
+        'name': 'Injected',
+        'description': '返回绑定的 Agent id',
+        'parameters': {'type': 'object', 'properties': {}},
+    }
+    __tool_command_args__ = ()
+
+    def __init__(self, owner: str) -> None:
+        self.owner = owner
+
+    async def execute(self) -> ToolResult:
+        return ToolResult(output=self.owner)
+
+
+class _HostTool(Tool):
+    __tool_name__ = 'HostAdded'
+    __tool_schema__ = {
+        'name': 'HostAdded',
+        'description': '宿主追加工具',
+        'parameters': {'type': 'object', 'properties': {}},
+    }
+    __tool_command_args__ = ()
+
+    async def execute(self) -> ToolResult:
+        return ToolResult(output='host')
+
+
+def _agent_factory(captured: list[BaseAgent]) -> Callable[[HooksCenter, EventBus], BaseAgent]:
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = BaseAgent(
+            AgentOptions(
+                name='Worker',
+                llm=ScriptedLLM([ScriptedTurn(content='done')]),
+            ),
+            hooks=hooks,
+            events=events,
+        )
+        captured.append(agent)
+        return agent
+
+    return build
 
 
 def _three_parts(error: BaseException) -> None:
@@ -916,3 +980,603 @@ async def test_sync_shutdown_wrapper_returning_an_awaitable_is_awaited():
     runtime = Runtime(modules=[RuntimeModule('wrapped', on_shutdown=wrapped)])
     await runtime.shutdown()
     assert stopped == ['done']
+
+
+async def test_agent_flags_are_snapshots_and_inherit_from_parent_then_explicit_override():
+    captured: list[BaseAgent] = []
+    supplied = {'count': 2}
+    runtime = Runtime(
+        modules=[RuntimeModule('counter', flags=(_count_flag(),))],
+        flags={'count': 1},
+    )
+    try:
+        root = await runtime.spawn(_agent_factory(captured), flags=supplied)
+        supplied['count'] = 3
+        child = await runtime.spawn(_agent_factory(captured), parent_id=root)
+        overridden = await runtime.spawn(
+            _agent_factory(captured),
+            parent_id=root,
+            flags={'count': 0},
+        )
+
+        root_info = await runtime.find(root)
+        child_info = await runtime.find(child)
+        overridden_info = await runtime.find(overridden)
+        assert root_info is not None and root_info.flags == {'count': 2}
+        assert child_info is not None and child_info.flags == {'count': 2}
+        assert overridden_info is not None and overridden_info.flags == {'count': 0}
+        root_info.flags['count'] = 3
+        again = await runtime.find(root)
+        assert again is not None and again.flags == {'count': 2}
+    finally:
+        await runtime.shutdown()
+
+
+async def test_fork_flags_replace_different_parent_flags_before_explicit_overrides():
+    captured: list[BaseAgent] = []
+    runtime = Runtime(modules=[RuntimeModule('counter', flags=(_count_flag(),))])
+    try:
+        parent = await runtime.spawn(_agent_factory(captured), flags={'count': 2})
+        source = await runtime.spawn(_agent_factory(captured), flags={'count': 3})
+        fork = await runtime.spawn(
+            _agent_factory(captured),
+            parent_id=parent,
+            fork_from=source,
+            flags={'count': 0},
+        )
+        info = await runtime.find(fork)
+        assert info is not None and info.flags == {'count': 0}
+
+        inherited_fork = await runtime.spawn(
+            _agent_factory(captured),
+            parent_id=parent,
+            fork_from=source,
+        )
+        inherited = await runtime.find(inherited_fork)
+        assert inherited is not None and inherited.flags == {'count': 3}
+    finally:
+        await runtime.shutdown()
+
+
+async def test_each_agent_gets_fresh_module_plugin_and_tool_instances():
+    captured: list[BaseAgent] = []
+    plugins: list[_HookPlugin] = []
+    tools: list[_InjectedTool] = []
+
+    async def observe(**_: object) -> HookResult:
+        return HookResult()
+
+    def plugin_factory(
+        runtime: Runtime, agent: BaseAgent, flags: Mapping[str, object]
+    ) -> _HookPlugin:
+        del runtime, flags
+        plugin = _HookPlugin(f'plugin-{agent.agent_id}', observe)
+        plugins.append(plugin)
+        return plugin
+
+    def tool_factory(
+        runtime: Runtime, agent: BaseAgent, flags: Mapping[str, object]
+    ) -> Mapping[str, Tool]:
+        del runtime, flags
+        tool = _InjectedTool(agent.agent_id)
+        tools.append(tool)
+        return {'Injected': tool}
+
+    runtime = Runtime(
+        modules=[
+            RuntimeModule(
+                'per-agent',
+                agent_plugins=(plugin_factory,),
+                tool_factories=(tool_factory,),
+            )
+        ]
+    )
+    try:
+        first = await runtime.spawn(_agent_factory(captured))
+        second = await runtime.spawn(_agent_factory(captured))
+        assert len({id(plugin) for plugin in plugins}) == 2
+        assert len({id(tool) for tool in tools}) == 2
+        assert cast(_InjectedTool, captured[0].options.tools['Injected']).owner == first
+        assert cast(_InjectedTool, captured[1].options.tools['Injected']).owner == second
+        assert captured[0].options.tools is not captured[1].options.tools
+    finally:
+        await runtime.shutdown()
+
+
+async def test_late_local_hooks_still_run_before_modules_and_runtime_plugins():
+    order: list[str] = []
+    captured: list[BaseAgent] = []
+
+    def callback(label: str) -> Callable[..., Awaitable[HookResult]]:
+        async def record(**kwargs: object) -> HookResult:
+            previous = cast(list[str], kwargs.get('probe', []))
+            order.append(label)
+            return HookResult(modified={'probe': [*previous, label]})
+
+        return record
+
+    class _RuntimePlugin:
+        @property
+        def name(self) -> str:
+            return 'runtime'
+
+        def register(self, hooks: HooksCenter) -> None:
+            hooks.register(Junction.PRE_LLM_REQUEST, callback('runtime'))
+
+    def plugin(label: str) -> Callable[..., _HookPlugin]:
+        return lambda *_: _HookPlugin(label, callback(label))
+
+    runtime = Runtime(
+        plugins=[_RuntimePlugin()],
+        modules=[
+            RuntimeModule('a', agent_plugins=(plugin('module-a'),)),
+            RuntimeModule('b', agent_plugins=(plugin('module-b'),)),
+        ],
+    )
+    try:
+        agent_id = await runtime.spawn(_agent_factory(captured))
+        captured[0].register_hook(Junction.PRE_LLM_REQUEST, callback('late-local'))
+        await runtime.send(agent_id, 'go')
+        await runtime.wait(agent_id)
+        assert order == ['late-local', 'module-a', 'module-b', 'runtime']
+    finally:
+        await runtime.shutdown()
+
+
+async def test_local_skip_stops_module_and_runtime_plugin_layers():
+    order: list[str] = []
+    captured: list[BaseAgent] = []
+
+    async def never(**_: object) -> HookResult:
+        order.append('later')
+        return HookResult()
+
+    async def stop(**_: object) -> HookResult:
+        order.append('local')
+        return HookResult(
+            skip=True,
+            result=ContextBlock(role='assistant', content='from local'),
+        )
+
+    module = RuntimeModule(
+        'module',
+        agent_plugins=(lambda *_: _HookPlugin('module', never),),
+    )
+    runtime = Runtime(plugins=[_HookPlugin('runtime', never)], modules=[module])
+    try:
+        agent_id = await runtime.spawn(_agent_factory(captured))
+        captured[0].register_hook(Junction.PRE_LLM_REQUEST, stop)
+        await runtime.send(agent_id, 'go')
+        ctx = await runtime.wait(agent_id)
+        assert order == ['local']
+        assert ctx.current_traj[-1].content == 'from local'
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.parametrize('returned', [None, [], 'tools'])
+async def test_bad_tool_factory_results_leave_no_agent_state(returned: object):
+    captured: list[BaseAgent] = []
+
+    def bad_tools(*_: object) -> Any:
+        return returned
+
+    runtime = Runtime(
+        modules=[
+            RuntimeModule(
+                'bad-tools',
+                tool_factories=(cast(Any, bad_tools),),
+            )
+        ]
+    )
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_agent_factory(captured))
+        assert 'bad-tools' in excinfo.value.expected
+        assert 'dict' in excinfo.value.next_action
+        assert await runtime.registry.list() == []
+        assert runtime._slots == {}  # pyright: ignore[reportPrivateUsage]
+        assert captured[0].options.tools == {}
+        assert captured[0]._gate_attached is False  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runtime.shutdown()
+
+
+async def test_failed_agent_module_assembly_restores_the_same_instance_for_retry():
+    captured: list[BaseAgent] = []
+    host_tools: dict[str, Tool] = {}
+    fail = True
+
+    def reused(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        if not captured:
+            captured.append(
+                BaseAgent(
+                    AgentOptions(
+                        name='Worker',
+                        llm=ScriptedLLM([ScriptedTurn(content='done')]),
+                        tools=host_tools,
+                    ),
+                    hooks=hooks,
+                    events=events,
+                )
+            )
+        return captured[0]
+
+    def tools(
+        runtime: Runtime, agent: BaseAgent, flags: Mapping[str, object]
+    ) -> Mapping[str, Tool]:
+        del runtime, flags
+        if fail:
+            raise RuntimeError('factory failed')
+        return {'Injected': _InjectedTool(agent.agent_id)}
+
+    runtime = Runtime(
+        modules=[RuntimeModule('retryable', tool_factories=(tools,))],
+        orchestration=True,
+    )
+    try:
+        with pytest.raises(RuntimeError, match='factory failed'):
+            await runtime.spawn(reused)
+        agent = captured[0]
+        assert agent.options.tools == {}
+        assert agent.options.tools is host_tools
+        assert agent._gate_attached is False  # pyright: ignore[reportPrivateUsage]
+        assert await runtime.registry.list() == []
+        assert runtime._slots == {}  # pyright: ignore[reportPrivateUsage]
+
+        host_tools['HostAdded'] = _HostTool()
+        fail = False
+        agent_id = await runtime.spawn(reused)
+        assert agent_id == agent.agent_id
+        assert tuple(agent.options.tools)[0] == 'HostAdded'
+        assert tuple(agent.options.tools)[-1] == 'Injected'
+    finally:
+        await runtime.shutdown()
+
+
+async def test_module_tool_name_cannot_replace_an_agent_tool():
+    captured: list[BaseAgent] = []
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = BaseAgent(
+            AgentOptions(
+                name='Worker',
+                llm=ScriptedLLM([ScriptedTurn(content='done')]),
+                tools={'Injected': _InjectedTool('agent')},
+            ),
+            hooks=hooks,
+            events=events,
+        )
+        captured.append(agent)
+        return agent
+
+    module = RuntimeModule(
+        'collision',
+        tool_factories=(lambda *_: {'Injected': _InjectedTool('module')},),
+    )
+    runtime = Runtime(modules=[module])
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(build)
+        assert 'Injected' in excinfo.value.received
+        assert '换一个名字' in excinfo.value.next_action
+        assert cast(_InjectedTool, captured[0].options.tools['Injected']).owner == 'agent'
+        assert captured[0]._gate_attached is False  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runtime.shutdown()
+
+
+async def test_spawn_flag_errors_happen_before_module_factories_and_registration():
+    calls: list[str] = []
+    captured: list[BaseAgent] = []
+
+    def plugin(*_: object) -> _HookPlugin:
+        calls.append('plugin')
+        raise AssertionError('must not run')
+
+    runtime = Runtime(
+        modules=[
+            RuntimeModule(
+                'counter',
+                flags=(_count_flag(),),
+                agent_plugins=(plugin,),
+            )
+        ]
+    )
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_agent_factory(captured), flags={'count': -1})
+        assert 'minimum' in excinfo.value.expected
+        assert 'count' in excinfo.value.next_action
+        assert calls == []
+        assert await runtime.registry.list() == []
+        assert runtime._slots == {}  # pyright: ignore[reportPrivateUsage]
+        assert captured[0]._gate_attached is False  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runtime.shutdown()
+
+
+async def test_second_plugin_register_failure_restores_the_module_hook_layer():
+    captured: list[BaseAgent] = []
+    observed: list[str] = []
+
+    async def record(**_: object) -> HookResult:
+        observed.append('module')
+        return HookResult()
+
+    class _BrokenPlugin:
+        @property
+        def name(self) -> str:
+            return 'broken'
+
+        def register(self, hooks: HooksCenter) -> None:
+            hooks.register(Junction.PRE_LLM_REQUEST, record)
+            raise RuntimeError('register failed')
+
+    module = RuntimeModule(
+        'plugins',
+        agent_plugins=(
+            lambda *_: _HookPlugin('first', record),
+            lambda *_: _BrokenPlugin(),
+        ),
+    )
+    runtime = Runtime(modules=[module])
+    try:
+        with pytest.raises(RuntimeError, match='register failed'):
+            await runtime.spawn(_agent_factory(captured))
+        await captured[0]._hooks.trigger(  # pyright: ignore[reportPrivateUsage]
+            Junction.PRE_LLM_REQUEST,
+            request={'messages': []},
+        )
+        assert observed == []
+        assert await runtime.registry.list() == []
+        assert captured[0]._gate_attached is False  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runtime.shutdown()
+
+
+async def test_duplicate_plugin_names_across_modules_are_rejected_with_both_owners():
+    captured: list[BaseAgent] = []
+
+    async def observe(**_: object) -> HookResult:
+        return HookResult()
+
+    runtime = Runtime(
+        modules=[
+            RuntimeModule(
+                'first-module',
+                agent_plugins=(lambda *_: _HookPlugin('same', observe),),
+            ),
+            RuntimeModule(
+                'second-module',
+                agent_plugins=(lambda *_: _HookPlugin('same', observe),),
+            ),
+        ]
+    )
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_agent_factory(captured))
+        assert 'same' in excinfo.value.received
+        assert 'first-module' in excinfo.value.received
+        assert 'second-module' in excinfo.value.received
+        assert await runtime.registry.list() == []
+    finally:
+        await runtime.shutdown()
+
+
+async def test_second_tool_factory_failure_does_not_install_the_first_batch():
+    captured: list[BaseAgent] = []
+
+    def fail(*_: object) -> Mapping[str, Tool]:
+        raise RuntimeError('second factory failed')
+
+    runtime = Runtime(
+        modules=[
+            RuntimeModule(
+                'tools',
+                tool_factories=(
+                    lambda _, agent, __: {'Injected': _InjectedTool(agent.agent_id)},
+                    fail,
+                ),
+            )
+        ]
+    )
+    try:
+        with pytest.raises(RuntimeError, match='second factory failed'):
+            await runtime.spawn(_agent_factory(captured))
+        assert captured[0].options.tools == {}
+        assert await runtime.registry.list() == []
+    finally:
+        await runtime.shutdown()
+
+
+async def test_invalid_tool_identity_is_rejected_before_any_batch_is_installed():
+    captured: list[BaseAgent] = []
+    runtime = Runtime(
+        modules=[
+            RuntimeModule(
+                'identity',
+                tool_factories=(lambda *_: {'Wrong': _InjectedTool('module')},),
+            )
+        ]
+    )
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_agent_factory(captured))
+        assert 'Wrong' in excinfo.value.received
+        assert 'Injected' in excinfo.value.next_action
+        assert captured[0].options.tools == {}
+    finally:
+        await runtime.shutdown()
+
+
+async def test_install_own_tools_failure_restores_tools_and_local_hooks():
+    observed: list[str] = []
+    captured: list[BaseAgent] = []
+
+    async def added(**_: object) -> HookResult:
+        observed.append('own')
+        return HookResult()
+
+    class _FailingOwnAgent(BaseAgent):
+        def install_own_tools(self, runtime: object) -> None:
+            del runtime
+            self.install_runtime_tools({'Injected': _InjectedTool('own')})
+            self.register_hook(Junction.PRE_LLM_REQUEST, added)
+            raise RuntimeError('own tools failed')
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = _FailingOwnAgent(
+            AgentOptions(name='Worker', llm=ScriptedLLM([])),
+            hooks=hooks,
+            events=events,
+        )
+        captured.append(agent)
+        return agent
+
+    runtime = Runtime(
+        modules=[
+            RuntimeModule(
+                'module-tools',
+                tool_factories=(lambda *_: {'Injected': _InjectedTool('module')},),
+            )
+        ]
+    )
+    try:
+        with pytest.raises(RuntimeError, match='own tools failed'):
+            await runtime.spawn(build)
+        agent = captured[0]
+        assert agent.options.tools == {}
+        await agent._hooks.trigger(  # pyright: ignore[reportPrivateUsage]
+            Junction.PRE_LLM_REQUEST,
+            request={'messages': []},
+        )
+        assert observed == []
+        assert agent._gate_attached is False  # pyright: ignore[reportPrivateUsage]
+        assert await runtime.registry.list() == []
+    finally:
+        await runtime.shutdown()
+
+
+async def test_registry_register_failure_rolls_back_agent_assembly_and_gate():
+    captured: list[BaseAgent] = []
+
+    def reused(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        if not captured:
+            _agent_factory(captured)(hooks, events)
+        return captured[0]
+
+    runtime = Runtime(
+        modules=[
+            RuntimeModule(
+                'tools',
+                tool_factories=(lambda _, agent, __: {'Injected': _InjectedTool(agent.agent_id)},),
+            )
+        ]
+    )
+    try:
+        with pytest.raises(ContractViolation):
+            await runtime.spawn(reused, parent_id='missing')
+        agent = captured[0]
+        assert agent.options.tools == {}
+        assert agent._gate_attached is False  # pyright: ignore[reportPrivateUsage]
+        assert await runtime.registry.list() == []
+        assert runtime._slots == {}  # pyright: ignore[reportPrivateUsage]
+
+        agent_id = await runtime.spawn(reused)
+        assert agent_id == agent.agent_id
+        assert tuple(agent.options.tools) == ('Injected',)
+    finally:
+        await runtime.shutdown()
+
+
+class _FailOnceEnsureBroker(InMemoryMessageBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = True
+
+    async def ensure_queue(self, agent_id: str) -> None:
+        await super().ensure_queue(agent_id)
+        if self.fail:
+            raise RuntimeError('ensure failed')
+
+    def has_queue(self, agent_id: str) -> bool:
+        return agent_id in self._mailboxes  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_broker_ensure_failure_removes_registry_queue_and_agent_assembly():
+    captured: list[BaseAgent] = []
+    broker = _FailOnceEnsureBroker()
+
+    def reused(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        if not captured:
+            _agent_factory(captured)(hooks, events)
+        return captured[0]
+
+    runtime = Runtime(
+        broker=broker,
+        modules=[
+            RuntimeModule(
+                'tools',
+                tool_factories=(lambda _, agent, __: {'Injected': _InjectedTool(agent.agent_id)},),
+            )
+        ],
+    )
+    try:
+        with pytest.raises(RuntimeError, match='ensure failed'):
+            await runtime.spawn(reused)
+        agent = captured[0]
+        assert await runtime.registry.get(agent.agent_id) is None
+        assert broker.has_queue(agent.agent_id) is False
+        assert agent.options.tools == {}
+        assert agent._gate_attached is False  # pyright: ignore[reportPrivateUsage]
+        assert runtime._slots == {}  # pyright: ignore[reportPrivateUsage]
+
+        broker.fail = False
+        agent_id = await runtime.spawn(reused)
+        assert agent_id == agent.agent_id
+        assert broker.has_queue(agent_id) is True
+    finally:
+        await runtime.shutdown()
+
+
+async def test_duplicate_id_register_failure_does_not_delete_the_existing_agent():
+    registry = InMemoryAgentRegistry()
+    broker = _FailOnceEnsureBroker()
+    broker.fail = False
+    runtime = Runtime(
+        registry=registry,
+        broker=broker,
+        modules=[
+            RuntimeModule(
+                'tools',
+                tool_factories=(lambda _, agent, __: {'Injected': _InjectedTool(agent.agent_id)},),
+            )
+        ],
+    )
+    module_hooks = HooksCenter(outer=runtime.hooks)
+    agent = BaseAgent(
+        AgentOptions(name='Existing', llm=ScriptedLLM([])),
+        hooks=module_hooks,
+        events=runtime.events,
+    )
+    await registry.register(
+        AgentInfo(
+            agent_id=agent.agent_id,
+            name='Existing',
+            agent_type='remote',
+        )
+    )
+    await broker.ensure_queue(agent.agent_id)
+    try:
+        with pytest.raises(ContractViolation):
+            await runtime.spawn(lambda *_: agent)
+        existing = await registry.get(agent.agent_id)
+        assert existing is not None and existing.agent_type == 'remote'
+        assert broker.has_queue(agent.agent_id) is True
+        assert agent.options.tools == {}
+        assert agent._gate_attached is False  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await broker.remove_queue(agent.agent_id)
+        await registry.unregister(agent.agent_id)
+        await runtime.shutdown()

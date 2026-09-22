@@ -113,7 +113,7 @@ import asyncio
 import copy
 import inspect
 import logging
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -514,6 +514,7 @@ class _Slot:
     control: ControlBlock
     gate: BrokerTurnGate
     factory: AgentFactory
+    flags: Mapping[str, FlagValue]
     owned: bool = False
     # 此刻代表这个 Agent 在等答复的那一个。一个 Agent 是一份注意力，因此这里是一个而不是一组；
     # 按 agent 分槽而不是放在 Runtime 上，一次抢占或中止才只落在被点名的那个 Agent 上。
@@ -874,6 +875,7 @@ class Runtime:
         parent_id: str | None = None,
         fork_from: str | None = None,
         metadata: dict[str, Any] | None = None,
+        flags: Mapping[str, FlagValue] | None = None,
     ) -> str:
         """建一个 Agent 并启动它的事件循环，返回它的 agent_id。
 
@@ -898,46 +900,83 @@ class Runtime:
             raise _parent_being_destroyed(parent_id)
         # cast 到 object 是因为要挡的正是违反 `AgentFactory` 标注的运行时取值；不擦掉静态类型，
         # 下面的 isinstance 就成了 pyright 眼里的死代码。
-        produced = cast('object', factory(self.hooks, self.events))
+        module_hooks = HooksCenter(outer=self.hooks)
+        produced = cast('object', factory(module_hooks, self.events))
         if not isinstance(produced, BaseAgent):
             raise _bad_factory_return(factory, produced)
         agent = produced
         agent_id = agent.agent_id
-        control = ControlBlock()
-        gate = BrokerTurnGate(agent_id, self.broker, control)
-        agent._attach_gate(gate)  # pyright: ignore[reportPrivateUsage]
-        self._install_orchestration(agent, agent_id)
-        # 旗子只决定其它角色。Orchestrator 在旗子关掉时仍要能派活，所以每个角色都有一次
-        # 自己装工具的机会；缺省实现什么都不做。
-        agent.install_own_tools(self)
+        assembly_snapshot = agent._assembly_snapshot()  # pyright: ignore[reportPrivateUsage]
+        inherited_flags: Mapping[str, FlagValue] | None = None
+        source: BaseAgent | None = None
+        source_trust = TrustLevel.TRUSTED
+        forked_blocks: list[ContextBlock] = []
         if fork_from is not None:
             source = self._table.get(fork_from)
             if source is None:
                 raise _cannot_fork_from(fork_from)
+            source_slot = self._slots.get(fork_from)
+            if source_slot is None:
+                raise _cannot_fork_from(fork_from)
+            inherited_flags = source_slot.flags
             # 溯源结论在截断**之前**取：被截掉的块可能是这份轨迹里唯一不可信的那一块。
             source_trust = provenance_of(source.context)
             query_trust = strictest_trust(query_trust, source_trust)
             for position, block in enumerate(_forkable_prefix(source.context.current_traj)):
                 try:
-                    agent.context.append(copy.deepcopy(block))
+                    forked_blocks.append(copy.deepcopy(block))
                 except Exception as exc:
                     raise _cannot_fork_a_block(fork_from, position, block.role, exc) from exc
-            if query is None:
-                self._carry_truncated_taint(agent, fork_from, source_trust)
+        elif parent_id is not None:
+            parent = await self.registry.get(parent_id)
+            if parent is not None:
+                inherited_flags = parent.flags
+        agent_flags = self._module_assembly.agent_flags(flags, inherited=inherited_flags)
         try:
             owned_metadata = copy.deepcopy(metadata or {})
         except Exception as exc:
             raise _cannot_register_metadata(agent_id, metadata or {}, exc) from exc
-        await self.registry.register(
-            AgentInfo(
-                agent_id=agent_id,
-                name=agent.options.name,
-                agent_type=type(agent).__name__,
-                parent_id=parent_id,
-                metadata=owned_metadata,
+        control = ControlBlock()
+        gate = BrokerTurnGate(agent_id, self.broker, control)
+        try:
+            self._install_orchestration(agent, agent_id)
+            self._module_assembly.install_agent(self, agent, agent_flags)
+            # 旗子只决定其它角色。Orchestrator 在旗子关掉时仍要能派活，所以每个角色都有一次
+            # 自己装工具的机会；缺省实现什么都不做。
+            agent.install_own_tools(self)
+            for block in forked_blocks:
+                agent.context.append(block)
+            if fork_from is not None and query is None:
+                self._carry_truncated_taint(agent, fork_from, source_trust)
+            agent._attach_gate(gate)  # pyright: ignore[reportPrivateUsage]
+        except BaseException:
+            agent._assembly_restore(assembly_snapshot)  # pyright: ignore[reportPrivateUsage]
+            raise
+        registered = False
+        queue_attempted = False
+        try:
+            await self.registry.register(
+                AgentInfo(
+                    agent_id=agent_id,
+                    name=agent.options.name,
+                    agent_type=type(agent).__name__,
+                    parent_id=parent_id,
+                    metadata=owned_metadata,
+                    flags=dict(agent_flags),
+                )
             )
-        )
-        await self.broker.ensure_queue(agent_id)
+            registered = True
+            queue_attempted = True
+            await self.broker.ensure_queue(agent_id)
+        except BaseException:
+            await self._rollback_unstarted_spawn(
+                agent_id,
+                agent,
+                assembly_snapshot,
+                registered=registered,
+                queue_attempted=queue_attempted,
+            )
+            raise
         # `_closed` 与 `_doomed` 在方法开头各读过一次，此后隔着 register / ensure_queue 两个
         # Protocol await。任何会挂起的 store 下，并发的 shutdown / despawn 会在这两个 await 期间
         # 插进来，于是：关机那一支建出一个永不被取消、永不被 await 的驱动，并把一个再没有订阅者的
@@ -950,19 +989,41 @@ class Runtime:
         # 按住，已经跑完的被这次 get 按住。顺序是**先带 await 的那一问、再读两个同步标志位**，
         # 于是最后一道守卫与 create_task 之间没有挂起点。
         if await self.registry.get(agent_id) is None:
-            await self._unbuild(agent_id)
+            await self._rollback_unstarted_spawn(
+                agent_id,
+                agent,
+                assembly_snapshot,
+                registered=True,
+                queue_attempted=True,
+            )
             raise _entry_vanished_during_spawn(agent_id, parent_id)
         if self._closed:
-            await self._unbuild(agent_id)
+            await self._rollback_unstarted_spawn(
+                agent_id,
+                agent,
+                assembly_snapshot,
+                registered=True,
+                queue_attempted=True,
+            )
             raise _already_shut_down()
         if parent_id is not None and parent_id in self._doomed:
-            await self._unbuild(agent_id)
+            await self._rollback_unstarted_spawn(
+                agent_id,
+                agent,
+                assembly_snapshot,
+                registered=True,
+                queue_attempted=True,
+            )
             raise _parent_being_destroyed(parent_id)
         # put 先于 create_task：put 被拒时还没有任务可泄漏。两者之间没有挂起点，任务因此不会在
         # set_task 之前就跑起来。
         self._table.put(agent_id, agent)
         self._slots[agent_id] = _Slot(
-            exit_mode=exit_mode, control=control, gate=gate, factory=factory
+            exit_mode=exit_mode,
+            control=control,
+            gate=gate,
+            factory=factory,
+            flags=agent_flags,
         )
         seed = None if query is None else _Seed(text=query, trust=query_trust)
         task = asyncio.create_task(self._drive(agent_id, agent, seed), name=f'agent:{agent_id}')
@@ -1019,6 +1080,34 @@ class Runtime:
             fork_from,
             agent.agent_id,
         )
+
+    async def _rollback_unstarted_spawn(
+        self,
+        agent_id: str,
+        agent: BaseAgent,
+        assembly_snapshot: tuple[Any, ...],
+        *,
+        registered: bool,
+        queue_attempted: bool,
+    ) -> None:
+        """回滚尚未创建驱动任务的 spawn，不让清理失败盖掉原始异常。"""
+        cleanups: list[tuple[str, Callable[[str], Awaitable[None]]]] = []
+        if queue_attempted:
+            cleanups.append(('remove_queue', self.broker.remove_queue))
+        if registered:
+            cleanups.append(('unregister', self.registry.unregister))
+        for operation, cleanup in cleanups:
+            try:
+                await cleanup(agent_id)
+            except BaseException:
+                logger.exception(
+                    '期望: spawn 回滚时 %s(%r) 成功或幂等返回。'
+                    ' 实际: 清理抛出异常，原始 spawn 失败会继续向上传播。'
+                    ' 下一步: 修复对应 Store 的幂等清理；随后确认邮箱、注册表和父子索引没有残留。',
+                    operation,
+                    agent_id,
+                )
+        agent._assembly_restore(assembly_snapshot)  # pyright: ignore[reportPrivateUsage]
 
     async def _unbuild(self, agent_id: str) -> None:
         """把 `spawn` 已经建好的两样按逆序还回去，不留半个 Agent。

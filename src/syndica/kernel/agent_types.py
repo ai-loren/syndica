@@ -53,3 +53,4 @@ class AgentInfo:
     # 条目诞生时盖时间戳，不由 store 盖：远端与内存实现不得各有一套时钟源。heartbeat_at 是租约
     # 活性不是创建时间，拿它当年龄会把刚复活过的老 Agent 判成新的。
     created_at: float = field(default_factory=time.time)
+    flags: dict[str, bool | int | str] = field(default_factory=dict[str, bool | int | str])

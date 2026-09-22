@@ -84,6 +84,7 @@ from syndica.kernel.errors import ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction, JunctionRef
 from syndica.kernel.llm import LLM, ContextOverflowError
+from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.tool import Tool, validate_tool_names
 from syndica.kernel.tool_executor import (
     DEFAULT_MAX_TOOL_CONCURRENCY,
@@ -394,6 +395,7 @@ class BaseAgent:
         # 撞上的那个 Agent 直接注册不进去。
         self.agent_id: str = uuid.uuid4().hex
         # 本 Agent 自己的一层，外层是宿主交来的那个中心。两层合成一条链，本层在前（spec §5.3）。
+        self._module_hooks = hooks
         self._hooks = HooksCenter(outer=hooks)
         self._events = events
         self._executor = ToolExecutor(
@@ -463,6 +465,40 @@ class BaseAgent:
         if junction in _RUNTIME_ONLY:
             raise _runtime_only_junction(junction)
         self._hooks.register(junction, cb)
+
+    def _assembly_snapshot(
+        self,
+    ) -> tuple[AgentOptions, dict[str, Tool], Any, Any, TurnGate, bool]:
+        """保存 Runtime 装配前本对象自己拥有的可变状态。"""
+        return (
+            self.options,
+            dict(self.options.tools),
+            self._hooks._assembly_snapshot(),  # pyright: ignore[reportPrivateUsage]
+            self._module_hooks._assembly_snapshot(),  # pyright: ignore[reportPrivateUsage]
+            self._gate,
+            self._gate_attached,
+        )
+
+    def _assembly_restore(
+        self,
+        snapshot: tuple[AgentOptions, dict[str, Tool], Any, Any, TurnGate, bool],
+    ) -> None:
+        """恢复 `_assembly_snapshot`；被拒的 spawn 不留下半套 Agent。"""
+        options, tools, local_hooks, module_hooks, gate, gate_attached = snapshot
+        options.tools.clear()
+        options.tools.update(tools)
+        self.options = options
+        self._executor._retarget(options.tools)  # pyright: ignore[reportPrivateUsage]
+        self._hooks._assembly_restore(local_hooks)  # pyright: ignore[reportArgumentType,reportPrivateUsage]
+        self._module_hooks._assembly_restore(  # pyright: ignore[reportArgumentType,reportPrivateUsage]
+            module_hooks
+        )
+        self._gate = gate
+        self._gate_attached = gate_attached
+
+    def _install_module_plugins(self, plugins: Iterable[Plugin]) -> None:
+        """把 Module 插件装进 local 与 Runtime 之间的独立一层。"""
+        install_plugins(self._module_hooks, tuple(plugins))
 
     def _attach_gate(self, gate: TurnGate) -> None:
         """装上控制面的门。

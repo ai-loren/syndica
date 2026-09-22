@@ -15,8 +15,9 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, TypeAlias, cast
 
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.hooks import HooksCenter
 from syndica.kernel.plugins import Plugin
-from syndica.kernel.tool import Tool
+from syndica.kernel.tool import Tool, validate_tool_names
 
 if TYPE_CHECKING:
     from syndica.kernel.agent import BaseAgent
@@ -459,6 +460,21 @@ def _overrides(
     return resolved
 
 
+class _ModulePlugin:
+    """冻结一次读到的插件名，同时保留原插件的 register 行为。"""
+
+    def __init__(self, name: str, plugin: Plugin) -> None:
+        self._name = name
+        self._plugin = plugin
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def register(self, hooks: HooksCenter) -> None:
+        self._plugin.register(hooks)
+
+
 class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
     """一次 Runtime 的 Module 声明、Flag 默认值与生命周期回调。"""
 
@@ -471,6 +487,119 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
         resolved.update(_overrides(flags, by_key, source='flags'))
         self.flags: Mapping[str, FlagValue] = MappingProxyType(resolved)
         self._mounted_services: tuple[str, ...] = ()
+
+    def agent_flags(
+        self,
+        overrides: object,
+        *,
+        inherited: Mapping[str, FlagValue] | None = None,
+    ) -> Mapping[str, FlagValue]:
+        """解析一个 Agent 的完整 Flag 快照。"""
+        by_key = {declaration.key: declaration for declaration in self.declarations}
+        resolved = dict(self.flags)
+        if inherited is not None:
+            resolved.update(_overrides(inherited, by_key, source='inherited flags'))
+        resolved.update(_overrides(overrides, by_key, source='spawn flags'))
+        return MappingProxyType(resolved)
+
+    def install_agent(
+        self,
+        runtime: Runtime,
+        agent: BaseAgent,
+        flags: Mapping[str, FlagValue],
+    ) -> None:
+        """构造完全部注入物后，一次性装到 Agent 自己的 Module 层。"""
+        plugins: list[Plugin] = []
+        plugin_owners: dict[str, str] = {}
+        tool_batches: list[tuple[str, dict[str, Tool]]] = []
+        for module in self.module_objects:
+            for index, factory in enumerate(module.agent_plugins):
+                produced = cast(object, factory(runtime, agent, flags))
+                if inspect.isawaitable(produced):
+                    if inspect.iscoroutine(produced):
+                        produced.close()
+                    raise _config(
+                        f'Module {module.name!r} 的 agent_plugins[{index}] 同步返回 Plugin',
+                        f'factory 返回了 awaitable：{type(produced).__name__}',
+                        '把异步初始化放进 Plugin 的 hook；factory 必须直接返回 Plugin 实例',
+                    )
+                if isinstance(produced, type):
+                    raise _config(
+                        f'Module {module.name!r} 的 agent_plugins[{index}] 返回 Plugin 实例',
+                        f'实际返回类对象 {produced.__name__}',
+                        f'给 {produced.__name__} 加上括号并返回构造后的实例',
+                    )
+                plugin_name = getattr(produced, 'name', None)
+                register = getattr(produced, 'register', None)
+                if (
+                    not isinstance(plugin_name, str)
+                    or not plugin_name.strip()
+                    or not callable(register)
+                ):
+                    raise _config(
+                        (
+                            f'Module {module.name!r} 的 agent_plugins[{index}] '
+                            '返回带非空 name 与 register(hooks) 的 Plugin'
+                        ),
+                        (
+                            f'实际返回 {type(produced).__name__}：'
+                            f'name={plugin_name!r} register callable={callable(register)}'
+                        ),
+                        '返回 Plugin 实例；name 用于查重，register 把 hook 挂到收到的中心',
+                    )
+                previous = plugin_owners.get(plugin_name)
+                if previous is not None:
+                    raise _config(
+                        '同一 Agent 的 Runtime Module 插件名唯一',
+                        (
+                            f'plugin name={plugin_name!r} 同时来自 Module '
+                            f'{previous!r} 与 {module.name!r}'
+                        ),
+                        '给其中一个插件换名，或只保留一个提供该插件的 Module',
+                    )
+                plugin_owners[plugin_name] = module.name
+                plugins.append(_ModulePlugin(plugin_name, cast(Plugin, produced)))
+            for index, factory in enumerate(module.tool_factories):
+                produced = cast(object, factory(runtime, agent, flags))
+                if inspect.isawaitable(produced):
+                    if inspect.iscoroutine(produced):
+                        produced.close()
+                    raise _config(
+                        f'Module {module.name!r} 的 tool_factories[{index}] 同步返回工具 Mapping',
+                        f'factory 返回了 awaitable：{type(produced).__name__}',
+                        '让 factory 直接返回 {工具名: Tool}；异步工作放进 Tool.execute',
+                    )
+                if not isinstance(produced, Mapping):
+                    raise _config(
+                        (
+                            f'Module {module.name!r} 的 tool_factories[{index}] '
+                            '返回 Mapping[str, Tool]'
+                        ),
+                        f'实际返回 {type(produced).__name__} 类型的 {produced!r}',
+                        '返回 {工具名: Tool}；没有工具时返回空 dict',
+                    )
+                validate_tool_names(cast(object, produced))
+                tool_batches.append((module.name, dict(cast(Mapping[str, Tool], produced))))
+
+        tools: dict[str, Tool] = {}
+        owners: dict[str, str] = {}
+        existing = set(agent.options.tools)
+        for module_name, batch in tool_batches:
+            for name, tool in batch.items():
+                previous = owners.get(name)
+                if name in existing or previous is not None:
+                    owner = 'Agent 已有工具' if name in existing else f'Module {previous!r}'
+                    raise _config(
+                        'Runtime Module 只新增工具，不覆盖已有名字',
+                        f'Module {module_name!r} 的工具 {name!r} 与{owner}冲突',
+                        '给工具换一个名字，或只保留一个提供该名字的 Module',
+                    )
+                owners[name] = module_name
+                tools[name] = tool
+
+        agent._install_module_plugins(plugins)  # pyright: ignore[reportPrivateUsage]
+        if tools:
+            agent.install_runtime_tools(tools)
 
     def install(self, runtime: Runtime) -> None:
         services = [

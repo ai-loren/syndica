@@ -171,6 +171,17 @@ _RUNTIME_INIT: tuple[tuple[str, str, bool], ...] = (
     ('modules', 'KEYWORD_ONLY', True),
     ('flags', 'KEYWORD_ONLY', True),
 )
+_RUNTIME_SPAWN: tuple[tuple[str, str, bool], ...] = (
+    ('self', 'POSITIONAL_OR_KEYWORD', False),
+    ('factory', 'POSITIONAL_OR_KEYWORD', False),
+    ('query', 'KEYWORD_ONLY', True),
+    ('query_trust', 'KEYWORD_ONLY', True),
+    ('exit_mode', 'KEYWORD_ONLY', True),
+    ('parent_id', 'KEYWORD_ONLY', True),
+    ('fork_from', 'KEYWORD_ONLY', True),
+    ('metadata', 'KEYWORD_ONLY', True),
+    ('flags', 'KEYWORD_ONLY', True),
+)
 _BASE_AGENT_INIT: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),
     ('options', 'POSITIONAL_OR_KEYWORD', False),
@@ -436,6 +447,20 @@ def test_the_agent_options_field_order_is_exactly_this():
 
 def test_the_runtime_constructor_shape_is_exactly_this():
     assert _init_shape(Runtime) == _RUNTIME_INIT
+
+
+def test_the_runtime_spawn_shape_is_exactly_this():
+    assert (
+        tuple(
+            (
+                parameter.name,
+                parameter.kind.name,
+                parameter.default is not inspect.Parameter.empty,
+            )
+            for parameter in inspect.signature(Runtime.spawn).parameters.values()
+        )
+        == _RUNTIME_SPAWN
+    )
 
 
 def test_the_base_agent_constructor_shape_is_exactly_this():
