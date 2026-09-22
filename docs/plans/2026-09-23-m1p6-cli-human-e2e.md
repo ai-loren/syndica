@@ -201,7 +201,7 @@ expect:
 
 ### Task 1 — 基线与事件序号
 
-**状态：pending**
+**状态：completed**（50 条事件测试；4 条真实变异；独立审查 APPROVE）
 
 **Files:** `events.py`、`test_events.py`、`test_public_api.py`
 
@@ -211,7 +211,7 @@ expect:
 
 ### Task 2 — YAML loader 与声明式 topology
 
-**状态：pending**
+**状态：in_progress**
 
 **Files:** `pyproject.toml`、`src/syndica/cli/config.py`、`tests/cli/test_config.py`
 

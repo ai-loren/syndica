@@ -14,7 +14,7 @@ import copy
 import weakref
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import TracebackType
 from typing import Any, Self
 
@@ -69,6 +69,21 @@ class Event:
     kind: str
     agent_id: str
     payload: dict[str, Any] = field(default_factory=dict[str, Any])
+    sequence: int = 0
+
+
+def _require_unassigned_sequence(event: Event) -> None:
+    """事件序号归总线所有；调用方只能交未分配的 0。"""
+    if type(event.sequence) is int and event.sequence == 0:
+        return
+    raise ContractViolation(
+        expected='Event.sequence=0，表示尚未由 EventBus 分配序号',
+        received=f'收到 sequence={event.sequence!r}，类型是 {type(event.sequence).__name__}',
+        next_action=(
+            '删掉 sequence 参数或传 0；EventBus.emit 会按投递顺序分配从 1 开始的序号，'
+            '调用方自填会制造重复或倒退的事件流'
+        ),
+    )
 
 
 def _snapshot(event: Event) -> Event:
@@ -206,6 +221,7 @@ class EventBus:
         # 再也没人读的缓冲里写。它是兜底，确定的退订时机由 Subscription.close 给。
         self._buffers: weakref.WeakSet[_Buffer] = weakref.WeakSet()
         self._closed = False
+        self._next_sequence = 1
 
     async def emit(self, event: Event) -> None:
         """把同一份快照投给每个订阅者。
@@ -219,9 +235,12 @@ class EventBus:
         """
         # 无订阅者、总线已关闭时也照样拷：否则 payload 合不合约要看当时有没有人在听，一个确定
         # 的编程错误会退化成只在特定时序下现身的 heisenbug。
+        _require_unassigned_sequence(event)
         snapshot = _snapshot(event)
         if self._closed:
             return
+        snapshot = replace(snapshot, sequence=self._next_sequence)
+        self._next_sequence += 1
         # 必须先快照订阅者集合：缓冲满时被挤掉的那条事件在 append 里当场回收，它 payload 的
         # __del__ 于是运行在本循环中途，而 __del__ 里 subscribe / close 会改动 _buffers——直接
         # 迭代 WeakSet 会撞 RuntimeError: Set changed size during iteration。

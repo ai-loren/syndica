@@ -127,6 +127,15 @@ def test_event_payload_defaults_to_empty_and_is_not_shared_between_instances():
     assert second.payload == {}
 
 
+def test_event_fields_append_sequence_after_the_existing_public_fields():
+    assert [field.name for field in dataclasses.fields(Event)] == [
+        'kind',
+        'agent_id',
+        'payload',
+        'sequence',
+    ]
+
+
 def test_event_rejects_field_rebinding():
     event = Event(kind='turn_start', agent_id='a1')
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -147,8 +156,10 @@ async def test_every_subscriber_receives_the_same_event():
     bus = EventBus()
     async with bus.subscribe() as cli, bus.subscribe() as server:
         await bus.emit(_event('turn_end'))
-        assert (await asyncio.wait_for(anext(cli), timeout=_TIMEOUT)).kind == 'turn_end'
-        assert (await asyncio.wait_for(anext(server), timeout=_TIMEOUT)).kind == 'turn_end'
+        cli_event = await asyncio.wait_for(anext(cli), timeout=_TIMEOUT)
+        server_event = await asyncio.wait_for(anext(server), timeout=_TIMEOUT)
+        assert cli_event.kind == server_event.kind == 'turn_end'
+        assert cli_event.sequence == server_event.sequence == 1
 
 
 async def test_events_are_delivered_in_emission_order():
@@ -159,6 +170,17 @@ async def test_events_are_delivered_in_emission_order():
     await bus.close()
     delivered = await asyncio.wait_for(_collect(events), timeout=_TIMEOUT)
     assert [event.kind for event in delivered] == ['agent_start', 'turn_start', 'turn_end']
+    assert [event.sequence for event in delivered] == [1, 2, 3]
+
+
+async def test_callers_cannot_forge_an_already_assigned_sequence():
+    bus = EventBus()
+    async with bus.subscribe():
+        with pytest.raises(ContractViolation) as excinfo:
+            await bus.emit(Event(kind='turn_start', agent_id='a1', sequence=9))
+    assert 'sequence=0' in excinfo.value.expected
+    assert 'sequence=9' in excinfo.value.received
+    assert '删掉 sequence' in excinfo.value.next_action
 
 
 async def test_emit_without_subscribers_does_not_block():
@@ -242,6 +264,7 @@ async def test_overflow_keeps_the_newest_events_and_drops_the_oldest():
     await bus.close()
     delivered = await asyncio.wait_for(_collect(events), timeout=_TIMEOUT)
     assert [event.payload['index'] for event in delivered] == [7, 8, 9]
+    assert [event.sequence for event in delivered] == [8, 9, 10]
 
 
 async def test_dropped_counts_every_event_the_buffer_could_not_hold():
