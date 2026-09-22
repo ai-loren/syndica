@@ -14,6 +14,8 @@
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
+from syndica.kernel.agents import Orchestrator, register_builtins
+from syndica.kernel.catalog import AgentCatalog, HostFacts, OverrideRecord
 from syndica.kernel.context import (
     ArtifactRef,
     Context,
@@ -55,6 +57,7 @@ from syndica.kernel.hooks import (
     JunctionRef,
 )
 from syndica.kernel.llm import LLM, ContextOverflowError, LLMConfig, ScriptedLLM, ScriptedTurn
+from syndica.kernel.manifest import AgentManifest, ManifestSource
 from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.plugins import Plugin
 from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback
@@ -62,6 +65,7 @@ from syndica.kernel.runtime import AgentFactory, Runtime
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tools import orchestration_tools
+from syndica.kernel.topology import AgentSlot, Topology
 from syndica.kernel.waiting import (
     Confirmation,
     Reply,
@@ -72,10 +76,13 @@ from syndica.kernel.waiting import (
 )
 
 __all__ = [
+    'AgentCatalog',
     'AgentFactory',
     'AgentInfo',
+    'AgentManifest',
     'AgentOptions',
     'AgentRegistry',
+    'AgentSlot',
     'AgentStatus',
     'AllowAll',
     'ArtifactRef',
@@ -101,6 +108,7 @@ __all__ = [
     'HookCallback',
     'HookResult',
     'HooksCenter',
+    'HostFacts',
     'InMemoryAgentRegistry',
     'InMemoryMessageBroker',
     'Junction',
@@ -109,10 +117,13 @@ __all__ = [
     'LLM',
     'LLMConfig',
     'LLMResponseError',
+    'ManifestSource',
     'Message',
     'MessageBroker',
     'MissingQueueCallback',
     'NO_RULE_MATCHED',
+    'Orchestrator',
+    'OverrideRecord',
     'Plugin',
     'Reply',
     'RiskLevel',
@@ -127,6 +138,7 @@ __all__ = [
     'ToolCall',
     'ToolFatalError',
     'ToolResult',
+    'Topology',
     'Trigger',
     'TrustLevel',
     'UserInput',
@@ -135,5 +147,6 @@ __all__ = [
     'Waiter',
     'orchestration_tools',
     'provenance_of',
+    'register_builtins',
     'strictest_trust',
 ]

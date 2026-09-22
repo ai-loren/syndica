@@ -22,10 +22,13 @@ from syndica.kernel.runtime import Runtime
 # 自己的导出面算出来的期望值（「每个名字都解析得到」「列表有序」）两条都由构造恒成立，测的是恒等式
 # 而不是这条承诺。这份清单同时钉住数量、拼写、无重复与落盘顺序。
 _KERNEL_EXPORTS: tuple[str, ...] = (
+    'AgentCatalog',
     'AgentFactory',
     'AgentInfo',
+    'AgentManifest',
     'AgentOptions',
     'AgentRegistry',
+    'AgentSlot',
     'AgentStatus',
     'AllowAll',
     'ArtifactRef',
@@ -51,6 +54,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'HookCallback',
     'HookResult',
     'HooksCenter',
+    'HostFacts',
     'InMemoryAgentRegistry',
     'InMemoryMessageBroker',
     'Junction',
@@ -59,10 +63,13 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'LLM',
     'LLMConfig',
     'LLMResponseError',
+    'ManifestSource',
     'Message',
     'MessageBroker',
     'MissingQueueCallback',
     'NO_RULE_MATCHED',
+    'Orchestrator',
+    'OverrideRecord',
     'Plugin',
     'Reply',
     'RiskLevel',
@@ -77,6 +84,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'ToolCall',
     'ToolFatalError',
     'ToolResult',
+    'Topology',
     'Trigger',
     'TrustLevel',
     'UserInput',
@@ -85,6 +93,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'Waiter',
     'orchestration_tools',
     'provenance_of',
+    'register_builtins',
     'strictest_trust',
 )
 # contracts 随 wheel 发布，是第三方写 Store 实现的入口（spec §13.3），同属兼容承诺。
@@ -200,28 +209,20 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 #   落点是随 wheel 发布的契约套件（见 D-53）。
 # - `correlation_of`：`Waiter` 密封分发的内部收口，`wait_for` 自己调。
 _WITHHELD: tuple[str, ...] = (
-    'AgentCatalog',
-    'AgentManifest',
-    'AgentSlot',
     'BrokerTurnGate',
     'ControlBlock',
     'DEFAULT_MAX_TOOL_CONCURRENCY',
     'Delegate',
     'Fork',
-    'HostFacts',
     'INTERCEPTABLE',
     'KillAgent',
     'LocalAgentTable',
-    'ManifestSource',
     'NullTurnGate',
     'OBSERVABLE',
-    'Orchestrator',
-    'OverrideRecord',
     'QueryAgent',
     'ReadOnlyKwarg',
     'SendMessage',
     'ToolExecutor',
-    'Topology',
     'TurnGate',
     'TurnGateDecision',
     'UPDATE_PROTECTED_FIELDS',
@@ -231,7 +232,6 @@ _WITHHELD: tuple[str, ...] = (
     'disposition_of',
     'install_plugins',
     'parse_mapping',
-    'register_builtins',
     'register_tool',
     'resolve_tool_names',
     'tool_name_disagreement',
@@ -413,6 +413,26 @@ def test_every_name_a_submodule_exports_is_either_promised_or_withheld_on_purpos
     declared, _ = _declared_exports()
     promised = set(kernel.__all__) | set(contracts.__all__)
     assert sorted(set(declared) - promised) == sorted(_WITHHELD)
+
+
+# 计划 3 裁决 9 点名要进承诺面的名字。逐字写死，不从 kernel.__all__ 推导：
+# 少导出一个，差集非空；多导出一个由 test_the_public_surface_is_exactly_this 抓住。
+_PLAN3_PROMISED: tuple[str, ...] = (
+    'AgentCatalog',
+    'AgentManifest',
+    'AgentSlot',
+    'HostFacts',
+    'ManifestSource',
+    'Orchestrator',
+    'OverrideRecord',
+    'Topology',
+    'register_builtins',
+)
+
+
+def test_promised_names_include_catalog_topology_and_orchestrator():
+    missing = [name for name in _PLAN3_PROMISED if name not in kernel.__all__]
+    assert missing == []
 
 
 def test_no_name_is_both_promised_and_withheld():

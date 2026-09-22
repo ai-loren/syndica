@@ -162,9 +162,16 @@ async def test_orchestrator_factory_installs_orchestration_tools_when_runtime_as
         worker_id = await quiet.spawn(factories['Worker'])
         orchestrator = quiet._table.get(orchestrator_id)
         worker = quiet._table.get(worker_id)
-        assert orchestrator is not None and 'Delegate' in orchestrator.options.tools
-        assert worker is not None and 'Delegate' not in worker.options.tools
-        assert 'Read' in worker.options.tools
+        assert orchestrator is not None
+        assert list(orchestrator.options.tools) == [
+            'Delegate',
+            'Fork',
+            'SendMessage',
+            'QueryAgent',
+            'KillAgent',
+        ]
+        assert worker is not None
+        assert list(worker.options.tools) == ['Read', 'Write', 'Edit', 'Bash']
         assert installs == ['Orchestrator']
     finally:
         await quiet.shutdown()
