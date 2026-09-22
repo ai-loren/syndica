@@ -135,6 +135,11 @@ Runtime **自己拥有的** hooks 与已挂服务回到构造前状态；第三�
 之外启动的任务、写入的文件或外部注册不在回滚承诺内，Module 作者必须让自己的失败路径可清理。
 本地快照捕获 `BaseException` 后还原再原样抛出。
 
+构造期校验 callback 的参数签名，并拒绝会返回 coroutine 的异步 service / tool / plugin factory 与
+`on_start`。`on_shutdown` 的公开类型是“callable 返回 Awaitable”，因此同步包装器合法；Runtime
+调用后校验返回值确实可 await，不合法时产生带 Module 名与修复动作的 `ConfigError`，但仍继续其余
+清理。
+
 shutdown 使用一个独立 `_shutdown_task` 独占完整清理流程；所有 `shutdown()` 调用都用
 `asyncio.shield` 等同一个任务。取消某个等待者不取消清理，后续调用仍能等到同一结果。顺序固定为：
 置终态并摘 broker 回调 → 取消并等待 Agent → 等 reaper → 触发一次 `RUNTIME_SHUTDOWN` → Module
