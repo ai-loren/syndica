@@ -21,9 +21,9 @@
 （`curl -o f; sh f`）。**同一形态换个平凡写法必须仍然命中**——多一段管道、多一次重定向、标志写在
 路径后面、路径加一对引号、命令前面加一个绕 alias 的反斜杠（`\\rm`）都不算另一种形态。
 
-**本计划只落地 `ALLOW` 与 `BLOCK` 两档处置的实现。** `CONFIRM` 这个取值现在就存在，因为并发分段
-要按「这次调用需不需要人工授权」判不安全（spec §5.6），没有这个取值那条从严规则就无从表达；真正
-的人工确认交互随 CLI 落在计划 6。
+`CONFIRM` 由宿主注入的 `ConfirmationHandler` 实现。默认没有 handler 时仍立即拒绝，不白耗等待；
+`MailboxConfirmationHandler` 才把请求发进事件流，并经 `Runtime.wait_for` 收回一次性答复。确认使用
+独立随机 request id，而不是模型给的 tool call id，迟到答复因此不能批准另一次调用。
 """
 
 from __future__ import annotations
@@ -38,19 +38,25 @@ from typing import Any, Protocol, cast, runtime_checkable
 
 from syndica.kernel.context import ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError, ContractViolation
+from syndica.kernel.events import Event, EventBus
 from syndica.kernel.tool import Tool
+from syndica.kernel.waiting import Confirmation, WaitResult, WaitState
 
 __all__ = [
     'DEFAULT_RULES',
     'NO_RULE_MATCHED',
     'AllowAll',
     'BlockHighRisk',
+    'ConfirmationHandler',
+    'ConfirmationOutcome',
+    'ConfirmationRequest',
     'DangerJudge',
     'DangerPolicy',
     'DangerRequest',
     'DangerRule',
     'DangerVerdict',
     'Disposition',
+    'MailboxConfirmationHandler',
     'RiskLevel',
     'disposition_of',
     'validate_danger_options',
@@ -78,6 +84,16 @@ class Disposition(Enum):
     ALLOW = 'allow'
     BLOCK = 'block'
     CONFIRM = 'confirm'
+
+
+class ConfirmationOutcome(Enum):
+    """One decision for one confirmation request."""
+
+    APPROVED = 'approved'
+    REJECTED = 'rejected'
+    TIMEOUT = 'timeout'
+    PREEMPTED = 'preempted'
+    ABORTED = 'aborted'
 
 
 @dataclass(frozen=True)
@@ -132,6 +148,89 @@ class DangerRequest:
     verdict: DangerVerdict
     call: ToolCall
     provenance: TrustLevel | None
+
+
+@dataclass(frozen=True)
+class ConfirmationRequest:
+    """An immutable snapshot of one request for human confirmation.
+
+    `request_id` is a fresh nonce and is intentionally distinct from the
+    model-provided `tool_call_id`. A late answer can therefore never approve a
+    later call that happens to reuse the same model id.
+    """
+
+    request_id: str
+    agent_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments: str
+    verdict: DangerVerdict
+
+
+class _ConfirmationRuntime(Protocol):
+    events: EventBus
+
+    async def wait_for(self, agent_id: str, waiter: Confirmation) -> WaitResult: ...
+
+
+@runtime_checkable
+class ConfirmationHandler(Protocol):
+    """Host-selected transport for one confirmation request."""
+
+    async def confirm(
+        self,
+        runtime: _ConfirmationRuntime,
+        request: ConfirmationRequest,
+    ) -> ConfirmationOutcome: ...
+
+
+class MailboxConfirmationHandler:
+    """Emit a request event and await one trusted human mailbox reply."""
+
+    def __init__(self, *, timeout: float = 300.0) -> None:
+        # Reuse the sealed waiter's complete timeout validation.
+        probe = Confirmation(timeout=timeout, tool_call_id='validation-probe')
+        self._timeout = probe.timeout
+
+    async def confirm(
+        self,
+        runtime: _ConfirmationRuntime,
+        request: ConfirmationRequest,
+    ) -> ConfirmationOutcome:
+        await runtime.events.emit(
+            Event(
+                kind='tool_confirmation_requested',
+                agent_id=request.agent_id,
+                payload={
+                    'request_id': request.request_id,
+                    'tool_call_id': request.tool_call_id,
+                    'tool_name': request.tool_name,
+                    'arguments': request.arguments,
+                    'verdict': {
+                        'rule_id': request.verdict.rule_id,
+                        'level': request.verdict.level.value,
+                        'reason': request.verdict.reason,
+                    },
+                },
+            )
+        )
+        waited = await runtime.wait_for(
+            request.agent_id,
+            Confirmation(timeout=self._timeout, tool_call_id=request.request_id),
+        )
+        if waited.state is WaitState.TIMEOUT:
+            return ConfirmationOutcome.TIMEOUT
+        if waited.state is WaitState.PREEMPTED:
+            return ConfirmationOutcome.PREEMPTED
+        if waited.state is WaitState.ABORTED:
+            return ConfirmationOutcome.ABORTED
+        answer = waited.message
+        if answer is None or answer.sender != 'human' or answer.trust is not TrustLevel.TRUSTED:
+            return ConfirmationOutcome.REJECTED
+        decision = answer.content.strip().lower()
+        return (
+            ConfirmationOutcome.APPROVED if decision == 'approve' else ConfirmationOutcome.REJECTED
+        )
 
 
 # 命令词之前可以出现的环境变量赋值（`FOO=1 rm -rf x`）。
@@ -764,6 +863,46 @@ def validate_danger_options(judge: object, policy: object) -> None:
                 '传 BlockHighRisk() / AllowAll()，或自己实现一个带 '
                 'decide(self, request: DangerRequest) -> Disposition 的类并传它的实例'
             ),
+        )
+
+
+def validate_confirmation_handler(handler: object) -> None:
+    """Validate the optional host confirmation transport before Runtime setup."""
+    if handler is None:
+        return
+    if isinstance(handler, type):
+        raise ConfigError(
+            expected=(
+                'confirmation_handler 是有 async confirm(runtime, request) 方法的实例，'
+                '或 None（没有人工确认通道）'
+            ),
+            received=f'confirmation_handler.confirm 无法使用：{_received_instead(handler)}',
+            next_action=(
+                '传 MailboxConfirmationHandler()，或实现 ConfirmationHandler 并传实例；不要传类本身'
+            ),
+        )
+    confirm = getattr(handler, 'confirm', None)
+    if not callable(confirm):
+        raise ConfigError(
+            expected='confirmation_handler.confirm 是 async callable',
+            received=(f'confirmation_handler.confirm={confirm!r}，类型是 {type(confirm).__name__}'),
+            next_action=(
+                '实现 async def confirm(self, runtime, request)，并返回 ConfirmationOutcome'
+            ),
+        )
+    try:
+        inspect.signature(confirm).bind(object(), object())
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            expected='confirmation_handler.confirm 能接收 runtime 与 request 两个位置参数',
+            received=f'confirmation_handler.confirm 的签名不匹配：{exc}',
+            next_action='改成 async def confirm(self, runtime, request) -> ConfirmationOutcome',
+        ) from exc
+    if not inspect.iscoroutinefunction(confirm):
+        raise ConfigError(
+            expected='confirmation_handler.confirm 是 async def',
+            received=f'confirmation_handler.confirm={confirm!r} 是同步 callable',
+            next_action='改成 async def confirm(self, runtime, request) -> ConfirmationOutcome',
         )
 
 

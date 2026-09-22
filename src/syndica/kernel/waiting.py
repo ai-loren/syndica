@@ -4,8 +4,9 @@ spec §4.2 把等待收进**一个**公开方法（`Runtime.wait_for`）加一�
 一个方法：新增等待类型于是不扩大公开面。密封的实际含义在 `correlation_of` 上——名单之外的
 `Waiter` **当场报错**，而不是落进某个默认分支去等一个永远不会来的答复。
 
-**三种等待共用一条实现：按关联 ID 匹配。** `Confirmation` 用 `tool_call_id`，`Reply` 用
-`correlation_id`，`UserInput` 用它自己生成的 `request_id`。于是 `wait_for` 就是
+**三种等待共用一条实现：按关联 ID 匹配。** `Confirmation` 用本次确认请求的一次性
+`tool_call_id`，`Reply` 用 `correlation_id`，`UserInput` 用它自己生成的 `request_id`。于是
+`wait_for` 就是
 `MessageBroker.take_by_correlation`——那个方法刻意不接受任意谓词，因为谓词下推不到远端队列
 （spec §4.4）。
 
@@ -171,7 +172,11 @@ class UserInput(Waiter):
 
 @dataclass(frozen=True)
 class Confirmation(Waiter):
-    """等一次工具调用的人工确认。关联 ID 就是那次调用的 id。"""
+    """等一次工具调用的人工确认。
+
+    字段名沿用 `tool_call_id`，值必须是确认通道为**这一次授权**生成的不可预测 ID，不是模型给出的
+    原始调用 ID。原始 ID 可能复用或被猜到，直接拿来关联会让迟到答复批准后续另一条调用。
+    """
 
     tool_call_id: str
 

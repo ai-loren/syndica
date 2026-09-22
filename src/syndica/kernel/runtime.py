@@ -129,6 +129,12 @@ from syndica.kernel.context import (
     strictest_trust,
 )
 from syndica.kernel.control import BrokerTurnGate, ControlBlock
+from syndica.kernel.danger import (
+    ConfirmationHandler,
+    ConfirmationOutcome,
+    ConfirmationRequest,
+    validate_confirmation_handler,
+)
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import (
     EventBus,
@@ -746,9 +752,11 @@ class Runtime:
         orchestration: bool = False,
         modules: Sequence[RuntimeModule] | None = None,
         flags: Mapping[str, FlagValue] | None = None,
+        confirmation_handler: ConfirmationHandler | None = None,
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
+        validate_confirmation_handler(confirmation_handler)
         module_assembly = _RuntimeModuleAssembly(modules, flags)
         self.registry: AgentRegistry = (
             InMemoryAgentRegistry()
@@ -772,6 +780,7 @@ class Runtime:
         # ——那里共用是为了热插拔，而角色表的载入与同名覆盖归计划 3，在那一层收口。
         self._agents: dict[str, AgentFactory] = dict(agents or {})
         self._orchestration = orchestration
+        self._confirmation_handler = confirmation_handler
         self._table: LocalAgentTable[BaseAgent] = LocalAgentTable()
         self._slots: dict[str, _Slot] = {}
         # 收尾在事件循环之外做，因此它自己是一个任务；不在实例表里，`shutdown` 的取消名单看不见
@@ -952,6 +961,9 @@ class Runtime:
             agent._configure_runtime_flags(  # pyright: ignore[reportPrivateUsage]
                 agent_flags
             )
+            agent._configure_confirmation(  # pyright: ignore[reportPrivateUsage]
+                None if self._confirmation_handler is None else self._confirm
+            )
             for block in forked_blocks:
                 agent.context.append(block)
             if fork_from is not None and query is None:
@@ -1038,6 +1050,18 @@ class Runtime:
         self._table.set_task(agent_id, task)
         await self.hooks.trigger(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)
         return agent_id
+
+    async def _confirm(self, request: ConfirmationRequest) -> ConfirmationOutcome:
+        handler = self._confirmation_handler
+        if handler is None:
+            raise ContractViolation(
+                expected='Runtime 有 confirmation_handler 才会发起确认',
+                received='没有 handler 却进入了确认 callback',
+                next_action=(
+                    '不要绕过 spawn 的确认绑定；需要确认时构造 Runtime(confirmation_handler=...)'
+                ),
+            )
+        return await handler.confirm(self, request)
 
     def _install_orchestration(self, agent: BaseAgent, agent_id: str) -> None:
         """把 spec §5.6 的五个编排工具挂进这个 Agent。

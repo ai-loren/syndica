@@ -1870,7 +1870,8 @@ async def test_the_confirmation_junction_receives_the_call_the_tool_the_args_and
     ).execute_tool_calls(Context(), [call])
     assert len(seen) == 1
     assert sorted(seen[0]) == ['args', 'tool', 'tool_call', 'verdict']
-    assert seen[0]['tool_call'] is call
+    assert seen[0]['tool_call'] == call
+    assert seen[0]['tool_call'] is not call
     assert seen[0]['tool'] is tool
     assert seen[0]['args'] == {'command': 'sudo rm -rf /'}
     assert seen[0]['verdict'].rule_id == _ESCALATION

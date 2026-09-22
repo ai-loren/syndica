@@ -39,6 +39,9 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'CachePrefixProvider',
     'ConfigError',
     'Confirmation',
+    'ConfirmationHandler',
+    'ConfirmationOutcome',
+    'ConfirmationRequest',
     'Context',
     'ContextBlock',
     'ContextOverflowError',
@@ -70,6 +73,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'LLMConfig',
     'LLMResponseError',
     'LocalWorkspace',
+    'MailboxConfirmationHandler',
     'ManifestSource',
     'Message',
     'MessageBroker',
@@ -181,6 +185,7 @@ _RUNTIME_INIT: tuple[tuple[str, str, bool], ...] = (
     ('orchestration', 'KEYWORD_ONLY', True),
     ('modules', 'KEYWORD_ONLY', True),
     ('flags', 'KEYWORD_ONLY', True),
+    ('confirmation_handler', 'KEYWORD_ONLY', True),
 )
 _RUNTIME_SPAWN: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),
@@ -395,6 +400,20 @@ def test_kernel_exports_the_human_tool_definitions_not_aliases():
     assert kernel.AskUser is AskUser
     assert kernel.AskUserQuestion is AskUserQuestion
     assert kernel.HumanInteractionModule is HumanInteractionModule
+
+
+def test_kernel_exports_the_confirmation_definitions_not_aliases():
+    from syndica.kernel.danger import (
+        ConfirmationHandler,
+        ConfirmationOutcome,
+        ConfirmationRequest,
+        MailboxConfirmationHandler,
+    )
+
+    assert kernel.ConfirmationHandler is ConfirmationHandler
+    assert kernel.ConfirmationOutcome is ConfirmationOutcome
+    assert kernel.ConfirmationRequest is ConfirmationRequest
+    assert kernel.MailboxConfirmationHandler is MailboxConfirmationHandler
 
 
 def test_export_list_is_sorted():

@@ -88,6 +88,7 @@ from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.tool import Tool, validate_tool_names
 from syndica.kernel.tool_executor import (
     DEFAULT_MAX_TOOL_CONCURRENCY,
+    ConfirmationCallback,
     ToolExecutor,
     validate_max_concurrency,
 )
@@ -468,7 +469,17 @@ class BaseAgent:
 
     def _assembly_snapshot(
         self,
-    ) -> tuple[AgentOptions, dict[str, Tool], Any, Any, TurnGate, bool, Disposition]:
+    ) -> tuple[
+        AgentOptions,
+        dict[str, Tool],
+        Any,
+        Any,
+        TurnGate,
+        bool,
+        Disposition,
+        str | None,
+        ConfirmationCallback | None,
+    ]:
         """保存 Runtime 装配前本对象自己拥有的可变状态。"""
         return (
             self.options,
@@ -478,6 +489,8 @@ class BaseAgent:
             self._gate,
             self._gate_attached,
             self._executor._untrusted_high_risk,  # pyright: ignore[reportPrivateUsage]
+            self._executor._confirmation_agent_id,  # pyright: ignore[reportPrivateUsage]
+            self._executor._confirmation,  # pyright: ignore[reportPrivateUsage]
         )
 
     def _assembly_restore(
@@ -490,10 +503,22 @@ class BaseAgent:
             TurnGate,
             bool,
             Disposition,
+            str | None,
+            ConfirmationCallback | None,
         ],
     ) -> None:
         """恢复 `_assembly_snapshot`；被拒的 spawn 不留下半套 Agent。"""
-        options, tools, local_hooks, module_hooks, gate, gate_attached, disposition = snapshot
+        (
+            options,
+            tools,
+            local_hooks,
+            module_hooks,
+            gate,
+            gate_attached,
+            disposition,
+            confirmation_agent_id,
+            confirmation,
+        ) = snapshot
         options.tools.clear()
         options.tools.update(tools)
         self.options = options
@@ -507,6 +532,14 @@ class BaseAgent:
         self._executor._configure_untrusted_high_risk(  # pyright: ignore[reportPrivateUsage]
             disposition
         )
+        if confirmation_agent_id is None:
+            self._executor._confirmation_agent_id = None  # pyright: ignore[reportPrivateUsage]
+            self._executor._confirmation = confirmation  # pyright: ignore[reportPrivateUsage]
+        else:
+            self._executor._configure_confirmation(  # pyright: ignore[reportPrivateUsage]
+                confirmation_agent_id,
+                confirmation,
+            )
 
     def _install_module_plugins(self, plugins: Iterable[Plugin]) -> None:
         """把 Module 插件装进 local 与 Runtime 之间的独立一层。"""
@@ -529,6 +562,16 @@ class BaseAgent:
             )
         self._executor._configure_untrusted_high_risk(  # pyright: ignore[reportPrivateUsage]
             disposition
+        )
+
+    def _configure_confirmation(
+        self,
+        callback: ConfirmationCallback | None,
+    ) -> None:
+        """Bind the host confirmation transport to this Agent's executor."""
+        self._executor._configure_confirmation(  # pyright: ignore[reportPrivateUsage]
+            self.agent_id,
+            callback,
         )
 
     def _attach_gate(self, gate: TurnGate) -> None:

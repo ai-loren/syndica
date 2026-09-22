@@ -233,7 +233,7 @@ expect:
 
 ### Task 4 — 人工确认与 D-38
 
-**状态：in_progress**
+**状态：completed**（1040 条定向测试；9 条真实变异；独立审查修复 4 项后 APPROVE）
 
 **Files:** `danger.py`、`tool_executor.py`、`agent.py`、`runtime.py`、对应单测
 
@@ -245,7 +245,7 @@ expect:
 
 ### Task 5 — L2 场景 schema 与 runner
 
-**状态：pending**
+**状态：in_progress**
 
 **Files:** `src/syndica/runner/scenario.py`、`src/syndica/runner/yaml.py`、
 `tests/runner/`、YAML fixtures
@@ -357,6 +357,10 @@ expect:
   已增加外部包守卫，并用一正一反两个 fixture 证明只禁 kernel、不禁 CLI。
 - Task 3：反射 schema 只接受基础 `list`，不能表达 `Sequence[str]` 的元素类型；`AskUserQuestion`
   因此使用手写 schema，运行时仍保留更精确的 Sequence 校验。
+- Task 4：可观察 hook 虽然丢弃返回值，仍能保留收到的可变对象并延迟修改；确认切点因此必须同时
+  复制最终参数与 ToolCall，批准后再从不可变 JSON 快照重建执行参数。
+- Task 4：writer-priority 执行门在 writer 等待期间被取消时必须 `notify_all`；否则已经在等的
+  reader 没有后续状态变化可唤醒，会永久停住。
 
 ## 文档更新清单
 

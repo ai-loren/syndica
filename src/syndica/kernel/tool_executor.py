@@ -19,6 +19,11 @@
 计数、可以记录，一次调用问它两遍（而且两遍看的参数还不同）就是在骗它。判据因此取「命中任何危险规则
 即不安全」，它严于「需要人工授权」，且在 `AllowAll` 这类宿主下仍然起作用。
 
+宿主仍可能对一条规则未命中的调用返回 `CONFIRM`。这在初始分段时不可知，因此每批另有一个执行门：
+普通调用共享进入，获批调用独占进入。确认等待与 PRE hook 可以同兄弟重叠，但获批调用的
+`Tool.execute` 和 POST hook 开始时没有兄弟在执行、结束前也不放兄弟进入。这样 policy 只决定一次，
+同时满足“需要人工授权的调用不与别人并发”。
+
 **结果块始终按调用顺序落进轨迹，与完成顺序无关。** 配对靠的是相邻性，而 provider 会拒掉配对断裂的
 消息。
 
@@ -66,9 +71,9 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 那道升级就恒不命中，而调用方以为有它。
 
 **被阻断的调用仍然产出恰好一个 role='tool' block。** 阻断不是失败，是一次「这条路走不通」的回答，
-模型据此换一种做法。它写给模型看，因此按三件套写。阻断与需要确认两种措辞**不可互换**：阻断是确定的
-否（换做法），需要确认是还没有人回答（这个 Runtime 上没有确认通道）。塌成一句，模型就分不清该换做法
-还是该等。
+模型据此换一种做法。它写给模型看，因此按三件套写。没有 handler 时的确认请求与直接阻断两种措辞
+**不可互换**：阻断是确定的否（换做法），缺通道是宿主没有接线。已接 handler 时，拒绝 / 超时 /
+抢占 / 中止各有独立状态；只有 `approved` 进入独占执行区间。
 
 **trust 只能收紧，不能放松。** hook 改写结果时最终 trust 取原结果与**链上每一次改写**里最严的那
 一个：ToolResult 上没有任何东西能区分「消毒之后刻意提升」与「忘了带 trust=」，而后者的后果是未标记
@@ -101,7 +106,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Sequence
+import uuid
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any, cast
 
@@ -115,6 +122,8 @@ from syndica.kernel.context import (
 )
 from syndica.kernel.danger import (
     BlockHighRisk,
+    ConfirmationOutcome,
+    ConfirmationRequest,
     DangerJudge,
     DangerPolicy,
     DangerRequest,
@@ -386,11 +395,57 @@ class _JudgeFailure(Exception):
         self.original = original
 
 
+ConfirmationCallback = Callable[[ConfirmationRequest], Awaitable[ConfirmationOutcome]]
+
+
+class _ExecutionGate:
+    """A writer-priority gate for the execute + POST interval of one batch."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._shared = 0
+        self._exclusive = False
+        self._exclusive_waiters = 0
+
+    @asynccontextmanager
+    async def hold(self, *, exclusive: bool) -> AsyncGenerator[None, None]:
+        if exclusive:
+            async with self._condition:
+                self._exclusive_waiters += 1
+                try:
+                    await self._condition.wait_for(
+                        lambda: not self._exclusive and self._shared == 0
+                    )
+                    self._exclusive = True
+                finally:
+                    self._exclusive_waiters -= 1
+                    self._condition.notify_all()
+            try:
+                yield
+            finally:
+                async with self._condition:
+                    self._exclusive = False
+                    self._condition.notify_all()
+            return
+
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: not self._exclusive and self._exclusive_waiters == 0
+            )
+            self._shared += 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._shared -= 1
+                self._condition.notify_all()
+
+
 def _gated_result(call: ToolCall, verdict: DangerVerdict, disposition: Disposition) -> ToolResult:
     """被闸拦下的调用交给模型的那一块。
 
-    两种措辞不可互换：阻断是**确定的否**（换做法），需要确认是**还没有人回答**（这个 Runtime 上
-    内核不收确认答复）。塌成一句，模型就分不清该换做法还是该等。
+    两种措辞不可互换：阻断是**确定的否**（换做法），CONFIRM 走到这里则表示这个 Runtime 没装
+    handler。塌成一句，模型就分不清该换做法还是该让宿主接上确认通道。
 
     需要确认这条只断言内核知道的那件事：**内核不消费确认切点的答复**。「没有人会看到它」是内核
     不知道的——`TOOL_CONFIRMATION_REQUIRED` 上可以挂着观察者，而且此刻它已经被叫到过了。
@@ -417,6 +472,31 @@ def _gated_result(call: ToolCall, verdict: DangerVerdict, disposition: Dispositi
             ' 下一步: 换一种达成同一目标的做法——缩小作用范围、去掉提权、避开不可逆操作；'
             '这次阻断不会被记住，也不存在「此后均可」的放行，同样的调用重来一次仍会被阻断。'
         )
+    )
+
+
+def _confirmation_result(
+    call: ToolCall,
+    verdict: DangerVerdict,
+    request: ConfirmationRequest,
+    outcome: ConfirmationOutcome,
+) -> ToolResult:
+    descriptions = {
+        ConfirmationOutcome.REJECTED: (
+            '可信的人类明确拒绝了这次调用，或答复来源 / 内容不符合确认协议'
+        ),
+        ConfirmationOutcome.TIMEOUT: '等待人类确认超时',
+        ConfirmationOutcome.PREEMPTED: '这次确认被新的等待顶掉',
+        ConfirmationOutcome.ABORTED: '等待确认时 Agent 被中止',
+    }
+    return ToolResult(
+        output=(
+            f'期望: {call.name}（id={call.id}）在执行前得到本次专属的可信人类批准。'
+            f' 实际: {descriptions[outcome]}；规则 {verdict.rule_id} 的风险等级是'
+            f' {verdict.level.value}，工具没有执行、也没有产生任何副作用。'
+            ' 下一步: 不要把本条当成批准；根据当前结局重新询问，或换一种不触发该规则的做法。'
+        ),
+        meta={'confirmation': outcome.value, 'request_id': request.request_id},
     )
 
 
@@ -521,6 +601,8 @@ class ToolExecutor:
         self._policy: DangerPolicy = policy if policy is not None else BlockHighRisk()
         self._max_concurrency = max_concurrency
         self._untrusted_high_risk = Disposition.BLOCK
+        self._confirmation_agent_id: str | None = None
+        self._confirmation: ConfirmationCallback | None = None
 
     def _retarget(self, tools: dict[str, Tool]) -> None:
         """换掉查表用的那张表。
@@ -543,15 +625,46 @@ class ToolExecutor:
             )
         self._untrusted_high_risk = raw_disposition
 
+    def _configure_confirmation(
+        self,
+        agent_id: object,
+        callback: ConfirmationCallback | None,
+    ) -> None:
+        """Bind this per-Agent executor to the host confirmation transport."""
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise ConfigError(
+                expected='confirmation 的 agent_id 是非空白 str',
+                received=f'收到 agent_id={agent_id!r}，类型是 {type(agent_id).__name__}',
+                next_action='传入这个 ToolExecutor 所属 BaseAgent 的 agent_id',
+            )
+        if callback is not None and not callable(callback):
+            raise ConfigError(
+                expected='confirmation callback 可调用，或 None（没有确认通道）',
+                received=f'收到 {callback!r}，类型是 {type(callback).__name__}',
+                next_action='传入 async callback(request) -> ConfirmationOutcome',
+            )
+        self._confirmation_agent_id = agent_id
+        self._confirmation = callback
+
     async def execute_tool_calls(self, ctx: Context, tool_calls: list[ToolCall]) -> None:
         provenance = provenance_of(ctx)
         safety = [self._concurrency_safe(call) for call in tool_calls]
+        execution_gate = _ExecutionGate()
+        confirmation_lock = asyncio.Lock()
         handled = 0
         failure: Exception | None = None
         failed_call: ToolCall | None = None
         for segment in _segments(safety, self._max_concurrency):
             calls = [tool_calls[index] for index in segment]
-            outcomes = _without_cancellation(await self._run_segment(ctx, calls, provenance))
+            outcomes = _without_cancellation(
+                await self._run_segment(
+                    ctx,
+                    calls,
+                    provenance,
+                    execution_gate,
+                    confirmation_lock,
+                )
+            )
             for call, outcome in zip(calls, outcomes, strict=True):
                 # 判定抛出这条路单独接：它是唯一能断言「工具没运行」的抛出点。
                 if isinstance(outcome, _JudgeFailure):
@@ -572,7 +685,12 @@ class ToolExecutor:
             raise failure
 
     async def _run_segment(
-        self, ctx: Context, calls: list[ToolCall], provenance: TrustLevel
+        self,
+        ctx: Context,
+        calls: list[ToolCall],
+        provenance: TrustLevel,
+        execution_gate: _ExecutionGate,
+        confirmation_lock: asyncio.Lock,
     ) -> list[ToolResult | BaseException]:
         """跑一段：段内并发，交回与 `calls` 同序的结果或异常。
 
@@ -582,14 +700,33 @@ class ToolExecutor:
         """
         if len(calls) == 1:
             try:
-                return [await self._execute_one(ctx, calls[0], provenance, has_siblings=False)]
+                return [
+                    await self._execute_one(
+                        ctx,
+                        calls[0],
+                        provenance,
+                        execution_gate,
+                        confirmation_lock,
+                        has_siblings=False,
+                    )
+                ]
             # 收进结果列表的只有 Exception，取消沿这条路直接上抛。并发那条路做不到这件事
             # （gather 把子协程的取消一并收进列表），所以两条路都还要过 `_without_cancellation`
             # ——「取消不写 block」这条只由它保证。
             except Exception as exc:
                 return [exc]
         return await asyncio.gather(
-            *(self._execute_one(ctx, call, provenance, has_siblings=True) for call in calls),
+            *(
+                self._execute_one(
+                    ctx,
+                    call,
+                    provenance,
+                    execution_gate,
+                    confirmation_lock,
+                    has_siblings=True,
+                )
+                for call in calls
+            ),
             return_exceptions=True,
         )
 
@@ -674,7 +811,14 @@ class ToolExecutor:
         )
 
     async def _execute_one(
-        self, ctx: Context, call: ToolCall, provenance: TrustLevel, *, has_siblings: bool
+        self,
+        ctx: Context,
+        call: ToolCall,
+        provenance: TrustLevel,
+        execution_gate: _ExecutionGate,
+        confirmation_lock: asyncio.Lock,
+        *,
+        has_siblings: bool,
     ) -> ToolResult:
         """跑一次调用。
 
@@ -734,38 +878,51 @@ class ToolExecutor:
         # 就地写会撞上一条指名 pre_tool_use 的错误——而那个切点根本不读 modified['args']。
         args = dict(cast(dict[str, Any], rewritten_args))
 
-        gated = await self._gated(call, tool, args, provenance)
+        gated, exclusive, execution_args = await self._gated(
+            call,
+            tool,
+            args,
+            provenance,
+            confirmation_lock,
+        )
         if gated is not None:
             return gated
+        args = execution_args
 
-        # 守卫必须坐在 POST_TOOL_USE 之前：让它去看 post.get('result', result) 就分不出坏值来自
-        # 工具还是来自 hook。cast 到 object 是因为要挡的正是违反 execute 标注的运行时取值，不擦
-        # 掉静态类型，下面的 isinstance 就成了 pyright 眼里的死代码。
-        try:
-            returned = cast(object, await tool.execute(**args))
-        except SyndicaError:
-            # 三件套写给程序员或运维，模型执行不了它的 next_action。
-            raise
-        except Exception as exc:
-            returned = _tool_raised_result(call, exc)
-        if not isinstance(returned, ToolResult):
-            raise _bad_tool_return(call, tool, returned)
-        result = returned
+        async with execution_gate.hold(exclusive=exclusive):
+            # 守卫必须坐在 POST_TOOL_USE 之前：让它去看 post.get('result', result) 就分不出坏值来自
+            # 工具还是来自 hook。cast 到 object 是因为要挡的正是违反 execute 标注的运行时取值，不擦
+            # 掉静态类型，下面的 isinstance 就成了 pyright 眼里的死代码。
+            try:
+                returned = cast(object, await tool.execute(**args))
+            except SyndicaError:
+                # 三件套写给程序员或运维，模型执行不了它的 next_action。
+                raise
+            except Exception as exc:
+                returned = _tool_raised_result(call, exc)
+            if not isinstance(returned, ToolResult):
+                raise _bad_tool_return(call, tool, returned)
+            result = returned
 
-        post = await self._hooks.trigger(
-            Junction.POST_TOOL_USE, tool_call=call, tool=tool, args=args, result=result
-        )
-        if post.result is not None:
-            raise _post_result_slot_rejected(post)
-        rewritten = post.get('result', result)
-        if not isinstance(rewritten, ToolResult):
-            raise _rewrite_rejected(Junction.POST_TOOL_USE, 'result', ToolResult, rewritten)
-        return _tightened(_strictest(result, post.rewrites('result')), rewritten)
+            post = await self._hooks.trigger(
+                Junction.POST_TOOL_USE, tool_call=call, tool=tool, args=args, result=result
+            )
+            if post.result is not None:
+                raise _post_result_slot_rejected(post)
+            rewritten = post.get('result', result)
+            if not isinstance(rewritten, ToolResult):
+                raise _rewrite_rejected(Junction.POST_TOOL_USE, 'result', ToolResult, rewritten)
+            return _tightened(_strictest(result, post.rewrites('result')), rewritten)
 
     async def _gated(
-        self, call: ToolCall, tool: Tool, args: dict[str, Any], provenance: TrustLevel
-    ) -> ToolResult | None:
-        """闸：放行交回 None，拦下交回给模型的那一块。
+        self,
+        call: ToolCall,
+        tool: Tool,
+        args: dict[str, Any],
+        provenance: TrustLevel,
+        confirmation_lock: asyncio.Lock,
+    ) -> tuple[ToolResult | None, bool, dict[str, Any]]:
+        """闸：交回（拦截结果或 None，批准后是否独占执行，最终执行参数）。
 
         处置经 `disposition_of` 取——它先按 `untrusted_high_risk` Flag 施加 spec §12.2 第 3 条
         的升级，再咨询宿主策略。直接调 `self._policy.decide` 会把升级整个绕过去，而 typing 与
@@ -783,13 +940,74 @@ class ToolExecutor:
         if disposition is Disposition.ALLOW:
             if verdict.level is RiskLevel.LOW and provenance is TrustLevel.UNTRUSTED:
                 _report_allowed_low_risk_from_untrusted(call, verdict)
-            return None
+            return None, False, args
         if disposition is Disposition.CONFIRM:
+            request = (
+                self._confirmation_request(call, args, verdict)
+                if self._confirmation is not None and self._confirmation_agent_id is not None
+                else None
+            )
+            observed_args = (
+                args if request is None else cast('dict[str, Any]', json.loads(request.arguments))
+            )
             await self._hooks.trigger(
                 Junction.TOOL_CONFIRMATION_REQUIRED,
-                tool_call=call,
+                tool_call=replace(call),
                 tool=tool,
-                args=args,
+                args=observed_args,
                 verdict=verdict,
             )
-        return _gated_result(call, verdict, disposition)
+            if self._confirmation is not None and request is not None:
+                async with confirmation_lock:
+                    outcome = cast('object', await self._confirmation(request))
+                if not isinstance(outcome, ConfirmationOutcome):
+                    raise ContractViolation(
+                        expected='confirmation callback 交回 ConfirmationOutcome',
+                        received=f'收到 {outcome!r}，类型是 {type(outcome).__name__}',
+                        next_action=(
+                            '交回 ConfirmationOutcome.APPROVED / REJECTED / TIMEOUT / '
+                            'PREEMPTED / ABORTED 之一，不要用 bool 或字符串'
+                        ),
+                    )
+                if outcome is ConfirmationOutcome.APPROVED:
+                    execution_args = cast('dict[str, Any]', json.loads(request.arguments))
+                    return None, True, execution_args
+                return _confirmation_result(call, verdict, request, outcome), False, args
+        return _gated_result(call, verdict, disposition), False, args
+
+    def _confirmation_request(
+        self,
+        call: ToolCall,
+        args: dict[str, Any],
+        verdict: DangerVerdict,
+    ) -> ConfirmationRequest:
+        agent_id = self._confirmation_agent_id
+        if agent_id is None:
+            raise ContractViolation(
+                expected='confirmation callback 与所属 agent_id 一起配置',
+                received='callback 已存在但 agent_id 缺失',
+                next_action='通过 BaseAgent._configure_confirmation 一次绑定两者',
+            )
+        try:
+            arguments = json.dumps(
+                args,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(',', ':'),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ContractViolation(
+                expected='确认前的最终工具参数可编码为 JSON 快照',
+                received=f'{call.name}（id={call.id}）参数编码失败：{type(exc).__name__}: {exc}',
+                next_action=(
+                    '让 PRE_TOOL_USE hook 交回只含 JSON 值的 dict；无法稳定展示给人的参数不得执行'
+                ),
+            ) from exc
+        return ConfirmationRequest(
+            request_id=uuid.uuid4().hex,
+            agent_id=agent_id,
+            tool_call_id=call.id,
+            tool_name=call.name,
+            arguments=arguments,
+            verdict=verdict,
+        )
