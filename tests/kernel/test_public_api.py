@@ -101,6 +101,9 @@ _CONTRACT_EXPORTS: tuple[str, ...] = (
     'AgentRegistryContract',
     'ContractSuite',
     'MessageBrokerContract',
+    'UPDATE_PROTECTED_FIELDS',
+    'UPDATE_PROTECTED_FIELD_OWNERS',
+    'UPDATE_WRITABLE_FIELDS',
 )
 # `Runtime` 的公开面：**spec §4.2 把它刻意收紧到 11 个方法**，每加一个都是一条永久兼容承诺。
 # 逐字写死，理由同 `_KERNEL_EXPORTS`——这份清单是唯一会因为「顺手加一个公开方法」而变红的东西，
@@ -205,12 +208,12 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # - `INTERCEPTABLE` / `OBSERVABLE` / `ReadOnlyKwarg`：分类表是内核自己分发时用的，
 #   `ReadOnlyKwarg` 是 `dict` 子类、hook 作者按 `dict` 用它。
 # - `LocalAgentTable`：spec §4.3 明文说它只在进程内有意义、不进 Protocol。
-# - `UPDATE_*`：第三方实现 `AgentRegistry.update` 要用，但它们不出现在任何公开签名里，
-#   落点是随 wheel 发布的契约套件（见 D-53）。
 # - `correlation_of`：`Waiter` 密封分发的内部收口，`wait_for` 自己调。
 # - `Workspace` / `Portal` / `LocalWorkspace` / `ExecResult` / `local_tools`：计划 4 Task 8
-#   才进 `kernel.__all__`。`Read` / `Write` / `Edit` 不进承诺面，宿主用 `local_tools` 按键取。
+#   才进 `kernel.__all__`。八个工具类不进承诺面，宿主用 `local_tools` 按键取。
 _WITHHELD: tuple[str, ...] = (
+    'Bash',
+    'BashOutput',
     'BrokerTurnGate',
     'ControlBlock',
     'DEFAULT_MAX_TOOL_CONCURRENCY',
@@ -218,8 +221,11 @@ _WITHHELD: tuple[str, ...] = (
     'Edit',
     'ExecResult',
     'Fork',
+    'Glob',
+    'Grep',
     'INTERCEPTABLE',
     'KillAgent',
+    'KillBash',
     'LocalAgentTable',
     'LocalWorkspace',
     'NullTurnGate',
@@ -234,9 +240,6 @@ _WITHHELD: tuple[str, ...] = (
     'TurnGateDecision',
     'Workspace',
     'Write',
-    'UPDATE_PROTECTED_FIELDS',
-    'UPDATE_PROTECTED_FIELD_OWNERS',
-    'UPDATE_WRITABLE_FIELDS',
     'correlation_of',
     'disposition_of',
     'install_plugins',

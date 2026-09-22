@@ -77,7 +77,8 @@ class InMemoryAgentRegistry:
                         '先把它归入 UPDATE_WRITABLE_FIELDS 或 UPDATE_PROTECTED_FIELDS'
                     ),
                 )
-        for key, value in fields.items():
+        owned_fields = copy.deepcopy(fields)
+        for key, value in owned_fields.items():
             setattr(info, key, value)
 
     async def children_of(self, agent_id: str) -> list[str]:

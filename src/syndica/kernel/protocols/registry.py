@@ -89,7 +89,8 @@ class AgentRegistry(Protocol):
         """无条件写 `UPDATE_WRITABLE_FIELDS` 里的字段。
 
         `UPDATE_PROTECTED_FIELDS` 里的字段与两个集合之外的字段名一律抛异常，
-        且拒绝时一个字段都不写。agent_id 不存在时抛异常。
+        且拒绝时一个字段都不写。agent_id 不存在时抛异常。写入的是调用方取值的深拷贝；
+        方法返回后调用方继续修改原容器，不得改变已经存下的字段。
         """
         ...
 

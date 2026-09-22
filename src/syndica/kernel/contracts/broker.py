@@ -282,10 +282,11 @@ class MessageBrokerContract(ContractSuite):
         await broker.publish('a1', _msg('other'))
         assert await broker.take_by_correlation('a1', 'nope', timeout=0.01) is None
 
-    async def test_take_by_correlation_times_out_while_non_matching_traffic_keeps_arriving(
+    async def test_wait_timeout_is_not_extended_by_nonmatching_messages(
         self, broker: MessageBroker
     ) -> None:
         await broker.ensure_queue('a1')
+        await broker.publish('a1', _msg('already queued'))
 
         async def publish_noise_forever() -> None:
             while True:

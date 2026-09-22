@@ -41,6 +41,12 @@ def _info(agent_id: str = 'a1', **kw: object) -> AgentInfo:
     )
 
 
+class _Uncopyable:
+    def __deepcopy__(self, memo: dict[int, object]) -> object:
+        del memo
+        raise RuntimeError('cannot copy')
+
+
 @contextmanager
 def _rejects(action: str) -> Generator[None]:
     """断言块内抛出 SyndicaError。kernel 只依赖标准库，本套件不得 import pytest。"""
@@ -185,6 +191,36 @@ class AgentRegistryContract(ContractSuite):
         await registry.update('a1', session_id='s1')
         got = await registry.get('a1')
         assert got is not None and got.session_id == 's1'
+
+    async def test_update_stores_a_snapshot_of_metadata(self, registry: AgentRegistry) -> None:
+        await registry.register(_info())
+        metadata = {'nested': {'labels': ['original']}}
+        await registry.update('a1', metadata=metadata)
+        metadata['nested']['labels'].append('mutated')  # pyright: ignore[reportAttributeAccessIssue]
+        got = await registry.get('a1')
+        assert got is not None
+        assert got.metadata == {'nested': {'labels': ['original']}}
+
+    async def test_update_copy_failure_writes_no_field(self, registry: AgentRegistry) -> None:
+        await registry.register(_info())
+        try:
+            await registry.update(
+                'a1',
+                session_id='must-not-stick',
+                metadata={'bad': _Uncopyable()},
+            )
+        except Exception:
+            pass
+        else:
+            raise AssertionError(
+                '期望不可深拷的 metadata 让 update 失败。'
+                ' 实际调用成功返回。'
+                ' 在写入前深拷所有字段，失败时不要留下前面字段的部分更新。'
+            )
+        got = await registry.get('a1')
+        assert got is not None
+        assert got.session_id is None
+        assert got.metadata == {}
 
     async def test_update_on_unknown_agent_raises(self, registry: AgentRegistry) -> None:
         with _rejects('update 一个未注册的 agent_id'):
