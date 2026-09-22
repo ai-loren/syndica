@@ -2,17 +2,17 @@
 
 写于 2026-09-21，2026-09-23 更新。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
-**一句话现状：** 计划 1–6 已收口，CLI、人机交互、人工确认与 L2 场景回放均已落地。
-**下一步是执行里程碑 1 最终审计**；不要重做计划 3–6，不要添加 `Runtime.start`。
+**一句话现状：** 里程碑 1 已完成最终审计，计划 1–6、CLI、人机交互、人工确认与 L2 场景回放
+均已落地。**下一步是单独规划里程碑 2（自举）**；不要重做 M1，也不要添加 `Runtime.start`。
 
 **先读顺序**
 
 1. 本文
 2. [`AGENTS.md`](../../AGENTS.md)
-3. [`docs/design/2026-09-03-architecture.md`](../design/2026-09-03-architecture.md) spec §15 / §4.6–4.8 / §17
-4. [`docs/decisions/2026-09-08-m1-scope.md`](../decisions/2026-09-08-m1-scope.md)
-5. [`docs/decisions/2026-09-14-deferred-items.md`](../decisions/2026-09-14-deferred-items.md)
-6. 已收口的计划 4：[`docs/plans/2026-09-22-m1p4-local-exec.md`](./2026-09-22-m1p4-local-exec.md)
+3. [`docs/audits/2026-09-23-m1-final-audit.md`](../audits/2026-09-23-m1-final-audit.md)
+4. [`docs/design/2026-09-03-architecture.md`](../design/2026-09-03-architecture.md) spec §15 / §4.6–4.8 / §17
+5. [`docs/decisions/2026-09-08-m1-scope.md`](../decisions/2026-09-08-m1-scope.md)
+6. [`docs/decisions/2026-09-14-deferred-items.md`](../decisions/2026-09-14-deferred-items.md)
 
 ---
 
@@ -28,20 +28,31 @@
 | git | 本项目此前默认**改完即 commit、不 push**，除非用户再说「推」 |
 | 提交时 | `git -c trace2.eventtarget= -c trace2.eventnesting= commit`（本机 git 会被 trace2 塞 Co-authored-by: Cursor） |
 
-**本文对照的基线是计划 5 Task 8 收口提交。** 动手前以 `git log -5 --oneline` 与
+**本文对照的基线是里程碑 1 最终审计提交。** 动手前以 `git log -5 --oneline` 与
 `git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
 
 ```
 $ git status -sb
-## main...origin/main [ahead 44]
+## main...origin/main [ahead 64]
 （工作区干净，无未提交改动）
 ```
 
-`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 最新计划 4 提交如下，更早的计划 3 记录继续保留在表中：
+`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 最新提交如下：
 
 | sha | 内容 |
 |---|---|
-| 本文同一提交 | **计划 5 Task 8**：公开面、真实 Runtime E2E、登记与交接收口 |
+| 本文同一提交 | **M1 最终审计**：六个挂单关闭、全量门禁、审计与交接 |
+| `26f8a3c` | **M1 审计 D-59**：尾部未配对批次扫描收敛为一个纯函数 |
+| `9604831` | **计划 6 Task 8**：L2 E2E、README、D-38 与计划收口 |
+| `b9a652f` | **计划 6 Task 7**：Runtime host、chat 与人机事件泵 |
+| `33f464e` | **计划 6 Task 6**：CLI 路由与惰性版本命令 |
+| `07e2a4d` | **计划 6 Task 5**：L2 ScenarioRunner |
+| `ff36133` | **计划 6 Task 4**：人工确认工具独占执行区间 |
+| `47a576c` | **计划 6 Task 3**：AskUser / AskUserQuestion |
+| `1397fa3` | **计划 6 Task 2**：安全 YAML 配置 |
+| `d4d04bc` | **计划 6 Task 1**：有序 EventBus |
+| `d60527e` | **计划 6 文件**：CLI、人机交互与 L2 场景回放 |
+| `83635d4` | **计划 5 Task 8**：公开面、真实 Runtime E2E、登记与交接收口 |
 | `4079d37` | **计划 5 Task 7**：PrefixDriftModule 与 provider 精确前缀单位 |
 | `608cf7f` | **计划 5 Task 6**：RetryModule |
 | `6533439` | **计划 5 Task 5**：SafetyModule 与两个安全 Flag |
@@ -94,8 +105,8 @@ $ git status -sb
 
 更早的计划 2 Task 1–15 已在 `origin/main` 一侧。
 
-计划 1–6 的代码均已收口；当前工作区若有改动，只应是里程碑 1 最终审计。`assemble` 不是
-`start()`，后续也不要加 `Runtime.start`。
+计划 1–6 与 M1 最终审计均已收口。`assemble` 不是 `start()`，后续也不要加
+`Runtime.start`。
 
 ---
 
@@ -128,7 +139,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | Tool 系统与 LLM 抽象 | **内核抽象已做** | Tool / ToolExecutor / DangerJudge / ScriptedLLM；OpenAI 兼容 provider 在计划 4 |
 | 最小本地执行（读写文件 + 跑命令） | **已做** | 计划 4：八个本地工具、真实拓扑集成测试、OpenAI 兼容 provider |
 
-**结论：计划 1–6 已收口。** CLI / 人工确认 / L2 场景层已经完成，里程碑 1 只剩最终收口审计。
+**结论：里程碑 1 已收口。** 计划 1–6、CLI / 人工确认 / L2 场景层与最终审计均已完成。
 
 子计划边界（不要重新解释）：
 
@@ -140,7 +151,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | **代码收口**；Task 1–9 全部完成 |
 | **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | **代码收口** [`2026-09-22-m1p5-runtime-modules.md`](./2026-09-22-m1p5-runtime-modules.md)；Task 1–8 全部完成 |
 | **6** | CLI + L2 场景回放 + AskUser | **代码收口** [`2026-09-23-m1p6-cli-human-e2e.md`](./2026-09-23-m1p6-cli-human-e2e.md) |
-| **M1 收口审计** | spec §15 取证 + 遗留项清空 + **那时再 push** | 未做 |
+| **M1 收口审计** | spec §15 取证 + 遗留项清空 + 全量门禁 | **已完成**；见 `docs/audits/2026-09-23-m1-final-audit.md` |
 
 ---
 
@@ -189,7 +200,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | **F-6** | `LLM.create` 必须兑现 `config.timeout` | **只补了契约正文**；可执行用例归计划 4（D-56） |
 | **F-8** | `update` 写入侧快照 | **只登记** D-57，归计划 4 |
 | **F-9** | 没有 `runtime_start` | **只登记** D-58；**禁止加 `async def start()`** |
-| **F-10** | 未配对批次扫描重复 | **只登记** D-59，归 M1 收口审计抽纯函数 |
+| **F-10** | 未配对批次扫描重复 | M1 最终审计：`26f8a3c` 抽为 `context._trailing_unpaired_batch`，结构守卫与连续尾块用例覆盖 |
 
 D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；被等 Agent 卡在 `LLM.create` → 计划 4 / D-56。
 
@@ -496,7 +507,7 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 | 8 | 依赖门禁缺口、注释、公开面、关台账 | 已落地 `ade688f` |
 | 9 | publish 与 remove_queue 的回执窗口 | 已落地（本文同一提交） |
 
-计划 4–6 所属遗留项已经全部转入登记表「已关闭」，下一步执行里程碑 1 最终审计。
+计划 4–6 所属遗留项与 M1 最终审计挂单均已转入登记表「已关闭」。
 
 ### 4.3 计划 5（已收口）
 
@@ -518,21 +529,22 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 
 挂单 D-38 已关闭：获批调用的 `execute + POST_TOOL_USE` 使用 writer-priority 执行门独占。
 
-### 4.5 里程碑 1 收口审计（计划 6 之后）
+### 4.5 里程碑 1 收口审计（已完成）
 
-spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或按当时用户指示）。
-
-挂单：D-51、D-27、D-58、D-59、V-01、V-02。D-52、D-49、D-08 已关。
+审计记录：[`docs/audits/2026-09-23-m1-final-audit.md`](../audits/2026-09-23-m1-final-audit.md)。
+spec §15 已逐条取证；D-51、D-27、D-58、D-59、V-01、V-02 已关闭；全量
+`2245 passed`，Ruff、格式、Pyright、依赖守卫与 L2 场景均通过。按用户要求仍未 push。
 
 ### 4.6 明确不在里程碑 1
 
 登记表「BEYOND-M1」整节：B-01 租约/孤儿回收、B-02 `wait_until_parked`、B-15 溯源链、D-40 只读视图嵌套、D-46 树深度、预算树属里程碑 8，等等。不要在计划 3–6 里顺手做。
 
-里程碑 2 起（自举、可观测性、PTY、压缩、产物、RL、HTTP/React、MCP/ACP/A2A）见 spec §15。**M1 没完之前不要开。**
+里程碑 2 起（自举、可观测性、PTY、压缩、产物、RL、HTTP/React、MCP/ACP/A2A）见 spec §15。
+开始前另写并评审一份自包含计划，不把 `BEYOND-M1` 整节当成一次性任务。
 
 ---
 
-## 5. 登记表归属速查（里程碑 1 内仍 OPEN 的）
+## 5. 登记表归属速查
 
 原文永远以 [`deferred-items.md`](../decisions/2026-09-14-deferred-items.md) 为准。这里只帮下一任定向，不要当权威。
 
@@ -542,7 +554,7 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 | **计划 4** | 无。Task 1–9 与所属登记项均已关闭 |
 | **计划 5** | 无。Task 1–8 与所属登记项均已关闭 |
 | **计划 6** | 无。D-38 已关闭 |
-| **M1 收口审计** | D-51、D-27、D-58、D-59、V-01、V-02 |
+| **M1 收口审计** | 无。D-51、D-27、D-58、D-59、V-01、V-02 已关闭 |
 | **已关、不要重开** | D-01…D-08、D-24–D-26、D-28、D-30–D-33、D-35、D-39、D-41、D-44、D-45、D-48、D-49、D-52、D-54、D-60 等（见登记表「已关闭」） |
 
 ---
@@ -558,9 +570,9 @@ git log -3 --oneline
 
 然后：
 
-1. 审计 D-51、D-27、D-58、D-59、V-01、V-02，并逐项留下可执行证据。
-2. 按 spec §15 逐字核对里程碑 1 判据。
-3. 跑全量 pytest、Ruff、Pyright、依赖守卫与两条 L2 场景。**仍不要 push**。
+1. 先读 M1 最终审计记录，不重做计划 1–6。
+2. 用户要继续时，为 spec §15 的里程碑 2（自举）单独写计划并等待 review。
+3. 未收到明确指令前仍不要 push。
 
 ---
 
@@ -640,7 +652,7 @@ git log -3 --oneline
 | 计划 3（已收口，不要重做） | `docs/plans/2026-09-21-m1p3-declarative-agents.md` |
 | 计划 4（已收口） | `docs/plans/2026-09-22-m1p4-local-exec.md` |
 | 本地工具 | `src/syndica/kernel/tools/local.py`；`tests/kernel/test_local_tools_*.py` |
-| **下一步** | 执行里程碑 1 最终审计 |
+| **下一步** | 为里程碑 2（自举）单独写计划 |
 | 范围裁决 | `docs/decisions/2026-09-08-m1-scope.md` |
 | 硬约束 / 变异纪律 | `AGENTS.md` |
 

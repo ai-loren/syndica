@@ -454,7 +454,7 @@ class HookResult:
 
 | 组 | 切点 | 可拦截 |
 | --- | --- | --- |
-| Runtime 生命周期 | `runtime_start` `runtime_shutdown` `agent_spawn` `agent_despawn` | — |
+| Runtime 生命周期 | `runtime_shutdown` `agent_spawn` `agent_despawn` | — |
 | Agent 生命周期 | `agent_start` `agent_end` `agent_error` | — |
 | Turn | `turn_start` `turn_end` | — |
 | 工具 | `pre_tool_use` `post_tool_use` | 是 |
@@ -462,6 +462,10 @@ class HookResult:
 | LLM | `pre_llm_request` `post_llm_response` `context_overflow` `llm_failure` | 是 |
 | 消息 | `message_injected` | — |
 | 背景工具 | `background_tool_completed` `tool_moved_to_background` | — |
+
+`runtime_start` 不进入内核切点：`Runtime.__init__` 是同步构造，当前没有可等待 hook 的启动阶段。
+为它增加 `Runtime.start()` 会让每个宿主多一个必须正确调用的新生命周期入口。需要异步初始化的能力
+应在宿主完成后再构造 Runtime，或由后续明确引入异步生命周期的里程碑统一设计。
 
 **扩展方式：固定核心枚举 + 命名空间字符串。** 内核切点是枚举（类型安全、可发现、IDE 可补全）；第三方能力注册带命名空间的切点（如 `artifact:created`），无需修改内核也无需等发版。
 

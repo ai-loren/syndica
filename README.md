@@ -73,6 +73,22 @@ cost, token, and wall-clock budgets are accepted by the parser but fail explicit
 budget engine is implemented. `chat` keeps sessions only inside its current process. Cross-process
 `--session` recovery and `sessions ...` require the later `SessionStore` milestone.
 
+## Logging
+
+Syndica is a library and does not install handlers or change application logging policy. Hosts
+must keep both the `syndica` logger and its handlers at `WARNING` or lower. Raising either
+threshold to `ERROR` drops the only record for a low-risk call that was allowed despite
+untrusted provenance.
+
+Do not randomly sample or broadly deduplicate `syndica.kernel.runtime` errors or the
+untrusted-provenance warning from `syndica.kernel.tool_executor`: each can be the only evidence
+of one discarded input, broker failure, or safety-relevant allow decision. The repeat-prone
+`syndica.kernel.hooks.center` discarded-return error may be rate-limited by the exact
+`(junction, callback, discarded value)` tuple over a bounded window, provided the first record
+and a periodic suppressed-count summary are retained. Prefer sink-side rate limits and alerts
+over raising logger thresholds; sustained repeats mean the hook is registered on the wrong
+junction and should be fixed.
+
 ## License
 
 MIT

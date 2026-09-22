@@ -68,22 +68,12 @@
 | D-56 | provider 未兑现 `LLMConfig.timeout` | 计划 4 Task 6：HTTPX 分段 timeout 与 provider 总墙钟同时生效，持续响应也不能越过总上限 |
 | D-57 | `AgentRegistry.update` 写入活引用 | 计划 4 Task 7：Protocol 明确深拷，契约覆盖嵌套快照和拷贝失败零部分写入 |
 | D-38 | 获批的 `CONFIRM` 工具可能与同批兄弟并发执行 | 计划 6 Task 4：writer-priority `_ExecutionGate` 让获批调用独占 `Tool.execute + POST_TOOL_USE`，确认前的 PRE / observer 仍可并发；取消会释放独占权。确定性并发回归覆盖前后兄弟、POST hook 与 writer cancellation，9 条真实变异和独立审查通过 |
-
-## 待审计核实（认为已被后续改动关闭）
-
-| # | 内容 | 认为关闭它的改动 |
-|---|---|---|
-| V-01 | `ERROR_CLASSES` 是手工维护列表，跨模块子类（`llm.ContextOverflowError`）覆盖不到 | 计划 1 Task 10 改为从文件树独立推导期望值、动态收集 `SyndicaError` 子类 |
-| V-02 | 接管 CAS 在 `parked` 状态下不是有效的所有权守卫 | 计划 2 Task 4 的 `ensure_active`；Task 7 进一步改为**用注册表状态作所有权凭证** |
-
-### 归里程碑 1 收口审计
-
-| # | 内容 |
-|---|---|
-| D-51 | **装过编排工具的 Agent 与没装过的，对「宿主手里那张原工具表」不对称。** C-1 的修法（Task 15 修复轮）让 `install_runtime_tools` 换上 Agent 自己的一份，于是 `orchestration=True` 的 Agent 此后不再共享工厂交进来的那张 dict，而 `orchestration=False` 的仍然共享。**不对称是修法的直接后果而不是疏漏**——共享它正是那条 Critical 本身（工厂复用同一张表时，第一次装配就把它变成「属于第一个 Agent」）；热插拔的入口仍在（改 `agent.options.tools`，executor 与它同对象，有用例钉住）。登记在这里是因为它是**公开字段上可观察的行为差异**：一个宿主如果按「我交进去的那张表就是它的活表」写代码，开不开 `orchestration` 会得到两种结果 | 发布前确认一次：要么把「收下之后内核可能换成自己的一份」写进 `AgentOptions.tools` 的公开契约（现在只写在 `install_runtime_tools` 上），要么让两条路一致（无条件在 `BaseAgent.__init__` 里取自己的一份——但那会打掉「工厂在构造之后往这张表里挂绑 `agent_id` 的工具」这个本仓自己在用的写法，见 `_AgentTool` 的 docstring） |
-| D-27 | **三条「唯一证据型」ERROR**（`_report_abandoned_input` / `_report_unwaited_timeout` / `_report_discarded_take_failure`）都断 `record.args`，但共同依赖「root logger 默认 WARNING」这个前提；宿主把级别调高则三条一起静默。这是既有模式，发布前确认一次。**计划 2 Task 11 又加了一条同族记录且更靠近那条线**：`tool_executor._report_allowed_low_risk_from_untrusted` 是 WARNING 而非 ERROR（它报的是一次放行，不是故障），于是宿主只要把级别提到 ERROR，spec §12.2 矩阵里那格唯一的痕迹就没了。发布前一并定这四条的级别与宿主配置指引。**计划 2 Task 13 又加了第五条 `hooks.center._report_discarded_return`，它是这一族里唯一「每次触发都可能重复」的**：前四条各自对应一次一过的丢失，而它按「切点 × 回调」计数，一个挂错层的观察者会在每一次触发上各产出一条。已量：单条 ERROR 332 字符；20 个观察者 × 3 次 trigger = 60 条 ≈ 19.5 KiB；`turn_start` 每轮触发一次，一个 500 轮长跑上 1 个挂错的观察者 ≈ 500 条 ≈ 162 KiB、20 个 ≈ 10 000 条 ≈ 3.2 MiB。**不改级别**（降级就等于把 D-07 那半重新静默掉，而它是这次丢弃的全部痕迹），发布前定的是宿主侧的去重 / 采样指引 |
-| D-58 | **spec §5.4 切点表第一行列了 `runtime_start`，实现里没有。** `Runtime` 没有任何异步启动入口（`__init__` 是同步的），没有可以 await hook 的位置。这是一次自觉的收窄：第三方能力没地方做「Runtime 起来时初始化一次」。不要加 `async def start()`——那会给每个宿主加一步必须调的初始化，且动公开面 |
-| D-59 | **「末尾未配对批次」的扫描逻辑在 `runtime._forkable_prefix` 与 `agent._unpaired_calls` 里逐字重复。** 今天行为一致，但它们守的是同一条承重不变式。收口审计时抽成纯函数，避免两处悄悄分叉 |
+| D-51 | 装过 Runtime 工具后，宿主原工具表不再是 Agent 的活表 | `AgentOptions.tools` 的公开 docstring 已明确“内核可能换上自己的副本，热插拔改 `agent.options.tools`”；三条用例分别钉住宿主表不被改、复用工厂按 Agent 隔离、换表后 executor 仍共享同一活表 |
+| D-27 | 唯一证据型日志的阈值、去重与采样策略未定 | 保留现有 WARNING / ERROR；README `Logging` 要求 `syndica` logger 与 handler 阈值不高于 WARNING，禁止随机采样一过性证据，只允许对 discarded-return 按精确键限流并保留首条与抑制计数；五条目标用例逐条验证级别与 `record.args` |
+| D-58 | spec 列出 `runtime_start`，实现没有异步启动入口 | spec §5.4 已删除该切点并记录收窄理由；`test_assemble_does_not_add_runtime_start_or_a_start_method` 与 Runtime 公开面守卫禁止偷偷加入 `Runtime.start` / `Junction.RUNTIME_START` |
+| D-59 | `runtime._forkable_prefix` 与 `agent._unpaired_calls` 重复扫描尾部未配对批次 | `26f8a3c`：扫描收敛为 `context._trailing_unpaired_batch`；AST 守卫要求唯一实现与两处消费者接线，并证明扫描范围；恢复用例覆盖两个连续已配对 tool block。六个真实变异全部被杀死，修复后独立复审 APPROVE |
+| V-01 | 手工异常清单漏掉跨模块 `SyndicaError` 子类 | `test_errors.py` 从文件树独立证明全部 kernel 模块已导入，动态发现含嵌套类的全部子类，并逐字断言清单；三种往返对每个类执行。审计命令 20 passed |
+| V-02 | `parked` 状态下的接管 CAS 不是有效所有权守卫 | `ensure_active` 先以本进程活驱动为凭据，再只从 ZOMBIE CAS 激活；测试覆盖 parked、RUNNING / PAUSED / WAITING、ABORTING、外进程持有、shutdown 与未知 Agent。审计命令 7 passed |
 
 ## 明确不在里程碑 1（BEYOND-M1）
 
