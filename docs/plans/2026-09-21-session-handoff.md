@@ -2,7 +2,7 @@
 
 写于 2026-09-21。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
-**一句话现状：** 计划 1、计划 2（含横切审计与 Task 16 评审残留）的**代码已收口并 commit**；计划 3 **计划已写，Task 1–4 已落地并 commit（`97c9edc` / `551b4d2` / `7071eda` / `73289a2`），Task 5–8 未做**；计划 4–6 未写未做。本地 `main` 比 `origin/main` 超前 22 个 commit，**未 push**。下一刀是计划 3 Task 5（`AgentSlot` / `Topology` 校验）。
+**一句话现状：** 计划 1、计划 2（含横切审计与 Task 16 评审残留）的**代码已收口并 commit**；计划 3 **计划已写，Task 1–5 已落地并 commit（`97c9edc` / `551b4d2` / `7071eda` / `73289a2` / `cb81e02`），Task 6–8 未做**；计划 4–6 未写未做。本地 `main` 比 `origin/main` 超前 24 个 commit，**未 push**。下一刀是计划 3 Task 6（`Runtime.assemble` / `resolve` / `occupy` / `send_to_slot`）。
 
 **先读顺序**
 
@@ -27,18 +27,20 @@
 | git | 本项目此前默认**改完即 commit、不 push**，除非用户再说「推」 |
 | 提交时 | `git -c trace2.eventtarget= -c trace2.eventnesting= commit`（本机 git 会被 trace2 塞 Co-authored-by: Cursor） |
 
-**本文对照的基线 HEAD：`73289a2`。** 提交本文之后 `HEAD` 会再前进一步；动手前以 `git log -3 --oneline` 与 `git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
+**本文对照的基线 HEAD：`cb81e02`。** 提交本文之后 `HEAD` 会再前进一步；动手前以 `git log -3 --oneline` 与 `git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
 
 ```
 $ git status -sb
-## main...origin/main [ahead 22]
-（工作区干净，无未提交改动——本文 commit 之后会变成 ahead 23）
+## main...origin/main [ahead 24]
+（工作区干净，无未提交改动——本文 commit 之后会变成 ahead 25）
 ```
 
-`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 从新到旧（相对 origin/main 的 22 个）：
+`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 从新到旧（相对 origin/main 的 24 个）：
 
 | sha | 内容 |
 |---|---|
+| `cb81e02` | **计划 3 Task 5**：`AgentSlot` / `Topology` 校验；还不接 Runtime。没有 `extra_plugins` |
+| `505efff` | 上一版交接（当时下一刀还是 Task 5；本文取代它） |
 | `73289a2` | **计划 3 Task 4**：`HostFacts` + freeze 时插值 + `AgentFactory`；`{cwd}` 即使宿主知道工作目录也拒绝 |
 | `8cd418e` | 上一版交接（当时下一刀还是 Task 4；本文取代它） |
 | `7071eda` | **计划 3 Task 3**：`AgentCatalog` 加载 / 覆盖可查询；同目录撞名整批拒绝；`get()` 也查不到未提交的名字 |
@@ -64,7 +66,7 @@ $ git status -sb
 
 更早的计划 2 Task 1–15 已在 `origin/main` 一侧。
 
-**本轮停笔时工作区干净。** 不要重做 Task 1 / Task 2 / Task 3 / Task 4。下一刀是 Task 5：新建 `topology.py` / `test_topology.py`，还不接 Runtime。
+**本轮停笔时工作区干净。** 不要重做 Task 1 / Task 2 / Task 3 / Task 4 / Task 5。下一刀是 Task 6：`Runtime.assemble` / `resolve` / `occupy` / `send_to_slot`。`assemble` 不是 `start()`。
 
 ---
 
@@ -93,11 +95,11 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | 各自跑通 LLM + 工具循环 | **已做（内核侧）** | 计划 1 turn 循环 + ScriptedLLM；真 LLM 在计划 4 |
 | 可终止与恢复 | **已做** | `kill` / `despawn` / `pause` / `resume` / `abort`；ZOMBIE 可寻址 |
 | 声明式 Agent 定义（§4.6） | **清单解析 + 工具目录 + 加载/覆盖 + freeze 已做；四个内置未做** | 计划 3 Task 1–4 已 commit；还差 Task 7–8 |
-| 拓扑装配（§4.7） | **计划已写，代码未做** | 计划 3 Task 5–6、8 |
+| 拓扑装配（§4.7） | **槽校验已做；assemble / resolve / occupy 未做** | 计划 3 Task 5 = `cb81e02`；还差 Task 6、8 |
 | Tool 系统与 LLM 抽象 | **内核抽象已做** | Tool / ToolExecutor / DangerJudge / ScriptedLLM；OpenAI 兼容 provider 在计划 4 |
 | 最小本地执行（读写文件 + 跑命令） | **未做** | 计划 4（`Read`/`Write`/`Edit`/`Glob`/`Grep`/`Bash`…） |
 
-**结论：计划 2 + 横切审计 ≈ 内核控制面做完；计划 3 Task 1–4 把清单解析、工具目录、AgentCatalog 加载/覆盖、freeze/插值钉住了。里程碑 1 本身没完。** 还缺拓扑 / 四个内置、本地执行。
+**结论：计划 2 + 横切审计 ≈ 内核控制面做完；计划 3 Task 1–5 把清单解析、工具目录、AgentCatalog 加载/覆盖、freeze/插值、拓扑槽校验钉住了。里程碑 1 本身没完。** 还缺 assemble、四个内置、本地执行。
 
 子计划边界（不要重新解释）：
 
@@ -105,7 +107,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 |---|---|---|
 | **1** | 单 Agent turn 循环 | **代码收口**，已在更早的历史上 |
 | **2** | 事件循环、生命周期、等待、危险判定、工具并发、插件、编排工具、公开面 | **代码收口**（含审计修复 + Task 16 残留） |
-| **3** | 声明式清单、目录、拓扑、四个内置角色 | **计划已写** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；**4/8 已执行**（Task 1 = `97c9edc`，Task 2 = `551b4d2`，Task 3 = `7071eda`，Task 4 = `73289a2`） |
+| **3** | 声明式清单、目录、拓扑、四个内置角色 | **计划已写** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；**5/8 已执行**（Task 1 = `97c9edc`，Task 2 = `551b4d2`，Task 3 = `7071eda`，Task 4 = `73289a2`，Task 5 = `cb81e02`） |
 | **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | 未写未做 |
 | **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | 未写未做 |
 | **6** | CLI + L2 场景回放 + AskUser | 未写未做 |
@@ -289,6 +291,29 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 9. **`budget` 缺省 → `max_turns=50`；`turns: null` → `None`。** 缺省那条必须显式断言 `== 50`：`_max_turns` 若在 `budget is None` 时返回 `None`，会覆盖 dataclass 缺省，旧用例全绿。
 10. **`_interpolate_prompt` 不进 `catalog.__all__`。** `HostFacts` 进 catalog `__all__` 且进 `_WITHHELD`。
 
+### 3.10 计划 3 Task 5 —— 已落地，commit `cb81e02`
+
+**不要重做。** 门禁：`uv run pytest -W error tests/kernel/test_topology.py tests/kernel/test_public_api.py -q` → **63 passed**；ruff / pyright 0 errors；`scripts/check_deps.py` 空。自我变异 35/35 已杀死（跑手 `/tmp/syndica-t5-mutate.py`，不入库）。独立评审 CHANGES_REQUESTED（`exit_mode='ZOMBIE'`、整浮点 `turns=40.0`、可变 metadata 能活），补断言后再杀 7 条（跑手 `/tmp/syndica-t5-mutate2.py`）。
+
+| 文件 | 角色 |
+|---|---|
+| `src/syndica/kernel/topology.py` | `AgentSlot`、`Topology.validate` |
+| `tests/kernel/test_topology.py` | 字段顺序、禁则、目录缺失名一次列全 |
+| `tests/kernel/test_public_api.py` `_WITHHELD` | 扣留 `AgentSlot`、`Topology` |
+| `src/syndica/kernel/__init__.py` | **没动**（等 Task 8） |
+| `src/syndica/kernel/runtime.py` | **没动**（assemble 是 Task 6） |
+
+执行时拍板、下一任不要改回去的细节：
+
+1. **没有 `extra_plugins`，也没有自由 `options`。** 字段顺序：`name`, `agent`, `is_root`, `cardinality`, `key_field`, `boot`, `exit_mode`, `extra_tools`, `budget`, `metadata`。插件仍只在 `Runtime(plugins=)`。
+2. **`keyed` 必须有非空白 `key_field`；singleton / on-demand 的 `key_field` 必须是 `None`。** 空字符串也不是 None。`keyed+eager` 与 `on-demand+eager` 各自能单独变红；singleton+eager 合法。
+3. **`exit_mode` 必须是 `ExitMode` 成员。** 字符串 `'zombie'` 和成员名 `'ZOMBIE'` 都拒。`IDLE` / `EXIT` 枚举值合法。
+4. **槽名唯一，一次列出每个重名和次数（`Alpha×2`）。** root 至多一个；三个 root 的名字都要出现在 received。零个 root、空拓扑合法。两个槽可以引用同一个角色名。
+5. **未知角色名不在构造时查。** `Topology.validate(catalog)` 一次列出全部缺失名，同一名字只出现一次；已在目录里的名字不进「缺少」那一半。`catalog` 必须是 `AgentCatalog`，鸭子类型即使有 `names()` / `get()` 也拒。
+6. **`metadata` 深拷进 `MappingProxyType`，拒绝键 `artifact_kinds`。** 浅拷贝、返回普通 dict、非 str 键只报第一个，都要能变红。`budget` 与清单同一约束：只有 `turns`；`0` 合法；`40.0` 与 bool 非法；结果也是 `MappingProxyType`。
+7. **`extra_tools` / `slots` 先拒 str（否则拆成字符），再收成 tuple。** 重复工具名保留，不去重。
+8. **本任务没有 `assemble` / `start`。** `validate` 成功时返回 `None`。
+
 ---
 
 ## 4. 还没做完的（按动手顺序）
@@ -304,7 +329,7 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 | M-7 | spec `AgentInfo.type` 实现叫 `agent_type`（避开内置名） | 登记即可，不要改回去 |
 | M-8 | `WaitState.ABORTED` 自己的 docstring 仍只写「协作式中止落在等待上」 | 补枚举 docstring，把 D-26 契约写到宿主会读的那一行 |
 
-### 4.1 下一步：执行计划 3 Task 5–8（8 个任务，4 完成）
+### 4.1 下一步：执行计划 3 Task 6–8（8 个任务，5 完成）
 
 **已关：** D-49、D-08。**不要动：** D-58（禁止 `Runtime.start` / `Junction.RUNTIME_START`）。
 
@@ -332,8 +357,8 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 | **2** | `validate_tool_names` 认 Mapping + 名字列表→工具表 | 改 `tool.py`、`test_tool.py`；`catalog.py` 的 `resolve_tool_names` / `register_tool` | **D-49、D-08** | **已 commit `551b4d2`** |
 | **3** | `AgentCatalog`：加载、覆盖可查询、`get(name)` | **改**已有 `catalog.py`、`test_catalog.py`（不要当空白重写） | — | **已 commit `7071eda`** |
 | **4** | 插值 + `freeze` 成 `AgentFactory` | **改**已有 `catalog.py`、`test_catalog.py`；新建 `test_prompt_interpolation.py` | — | **已 commit `73289a2`** |
-| **5** | `AgentSlot` / `Topology` 校验（还不接 Runtime） | `topology.py`、`test_topology.py` | — | **下一刀** |
-| **6** | `Runtime.assemble` / `resolve` / `occupy` / `send_to_slot` | `runtime.py`、`test_assemble.py`、`_RUNTIME_SURFACE` 加名字 | — | 未做 |
+| **5** | `AgentSlot` / `Topology` 校验（还不接 Runtime） | `topology.py`、`test_topology.py` | — | **已 commit `cb81e02`** |
+| **6** | `Runtime.assemble` / `resolve` / `occupy` / `send_to_slot` | `runtime.py`、`test_assemble.py`、`_RUNTIME_SURFACE` 加名字 | — | **下一刀** |
 | **7** | 四个内置角色 | `src/syndica/kernel/agents/{orchestrator.py,planner.json,explorer.json,worker.json,__init__.py}`、`test_builtin_agents.py` | — | 未做 |
 | **8** | 公开面收口 + 端到端一条拓扑 | `kernel/__init__.py`、`test_public_api.py`、`tests/integration/test_topology_lifecycle.py` | 把 Task 1 扣留的名字挪进承诺面 | 未做 |
 
@@ -389,7 +414,7 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 
 | 归属 | 条目 |
 |---|---|
-| **计划 3（还没关的）** | 无（D-49、D-08 已关）。剩下的是 Task 5–8 的功能，不是登记表 OPEN 项 |
+| **计划 3（还没关的）** | 无（D-49、D-08 已关）。剩下的是 Task 6–8 的功能，不是登记表 OPEN 项 |
 | **计划 4** | D-09、D-50、D-34、D-36、D-37、D-10–D-17、D-53、D-56、D-57 |
 | **计划 5** | D-18、D-47（墙钟）、D-19–D-23、D-29、D-55 |
 | **计划 6** | D-38 |
@@ -403,21 +428,22 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 在 `/Users/bytedance/Documents/syndica`：
 
 ```bash
-git status -sb          # 应是 main...origin/main [ahead 23]（本文 commit 之后），工作区干净
-git log -3 --oneline    # 第一条应是本文；第二条 `73289a2` Task 4
+git status -sb          # 应是 main...origin/main [ahead 25]（本文 commit 之后），工作区干净
+git log -3 --oneline    # 第一条应是本文；第二条 `cb81e02` Task 5
 ```
 
 然后：
 
-1. 打开 [`docs/plans/2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)，从 **Task 5** 开始。不要重做 Task 1–4，不要先写计划 4，不要加 `Runtime.start`。
-2. Task 5 必写用例名已经列在计划里。新建 `src/syndica/kernel/topology.py` 与 `tests/kernel/test_topology.py`。新模块必须有字面量 `__all__`，名字进 `_WITHHELD`（至少 `AgentSlot`、`Topology`），`kernel.__all__` 仍然先不要动。
+1. 打开 [`docs/plans/2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)，从 **Task 6** 开始。不要重做 Task 1–5，不要先写计划 4，不要加 `Runtime.start`。
+2. Task 6 必写用例名已经列在计划里。改 `src/syndica/kernel/runtime.py`，新建 `tests/kernel/test_assemble.py`。`assemble` / `resolve` / `occupy` / `send_to_slot` 进 `_RUNTIME_SURFACE`。`AgentSlot` / `Topology` 仍先留在 `_WITHHELD`，等 Task 8。
 3. 每个任务走完变异 + 独立评审再 commit。**仍不要 push**，直到 M1 收口审计通过，或用户明确说推。
 
-Task 5 压缩版（细节以计划 Task 5 节为准）：
+Task 6 压缩版（细节以计划 Task 6 节为准）：
 
-- `AgentSlot` **不要** `extra_plugins`。增强面只留 `extra_tools` / `budget` / `metadata`。
-- 拓扑只增强、不替换。`keyed+eager` 与 `on-demand+eager` 禁止。
-- 本任务还不接 `Runtime.assemble`（那是 Task 6）。
+- `assemble` 不是生命周期 `start`。没 assemble 的 Runtime 与今天一样。第二次 assemble → `ContractViolation`。
+- 只 spawn `boot='eager'` 的 singleton。keyed / on-demand 的 eager 已在 Task 5 拒绝。
+- `extra_tools` 只并上，不替换清单里已有的名字。`metadata` 深拷进 `spawn(metadata=)`；与 `artifact_kinds` 合并时键冲突 ConfigError（槽上已禁止这个键）。
+- `find` 仍然绝不激活。
 - 本机 bash **没有** `declare -A`，变异跑手用 Python。先清 `__pycache__`，sha256 还原（不要 `git checkout`）。新文件先 `git add` 再取基线。
 
 ---
@@ -447,6 +473,11 @@ Task 5 压缩版（细节以计划 Task 5 节为准）：
 - **无 `budget` 必须断言 `max_turns == 50`。** `_max_turns` 返回 `None` 会覆盖 dataclass 缺省。
 - **缺模型 / 缺 subagents 至少 3 个独立缺失名。** 「最多报两个」会绿。
 - **host 鸭子类型用 `SimpleNamespace(os, platform, shell, cwd)`，不要只传 `'darwin'`。**
+- **`exit_mode='ZOMBIE'` 不是 `ExitMode.ZOMBIE`。** 只拒小写 `'zombie'` 时，`ExitMode[value]` 旁路能活。
+- **`budget.turns=40.0` 不是 40。** bool 被拒之后，整浮点仍可能被 `int()` 收成合法轮次。`turns=0` 合法，不要写成 `<= 0` 就拒。
+- **`metadata` / `budget` 必须是 `MappingProxyType`。** 只断言深拷贝挡不住「返回普通 dict」。
+- **cardinality / boot 大小写敏感。** `casefold()` 之后 `'Keyed'` 会过。
+- **`validate` 成功返回 `None`。** 末尾 `return True` 时，只调用、不断言返回值的用例全绿。
 
 ---
 
@@ -462,6 +493,7 @@ Task 5 压缩版（细节以计划 Task 5 节为准）：
 | 工具目录（Task 2 已做） | `src/syndica/kernel/catalog.py` `register_tool` / `resolve_tool_names`；`tool.py` `validate_tool_names` |
 | Agent 目录（Task 3 已做） | `src/syndica/kernel/catalog.py` `AgentCatalog` / `OverrideRecord` |
 | freeze / 插值（Task 4 已做） | `src/syndica/kernel/catalog.py` `HostFacts` / `freeze` / `_interpolate_prompt` |
+| 拓扑槽（Task 5 已做） | `src/syndica/kernel/topology.py` `AgentSlot` / `Topology.validate` |
 | 公开面守卫 / `__init__` 签名 | `tests/kernel/test_public_api.py` |
 | 装门（仅内核） | `BaseAgent._attach_gate`；测试走 `_agent(..., gate=)` |
 | 多 Agent 取证 | `tests/integration/test_multi_agent_lifecycle.py` |
@@ -473,9 +505,8 @@ Task 5 压缩版（细节以计划 Task 5 节为准）：
 
 计划 3 执行时会新建、今天**还不存在**的文件：
 
-- `src/syndica/kernel/topology.py`
 - `src/syndica/kernel/agents/`（`orchestrator.py` + 三份 JSON）
-- `tests/kernel/test_topology.py` / `test_assemble.py` / `test_builtin_agents.py`
+- `tests/kernel/test_assemble.py` / `test_builtin_agents.py`
 - `tests/integration/test_topology_lifecycle.py`
 
 已经存在、不要当空白重写：
@@ -485,3 +516,5 @@ Task 5 压缩版（细节以计划 Task 5 节为准）：
 - `src/syndica/kernel/catalog.py`
 - `tests/kernel/test_catalog.py`
 - `tests/kernel/test_prompt_interpolation.py`
+- `src/syndica/kernel/topology.py`
+- `tests/kernel/test_topology.py`
