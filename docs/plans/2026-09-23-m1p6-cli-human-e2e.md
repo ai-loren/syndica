@@ -245,7 +245,7 @@ expect:
 
 ### Task 5 — L2 场景 schema 与 runner
 
-**状态：in_progress**
+**状态：completed**（23 条 Runner 测试；10 条真实变异；两轮审查修复 5 项后最终 APPROVE）
 
 **Files:** `src/syndica/runner/scenario.py`、`src/syndica/runner/yaml.py`、
 `tests/runner/`、YAML fixtures
@@ -361,6 +361,14 @@ expect:
   复制最终参数与 ToolCall，批准后再从不可变 JSON 快照重建执行参数。
 - Task 4：writer-priority 执行门在 writer 等待期间被取消时必须 `notify_all`；否则已经在等的
   reader 没有后续状态变化可唤醒，会永久停住。
+- Task 5：`expect` 字段缺省表示不检查，但显式 `{}` / `[]` 必须断言结果为空；只看 truthiness
+  会让一份写明“什么都不应发生”的黄金文件假绿。
+- Task 5：场景目录包含被用户角色覆盖后的全部内置角色；冻结目录时模型占位必须覆盖整个 catalog，
+  不能只按实际运行角色取模型名，否则未参与回放的内置角色会阻断非默认模型场景。
+- Task 5：EventBus 的有界订阅会在单轮突发超过 1024 条时丢最旧事件；L2 runner 必须同时检查
+  `subscription.dropped` 与从 1 连续的 sequence，不能把截断后的有序后缀当成完整轨迹。
+- Task 5：真实 Bash 可以生成二进制文件，而 L2 v1 的 workspace 契约是文本 Mapping；快照遇到
+  非 UTF-8 文件时必须给出带相对路径的 `ScenarioMismatch`，不能泄漏裸解码异常。
 
 ## 文档更新清单
 

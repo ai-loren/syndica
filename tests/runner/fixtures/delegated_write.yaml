@@ -1,0 +1,75 @@
+version: 1
+name: delegated-write
+agents:
+  Coordinator:
+    manifest:
+      name: Coordinator
+      description: Coordinates one worker.
+    instances:
+      - turns:
+          - tool_calls:
+              - id: delegate-1
+                name: Delegate
+                arguments:
+                  agent: Worker
+                  query: Write the requested file.
+          - content: coordination complete
+  Worker:
+    manifest:
+      name: Worker
+      description: Writes files.
+      tools: [Write, Glob, Read, Grep]
+    instances:
+      - turns:
+          - tool_calls:
+              - id: write-1
+                name: Write
+                arguments:
+                  path: result.txt
+                  content: scenario-ok
+          - tool_calls:
+              - {id: glob-1, name: Glob, arguments: {pattern: "*.txt"}}
+              - {id: read-1, name: Read, arguments: {path: result.txt}}
+              - {id: grep-1, name: Grep, arguments: {pattern: scenario, path: "."}}
+          - content: worker complete
+topology:
+  slots:
+    - name: root
+      agent: Coordinator
+      is_root: true
+      cardinality: singleton
+      boot: eager
+entry:
+  slot: root
+  prompt: Start the scenario.
+responses: []
+expect:
+  final_output:
+    "Coordinator[0]": coordination complete
+    "Worker[0]": worker complete
+  tool_order:
+    "Coordinator[0]": [Delegate]
+    "Worker[0]": [Write, Glob, Read, Grep]
+  stop_reasons:
+    "Coordinator[0]": completed
+    "Worker[0]": completed
+  statuses:
+    "Coordinator[0]": zombie
+    "Worker[0]": zombie
+  events:
+    - agent_start
+    - turn_start
+    - agent_start
+    - turn_start
+    - turn_end
+    - turn_start
+    - turn_end
+    - turn_start
+    - turn_end
+    - agent_end
+    - turn_end
+    - turn_start
+    - turn_end
+    - agent_end
+  workspace:
+    result.txt: scenario-ok
