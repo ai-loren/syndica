@@ -1,10 +1,11 @@
 import asyncio
+import copy
 import time
 
 import pytest
 
 from syndica.kernel.contracts.broker import MessageBrokerContract
-from syndica.kernel.message import Message
+from syndica.kernel.message import DeliveryResult, Message
 from syndica.kernel.protocols.broker import MessageBroker
 from syndica.kernel.stores.memory_broker import InMemoryMessageBroker
 
@@ -151,6 +152,28 @@ class _SwallowsTheCancel(InMemoryMessageBroker):
                 return None
 
 
+class _PublishesIntoAQueueItAlreadyRemoved(InMemoryMessageBroker):
+    async def publish(self, agent_id: str, message: Message) -> DeliveryResult:
+        mailbox = self._mailboxes.get(agent_id)
+        if mailbox is None:
+            return await super().publish(agent_id, message)
+        checked = asyncio.Event()
+        removed = asyncio.Event()
+
+        async def remove_between_check_and_write() -> None:
+            checked.set()
+            await self.remove_queue(agent_id)
+            removed.set()
+
+        removal = asyncio.create_task(remove_between_check_and_write())
+        await checked.wait()
+        await removed.wait()
+        mailbox.messages.append(copy.deepcopy(message))
+        self._refresh(mailbox)
+        await removal
+        return DeliveryResult(ok=True, message_id=message.id)
+
+
 class TestInMemoryMessageBroker(MessageBrokerContract):
     @pytest.fixture
     def broker(self) -> MessageBroker:
@@ -268,3 +291,12 @@ async def test_the_consume_path_case_catches_a_pending_entry_consume_cannot_see(
     with pytest.raises(AssertionError) as info:
         await case(_KeepsThePendingEntryAwayFromConsume())
     assert 'consume 交出' in str(info.value)
+
+
+async def test_the_publish_receipt_case_catches_a_message_written_to_a_removed_queue():
+    suite = MessageBrokerContract()
+    with pytest.raises(AssertionError) as info:
+        await suite.test_publish_ok_means_the_message_is_still_in_the_mailbox(
+            _PublishesIntoAQueueItAlreadyRemoved()
+        )
+    assert '成功回执' in str(info.value)

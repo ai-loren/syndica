@@ -48,6 +48,16 @@
 | D-15 | 依赖违规的下一步动作未断言 | 计划 4 Task 8：`test_violations_exit_1` 断言“把 backend 需要的类型与入口下沉到 kernel” |
 | D-16 | `test_surface_importing_itself_is_allowed` 多余创建 `args.py` | 计划 4 Task 8 删除该写入；依赖扫描器只做 AST 静态检查，不要求被导入模块真实存在 |
 | D-17 | pyright 配置注释包含变更过程 | 计划 4 Task 8：注释只保留当前约束“strict 使用顶层路径列表” |
+| D-10 | provider API 不接受 schema 的 `title` / `$defs` / `$ref` | 计划 4 Task 6：OpenAI backend 递归删除 `title` / `$defs`、拒绝 `$ref`，含映射与数组嵌套测试 |
+| D-11 | `publish` 向已删除邮箱写入仍返回成功 | 计划 4 Task 9：Protocol 声明线性化语义，`test_publish_ok_means_the_message_is_still_in_the_mailbox` 及并发删除反例验证 |
+| D-12 | 关联等待的 timeout 可能被非匹配消息延长 | 计划 4 Task 7：`test_wait_timeout_is_not_extended_by_nonmatching_messages` 持续注入噪声并要求原期限返回 |
+| D-34 | 内置工具未逐个声明命令参数 | 计划 4 Task 2–4：八个本地工具均显式声明；仅 Bash 使用 `('command',)`，其余为 `()` |
+| D-36 | 未声明命令参数会让长文本终止整轮 | 计划 4 Task 2–4：文件与搜索工具声明 `()`，正文不进入危险命令扫描 |
+| D-37 | 危险判定两次扫描放大长文本成本 | 计划 4 Task 2–4：非执行文本不扫描，Bash 只扫描 `command` |
+| D-50 | provider 可能把内核旁路字段发给模型 | 计划 4 Task 6：`test_request_drops_extra_trust_and_artifacts` 与联合字段键序测试 |
+| D-53 | 第三方 Registry 实现拿不到字段分类 | 计划 4 Task 7：三个 `UPDATE_*` 从 `syndica.kernel.contracts` 再导出并验证对象身份 |
+| D-56 | provider 未兑现 `LLMConfig.timeout` | 计划 4 Task 6：HTTPX 分段 timeout 与 provider 总墙钟同时生效，持续响应也不能越过总上限 |
+| D-57 | `AgentRegistry.update` 写入活引用 | 计划 4 Task 7：Protocol 明确深拷，契约覆盖嵌套快照和拷贝失败零部分写入 |
 
 ## 待审计核实（认为已被后续改动关闭）
 
@@ -57,21 +67,6 @@
 | V-02 | 接管 CAS 在 `parked` 状态下不是有效的所有权守卫 | 计划 2 Task 4 的 `ensure_active`；Task 7 进一步改为**用注册表状态作所有权凭证** |
 
 ## 有主待做（里程碑 1 内）
-
-### 归计划 4（第一个 backend + provider）
-
-| # | 内容 |
-|---|---|
-| D-50 | **`LLM.create` 契约里「进请求的只有 `role` / `content` / `tool_calls` / `tool_call_id`，`extra` / `trust` / `artifacts` 一律不进」这一条没有可执行的用例。** 正文是计划 2 Task 15 修复轮补的（此前它只以「事实」的身份出现在 D-48 正文里）：内核**依赖**它而契约没写，按 AGENTS.md 的判据就是「第三方 backend 一定会违反的性质」——一个把 block 整个 `asdict` 出去的 provider 会把每次工具调用的 `meta`（经 `tool_executor._append` 落进 `extra['tool_meta']`）灌进模型上下文，其中就有 `QueryAgent` 刻意只放 `meta`、不放 `output` 的子代 id。里程碑 1 里没有 provider，所以本轮只能写正文 | 归**计划 4（第一个 backend + provider）**：那里有第一个真实现，落点是 provider 自己的契约测试——给一块带 `extra` / `trust` / 非空 `artifacts` 的 `ContextBlock`，断言发出去的请求体里这三样一个都没有，且键序与四个字段的清单逐字相符（键序漂移会让前缀缓存整体失效，spec §5.2） |
-| D-34 | **每一个内置工具都必须显式声明 `__tool_command_args__`。** 计划 4 加的文件读写与命令执行工具正是这条纪律的第一批用户：执行类工具漏声明会让判定改去扫它的全部参数（保证更弱且会对文本参数误报），而 `Read` / `Write` / `Grep` 这类收文本的工具漏声明会被自己写的文档内容命中——一段含 markdown 表格或围栏代码块的正文里一个裸 `|` 就能拼出假管道链。判定已在结论里点名「这个工具没声明」并给出修法，但那是**事后**诊断；纪律在计划 4 建立，成本是每个工具一行 |
-| D-36 | **判定读不完参数会终结一整次 `run()`，而这条路此前打不到任何人。** 未声明 `__tool_command_args__` 的工具，判定按「全查」读它的每个参数；一个收大段文本的普通工具收到超过 `_MAX_TEXT_CHARS`（262144）字符或嵌套超过 8 层的值时，`danger._readable_texts` 抛 `ContractViolation`。计划 2 Task 11 之前判定没有生产调用者，这条只在单测里现身；接上闸之后它坐在**每次工具调用的必经之路**上：实测 300KB 文本的一次调用 → 失败那个调用得一条「判定抛出…工具没有运行」的 block、同批其余得「没有执行」、`ctx.stop_reason=ERROR`，且异常上抛出 `run()`（`SyndicaError` 按 spec §10 交给 agent loop）。**修法是让工具声明**（`__tool_command_args__ = ()` 或只声明真会被执行的那几个参数），与 D-34 是同一条纪律的两面：D-34 说漏声明会让闸变弱或误报，本条说漏声明还能让一次长跑当场失败。B-09 登记的是判定侧「读不出」的行为，**不含**「它现在会终结一次 run」 |
-| D-37 | **危险判定现在在每次工具调用上跑两遍**（分段一次看模型发出来的参数，闸一次看 `PRE_TOOL_USE` 改写之后的参数），于是 D-36 那条上限扫描的成本翻倍。**已实测而非推论**：三个调用恰好问 `judge` 六遍、问宿主 `policy` 三遍（分段只问判定不问处置，`test_segmenting_does_not_consult_the_host_policy_a_second_time` 钉住后一半）。**两遍不能合并成一遍**：闸必须判真正会被执行的那份参数，而「参数有没有被 hook 改过」这个判据本身不完备（顶层已由 D-35 的只读视图堵住，嵌套层见 D-40），复用分段那次结论就等于让闸去判一份不会被执行的参数——用一条静默的安全缺口换一半 CPU，方向是反的。真正的省法是让工具**声明** `__tool_command_args__`（D-34）：声明 `()` 的工具两遍都读不出任何文本，扫描退化成常数。计划 4 加第一批收大段文本的工具时一并量一次实际开销 |
-| D-10 | `__tool_model__` 层输出带 `title` / `$defs` / `$ref`，部分 provider API 会拒。要知道目标 API 约束才能定，属 provider backend 的事 |
-| D-11 | **`remove_queue` 的回执窗口**（计划 2 Task 4 的 Defect B）。不是「无法关闭」，而是「完整修法要改 `MessageBroker` Protocol，Task 4 选择不改」。评审已用一个在 `remove_queue` 内挂起的 broker 证明窗口真实存在（`ok=True`、消息消失、零 ERROR），且该 broker 就是 Protocol 修法的测试手段。计划 4 要动 broker 契约，一并做 |
-| D-12 | 契约套件缺一条「`timeout` 从调用那一刻起算」的用例——计划 2 Task 9 的 `_report_unwaited_timeout` 判据建立在它上面，而它现在只是契约里的一句文字 |
-| D-53 | **`UPDATE_WRITABLE_FIELDS` / `UPDATE_PROTECTED_FIELDS` / `UPDATE_PROTECTED_FIELD_OWNERS` 不在 `kernel.__all__`，而 `AgentRegistry` 是公开 Protocol。** 第三方实现 `update` 要知道哪些字段可写、哪些另有专用机制，而这三个集合不出现在任何公开签名里（`update(agent_id, **fields)`），所以按计划 2 Task 16 的判据（「哪个公开签名需要它」）它们进不了公开面。内核自己的内存实现直接 import 它们；第三方照做等于硬编码四个字段名，而 `AgentInfo` 加一个字段时那份副本会静默漂移——与 V-01 的 `ERROR_CLASSES` 同型。归**计划 4**：那里有第一个真的第三方 Store。落点是随 wheel 发布的 `syndica.kernel.contracts`（spec §13.3 指给第三方的入口），把三个常量 re-export 过去并给契约套件补一条「protected 字段必须被拒、writable 字段必须被收」的用例，而不是让第三方去 import 一个没有兼容承诺的子模块 |
-| D-56 | **`LLM.create` 契约没说谁负责兑现 `LLMConfig.timeout`。** 全仓没有任何地方读 `config.timeout`。abort 不打断轮内 LLM 调用，`create` 不返回时唯一出路是 `kill`。本轮只补契约正文（实现必须在 `config.timeout` 内返回或抛出；不要在内核里包 `asyncio.timeout`——那会把取消域从 provider 手里拿走、远端连接留在那里，与 broker 的 ASYNC109 豁免同型）。**可执行用例归计划 4 的第一个 provider 契约** |
-| D-57 | **`AgentRegistry.update` 的写入侧快照语义未定义。** `register` 深拷且有契约用例，`update` 直接 `setattr` 调用方的对象、契约无用例、Protocol 正文也没写。内核今天一次都不调 `update`，是纯公开面欠账。归计划 4（与 D-53 同一批动 store 契约） |
 
 ### 归计划 5（Runtime Module + Flag）
 

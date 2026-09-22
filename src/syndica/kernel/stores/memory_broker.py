@@ -74,6 +74,8 @@ class InMemoryMessageBroker:
                     f' 下一步: 先 ensure_queue，或注册一个能激活该 agent 的回调。'
                 ),
             )
+        # 从最终确认 mailbox 到 append 与回执之间没有挂起点；remove_queue 不可能在这段临界区插入，
+        # 因此不会向已摘掉的旧邮箱写入后仍返回 ok=True。
         # 存快照而不是调用方的对象：否则调用方 publish 之后改动它就改到了已入队的内容，
         # 而序列化的远端实现不会，换后端即行为分叉。
         mailbox.messages.append(copy.deepcopy(message))

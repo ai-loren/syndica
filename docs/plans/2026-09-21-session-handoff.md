@@ -1,8 +1,8 @@
 # 会话交接：里程碑 1 做到哪、接着做什么
 
-写于 2026-09-21。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
+写于 2026-09-21，2026-09-22 更新。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
-**一句话现状：** 计划 1、计划 2 的代码已收口；计划 3 **8/8 已落地**（Task 8 = `15436ed`）；计划 4 **Task 1–2 已落地**（Task 2 = `4989d9f`），Task 3–9 未做。计划 5–6 未写未做。本地 `main` 比 `origin/main` 超前 36 个 commit（本文提交后是 37），**未 push**。下一刀是**计划 4 Task 3**（Glob / Grep），不要重写计划，不要重做 Task 2，不要断言 `local_tools` 只有 3 个键。
+**一句话现状：** 计划 1、计划 2、计划 3 已收口；计划 4 **9/9 已落地**。计划 5–6 未写未做，里程碑 1 尚未完成。**下一步是先写计划 5，再按同等严格度执行**；不要重做计划 3–4，不要添加 `Runtime.start`。
 
 **先读顺序**
 
@@ -11,7 +11,7 @@
 3. [`docs/design/2026-09-03-architecture.md`](../design/2026-09-03-architecture.md) spec §15 / §4.6–4.8 / §17
 4. [`docs/decisions/2026-09-08-m1-scope.md`](../decisions/2026-09-08-m1-scope.md)
 5. [`docs/decisions/2026-09-14-deferred-items.md`](../decisions/2026-09-14-deferred-items.md)
-6. 当前子计划：[`docs/plans/2026-09-22-m1p4-local-exec.md`](./2026-09-22-m1p4-local-exec.md)
+6. 已收口的计划 4：[`docs/plans/2026-09-22-m1p4-local-exec.md`](./2026-09-22-m1p4-local-exec.md)
 
 ---
 
@@ -27,18 +27,25 @@
 | git | 本项目此前默认**改完即 commit、不 push**，除非用户再说「推」 |
 | 提交时 | `git -c trace2.eventtarget= -c trace2.eventnesting= commit`（本机 git 会被 trace2 塞 Co-authored-by: Cursor） |
 
-**本文对照的基线 HEAD：`15436ed`。** 提交本文之后 `HEAD` 会再前进一步；动手前以 `git log -3 --oneline` 与 `git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
+**本文对照的基线 HEAD：`ade688f`。** Task 9 与本次交接更新在同一提交；动手前以 `git log -3 --oneline` 与 `git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
 
 ```
 $ git status -sb
-## main...origin/main [ahead 36]
-（工作区干净，无未提交改动——本文 commit 之后会变成 ahead 37）
+## main...origin/main [ahead 44]
+（工作区干净，无未提交改动）
 ```
 
-`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 从新到旧（相对 origin/main 的 30 个，表里只列计划 3 这一段；更早的见下文）：
+`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 最新计划 4 提交如下，更早的计划 3 记录继续保留在表中：
 
 | sha | 内容 |
 |---|---|
+| 本文同一提交 | **计划 4 Task 9**：publish 成功回执的邮箱线性化契约；计划 4 收口 |
+| `ade688f` | **计划 4 Task 8**：工作区公开面、依赖门禁、登记表 |
+| `10b4dad` | **计划 4 Task 7**：Registry 快照、contracts 再导出、broker 总 timeout |
+| `30fed58` | **计划 4 Task 6**：OpenAI 兼容 provider |
+| `6b95895` | **计划 4 Task 5**：真实本地工具跑通拓扑 |
+| `d0eee37` | **计划 4 Task 4**：Bash / BashOutput / KillBash |
+| `6e36b86` | **计划 4 Task 3**：Glob / Grep |
 | `4989d9f` | **计划 4 Task 2**：Read / Write / Edit。模型犯的错进 output；`__tool_command_args__ = ()` |
 | `c13e103` | 交接改到计划 4 Task 2（已被本文取代） |
 | `1fc689c` | **计划 4 Task 1**：Portal / LocalWorkspace。越界用解析后的真实路径，不用字符串前缀 |
@@ -78,7 +85,7 @@ $ git status -sb
 
 更早的计划 2 Task 1–15 已在 `origin/main` 一侧。
 
-**本轮停笔时工作区干净。** 不要重做计划 3，不要重写计划 4，不要重做 Task 1–2。下一刀是计划 4 Task 3（Glob / Grep，追加到 `local_tools`，不要改前三个键的相对顺序）。`assemble` 不是 `start()`，计划 4 也不要加。
+**本轮停笔时工作区干净。** 不要重做计划 3–4。下一步是写计划 5；`assemble` 不是 `start()`，后续也不要加 `Runtime.start`。
 
 ---
 
@@ -109,9 +116,9 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | 声明式 Agent 定义（§4.6） | **已做** | 计划 3 Task 1–4、Task 7、Task 8（`15436ed` 起宿主从 `syndica.kernel` 拿到清单与内置） |
 | 拓扑装配（§4.7） | **已做（控制面）** | 计划 3 Task 5–6 + `tests/integration/test_topology_lifecycle.py`。真文件工具仍在计划 4 |
 | Tool 系统与 LLM 抽象 | **内核抽象已做** | Tool / ToolExecutor / DangerJudge / ScriptedLLM；OpenAI 兼容 provider 在计划 4 |
-| 最小本地执行（读写文件 + 跑命令） | **未做** | 计划 4（`Read`/`Write`/`Edit`/`Glob`/`Grep`/`Bash`…） |
+| 最小本地执行（读写文件 + 跑命令） | **已做** | 计划 4：八个本地工具、真实拓扑集成测试、OpenAI 兼容 provider |
 
-**结论：计划 2 + 横切审计 ≈ 内核控制面做完；计划 3 已收口**（清单、目录、freeze、拓扑、四个内置、公开面、一条拓扑端到端）。**里程碑 1 本身没完。** 还缺本地执行、Runtime Module、CLI。
+**结论：计划 1–4 已收口。里程碑 1 本身没完。** 还缺 Runtime Module、CLI 与最终收口审计。
 
 子计划边界（不要重新解释）：
 
@@ -120,7 +127,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | **1** | 单 Agent turn 循环 | **代码收口**，已在更早的历史上 |
 | **2** | 事件循环、生命周期、等待、危险判定、工具并发、插件、编排工具、公开面 | **代码收口**（含审计修复 + Task 16 残留） |
 | **3** | 声明式清单、目录、拓扑、四个内置角色 | **代码收口** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；Task 1 = `97c9edc`，Task 2 = `551b4d2`，Task 3 = `7071eda`，Task 4 = `73289a2`，Task 5 = `cb81e02`，Task 6 = `b508023`，Task 7 = `d0e6828`，Task 8 = `15436ed` |
-| **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | 计划 `91b00d7`；Task 1 = `1fc689c`；Task 2–9 未做 |
+| **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | **代码收口**；Task 1–9 全部完成 |
 | **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | 未写未做 |
 | **6** | CLI + L2 场景回放 + AskUser | 未写未做 |
 | **M1 收口审计** | spec §15 取证 + 遗留项清空 + **那时再 push** | 未做 |
@@ -461,25 +468,25 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 
 遗留项**同时**记进 [`deferred-items.md`](../decisions/2026-09-14-deferred-items.md)，不要只写 gitignored 的 `.superpowers/sdd/progress*.md`。
 
-### 4.2 计划 4 Task 2 已落地（`4989d9f`）。下一步：Task 3
+### 4.2 计划 4 已收口
 
 需求在 [`2026-09-22-m1p4-local-exec.md`](./2026-09-22-m1p4-local-exec.md)。不要在执行时重新划范围：git / worktree / 快照 / 伪终端是里程碑 5。
 
-九个任务，建议九个 commit，不要 push：
+九个任务均已完成：
 
 | Task | 标题 | 状态 |
 |---|---|---|
 | 1 | Portal / Workspace / LocalWorkspace 路径监狱 | 已落地 `1fc689c` |
 | 2 | Read / Write / Edit | 已落地 `4989d9f` |
-| 3 | Glob / Grep | **下一刀** |
-| 4 | Bash / BashOutput / KillBash | 未做 |
-| 5 | 真实工具跑通一条拓扑 | 未做 |
-| 6 | OpenAI 兼容 provider | 未做 |
-| 7 | 注册表快照、契约再导出、等待超时起算点 | 未做 |
-| 8 | 依赖门禁缺口、注释、公开面、关台账 | 未做 |
-| 9 | publish 与 remove_queue 的回执窗口 | 未做 |
+| 3 | Glob / Grep | 已落地 `6e36b86` |
+| 4 | Bash / BashOutput / KillBash | 已落地 `d0eee37` |
+| 5 | 真实工具跑通一条拓扑 | 已落地 `6b95895` |
+| 6 | OpenAI 兼容 provider | 已落地 `30fed58` |
+| 7 | 注册表快照、契约再导出、等待超时起算点 | 已落地 `10b4dad` |
+| 8 | 依赖门禁缺口、注释、公开面、关台账 | 已落地 `ade688f` |
+| 9 | publish 与 remove_queue 的回执窗口 | 已落地（本文同一提交） |
 
-D-09、D-13、D-16 的实现已经在仓库里，Task 8 只关台账，禁止重写扫描器。D-56：provider 自己遵守 `config.timeout`，内核不要包 `asyncio.timeout`。
+计划 4 所属遗留项已经全部转入登记表「已关闭」。下一步先写计划 5，不要直接跨到计划 6。
 
 ### 4.3 计划 5（未写未做）
 
@@ -514,7 +521,7 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 | 归属 | 条目 |
 |---|---|
 | **计划 3** | 无。D-49、D-08 已关，八个任务都已 commit |
-| **计划 4** | D-09、D-50、D-34、D-36、D-37、D-10–D-17、D-53、D-56、D-57 |
+| **计划 4** | 无。Task 1–9 与所属登记项均已关闭 |
 | **计划 5** | D-18、D-47（墙钟）、D-19–D-23、D-29、D-55 |
 | **计划 6** | D-38 |
 | **M1 收口审计** | D-51、D-27、D-58、D-59、V-01、V-02 |
@@ -527,15 +534,15 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 在 `/Users/bytedance/Documents/syndica`：
 
 ```bash
-git status -sb          # 应是 main...origin/main [ahead 37]（本文 commit 之后），工作区干净
-git log -3 --oneline    # 第一条应是本文；第二条 `4989d9f` Task 2
+git status -sb
+git log -3 --oneline
 ```
 
 然后：
 
-1. **做计划 4 Task 3**（Glob / Grep）。计划文件已在 `docs/plans/2026-09-22-m1p4-local-exec.md`，不要重写，不要重做 Task 1–2，不要加 `Runtime.start`。
-2. `local_tools` 现在的前三个键是 Read、Write、Edit。Task 3 只追加，不要断言键的个数正好是 3。超过 1 MiB 的拒绝在 `read_text` 里，output 带字节数。
-3. 每个任务走完变异 + 独立评审再 commit。**仍不要 push**，直到 M1 收口审计通过，或用户明确说推。
+1. **先写计划 5**：Runtime Module + Flag、重试 / 故障转移 Module、前缀漂移检测。
+2. 计划 5 的范围以 spec §5.2 / §5.5 / §5.7 与登记表 D-18、D-47、D-19–D-23、D-29、D-55 为准。
+3. 每个任务走完变异 + 独立评审再 commit。**仍不要 push**，直到 M1 收口审计通过。
 
 ---
 
@@ -613,9 +620,9 @@ git log -3 --oneline    # 第一条应是本文；第二条 `4989d9f` Task 2
 | 登记表 | `docs/decisions/2026-09-14-deferred-items.md` |
 | 计划 2 原文 | `docs/plans/2026-09-08-m1p2-control-plane.md` |
 | 计划 3（已收口，不要重做） | `docs/plans/2026-09-21-m1p3-declarative-agents.md` |
-| 计划 4（已写，Task 1–2 已落地） | `docs/plans/2026-09-22-m1p4-local-exec.md` |
-| 文件工具（Task 2 已做） | `src/syndica/kernel/tools/local.py`；`tests/kernel/test_local_tools_files.py` |
-| **下一刀** | 计划 4 Task 3：Glob / Grep |
+| 计划 4（已收口） | `docs/plans/2026-09-22-m1p4-local-exec.md` |
+| 本地工具 | `src/syndica/kernel/tools/local.py`；`tests/kernel/test_local_tools_*.py` |
+| **下一步** | 写计划 5 |
 | 范围裁决 | `docs/decisions/2026-09-08-m1-scope.md` |
 | 硬约束 / 变异纪律 | `AGENTS.md` |
 

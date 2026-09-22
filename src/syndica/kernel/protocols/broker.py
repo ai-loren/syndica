@@ -69,6 +69,11 @@ class MessageBroker(Protocol):
         后端自己的 entry id 就对不上了，而调用方手里没有别的对照物。
 
         邮箱不存在时先走 on_missing_queue 回调；回调之后仍不存在则返回 ok=False。
+
+        publish 与 remove_queue 重叠时必须存在明确的线性化顺序：若 remove_queue 先摘掉邮箱，
+        publish 必须返回 ok=False；若 publish 先写入，remove_queue 可以随后按其明文契约丢弃未消费
+        消息。最终确认邮箱存在与写入消息之间不得让出，否则会向已经摘掉的旧邮箱写入并返回成功。
+        远端实现用事务或原子脚本把检查与写入收成一个线性化操作。
         """
         ...
 

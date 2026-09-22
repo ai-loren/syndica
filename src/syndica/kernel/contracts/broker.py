@@ -152,6 +152,21 @@ class MessageBrokerContract(ContractSuite):
         assert result.ok is True
         assert result.message_id == message.id
 
+    async def test_publish_ok_means_the_message_is_still_in_the_mailbox(
+        self, broker: MessageBroker
+    ) -> None:
+        await broker.ensure_queue('a1')
+        message = _msg('receipt-visible')
+        result = await broker.publish('a1', message)
+        queued = await broker.consume('a1')
+        assert not result.ok or [item.id for item in queued] == [message.id], (
+            '期望 publish 返回 ok=True 时，这条消息已经进入此刻仍属于目标 Agent 的邮箱。'
+            f' 实际回执是 ok={result.ok} message_id={result.message_id!r}，'
+            f'随后 consume 看到 {[item.id for item in queued]}。'
+            ' 把最终邮箱检查、写入与成功回执放进同一个不让 remove_queue 插入的临界区；'
+            '远端实现使用事务或原子脚本。'
+        )
+
     async def test_consume_is_exactly_once(self, broker: MessageBroker) -> None:
         await broker.ensure_queue('a1')
         await broker.publish('a1', _msg())
