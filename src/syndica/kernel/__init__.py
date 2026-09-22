@@ -56,12 +56,22 @@ from syndica.kernel.hooks import (
     JunctionKind,
     JunctionRef,
 )
-from syndica.kernel.llm import LLM, ContextOverflowError, LLMConfig, ScriptedLLM, ScriptedTurn
+from syndica.kernel.llm import (
+    LLM,
+    CachePrefixProvider,
+    ContextOverflowError,
+    LLMConfig,
+    ScriptedLLM,
+    ScriptedTurn,
+)
 from syndica.kernel.local_workspace import LocalWorkspace
 from syndica.kernel.manifest import AgentManifest, ManifestSource
 from syndica.kernel.message import DeliveryResult, Message, Trigger
+from syndica.kernel.modules import FlagDeclaration, RuntimeModule, SafetyModule
 from syndica.kernel.plugins import Plugin
+from syndica.kernel.prefix_drift import PrefixDriftModule, PrefixDriftRecord, PrefixDriftService
 from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback
+from syndica.kernel.retry import RetryModule
 from syndica.kernel.runtime import AgentFactory, Runtime
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
@@ -91,6 +101,7 @@ __all__ = [
     'ArtifactRef',
     'BaseAgent',
     'BlockHighRisk',
+    'CachePrefixProvider',
     'ConfigError',
     'Confirmation',
     'Context',
@@ -109,6 +120,7 @@ __all__ = [
     'EventBus',
     'ExecResult',
     'ExitMode',
+    'FlagDeclaration',
     'HookCallback',
     'HookResult',
     'HooksCenter',
@@ -131,10 +143,16 @@ __all__ = [
     'OverrideRecord',
     'Plugin',
     'Portal',
+    'PrefixDriftModule',
+    'PrefixDriftRecord',
+    'PrefixDriftService',
     'Reply',
+    'RetryModule',
     'RiskLevel',
     'Role',
     'Runtime',
+    'RuntimeModule',
+    'SafetyModule',
     'ScriptedLLM',
     'ScriptedTurn',
     'StopReason',

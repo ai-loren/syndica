@@ -23,6 +23,10 @@
 | D-21 | 异常子类新增必填参数时必须覆写 `__reduce__` 的约束未进代码 | 计划 5 Task 1 复核：约束已在 `_rebuild` docstring；合规与不合规子类分别有 copy / deepcopy / pickle 三档证据 |
 | D-22 | 三件套的类型错误与空值错误不可区分 | 计划 5 Task 1 复核：非 str 抛 `TypeError`，空白 str 抛 `ValueError`，两组均参数化三个字段 |
 | D-23 | 多字段同时非法时的诊断顺序未锁定 | 计划 5 Task 1：`test_multiple_invalid_parts_are_checked_in_constructor_order` 钉住 `expected -> received -> next_action` |
+| D-18 | 宿主级等待上限（Flag）未实现 | 计划 5 Task 5：`SafetyModule.max_wait_seconds` 同时 clamp `wait_for` 与 `_wait_in_turn`；0 保留原超时。双 Agent 用例钉住 `min(waiter.timeout, ceiling)` 与 per-Agent 隔离 |
+| D-47 | `Runtime._wait_in_turn` 没有墙钟上限 | 计划 5 Task 5：正数 `max_wait_seconds` 到期返回 `WaitState.TIMEOUT`，目标 Agent 不被取消；目标完成、abort、preempt 与 timeout 的优先级均有测试 |
+| D-29 | `untrusted_high_risk` Flag 未实现 | 计划 5 Task 5：`reject / ask / allow` 映射到 `BLOCK / CONFIRM / ALLOW`，在 `DangerPolicy` 前生效且不咨询 policy；真实 ToolExecutor 三态与跨 Agent 隔离已覆盖 |
+| D-55 | `spawn(flags=...)` 与 `AgentInfo.flags` 缺失 | 计划 5 Task 4：完整解析快照写入 Registry，父 / fork / 显式覆盖及深拷隔离均有测试，受保护字段契约禁止普通 update 改写 |
 | B-16 | **同一段并发调用之间，`PRE_TOOL_USE` 改写参数时的溯源重取看不到兄弟的产出**（原判 BEYOND-M1，理由是「修法就是不并发」） | **判错了，修法在本层且很小**：`is_concurrency_safe` 的语义是「本次调用不写任何共享状态」，不是「我的输出不会经 hook 进到兄弟的参数里」，所以两个**按契约正确声明**的工具就够触发，缺口不被并发的前提框住。多元素段里那次重取**结构上就是一次失败的溯源**（兄弟的证据还没落进轨迹），而 spec §13 已经规定溯源失败时按最坏情况处理。计划 2 Task 12 修复轮：`_execute_one` 收一个必填的 `has_siblings`（由 `_run_segment` 从决定要不要进 `gather` 的同一个 `len(calls)` 判断算出，漏传是 pyright 错误），hook 改写过参数且本段有兄弟时直接取 `TrustLevel.UNTRUSTED`。两种形态各有能单独变红的用例，且都按 `limit` ∈ {1, 4} 参数化——**同一批输入在 `limit=1` 与 `limit=N` 下必须得出同一个安全结论**；另有一条断言同一批调用在两个上限下落下逐块相同的轨迹。作用面只在「hook 改写参数 ∧ 多元素段」这个交集上，**默认路径零成本**：`src/` 里今天一个 `Tool` 子类都没有、零工具声明可并发，线上行为一字未变；它的对象是交给第三方的契约（计划 4 的文件读写 / 命令执行工具落地时就活）。多判的那一侧登记为 B-18 |
 | D-04 | 取消（`CancelledError`）会留下 block 数少于 call 数的轨迹 | 设计如此且在该处无法关闭（取消可能落在进入工具之前）。已在 `tool_executor` docstring 记明 resume 需修补，计划 1 Task 13 给「这份 Context 在轮中被打断」找到了落点（`extra['interrupted']`）。计划 2 Task 12 引入并发段后这条**形态不变而量级变了**：取消到达在 `gather` 完成之后、写 block 之前时，一次取消丢掉的是**整段已经跑完的结果**（实测三个工具全部 `exit` 到底而 `n_blocks=0`）；串行时最多丢一个，并发时最多丢 `max_concurrency` 个。保住它的机制也多了一道：`asyncio.gather(return_exceptions=True)` 把子协程自己抛的 `CancelledError` **收进结果列表**而不是上抛（实测 3.11：收到的是一个丢了原消息的新实例），因此 `_without_cancellation` 必须在整段写任何 block 之前先扫一遍并原样上抛——照结果处理就等于把一次取消写成一块工具结果 |
 | D-05 | `_resume_one` 的读-改窗口：注册表短暂停在 `WAITING` 而槽里无 waiter | 计划 2 Task 9 明确留着，理由写进 `_resumed_status` docstring：自愈路径是下一个轮边界的 `_oscillate`（`allowed` 含 `WAITING`），而修法自己更糟——「CAS 后复检 waiter、没了就改 RUNNING」有同样窗口，会把刚装上的新等待抹成 RUNNING |
@@ -73,15 +77,6 @@
 
 ## 有主待做（里程碑 1 内）
 
-### 归计划 5（Runtime Module + Flag）
-
-| # | 内容 |
-|---|---|
-| D-18 | **宿主级等待上限（Flag）**。spec §4.2 只说「每个 `Waiter` 带自己的上限」，全文无宿主级 clamp 的取值依据，于是 `1e308` 秒仍是合法输入、实质是永久挂起。落点是收下 Waiter 的那一层读一条 Flag 做 clamp 或拒绝 |
-| D-47 | **`Runtime._wait_in_turn`（派活 / 分叉的等待）没有墙钟上限。** Task 9 把「等待必须有上限」立成裁决（`Waiter.timeout` 不接受 `None` 也不接受 0），理由是「长跑里等人工输入可能几小时无人查看，没有上限就是永久挂起，而挂住的 Agent 会一直占着预算与租约」。本任务**采纳了那条裁决的可打断那一半**（`abort(发起方)` 现在当场打断这次等待，与 `wait_for` 同一个令牌机制），**没有采纳上限那一半**，理由是两者等的东西性质不同：`wait_for` 等的是本 Runtime 管不到的东西（一个人、一条外部答复），没有上限就真的没有出路；在轮等待等的是本 Runtime 自己驱动的一个 Agent，`abort(发起方)` / `kill(被等方)` / `despawn(被等方)` 三条控制面路径都让它当场返回。**另两条控制面路径的行为也一并登记**（Task 14 修复轮取证，两者都正确、只是此前没写进来）：`pause(发起方)` **不**打断这次等待——挂起在轮的边界上兑现，而这次等待在轮的中间，门要等这一轮先走完；`shutdown` 经取消打断它（`gather` 取消全部驱动任务，`CancelledError` 从这次 `asyncio.wait` 上抛，令牌不被消费）。残留缺口只剩墙钟：被等的那一方卡在一次**没有超时的 LLM 调用**里时，只有上面三条路救得回来，而「占着预算与租约」这一条与 Task 9 的理由逐字相同。**范围原先整条归计划 5 是错的**：宿主级 clamp 到期后发起方返回了，**被卡住的那个 Agent 仍然卡着**——它停在 `LLM.create` 上，而 `abort` 不打断轮内调用。拆成两半：**一半跟计划 5**——宿主级等待上限（与 D-18 同一条 Flag）clamp `_wait_in_turn`，让发起方有墙钟出路；**一半跟计划 4**——第一个 provider 必须兑现 `LLMConfig.timeout`（见 D-56），那才是被等 Agent 自己的出路。**刻意不在内核里包 `asyncio.timeout`**：那会把取消域从 provider 手里拿走、远端连接留在那里，与 broker 的 ASYNC109 豁免同型。**刻意不在本任务里发明一个默认值**：`wait_for` 的 docstring 已经写明理由——在这里悄悄夹一道宿主级上限，一次四小时的正当等待会静默变成一小时，而症状只在长跑里现身 |
-| D-29 | **`untrusted_high_risk` flag 未实现**。spec §12.2 的处置矩阵把「高风险 + 可溯源到不可信」交给这条 flag（`reject` 默认 / `ask` / `allow`），而 `danger.disposition_of` 现在把 `reject` 写死。写死的是**默认值**，不是能力边界：`disposition_of` 是内核自己的函数（第三方只调不实现），加一个带默认值的参数对任何调用方都不破坏。做这条时一并给 `ask` 找落点——`Disposition.CONFIRM` 的交互通道在计划 6。**它唯一改变的是 `AllowAll` 这类宿主能不能把这一格调成 `ask` / `allow`**：默认宿主用 `BlockHighRisk`，它对 HIGH 一律 BLOCK 且与 provenance 无关，所以默认宿主的长跑会不会卡在高风险调用上与本条完全无关（决定它的是默认策略本身）。**排在计划 4 之前的理由是另一条**：计划 4 才有第一批真能触发 HIGH 规则的工具（文件读写 + 命令执行，见 D-34），届时 B-15 的误报面——含「任何一次工具异常之后整份轨迹永久算不可信」——才从理论变成活的，而唯一的逃生口就是这条 flag |
-| D-55 | **`flags` 在 spec 里有两处落点，实现里一处都没有，而此前无人登记。** spec §4.2 的 `spawn` 签名逐字写着 `flags=None`，§4.3 的 `AgentInfo` 字段表里也列着 `flags`；实现的 `spawn` 只有 `metadata`，`AgentInfo` 里 `grep flags` 零命中。计划 2 的自检表（覆盖 §4.1 / §4.2 / §4.3 / §4.5 …）逐条对过这几节却没提它，所以它是一处**沉默的缺席**而不是一次记过的推迟。两侧都不是破坏性变更（加一个带默认值的 keyword-only 参数、给 dataclass 追加一个带默认值的字段，对既有调用方都无声），因此不构成发布阻塞；真正的代价是「Flag 按 Agent 生效」这条能力今天连载体都没有，宿主读不到也写不进。归**计划 5（Runtime Module + Flag）**：Flag 的取值语义、作用域与合并规则都在那里定，`spawn(flags=...)` 与 `AgentInfo.flags` 是它落到进程模型上的两个端点，**不要在那之前先把字段加出来**——一个没有读者的字段会被下一个人当成死代码删掉，或者被当成「已经支持 Flag 了」用。同句评审里的 `created_at` 已落到 `AgentInfo`（横切审计 F-2）：它的读者不依赖 Flag 机制（D-46 的 ZOMBIE 回收要年龄，`heartbeat_at` 是租约活性不是创建时间） |
-
 ### 归计划 6（CLI + 人工确认交互）
 
 | # | 内容 |
@@ -98,6 +93,10 @@
 | D-59 | **「末尾未配对批次」的扫描逻辑在 `runtime._forkable_prefix` 与 `agent._unpaired_calls` 里逐字重复。** 今天行为一致，但它们守的是同一条承重不变式。收口审计时抽成纯函数，避免两处悄悄分叉 |
 
 ## 明确不在里程碑 1（BEYOND-M1）
+
+> 计划 5 更新：本节旧条目里“D-29 未实现 / 宿主关不掉”描述的是发现缺口时的历史状态。现在
+> `SafetyModule.untrusted_high_risk` 已提供 `reject / ask / allow` 显式处置；B-15 / B-18 的
+> 溯源上界与误报本身仍留待里程碑 5。
 
 | # | 内容 | 理由 |
 |---|---|---|

@@ -1,10 +1,10 @@
 # 会话交接：里程碑 1 做到哪、接着做什么
 
-写于 2026-09-21，2026-09-22 更新。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
+写于 2026-09-21，2026-09-23 更新。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
-**一句话现状：** 计划 1、计划 2、计划 3 已收口；计划 4 **9/9 已落地**。计划 5
-[`2026-09-22-m1p5-runtime-modules.md`](./2026-09-22-m1p5-runtime-modules.md) 已写待执行，计划 6 未写未做，
-里程碑 1 尚未完成。**下一步是评审并执行计划 5**；不要重做计划 3–4，不要添加 `Runtime.start`。
+**一句话现状：** 计划 1–5 已收口。计划 6 未写未做，里程碑 1 尚未完成。**下一步是依据既定范围
+起草并评审计划 6（CLI + 人工确认交互 + L2 场景回放）**；不要重做计划 3–5，不要添加
+`Runtime.start`。
 
 **先读顺序**
 
@@ -29,7 +29,8 @@
 | git | 本项目此前默认**改完即 commit、不 push**，除非用户再说「推」 |
 | 提交时 | `git -c trace2.eventtarget= -c trace2.eventnesting= commit`（本机 git 会被 trace2 塞 Co-authored-by: Cursor） |
 
-**本文对照的基线 HEAD：`ade688f`。** Task 9 与本次交接更新在同一提交；动手前以 `git log -3 --oneline` 与 `git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
+**本文对照的基线是计划 5 Task 8 收口提交。** 动手前以 `git log -5 --oneline` 与
+`git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
 
 ```
 $ git status -sb
@@ -41,7 +42,14 @@ $ git status -sb
 
 | sha | 内容 |
 |---|---|
-| 本文同一提交 | **计划 4 Task 9**：publish 成功回执的邮箱线性化契约；计划 4 收口 |
+| 本文同一提交 | **计划 5 Task 8**：公开面、真实 Runtime E2E、登记与交接收口 |
+| `4079d37` | **计划 5 Task 7**：PrefixDriftModule 与 provider 精确前缀单位 |
+| `608cf7f` | **计划 5 Task 6**：RetryModule |
+| `6533439` | **计划 5 Task 5**：SafetyModule 与两个安全 Flag |
+| `f131a28` | **计划 5 Task 4**：per-Agent Module 装配与 AgentInfo.flags |
+| `da996c0` | **计划 5 Task 3**：Runtime 级 Module 装配 |
+| `8f75e0e` | **计划 5 Task 2**：FlagDeclaration 与 RuntimeModule 声明 |
+| `a54da01` | **计划 5 Task 1**：复核并关闭 D-19～D-23 |
 | `ade688f` | **计划 4 Task 8**：工作区公开面、依赖门禁、登记表 |
 | `10b4dad` | **计划 4 Task 7**：Registry 快照、contracts 再导出、broker 总 timeout |
 | `30fed58` | **计划 4 Task 6**：OpenAI 兼容 provider |
@@ -87,7 +95,8 @@ $ git status -sb
 
 更早的计划 2 Task 1–15 已在 `origin/main` 一侧。
 
-**本轮停笔时工作区干净。** 不要重做计划 3–4。下一步是写计划 5；`assemble` 不是 `start()`，后续也不要加 `Runtime.start`。
+**本轮停笔时工作区干净。** 不要重做计划 3–5。下一步是写计划 6；`assemble` 不是 `start()`，
+后续也不要加 `Runtime.start`。
 
 ---
 
@@ -120,7 +129,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | Tool 系统与 LLM 抽象 | **内核抽象已做** | Tool / ToolExecutor / DangerJudge / ScriptedLLM；OpenAI 兼容 provider 在计划 4 |
 | 最小本地执行（读写文件 + 跑命令） | **已做** | 计划 4：八个本地工具、真实拓扑集成测试、OpenAI 兼容 provider |
 
-**结论：计划 1–4 已收口。里程碑 1 本身没完。** 还缺 Runtime Module、CLI 与最终收口审计。
+**结论：计划 1–5 已收口。里程碑 1 本身没完。** 还缺 CLI / 人工确认 / L2 场景层与最终收口审计。
 
 子计划边界（不要重新解释）：
 
@@ -130,7 +139,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | **2** | 事件循环、生命周期、等待、危险判定、工具并发、插件、编排工具、公开面 | **代码收口**（含审计修复 + Task 16 残留） |
 | **3** | 声明式清单、目录、拓扑、四个内置角色 | **代码收口** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；Task 1 = `97c9edc`，Task 2 = `551b4d2`，Task 3 = `7071eda`，Task 4 = `73289a2`，Task 5 = `cb81e02`，Task 6 = `b508023`，Task 7 = `d0e6828`，Task 8 = `15436ed` |
 | **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | **代码收口**；Task 1–9 全部完成 |
-| **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | 计划已写，待执行 |
+| **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | **代码收口** [`2026-09-22-m1p5-runtime-modules.md`](./2026-09-22-m1p5-runtime-modules.md)；Task 1–8 全部完成 |
 | **6** | CLI + L2 场景回放 + AskUser | 未写未做 |
 | **M1 收口审计** | spec §15 取证 + 遗留项清空 + **那时再 push** | 未做 |
 
@@ -488,16 +497,17 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 | 8 | 依赖门禁缺口、注释、公开面、关台账 | 已落地 `ade688f` |
 | 9 | publish 与 remove_queue 的回执窗口 | 已落地（本文同一提交） |
 
-计划 4 所属遗留项已经全部转入登记表「已关闭」。下一步评审并执行计划 5，不要直接跨到计划 6。
+计划 4 所属遗留项已经全部转入登记表「已关闭」；计划 5 也已收口，下一步执行计划 6。
 
-### 4.3 计划 5（已写待执行）
+### 4.3 计划 5（已收口）
 
 计划文件：[`2026-09-22-m1p5-runtime-modules.md`](./2026-09-22-m1p5-runtime-modules.md)。
 
-范围：Runtime Module + Flag（§5.5 四类注入）；重试 / 故障转移 Module（§5.7）；前缀漂移检测
-（§5.2）。
+范围已完成：Runtime Module + Flag（§5.5 四类注入）；重试 / 故障转移 Module（§5.7）；
+前缀漂移检测（§5.2）。Task 1–7 分别提交为 `a54da01`、`8f75e0e`、`da996c0`、`f131a28`、
+`6533439`、`608cf7f`、`4079d37`；Task 8 与本次交接同提交。
 
-挂单：D-18、D-47（墙钟那一半）、D-19、D-20、D-21、D-22、D-23、D-29（`untrusted_high_risk` flag）、D-55（**`flags` 字段不要提前加**，没有读者会被当死代码删掉）。
+挂单 D-18、D-47（墙钟）、D-19–D-23、D-29、D-55 已全部转入登记表“已关闭”。
 
 ### 4.4 计划 6（未写未做）
 
@@ -527,7 +537,7 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 |---|---|
 | **计划 3** | 无。D-49、D-08 已关，八个任务都已 commit |
 | **计划 4** | 无。Task 1–9 与所属登记项均已关闭 |
-| **计划 5** | D-18、D-47（墙钟）、D-19–D-23、D-29、D-55 |
+| **计划 5** | 无。Task 1–8 与所属登记项均已关闭 |
 | **计划 6** | D-38 |
 | **M1 收口审计** | D-51、D-27、D-58、D-59、V-01、V-02 |
 | **已关、不要重开** | D-01…D-08、D-24–D-26、D-28、D-30–D-33、D-35、D-39、D-41、D-44、D-45、D-48、D-49、D-52、D-54、D-60 等（见登记表「已关闭」） |
@@ -545,8 +555,8 @@ git log -3 --oneline
 
 然后：
 
-1. **评审并执行计划 5**：[`2026-09-22-m1p5-runtime-modules.md`](./2026-09-22-m1p5-runtime-modules.md)。
-2. 范围仍以 spec §5.2 / §5.5 / §5.7 与登记表 D-18、D-47、D-19–D-23、D-29、D-55 为准。
+1. **起草并评审计划 6**：CLI、人工确认交互与 L2 声明式场景回放。
+2. 范围以 spec §9.1、§13.1、既定 M1 scope 与登记表 D-38 为准。
 3. 每个任务走完变异 + 独立评审再 commit。**仍不要 push**，直到 M1 收口审计通过。
 
 ---
@@ -627,7 +637,7 @@ git log -3 --oneline
 | 计划 3（已收口，不要重做） | `docs/plans/2026-09-21-m1p3-declarative-agents.md` |
 | 计划 4（已收口） | `docs/plans/2026-09-22-m1p4-local-exec.md` |
 | 本地工具 | `src/syndica/kernel/tools/local.py`；`tests/kernel/test_local_tools_*.py` |
-| **下一步** | 执行计划 5 |
+| **下一步** | 起草并执行计划 6 |
 | 范围裁决 | `docs/decisions/2026-09-08-m1-scope.md` |
 | 硬约束 / 变异纪律 | `AGENTS.md` |
 
