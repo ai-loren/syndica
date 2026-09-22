@@ -137,6 +137,12 @@ from syndica.kernel.events import (
 from syndica.kernel.hooks import HooksCenter, Junction
 from syndica.kernel.local_table import LocalAgentTable
 from syndica.kernel.message import DeliveryResult, Message, Trigger
+from syndica.kernel.modules import (
+    FlagDeclaration,
+    FlagValue,
+    RuntimeModule,
+    _RuntimeModuleAssembly,  # pyright: ignore[reportPrivateUsage]
+)
 from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
@@ -161,6 +167,29 @@ _StoreT = TypeVar('_StoreT')
 # 代价是 broker 必须让回调看得见调用方 publish 时的上下文；这条已经是 MessageBroker 的明文契约
 # 并由契约套件强制，见 protocols/broker.py。
 _ACTIVATION_ALLOWED: ContextVar[bool] = ContextVar('syndica_activation_allowed', default=True)
+_SHUTTING_DOWN: ContextVar[tuple[object, ...]] = ContextVar('syndica_shutting_down', default=())
+
+
+def _observe_shutdown_task(task: asyncio.Task[None]) -> None:
+    """取回后台关机失败；后续 await 同一任务仍会得到同一个异常。"""
+    try:
+        failure = task.exception()
+    except asyncio.CancelledError:
+        logger.error(
+            '期望: Runtime 的共享关机任务完成全部清理。'
+            ' 实际: 关机任务自身被取消。'
+            ' 下一步: 不要直接取消 runtime:shutdown 任务；取消调用方自己的 shutdown 等待即可。'
+        )
+        return
+    if failure is not None:
+        logger.error(
+            '期望: Runtime Module 全部正常关闭。'
+            ' 实际: 共享关机任务以 %s: %s 结束。'
+            ' 下一步: 再次 await runtime.shutdown() 取得同一异常组，并修复其中点名的 Module。',
+            type(failure).__name__,
+            failure,
+        )
+
 
 # 「此刻这段代码跑在谁的事件循环里」。`_drive` 在入口无条件置位，其余一律读它。
 #
@@ -709,9 +738,12 @@ class Runtime:
         plugins: Sequence[Plugin] | None = None,
         agents: Mapping[str, AgentFactory] | None = None,
         orchestration: bool = False,
+        modules: Sequence[RuntimeModule] | None = None,
+        flags: Mapping[str, FlagValue] | None = None,
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
+        module_assembly = _RuntimeModuleAssembly(modules, flags)
         self.registry: AgentRegistry = (
             InMemoryAgentRegistry()
             if registry is None
@@ -751,7 +783,8 @@ class Runtime:
         # 摘是幂等的，报不是。**不用它让谁等谁**（理由见模块文档）。
         self._destroying: dict[str, _Teardown] = {}
         self._closed = False
-        self._shutdown_reported = False
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._shutdown_waits_for: dict[Runtime, int] = {}
         # 拓扑别名与 `_slots` 不是一张表。`_slots` 是每个已 spawn Agent 的生命周期；别名是
         # 「槽名 → 当时的 agent_id」快照。复用 `_slots` 会让一次 occupy 盖掉驱动任务。
         self._assembled = False
@@ -759,6 +792,8 @@ class Runtime:
         self._topology_aliases: dict[str, str] = {}
         self._topology_alias_owners: dict[str, str] = {}
         self._topology_tools: dict[str, Tool] = {}
+        self._module_assembly = module_assembly
+        self._module_assembly.install(self)
         # 「队列不存在」是懒启动与 ZOMBIE 复活的唯一触发点（spec §4.4）。接在这里，而不是让每个
         # 调用方自己先判断再激活——那样「复活」就有了 N 份实现。
         self.broker.on_missing_queue(self._on_missing_queue)
@@ -771,6 +806,21 @@ class Runtime:
         内部列表的话，第一个读者一次 `append` 就改了后来每个读者看到的答案。
         """
         return self._plugin_names
+
+    @property
+    def modules(self) -> tuple[str, ...]:
+        """已装 Runtime Module 的名字，按装配顺序。"""
+        return self._module_assembly.names
+
+    @property
+    def flags(self) -> Mapping[str, FlagValue]:
+        """Runtime 级 Flag 的只读解析结果。"""
+        return self._module_assembly.flags
+
+    @property
+    def flag_declarations(self) -> tuple[FlagDeclaration, ...]:
+        """已装 Module 的 Flag 声明，按 Module 与声明顺序。"""
+        return self._module_assembly.declarations
 
     @property
     def agent_names(self) -> tuple[str, ...]:
@@ -2437,14 +2487,58 @@ class Runtime:
         取消不等于停下：任务还要一路展开出来。不等它们停下，未结束的任务会在解释器退出时留下
         一串 "Task was destroyed but it is pending"。
         """
+        chain = _SHUTTING_DOWN.get()
+        if self in chain:
+            # 生命周期回调已在这条清理链里；A 关 B、B 再关 A 也会形成同一种永久环。
+            return
+        task = self._shutdown_task
+        if task is None:
+            # 检查与赋值之间没有挂起点，同一事件循环里只会创建一条清理任务。shield 让调用方取消
+            # 自己的等待时不把 Runtime 留在拆到一半的状态。
+            task = asyncio.create_task(self._shutdown_once(), name='runtime:shutdown')
+            task.add_done_callback(_observe_shutdown_task)
+            self._shutdown_task = task
+        caller = cast('Runtime | None', chain[-1] if chain else None)
+        if caller is not None and self._shutdown_reaches(caller):
+            return
+        if caller is not None:
+            caller._shutdown_waits_for[self] = caller._shutdown_waits_for.get(self, 0) + 1
+        try:
+            await asyncio.shield(task)
+        finally:
+            if caller is not None:
+                remaining = caller._shutdown_waits_for[self] - 1
+                if remaining:
+                    caller._shutdown_waits_for[self] = remaining
+                else:
+                    del caller._shutdown_waits_for[self]
+
+    def _shutdown_reaches(self, target: Runtime) -> bool:
+        """当前关机等待图里，从 self 出发能否走到 target。"""
+        pending: list[Runtime] = [self]
+        seen: set[Runtime] = set()
+        while pending:
+            runtime = pending.pop()
+            if runtime is target:
+                return True
+            if runtime in seen:
+                continue
+            seen.add(runtime)
+            pending.extend(runtime._shutdown_waits_for)
+        return False
+
+    async def _shutdown_once(self) -> None:
+        """完整关机只跑一次；每个公开 `shutdown` 调用等待本任务的同一结果。"""
+        token = _SHUTTING_DOWN.set((*_SHUTTING_DOWN.get(), self))
+        try:
+            await self._shutdown_body()
+        finally:
+            _SHUTTING_DOWN.reset(token)
+
+    async def _shutdown_body(self) -> None:
+        """执行关机步骤；与共享任务和重入检测分开。"""
         # 置位在 gather 之前：与本次关机并发的 spawn 既赶不上取消名单、事件又发不出去。
-        # 触发只报一次：拆除每一步都是幂等的，必须照常做完全部拆除（返回即意味着都停了）。不能在
-        # 方法开头 `if self._closed: return`——那会让第二次调用在第一次还没跑完时提前返回。
-        report = not self._shutdown_reported
-        self._shutdown_reported = True
         self._closed = True
-        # 摘回调也在 gather 之前：链是 broker 的，活得比本 Runtime 长。不摘，共享 broker 上每个
-        # 关停的 Runtime 都留一条永远答 False 的死回调，并靠那条引用把自己整个钉在内存里。
         self.broker.off_missing_queue(self._on_missing_queue)
         tasks = [
             task
@@ -2462,6 +2556,17 @@ class Runtime:
             reapers = list(self._reapers)
             self._reapers.clear()
             await asyncio.gather(*reapers, return_exceptions=True)
-        if report:
-            await self.hooks.trigger(Junction.RUNTIME_SHUTDOWN)
-        await self.events.close()
+        await self.hooks.trigger(Junction.RUNTIME_SHUTDOWN)
+        failures: list[BaseException] = []
+        try:
+            failures.extend(await self._module_assembly.shutdown(self))
+        finally:
+            await self.events.close()
+        if not failures:
+            return
+        if all(isinstance(failure, Exception) for failure in failures):
+            raise ExceptionGroup(
+                'Runtime Module 关闭失败',
+                cast(list[Exception], failures),
+            )
+        raise BaseExceptionGroup('Runtime Module 关闭失败', failures)

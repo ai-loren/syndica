@@ -480,6 +480,8 @@ def test_assemble_does_not_add_runtime_start_or_a_start_method() -> None:
         'plugins',
         'agents',
         'orchestration',
+        'modules',
+        'flags',
     )
     source = inspect.getsource(Runtime.assemble)
     assert 'RUNTIME_START' not in source

@@ -350,3 +350,210 @@ class RuntimeModule:
         object.__setattr__(self, 'tool_factories', checked_tools)
         object.__setattr__(self, 'on_start', on_start)
         object.__setattr__(self, 'on_shutdown', on_shutdown)
+
+
+def _module_sequence(value: object) -> tuple[RuntimeModule, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str | bytes | bytearray) or not isinstance(value, Sequence):
+        raise _config(
+            'modules 是 RuntimeModule 实例的 list / tuple 序列',
+            f'收到 modules={value!r}，类型是 {type(value).__name__}',
+            '传入 RuntimeModule 实例序列，例如 modules=[RuntimeModule("audit")]',
+        )
+    modules: list[RuntimeModule] = []
+    names: list[str] = []
+    for index, module in enumerate(cast(Sequence[object], value)):
+        if isinstance(module, type) or not isinstance(module, RuntimeModule):
+            raise _config(
+                f'modules[{index}] 是 RuntimeModule 实例',
+                f'收到 {module!r}，类型是 {type(module).__name__}',
+                '传入构造后的实例；若传的是 RuntimeModule 类本身，请加上括号',
+            )
+        if module.name in names:
+            raise _config(
+                '一个 Runtime 内每个 Runtime Module 名只出现一次',
+                f'modules[{index}] 的 name={module.name!r} 与前面重复',
+                '去掉重复 Module；重复装配会让 hook、工具与清理各执行两次',
+            )
+        modules.append(module)
+        names.append(module.name)
+    return tuple(modules)
+
+
+def _declarations(
+    modules: Sequence[RuntimeModule],
+) -> tuple[FlagDeclaration, ...]:
+    declarations: list[FlagDeclaration] = []
+    owners: dict[str, str] = {}
+    for module in modules:
+        for declaration in module.flags:
+            previous = owners.get(declaration.key)
+            if previous is not None:
+                raise _config(
+                    '一个 Runtime 内每个 Flag key 只由一个 Module 声明',
+                    (f'key={declaration.key!r} 同时由 Module {previous!r} 与 {module.name!r} 声明'),
+                    '给其中一项换一个稳定 key；即使声明相同，也必须只有一个所有者',
+                )
+            owners[declaration.key] = module.name
+            declarations.append(declaration)
+    return tuple(declarations)
+
+
+def _override(declaration: FlagDeclaration, value: object, *, source: str) -> FlagValue:
+    expected_type = type(declaration.default)
+    if type(value) is not expected_type:
+        raise _config(
+            (
+                f'Flag {declaration.key!r} 是 {expected_type.__name__}，'
+                '与声明的 default 类型精确相同'
+            ),
+            f'{source}[{declaration.key!r}]={value!r}，类型是 {type(value).__name__}',
+            f'修正 {declaration.key!r} 的值；bool 不得冒充 int',
+        )
+    checked = value
+    if declaration.choices and checked not in declaration.choices:
+        raise _config(
+            f'Flag {declaration.key!r} 是 choices={declaration.choices!r} 中的一项',
+            f'{source}[{declaration.key!r}]={checked!r}',
+            f'修正 {declaration.key!r}，使用声明列出的值之一',
+        )
+    if type(checked) is int and (
+        (declaration.minimum is not None and checked < declaration.minimum)
+        or (declaration.maximum is not None and checked > declaration.maximum)
+    ):
+        raise _config(
+            (
+                f'Flag {declaration.key!r} 落在 '
+                f'minimum={declaration.minimum!r} maximum={declaration.maximum!r} 的闭区间'
+            ),
+            f'{source}[{declaration.key!r}]={checked!r}',
+            f'修正 {declaration.key!r}，使它不越过 minimum / maximum',
+        )
+    return checked
+
+
+def _overrides(
+    value: object,
+    declarations: Mapping[str, FlagDeclaration],
+    *,
+    source: str,
+) -> dict[str, FlagValue]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise _config(
+            f'{source} 是 Flag key 到 bool | int | str 的 Mapping，或 None',
+            f'收到 {source}={value!r}，类型是 {type(value).__name__}',
+            f'修正 {source}：传 dict，例如 {source}={{"feature_enabled": True}}',
+        )
+    resolved: dict[str, FlagValue] = {}
+    for key, raw in cast(Mapping[object, object], value).items():
+        if not isinstance(key, str) or key not in declarations:
+            raise _config(
+                f'{source} 的每个 key 都由已安装的 Runtime Module 声明',
+                f'收到未知 key={key!r}；已声明: {sorted(declarations)}',
+                f'修正 {source}：删除这个 key，或安装声明它的 Module',
+            )
+        resolved[key] = _override(declarations[key], raw, source=source)
+    return resolved
+
+
+class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
+    """一次 Runtime 的 Module 声明、Flag 默认值与生命周期回调。"""
+
+    def __init__(self, modules: object, flags: object) -> None:
+        self.module_objects = _module_sequence(modules)
+        self.names = tuple(module.name for module in self.module_objects)
+        self.declarations = _declarations(self.module_objects)
+        by_key = {declaration.key: declaration for declaration in self.declarations}
+        resolved = {declaration.key: declaration.default for declaration in self.declarations}
+        resolved.update(_overrides(flags, by_key, source='flags'))
+        self.flags: Mapping[str, FlagValue] = MappingProxyType(resolved)
+        self._mounted_services: tuple[str, ...] = ()
+
+    def install(self, runtime: Runtime) -> None:
+        services = [
+            (module, name, factory)
+            for module in self.module_objects
+            for name, factory in module.services.items()
+        ]
+        names: set[str] = set()
+        existing = set(dir(runtime))
+        for module, name, _ in services:
+            if name in existing or name in names:
+                owner = (
+                    'Runtime 已有公开属性' if name in existing else '前面的另一个 Runtime Module'
+                )
+                raise _config(
+                    'Runtime service 名不覆盖现有公开属性，且在 Module 间唯一',
+                    f'Module {module.name!r} 的 service {name!r} 与{owner}冲突',
+                    '换一个 service 名；服务会直接挂成 runtime.<name>',
+                )
+            names.add(name)
+
+        hooks = runtime.hooks
+        snapshot = hooks._assembly_snapshot()  # pyright: ignore[reportPrivateUsage]
+        mounted: list[str] = []
+        try:
+            for _module, name, factory in services:
+                service = factory(runtime, self.flags)
+                if inspect.isawaitable(service):
+                    if inspect.iscoroutine(service):
+                        service.close()
+                    raise _config(
+                        f'Module {_module.name!r} 的 service {name!r} 由同步 factory 创建',
+                        f'factory 返回了 awaitable：{type(service).__name__}',
+                        (
+                            '把异步初始化留在 service 自己的方法里；'
+                            'service factory 必须直接返回可挂到 runtime 上的对象'
+                        ),
+                    )
+                setattr(runtime, name, service)
+                mounted.append(name)
+            for module in self.module_objects:
+                if module.on_start is None:
+                    continue
+                returned = module.on_start(runtime, self.flags)
+                if returned is not None:
+                    if inspect.iscoroutine(returned):
+                        returned.close()
+                    raise _config(
+                        f'Module {module.name!r} 的 on_start 返回 None',
+                        (
+                            f'Module {module.name!r} 实际返回 '
+                            f'{type(returned).__name__} 类型的 {returned!r}'
+                        ),
+                        '让 on_start 完成同步装配后 return None；异步初始化请放进 Runtime service',
+                    )
+        except BaseException:
+            hooks._assembly_restore(snapshot)  # pyright: ignore[reportPrivateUsage]
+            for name in reversed(mounted):
+                delattr(runtime, name)
+            raise
+        self._mounted_services = tuple(mounted)
+
+    async def shutdown(self, runtime: Runtime) -> list[BaseException]:
+        failures: list[BaseException] = []
+        for module in reversed(self.module_objects):
+            callback = module.on_shutdown
+            if callback is None:
+                continue
+            try:
+                returned = callback(runtime)
+                if not inspect.isawaitable(returned):
+                    raise _config(
+                        f'Module {module.name!r} 的 on_shutdown 返回 Awaitable[None]',
+                        f'实际返回 {type(returned).__name__} 类型的 {returned!r}',
+                        '让 on_shutdown 返回 coroutine / Future，并在完成时返回 None',
+                    )
+                completed = await returned
+                if completed is not None:
+                    raise _config(
+                        f'Module {module.name!r} 的 on_shutdown await 后返回 None',
+                        f'实际返回 {type(completed).__name__} 类型的 {completed!r}',
+                        '让 on_shutdown 的异步清理结束时 return None',
+                    )
+            except BaseException as exc:
+                failures.append(exc)
+        return failures

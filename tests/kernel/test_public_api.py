@@ -127,9 +127,12 @@ _RUNTIME_SURFACE: tuple[str, ...] = (
     'despawn',
     'ensure_active',
     'events',
+    'flag_declarations',
+    'flags',
     'find',
     'hooks',
     'kill',
+    'modules',
     'occupy',
     'pause',
     'plugins',
@@ -165,6 +168,8 @@ _RUNTIME_INIT: tuple[tuple[str, str, bool], ...] = (
     ('plugins', 'KEYWORD_ONLY', True),
     ('agents', 'KEYWORD_ONLY', True),
     ('orchestration', 'KEYWORD_ONLY', True),
+    ('modules', 'KEYWORD_ONLY', True),
+    ('flags', 'KEYWORD_ONLY', True),
 )
 _BASE_AGENT_INIT: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),
@@ -389,6 +394,25 @@ def test_the_runtime_surface_is_exactly_this(orchestration: bool):
     assert sorted(name for name in dir(runtime) if not name.startswith('_')) == sorted(
         _RUNTIME_SURFACE
     )
+
+
+async def test_a_module_adds_exactly_its_declared_runtime_services():
+    from syndica.kernel.modules import RuntimeModule
+
+    runtime = Runtime(
+        modules=[
+            RuntimeModule(
+                'clock',
+                services={'clock_service': lambda *_: object()},
+            )
+        ]
+    )
+    try:
+        assert sorted(name for name in dir(runtime) if not name.startswith('_')) == sorted(
+            (*_RUNTIME_SURFACE, 'clock_service')
+        )
+    finally:
+        await runtime.shutdown()
 
 
 def test_the_base_agent_surface_is_exactly_this():

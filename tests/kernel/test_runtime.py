@@ -6958,8 +6958,8 @@ async def test_concurrent_shutdown_triggers_runtime_shutdown_only_once():
     assert seen == ['shutdown']
 
 
-async def test_second_shutdown_still_closes_the_bus_while_the_first_is_in_the_hook():
-    """第二次不得在方法开头见 `_closed` 就返回：那会把关闭总线这一步跳过。"""
+async def test_concurrent_shutdown_waits_for_the_same_complete_cleanup():
+    """每个成功返回的 shutdown 都保证 lifecycle hook 与事件总线已经关闭。"""
     entered = asyncio.Event()
     hold = asyncio.Event()
 
@@ -6972,7 +6972,12 @@ async def test_second_shutdown_still_closes_the_bus_while_the_first_is_in_the_ho
     runtime.hooks.register(Junction.RUNTIME_SHUTDOWN, stall)
     first = asyncio.create_task(runtime.shutdown())
     await asyncio.wait_for(entered.wait(), _TIMEOUT)
-    await runtime.shutdown()
+    second = asyncio.create_task(runtime.shutdown())
+    await asyncio.sleep(0)
+    assert not second.done()
+    hold.set()
+    await asyncio.gather(first, second)
+
     probe = runtime.events.subscribe()
     await runtime.events.emit(Event(kind='probe', agent_id='none'))
     got: list[Event] = []
@@ -6981,8 +6986,6 @@ async def test_second_shutdown_still_closes_the_bus_while_the_first_is_in_the_ho
     except (StopAsyncIteration, TimeoutError):
         pass
     assert got == []
-    hold.set()
-    await first
 
 
 async def test_kill_then_despawn_does_not_error_when_the_zombie_transition_loses_the_entry(
