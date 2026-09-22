@@ -249,7 +249,12 @@ class AgentCatalog:
         cls = self._resolve_class(manifest)
         tool_names = self._union_tool_names(manifest)
         captured_tools = dict(resolve_tool_names(tool_names, tools))
-        prompt = _interpolate_prompt(manifest.system_prompt, host, role=manifest.name)
+        prompt = _role_prompt(
+            cls,
+            self,
+            _interpolate_prompt(manifest.system_prompt, host, role=manifest.name),
+            role=manifest.name,
+        )
         options = AgentOptions(
             name=manifest.name,
             llm=models[manifest.model],
@@ -633,6 +638,33 @@ def _import_impl(path: str) -> type[BaseAgent]:
             )
         obj = getattr(obj, part)
     return _base_agent_subclass(obj)
+
+
+def _role_prompt(
+    cls: type[BaseAgent],
+    catalog: AgentCatalog,
+    interpolated: str,
+    *,
+    role: str,
+) -> str:
+    """类可以在 freeze 时用目录里当时的 description 拼系统提示词。
+
+    拼在 freeze，不在 register：用户后载入的同名清单要能换掉内置描述，编排者看到的是
+    覆盖之后的那一句。没有 `compose_system_prompt` 的角色沿用清单里的提示词。
+    """
+    composer = cast('object', getattr(cls, 'compose_system_prompt', None))
+    if not callable(composer):
+        return interpolated
+    composed = composer(catalog)
+    if not isinstance(composed, str) or not composed.strip():
+        raise ConfigError(
+            expected=f'{role!r} 的 compose_system_prompt 返回非空白 str',
+            received=f'收到 {composed!r}',
+            next_action='返回拼好的系统提示词；各角色描述从 catalog.get 取，不要写死覆盖前的文案',
+        )
+    if not interpolated:
+        return composed
+    return f'{composed}\n{interpolated}'
 
 
 def _interpolate_prompt(prompt: object, host: HostFacts | None, *, role: str) -> str:

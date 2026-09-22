@@ -437,6 +437,15 @@ class BaseAgent:
         self.options = options
         self._executor._retarget(merged)  # pyright: ignore[reportPrivateUsage]
 
+    def install_own_tools(self, runtime: object) -> None:
+        """驱动方装完编排工具之后，角色再装只属于自己的那一套。缺省什么都不装。
+
+        调用点在 `Runtime.spawn`，且在 `Runtime(orchestration=)` 那一支之后：编排旗子关掉时，
+        需要派活的角色仍然得在这里自己装上 Delegate。已经有同名工具就不要再装——再装会盖掉
+        旗子刚刚绑上的那一套。
+        """
+        del runtime
+
     @property
     def context(self) -> Context:
         return self._context

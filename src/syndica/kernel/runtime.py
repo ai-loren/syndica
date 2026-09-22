@@ -857,6 +857,9 @@ class Runtime:
         gate = BrokerTurnGate(agent_id, self.broker, control)
         agent._attach_gate(gate)  # pyright: ignore[reportPrivateUsage]
         self._install_orchestration(agent, agent_id)
+        # 旗子只决定其它角色。Orchestrator 在旗子关掉时仍要能派活，所以每个角色都有一次
+        # 自己装工具的机会；缺省实现什么都不做。
+        agent.install_own_tools(self)
         if fork_from is not None:
             source = self._table.get(fork_from)
             if source is None:
