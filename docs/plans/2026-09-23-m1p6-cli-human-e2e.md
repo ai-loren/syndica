@@ -259,7 +259,7 @@ expect:
 
 ### Task 6 — CLI 路由、参数与惰性导入
 
-**状态：pending**
+**状态：completed**（61 条 CLI / 依赖测试；6 条真实变异；独立审查修复 1 项后 APPROVE）
 
 **Files:** `src/syndica/cli/`、`src/syndica/__main__.py`、`pyproject.toml`、CLI 单测
 
@@ -369,6 +369,10 @@ expect:
   `subscription.dropped` 与从 1 连续的 sequence，不能把截断后的有序后缀当成完整轨迹。
 - Task 5：真实 Bash 可以生成二进制文件，而 L2 v1 的 workspace 契约是文本 Mapping；快照遇到
   非 UTF-8 文件时必须给出带相对路径的 `ScenarioMismatch`，不能泄漏裸解码异常。
+- Task 6：argparse 默认把 help / usage 写到进程全局流，注入 `CliIO` 本身不够；解析必须在重定向
+  上下文中运行，否则嵌入式宿主和测试都拿不到完整输出。
+- Task 6：Runtime host 可能抛不带三件套的普通异常；CLI 进程边界必须保留异常类型与消息并补齐
+  expected / received / next_action，不能把 traceback 直接交给终端用户。
 
 ## 文档更新清单
 
