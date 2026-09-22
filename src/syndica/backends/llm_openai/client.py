@@ -12,6 +12,7 @@ import httpx
 from syndica.kernel.context import ContextBlock, ToolCall
 from syndica.kernel.errors import ConfigError, LLMResponseError
 from syndica.kernel.llm import LLMConfig
+from syndica.kernel.llm.base import _stable_json_bytes  # pyright: ignore[reportPrivateUsage]
 
 __all__ = ['OpenAICompatible']
 
@@ -238,7 +239,11 @@ class OpenAICompatible:
     def config(self) -> LLMConfig:
         return self._config
 
-    async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+    def _request_parts(
+        self,
+        messages: list[ContextBlock],
+        kwargs: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, object]]]:
         request_args = {**self._config.request_args, **kwargs}
         reserved = sorted(_RESERVED_REQUEST_KEYS & set(request_args))
         if reserved:
@@ -248,11 +253,35 @@ class OpenAICompatible:
                 '用 LLMConfig.derive(model=...) 改模型；消息只通过 create(messages) 传入',
             )
         raw_tools = request_args.pop('tools', [])
+        encoded_messages = [_message(block) for block in messages]
+        tools = _tool_payloads(raw_tools)
+        return request_args, encoded_messages, tools
+
+    def cache_prefix_units(
+        self,
+        messages: list[ContextBlock],
+        **kwargs: Any,
+    ) -> tuple[bytes, ...]:
+        request_args, encoded_messages, tools = self._request_parts(messages, kwargs)
+        system: dict[str, Any] | None = None
+        history = encoded_messages
+        if messages and messages[0].role == 'system':
+            system = encoded_messages[0]
+            history = encoded_messages[1:]
+        return (
+            _stable_json_bytes({'provider': self._config.provider, 'model': self._config.model}),
+            _stable_json_bytes(request_args),
+            _stable_json_bytes(system),
+            _stable_json_bytes(tools),
+            *(_stable_json_bytes(message) for message in history),
+        )
+
+    async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        request_args, encoded_messages, tools = self._request_parts(messages, kwargs)
         body: dict[str, object] = {
             'model': self._config.model,
-            'messages': [_message(block) for block in messages],
+            'messages': encoded_messages,
         }
-        tools = _tool_payloads(raw_tools)
         if tools:
             body['tools'] = tools
         body.update(request_args)

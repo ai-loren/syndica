@@ -8,6 +8,7 @@ API 密钥、base URL 这类部署事实由宿主填进 `client_args`。
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Protocol, Self, cast, runtime_checkable
@@ -15,7 +16,7 @@ from typing import Any, Protocol, Self, cast, runtime_checkable
 from syndica.kernel.context import ContextBlock
 from syndica.kernel.errors import ConfigError, SyndicaError
 
-__all__ = ['ContextOverflowError', 'LLM', 'LLMConfig']
+__all__ = ['CachePrefixProvider', 'ContextOverflowError', 'LLM', 'LLMConfig']
 
 
 class ContextOverflowError(SyndicaError):
@@ -112,3 +113,61 @@ class LLM(Protocol):
         远端连接留在那里。
         """
         ...
+
+
+@runtime_checkable
+class CachePrefixProvider(Protocol):
+    """给漂移检测器提供模型实际用于前缀匹配的有序请求单位。
+
+    顺序固定为 provider/model、最终请求参数、system、tools、逐条历史。每项必须是稳定编码后的
+    `bytes`；只有在末尾追加历史时，旧 tuple 才会是新 tuple 的前缀。
+    """
+
+    def cache_prefix_units(
+        self,
+        messages: list[ContextBlock],
+        **kwargs: Any,
+    ) -> tuple[bytes, ...]: ...
+
+
+def _stable_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(',', ':'),
+    ).encode('utf-8')
+
+
+def _provider_visible_message(block: ContextBlock) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        'role': block.role,
+        'content': block.content,
+        'tool_calls': [
+            {'id': call.id, 'name': call.name, 'arguments': call.arguments}
+            for call in block.tool_calls
+        ],
+        'tool_call_id': block.tool_call_id,
+    }
+    return {key: value for key, value in values.items() if value}
+
+
+def _logical_cache_prefix_units(  # pyright: ignore[reportUnusedFunction]
+    config: LLMConfig,
+    messages: list[ContextBlock],
+    request: Mapping[str, Any],
+) -> tuple[bytes, ...]:
+    """第三方 provider 的通用逻辑编码；只保留模型可见字段与原有顺序。"""
+    request_args = {**config.request_args, **request}
+    tools = request_args.pop('tools', [])
+    system: ContextBlock | None = None
+    history = messages
+    if messages and messages[0].role == 'system':
+        system = messages[0]
+        history = messages[1:]
+    return (
+        _stable_json_bytes({'provider': config.provider, 'model': config.model}),
+        _stable_json_bytes(request_args),
+        _stable_json_bytes(None if system is None else _provider_visible_message(system)),
+        _stable_json_bytes(tools),
+        *(_stable_json_bytes(_provider_visible_message(block)) for block in history),
+    )

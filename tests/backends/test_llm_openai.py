@@ -14,7 +14,7 @@ import pytest
 from syndica.backends.llm_openai import OpenAICompatible
 from syndica.kernel.context import ArtifactRef, ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError, LLMResponseError
-from syndica.kernel.llm import LLMConfig
+from syndica.kernel.llm import CachePrefixProvider, LLMConfig
 
 
 def _config(*, timeout: float = 3.5) -> LLMConfig:
@@ -110,6 +110,97 @@ async def test_message_keys_follow_role_content_tool_calls_tool_call_id() -> Non
         ['role', 'content', 'tool_calls'],
         ['role', 'content', 'tool_call_id'],
     ]
+
+
+def test_cache_prefix_units_reuse_the_exact_openai_message_and_tool_encoding() -> None:
+    llm = OpenAICompatible(_config())
+    tools = [
+        {
+            'name': 'Beta',
+            'description': 'beta',
+            'parameters': {
+                'required': ['value'],
+                'title': 'Removed',
+                'type': 'object',
+                'properties': {'value': {'title': 'Removed Too', 'type': 'string'}},
+            },
+        },
+        {'name': 'Alpha', 'description': 'alpha', 'parameters': {'type': 'object'}},
+        {'name': 'Gamma', 'description': 'gamma', 'parameters': {'type': 'object'}},
+    ]
+    messages = [
+        ContextBlock(role='system', content='system'),
+        ContextBlock(
+            role='user',
+            content='你好',
+            trust=TrustLevel.UNTRUSTED,
+            extra={'private': 'not visible'},
+        ),
+        ContextBlock(
+            role='assistant',
+            tool_calls=[ToolCall(id='c1', name='Beta', arguments='{"value":"x"}')],
+        ),
+    ]
+
+    assert isinstance(llm, CachePrefixProvider)
+    decoded = [
+        json.loads(unit)
+        for unit in llm.cache_prefix_units(
+            messages,
+            tools=tools,
+            temperature=1,
+            zeta='last',
+        )
+    ]
+
+    assert decoded == [
+        {'provider': 'openai-compatible', 'model': 'model-a'},
+        {'temperature': 1, 'zeta': 'last'},
+        {'role': 'system', 'content': 'system'},
+        [
+            {
+                'type': 'function',
+                'function': {
+                    'name': 'Beta',
+                    'description': 'beta',
+                    'parameters': {
+                        'required': ['value'],
+                        'type': 'object',
+                        'properties': {'value': {'type': 'string'}},
+                    },
+                },
+            },
+            {
+                'type': 'function',
+                'function': {
+                    'name': 'Alpha',
+                    'description': 'alpha',
+                    'parameters': {'type': 'object'},
+                },
+            },
+            {
+                'type': 'function',
+                'function': {
+                    'name': 'Gamma',
+                    'description': 'gamma',
+                    'parameters': {'type': 'object'},
+                },
+            },
+        ],
+        {'role': 'user', 'content': '你好'},
+        {
+            'role': 'assistant',
+            'tool_calls': [
+                {
+                    'id': 'c1',
+                    'type': 'function',
+                    'function': {'name': 'Beta', 'arguments': '{"value":"x"}'},
+                }
+            ],
+        },
+    ]
+    assert [item['function']['name'] for item in decoded[3]] == ['Beta', 'Alpha', 'Gamma']
+    assert list(decoded[3][0]['function']['parameters']) == ['required', 'type', 'properties']
 
 
 async def test_schema_title_and_defs_are_stripped() -> None:

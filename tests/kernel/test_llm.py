@@ -1,11 +1,19 @@
 import copy
 import dataclasses
+import json
 
 import pytest
 
 from syndica.kernel.context import ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError, LLMResponseError, SyndicaError
-from syndica.kernel.llm import LLM, ContextOverflowError, LLMConfig, ScriptedLLM, ScriptedTurn
+from syndica.kernel.llm import (
+    LLM,
+    CachePrefixProvider,
+    ContextOverflowError,
+    LLMConfig,
+    ScriptedLLM,
+    ScriptedTurn,
+)
 
 
 def _config() -> LLMConfig:
@@ -23,6 +31,69 @@ def _overflow() -> ContextOverflowError:
         received='超出窗口',
         next_action='压缩上下文后重试',
     )
+
+
+def test_scripted_llm_exposes_ordered_provider_visible_cache_prefix_units():
+    llm = ScriptedLLM(
+        [],
+        config=LLMConfig(
+            provider='scripted',
+            model='m1',
+            request_args={'temperature': 0, 'top_p': 0.8},
+        ),
+    )
+    tools = [
+        {
+            'name': 'Beta',
+            'description': 'beta',
+            'parameters': {
+                'required': ['value'],
+                'type': 'object',
+                'properties': {'value': {'type': 'string'}},
+            },
+        },
+        {'name': 'Alpha', 'description': 'alpha', 'parameters': {'type': 'object'}},
+        {'name': 'Gamma', 'description': 'gamma', 'parameters': {'type': 'object'}},
+    ]
+    messages = [
+        ContextBlock(role='system', content='system'),
+        ContextBlock(
+            role='user',
+            content='你好',
+            trust=TrustLevel.UNTRUSTED,
+            extra={'private': 'not visible'},
+        ),
+        ContextBlock(
+            role='assistant',
+            tool_calls=[ToolCall(id='c1', name='Beta', arguments='{"value":"x"}')],
+        ),
+    ]
+
+    assert isinstance(llm, CachePrefixProvider)
+    decoded = [
+        json.loads(unit)
+        for unit in llm.cache_prefix_units(
+            messages,
+            tools=tools,
+            temperature=1,
+            zeta='last',
+        )
+    ]
+
+    assert decoded == [
+        {'provider': 'scripted', 'model': 'm1'},
+        {'temperature': 1, 'top_p': 0.8, 'zeta': 'last'},
+        {'role': 'system', 'content': 'system'},
+        tools,
+        {'role': 'user', 'content': '你好'},
+        {
+            'role': 'assistant',
+            'tool_calls': [{'id': 'c1', 'name': 'Beta', 'arguments': '{"value":"x"}'}],
+        },
+    ]
+    assert list(decoded[1]) == ['temperature', 'top_p', 'zeta']
+    assert [item['name'] for item in decoded[3]] == ['Beta', 'Alpha', 'Gamma']
+    assert list(decoded[3][0]['parameters']) == ['required', 'type', 'properties']
 
 
 def test_config_is_frozen():

@@ -15,7 +15,10 @@ from typing import Any
 
 from syndica.kernel.context import ContextBlock, ToolCall
 from syndica.kernel.errors import ConfigError
-from syndica.kernel.llm.base import LLMConfig
+from syndica.kernel.llm.base import (
+    LLMConfig,
+    _logical_cache_prefix_units,  # pyright: ignore[reportPrivateUsage]
+)
 
 __all__ = ['ScriptedLLM', 'ScriptedTurn']
 
@@ -64,6 +67,13 @@ class ScriptedLLM:
     @property
     def config(self) -> LLMConfig:
         return self._config
+
+    def cache_prefix_units(
+        self,
+        messages: list[ContextBlock],
+        **kwargs: Any,
+    ) -> tuple[bytes, ...]:
+        return _logical_cache_prefix_units(self._config, messages, kwargs)
 
     async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
         self.calls.append(copy.deepcopy(messages))
