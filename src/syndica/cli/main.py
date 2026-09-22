@@ -63,6 +63,10 @@ class CliHost(Protocol):
 
     def doctor(self, config: str) -> str: ...
 
+    def open_chat(self, config: str) -> str: ...
+
+    def active_agents(self) -> str: ...
+
 
 class _ParserExit(Exception):
     def __init__(self, status: int, message: str | None = None) -> None:
@@ -113,7 +117,7 @@ def _parser() -> _ArgumentParser:
     target = run.add_mutually_exclusive_group()
     target.add_argument('--agent')
     target.add_argument('--topology')
-    run.add_argument('--session')
+    target.add_argument('--session')
     run.add_argument('--max-turns', type=_positive_int)
     run.add_argument('--max-cost', type=_positive_float)
     run.add_argument('--max-tokens', type=_positive_int)
@@ -207,24 +211,78 @@ def _host_call(action: Callable[[], str], streams: CliIO) -> int:
     try:
         output = action()
     except Exception as exc:
-        parts = (
-            getattr(exc, 'expected', None),
-            getattr(exc, 'received', None),
-            getattr(exc, 'next_action', None),
-        )
-        if all(isinstance(part, str) and part.strip() for part in parts):
-            expected, received, next_action = parts
-        else:
-            expected = 'CLI host 完成当前命令'
-            received = f'{type(exc).__name__}: {exc}'
-            next_action = '检查 Runtime host 配置和错误日志后重试'
-        _write(
-            streams.stderr,
-            f'期望: {expected}\n实际: {received}\n下一步: {next_action}',
-        )
-        return 1
+        return _host_failure(exc, streams)
     _write(streams.stdout, output)
     return 0
+
+
+def _host_failure(exc: Exception, streams: CliIO) -> int:
+    parts = (
+        getattr(exc, 'expected', None),
+        getattr(exc, 'received', None),
+        getattr(exc, 'next_action', None),
+    )
+    if all(isinstance(part, str) and part.strip() for part in parts):
+        expected, received, next_action = parts
+    else:
+        expected = 'CLI host 完成当前命令'
+        received = f'{type(exc).__name__}: {exc}'
+        next_action = '检查 Runtime host 配置和错误日志后重试'
+    _write(
+        streams.stderr,
+        f'期望: {expected}\n实际: {received}\n下一步: {next_action}',
+    )
+    return 1
+
+
+def _chat(host: CliHost, config: str, streams: CliIO) -> int:
+    try:
+        target = host.open_chat(config)
+    except Exception as exc:
+        return _host_failure(exc, streams)
+    while True:
+        streams.stdout.write(f'[{target}]> ')
+        streams.stdout.flush()
+        line = streams.stdin.readline()
+        if line == '':
+            return 0
+        message = line.rstrip('\r\n')
+        if not message:
+            continue
+        if message == ':quit':
+            return 0
+        if message == ':agents':
+            try:
+                _write(streams.stdout, host.active_agents())
+            except Exception as exc:
+                return _host_failure(exc, streams)
+            continue
+        if message.startswith(':use '):
+            selected = message.removeprefix(':use ')
+            if not selected:
+                _write(
+                    streams.stderr,
+                    '期望: :use 后跟完整 agent id\n'
+                    '实际: 目标为空\n'
+                    '下一步: 先输入 :agents 查看活动 Agent，再输入 :use <agent-id>',
+                )
+                return 2
+            target = selected
+            continue
+        if message.startswith(':'):
+            _write(
+                streams.stderr,
+                '期望: chat 控制命令是 :agents / :use <agent-id> / :quit\n'
+                f'实际: 收到 {message!r}\n'
+                '下一步: 改用已列出的控制命令，普通消息不要以冒号开头',
+            )
+            return 2
+        request = RunRequest(prompt=message, config=config, session=target)
+        try:
+            output = host.run_request(request)
+        except Exception as exc:
+            return _host_failure(exc, streams)
+        _write(streams.stdout, output)
 
 
 def main(
@@ -284,13 +342,7 @@ def main(
     if namespace.command == 'doctor':
         return _host_call(lambda: host.doctor(namespace.config), streams)
     if namespace.command == 'chat':
-        _write(
-            streams.stderr,
-            '期望: chat 进入交互式 Runtime host\n'
-            '实际: 当前 CLI router 尚未装配交互循环\n'
-            '下一步: 使用 run，或完成计划 6 Task 7 的 chat host',
-        )
-        return 2
+        return _chat(host, namespace.config, streams)
     request = RunRequest(
         prompt=' '.join(namespace.prompt),
         config=namespace.config,

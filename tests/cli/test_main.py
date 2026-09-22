@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tomllib
@@ -34,6 +35,13 @@ class _Host:
     def doctor(self, config: str) -> str:
         self.doctor_configs.append(config)
         return 'healthy'
+
+    def open_chat(self, config: str) -> str:
+        assert config == '.syndica.yaml'
+        return 'root-agent-id'
+
+    def active_agents(self) -> str:
+        return 'root-agent-id Orchestrator zombie\nworker-agent-id Worker zombie'
 
 
 def test_module_version_command_does_not_import_product_packages() -> None:
@@ -246,6 +254,7 @@ def test_session_commands_fail_with_the_milestone_boundary(verb: str) -> None:
     'argv',
     [
         ['run', 'go', '--agent', 'Worker', '--topology', 'review'],
+        ['run', 'go', '--agent', 'Worker', '--session', 'existing'],
         ['run', 'go', '--max-turns', '0'],
         ['run', 'go', '--max-cost', 'nan'],
         ['run', 'go', '--max-tokens', '3.5'],
@@ -352,3 +361,76 @@ def test_unexpected_host_errors_are_wrapped_without_a_traceback() -> None:
         '实际: RuntimeError: boom\n'
         '下一步: 检查 Runtime host 配置和错误日志后重试\n'
     )
+
+
+def test_chat_uses_run_requests_and_keeps_the_current_target_visible() -> None:
+    host = _Host()
+    stdout = StringIO()
+
+    code = main(
+        ['chat'],
+        host=host,
+        io=CliIO(
+            stdin=StringIO('first message\n:agents\n:use worker-agent-id\nsecond message\n:quit\n'),
+            stdout=stdout,
+            stderr=StringIO(),
+        ),
+    )
+
+    assert code == 0
+    assert [(request.prompt, request.session) for request in host.requests] == [
+        ('first message', 'root-agent-id'),
+        ('second message', 'worker-agent-id'),
+    ]
+    assert '[root-agent-id]> ' in stdout.getvalue()
+    assert '[worker-agent-id]> ' in stdout.getvalue()
+    assert 'worker-agent-id Worker zombie' in stdout.getvalue()
+
+
+def test_module_entrypoint_lists_agents_without_model_configuration(
+    tmp_path: Path,
+) -> None:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {'OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL'}
+    }
+
+    completed = subprocess.run(
+        [sys.executable, '-m', 'syndica', 'agents', 'list'],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout.splitlines() == ['Planner', 'Explorer', 'Worker', 'Orchestrator']
+    assert completed.stderr == ''
+
+
+def test_module_entrypoint_doctor_builds_the_openai_composition_without_network(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        [sys.executable, '-m', 'syndica', 'doctor'],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            'OPENAI_BASE_URL': 'https://llm.example.test/v1',
+            'OPENAI_API_KEY': 'test-key',
+            'OPENAI_MODEL': 'model-a',
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout.splitlines() == [
+        'config: ok .syndica.yaml',
+        'models: ok default',
+        f'workspace: ok {tmp_path}',
+    ]
+    assert completed.stderr == ''

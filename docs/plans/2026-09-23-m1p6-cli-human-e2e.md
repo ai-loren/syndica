@@ -270,7 +270,7 @@ expect:
 
 ### Task 7 — CLI Runtime host 与 chat
 
-**状态：pending**
+**状态：completed**（76 条 CLI / Runtime 组合测试；12 条真实变异；两轮审查修复 4 项后 APPROVE）
 
 **Files:** CLI host / terminal 模块、composition root、CLI 集成测试
 
@@ -373,6 +373,14 @@ expect:
   上下文中运行，否则嵌入式宿主和测试都拿不到完整输出。
 - Task 6：Runtime host 可能抛不带三件套的普通异常；CLI 进程边界必须保留异常类型与消息并补齐
   expected / received / next_action，不能把 traceback 直接交给终端用户。
+- Task 7：chat 的目标表不能只登记根 Agent；`:agents` 展示整个 Runtime registry，`:use` 就必须能
+  选择同一 Runtime 中 Delegate 创建的子 Agent。
+- Task 7：活动 session 的 Agent、预算与 Flag 已在 spawn 时冻结；本轮不能生效的覆盖参数必须明确
+  拒绝，不能解析后静默忽略。
+- Task 7：CLI `max_turns` 是上限，直接 Agent 与 topology 根槽都只能收紧已有清单 / 槽预算；
+  topology 路径从 `AgentManifest.budget` 与 `AgentOptions.max_turns` 纯计算，不额外构造 Agent。
+- Task 7：`Runtime.wait()` 会把 Agent 内部异常收成 `Context.stop_reason=error`；CLI host 必须检查
+  stop reason，否则会把失败当成空输出并返回 exit 0。
 
 ## 文档更新清单
 
