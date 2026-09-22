@@ -18,6 +18,9 @@ from syndica.kernel.workspace import ExecResult, Portal
 
 __all__ = ['LocalWorkspace']
 
+# 超过这个大小的文件拒绝整篇读入。模型上下文装不下，拒绝时必须报出实际字节数。
+_MAX_READ_BYTES: int = 1024 * 1024
+
 
 def _not_yet(name: str) -> ContractViolation:
     return ContractViolation(
@@ -61,6 +64,13 @@ class LocalWorkspace:
                 expected='path 指向根目录内的文件',
                 received=f'path={path!r} 不是文件',
                 next_action='改用文件路径',
+            )
+        size = real.stat().st_size
+        if size > _MAX_READ_BYTES:
+            raise ConfigError(
+                expected=f'单文件不超过 {_MAX_READ_BYTES} 字节',
+                received=f'文件有 {size} 字节',
+                next_action='换一个不超过 1 MiB 的文件',
             )
         lines = _read_utf8(real, path).splitlines()
         start = offset - 1
