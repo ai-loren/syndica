@@ -210,15 +210,24 @@ def test_non_str_part_is_rejected_with_the_field_name_and_the_type_received(fiel
     _assert_three_part(str(excinfo.value))
 
 
-@pytest.mark.parametrize('error_cls', KERNEL_ERROR_CLASSES, ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize(
+    'error_cls', [*KERNEL_ERROR_CLASSES, _KeyedError], ids=lambda cls: cls.__name__
+)
 @pytest.mark.parametrize(
     ('bad', 'raised'), [(None, TypeError), ('', ValueError)], ids=['wrong-type', 'blank']
 )
 def test_a_rejected_part_names_the_class_being_constructed_not_the_base(error_cls, bad, raised):
     """这条消息的读者正在写子类；报出基类名会指着一个没问题的地方。"""
     parts = {**PARTS, 'expected': bad}
+    extra = {
+        name: 'probe'
+        for name, parameter in signature(error_cls).parameters.items()
+        if parameter.default is Parameter.empty
+        and parameter.kind not in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD)
+        and name not in PARTS
+    }
     with pytest.raises(raised) as excinfo:
-        error_cls(**parts)
+        error_cls(**parts, **extra)
     assert error_cls.__name__ in str(excinfo.value)
     if error_cls is not SyndicaError:
         assert SyndicaError.__name__ not in str(excinfo.value)
@@ -228,6 +237,28 @@ def test_a_blank_part_is_a_three_part_message_too():
     with pytest.raises(ValueError) as excinfo:
         SyndicaError(expected='a', received='b', next_action='  ')
     _assert_three_part(str(excinfo.value))
+
+
+def test_multiple_invalid_parts_are_checked_in_constructor_order():
+    """一次只报最先能修的字段；顺序漂移会让相同配置给出不同诊断。"""
+    with pytest.raises(TypeError) as excinfo:
+        SyndicaError(
+            expected=None,  # pyright: ignore[reportArgumentType]
+            received=0,  # pyright: ignore[reportArgumentType]
+            next_action=[],  # pyright: ignore[reportArgumentType]
+        )
+    assert 'expected=None' in str(excinfo.value)
+    assert 'received=0' not in str(excinfo.value)
+    assert 'next_action=[]' not in str(excinfo.value)
+
+    with pytest.raises(TypeError) as excinfo:
+        SyndicaError(
+            expected='valid',
+            received=0,  # pyright: ignore[reportArgumentType]
+            next_action=[],  # pyright: ignore[reportArgumentType]
+        )
+    assert 'received=0' in str(excinfo.value)
+    assert 'next_action=[]' not in str(excinfo.value)
 
 
 @pytest.mark.parametrize('error_cls', KERNEL_ERROR_CLASSES, ids=lambda cls: cls.__name__)

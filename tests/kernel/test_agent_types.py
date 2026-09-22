@@ -30,6 +30,14 @@ def test_three_exit_modes_exist():
     }
 
 
+def test_agent_states_and_exit_modes_do_not_equal_their_serialized_strings():
+    """枚举与落盘字符串必须显式转换；混入 str 会掩盖漏写 `.value` 的调用方错误。"""
+    assert AgentStatus.IDLE != 'idle'
+    assert AgentStatus.ZOMBIE != 'zombie'
+    assert ExitMode.IDLE != 'idle'
+    assert ExitMode.EXIT != 'exit'
+
+
 def test_info_defaults_to_idle_with_no_children():
     info = _info()
     assert info.status is AgentStatus.IDLE
