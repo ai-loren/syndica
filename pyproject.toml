@@ -54,7 +54,6 @@ quote-style = "single"
 [tool.pyright]
 include = ["src", "tests", "scripts"]
 pythonVersion = "3.11"
-# 必须用顶层 strict 路径列表：pyright 在 executionEnvironments 里不认 typeCheckingMode，
-# 改写成那种形式会让 src 静默降级为 standard。
+# strict 必须使用顶层路径列表；executionEnvironments 不支持 typeCheckingMode。
 typeCheckingMode = "standard"
 strict = ["src"]

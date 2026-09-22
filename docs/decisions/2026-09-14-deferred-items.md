@@ -42,6 +42,12 @@
 | D-52 | **`BaseAgent.attach_gate` 与 `BaseAgent.__init__(gate=...)` 是公开名字，而它们的参数类型 `TurnGate` 不在公开面。** 只看得见 `syndica.kernel` 的宿主调得到这两个入口、却写不出标注，也造不出除默认 `NullTurnGate` 之外的任何门 | 选「降私有」那条路：`attach_gate` → `_attach_gate`，构造器去掉 `gate=`。`Runtime.spawn` 是唯一生产者。`_BASE_AGENT_SURFACE` 不再含这个名字。B-02 依据 (b)（`ControlBlock` / `TurnGate` 不在公开面）因此不动 |
 | D-49 | **`validate_tool_names` 收到一个非 Mapping 时撞裸 `AttributeError`**（`'list' object has no attribute 'items'`），三件套零条。声明式清单里 `tools: [Read, Grep, Glob]` 正是它的明文写法 | 计划 3 Task 2：`validate_tool_names(tools: object)` 先挡 str/bytes 与非 Mapping，三件套点名该写成 `{名字: Tool}`、并指路 `resolve_tool_names`。证据：`test_validate_tool_names_rejects_a_list_with_the_three_part_error`。变异 drop-mapping-guard 只红这一条 |
 | D-08 | 手写 schema 的 `name` 键可与 `tool.name` 分叉（模型按前者调用、注册表按后者索引）。守卫属注册层 | 计划 3 Task 2：`register_tool` 是往目录插入的唯一正式入口，按 `tool.name` 建键；三轴不一致就拒。`table[k]=tool` 仍能绕过登记，但 `resolve_tool_names` 对产出立刻再跑 `validate_tool_names`，生插分叉在解析出口被拦。证据：`test_register_tool_rejects_disagreement_among_the_three_identity_axes`（登记口；`next_action` 同时含 `__tool_schema__` 与两个名字）；`test_resolve_rejects_a_catalog_entry_with_disagreeing_identity_axes`（生插后 resolve）。变异 register-renames-to-schema-name 只红登记口那条；删掉 resolve 末尾的 `validate_tool_names` 只红生插那条 |
+| D-09 | backend 不得 import surface 的依赖规则未覆盖 | 计划 4 Task 8：`test_backend_importing_a_surface_is_caught` 构造真实违规并断言 backend 与 surface 名称 |
+| D-13 | `scripts/check_deps.py` 的 UTF-8 读取无自动化保护 | `test_sources_are_read_as_utf_8_regardless_of_locale` 在 C locale 下验证中文源码 |
+| D-14 | 布局错误与依赖违规的退出码未区分 | 计划 4 Task 8：`test_missing_root_exits_2` 与 `test_violations_exit_1` 分别钉住 2 / 1 |
+| D-15 | 依赖违规的下一步动作未断言 | 计划 4 Task 8：`test_violations_exit_1` 断言“把 backend 需要的类型与入口下沉到 kernel” |
+| D-16 | `test_surface_importing_itself_is_allowed` 多余创建 `args.py` | 计划 4 Task 8 删除该写入；依赖扫描器只做 AST 静态检查，不要求被导入模块真实存在 |
+| D-17 | pyright 配置注释包含变更过程 | 计划 4 Task 8：注释只保留当前约束“strict 使用顶层路径列表” |
 
 ## 待审计核实（认为已被后续改动关闭）
 
@@ -56,7 +62,6 @@
 
 | # | 内容 |
 |---|---|
-| D-09 | **依赖规则 3 只实现一半**：`backend 不得 import surface` 未覆盖。原始条目自带期限——「第一个 backend 落地前须补」，而计划 4 就是它 |
 | D-50 | **`LLM.create` 契约里「进请求的只有 `role` / `content` / `tool_calls` / `tool_call_id`，`extra` / `trust` / `artifacts` 一律不进」这一条没有可执行的用例。** 正文是计划 2 Task 15 修复轮补的（此前它只以「事实」的身份出现在 D-48 正文里）：内核**依赖**它而契约没写，按 AGENTS.md 的判据就是「第三方 backend 一定会违反的性质」——一个把 block 整个 `asdict` 出去的 provider 会把每次工具调用的 `meta`（经 `tool_executor._append` 落进 `extra['tool_meta']`）灌进模型上下文，其中就有 `QueryAgent` 刻意只放 `meta`、不放 `output` 的子代 id。里程碑 1 里没有 provider，所以本轮只能写正文 | 归**计划 4（第一个 backend + provider）**：那里有第一个真实现，落点是 provider 自己的契约测试——给一块带 `extra` / `trust` / 非空 `artifacts` 的 `ContextBlock`，断言发出去的请求体里这三样一个都没有，且键序与四个字段的清单逐字相符（键序漂移会让前缀缓存整体失效，spec §5.2） |
 | D-34 | **每一个内置工具都必须显式声明 `__tool_command_args__`。** 计划 4 加的文件读写与命令执行工具正是这条纪律的第一批用户：执行类工具漏声明会让判定改去扫它的全部参数（保证更弱且会对文本参数误报），而 `Read` / `Write` / `Grep` 这类收文本的工具漏声明会被自己写的文档内容命中——一段含 markdown 表格或围栏代码块的正文里一个裸 `|` 就能拼出假管道链。判定已在结论里点名「这个工具没声明」并给出修法，但那是**事后**诊断；纪律在计划 4 建立，成本是每个工具一行 |
 | D-36 | **判定读不完参数会终结一整次 `run()`，而这条路此前打不到任何人。** 未声明 `__tool_command_args__` 的工具，判定按「全查」读它的每个参数；一个收大段文本的普通工具收到超过 `_MAX_TEXT_CHARS`（262144）字符或嵌套超过 8 层的值时，`danger._readable_texts` 抛 `ContractViolation`。计划 2 Task 11 之前判定没有生产调用者，这条只在单测里现身；接上闸之后它坐在**每次工具调用的必经之路**上：实测 300KB 文本的一次调用 → 失败那个调用得一条「判定抛出…工具没有运行」的 block、同批其余得「没有执行」、`ctx.stop_reason=ERROR`，且异常上抛出 `run()`（`SyndicaError` 按 spec §10 交给 agent loop）。**修法是让工具声明**（`__tool_command_args__ = ()` 或只声明真会被执行的那几个参数），与 D-34 是同一条纪律的两面：D-34 说漏声明会让闸变弱或误报，本条说漏声明还能让一次长跑当场失败。B-09 登记的是判定侧「读不出」的行为，**不含**「它现在会终结一次 run」 |
@@ -64,11 +69,6 @@
 | D-10 | `__tool_model__` 层输出带 `title` / `$defs` / `$ref`，部分 provider API 会拒。要知道目标 API 约束才能定，属 provider backend 的事 |
 | D-11 | **`remove_queue` 的回执窗口**（计划 2 Task 4 的 Defect B）。不是「无法关闭」，而是「完整修法要改 `MessageBroker` Protocol，Task 4 选择不改」。评审已用一个在 `remove_queue` 内挂起的 broker 证明窗口真实存在（`ok=True`、消息消失、零 ERROR），且该 broker 就是 Protocol 修法的测试手段。计划 4 要动 broker 契约，一并做 |
 | D-12 | 契约套件缺一条「`timeout` 从调用那一刻起算」的用例——计划 2 Task 9 的 `_report_unwaited_timeout` 判据建立在它上面，而它现在只是契约里的一句文字 |
-| D-13 | `scripts/check_deps.py` 的 `encoding='utf-8'` 无自动化保护（删掉它套件仍全绿） |
-| D-14 | `check_deps` 退出码 2（「没查成」）与 1（「查出违规」）的区分无测试钉住，而它的诊断依赖这个区分 |
-| D-15 | `check_deps` 错误三件套的第三部分（`next_action`）未被任何断言覆盖。**计划 2 Task 8 已把这条立成仓库规则**（AGENTS.md「错误消息」节：三件套里最容易整条零断言的就是第三件），所以这是一条已知规则的存量违反 |
-| D-16 | `tests/test_deps.py` 里 `args.py` 的 `write_text` 多余（校验器纯静态扫描，不看磁盘） |
-| D-17 | `pyproject.toml` 的 pyright 注释后半句带「为什么没那样写」的反事实色彩，违反 AGENTS.md 注释纪律 |
 | D-53 | **`UPDATE_WRITABLE_FIELDS` / `UPDATE_PROTECTED_FIELDS` / `UPDATE_PROTECTED_FIELD_OWNERS` 不在 `kernel.__all__`，而 `AgentRegistry` 是公开 Protocol。** 第三方实现 `update` 要知道哪些字段可写、哪些另有专用机制，而这三个集合不出现在任何公开签名里（`update(agent_id, **fields)`），所以按计划 2 Task 16 的判据（「哪个公开签名需要它」）它们进不了公开面。内核自己的内存实现直接 import 它们；第三方照做等于硬编码四个字段名，而 `AgentInfo` 加一个字段时那份副本会静默漂移——与 V-01 的 `ERROR_CLASSES` 同型。归**计划 4**：那里有第一个真的第三方 Store。落点是随 wheel 发布的 `syndica.kernel.contracts`（spec §13.3 指给第三方的入口），把三个常量 re-export 过去并给契约套件补一条「protected 字段必须被拒、writable 字段必须被收」的用例，而不是让第三方去 import 一个没有兼容承诺的子模块 |
 | D-56 | **`LLM.create` 契约没说谁负责兑现 `LLMConfig.timeout`。** 全仓没有任何地方读 `config.timeout`。abort 不打断轮内 LLM 调用，`create` 不返回时唯一出路是 `kill`。本轮只补契约正文（实现必须在 `config.timeout` 内返回或抛出；不要在内核里包 `asyncio.timeout`——那会把取消域从 provider 手里拿走、远端连接留在那里，与 broker 的 ASYNC109 豁免同型）。**可执行用例归计划 4 的第一个 provider 契约** |
 | D-57 | **`AgentRegistry.update` 的写入侧快照语义未定义。** `register` 深拷且有契约用例，`update` 直接 `setattr` 调用方的对象、契约无用例、Protocol 正文也没写。内核今天一次都不调 `update`，是纯公开面欠账。归计划 4（与 D-53 同一批动 store 契约） |

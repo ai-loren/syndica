@@ -53,6 +53,12 @@ def test_missing_root_fails_loudly(tmp_path):
     assert 'syndica' in result.stderr
 
 
+def test_missing_root_exits_2(tmp_path):
+    missing = tmp_path / 'no-such-src'
+    result = _run_checker('--root', str(missing))
+    assert result.returncode == 2
+
+
 def test_root_without_syndica_package_fails_loudly(tmp_path):
     """root 存在但没有 syndica 包是同一类假绿：扫到 0 个文件不等于合规。"""
     root = tmp_path / 'src'
@@ -79,7 +85,6 @@ def test_surface_importing_itself_is_allowed(tmp_path):
     module = tmp_path / 'src' / 'syndica' / 'cli' / 'main.py'
     module.parent.mkdir(parents=True)
     module.write_text('from syndica.cli.args import parse\n')
-    (module.parent / 'args.py').write_text('')
     result = _run_checker('--root', str(tmp_path / 'src'))
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -148,6 +153,15 @@ def test_backend_importing_a_surface_is_caught(tmp_path):
     assert result.returncode != 0, result.stdout + result.stderr
     assert 'backends/alpha/client.py' in result.stdout
     assert 'cli' in result.stdout
+
+
+def test_violations_exit_1(tmp_path):
+    module = tmp_path / 'src' / 'syndica' / 'backends' / 'alpha' / 'client.py'
+    module.parent.mkdir(parents=True)
+    module.write_text('from syndica.cli import main\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode == 1
+    assert '把 backend 需要的类型与入口下沉到 kernel' in result.stdout
 
 
 def test_a_backend_may_import_its_own_sibling_module(tmp_path):

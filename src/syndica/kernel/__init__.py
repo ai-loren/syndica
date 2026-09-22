@@ -57,6 +57,7 @@ from syndica.kernel.hooks import (
     JunctionRef,
 )
 from syndica.kernel.llm import LLM, ContextOverflowError, LLMConfig, ScriptedLLM, ScriptedTurn
+from syndica.kernel.local_workspace import LocalWorkspace
 from syndica.kernel.manifest import AgentManifest, ManifestSource
 from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.plugins import Plugin
@@ -65,6 +66,7 @@ from syndica.kernel.runtime import AgentFactory, Runtime
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tools import orchestration_tools
+from syndica.kernel.tools.local import local_tools
 from syndica.kernel.topology import AgentSlot, Topology
 from syndica.kernel.waiting import (
     Confirmation,
@@ -74,6 +76,7 @@ from syndica.kernel.waiting import (
     WaitResult,
     WaitState,
 )
+from syndica.kernel.workspace import ExecResult, Portal, Workspace
 
 __all__ = [
     'AgentCatalog',
@@ -104,6 +107,7 @@ __all__ = [
     'Disposition',
     'Event',
     'EventBus',
+    'ExecResult',
     'ExitMode',
     'HookCallback',
     'HookResult',
@@ -117,6 +121,7 @@ __all__ = [
     'LLM',
     'LLMConfig',
     'LLMResponseError',
+    'LocalWorkspace',
     'ManifestSource',
     'Message',
     'MessageBroker',
@@ -125,6 +130,7 @@ __all__ = [
     'Orchestrator',
     'OverrideRecord',
     'Plugin',
+    'Portal',
     'Reply',
     'RiskLevel',
     'Role',
@@ -145,6 +151,8 @@ __all__ = [
     'WaitResult',
     'WaitState',
     'Waiter',
+    'Workspace',
+    'local_tools',
     'orchestration_tools',
     'provenance_of',
     'register_builtins',

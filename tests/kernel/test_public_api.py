@@ -50,6 +50,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'Disposition',
     'Event',
     'EventBus',
+    'ExecResult',
     'ExitMode',
     'HookCallback',
     'HookResult',
@@ -63,6 +64,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'LLM',
     'LLMConfig',
     'LLMResponseError',
+    'LocalWorkspace',
     'ManifestSource',
     'Message',
     'MessageBroker',
@@ -71,6 +73,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'Orchestrator',
     'OverrideRecord',
     'Plugin',
+    'Portal',
     'Reply',
     'RiskLevel',
     'Role',
@@ -91,6 +94,8 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'WaitResult',
     'WaitState',
     'Waiter',
+    'Workspace',
+    'local_tools',
     'orchestration_tools',
     'provenance_of',
     'register_builtins',
@@ -209,8 +214,7 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 #   `ReadOnlyKwarg` 是 `dict` 子类、hook 作者按 `dict` 用它。
 # - `LocalAgentTable`：spec §4.3 明文说它只在进程内有意义、不进 Protocol。
 # - `correlation_of`：`Waiter` 密封分发的内部收口，`wait_for` 自己调。
-# - `Workspace` / `Portal` / `LocalWorkspace` / `ExecResult` / `local_tools`：计划 4 Task 8
-#   才进 `kernel.__all__`。八个工具类不进承诺面，宿主用 `local_tools` 按键取。
+# - 八个工具类不进承诺面，宿主用 `local_tools` 按键取。
 _WITHHELD: tuple[str, ...] = (
     'Bash',
     'BashOutput',
@@ -219,7 +223,6 @@ _WITHHELD: tuple[str, ...] = (
     'DEFAULT_MAX_TOOL_CONCURRENCY',
     'Delegate',
     'Edit',
-    'ExecResult',
     'Fork',
     'Glob',
     'Grep',
@@ -227,10 +230,8 @@ _WITHHELD: tuple[str, ...] = (
     'KillAgent',
     'KillBash',
     'LocalAgentTable',
-    'LocalWorkspace',
     'NullTurnGate',
     'OBSERVABLE',
-    'Portal',
     'QueryAgent',
     'Read',
     'ReadOnlyKwarg',
@@ -238,12 +239,10 @@ _WITHHELD: tuple[str, ...] = (
     'ToolExecutor',
     'TurnGate',
     'TurnGateDecision',
-    'Workspace',
     'Write',
     'correlation_of',
     'disposition_of',
     'install_plugins',
-    'local_tools',
     'parse_mapping',
     'register_tool',
     'resolve_tool_names',
@@ -349,6 +348,18 @@ def _agent() -> BaseAgent:
 
 def test_every_exported_name_resolves():
     assert [name for name in kernel.__all__ if not hasattr(kernel, name)] == []
+
+
+def test_kernel_exports_workspace_types_and_local_tools():
+    from syndica.kernel.local_workspace import LocalWorkspace
+    from syndica.kernel.tools.local import local_tools
+    from syndica.kernel.workspace import ExecResult, Portal, Workspace
+
+    assert kernel.ExecResult is ExecResult
+    assert kernel.LocalWorkspace is LocalWorkspace
+    assert kernel.Portal is Portal
+    assert kernel.Workspace is Workspace
+    assert kernel.local_tools is local_tools
 
 
 def test_export_list_is_sorted():
