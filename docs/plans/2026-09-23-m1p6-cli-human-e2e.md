@@ -223,7 +223,7 @@ expect:
 
 ### Task 3 — AskUser / AskUserQuestion
 
-**状态：in_progress**
+**状态：completed**（505 条定向测试；7 条真实变异；独立审查修复 2 项后 APPROVE）
 
 **Files:** `kernel/tools/human.py`、`kernel/modules.py`、公开导出与对应单测
 
@@ -233,7 +233,7 @@ expect:
 
 ### Task 4 — 人工确认与 D-38
 
-**状态：pending**
+**状态：in_progress**
 
 **Files:** `danger.py`、`tool_executor.py`、`agent.py`、`runtime.py`、对应单测
 
@@ -355,6 +355,8 @@ expect:
 
 - Task 2：`scripts/check_deps.py` 原先只校验 Syndica 组件间依赖，不能发现 kernel 新增 PyYAML；
   已增加外部包守卫，并用一正一反两个 fixture 证明只禁 kernel、不禁 CLI。
+- Task 3：反射 schema 只接受基础 `list`，不能表达 `Sequence[str]` 的元素类型；`AskUserQuestion`
+  因此使用手写 schema，运行时仍保留更精确的 Sequence 校验。
 
 ## 文档更新清单
 

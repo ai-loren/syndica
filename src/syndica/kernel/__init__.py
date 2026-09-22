@@ -75,7 +75,12 @@ from syndica.kernel.retry import RetryModule
 from syndica.kernel.runtime import AgentFactory, Runtime
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
-from syndica.kernel.tools import orchestration_tools
+from syndica.kernel.tools import (
+    AskUser,
+    AskUserQuestion,
+    HumanInteractionModule,
+    orchestration_tools,
+)
 from syndica.kernel.tools.local import local_tools
 from syndica.kernel.topology import AgentSlot, Topology
 from syndica.kernel.waiting import (
@@ -99,6 +104,8 @@ __all__ = [
     'AgentStatus',
     'AllowAll',
     'ArtifactRef',
+    'AskUser',
+    'AskUserQuestion',
     'BaseAgent',
     'BlockHighRisk',
     'CachePrefixProvider',
@@ -125,6 +132,7 @@ __all__ = [
     'HookResult',
     'HooksCenter',
     'HostFacts',
+    'HumanInteractionModule',
     'InMemoryAgentRegistry',
     'InMemoryMessageBroker',
     'Junction',

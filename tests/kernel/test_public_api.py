@@ -32,6 +32,8 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'AgentStatus',
     'AllowAll',
     'ArtifactRef',
+    'AskUser',
+    'AskUserQuestion',
     'BaseAgent',
     'BlockHighRisk',
     'CachePrefixProvider',
@@ -58,6 +60,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'HookResult',
     'HooksCenter',
     'HostFacts',
+    'HumanInteractionModule',
     'InMemoryAgentRegistry',
     'InMemoryMessageBroker',
     'Junction',
@@ -384,6 +387,14 @@ def test_kernel_exports_workspace_types_and_local_tools():
     assert kernel.Portal is Portal
     assert kernel.Workspace is Workspace
     assert kernel.local_tools is local_tools
+
+
+def test_kernel_exports_the_human_tool_definitions_not_aliases():
+    from syndica.kernel.tools.human import AskUser, AskUserQuestion, HumanInteractionModule
+
+    assert kernel.AskUser is AskUser
+    assert kernel.AskUserQuestion is AskUserQuestion
+    assert kernel.HumanInteractionModule is HumanInteractionModule
 
 
 def test_export_list_is_sorted():

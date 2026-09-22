@@ -47,6 +47,8 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 "src/syndica/kernel/workspace.py" = ["ASYNC109"]
 "src/syndica/kernel/local_workspace.py" = ["ASYNC109"]
 "src/syndica/kernel/tools/local.py" = ["ASYNC109"]
+# Human tools expose a waiter timeout that Runtime forwards to the broker.
+"src/syndica/kernel/tools/human.py" = ["ASYNC109"]
 
 [tool.ruff.format]
 quote-style = "single"
