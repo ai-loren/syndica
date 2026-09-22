@@ -2,7 +2,7 @@
 
 写于 2026-09-21。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
-**一句话现状：** 计划 1、计划 2（含横切审计与 Task 16 评审残留）的**代码已收口并 commit**；计划 3 **8/8 已落地并 commit**（Task 8 = `15436ed`）；计划 4–6 未写未做。本地 `main` 比 `origin/main` 超前 30 个 commit，**未 push**。下一刀是**写计划 4**，不要在同一口气里开始写计划 4 的代码。
+**一句话现状：** 计划 1、计划 2 的代码已收口；计划 3 **8/8 已落地**（Task 8 = `15436ed`）；计划 4 **文件已写、代码未动**（`91b00d7`）。计划 5–6 未写未做。本地 `main` 比 `origin/main` 超前 32 个 commit（本文提交后是 33），**未 push**。下一刀是**执行计划 4 Task 1**，不要重写计划，不要先做 Task 2。
 
 **先读顺序**
 
@@ -11,7 +11,7 @@
 3. [`docs/design/2026-09-03-architecture.md`](../design/2026-09-03-architecture.md) spec §15 / §4.6–4.8 / §17
 4. [`docs/decisions/2026-09-08-m1-scope.md`](../decisions/2026-09-08-m1-scope.md)
 5. [`docs/decisions/2026-09-14-deferred-items.md`](../decisions/2026-09-14-deferred-items.md)
-6. 当前子计划：[`docs/plans/2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)
+6. 当前子计划：[`docs/plans/2026-09-22-m1p4-local-exec.md`](./2026-09-22-m1p4-local-exec.md)
 
 ---
 
@@ -39,6 +39,8 @@ $ git status -sb
 
 | sha | 内容 |
 |---|---|
+| `91b00d7` | **计划 4 文件**：最小本地执行 + OpenAI 兼容客户端。代码还没写 |
+| `6c4b2fd` | 上一版交接（当时下一刀还是写计划 4；本文取代它） |
 | `15436ed` | **计划 3 Task 8**：目录、拓扑、四个内置进入 `kernel.__all__`；一条拓扑端到端。Delegate 冷启动，不占 lazy 槽 |
 | `38ee38f` | 上一版交接（当时下一刀还是 Task 8；本文取代它） |
 | `d0e6828` | **计划 3 Task 7**：四个内置角色。Orchestrator 自己装 Delegate；提示词在 freeze 时用目录里当时的 description |
@@ -72,7 +74,7 @@ $ git status -sb
 
 更早的计划 2 Task 1–15 已在 `origin/main` 一侧。
 
-**本轮停笔时工作区干净。** 不要重做计划 3。下一刀是写计划 4（Workspace / 文件与执行工具 / OpenAI 兼容 provider）。`assemble` 不是 `start()`，计划 4 也不要加。
+**本轮停笔时工作区干净。** 不要重做计划 3，不要重写计划 4。下一刀是计划 4 Task 1（`Portal` / `LocalWorkspace` 路径监狱）。`assemble` 不是 `start()`，计划 4 也不要加。
 
 ---
 
@@ -114,7 +116,7 @@ spec §15 里程碑 1 判据原文：*Runtime 能创建多个 Agent、互发消�
 | **1** | 单 Agent turn 循环 | **代码收口**，已在更早的历史上 |
 | **2** | 事件循环、生命周期、等待、危险判定、工具并发、插件、编排工具、公开面 | **代码收口**（含审计修复 + Task 16 残留） |
 | **3** | 声明式清单、目录、拓扑、四个内置角色 | **代码收口** [`2026-09-21-m1p3-declarative-agents.md`](./2026-09-21-m1p3-declarative-agents.md)；Task 1 = `97c9edc`，Task 2 = `551b4d2`，Task 3 = `7071eda`，Task 4 = `73289a2`，Task 5 = `cb81e02`，Task 6 = `b508023`，Task 7 = `d0e6828`，Task 8 = `15436ed` |
-| **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | 未写未做 |
+| **4** | Workspace/Portal + 文件与执行工具 + OpenAI 兼容 provider | 计划已写 `91b00d7`，Task 1–9 未做 |
 | **5** | Runtime Module + Flag + 重试 Module + 前缀漂移检测 | 未写未做 |
 | **6** | CLI + L2 场景回放 + AskUser | 未写未做 |
 | **M1 收口审计** | spec §15 取证 + 遗留项清空 + **那时再 push** | 未做 |
@@ -412,7 +414,7 @@ D-47 已拆成两半：墙钟 clamp → 计划 5（与 D-18 同一条 Flag）；
 | M-7 | spec `AgentInfo.type` 实现叫 `agent_type`（避开内置名） | 登记即可，不要改回去 |
 | M-8 | `WaitState.ABORTED` 自己的 docstring 仍只写「协作式中止落在等待上」 | 补枚举 docstring，把 D-26 契约写到宿主会读的那一行 |
 
-### 4.1 计划 3 已收口。下一步：写计划 4（不要先写代码）
+### 4.1 计划 3 已收口。计划 4 的文件已写（`91b00d7`）。下一步：Task 1
 
 **已关：** D-49、D-08。**不要动：** D-58（禁止 `Runtime.start` / `Junction.RUNTIME_START`）。计划 3 的八个任务都已 commit。下面的裁决留给读代码的人，不是待办。
 
@@ -455,15 +457,25 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 
 遗留项**同时**记进 [`deferred-items.md`](../decisions/2026-09-14-deferred-items.md)，不要只写 gitignored 的 `.superpowers/sdd/progress*.md`。
 
-### 4.2 计划 4（未写未做）——计划 3 全部收口后再写
+### 4.2 计划 4 已写（`91b00d7`），从 Task 1 执行
 
-- `Workspace` / `Portal` + `LocalWorkspace`（本地目录 + 子进程，零依赖）
-- 文件与执行工具：`Read` / `Write` / `Edit` / `Glob` / `Grep` / `Bash` + `BashOutput` / `KillBash`
-- 第一个 backend 包：仅 OpenAI 兼容 HTTP（Anthropic 原生不在 M1）
+需求在 [`2026-09-22-m1p4-local-exec.md`](./2026-09-22-m1p4-local-exec.md)。不要在执行时重新划范围：git / worktree / 快照 / 伪终端是里程碑 5。
 
-挂单（动手前整表再读原文）：D-09、D-50、D-34、D-36、D-37、D-10、D-11、D-12、D-13、D-14、D-15、D-16、D-17、D-53、**D-56**、**D-57**。
+九个任务，建议九个 commit，不要 push：
 
-D-56：**第一个 provider 必须在 `config.timeout` 内返回。不要在内核里包 `asyncio.timeout`。**
+| Task | 标题 | 状态 |
+|---|---|---|
+| 1 | Portal / Workspace / LocalWorkspace 路径监狱 | **下一刀** |
+| 2 | Read / Write / Edit | 未做 |
+| 3 | Glob / Grep | 未做 |
+| 4 | Bash / BashOutput / KillBash | 未做 |
+| 5 | 真实工具跑通一条拓扑 | 未做 |
+| 6 | OpenAI 兼容 provider | 未做 |
+| 7 | 注册表快照、契约再导出、等待超时起算点 | 未做 |
+| 8 | 依赖门禁缺口、注释、公开面、关台账 | 未做 |
+| 9 | publish 与 remove_queue 的回执窗口 | 未做 |
+
+D-09、D-13、D-16 的实现已经在仓库里，Task 8 只关台账，禁止重写扫描器。D-56：provider 自己遵守 `config.timeout`，内核不要包 `asyncio.timeout`。
 
 ### 4.3 计划 5（未写未做）
 
