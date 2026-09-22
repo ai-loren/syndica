@@ -1,4 +1,4 @@
-"""本地文件工具。只调 Portal，不碰磁盘。
+"""本地文件与搜索工具。只调 Portal，不碰磁盘。
 
 模型犯的错（越界、旧串不唯一、文件过大）写进 output，不抛。
 这些工具的文本不是要执行的命令，所以 `__tool_command_args__` 必须是 `()`：
@@ -11,7 +11,7 @@ from syndica.kernel.errors import ConfigError
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.workspace import Portal
 
-__all__ = ['Edit', 'Read', 'Write', 'local_tools']
+__all__ = ['Edit', 'Glob', 'Grep', 'Read', 'Write', 'local_tools']
 
 _READ_LIMIT: int = 2000
 
@@ -85,9 +85,58 @@ class Edit(Tool):
         return ToolResult(output=f'已替换 {path} 中的一处文本')
 
 
+class Glob(Tool):
+    """按模式查找工作区里的路径。"""
+
+    __tool_name__ = 'Glob'
+    __tool_command_args__ = ()
+
+    def __init__(self, portal: Portal) -> None:
+        self._portal = portal
+
+    async def execute(self, pattern: str) -> ToolResult:
+        """按相对工作区根的模式查找路径，结果按字典序排列。
+        pattern: 相对工作区根的 glob 模式
+        """
+        try:
+            paths = await self._portal.glob_paths(pattern)
+        except ConfigError as exc:
+            return _told(exc)
+        return ToolResult(output=list(paths))
+
+
+class Grep(Tool):
+    """按正则搜索工作区里的文本。"""
+
+    __tool_name__ = 'Grep'
+    __tool_command_args__ = ()
+
+    def __init__(self, portal: Portal) -> None:
+        self._portal = portal
+
+    async def execute(self, pattern: str, path: str = '.') -> ToolResult:
+        """按 Python 正则搜索文件，每条结果包含相对路径、行号和行内容。
+        pattern: Python 正则表达式
+        path: 相对工作区根的文件或目录，默认搜索整个工作区
+        """
+        try:
+            hits = await self._portal.grep_text(pattern, path)
+        except ConfigError as exc:
+            return _told(exc)
+        return ToolResult(output=list(hits))
+
+
 def local_tools(portal: Portal) -> dict[str, Tool]:
     """按固定顺序交出本地工具。后续任务只追加键，不改已有键的相对顺序。"""
     read = Read(portal)
     write = Write(portal)
     edit = Edit(portal)
-    return {read.name: read, write.name: write, edit.name: edit}
+    glob = Glob(portal)
+    grep = Grep(portal)
+    return {
+        read.name: read,
+        write.name: write,
+        edit.name: edit,
+        glob.name: glob,
+        grep.name: grep,
+    }

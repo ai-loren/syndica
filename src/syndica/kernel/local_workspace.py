@@ -134,6 +134,12 @@ class LocalWorkspace:
                 received=f'pattern={pattern!r} 是绝对路径',
                 next_action='去掉根前缀，只传相对模式',
             )
+        if '..' in Path(pattern).parts:
+            raise ConfigError(
+                expected='pattern 是不含 ..、不会离开工作区根目录的相对模式',
+                received=f'pattern={pattern!r} 含父目录段 ..',
+                next_action='去掉 ..，从工作区根目录开始写相对模式',
+            )
         found: list[str] = []
         for match in self._root.glob(pattern):
             if not self._stays(match):
