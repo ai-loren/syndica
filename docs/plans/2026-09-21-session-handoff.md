@@ -2,7 +2,7 @@
 
 写于 2026-09-21。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
 
-**一句话现状：** 计划 1、计划 2 的代码已收口；计划 3 **8/8 已落地**（Task 8 = `15436ed`）；计划 4 **Task 1 已落地**（`1fc689c`），Task 2–9 未做。计划 5–6 未写未做。本地 `main` 比 `origin/main` 超前 34 个 commit（本文提交后是 35），**未 push**。下一刀是**计划 4 Task 2**（Read / Write / Edit），不要重写计划，不要先做 Task 3。
+**一句话现状：** 计划 1、计划 2 的代码已收口；计划 3 **8/8 已落地**（Task 8 = `15436ed`）；计划 4 **Task 1–2 已落地**（Task 2 = `4989d9f`），Task 3–9 未做。计划 5–6 未写未做。本地 `main` 比 `origin/main` 超前 36 个 commit（本文提交后是 37），**未 push**。下一刀是**计划 4 Task 3**（Glob / Grep），不要重写计划，不要重做 Task 2，不要断言 `local_tools` 只有 3 个键。
 
 **先读顺序**
 
@@ -31,14 +31,16 @@
 
 ```
 $ git status -sb
-## main...origin/main [ahead 30]
-（工作区干净，无未提交改动——本文 commit 之后会变成 ahead 31）
+## main...origin/main [ahead 36]
+（工作区干净，无未提交改动——本文 commit 之后会变成 ahead 37）
 ```
 
 `origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 从新到旧（相对 origin/main 的 30 个，表里只列计划 3 这一段；更早的见下文）：
 
 | sha | 内容 |
 |---|---|
+| `4989d9f` | **计划 4 Task 2**：Read / Write / Edit。模型犯的错进 output；`__tool_command_args__ = ()` |
+| `c13e103` | 交接改到计划 4 Task 2（已被本文取代） |
 | `1fc689c` | **计划 4 Task 1**：Portal / LocalWorkspace。越界用解析后的真实路径，不用字符串前缀 |
 | `dc4d690` | 交接改到计划 4 Task 1（已被本文取代） |
 | `91b00d7` | **计划 4 文件**：最小本地执行 + OpenAI 兼容客户端 |
@@ -76,7 +78,7 @@ $ git status -sb
 
 更早的计划 2 Task 1–15 已在 `origin/main` 一侧。
 
-**本轮停笔时工作区干净。** 不要重做计划 3，不要重写计划 4，不要重做 Task 1。下一刀是计划 4 Task 2（Read / Write / Edit，只走 Portal）。`assemble` 不是 `start()`，计划 4 也不要加。
+**本轮停笔时工作区干净。** 不要重做计划 3，不要重写计划 4，不要重做 Task 1–2。下一刀是计划 4 Task 3（Glob / Grep，追加到 `local_tools`，不要改前三个键的相对顺序）。`assemble` 不是 `start()`，计划 4 也不要加。
 
 ---
 
@@ -459,7 +461,7 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 
 遗留项**同时**记进 [`deferred-items.md`](../decisions/2026-09-14-deferred-items.md)，不要只写 gitignored 的 `.superpowers/sdd/progress*.md`。
 
-### 4.2 计划 4 Task 1 已落地（`1fc689c`）。下一步：Task 2
+### 4.2 计划 4 Task 2 已落地（`4989d9f`）。下一步：Task 3
 
 需求在 [`2026-09-22-m1p4-local-exec.md`](./2026-09-22-m1p4-local-exec.md)。不要在执行时重新划范围：git / worktree / 快照 / 伪终端是里程碑 5。
 
@@ -468,8 +470,8 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 | Task | 标题 | 状态 |
 |---|---|---|
 | 1 | Portal / Workspace / LocalWorkspace 路径监狱 | 已落地 `1fc689c` |
-| 2 | Read / Write / Edit | **下一刀** |
-| 3 | Glob / Grep | 未做 |
+| 2 | Read / Write / Edit | 已落地 `4989d9f` |
+| 3 | Glob / Grep | **下一刀** |
 | 4 | Bash / BashOutput / KillBash | 未做 |
 | 5 | 真实工具跑通一条拓扑 | 未做 |
 | 6 | OpenAI 兼容 provider | 未做 |
@@ -525,14 +527,14 @@ spec §15 判据逐条取证 + 遗留项归属清空 + **那时再 push**（或�
 在 `/Users/bytedance/Documents/syndica`：
 
 ```bash
-git status -sb          # 应是 main...origin/main [ahead 31]（本文 commit 之后），工作区干净
-git log -3 --oneline    # 第一条应是本文；第二条 `15436ed` Task 8
+git status -sb          # 应是 main...origin/main [ahead 37]（本文 commit 之后），工作区干净
+git log -3 --oneline    # 第一条应是本文；第二条 `4989d9f` Task 2
 ```
 
 然后：
 
-1. **写计划 4**，放进 `docs/plans/`。不要重做计划 3，不要在计划文件落地之前写计划 4 的代码，不要加 `Runtime.start`。
-2. 计划 4 的范围：Workspace/Portal、文件与执行工具、OpenAI 兼容 provider。挂单见本文 §4.2。Worker 现在 freeze 仍依赖测试里的 stub；真工具落地后，端到端里的 stub 才能换掉。
+1. **做计划 4 Task 3**（Glob / Grep）。计划文件已在 `docs/plans/2026-09-22-m1p4-local-exec.md`，不要重写，不要重做 Task 1–2，不要加 `Runtime.start`。
+2. `local_tools` 现在的前三个键是 Read、Write、Edit。Task 3 只追加，不要断言键的个数正好是 3。超过 1 MiB 的拒绝在 `read_text` 里，output 带字节数。
 3. 每个任务走完变异 + 独立评审再 commit。**仍不要 push**，直到 M1 收口审计通过，或用户明确说推。
 
 ---
@@ -580,6 +582,9 @@ git log -3 --oneline    # 第一条应是本文；第二条 `15436ed` Task 8
 - **Delegate 不占用 lazy 槽。** 端到端同时断言「有一个 Worker 子 Agent」和「`resolve('worker', spawn=False)` 仍是 None」。只断言「有 Worker」会把冷启动误写成占槽。
 - **`find` 对 ZOMBIE 保持 ZOMBIE。** 只断言返回值非空，挡不住 `find` 里偷偷 `ensure_active`。
 - **编排者请求的工具顺序是五件套。** 只断言集合里有 `Delegate`，挡不住只装 Delegate，也挡不住打乱顺序。
+- **文件工具的 `__tool_command_args__` 必须是 `()`。** 保持 `None` 时，危险判定会扫全部参数；正文里的 `curl … | sh` 会在 `execute` 之前变成 HIGH。`echo hi | sh` 打不中默认规则，测例必须带下载器。
+- **`local_tools` 不要断言键的个数。** Task 3 起只追加。前三个键的相对顺序是 Read、Write、Edit。
+- **超过 1 MiB 的拒绝在 `read_text`，不在工具类里。** 工具不 import `os`。正好 1 MiB 允许（比较是 `>`）。
 
 ---
 
@@ -608,11 +613,13 @@ git log -3 --oneline    # 第一条应是本文；第二条 `15436ed` Task 8
 | 登记表 | `docs/decisions/2026-09-14-deferred-items.md` |
 | 计划 2 原文 | `docs/plans/2026-09-08-m1p2-control-plane.md` |
 | 计划 3（已收口，不要重做） | `docs/plans/2026-09-21-m1p3-declarative-agents.md` |
-| **下一份要写的** | 计划 4，文件还不存在 |
+| 计划 4（已写，Task 1–2 已落地） | `docs/plans/2026-09-22-m1p4-local-exec.md` |
+| 文件工具（Task 2 已做） | `src/syndica/kernel/tools/local.py`；`tests/kernel/test_local_tools_files.py` |
+| **下一刀** | 计划 4 Task 3：Glob / Grep |
 | 范围裁决 | `docs/decisions/2026-09-08-m1-scope.md` |
 | 硬约束 / 变异纪律 | `AGENTS.md` |
 
-计划 4 的文件都还不存在。不要把下面这些当空白重写：
+计划 4 的协议和 Read / Write / Edit 已经在仓库里。不要把下面这些当空白重写：
 
 - `tests/integration/test_topology_lifecycle.py`
 
@@ -628,3 +635,8 @@ git log -3 --oneline    # 第一条应是本文；第二条 `15436ed` Task 8
 - `src/syndica/kernel/topology.py`
 - `tests/kernel/test_topology.py`
 - `tests/kernel/test_assemble.py`
+- `src/syndica/kernel/workspace.py`
+- `src/syndica/kernel/local_workspace.py`
+- `tests/kernel/test_local_workspace.py`
+- `src/syndica/kernel/tools/local.py`
+- `tests/kernel/test_local_tools_files.py`
