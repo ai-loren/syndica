@@ -77,7 +77,14 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
-from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall, TrustLevel
+from syndica.kernel.context import (
+    Context,
+    ContextBlock,
+    StopReason,
+    ToolCall,
+    TrustLevel,
+    _trailing_unpaired_batch,  # pyright: ignore[reportPrivateUsage]
+)
 from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
 from syndica.kernel.danger import DangerJudge, DangerPolicy, Disposition, validate_danger_options
 from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError
@@ -335,13 +342,8 @@ def _unpaired_calls(blocks: list[ContextBlock]) -> list[ToolCall]:
     只认「assistant 后面紧跟着若干 tool block」这一种尾形。中间隔着别的 role 说明这段轨迹已经被
     另一方改过，往后面追加结果只会让配对错得更远。
     """
-    index = len(blocks) - 1
-    while index >= 0 and blocks[index].role == 'tool':
-        index -= 1
-    if index < 0 or blocks[index].role != 'assistant' or not blocks[index].tool_calls:
-        return []
-    answered = {block.tool_call_id for block in blocks[index + 1 :]}
-    return [call for call in blocks[index].tool_calls if call.id not in answered]
+    batch = _trailing_unpaired_batch(blocks)
+    return [] if batch is None else list(batch[1])
 
 
 _ABORT_AFTER_LLM_WHY = '中止在模型已经产出之后、任何工具执行之前被兑现，本批调用就此停下。'

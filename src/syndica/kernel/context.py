@@ -8,6 +8,7 @@ Registry（spec §4.3）。理由是 Agent 阻塞或崩溃时无法自报状态�
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -84,6 +85,22 @@ class Context:
 
     def append(self, block: ContextBlock) -> None:
         self._blocks.append(block)
+
+
+def _trailing_unpaired_batch(  # pyright: ignore[reportUnusedFunction]
+    blocks: Sequence[ContextBlock],
+) -> tuple[int, tuple[ToolCall, ...]] | None:
+    """返回轨迹末尾那个未配对批次的位置与未配对调用。"""
+    index = len(blocks) - 1
+    while index >= 0 and blocks[index].role == 'tool':
+        index -= 1
+    if index < 0 or blocks[index].role != 'assistant' or not blocks[index].tool_calls:
+        return None
+    answered = {block.tool_call_id for block in blocks[index + 1 :]}
+    unpaired = tuple(call for call in blocks[index].tool_calls if call.id not in answered)
+    if not unpaired:
+        return None
+    return index, unpaired
 
 
 def provenance_of(ctx: Context) -> TrustLevel:

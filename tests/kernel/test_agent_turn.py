@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import dataclasses
+import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -36,6 +39,62 @@ _SYSTEM_PROMPT = 'You are a worker.'
 # 门按 agent_id 认邮箱，而 BaseAgent 的 agent_id 是构造时才生成的 uuid；这些用例只需要门与
 # broker 说的是同一个邮箱，用哪个名字无关紧要。
 _MAILBOX = 'a1'
+_KERNEL = Path(__file__).parents[2] / 'src' / 'syndica' / 'kernel'
+
+
+def _function_in(path: Path, function: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    return next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == function
+    )
+
+
+def _calls_in(path: Path, function: str) -> set[str]:
+    target = _function_in(path, function)
+    return {
+        node.func.id
+        for node in ast.walk(target)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+
+def test_resume_and_fork_share_the_one_trailing_unpaired_batch_scan():
+    paths = sorted(_KERNEL.rglob('*.py'))
+    walked = {
+        (Path(root) / name).relative_to(_KERNEL).as_posix()
+        for root, _, names in os.walk(_KERNEL)
+        for name in names
+        if name.endswith('.py')
+    }
+    assert {path.relative_to(_KERNEL).as_posix() for path in paths} == walked
+
+    definitions = []
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        definitions.extend(
+            (path.relative_to(_KERNEL).as_posix(), node.name)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.name == '_trailing_unpaired_batch'
+        )
+
+    assert definitions == [('context.py', '_trailing_unpaired_batch')]
+    consumers = (
+        (_KERNEL / 'agent.py', '_unpaired_calls'),
+        (_KERNEL / 'runtime.py', '_forkable_prefix'),
+    )
+    for path, function in consumers:
+        assert '_trailing_unpaired_batch' in _calls_in(path, function)
+        fields_read = {
+            node.attr
+            for node in ast.walk(_function_in(path, function))
+            if isinstance(node, ast.Attribute)
+        }
+        assert fields_read.isdisjoint({'role', 'tool_call_id', 'tool_calls'})
+
+
 # 逐字写死而不是读 tool.schema：期望值与被测对象同源时，schema 缺一半会让期望值跟着缩水。这份
 # schema 逐字进模型请求的字节前缀（spec §5.2），键序一并钉住。
 _ECHO_SCHEMA: dict[str, Any] = {
@@ -824,7 +883,11 @@ async def test_a_resume_repairs_only_the_tool_calls_the_cancellation_left_unpair
     agent, _ = _agent(
         [
             ScriptedTurn(
-                tool_calls=[_call('c1', 'hi'), ToolCall(id='b1', name='Blocking', arguments='{}')]
+                tool_calls=[
+                    _call('c1', 'hi'),
+                    _call('c2', 'bye'),
+                    ToolCall(id='b1', name='Blocking', arguments='{}'),
+                ]
             ),
             ScriptedTurn(content='done'),
         ],
@@ -839,6 +902,7 @@ async def test_a_resume_repairs_only_the_tool_calls_the_cancellation_left_unpair
         ('user', None),
         ('assistant', None),
         ('tool', 'c1'),
+        ('tool', 'c2'),
     ]
 
     ctx = await agent.run('again')
@@ -846,11 +910,20 @@ async def test_a_resume_repairs_only_the_tool_calls_the_cancellation_left_unpair
         ('user', None),
         ('assistant', None),
         ('tool', 'c1'),
+        ('tool', 'c2'),
         ('tool', 'b1'),
         ('user', None),
         ('assistant', None),
     ]
-    assert _roles(_llm(agent).calls[1]) == ['system', 'user', 'assistant', 'tool', 'tool', 'user']
+    assert _roles(_llm(agent).calls[1]) == [
+        'system',
+        'user',
+        'assistant',
+        'tool',
+        'tool',
+        'tool',
+        'user',
+    ]
     assert ctx.stop_reason is StopReason.COMPLETED
 
 

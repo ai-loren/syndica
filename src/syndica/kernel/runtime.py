@@ -125,6 +125,7 @@ from syndica.kernel.context import (
     ContextBlock,
     StopReason,
     TrustLevel,
+    _trailing_unpaired_batch,  # pyright: ignore[reportPrivateUsage]
     provenance_of,
     strictest_trust,
 )
@@ -249,14 +250,10 @@ def _forkable_prefix(blocks: list[ContextBlock]) -> list[ContextBlock]:
     这份轨迹里唯一的不可信标记**，所以 `spawn` 另外把源 Agent 的溯源结论带到分身身上（见 `spawn`
     的 `query_trust` 与 `_carry_truncated_taint`）。
     """
-    index = len(blocks) - 1
-    while index >= 0 and blocks[index].role == 'tool':
-        index -= 1
-    if index < 0 or blocks[index].role != 'assistant' or not blocks[index].tool_calls:
+    batch = _trailing_unpaired_batch(blocks)
+    if batch is None:
         return list(blocks)
-    answered = {block.tool_call_id for block in blocks[index + 1 :]}
-    if all(call.id in answered for call in blocks[index].tool_calls):
-        return list(blocks)
+    index, _ = batch
     head = blocks[index]
     if not head.content:
         return blocks[:index]
