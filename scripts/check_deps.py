@@ -30,6 +30,7 @@ KERNEL = 'kernel'
 BACKENDS = 'backends'
 SURFACES = frozenset({'cli', 'server', 'runner'})
 FORBIDDEN_FROM_KERNEL = SURFACES | {BACKENDS}
+FORBIDDEN_KERNEL_EXTERNALS = frozenset({'yaml'})
 
 
 class LayoutError(Exception):
@@ -88,7 +89,7 @@ def _resolve_import_from(node: ast.ImportFrom, package: tuple[str, ...]) -> list
     return [(*base, alias.name) for alias in node.names]
 
 
-def _imported_components(path: Path, package_root: Path) -> set[tuple[str, ...]]:
+def _imported_modules(path: Path, package_root: Path) -> list[tuple[str, ...]]:
     tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
     package = (PACKAGE, *path.parent.relative_to(package_root).parts)
     modules: list[tuple[str, ...]] = []
@@ -97,6 +98,10 @@ def _imported_components(path: Path, package_root: Path) -> set[tuple[str, ...]]
             modules.extend(_resolve_import_from(node, package))
         elif isinstance(node, ast.Import):
             modules.extend(tuple(alias.name.split('.')) for alias in node.names)
+    return modules
+
+
+def _imported_components(modules: list[tuple[str, ...]]) -> set[tuple[str, ...]]:
     return {_component(parts[1:]) for parts in modules if len(parts) >= 2 and parts[0] == PACKAGE}
 
 
@@ -145,7 +150,20 @@ def check(root: Path) -> list[str]:
         if not owner:
             continue
         rel = path.relative_to(package_root)
-        for imported in sorted(_imported_components(path, package_root)):
+        modules = _imported_modules(path, package_root)
+        if owner[0] == KERNEL:
+            forbidden = sorted(
+                module[0]
+                for module in modules
+                if module and module[0] in FORBIDDEN_KERNEL_EXTERNALS
+            )
+            for imported in forbidden:
+                violations.append(
+                    f'{rel}: kernel imports external package {imported!r} (PyYAML). '
+                    'kernel 只允许标准库、pydantic 与一个 HTTP 客户端；'
+                    '把 YAML 解析留在 cli / runner surface，再把 Mapping 交给 kernel。'
+                )
+        for imported in sorted(_imported_components(modules)):
             message = _violation(rel, owner, imported)
             if message:
                 violations.append(message)

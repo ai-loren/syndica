@@ -152,7 +152,7 @@ def _budget(value: object) -> Mapping[str, int | None] | None:
                 f'turns={turns!r}，类型是 {type(turns).__name__}'
                 + ('：bool 是 int 的子类，YAML yes 会变成 1 轮' if isinstance(turns, bool) else '')
             ),
-            next_action='传整数轮次，或 null；不要传布尔值或浮点',
+            next_action='给 budget.turns 传整数轮次，或 null；不要传布尔值或浮点',
         )
     if turns < 0:
         raise ConfigError(

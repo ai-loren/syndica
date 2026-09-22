@@ -144,6 +144,23 @@ def test_surface_importing_a_backend_is_caught(tmp_path):
     assert 'backends.llm_openai' in result.stdout
 
 
+def test_kernel_importing_yaml_is_caught_but_cli_may_use_it(tmp_path):
+    kernel_module = tmp_path / 'src' / 'syndica' / 'kernel' / 'config.py'
+    kernel_module.parent.mkdir(parents=True)
+    kernel_module.write_text('import yaml\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode != 0
+    assert 'kernel/config.py' in result.stdout
+    assert 'PyYAML' in result.stdout
+
+    kernel_module.unlink()
+    cli_module = tmp_path / 'src' / 'syndica' / 'cli' / 'config.py'
+    cli_module.parent.mkdir(parents=True)
+    cli_module.write_text('import yaml\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_backend_importing_a_surface_is_caught(tmp_path):
     """backend 只允许依赖 kernel（spec §3.2 规则 3）。"""
     module = tmp_path / 'src' / 'syndica' / 'backends' / 'alpha' / 'client.py'

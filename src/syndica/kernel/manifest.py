@@ -34,7 +34,7 @@ _PUBLIC_FIELDS: tuple[str, ...] = (
 )
 _KNOWN_KEYS: frozenset[str] = frozenset((*_PUBLIC_FIELDS, 'impl'))
 _SOURCE_KINDS: frozenset[str] = frozenset(
-    {'mapping', 'json_file', 'json_directory', 'builtin', 'class'}
+    {'mapping', 'json_file', 'json_directory', 'yaml_file', 'builtin', 'class'}
 )
 
 
@@ -45,7 +45,7 @@ class ManifestSource:
     `origin` 是解析 `system_prompt` 相对路径的目录；纯 Mapping 没有 origin，提示词按字面保存。
     """
 
-    kind: Literal['mapping', 'json_file', 'json_directory', 'builtin', 'class']
+    kind: Literal['mapping', 'json_file', 'json_directory', 'yaml_file', 'builtin', 'class']
     location: str
     origin: str | None = None
 
@@ -122,7 +122,7 @@ def _require_source(source: object) -> None:
         raise ConfigError(
             expected=f'source.kind 是 {_SOURCE_KINDS} 之一',
             received=f'source.kind={source.kind!r}',
-            next_action='改成 mapping / json_file / json_directory / builtin / class',
+            next_action='改成 mapping / json_file / json_directory / yaml_file / builtin / class',
         )
     if not source.location.strip():
         raise ConfigError(

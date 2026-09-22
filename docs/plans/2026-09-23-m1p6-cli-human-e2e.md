@@ -211,9 +211,10 @@ expect:
 
 ### Task 2 — YAML loader 与声明式 topology
 
-**状态：in_progress**
+**状态：completed**（135 条定向测试；8 条真实变异；独立审查修复 3 项后 APPROVE）
 
-**Files:** `pyproject.toml`、`src/syndica/cli/config.py`、`tests/cli/test_config.py`
+**Files:** `pyproject.toml`、`src/syndica/cli/config.py`、`kernel/manifest.py`、
+`kernel/topology.py`、`scripts/check_deps.py`、`tests/cli/test_config.py`、`tests/test_deps.py`
 
 - 落地 CLI 安全单 Mapping loader、manifest 加载、命名 Topology / AgentSlot Mapping 解析。
 - 拒绝重复键、未知键、bool 冒充 int、非法 enum 字符串；不 normalize 名字或键。
@@ -222,7 +223,7 @@ expect:
 
 ### Task 3 — AskUser / AskUserQuestion
 
-**状态：pending**
+**状态：in_progress**
 
 **Files:** `kernel/tools/human.py`、`kernel/modules.py`、公开导出与对应单测
 
@@ -352,7 +353,8 @@ expect:
 
 ## 意外发现
 
-- 待执行后补。
+- Task 2：`scripts/check_deps.py` 原先只校验 Syndica 组件间依赖，不能发现 kernel 新增 PyYAML；
+  已增加外部包守卫，并用一正一反两个 fixture 证明只禁 kernel、不禁 CLI。
 
 ## 文档更新清单
 
