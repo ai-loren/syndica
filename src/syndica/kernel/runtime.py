@@ -116,7 +116,7 @@ import logging
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from syndica.kernel.agent import BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
@@ -142,6 +142,12 @@ from syndica.kernel.protocols import AgentRegistry, MessageBroker
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tools import orchestration_tools
 from syndica.kernel.waiting import Waiter, WaitResult, WaitState, correlation_of
+
+if TYPE_CHECKING:
+    from syndica.kernel.catalog import AgentCatalog
+    from syndica.kernel.llm import LLM
+    from syndica.kernel.tool import Tool
+    from syndica.kernel.topology import AgentSlot, Topology
 
 __all__ = ['AgentFactory', 'Runtime', 'validate_agent_factories']
 
@@ -631,6 +637,60 @@ def _checked_store(value: object, protocol: type[_StoreT], field: str, construct
     return value
 
 
+def _alias_for(slot: AgentSlot, key: str | None) -> str | None:
+    """稳定别名。on-demand 没有别名：每次 occupy 都是新实例，resolve 永远是 None。"""
+    if slot.cardinality == 'on-demand':
+        if key is not None:
+            raise ConfigError(
+                expected=f'槽 {slot.name!r} 是 on-demand，不接受 key',
+                received=f'key={key!r}',
+                next_action='去掉 key。on-demand 每次 occupy 新建，不按键复用',
+            )
+        return None
+    if slot.cardinality == 'singleton':
+        if key is not None:
+            raise ConfigError(
+                expected=f'槽 {slot.name!r} 是 singleton，不接受 key',
+                received=f'key={key!r}',
+                next_action='去掉 key。singleton 的别名就是槽名',
+            )
+        return slot.name
+    if not isinstance(key, str) or not key.strip():
+        raise ConfigError(
+            expected=f'槽 {slot.name!r} 是 keyed，key 是非空白字符串',
+            received=f'key={key!r}',
+            next_action='传入这次实例的键，例如 resolve(name, key="a")',
+        )
+    return f'{slot.name}:{key}'
+
+
+def _tightened_max_turns(current: int | None, requested: int | None, role: str) -> int | None:
+    """槽预算只许把实例 max_turns 收紧。放宽（含把有上限改成 null）当场失败。"""
+    if requested is None:
+        if current is None:
+            return None
+        raise ConfigError(
+            expected=f'槽预算只收紧角色 {role!r} 的 max_turns={current}',
+            received='turns=null，等于把有上限的角色改成不限轮次',
+            next_action='传一个不超过角色 max_turns 的非负整数，或不写 budget',
+        )
+    if current is not None and requested > current:
+        raise ConfigError(
+            expected=f'槽预算只收紧，不放宽（角色 {role!r} 的 max_turns={current}）',
+            received=f'turns={requested}',
+            next_action='传一个不超过角色 max_turns 的整数，或另定义一个预算更大的角色',
+        )
+    return requested
+
+
+@dataclass(frozen=True)
+class _TopologyBinding:
+    """装配时钉死的槽。artifact_kinds 是当时清单上的快照，之后改目录不影响已装配的实例。"""
+
+    slot: AgentSlot
+    artifact_kinds: tuple[str, ...]
+
+
 class Runtime:
     """Agent 的生命周期驱动与控制面。
 
@@ -692,6 +752,13 @@ class Runtime:
         self._destroying: dict[str, _Teardown] = {}
         self._closed = False
         self._shutdown_reported = False
+        # 拓扑别名与 `_slots` 不是一张表。`_slots` 是每个已 spawn Agent 的生命周期；别名是
+        # 「槽名 → 当时的 agent_id」快照。复用 `_slots` 会让一次 occupy 盖掉驱动任务。
+        self._assembled = False
+        self._topology_bindings: dict[str, _TopologyBinding] = {}
+        self._topology_aliases: dict[str, str] = {}
+        self._topology_alias_owners: dict[str, str] = {}
+        self._topology_tools: dict[str, Tool] = {}
         # 「队列不存在」是懒启动与 ZOMBIE 复活的唯一触发点（spec §4.4）。接在这里，而不是让每个
         # 调用方自己先判断再激活——那样「复活」就有了 N 份实现。
         self.broker.on_missing_queue(self._on_missing_queue)
@@ -717,8 +784,8 @@ class Runtime:
     def agent_factory(self, name: str) -> AgentFactory | None:
         """按角色名取工厂；没有就 None（问句只答不抛）。
 
-        这是「派活给谁」的最小落点。**声明式定义、加载源与同名覆盖归计划 3**——那里会在这张表
-        之上加载入与覆盖记录，本方法的返回语义不变。
+        这是「派活给谁」的最小落点。`assemble` 用目录 freeze 的工厂覆盖同名项；本方法仍只按名字取，
+        没有就 None。
         """
         return self._agents.get(name)
 
@@ -2103,9 +2170,263 @@ class Runtime:
             remaining,
         )
 
+    async def assemble(
+        self,
+        topology: Topology,
+        catalog: AgentCatalog,
+        *,
+        tools: Mapping[str, Tool],
+        models: Mapping[str, LLM],
+        host: object = None,
+    ) -> None:
+        """把拓扑装进本 Runtime。这不是 `start`，也不发 Runtime 启动切点。
+
+        只 spawn `boot='eager'` 的 singleton。lazy 等 `send_to_slot`，manual 等 `occupy`。
+        第二次调用是契约违反：要换形态就新 Runtime。中途 spawn 失败也已经算装过，避免重试把
+        已经起来的 eager 再 spawn 一遍。
+        """
+        from syndica.kernel.catalog import AgentCatalog
+        from syndica.kernel.topology import Topology
+
+        if self._closed:
+            raise _already_shut_down()
+        # 签名挡不住绕过类型检查的调用方，所以先收成 object 再判真实类型。
+        received_topology = cast(object, topology)
+        if not isinstance(received_topology, Topology):
+            raise ConfigError(
+                expected='topology 是 Topology',
+                received=f'收到 {type(received_topology).__name__} 类型的 {received_topology!r}',
+                next_action='传入 Topology(slots=...)；不要传裸列表',
+            )
+        received_catalog = cast(object, catalog)
+        if not isinstance(received_catalog, AgentCatalog):
+            raise ConfigError(
+                expected='catalog 是 AgentCatalog',
+                received=f'收到 {type(received_catalog).__name__} 类型的 {received_catalog!r}',
+                next_action='传入 AgentCatalog；先 load_mapping / register_class 再 assemble',
+            )
+        if self._assembled:
+            raise ContractViolation(
+                expected='一个 Runtime 只 assemble 一次',
+                received='assemble 已被调用过',
+                next_action='要换拓扑就新建一个 Runtime；不要在同一个进程上重装',
+            )
+        received_tools = cast(object, tools)
+        if isinstance(received_tools, (str, bytes)) or not isinstance(received_tools, Mapping):
+            raise ConfigError(
+                expected='tools 是「名字 → Tool」的映射',
+                received=f'收到 {type(received_tools).__name__} 类型的 {received_tools!r}',
+                next_action='传入 {"Read": read_tool} 这样的表。槽上的 extra_tools 按这张表解析',
+            )
+        tool_table = cast('Mapping[str, Tool]', received_tools)
+        received_topology.validate(received_catalog)
+        frozen = received_catalog.freeze(tool_table, models, host)
+        for name, factory in frozen.items():
+            if name in self._agents:
+                logger.info('catalog 覆盖了 Runtime(agents=) 里同名工厂 %s', name)
+            self._agents[name] = factory
+        self._topology_tools = dict(tool_table)
+        bindings: dict[str, _TopologyBinding] = {}
+        for slot in received_topology.slots:
+            manifest = received_catalog.get(slot.agent)
+            bindings[slot.name] = _TopologyBinding(
+                slot=slot,
+                artifact_kinds=tuple(manifest.artifact_kinds),
+            )
+        self._topology_bindings = bindings
+        self._topology_aliases = {}
+        self._topology_alias_owners = {}
+        self._assembled = True
+        for slot in received_topology.slots:
+            if slot.boot == 'eager':
+                await self._spawn_slot(bindings[slot.name], key=None)
+
+    async def resolve(
+        self,
+        name: str,
+        *,
+        key: str | None = None,
+        spawn: bool = False,
+    ) -> str | None:
+        """按槽名取已有别名。`spawn=False` 不创建。on-demand 永远 None。
+
+        manual 即使 `spawn=True` 也不创建：没有调用方的显式 occupy，它不该出现。
+        """
+        binding = self._binding(name)
+        slot = binding.slot
+        alias = _alias_for(slot, key)
+        if alias is None:
+            return None
+        existing = self._owned_alias(slot, alias)
+        if existing is not None:
+            return existing
+        if not spawn:
+            return None
+        if slot.boot == 'manual':
+            raise ConfigError(
+                expected=f'槽 {name!r} 是 manual，resolve 不会创建它',
+                received='spawn=True',
+                next_action='用 occupy 显式创建；manual 不会因寻址而出现',
+            )
+        return await self._spawn_slot(binding, key=key)
+
+    async def occupy(self, name: str, *, key: str | None = None) -> str:
+        """显式要一个实例。singleton / 同一 key 再次调用返回同一个 agent_id。
+
+        on-demand 每次都新建，并且不进别名表。
+        """
+        binding = self._binding(name)
+        alias = _alias_for(binding.slot, key)
+        if alias is not None:
+            existing = self._owned_alias(binding.slot, alias)
+            if existing is not None:
+                return existing
+        return await self._spawn_slot(binding, key=key)
+
+    async def send_to_slot(
+        self,
+        name: str,
+        content: str,
+        *,
+        key: str | None = None,
+        trigger: Trigger = Trigger.PENDING,
+        activate: bool = True,
+        sender: str = 'runtime',
+        correlation_id: str | None = None,
+        trust: TrustLevel = TrustLevel.TRUSTED,
+    ) -> DeliveryResult:
+        """按槽名投递。lazy 的第一次寻址会创建；manual 与 on-demand 拒绝。
+
+        不把槽名塞进 `send` 的第一个参数：那一位是 agent_id。两条寻址混在一个参数里，
+        调用方无法从类型上看出自己传的是哪一种。
+        """
+        binding = self._binding(name)
+        slot = binding.slot
+        if slot.cardinality == 'on-demand' or slot.boot == 'manual':
+            raise ConfigError(
+                expected=('send_to_slot 只服务 singleton / keyed；lazy 会在第一次寻址时创建'),
+                received=f'槽 {name!r} cardinality={slot.cardinality!r} boot={slot.boot!r}',
+                next_action='这种槽用 occupy 拿到 agent_id，再 send(agent_id, ...)',
+            )
+        agent_id = await self.resolve(name, key=key, spawn=True)
+        if agent_id is None:
+            raise ContractViolation(
+                expected=f'槽 {name!r} 在 send_to_slot 时已经有或刚创建出 agent_id',
+                received='resolve 返回 None',
+                next_action='on-demand 与 manual 走 occupy；这条路径只服务 singleton 与 keyed',
+            )
+        return await self.send(
+            agent_id,
+            content,
+            trigger=trigger,
+            activate=activate,
+            sender=sender,
+            correlation_id=correlation_id,
+            trust=trust,
+        )
+
+    def _binding(self, name: str) -> _TopologyBinding:
+        if not self._assembled:
+            raise ConfigError(
+                expected='先 assemble 再按槽名寻址',
+                received=f'槽 {name!r}，Runtime 还没有装配拓扑',
+                next_action=('先 await runtime.assemble(topology, catalog, tools=..., models=...)'),
+            )
+        binding = self._topology_bindings.get(name)
+        if binding is None:
+            known = sorted(self._topology_bindings)
+            raise ConfigError(
+                expected=f'槽名是已装配拓扑里的一个：{known}',
+                received=f'name={name!r}',
+                next_action='用 Topology 里的 slot.name，不要用角色名或 agent_id',
+            )
+        return binding
+
+    async def _spawn_slot(self, binding: _TopologyBinding, *, key: str | None) -> str:
+        slot = binding.slot
+        base = self._agents.get(slot.agent)
+        if base is None:
+            raise ConfigError(
+                expected=f'角色 {slot.agent!r} 的工厂在 assemble 时已经并进 Runtime',
+                received=f'agent_names={list(self._agents)!r}，没有 {slot.agent!r}',
+                next_action='确认 assemble 用的 catalog 里有这个角色，并且没有在之后删掉工厂',
+            )
+        alias = _alias_for(slot, key)
+        if alias is not None:
+            existing = self._owned_alias(slot, alias)
+            if existing is not None:
+                return existing
+        agent_id = await self.spawn(
+            self._enhanced_factory(base, slot),
+            exit_mode=slot.exit_mode,
+            metadata=self._instance_metadata(slot, binding.artifact_kinds),
+        )
+        if alias is not None:
+            self._topology_aliases[alias] = agent_id
+            self._topology_alias_owners[alias] = slot.name
+        return agent_id
+
+    def _owned_alias(self, slot: AgentSlot, alias: str) -> str | None:
+        """同一槽再次算出这个别名时返回已有 agent_id。别的槽占用了它则拒绝。"""
+        existing = self._topology_aliases.get(alias)
+        if existing is None:
+            return None
+        owner = self._topology_alias_owners.get(alias)
+        if owner == slot.name:
+            return existing
+        raise ConfigError(
+            expected=f'别名 {alias!r} 还没有被占用',
+            received=f'槽 {slot.name!r} 算出的别名已被占用（当前属于槽 {owner!r}）',
+            next_action='改槽名。别名是槽名或「槽名:键」，两个槽不得算出同一个',
+        )
+
+    def _enhanced_factory(self, base: AgentFactory, slot: AgentSlot) -> AgentFactory:
+        """包一层槽增强。工厂闭包里的 AgentOptions 可能被多次调用复用，这里只换本实例的那一份。"""
+
+        def factory(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+            agent = base(hooks, events)
+            self._apply_slot_enhance(agent, slot)
+            return agent
+
+        return factory
+
+    def _apply_slot_enhance(self, agent: BaseAgent, slot: AgentSlot) -> None:
+        from syndica.kernel.catalog import resolve_tool_names
+
+        extra: dict[str, Tool] = {}
+        if slot.extra_tools:
+            resolved = resolve_tool_names(slot.extra_tools, self._topology_tools)
+            extra = dict(resolved)
+            clashes = sorted(set(extra) & set(agent.options.tools))
+            if clashes:
+                raise ConfigError(
+                    expected=f'槽 {slot.name!r} 的 extra_tools 只并上角色还没有的工具',
+                    received=f'这些名字已经在角色 {slot.agent!r} 上：{clashes}。增强不得替换',
+                    next_action='需要不同行为就定义不同角色；槽不得替换基础工具',
+                )
+        if slot.budget is not None:
+            tightened = _tightened_max_turns(
+                agent.options.max_turns, slot.budget['turns'], slot.agent
+            )
+            agent.options = replace(agent.options, max_turns=tightened)
+        if extra:
+            agent.install_runtime_tools(extra)
+
+    def _instance_metadata(self, slot: AgentSlot, kinds: tuple[str, ...]) -> dict[str, Any]:
+        owned = copy.deepcopy(dict(slot.metadata))
+        if 'artifact_kinds' in owned:
+            raise ConfigError(
+                expected='槽 metadata 不得占用 artifact_kinds',
+                received=f'槽 {slot.name!r} 的 metadata 含 artifact_kinds',
+                next_action='删掉这个键。产物种类写在角色清单上，occupy 时再并进来',
+            )
+        owned['artifact_kinds'] = kinds
+        return owned
+
     async def find(self, agent_id: str) -> AgentInfo | None:
-        """只读路径，绝不激活任何 Agent。"""
-        return await self.registry.get(agent_id)
+        """只读路径，绝不激活、也绝不创建。已有别名会解析成当时的 agent_id。"""
+        mapped = self._topology_aliases.get(agent_id)
+        return await self.registry.get(mapped if mapped is not None else agent_id)
 
     async def shutdown(self) -> None:
         """取消所有事件循环，**等它们停下来**再关事件总线。幂等，且是终态：此后 spawn 报错。
