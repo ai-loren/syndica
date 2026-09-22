@@ -1575,7 +1575,7 @@ async def test_the_policy_sees_untrusted_provenance_on_the_one_grid_that_reaches
 
 
 async def test_a_high_risk_call_traceable_to_untrusted_content_is_blocked_whatever_a_policy_says():
-    """spec §12.2 第 3 条：这道升级不允许被宿主策略配掉，所以它必须经 `disposition_of` 走。"""
+    """默认升级不允许被 DangerPolicy 配掉，所以必须经 `disposition_of` 走。"""
     tool = _Runner()
     policy = _RecordingPolicy(Disposition.ALLOW)
     ctx = _untrusted_context()
@@ -1622,8 +1622,9 @@ async def test_untrusted_content_counts_whatever_role_carries_it(role):
 
 async def test_one_plain_tool_exception_escalates_every_later_high_risk_call_on_that_context():
     """溯源是上界（B-15）：`_tool_raised_result` 按 UNTRUSTED 落盘，于是一次纯本地工具的异常也会
-    把这份 Context 余生的高风险调用钉成「可溯源到不可信」，`AllowAll` 也关不掉。钉住它是为了让下
-    一次调整那条 trust 成为一次自觉的改动——只钉那些块自己的 trust 时，闸的行为会被静默改掉。"""
+    把这份 Context 余生的高风险调用钉成「可溯源到不可信」，默认 SafetyModule 仍会阻断。钉住它
+    是为了让下一次调整那条 trust 成为一次自觉的改动——只钉那些块自己的 trust 时，闸的行为会被
+    静默改掉。"""
     runner = _Runner()
     executor = ToolExecutor(
         tools={'Boom': _Boom(), 'Runner': runner}, hooks=HooksCenter(), policy=AllowAll()
@@ -1734,8 +1735,8 @@ async def test_a_hook_that_hands_back_the_very_same_mapping_is_still_its_author(
 
 async def test_a_pre_hook_writing_into_args_in_place_fails_loudly():
     """就地改而不声明 `modified['args']` 也能换掉真正被执行的参数，却不进 `HookResult.history`
-    ——作者判据看不见它，那道关不掉的升级于是按一份已经失效的批快照放行。检测在 executor 侧做不
-    干净（要对模型与 hook 控制的值调 `__eq__`），所以它在结构上不可能：写入当场失败。"""
+    ——作者判据看不见它，宿主配置的升级处置于是按一份已经失效的批快照放行。检测在 executor 侧
+    做不干净（要对模型与 hook 控制的值调 `__eq__`），所以它在结构上不可能：写入当场失败。"""
     runner = _Runner()
     hooks = HooksCenter()
 
@@ -2677,7 +2678,7 @@ async def test_a_single_call_segment_retakes_provenance_instead_of_assuming_the_
 
 async def test_a_concurrent_segment_without_a_rewriting_hook_still_judges_the_batch_snapshot():
     """最坏情况只施加在「hook 改写参数 ∧ 多元素段」这个交集上。铺到整个并发段，每一批并发调用
-    都会被当成可溯源到不可信内容，而宿主关不掉（D-29 未实现）。"""
+    都会被当成可溯源到不可信内容，并触发宿主配置的升级处置。"""
     policy = _RecordingPolicy()
     await _concurrent({'Probe': _Probe()}, policy=policy).execute_tool_calls(
         Context(), _probe_calls(2)

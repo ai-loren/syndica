@@ -767,12 +767,18 @@ def validate_danger_options(judge: object, policy: object) -> None:
         )
 
 
-def disposition_of(policy: DangerPolicy, request: DangerRequest) -> Disposition:
+def disposition_of(
+    policy: DangerPolicy,
+    request: DangerRequest,
+    *,
+    untrusted_high_risk: Disposition = Disposition.BLOCK,
+) -> Disposition:
     """处置的唯一入口：先施加强制升级，再咨询宿主策略。
 
-    **高风险 + 可溯源到不可信内容 → 阻断，且不咨询 policy**（spec §12.2 第 3 条、§17 第 75 条）。
-    放在 policy 之后取严者也能得到同样的答案，但那样这一条就成了「策略之一」；不允许模型自授权
-    要求它是结构上关不掉的一步。
+    **高风险 + 可溯源到不可信内容 → 使用宿主显式配置的升级处置，且不咨询 policy**
+    （spec §12.2 第 3 条、§17 第 75 条）。默认 BLOCK；CONFIRM 与 ALLOW 只能由 Runtime Module 的
+    `untrusted_high_risk` Flag 显式给出，不是模型授权。放在 policy 之后取严者会让这一条变成
+    「策略之一」，不满足强制升级的结构约束。
 
     `provenance is None`（没有溯源过）**不**触发升级：这一条的前提是「可溯源到不可信内容」，前提
     没有被确认成立时冒充它成立，等于把一份没做过的检查报成做过了。溯源本身由调用方给出，于是
@@ -783,8 +789,18 @@ def disposition_of(policy: DangerPolicy, request: DangerRequest) -> Disposition:
     `is` 也不 `==` 任何成员，下游那句 `is Disposition.BLOCK` 为假——症状是**放行**，正是最危险的
     那个方向。
     """
+    raw_disposition = cast('object', untrusted_high_risk)
+    if not isinstance(raw_disposition, Disposition):
+        raise ContractViolation(
+            expected='untrusted_high_risk 是 Disposition 成员',
+            received=(f'收到 {raw_disposition!r}，类型是 {type(raw_disposition).__name__}'),
+            next_action=(
+                '传 Disposition.BLOCK / Disposition.CONFIRM / Disposition.ALLOW；'
+                'Runtime 宿主请改 SafetyModule 的 untrusted_high_risk Flag'
+            ),
+        )
     if request.verdict.level is RiskLevel.HIGH and request.provenance is TrustLevel.UNTRUSTED:
-        return Disposition.BLOCK
+        return raw_disposition
     decided = cast('object', policy.decide(request))
     if not isinstance(decided, Disposition):
         raise ContractViolation(

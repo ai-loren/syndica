@@ -161,6 +161,13 @@ def _judge(command: Any) -> DangerVerdict:
     return DangerJudge().judge(_Runner(), {'command': command})
 
 
+def _three_parts(error: BaseException) -> None:
+    text = str(error)
+    assert '期望:' in text
+    assert '实际:' in text
+    assert '下一步:' in text
+
+
 # --- 枚举与数据形状 -------------------------------------------------------------------------
 
 
@@ -980,9 +987,43 @@ def test_a_high_risk_call_traceable_to_untrusted_content_is_blocked_whatever_the
 
 
 def test_the_policy_is_not_even_consulted_when_the_escalation_applies():
-    """升级配不掉：policy 在它之后才被咨询，于是宿主换一个策略也关不掉这一条。"""
+    """升级不由 DangerPolicy 配置：policy 在它之后才被咨询。"""
     policy = _Recording(Disposition.ALLOW)
     disposition_of(policy, _request(RiskLevel.HIGH, TrustLevel.UNTRUSTED))
+    assert policy.seen == []
+
+
+@pytest.mark.parametrize(
+    'configured',
+    [Disposition.BLOCK, Disposition.CONFIRM, Disposition.ALLOW],
+    ids=['reject', 'ask', 'allow'],
+)
+def test_untrusted_high_risk_uses_the_explicit_host_disposition_before_policy(
+    configured: Disposition,
+):
+    policy = _Recording(Disposition.BLOCK)
+    request = _request(RiskLevel.HIGH, TrustLevel.UNTRUSTED)
+
+    assert disposition_of(policy, request, untrusted_high_risk=configured) is configured
+    assert policy.seen == []
+
+
+@pytest.mark.parametrize('configured', ['allow', None, RiskLevel.HIGH])
+def test_untrusted_high_risk_rejects_non_disposition_values_with_three_part_guidance(
+    configured: object,
+):
+    policy = _Recording()
+    with pytest.raises(ContractViolation) as excinfo:
+        disposition_of(
+            policy,
+            _request(RiskLevel.HIGH, TrustLevel.UNTRUSTED),
+            untrusted_high_risk=cast(Any, configured),
+        )
+
+    _three_parts(excinfo.value)
+    assert 'Disposition' in excinfo.value.expected
+    assert type(configured).__name__ in excinfo.value.received
+    assert 'SafetyModule' in excinfo.value.next_action
     assert policy.seen == []
 
 

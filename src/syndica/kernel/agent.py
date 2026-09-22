@@ -79,8 +79,8 @@ from typing import Any, cast
 
 from syndica.kernel.context import Context, ContextBlock, StopReason, ToolCall, TrustLevel
 from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
-from syndica.kernel.danger import DangerJudge, DangerPolicy, validate_danger_options
-from syndica.kernel.errors import ContractViolation, LLMResponseError
+from syndica.kernel.danger import DangerJudge, DangerPolicy, Disposition, validate_danger_options
+from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction, JunctionRef
 from syndica.kernel.llm import LLM, ContextOverflowError
@@ -468,7 +468,7 @@ class BaseAgent:
 
     def _assembly_snapshot(
         self,
-    ) -> tuple[AgentOptions, dict[str, Tool], Any, Any, TurnGate, bool]:
+    ) -> tuple[AgentOptions, dict[str, Tool], Any, Any, TurnGate, bool, Disposition]:
         """保存 Runtime 装配前本对象自己拥有的可变状态。"""
         return (
             self.options,
@@ -477,14 +477,23 @@ class BaseAgent:
             self._module_hooks._assembly_snapshot(),  # pyright: ignore[reportPrivateUsage]
             self._gate,
             self._gate_attached,
+            self._executor._untrusted_high_risk,  # pyright: ignore[reportPrivateUsage]
         )
 
     def _assembly_restore(
         self,
-        snapshot: tuple[AgentOptions, dict[str, Tool], Any, Any, TurnGate, bool],
+        snapshot: tuple[
+            AgentOptions,
+            dict[str, Tool],
+            Any,
+            Any,
+            TurnGate,
+            bool,
+            Disposition,
+        ],
     ) -> None:
         """恢复 `_assembly_snapshot`；被拒的 spawn 不留下半套 Agent。"""
-        options, tools, local_hooks, module_hooks, gate, gate_attached = snapshot
+        options, tools, local_hooks, module_hooks, gate, gate_attached, disposition = snapshot
         options.tools.clear()
         options.tools.update(tools)
         self.options = options
@@ -495,10 +504,32 @@ class BaseAgent:
         )
         self._gate = gate
         self._gate_attached = gate_attached
+        self._executor._configure_untrusted_high_risk(  # pyright: ignore[reportPrivateUsage]
+            disposition
+        )
 
     def _install_module_plugins(self, plugins: Iterable[Plugin]) -> None:
         """把 Module 插件装进 local 与 Runtime 之间的独立一层。"""
         install_plugins(self._module_hooks, tuple(plugins))
+
+    def _configure_runtime_flags(self, flags: Mapping[str, bool | int | str]) -> None:
+        """把已解析的 Runtime Flag 接到构造时已创建的执行器。"""
+        value = flags.get('untrusted_high_risk', 'reject')
+        dispositions = {
+            'reject': Disposition.BLOCK,
+            'ask': Disposition.CONFIRM,
+            'allow': Disposition.ALLOW,
+        }
+        disposition = dispositions.get(value) if isinstance(value, str) else None
+        if disposition is None:
+            raise ConfigError(
+                expected='untrusted_high_risk 是 reject / ask / allow',
+                received=f'收到 {value!r}，类型是 {type(value).__name__}',
+                next_action='经 SafetyModule 声明并解析该 Flag，不要直接调用私有装配入口',
+            )
+        self._executor._configure_untrusted_high_risk(  # pyright: ignore[reportPrivateUsage]
+            disposition
+        )
 
     def _attach_gate(self, gate: TurnGate) -> None:
         """装上控制面的门。
@@ -537,7 +568,7 @@ class BaseAgent:
         `trust` 是 `query` 那一块的信任级别。门那条路早就带着它（`Message.trust` 经 `_inject`
         原样落进块），这一条也必须能表达同一件事：派活与分叉交给子 Agent 的第一条输入是模型写下
         的文字，而模型读过什么决定了那段文字是什么的衍生物（spec §12.2 第 2 条）。标记丢在这里，
-        子 Agent 的高风险调用就绕过了 §12.2 第 3 条那道关不掉的升级。
+        子 Agent 的高风险调用就绕过了 §12.2 第 3 条由宿主显式配置的升级处置。
         """
         if self._running:
             raise _concurrent_run(self.agent_id)

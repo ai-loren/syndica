@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from syndica.kernel.agent import BaseAgent
     from syndica.kernel.runtime import Runtime
 
-__all__ = ['FlagDeclaration', 'RuntimeModule']
+__all__ = ['FlagDeclaration', 'RuntimeModule', 'SafetyModule']
 
 FlagValue: TypeAlias = bool | int | str
 AgentPluginFactory: TypeAlias = Callable[['Runtime', 'BaseAgent', Mapping[str, FlagValue]], Plugin]
@@ -351,6 +351,29 @@ class RuntimeModule:
         object.__setattr__(self, 'tool_factories', checked_tools)
         object.__setattr__(self, 'on_start', on_start)
         object.__setattr__(self, 'on_shutdown', on_shutdown)
+
+
+class SafetyModule(RuntimeModule):
+    """等待墙钟与不可信高风险处置的 Flag 声明。"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            'safety',
+            flags=(
+                FlagDeclaration(
+                    key='max_wait_seconds',
+                    default=0,
+                    description='单个 Agent 等待答复或另一个 Agent 的最长墙钟秒数；0 表示不限制',
+                    minimum=0,
+                ),
+                FlagDeclaration(
+                    key='untrusted_high_risk',
+                    default='reject',
+                    description='高风险调用可溯源到不可信内容时的处置',
+                    choices=('reject', 'ask', 'allow'),
+                ),
+            ),
+        )
 
 
 def _module_sequence(value: object) -> tuple[RuntimeModule, ...]:

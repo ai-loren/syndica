@@ -17,8 +17,8 @@
 
 **模型写下的每一段文字进另一个 Agent 的上下文时都带着发起方的溯源结论**（`Delegate` 的 `query`、
 `SendMessage` 的 `content`）。发起方读过的不可信内容只要被它复述进去，在接收方那里必须仍然不可信，
-否则一次派活或一条消息就把标记洗掉了，而接收方的高风险调用于是绕过 spec §12.2 第 3 条那道关不掉
-的升级。判据是 `context.provenance_of` 这一个定义，经 `Runtime._provenance_of` 读。
+否则一次派活或一条消息就把标记洗掉了，而接收方的高风险调用于是绕过 spec §12.2 第 3 条由宿主
+显式配置的升级处置。判据是 `context.provenance_of` 这一个定义，经 `Runtime._provenance_of` 读。
 
 **`KillAgent` 的目标限制在发起方的后代。** 注册表是全局的，而模型只要顺着 `QueryAgent` 报出的
 `parent` 往上走就能寻址到自己的父与根协调者——不限制的话，一个被说服的子 Agent 能停掉正等着它的
@@ -145,8 +145,8 @@ def _interrupted(child_id: str, state: WaitState) -> ToolResult:
     `trust` 是 `TRUSTED`：这一块只嵌内核自撰的文字与一个内核生成的 `child_id`，没有任何来自子
     Agent 或外部的字节（判据见 `tool_executor` 模块 docstring）。标成 `UNTRUSTED` 会让一次正当的
     `abort` 永久废掉这个 Agent 的 `AllowAll`——这块落进轨迹之后，`provenance_of` 是「出现过就算」
-    的上界，而宿主关不掉它（D-29 未实现）。**日后往这段话里加入子 Agent 的部分产出，就必须改回
-    读子 Agent 的真实溯源**。
+    的上界；宿主虽能用 SafetyModule 显式放宽，但默认仍会阻断。**日后往这段话里加入子 Agent 的
+    部分产出，就必须改回读子 Agent 的真实溯源**。
     """
     return ToolResult(
         output=(
@@ -216,7 +216,7 @@ class Delegate(_AgentTool):
             )
         # `query` 是本 Agent 的模型写下的文字，而模型读过什么决定了那段文字是什么的衍生物
         # （spec §12.2 第 2 条）。丢掉这一步，任何不可信内容都能经一次派活洗成子 Agent 的可信
-        # 输入，而子 Agent 的高风险调用于是绕过那道关不掉的升级。
+        # 输入，而子 Agent 的高风险调用于是绕过宿主配置的升级处置。
         trust = self._runtime._provenance_of(self._agent_id)  # pyright: ignore[reportPrivateUsage]
         child_id = await self._runtime.spawn(
             factory,
@@ -302,7 +302,7 @@ class SendMessage(_AgentTool):
             )
         # `content` 是本 Agent 的模型写下的文字，而模型读过什么决定了那段文字是什么的衍生物
         # （spec §12.2 第 2 条）。丢掉这一步，任何不可信内容都能经一条消息洗成收件人的可信输入，
-        # 而收件人的高风险调用于是绕过那道关不掉的升级。
+        # 而收件人的高风险调用于是绕过宿主配置的升级处置。
         trust = self._runtime._provenance_of(self._agent_id)  # pyright: ignore[reportPrivateUsage]
         delivered = await self._runtime.send(
             agent_id, content, trigger=when, sender=self._agent_id, trust=trust

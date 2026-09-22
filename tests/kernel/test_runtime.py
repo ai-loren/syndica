@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+import syndica.kernel.runtime as runtime_module
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
 from syndica.kernel.context import ContextBlock, StopReason, ToolCall, TrustLevel
@@ -22,6 +23,7 @@ from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import LLMConfig, ScriptedLLM, ScriptedTurn
 from syndica.kernel.message import DeliveryResult, Message, Trigger
+from syndica.kernel.modules import SafetyModule
 from syndica.kernel.protocols import AgentRegistry, MissingQueueCallback
 from syndica.kernel.runtime import _LIVE_STATUSES, AgentFactory, Runtime, _WaitToken
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
@@ -41,8 +43,8 @@ _TIMEOUT = 1.0
 # ——它要挡的回归是「明明没等到也没被打断，却提前返回了」，而那种返回会被误读成超时。
 _BRIEF_WAIT = 0.05
 _UNREACHED_WAIT = 30.0
-# 一次四小时的人工确认。取到小时量级是为了越过任何「看着合理」的宿主级上限：`wait_for` 不 clamp
-# 是明确裁决，而秒级或分钟级的取值挡不住一道 min(timeout, 3600) ——它会把这次确认静默截成一小时。
+# 一次四小时的人工确认。没有 SafetyModule 时它必须原样传给 broker；装了 Module 后，测试用这
+# 个取值证明宿主级上限真的取了更小值。
 _LONG_WAIT = 4 * 3600.0
 _SYSTEM_PROMPT = 'You are a worker.'
 # 注册顺序既非升序（Concat / Echo / Upper）亦非降序，反转后同样两者都不是：n=1 或恰好有序时，
@@ -211,6 +213,28 @@ class _Gate(Tool):
         return ToolResult(output=f'released {index}')
 
 
+class _AsyncioWaitProxy:
+    """只替换 runtime 模块看到的 `asyncio.wait`，其余 asyncio API 原样转发。"""
+
+    def __init__(
+        self,
+        wait: Callable[..., Awaitable[tuple[set[Any], set[Any]]]],
+    ) -> None:
+        self._wait = wait
+
+    async def wait(
+        self,
+        futures: Any,
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109
+        return_when: str = asyncio.ALL_COMPLETED,
+    ) -> tuple[set[Any], set[Any]]:
+        return await self._wait(futures, timeout=timeout, return_when=return_when)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(asyncio, name)
+
+
 class _RecordingRegistry:
     """记下每一次状态转换（尝试的与真的写进去的），并可让指定的一次转换失败。
 
@@ -353,9 +377,8 @@ class _SpyBroker:
         self._consumes: dict[str, int] = {}
         self._took = asyncio.Event()
         self._takes: dict[str, int] = {}
-        # 交给 take_by_correlation 的那个上限，原样记下。`wait_for` 不 clamp 是一条明确裁决，而
-        # 它在外面唯一的观测点就是这里：夹一道宿主级上限之后，一次四小时的人工确认会静默变成一
-        # 小时，而症状只在长跑里现身。
+        # 交给 take_by_correlation 的有效上限，原样记下。它是验证 Waiter 自有 timeout 与
+        # SafetyModule 宿主上限如何合并的唯一外部观测点。
         self.take_timeouts: list[tuple[str, float | None]] = []
         self.removals: list[tuple[str, AgentStatus | None]] = []
         self.hold_removal_of: str | None = None
@@ -731,7 +754,12 @@ async def _running(
 
 
 async def _armed(
-    runtime: Runtime, broker: _SpyBroker, tool: _Waiting, *, parent_id: str | None = None
+    runtime: Runtime,
+    broker: _SpyBroker,
+    tool: _Waiting,
+    *,
+    parent_id: str | None = None,
+    flags: dict[str, bool | int | str] | None = None,
 ) -> str:
     """起一个等待型 Agent，停在邮箱上、工具已经拿到自己的 agent_id，但还没开始跑。
 
@@ -744,7 +772,11 @@ async def _armed(
             ScriptedTurn(content='done'),
         ]
     )
-    agent_id = await runtime.spawn(_factory(llm, tools={'Waiting': tool}), parent_id=parent_id)
+    agent_id = await runtime.spawn(
+        _factory(llm, tools={'Waiting': tool}),
+        parent_id=parent_id,
+        flags=flags,
+    )
     await asyncio.wait_for(broker.reach(agent_id, 1), _TIMEOUT)
     tool.runtime = runtime
     tool.agent_id = agent_id
@@ -763,9 +795,14 @@ async def _started(runtime: Runtime, broker: _SpyBroker, tool: _Waiting, agent_i
 
 
 async def _waiting(
-    runtime: Runtime, broker: _SpyBroker, tool: _Waiting, *, parent_id: str | None = None
+    runtime: Runtime,
+    broker: _SpyBroker,
+    tool: _Waiting,
+    *,
+    parent_id: str | None = None,
+    flags: dict[str, bool | int | str] | None = None,
 ) -> str:
-    agent_id = await _armed(runtime, broker, tool, parent_id=parent_id)
+    agent_id = await _armed(runtime, broker, tool, parent_id=parent_id, flags=flags)
     await _started(runtime, broker, tool, agent_id)
     return agent_id
 
@@ -6099,11 +6136,8 @@ async def test_a_wait_for_an_agent_kill_left_in_aborting_answers_aborted():
     await asyncio.wait_for(runtime.shutdown(), _TIMEOUT)
 
 
-async def test_the_waiter_timeout_reaches_the_broker_unclamped():
-    """上限来自 `Waiter` 自己（spec §4.2），`wait_for` 不 clamp。
-
-    在这里悄悄夹一道宿主级上限，一次四小时的人工确认会静默变成一小时，而症状只在长跑里现身。
-    """
+async def test_the_waiter_timeout_reaches_the_broker_unclamped_without_a_safety_module():
+    """没有宿主级上限时，`Waiter` 自己的 timeout 原样下传。"""
     broker = _SpyBroker()
     runtime = Runtime(broker=broker)
     tool = _Waiting(Reply(timeout=_LONG_WAIT, correlation_id='r1'))
@@ -6115,6 +6149,43 @@ async def test_the_waiter_timeout_reaches_the_broker_unclamped():
     assert [result.state for result in tool.results] == [WaitState.ANSWERED]
     tool.release.set()
     await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    await asyncio.wait_for(runtime.shutdown(), _TIMEOUT)
+
+
+async def test_safety_module_uses_the_shorter_timeout_and_keeps_agent_overrides_isolated():
+    broker = _SpyBroker()
+    runtime = Runtime(
+        broker=broker,
+        modules=[SafetyModule()],
+        flags={'max_wait_seconds': 10},
+    )
+    own_timeout = _Waiting(Reply(timeout=3, correlation_id='r1'))
+    host_ceiling = _Waiting(Reply(timeout=20, correlation_id='r2'))
+    first = await _waiting(
+        runtime,
+        broker,
+        own_timeout,
+        flags={'max_wait_seconds': 5},
+    )
+    second = await _waiting(
+        runtime,
+        broker,
+        host_ceiling,
+        flags={'max_wait_seconds': 7},
+    )
+
+    assert broker.take_timeouts == [(first, 3), (second, 7.0)]
+    assert (await runtime.send(first, 'first answer', correlation_id='r1')).ok
+    assert (await runtime.send(second, 'second answer', correlation_id='r2')).ok
+    await asyncio.wait_for(
+        asyncio.gather(own_timeout.returned.wait(), host_ceiling.returned.wait()),
+        _TIMEOUT,
+    )
+    assert [result.state for result in own_timeout.results] == [WaitState.ANSWERED]
+    assert [result.state for result in host_ceiling.results] == [WaitState.ANSWERED]
+    own_timeout.release.set()
+    host_ceiling.release.set()
+    await asyncio.wait_for(asyncio.gather(runtime.wait(first), runtime.wait(second)), _TIMEOUT)
     await asyncio.wait_for(runtime.shutdown(), _TIMEOUT)
 
 
@@ -6836,6 +6907,127 @@ async def test_a_factory_that_accepts_two_positional_arguments_is_accepted():
     runtime = Runtime(agents={'Worker': _Callable()})
 
     assert runtime.agent_names == ('Worker',)
+    await runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ('max_wait_seconds', 'expected_timeout', 'interrupt'),
+    [
+        (0, None, WaitState.ABORTED),
+        (2, 2.0, WaitState.ABORTED),
+        (3, 3.0, WaitState.PREEMPTED),
+    ],
+    ids=['disabled-abort', 'clamped-abort', 'clamped-preempt'],
+)
+async def test_in_turn_wait_uses_the_calling_agents_ceiling_and_interrupt_beats_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    max_wait_seconds: int,
+    expected_timeout: float | None,
+    interrupt: WaitState,
+):
+    runtime = Runtime(modules=[SafetyModule()])
+    parent = await runtime.spawn(
+        _factory(_done()),
+        query='parent',
+        flags={'max_wait_seconds': max_wait_seconds},
+    )
+    await runtime.wait(parent)
+    blockers: list[_Block] = []
+    target = await _running(runtime, blockers)
+    target_task = runtime._table.get_task(target)
+    assert target_task is not None and not target_task.done()
+    observed: list[tuple[float | None, str]] = []
+
+    async def reach_timeout(
+        futures: Any,
+        *,
+        timeout: float | None,  # noqa: ASYNC109
+        return_when: str,
+    ) -> tuple[set[Any], set[Any]]:
+        observed.append((timeout, return_when))
+        delegation = runtime._slots[parent].delegation
+        assert delegation is not None
+        delegation.interrupt(interrupt)
+        return set(), set(futures)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_module, 'asyncio', _AsyncioWaitProxy(reach_timeout))
+        outcome = await runtime._wait_in_turn(parent, target)
+
+    assert observed == [(expected_timeout, asyncio.FIRST_COMPLETED)]
+    assert outcome.state is interrupt
+    assert outcome.context is None
+    assert not target_task.done()
+    assert await _status(runtime, target) is AgentStatus.RUNNING
+    blockers[0].release.set()
+    await asyncio.wait_for(runtime.wait(target), _TIMEOUT)
+    await runtime.shutdown()
+
+
+async def test_in_turn_safety_timeout_does_not_cancel_the_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runtime = Runtime(modules=[SafetyModule()], flags={'max_wait_seconds': 1})
+    parent = await runtime.spawn(_factory(_done()), query='parent')
+    await runtime.wait(parent)
+    blockers: list[_Block] = []
+    target = await _running(runtime, blockers)
+    target_task = runtime._table.get_task(target)
+    assert target_task is not None and not target_task.done()
+
+    async def reach_timeout(
+        futures: Any,
+        *,
+        timeout: float | None,  # noqa: ASYNC109
+        return_when: str,
+    ) -> tuple[set[Any], set[Any]]:
+        assert timeout == 1.0
+        assert return_when == asyncio.FIRST_COMPLETED
+        return set(), set(futures)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_module, 'asyncio', _AsyncioWaitProxy(reach_timeout))
+        outcome = await runtime._wait_in_turn(parent, target)
+
+    assert outcome.state is WaitState.TIMEOUT
+    assert outcome.context is None
+    assert not target_task.done()
+    assert await _status(runtime, target) is AgentStatus.RUNNING
+    blockers[0].release.set()
+    await asyncio.wait_for(runtime.wait(target), _TIMEOUT)
+    await runtime.shutdown()
+
+
+async def test_a_target_finishing_at_the_safety_deadline_wins_over_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runtime = Runtime(modules=[SafetyModule()], flags={'max_wait_seconds': 1})
+    parent = await runtime.spawn(_factory(_done()), query='parent')
+    await runtime.wait(parent)
+    blockers: list[_Block] = []
+    target = await _running(runtime, blockers)
+    target_task = runtime._table.get_task(target)
+    assert target_task is not None and not target_task.done()
+
+    async def finish_at_timeout(
+        futures: Any,
+        *,
+        timeout: float | None,  # noqa: ASYNC109
+        return_when: str,
+    ) -> tuple[set[Any], set[Any]]:
+        assert timeout == 1.0
+        assert return_when == asyncio.FIRST_COMPLETED
+        blockers[0].release.set()
+        await target_task
+        return set(), set(futures)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_module, 'asyncio', _AsyncioWaitProxy(finish_at_timeout))
+        outcome = await runtime._wait_in_turn(parent, target)
+
+    assert outcome.state is WaitState.ANSWERED
+    assert outcome.context is not None
+    assert outcome.context.stop_reason is StopReason.COMPLETED
     await runtime.shutdown()
 
 

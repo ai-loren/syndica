@@ -453,12 +453,12 @@ class _InTurnWaitResult:
     **刻意不进公开面**：唯一的消费者是本包里的编排工具，而加一个公开名字不是破坏性变更、去掉一个
     是。第三方要它时再放出来。
 
-    只出现三态：`ANSWERED`（被等的那个事件循环结束了）、`ABORTED`、`PREEMPTED`。没有 `TIMEOUT`
-    ——这次等待没有上限，理由见 `Runtime._wait_in_turn`。
+    四态：`ANSWERED`（被等的那个事件循环结束了）、`ABORTED`、`PREEMPTED`、`TIMEOUT`。最后一态
+    只在 Agent 的 `max_wait_seconds` Flag 为正时出现。
 
-    **只有 `ANSWERED` 带 `context`，且 `ANSWERED` 必须带。** 被打断的等待没有轨迹可交，硬凑一份
-    会让调用方把「它还在跑」读成「它已经跑完」；而没有轨迹的 `ANSWERED` 在调用方那里表现为一次
-    拿不到结果的成功。两者都是产出方的缺陷，在构造处拦下比在使用处现身便宜得多。
+    **只有 `ANSWERED` 带 `context`，且 `ANSWERED` 必须带。** 被打断或超时的等待没有轨迹可交，
+    硬凑一份会让调用方把「它还在跑」读成「它已经跑完」；而没有轨迹的 `ANSWERED` 在调用方那里
+    表现为一次拿不到结果的成功。两者都是产出方的缺陷，在构造处拦下比在使用处现身便宜得多。
     """
 
     state: WaitState
@@ -567,6 +567,11 @@ def _resumed_status(slot: _Slot) -> AgentStatus:
     if slot.waiter is not None:
         return AgentStatus.WAITING
     return AgentStatus.RUNNING if slot.control.in_run else AgentStatus.IDLE
+
+
+def _wait_ceiling(flags: Mapping[str, FlagValue]) -> float | None:
+    seconds = flags.get('max_wait_seconds', 0)
+    return float(seconds) if type(seconds) is int and seconds > 0 else None
 
 
 def _cannot_wait_for(agent_id: str, received: str) -> ContractViolation:
@@ -855,7 +860,7 @@ class Runtime:
         """这个 Agent 的轨迹能不能溯源到不可信内容（spec §12.2）。只读，绝不激活。
 
         本进程手里没有它的实例时答 `UNTRUSTED`：唯一的消费者是「派出去的那件活该不该带着不可信
-        标记」，而答不出来就按最坏情况处理（spec §13）——少判的后果是那道关不掉的升级静默失效。
+        标记」，而答不出来就按最坏情况处理（spec §13）——少判会让宿主配置的升级处置静默失效。
 
         **私有**：唯一的消费者是本包里的 `Delegate`，理由同 `_InTurnWaitResult`。判据本身
         （`context.provenance_of`）是模块级函数、单一定义，宿主要问同一个问题就用它。
@@ -944,6 +949,9 @@ class Runtime:
             # 旗子只决定其它角色。Orchestrator 在旗子关掉时仍要能派活，所以每个角色都有一次
             # 自己装工具的机会；缺省实现什么都不做。
             agent.install_own_tools(self)
+            agent._configure_runtime_flags(  # pyright: ignore[reportPrivateUsage]
+                agent_flags
+            )
             for block in forked_blocks:
                 agent.context.append(block)
             if fork_from is not None and query is None:
@@ -1378,11 +1386,8 @@ class Runtime:
         只在轮的边界上被读到，不打断这次等待，一次 `abort(agent_id)` 要等被等的那个 Agent 自己
         干完才兑现。这与 `wait_for` 上那条裁决同型，令牌也是同一个机制。
 
-        **没有等待上限，与 `wait_for` 刻意不同。** `wait_for` 等的是本 Runtime 管不到的东西（一个
-        人、一条外部答复），没有上限就真的没有出路；这里等的是本 Runtime 自己驱动的一个 Agent，
-        `abort(agent_id)` / `kill(target_id)` / `despawn(target_id)` 都让这次等待当场返回。凭空
-        发明一个上限会把一次正当的长派活静默截断，而那正是 `wait_for` 不 clamp 的同一条理由。
-        剩下的缺口是墙钟：被等的那一方卡在一次没有超时的 LLM 调用里时，只有上面那三条路救得回来。
+        `SafetyModule.max_wait_seconds` 为正时，本等待与 `wait_for` 受同一宿主级墙钟上限约束；默认
+        0 不凭空截短合法长任务。到期只让发起方收到 TIMEOUT，不取消被等 Agent。
 
         **注册表不写 `WAITING`。** `WAITING` 说的是「这一轮悬在一条匹配的答复上」，而等一个子
         Agent 干活是这一轮的工作本身；写下它会让 `resume` 的 CAS（只收 `PAUSED`）与
@@ -1430,7 +1435,11 @@ class Runtime:
                 # 只等、不取消：`target` 是被等那一方的驱动任务（取消它就是一次没人要求的
                 # `kill`，而这次等待被打断不该改变被等那一方的归宿），`token.raised` 归令牌所有
                 # （取消它会让此后的 `interrupt` 静默落空）。
-                await asyncio.wait({target, token.raised}, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait(
+                    {target, token.raised},
+                    timeout=_wait_ceiling(slot.flags),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             # 「被等的那一方结束了没有」只判这一次，两条路（等过与没等过）因此给出同一个答案，
             # 而中断胜出只是**它没结束**的那一格。写成「令牌被打过就交回中断」会让一份已经跑完的
             # 轨迹在中断也到达时被丢掉。
@@ -1438,7 +1447,9 @@ class Runtime:
                 return _InTurnWaitResult(
                     state=WaitState.ANSWERED, context=self._finished_context(target_id)
                 )
-            return _InTurnWaitResult(state=token.raised.result())
+            if token.raised.done():
+                return _InTurnWaitResult(state=token.raised.result())
+            return _InTurnWaitResult(state=WaitState.TIMEOUT)
         finally:
             # `is token`：被顶掉的那次等待先返回时，槽里装的是顶掉它的那个令牌，而那次等待还挂着。
             if slot.delegation is token:
@@ -1479,8 +1490,8 @@ class Runtime:
         `trust` 是这段 `content` 的信任级别（spec §12.2 第 2 条），由**写下这段文字的那一方**给
         出，经 `Message.trust` 与 `BaseAgent._inject` 原样落进收件人的 user 块。默认可信：宿主自己
         写的消息就是可信的。**内容来自一个模型时必须传它**——模型读过什么决定了那段文字是什么的
-        衍生物，标记丢在这里，收件人的高风险调用就绕过了那道关不掉的升级（`SendMessage` 传的是
-        发送方的溯源结论）。
+        衍生物，标记丢在这里，收件人的高风险调用就绕过了宿主配置的升级处置（`SendMessage` 传的
+        是发送方的溯源结论）。
 
         **投递失败返回结构化结果而不抛异常**，调用方才能识别可重试的瞬时错误。
 
@@ -2134,9 +2145,8 @@ class Runtime:
         用同一套编码，而两侧的编码只要有一处不一致，症状就是答复躺在邮箱里、等待跑满超时、零日志
         ——比当前的碰撞风险更难查。
 
-        **等待上限来自 `Waiter` 自己**（spec §4.2）：本方法不 clamp，因此一个荒谬的大超时实质上是
-        永久挂起，只有 `abort` 救得回来。交给 broker 的就是 `waiter.timeout` 本身——在这里悄悄夹一道
-        宿主级上限，一次四小时的人工确认会静默变成一小时，而症状只在长跑里现身。
+        等待先取 `Waiter.timeout`，再由 `SafetyModule.max_wait_seconds` 做宿主级 clamp；Flag 为 0
+        时原样交给 broker，不凭空截短一次合法的长等待。
 
         `waiter` 不是三种登记类型之一（或同时是两种）抛 `ContractViolation`；它的关联 ID 本身不合法
         抛 `ConfigError`。两者都在**改动状态之前**抛出，被拒的调用因此不会把这个 Agent 留在
@@ -2200,7 +2210,9 @@ class Runtime:
                 # 令牌已经被打过了：向 broker 发一次注定要被取消的请求只是多一次往返。这条路上
                 # 匹配的答复留在邮箱里退回成一条普通消息，与被中断的等待是同一个归宿。
                 return WaitResult(state=token.raised.result())
-            return await self._awaited(agent_id, correlation, waiter.timeout, token)
+            ceiling = _wait_ceiling(slot.flags)
+            timeout = waiter.timeout if ceiling is None else min(waiter.timeout, ceiling)
+            return await self._awaited(agent_id, correlation, timeout, token)
         except asyncio.CancelledError:
             cancelled = True
             raise

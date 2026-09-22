@@ -253,6 +253,7 @@ _WITHHELD: tuple[str, ...] = (
     'Read',
     'ReadOnlyKwarg',
     'RuntimeModule',
+    'SafetyModule',
     'SendMessage',
     'ToolExecutor',
     'TurnGate',

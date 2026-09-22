@@ -50,7 +50,7 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 `PRE_TOOL_USE` 是参数的最后一个写者，把闸放在它之前，一个改写参数的 hook 就能绕过整道闸。放在它之
 后不会让 hook 有机会放宽：闸重新判定的正是 hook 自己的产出。`skip=True` 的 hook 顶替了这次调用、
 什么都没执行，因此没有可判的东西。处置**只经 `danger.disposition_of` 取**，不直接问 policy：spec
-§12.2 第 3 条的强制升级坐在咨询 policy 之前，绕过它这条升级就在整条生产路径上从不运行。
+§12.2 第 3 条的升级与宿主显式 Flag 坐在咨询 policy 之前，绕过它就在整条生产路径上从不运行。
 
 **溯源按批快照算一次，而这个快照只对模型产出的那一份参数成立。** 那一份是模型在本批开始之前一次
 产出的，本批中途出现的不可信结果影响不了它；逐次重算会让同一条命令的处置取决于它排在批里第几个，
@@ -58,7 +58,7 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 进轨迹的不可信输出展开进参数——那时重取一次并取两者中更严的（spec §13：溯源失败时按最坏情况处理）。
 **在多元素段里这次重取本身就是一次失败的溯源**：hook 能从旁路拿到同段兄弟的产出，而兄弟的 block 要
 等整段跑完才落进轨迹，重取在轨迹里一个字都看不到；因此那里直接按最坏情况取 `UNTRUSTED`，不再重取。
-代价是「hook 改写参数 ∧ 多元素段」这个交集上多判（B-18），而少判的后果是那道关不掉的升级与 §12.2
+代价是「hook 改写参数 ∧ 多元素段」这个交集上多判（B-18），而少判的后果是默认从严的升级与 §12.2
 低风险那一格的记录义务**静默**失效——**同一批输入在 `max_concurrency=1` 与 `=N` 下必须得出同一个
 安全结论**，一个调度配置项改不掉安全结论。
 当前形态是「这份轨迹里出现过 `trust=UNTRUSTED` 的 block」——它是上界而非因果链，完整的溯源要接产物
@@ -83,8 +83,8 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 
 **交给 `PRE_TOOL_USE` 的那份 `args` 是只读视图，就地写当场失败。** 就地改而不声明
 `modified['args']` 也能改变真正被执行的参数，却不进 `HookResult.history`——于是上面那个「hook 是
-这份参数的作者」的判据看不见它，重取不发生，那道关不掉的升级按一份已经失效的批快照放行。视图只护
-住顶层：`args['config']['x'] = 1` 仍然逃得掉，见 `hooks.readonly`。
+这份参数的作者」的判据看不见它，重取不发生，默认升级会按一份已经失效的批快照放行。视图只护住
+顶层：`args['config']['x'] = 1` 仍然逃得掉，见 `hooks.readonly`。
 
 `modified` 通道改写的是 kwargs，类型必须与传进去的一致（`args` 是 dict，`result` 是 ToolResult）；
 不合就是 hook 的编程错误，报 ContractViolation 而不是静默丢弃作者的意图。工具自己返回非 ToolResult
@@ -520,6 +520,7 @@ class ToolExecutor:
         self._judge = judge if judge is not None else DangerJudge()
         self._policy: DangerPolicy = policy if policy is not None else BlockHighRisk()
         self._max_concurrency = max_concurrency
+        self._untrusted_high_risk = Disposition.BLOCK
 
     def _retarget(self, tools: dict[str, Tool]) -> None:
         """换掉查表用的那张表。
@@ -530,6 +531,17 @@ class ToolExecutor:
         """
         validate_tool_names(tools)
         self._tools = tools
+
+    def _configure_untrusted_high_risk(self, disposition: Disposition) -> None:
+        """配置 HIGH + UNTRUSTED 的宿主处置；值已经由 SafetyModule Flag 解析。"""
+        raw_disposition = cast('object', disposition)
+        if not isinstance(raw_disposition, Disposition):
+            raise ConfigError(
+                expected='untrusted_high_risk 映射成 Disposition 成员',
+                received=f'收到 {raw_disposition!r}，类型是 {type(raw_disposition).__name__}',
+                next_action='经 SafetyModule 的 untrusted_high_risk Flag 配置 reject / ask / allow',
+            )
+        self._untrusted_high_risk = raw_disposition
 
     async def execute_tool_calls(self, ctx: Context, tool_calls: list[ToolCall]) -> None:
         provenance = provenance_of(ctx)
@@ -667,8 +679,8 @@ class ToolExecutor:
         """跑一次调用。
 
         `has_siblings` 没有默认值：它决定 hook 改写参数之后这次调用按什么溯源结论过闸，漏传一处
-        就是那道关不掉的升级在那条路上静默失效，而默认值会把这件事变成静态检查看不见的疏漏。它由
-        `_run_segment` 从决定要不要进 `gather` 的那同一个 `len(calls)` 判断算出，两者不可能错位。
+        就是默认升级在那条路上静默失效，而默认值会把这件事变成静态检查看不见的疏漏。它由
+        `_run_segment` 从决定要不要进 `gather` 的同一个 `len(calls)` 判断算出，两者不可能错位。
         """
         tool = self._tools.get(call.name)
         if tool is None:
@@ -711,8 +723,8 @@ class ToolExecutor:
         if pre.rewrites('args') or rewritten_args is not handed:
             # 多元素段里这次重取**结构上就是一次失败的溯源**：hook 能从旁路拿到同段兄弟的产出并
             # 展开进参数，而兄弟的 block 要等整段跑完才落进轨迹，重取在轨迹里一个字都看不到。
-            # spec §13：溯源失败时按最坏情况处理。少判的方向不可回收——那道关不掉的升级会静默失
-            # 效，§12.2 低风险那一格的记录义务也会一起无声消失。
+            # spec §13：溯源失败时按最坏情况处理。少判的方向不可回收——默认升级会静默失效，
+            # §12.2 低风险那一格的记录义务也会一起无声消失。
             provenance = (
                 TrustLevel.UNTRUSTED
                 if has_siblings
@@ -755,15 +767,18 @@ class ToolExecutor:
     ) -> ToolResult | None:
         """闸：放行交回 None，拦下交回给模型的那一块。
 
-        处置经 `disposition_of` 取——它先施加 spec §12.2 第 3 条那道关不掉的升级，再咨询宿主
-        策略。直接调 `self._policy.decide` 会把升级整个绕过去，而 typing 与运行期都不出声。
+        处置经 `disposition_of` 取——它先按 `untrusted_high_risk` Flag 施加 spec §12.2 第 3 条
+        的升级，再咨询宿主策略。直接调 `self._policy.decide` 会把升级整个绕过去，而 typing 与
+        运行期都不出声。
         """
         try:
             verdict = self._judge.judge(tool, args)
         except Exception as exc:
             raise _JudgeFailure(exc) from exc
         disposition = disposition_of(
-            self._policy, DangerRequest(verdict=verdict, call=call, provenance=provenance)
+            self._policy,
+            DangerRequest(verdict=verdict, call=call, provenance=provenance),
+            untrusted_high_risk=self._untrusted_high_risk,
         )
         if disposition is Disposition.ALLOW:
             if verdict.level is RiskLevel.LOW and provenance is TrustLevel.UNTRUSTED:

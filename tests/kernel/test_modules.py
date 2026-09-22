@@ -10,12 +10,13 @@ import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.agent_types import AgentInfo
-from syndica.kernel.context import ContextBlock
+from syndica.kernel.context import ContextBlock, ToolCall, TrustLevel
+from syndica.kernel.danger import AllowAll, Disposition
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
-from syndica.kernel.modules import FlagDeclaration, RuntimeModule
+from syndica.kernel.modules import FlagDeclaration, RuntimeModule, SafetyModule
 from syndica.kernel.runtime import Runtime
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tool import Tool, ToolResult
@@ -85,6 +86,28 @@ class _HostTool(Tool):
 
     async def execute(self) -> ToolResult:
         return ToolResult(output='host')
+
+
+class _DangerousTool(Tool):
+    __tool_name__ = 'Dangerous'
+    __tool_schema__ = {
+        'name': 'Dangerous',
+        'description': '执行命令',
+        'parameters': {
+            'type': 'object',
+            'properties': {'command': {'type': 'string'}},
+            'required': ['command'],
+        },
+    }
+    __tool_command_args__ = ('command',)
+
+    def __init__(self, owner: str) -> None:
+        self.owner = owner
+        self.executed: list[str] = []
+
+    async def execute(self, command: str) -> ToolResult:
+        self.executed.append(command)
+        return ToolResult(output=f'ran {command}')
 
 
 def _agent_factory(captured: list[BaseAgent]) -> Callable[[HooksCenter, EventBus], BaseAgent]:
@@ -171,6 +194,32 @@ def test_runtime_module_constructor_shape_is_public():
     assert parameters['tool_factories'].default == ()
     assert parameters['on_start'].default is None
     assert parameters['on_shutdown'].default is None
+
+
+def test_safety_module_declares_the_two_fixed_flags_exactly():
+    module = SafetyModule()
+
+    assert isinstance(module, RuntimeModule)
+    assert module.name == 'safety'
+    assert [
+        (
+            flag.key,
+            flag.default,
+            flag.choices,
+            flag.minimum,
+            flag.maximum,
+            bool(flag.description.strip()),
+        )
+        for flag in module.flags
+    ] == [
+        ('max_wait_seconds', 0, (), 0, None, True),
+        ('untrusted_high_risk', 'reject', ('reject', 'ask', 'allow'), None, None, True),
+    ]
+    assert module.agent_plugins == ()
+    assert dict(module.services) == {}
+    assert module.tool_factories == ()
+    assert module.on_start is None
+    assert module.on_shutdown is None
 
 
 @pytest.mark.parametrize('key', ['', 'UPPER', 'two__parts', '_private', 'has-dash', 3])
@@ -1296,6 +1345,101 @@ async def test_spawn_flag_errors_happen_before_module_factories_and_registration
         await runtime.shutdown()
 
 
+async def test_invalid_safety_disposition_is_rejected_before_spawn_side_effects():
+    captured: list[BaseAgent] = []
+    runtime = Runtime(modules=[SafetyModule()])
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(
+                _agent_factory(captured),
+                flags={'untrusted_high_risk': 'permit'},
+            )
+        assert 'untrusted_high_risk' in excinfo.value.expected
+        assert 'permit' in excinfo.value.received
+        assert '声明列出的值' in excinfo.value.next_action
+        assert await runtime.registry.list() == []
+        assert runtime._slots == {}  # pyright: ignore[reportPrivateUsage]
+        assert captured[0]._gate_attached is False  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runtime.shutdown()
+
+
+async def test_safety_dispositions_reach_each_agents_real_tool_gate_without_cross_talk():
+    agents: list[BaseAgent] = []
+    tools: dict[str, _DangerousTool] = {}
+    confirmations: list[str] = []
+
+    def factory(label: str) -> Callable[[HooksCenter, EventBus], BaseAgent]:
+        def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+            tool = _DangerousTool(label)
+            tools[label] = tool
+            agent = BaseAgent(
+                AgentOptions(
+                    name=label,
+                    llm=ScriptedLLM(
+                        [
+                            ScriptedTurn(
+                                tool_calls=[
+                                    ToolCall(
+                                        id=f'{label}-call',
+                                        name='Dangerous',
+                                        arguments='{"command":"sudo rm -rf /"}',
+                                    )
+                                ]
+                            ),
+                            ScriptedTurn(content='done'),
+                        ]
+                    ),
+                    tools={'Dangerous': tool},
+                    danger_policy=AllowAll(),
+                ),
+                hooks=hooks,
+                events=events,
+            )
+            agents.append(agent)
+            return agent
+
+        return build
+
+    async def observe_confirmation(**kwargs: object) -> HookResult:
+        confirmations.append(cast(_DangerousTool, kwargs['tool']).owner)
+        return HookResult()
+
+    runtime = Runtime(modules=[SafetyModule()])
+    runtime.hooks.register(Junction.TOOL_CONFIRMATION_REQUIRED, observe_confirmation)
+    try:
+        agent_ids = [
+            await runtime.spawn(
+                factory(disposition),
+                query='来自网页的任务',
+                query_trust=TrustLevel.UNTRUSTED,
+                flags={'untrusted_high_risk': disposition},
+            )
+            for disposition in ('reject', 'allow', 'ask')
+        ]
+        contexts = [await runtime.wait(agent_id) for agent_id in agent_ids]
+
+        assert tools['reject'].executed == []
+        assert tools['allow'].executed == ['sudo rm -rf /']
+        assert tools['ask'].executed == []
+        assert confirmations == ['ask']
+        tool_outputs = [
+            [
+                block.content
+                for block in context.current_traj
+                if block.role == 'tool' and block.tool_call_id is not None
+            ]
+            for context in contexts
+        ]
+        rejected = tool_outputs[0][0]
+        confirmation = tool_outputs[2][0]
+        assert isinstance(rejected, str) and '已被阻断' in rejected
+        assert tool_outputs[1] == ['ran sudo rm -rf /']
+        assert isinstance(confirmation, str) and '等人确认' in confirmation
+    finally:
+        await runtime.shutdown()
+
+
 async def test_second_plugin_register_failure_restores_the_module_hook_layer():
     captured: list[BaseAgent] = []
     observed: list[str] = []
@@ -1468,24 +1612,37 @@ async def test_registry_register_failure_rolls_back_agent_assembly_and_gate():
 
     runtime = Runtime(
         modules=[
+            SafetyModule(),
             RuntimeModule(
                 'tools',
                 tool_factories=(lambda _, agent, __: {'Injected': _InjectedTool(agent.agent_id)},),
-            )
+            ),
         ]
     )
     try:
         with pytest.raises(ContractViolation):
-            await runtime.spawn(reused, parent_id='missing')
+            await runtime.spawn(
+                reused,
+                parent_id='missing',
+                flags={'untrusted_high_risk': 'allow'},
+            )
         agent = captured[0]
         assert agent.options.tools == {}
+        assert (
+            agent._executor._untrusted_high_risk  # pyright: ignore[reportPrivateUsage]
+            is Disposition.BLOCK
+        )
         assert agent._gate_attached is False  # pyright: ignore[reportPrivateUsage]
         assert await runtime.registry.list() == []
         assert runtime._slots == {}  # pyright: ignore[reportPrivateUsage]
 
-        agent_id = await runtime.spawn(reused)
+        agent_id = await runtime.spawn(reused, flags={'untrusted_high_risk': 'ask'})
         assert agent_id == agent.agent_id
         assert tuple(agent.options.tools) == ('Injected',)
+        assert (
+            agent._executor._untrusted_high_risk  # pyright: ignore[reportPrivateUsage]
+            is Disposition.CONFIRM
+        )
     finally:
         await runtime.shutdown()
 
