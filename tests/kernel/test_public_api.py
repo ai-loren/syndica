@@ -252,6 +252,7 @@ _WITHHELD: tuple[str, ...] = (
     'QueryAgent',
     'Read',
     'ReadOnlyKwarg',
+    'RetryModule',
     'RuntimeModule',
     'SafetyModule',
     'SendMessage',
