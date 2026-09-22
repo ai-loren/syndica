@@ -197,6 +197,7 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 _WITHHELD: tuple[str, ...] = (
     'AgentCatalog',
     'AgentManifest',
+    'AgentSlot',
     'BrokerTurnGate',
     'ControlBlock',
     'DEFAULT_MAX_TOOL_CONCURRENCY',
@@ -214,6 +215,7 @@ _WITHHELD: tuple[str, ...] = (
     'ReadOnlyKwarg',
     'SendMessage',
     'ToolExecutor',
+    'Topology',
     'TurnGate',
     'TurnGateDecision',
     'UPDATE_PROTECTED_FIELDS',
