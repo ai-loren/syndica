@@ -11,6 +11,9 @@ dist/
 .venv/
 venv/
 env/
+.env
+.env.*
+!.env.example
 
 .pytest_cache/
 .ruff_cache/

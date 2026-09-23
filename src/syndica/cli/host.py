@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import platform
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -35,6 +36,7 @@ from syndica.kernel import (
     SafetyModule,
     StopReason,
     Subscription,
+    SyndicaError,
     Topology,
     TrustLevel,
     local_tools,
@@ -44,6 +46,34 @@ from syndica.kernel import (
 __all__ = ['RuntimeCliHost']
 
 ModelFactory = Callable[[str], LLM]
+_RUNTIME_LOGGER = 'syndica.kernel.runtime'
+
+
+class _RuntimeErrorCapture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.ERROR)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+class _CaptureRuntimeErrors:
+    def __init__(self) -> None:
+        self.records: list[logging.LogRecord] = []
+        self._handler = _RuntimeErrorCapture()
+        self._logger = logging.getLogger(_RUNTIME_LOGGER)
+        self._previous_propagate = self._logger.propagate
+
+    def __enter__(self) -> list[logging.LogRecord]:
+        self._logger.addHandler(self._handler)
+        self._logger.propagate = False
+        self.records = self._handler.records
+        return self.records
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._logger.removeHandler(self._handler)
+        self._logger.propagate = self._previous_propagate
 
 
 def _default_config(path: Path) -> CliConfig:
@@ -60,12 +90,33 @@ def _model_names(config: CliConfig) -> tuple[str, ...]:
     return tuple(dict.fromkeys(config.catalog.get(name).model for name in config.catalog.names()))
 
 
-def _last_output(context: Context) -> str:
+def _runtime_error_detail(records: list[logging.LogRecord]) -> str | None:
+    if not records:
+        return None
+    record = records[-1]
+    if record.exc_info is not None:
+        error = record.exc_info[1]
+        if isinstance(error, SyndicaError):
+            return error.message
+        if error is not None:
+            return f'{type(error).__name__}: {error}'
+    return record.getMessage()
+
+
+def _last_output(context: Context, runtime_errors: list[logging.LogRecord]) -> str:
     if context.stop_reason is StopReason.ERROR:
+        detail = _runtime_error_detail(runtime_errors)
+        received = 'Context.stop_reason 是 error'
+        next_action = '查看当前命令之前输出的 Runtime 错误日志，修复失败的 LLM、工具或 hook'
+        if detail is not None:
+            received = f'{received}；Runtime 最近错误：{detail}'
+            next_action = (
+                '先处理 Runtime 最近错误；如果它来自外部模型服务，修复配置、额度或稍后重试'
+            )
         raise ContractViolation(
             expected='CLI 请求对应的 Agent 以 completed / max_turns / aborted 之一结束',
-            received='Context.stop_reason 是 error',
-            next_action='查看当前命令之前输出的 Runtime 错误日志，修复失败的 LLM、工具或 hook',
+            received=received,
+            next_action=next_action,
         )
     outputs = [
         block.content
@@ -507,19 +558,20 @@ class RuntimeCliHost:
             raise
 
     async def _run_session(self, session: _ChatSession, prompt: str) -> str:
-        delivered = await session.runtime.send(session.agent_id, prompt)
-        if not delivered.ok:
-            raise _config_error(
-                f'chat target {session.agent_id!r} 接受新消息',
-                delivered.reason or 'broker 未给出失败原因',
-                '输入 :agents 检查目标状态，或退出后重新进入 chat',
+        with _CaptureRuntimeErrors() as runtime_errors:
+            delivered = await session.runtime.send(session.agent_id, prompt)
+            if not delivered.ok:
+                raise _config_error(
+                    f'chat target {session.agent_id!r} 接受新消息',
+                    delivered.reason or 'broker 未给出失败原因',
+                    '输入 :agents 检查目标状态，或退出后重新进入 chat',
+                )
+            context = await self._wait_with_pump(
+                session.runtime,
+                session.agent_id,
+                session.pump,
             )
-        context = await self._wait_with_pump(
-            session.runtime,
-            session.agent_id,
-            session.pump,
-        )
-        return _last_output(context)
+            return _last_output(context, runtime_errors)
 
     async def _run_chat_request(self, request: RunRequest) -> str:
         target = request.session
@@ -597,83 +649,86 @@ class RuntimeCliHost:
         )
         tools = local_tools(workspace.portal())
         try:
-            model_names = _model_names(config)
-            models: Mapping[str, LLM] = {name: self._model_factory(name) for name in model_names}
-            facts = HostFacts(
-                os=platform.system().lower(),
-                platform=platform.platform(),
-                shell='/bin/sh',
-            )
-            factories = config.catalog.freeze(tools, models, facts)
-            runtime = Runtime(
-                agents={} if request.topology is not None else factories,
-                orchestration=True,
-                modules=_modules(),
-                flags=flags,
-                confirmation_handler=MailboxConfirmationHandler(timeout=300),
-            )
-            subscription = runtime.events.subscribe()
-            pump = asyncio.create_task(
-                self._event_pump(runtime, subscription),
-                name='cli-human-events',
-            )
-            try:
-                if request.topology is not None:
-                    topology = config.topologies.get(request.topology)
-                    if topology is None:
-                        raise _config_error(
-                            f'--topology 是配置中的名字之一：{list(config.topologies)!r}',
-                            f'收到 {request.topology!r}',
-                            '运行 syndica topology list，再逐字使用其中一个名字',
+            with _CaptureRuntimeErrors() as runtime_errors:
+                model_names = _model_names(config)
+                models: Mapping[str, LLM] = {
+                    name: self._model_factory(name) for name in model_names
+                }
+                facts = HostFacts(
+                    os=platform.system().lower(),
+                    platform=platform.platform(),
+                    shell='/bin/sh',
+                )
+                factories = config.catalog.freeze(tools, models, facts)
+                runtime = Runtime(
+                    agents={} if request.topology is not None else factories,
+                    orchestration=True,
+                    modules=_modules(),
+                    flags=flags,
+                    confirmation_handler=MailboxConfirmationHandler(timeout=300),
+                )
+                subscription = runtime.events.subscribe()
+                pump = asyncio.create_task(
+                    self._event_pump(runtime, subscription),
+                    name='cli-human-events',
+                )
+                try:
+                    if request.topology is not None:
+                        topology = config.topologies.get(request.topology)
+                        if topology is None:
+                            raise _config_error(
+                                f'--topology 是配置中的名字之一：{list(config.topologies)!r}',
+                                f'收到 {request.topology!r}',
+                                '运行 syndica topology list，再逐字使用其中一个名字',
+                            )
+                        roots = [slot for slot in topology.slots if slot.is_root]
+                        if not roots:
+                            raise _config_error(
+                                f'topology {request.topology!r} 有一个 root 槽',
+                                '所有 topology.slots 的 is_root 都是 false',
+                                '给要接收 CLI prompt 的 singleton 槽设置 is_root: true',
+                            )
+                        root_slot = roots[0]
+                        topology = _with_root_turn_limit(
+                            topology,
+                            request.max_turns,
+                            config.catalog,
                         )
-                    roots = [slot for slot in topology.slots if slot.is_root]
-                    if not roots:
-                        raise _config_error(
-                            f'topology {request.topology!r} 有一个 root 槽',
-                            '所有 topology.slots 的 is_root 都是 false',
-                            '给要接收 CLI prompt 的 singleton 槽设置 is_root: true',
+                        await runtime.assemble(
+                            topology,
+                            config.catalog,
+                            tools=tools,
+                            models=models,
+                            host=facts,
                         )
-                    root_slot = roots[0]
-                    topology = _with_root_turn_limit(
-                        topology,
-                        request.max_turns,
-                        config.catalog,
-                    )
-                    await runtime.assemble(
-                        topology,
-                        config.catalog,
-                        tools=tools,
-                        models=models,
-                        host=facts,
-                    )
-                    delivered = await runtime.send_to_slot(root_slot.name, request.prompt)
-                    if not delivered.ok:
-                        raise _config_error(
-                            f'拓扑根槽 {root_slot.name!r} 接受输入',
-                            delivered.reason or 'broker 未给出失败原因',
-                            '检查根槽 boot/cardinality 与 Runtime 状态',
+                        delivered = await runtime.send_to_slot(root_slot.name, request.prompt)
+                        if not delivered.ok:
+                            raise _config_error(
+                                f'拓扑根槽 {root_slot.name!r} 接受输入',
+                                delivered.reason or 'broker 未给出失败原因',
+                                '检查根槽 boot/cardinality 与 Runtime 状态',
+                            )
+                        agent_id = await runtime.resolve(root_slot.name)
+                        if agent_id is None:
+                            raise AssertionError('root slot accepted input without an agent id')
+                    else:
+                        role = request.agent or 'Orchestrator'
+                        factory = runtime.agent_factory(role)
+                        if factory is None:
+                            config.catalog.get(role)
+                            raise AssertionError(
+                                'catalog.get returned without a matching runtime factory'
+                            )
+                        agent_id = await runtime.spawn(
+                            _with_max_turns(factory, request.max_turns),
+                            query=request.prompt,
+                            exit_mode=ExitMode.ZOMBIE,
                         )
-                    agent_id = await runtime.resolve(root_slot.name)
-                    if agent_id is None:
-                        raise AssertionError('root slot accepted input without an agent id')
-                else:
-                    role = request.agent or 'Orchestrator'
-                    factory = runtime.agent_factory(role)
-                    if factory is None:
-                        config.catalog.get(role)
-                        raise AssertionError(
-                            'catalog.get returned without a matching runtime factory'
-                        )
-                    agent_id = await runtime.spawn(
-                        _with_max_turns(factory, request.max_turns),
-                        query=request.prompt,
-                        exit_mode=ExitMode.ZOMBIE,
-                    )
-                context = await self._wait_with_pump(runtime, agent_id, pump)
-                return _last_output(context)
-            finally:
-                await runtime.shutdown()
-                await pump
-                subscription.close()
+                    context = await self._wait_with_pump(runtime, agent_id, pump)
+                    return _last_output(context, runtime_errors)
+                finally:
+                    await runtime.shutdown()
+                    await pump
+                    subscription.close()
         finally:
             await workspace.close()

@@ -73,6 +73,32 @@ export OPENAI_API_KEY=your-key
 
 `OPENAI_API_KEY` is optional for endpoints that do not require it.
 
+### OpenRouter free models
+
+OpenRouter is supported directly through the same OpenAI-compatible backend. Setting either
+OpenRouter variable selects this mode:
+
+```bash
+export OPENROUTER_API_KEY=your-openrouter-key
+export OPENROUTER_MODEL=openrouter/free
+```
+
+`OPENROUTER_MODEL` is optional and defaults to `openrouter/free`. To enforce zero-cost inference,
+Syndica accepts only `openrouter/free` or a specific model ID ending in `:free` while OpenRouter
+mode is active. The free router can select a model that supports the request's required features,
+including tool calling.
+
+For the first multi-agent demo, a specific free model that advertises `tools` support is often
+easier to diagnose than the router:
+
+```bash
+export OPENROUTER_MODEL=cohere/north-mini-code:free
+```
+
+OpenRouter mode takes precedence if OpenRouter and generic `OPENAI_*` variables are both present.
+Keep API keys in environment variables; `.env` files are ignored by Git and are not loaded
+automatically.
+
 ## Quick Start
 
 Inspect the built-in catalog:

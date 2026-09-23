@@ -132,6 +132,23 @@ def _response_error(received: str, next_action: str) -> LLMResponseError:
     )
 
 
+def _response_excerpt(response: httpx.Response) -> str:
+    text = response.text.strip()
+    if not text:
+        return '<empty>'
+    if len(text) > 1000:
+        return f'{text[:1000]}...<truncated>'
+    return text
+
+
+def _http_error_message(error: httpx.HTTPError) -> str:
+    if isinstance(error, httpx.HTTPStatusError):
+        response = error.response
+        body = _response_excerpt(response)
+        return f'HTTP {response.status_code} {response.reason_phrase}: {body}'
+    return f'{type(error).__name__}: {error}'
+
+
 def _tool_calls(value: object) -> list[ToolCall]:
     if value is None:
         return []
@@ -295,8 +312,8 @@ class OpenAICompatible:
             ) from exc
         except httpx.HTTPError as exc:
             raise _response_error(
-                f'HTTP 请求失败：{type(exc).__name__}: {exc}',
-                '检查 base_url、认证信息和端点状态后重试',
+                f'HTTP 请求失败：{_http_error_message(exc)}',
+                '检查 base_url、认证信息、模型名、请求参数和端点状态后重试',
             ) from exc
         return _assistant(response)
 

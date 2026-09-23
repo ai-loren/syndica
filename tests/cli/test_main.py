@@ -16,6 +16,17 @@ import pytest
 from syndica.cli.main import CliIO, InspectRequest, RunRequest, main
 
 REPO_ROOT = Path(__file__).parents[2]
+_MODEL_ENV = {
+    'OPENAI_API_KEY',
+    'OPENAI_BASE_URL',
+    'OPENAI_MODEL',
+    'OPENROUTER_API_KEY',
+    'OPENROUTER_MODEL',
+}
+
+
+def _without_model_env() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items() if key not in _MODEL_ENV}
 
 
 class _Host:
@@ -390,16 +401,10 @@ def test_chat_uses_run_requests_and_keeps_the_current_target_visible() -> None:
 def test_module_entrypoint_lists_agents_without_model_configuration(
     tmp_path: Path,
 ) -> None:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in {'OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL'}
-    }
-
     completed = subprocess.run(
         [sys.executable, '-m', 'syndica', 'agents', 'list'],
         cwd=tmp_path,
-        env=env,
+        env=_without_model_env(),
         check=False,
         capture_output=True,
         text=True,
@@ -417,7 +422,7 @@ def test_module_entrypoint_doctor_builds_the_openai_composition_without_network(
         [sys.executable, '-m', 'syndica', 'doctor'],
         cwd=tmp_path,
         env={
-            **os.environ,
+            **_without_model_env(),
             'OPENAI_BASE_URL': 'https://llm.example.test/v1',
             'OPENAI_API_KEY': 'test-key',
             'OPENAI_MODEL': 'model-a',
@@ -434,3 +439,120 @@ def test_module_entrypoint_doctor_builds_the_openai_composition_without_network(
         f'workspace: ok {tmp_path}',
     ]
     assert completed.stderr == ''
+
+
+@pytest.mark.parametrize('model', ['openrouter/free', 'meta-llama/example:free'])
+def test_module_entrypoint_doctor_accepts_only_explicitly_free_openrouter_models(
+    tmp_path: Path,
+    model: str,
+) -> None:
+    completed = subprocess.run(
+        [sys.executable, '-m', 'syndica', 'doctor'],
+        cwd=tmp_path,
+        env={
+            **_without_model_env(),
+            'OPENROUTER_API_KEY': 'test-openrouter-key',
+            'OPENROUTER_MODEL': model,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout.splitlines() == [
+        'config: ok .syndica.yaml',
+        'models: ok default',
+        f'workspace: ok {tmp_path}',
+    ]
+    assert completed.stderr == ''
+
+
+def test_openrouter_configuration_uses_its_endpoint_key_and_attribution_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from syndica.__main__ import _configured_model
+
+    for key in _MODEL_ENV:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'test-openrouter-key')
+
+    llm = _configured_model('default')
+
+    assert llm.config.model == 'openrouter/free'
+    assert llm.config.client_args == {
+        'base_url': 'https://openrouter.ai/api/v1',
+        'api_key': 'test-openrouter-key',
+        'headers': {
+            'HTTP-Referer': 'https://github.com/ai-loren/syndica',
+            'X-Title': 'Syndica',
+        },
+    }
+
+
+def test_module_entrypoint_rejects_a_paid_openrouter_model_before_network(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        [sys.executable, '-m', 'syndica', 'doctor'],
+        cwd=tmp_path,
+        env={
+            **_without_model_env(),
+            'OPENROUTER_API_KEY': 'must-not-appear',
+            'OPENROUTER_MODEL': 'anthropic/paid-model',
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ''
+    assert 'openrouter/free' in completed.stderr
+    assert ':free' in completed.stderr
+    assert 'anthropic/paid-model' in completed.stderr
+    assert 'must-not-appear' not in completed.stderr
+
+
+def test_generic_openai_variables_cannot_bypass_the_openrouter_free_model_gate(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        [sys.executable, '-m', 'syndica', 'doctor'],
+        cwd=tmp_path,
+        env={
+            **_without_model_env(),
+            'OPENAI_BASE_URL': 'https://openrouter.ai/api/v1',
+            'OPENAI_API_KEY': 'must-not-appear',
+            'OPENAI_MODEL': 'anthropic/paid-model',
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ''
+    assert 'openrouter/free' in completed.stderr
+    assert ':free' in completed.stderr
+    assert 'must-not-appear' not in completed.stderr
+
+
+def test_module_entrypoint_requires_an_openrouter_key_when_its_model_is_configured(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        [sys.executable, '-m', 'syndica', 'doctor'],
+        cwd=tmp_path,
+        env={
+            **_without_model_env(),
+            'OPENROUTER_MODEL': 'openrouter/free',
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ''
+    assert 'OPENROUTER_API_KEY' in completed.stderr

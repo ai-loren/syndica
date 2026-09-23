@@ -334,6 +334,25 @@ async def test_malformed_response_is_a_three_part_llm_error() -> None:
     assert '端点响应体' in caught.value.next_action
 
 
+async def test_http_status_error_includes_provider_response_body() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                400,
+                json={'error': {'message': 'No endpoints found that support tool use'}},
+            )
+        )
+    ) as client:
+        with pytest.raises(LLMResponseError) as caught:
+            await OpenAICompatible(_config(), client=client).create(
+                [ContextBlock(role='user', content='go')]
+            )
+
+    assert 'HTTP 400 Bad Request' in caught.value.received
+    assert 'No endpoints found that support tool use' in caught.value.received
+    assert '模型名' in caught.value.next_action
+
+
 def test_headers_must_be_a_string_mapping() -> None:
     config = LLMConfig(
         provider='openai-compatible',

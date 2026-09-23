@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from io import StringIO
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from syndica.cli.main import CliIO, InspectRequest, RunRequest
 from syndica.kernel import (
     ConfigError,
     ContractViolation,
+    LLMResponseError,
     ScriptedLLM,
     ScriptedTurn,
     ToolCall,
@@ -458,7 +460,45 @@ def test_agent_error_is_reported_as_a_three_part_cli_failure(tmp_path: Path) -> 
 
     assert 'completed' in excinfo.value.expected
     assert 'error' in excinfo.value.received
-    assert '日志' in excinfo.value.next_action
+    assert 'injected failure' in excinfo.value.received
+    assert 'Runtime 最近错误' in excinfo.value.received
+    assert '先处理' in excinfo.value.next_action
+
+
+def test_agent_error_does_not_print_runtime_traceback_to_cli(
+    tmp_path: Path,
+) -> None:
+    logger_output = StringIO()
+    handler = logging.StreamHandler(logger_output)
+    root = logging.getLogger()
+    previous_level = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.ERROR)
+    error = LLMResponseError(
+        expected='OpenAI 兼容端点返回一条可解析的 assistant 消息',
+        received=(
+            'HTTP 请求失败：HTTP 429 Too Many Requests: '
+            '{"error":{"message":"Rate limit exceeded: free-models-per-day"}}'
+        ),
+        next_action='检查 base_url、认证信息、模型名、请求参数和端点状态后重试',
+    )
+    llm = ScriptedLLM([ScriptedTurn(raises=error)])
+    host = RuntimeCliHost(
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
+        model_factory=lambda _: llm,
+        workspace_root=tmp_path,
+    )
+    try:
+        with pytest.raises(ContractViolation) as excinfo:
+            host.run_request(RunRequest(prompt='fail', agent='Worker'))
+    finally:
+        host.close()
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
+
+    assert 'free-models-per-day' in excinfo.value.received
+    assert 'Rate limit exceeded' in excinfo.value.received
+    assert logger_output.getvalue() == ''
 
 
 def test_running_a_topology_without_a_root_fails_with_actionable_guidance(
