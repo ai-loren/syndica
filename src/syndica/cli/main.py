@@ -63,7 +63,7 @@ class CliHost(Protocol):
 
     def doctor(self, config: str) -> str: ...
 
-    def open_chat(self, config: str) -> str: ...
+    def open_chat(self, config: str, max_turns: int | None = None) -> str: ...
 
     def active_agents(self) -> str: ...
 
@@ -123,7 +123,8 @@ def _parser() -> _ArgumentParser:
     run.add_argument('--max-tokens', type=_positive_int)
     run.add_argument('--max-wall-clock', type=_positive_float)
     run.add_argument('--flag', action='append', default=[])
-    commands.add_parser('chat')
+    chat = commands.add_parser('chat')
+    chat.add_argument('--max-turns', type=_positive_int)
     for resource in ('agents', 'topology', 'flags'):
         noun = commands.add_parser(resource)
         actions = noun.add_subparsers(dest='action', required=True)
@@ -235,9 +236,9 @@ def _host_failure(exc: Exception, streams: CliIO) -> int:
     return 1
 
 
-def _chat(host: CliHost, config: str, streams: CliIO) -> int:
+def _chat(host: CliHost, config: str, streams: CliIO, max_turns: int | None) -> int:
     try:
-        target = host.open_chat(config)
+        target = host.open_chat(config, max_turns)
     except Exception as exc:
         return _host_failure(exc, streams)
     while True:
@@ -342,7 +343,7 @@ def main(
     if namespace.command == 'doctor':
         return _host_call(lambda: host.doctor(namespace.config), streams)
     if namespace.command == 'chat':
-        return _chat(host, namespace.config, streams)
+        return _chat(host, namespace.config, streams, namespace.max_turns)
     request = RunRequest(
         prompt=' '.join(namespace.prompt),
         config=namespace.config,

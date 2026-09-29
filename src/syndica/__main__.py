@@ -138,8 +138,8 @@ class _LazyHost:
     def doctor(self, config: str) -> str:
         return self._get().doctor(config)
 
-    def open_chat(self, config: str) -> str:
-        return self._get().open_chat(config)
+    def open_chat(self, config: str, max_turns: int | None = None) -> str:
+        return self._get().open_chat(config, max_turns)
 
     def active_agents(self) -> str:
         return self._get().active_agents()

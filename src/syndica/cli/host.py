@@ -7,8 +7,9 @@ import json
 import logging
 import platform
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
+from textwrap import indent
 from types import MappingProxyType
 from typing import cast
 
@@ -17,17 +18,13 @@ from syndica.cli.main import CliIO, InspectRequest, RunRequest
 from syndica.kernel import (
     LLM,
     AgentCatalog,
-    AgentFactory,
     AgentOptions,
     AgentSlot,
-    BaseAgent,
     ConfigError,
     Context,
     ContractViolation,
-    EventBus,
     ExitMode,
     FlagDeclaration,
-    HooksCenter,
     HostFacts,
     HumanInteractionModule,
     LocalWorkspace,
@@ -90,10 +87,35 @@ def _model_names(config: CliConfig) -> tuple[str, ...]:
     return tuple(dict.fromkeys(config.catalog.get(name).model for name in config.catalog.names()))
 
 
-def _runtime_error_detail(records: list[logging.LogRecord]) -> str | None:
-    if not records:
-        return None
-    record = records[-1]
+def _role_turns(catalog: AgentCatalog, name: str) -> int | None:
+    manifest = catalog.get(name)
+    return AgentOptions.max_turns if manifest.budget is None else manifest.budget['turns']
+
+
+def _turn_capped(catalog: AgentCatalog, max_turns: int | None) -> AgentCatalog:
+    """同一份目录，但每个角色的轮数预算都不超过 max_turns。
+
+    委派与分叉出来的子 Agent 都由目录里的工厂造出（拓扑的 assemble 也用它覆盖同名工厂），
+    所以上限必须落在角色上：只收紧根 Agent 时，一次委派会按角色预算（缺省 50 轮）跑满。
+    """
+    if max_turns is None:
+        return catalog
+    capped = AgentCatalog()
+    for name in catalog.names():
+        manifest = catalog.get(name)
+        role_limit = _role_turns(catalog, name)
+        data: dict[str, object] = {
+            field.name: getattr(manifest, field.name)
+            for field in fields(manifest)
+            if field.name != 'source'
+        }
+        data['budget'] = {'turns': max_turns if role_limit is None else min(role_limit, max_turns)}
+        # system_prompt 已是解析后的正文；留着 origin 会让它被当成相对路径再解析一次。
+        capped.load_mapping(data, source=replace(manifest.source, origin=None))
+    return capped
+
+
+def _record_detail(record: logging.LogRecord) -> str:
     if record.exc_info is not None:
         error = record.exc_info[1]
         if isinstance(error, SyndicaError):
@@ -103,41 +125,92 @@ def _runtime_error_detail(records: list[logging.LogRecord]) -> str | None:
     return record.getMessage()
 
 
-def _last_output(context: Context, runtime_errors: list[logging.LogRecord]) -> str:
-    if context.stop_reason is StopReason.ERROR:
-        detail = _runtime_error_detail(runtime_errors)
-        received = 'Context.stop_reason 是 error'
-        next_action = '查看当前命令之前输出的 Runtime 错误日志，修复失败的 LLM、工具或 hook'
-        if detail is not None:
-            received = f'{received}；Runtime 最近错误：{detail}'
-            next_action = (
-                '先处理 Runtime 最近错误；如果它来自外部模型服务，修复配置、额度或稍后重试'
-            )
-        raise ContractViolation(
-            expected='CLI 请求对应的 Agent 以 completed / max_turns / aborted 之一结束',
-            received=received,
-            next_action=next_action,
-        )
-    outputs = [
-        block.content
-        for block in context.current_traj
-        if block.role == 'assistant' and isinstance(block.content, str) and block.content
-    ]
-    return outputs[-1] if outputs else ''
+def _runtime_error_report(
+    record: logging.LogRecord, names: Mapping[str, str], position: str
+) -> str:
+    args = record.args if isinstance(record.args, tuple) else ()
+    agent = next((arg for arg in args if isinstance(arg, str) and arg in names), None)
+    where = '' if agent is None else f'（agent {names[agent]} {agent}）'
+    return f'Runtime 错误 {position}{where}:\n{indent(_record_detail(record), "  ")}'
 
 
-def _with_max_turns(factory: AgentFactory, max_turns: int | None) -> AgentFactory:
-    if max_turns is None:
-        return factory
+def _error_failure(records: list[logging.LogRecord]) -> ContractViolation:
+    received = 'Context.stop_reason 是 error'
+    next_action = '查看当前命令之前输出的 Runtime 错误日志，修复失败的 LLM、工具或 hook'
+    if records:
+        received = f'{received}；Runtime 最近错误：{_record_detail(records[-1])}'
+        next_action = '先处理 Runtime 最近错误；如果它来自外部模型服务，修复配置、额度或稍后重试'
+    return ContractViolation(
+        expected='CLI 请求对应的 Agent 以 completed / max_turns / aborted 之一结束',
+        received=received,
+        next_action=next_action,
+    )
 
-    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
-        agent = factory(hooks, events)
-        existing = agent.options.max_turns
-        tightened = max_turns if existing is None else min(existing, max_turns)
-        agent.options = replace(agent.options, max_turns=tightened)
-        return agent
 
-    return build
+# 按 StopReason 取全，外加被硬终止时的 None：缺一个键，那种结局就在 CLI 里撞成 KeyError。
+_NO_ANSWER: dict[StopReason | None, tuple[str, str]] = {
+    StopReason.COMPLETED: (
+        '它正常结束，但没有留下任何文字',
+        '重试一次；反复出现就换一个模型',
+    ),
+    StopReason.MAX_TURNS: (
+        '它用完了轮次预算（max_turns），最后一轮还在调用工具',
+        (
+            '提高 --max-turns 后重试，或把任务拆小；'
+            'chat 里同一个 Agent 的轮数跨消息累计，用完要重开 chat'
+        ),
+    ),
+    StopReason.ABORTED: (
+        '它被中止了，例如等人回答时 stdin 已经关闭',
+        '在交互终端里重跑并回答它的提问，或在 prompt 里一次给全它需要的信息',
+    ),
+    StopReason.ERROR: (
+        '它以错误结束',
+        '先处理上面列出的 Runtime 错误，再重试',
+    ),
+    None: (
+        '它在给出回答之前被硬终止了（kill / 关机）',
+        '重试；被外部终止的 Agent 不会留下回答',
+    ),
+}
+
+_CUT_SHORT: dict[StopReason | None, str] = {
+    StopReason.MAX_TURNS: (
+        '注意: Agent 用完了轮次预算（max_turns）才停下，本次输出是它最后留下的一段文字，'
+        '可能不完整；需要完整结果就提高 --max-turns 重试'
+    ),
+    StopReason.ABORTED: '注意: Agent 被中止了，本次输出是它最后留下的一段文字，可能不完整',
+}
+
+
+def _no_answer(reason: StopReason | None) -> ContractViolation:
+    why, next_action = _NO_ANSWER[reason]
+    ended = None if reason is None else reason.value
+    return ContractViolation(
+        expected='CLI 请求对应的 Agent 用一段文字回答这次请求',
+        received=f'Agent 结束时 stop_reason={ended}，没有留下文字回答：{why}',
+        next_action=next_action,
+    )
+
+
+def _final_text(context: Context, start: int) -> str | None:
+    for block in reversed(context.current_traj[start:]):
+        if block.role == 'assistant' and isinstance(block.content, str) and block.content:
+            return block.content
+    return None
+
+
+def _after_message(context: Context, message_id: str | None) -> int:
+    """这条消息注入之后的位置；它没被注入（Agent 没读到它）时是轨迹末尾。
+
+    chat 里同一个 Agent 的轨迹跨消息累积，不从这里往后找，就会把上一条消息的回答当成这一条的。
+    没有回执 id 时不找：初始 query 那一块同样没有 message_id，拿 None 去比会把它当成这条消息。
+    """
+    if message_id is not None:
+        for index, block in enumerate(context.current_traj):
+            if block.role == 'user' and block.extra.get('message_id') == message_id:
+                return index + 1
+    return len(context.current_traj)
 
 
 def _config_error(expected: str, received: str, next_action: str) -> ConfigError:
@@ -239,32 +312,31 @@ def _validated_request(request: RunRequest) -> dict[str, bool | int | str]:
     return _request_flags(request.flags, declarations)
 
 
-def _with_root_turn_limit(
+def _with_turn_limit(
     topology: Topology,
     max_turns: int | None,
     catalog: AgentCatalog,
 ) -> Topology:
+    """每个槽都收紧到 max_turns。
+
+    `catalog` 必须是收紧之前的目录：角色预算收紧之后，槽上原本合法的更大预算会被 assemble 当成
+    放宽而拒绝；原本就在放宽的槽保持原样，让 assemble 照常报它。
+    """
     if max_turns is None:
         return topology
     slots: list[AgentSlot] = []
     for slot in topology.slots:
-        if slot.is_root:
-            manifest = catalog.get(slot.agent)
-            role_limit = (
-                AgentOptions.max_turns if manifest.budget is None else manifest.budget['turns']
-            )
-            slot_limit = None if slot.budget is None else slot.budget['turns']
-            if slot.budget is not None and (
-                (slot_limit is None and role_limit is not None)
-                or (slot_limit is not None and role_limit is not None and slot_limit > role_limit)
-            ):
-                slots.append(slot)
-                continue
-            current = role_limit if slot.budget is None else slot_limit
-            tightened = max_turns if current is None else min(current, max_turns)
-            slots.append(replace(slot, budget=MappingProxyType({'turns': tightened})))
-        else:
+        role_limit = _role_turns(catalog, slot.agent)
+        slot_limit = None if slot.budget is None else slot.budget['turns']
+        if slot.budget is not None and (
+            (slot_limit is None and role_limit is not None)
+            or (slot_limit is not None and role_limit is not None and slot_limit > role_limit)
+        ):
             slots.append(slot)
+            continue
+        current = role_limit if slot.budget is None else slot_limit
+        tightened = max_turns if current is None else min(current, max_turns)
+        slots.append(replace(slot, budget=MappingProxyType({'turns': tightened})))
     return Topology(slots=tuple(slots))
 
 
@@ -411,8 +483,8 @@ class RuntimeCliHost:
     def doctor(self, config: str) -> str:
         return self._runner.run(self._doctor(config))
 
-    def open_chat(self, config: str) -> str:
-        return self._runner.run(self._open_chat(config))
+    def open_chat(self, config: str, max_turns: int | None = None) -> str:
+        return self._runner.run(self._open_chat(config, max_turns))
 
     def active_agents(self) -> str:
         return self._runner.run(self._active_agents())
@@ -433,6 +505,43 @@ class RuntimeCliHost:
     def _prompt(self, text: str) -> None:
         self._io.stdout.write(text)
         self._io.stdout.flush()
+
+    def _warn(self, text: str) -> None:
+        self._io.stderr.write(f'{text}\n')
+        self._io.stderr.flush()
+
+    async def _answer(
+        self,
+        runtime: Runtime,
+        context: Context,
+        records: list[logging.LogRecord],
+        *,
+        start: int,
+        fail_without_text: bool,
+    ) -> str:
+        """把目标 Agent 的终局交给用户：Runtime 错误写进 stderr，回答作为返回值。
+
+        这些错误记录被 `_CaptureRuntimeErrors` 截下、不会冒到 logging；子 Agent 失败时根 Agent 照样
+        可能给出回答，不在这里写出去，失败就只剩一个看起来正常的结论。被最终错误引用的那一条不重复写。
+        """
+        names = {info.agent_id: info.name for info in await runtime.registry.list()}
+        failed = context.stop_reason is StopReason.ERROR
+        listed = records[:-1] if failed else records
+        for position, record in enumerate(listed, start=1):
+            self._warn(_runtime_error_report(record, names, f'{position}/{len(listed)}'))
+        if failed:
+            raise _error_failure(records)
+        text = _final_text(context, start)
+        if text is None:
+            missing = _no_answer(context.stop_reason)
+            if fail_without_text:
+                raise missing
+            self._warn(missing.message)
+            return ''
+        notice = _CUT_SHORT.get(context.stop_reason)
+        if notice is not None:
+            self._warn(notice)
+        return text
 
     async def _event_pump(self, runtime: Runtime, subscription: Subscription) -> None:
         async for event in subscription:
@@ -498,8 +607,9 @@ class RuntimeCliHost:
             f'workspace: ok {self._workspace_root}'
         )
 
-    async def _open_chat(self, path: str) -> str:
+    async def _open_chat(self, path: str, max_turns: int | None) -> str:
         config = self._config(path)
+        catalog = _turn_capped(config.catalog, max_turns)
         workspace = LocalWorkspace(
             str(self._workspace_root),
             shell='/bin/sh',
@@ -513,7 +623,7 @@ class RuntimeCliHost:
             models: Mapping[str, LLM] = {
                 name: self._model_factory(name) for name in _model_names(config)
             }
-            factories = config.catalog.freeze(
+            factories = catalog.freeze(
                 tools,
                 models,
                 HostFacts(
@@ -535,7 +645,7 @@ class RuntimeCliHost:
             )
             factory = runtime.agent_factory('Orchestrator')
             if factory is None:
-                config.catalog.get('Orchestrator')
+                catalog.get('Orchestrator')
                 raise AssertionError('catalog.get returned without an Orchestrator runtime factory')
             agent_id = await runtime.spawn(factory, exit_mode=ExitMode.ZOMBIE)
             self._sessions[agent_id] = _ChatSession(
@@ -571,7 +681,13 @@ class RuntimeCliHost:
                 session.agent_id,
                 session.pump,
             )
-            return _last_output(context, runtime_errors)
+            return await self._answer(
+                session.runtime,
+                context,
+                runtime_errors,
+                start=_after_message(context, delivered.message_id),
+                fail_without_text=False,
+            )
 
     async def _run_chat_request(self, request: RunRequest) -> str:
         target = request.session
@@ -642,6 +758,7 @@ class RuntimeCliHost:
         flags: Mapping[str, bool | int | str],
     ) -> str:
         config = self._config(request.config)
+        catalog = _turn_capped(config.catalog, request.max_turns)
         workspace = LocalWorkspace(
             str(self._workspace_root),
             shell='/bin/sh',
@@ -659,7 +776,7 @@ class RuntimeCliHost:
                     platform=platform.platform(),
                     shell='/bin/sh',
                 )
-                factories = config.catalog.freeze(tools, models, facts)
+                factories = catalog.freeze(tools, models, facts)
                 runtime = Runtime(
                     agents={} if request.topology is not None else factories,
                     orchestration=True,
@@ -689,14 +806,14 @@ class RuntimeCliHost:
                                 '给要接收 CLI prompt 的 singleton 槽设置 is_root: true',
                             )
                         root_slot = roots[0]
-                        topology = _with_root_turn_limit(
+                        topology = _with_turn_limit(
                             topology,
                             request.max_turns,
                             config.catalog,
                         )
                         await runtime.assemble(
                             topology,
-                            config.catalog,
+                            catalog,
                             tools=tools,
                             models=models,
                             host=facts,
@@ -715,17 +832,23 @@ class RuntimeCliHost:
                         role = request.agent or 'Orchestrator'
                         factory = runtime.agent_factory(role)
                         if factory is None:
-                            config.catalog.get(role)
+                            catalog.get(role)
                             raise AssertionError(
                                 'catalog.get returned without a matching runtime factory'
                             )
                         agent_id = await runtime.spawn(
-                            _with_max_turns(factory, request.max_turns),
+                            factory,
                             query=request.prompt,
                             exit_mode=ExitMode.ZOMBIE,
                         )
                     context = await self._wait_with_pump(runtime, agent_id, pump)
-                    return _last_output(context, runtime_errors)
+                    return await self._answer(
+                        runtime,
+                        context,
+                        runtime_errors,
+                        start=0,
+                        fail_without_text=True,
+                    )
                 finally:
                     await runtime.shutdown()
                     await pump

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from io import StringIO
 from pathlib import Path
 
@@ -13,10 +14,13 @@ from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, InspectRequest, RunRequest
 from syndica.kernel import (
     ConfigError,
+    Context,
+    ContextBlock,
     ContractViolation,
     LLMResponseError,
     ScriptedLLM,
     ScriptedTurn,
+    StopReason,
     ToolCall,
 )
 
@@ -368,11 +372,14 @@ def test_eof_aborts_a_pending_human_question(tmp_path: Path) -> None:
         workspace_root=tmp_path,
     )
     try:
-        output = host.run_request(RunRequest(prompt='ask', agent='Worker'))
+        with pytest.raises(ContractViolation) as excinfo:
+            host.run_request(RunRequest(prompt='ask', agent='Worker'))
     finally:
         host.close()
 
-    assert output == ''
+    assert 'aborted' in excinfo.value.received
+    assert 'stdin' in excinfo.value.received
+    assert excinfo.value.next_action
 
 
 def test_eof_rejects_confirmation_without_executing_the_tool(tmp_path: Path) -> None:
@@ -705,3 +712,342 @@ topologies:
 
     assert output == 'first only'
     assert len(llm.calls) == 1
+
+
+_TEAM = """
+version: 1
+agents:
+  - {name: Worker, description: custom worker, model: worker-model}
+  - {name: Explorer, description: custom explorer, model: explorer-model}
+  - {name: Lead, description: lead role, model: lead-model}
+"""
+
+
+def _team(tmp_path: Path, extra: str = '') -> Path:
+    config = tmp_path / 'team.yaml'
+    config.write_text(_TEAM + extra, encoding='utf-8')
+    return config
+
+
+def _delegating(*roles: str, answer: str) -> ScriptedLLM:
+    delegations = [
+        ScriptedTurn(
+            tool_calls=[
+                ToolCall(
+                    id=f'delegate-{index}',
+                    name='Delegate',
+                    arguments=json.dumps({'agent': role, 'query': f'{role} task'}),
+                )
+            ]
+        )
+        for index, role in enumerate(roles, start=1)
+    ]
+    return ScriptedLLM([*delegations, ScriptedTurn(content=answer)])
+
+
+def _busy_child() -> ScriptedLLM:
+    return ScriptedLLM(
+        [
+            *(
+                ScriptedTurn(tool_calls=[ToolCall(id=f'busy-{n}', name='Missing', arguments='{}')])
+                for n in range(1, 4)
+            ),
+            ScriptedTurn(content='child finished'),
+        ]
+    )
+
+
+def _child_id(root: ScriptedLLM, call: int) -> str:
+    result = root.calls[call][-1]
+    assert isinstance(result.content, str)
+    found = re.search(r'agent ([0-9a-f]{32})', result.content)
+    assert found is not None, result.content
+    return found.group(1)
+
+
+def _host(tmp_path: Path, models: dict[str, ScriptedLLM], stderr: StringIO) -> RuntimeCliHost:
+    return RuntimeCliHost(
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
+        model_factory=lambda name: models.get(name, models['default']),
+        workspace_root=tmp_path,
+    )
+
+
+def test_a_failed_delegated_agent_is_reported_on_stderr_when_the_root_still_answers(
+    tmp_path: Path,
+) -> None:
+    root = _delegating('Worker', answer='root answered anyway')
+    worker = ScriptedLLM(
+        [
+            ScriptedTurn(
+                raises=LLMResponseError(
+                    expected='OpenAI 兼容端点返回一条可解析的 assistant 消息',
+                    received=(
+                        'HTTP 请求失败：HTTP 400 Bad Request: '
+                        '"messages[3].content[0]" must be an object'
+                    ),
+                    next_action='检查 base_url、认证信息、模型名、请求参数和端点状态后重试',
+                )
+            )
+        ]
+    )
+    stderr = StringIO()
+    host = _host(tmp_path, {'default': root, 'worker-model': worker}, stderr)
+    try:
+        output = host.run_request(RunRequest(prompt='survey', config=str(_team(tmp_path))))
+    finally:
+        host.close()
+
+    report = stderr.getvalue()
+    assert output == 'root answered anyway'
+    assert f'Worker {_child_id(root, 1)}' in report
+    assert '"messages[3].content[0]" must be an object' in report
+    assert '下一步: 检查 base_url' in report
+
+
+def test_every_child_failure_is_reported_once_in_the_order_it_happened(tmp_path: Path) -> None:
+    root = _delegating('Worker', 'Explorer', answer='root done')
+    worker = ScriptedLLM([ScriptedTurn(raises=RuntimeError('worker exploded'))])
+    explorer = ScriptedLLM([ScriptedTurn(raises=RuntimeError('explorer exploded'))])
+    stderr = StringIO()
+    host = _host(
+        tmp_path,
+        {'default': root, 'worker-model': worker, 'explorer-model': explorer},
+        stderr,
+    )
+    try:
+        output = host.run_request(RunRequest(prompt='survey', config=str(_team(tmp_path))))
+    finally:
+        host.close()
+
+    report = stderr.getvalue()
+    assert output == 'root done'
+    assert report.count('worker exploded') == 1
+    assert report.count('explorer exploded') == 1
+    assert report.index('worker exploded') < report.index('explorer exploded')
+    assert f'Worker {_child_id(root, 1)}' in report
+    assert f'Explorer {_child_id(root, 2)}' in report
+
+
+def test_a_root_failure_is_quoted_once_after_the_child_failures_before_it(
+    tmp_path: Path,
+) -> None:
+    root = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        id='delegate-1',
+                        name='Delegate',
+                        arguments='{"agent":"Worker","query":"Worker task"}',
+                    )
+                ]
+            ),
+            ScriptedTurn(raises=RuntimeError('root exploded')),
+        ]
+    )
+    worker = ScriptedLLM([ScriptedTurn(raises=RuntimeError('worker exploded'))])
+    stderr = StringIO()
+    host = _host(tmp_path, {'default': root, 'worker-model': worker}, stderr)
+    try:
+        with pytest.raises(ContractViolation) as excinfo:
+            host.run_request(RunRequest(prompt='survey', config=str(_team(tmp_path))))
+    finally:
+        host.close()
+
+    assert 'root exploded' in excinfo.value.received
+    assert 'worker exploded' in stderr.getvalue()
+    assert 'root exploded' not in stderr.getvalue()
+
+
+def test_a_completed_run_writes_nothing_to_stderr(tmp_path: Path) -> None:
+    stderr = StringIO()
+    host = _host(tmp_path, {'default': ScriptedLLM([ScriptedTurn(content='done')])}, stderr)
+    try:
+        output = host.run_request(RunRequest(prompt='go', agent='Worker'))
+    finally:
+        host.close()
+
+    assert output == 'done'
+    assert stderr.getvalue() == ''
+
+
+def test_a_run_that_ends_without_any_text_fails_with_its_stop_reason(tmp_path: Path) -> None:
+    llm = ScriptedLLM(
+        [ScriptedTurn(tool_calls=[ToolCall(id='missing-1', name='Missing', arguments='{}')])]
+    )
+    host = _host(tmp_path, {'default': llm}, StringIO())
+    try:
+        with pytest.raises(ContractViolation) as excinfo:
+            host.run_request(RunRequest(prompt='one turn only', agent='Worker', max_turns=1))
+    finally:
+        host.close()
+
+    assert 'max_turns' in excinfo.value.received
+    assert '--max-turns' in excinfo.value.next_action
+    assert len(llm.calls) == 1
+
+
+def test_a_text_answer_cut_short_by_max_turns_is_flagged_on_stderr(tmp_path: Path) -> None:
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                content='partial',
+                tool_calls=[ToolCall(id='missing-1', name='Missing', arguments='{}')],
+            )
+        ]
+    )
+    stderr = StringIO()
+    host = _host(tmp_path, {'default': llm}, stderr)
+    try:
+        output = host.run_request(RunRequest(prompt='one turn only', agent='Worker', max_turns=1))
+    finally:
+        host.close()
+
+    assert output == 'partial'
+    assert 'max_turns' in stderr.getvalue()
+    assert '--max-turns' in stderr.getvalue()
+
+
+def test_chat_reports_a_message_that_got_no_new_answer_instead_of_repeating_the_last_one(
+    tmp_path: Path,
+) -> None:
+    llm = ScriptedLLM([ScriptedTurn(content='first answer'), ScriptedTurn(content='never')])
+    stderr = StringIO()
+    host = _host(tmp_path, {'default': llm}, stderr)
+    try:
+        target = host.open_chat('.syndica.yaml', max_turns=1)
+        first = host.run_request(RunRequest(prompt='first', session=target))
+        second = host.run_request(RunRequest(prompt='second', session=target))
+    finally:
+        host.close()
+
+    assert first == 'first answer'
+    assert second == ''
+    assert 'max_turns' in stderr.getvalue()
+    assert len(llm.calls) == 1
+
+
+def test_every_stop_reason_explains_a_missing_answer() -> None:
+    from syndica.cli.host import _NO_ANSWER  # pyright: ignore[reportPrivateUsage]
+
+    assert set(_NO_ANSWER) == {*StopReason, None}
+
+
+def test_a_message_without_a_receipt_id_is_not_matched_to_the_initial_query() -> None:
+    from syndica.cli.host import _after_message  # pyright: ignore[reportPrivateUsage]
+
+    context = Context()
+    context.append(ContextBlock(role='user', content='initial query'))
+    context.append(ContextBlock(role='assistant', content='old answer'))
+
+    assert _after_message(context, None) == 2
+
+
+def test_max_turns_keeps_a_file_prompt_as_the_text_it_was_read_as(tmp_path: Path) -> None:
+    (tmp_path / 'prompt.md').write_text('notes.md', encoding='utf-8')
+    (tmp_path / 'notes.md').write_text('a different prompt', encoding='utf-8')
+    config = tmp_path / 'prompted.yaml'
+    config.write_text(
+        """
+version: 1
+agents:
+  - {name: Worker, description: prompted worker, system_prompt: prompt.md}
+""",
+        encoding='utf-8',
+    )
+    llm = ScriptedLLM([ScriptedTurn(content='done')])
+    host = _host(tmp_path, {'default': llm}, StringIO())
+    try:
+        output = host.run_request(
+            RunRequest(prompt='go', config=str(config), agent='Worker', max_turns=2)
+        )
+    finally:
+        host.close()
+
+    assert output == 'done'
+    assert llm.calls[0][0].content == 'notes.md'
+
+
+def test_max_turns_caps_a_delegated_child_as_well_as_the_root(tmp_path: Path) -> None:
+    root = _delegating('Worker', answer='root done')
+    worker = _busy_child()
+    host = _host(tmp_path, {'default': root, 'worker-model': worker}, StringIO())
+    try:
+        output = host.run_request(RunRequest(prompt='go', config=str(_team(tmp_path)), max_turns=2))
+    finally:
+        host.close()
+
+    delegated = root.calls[1][-1].content
+    assert output == 'root done'
+    assert len(worker.calls) == 2
+    assert isinstance(delegated, str)
+    assert '轮次预算' in delegated
+
+
+def test_max_turns_caps_delegated_children_in_a_topology_run(tmp_path: Path) -> None:
+    config = _team(
+        tmp_path,
+        """
+topologies:
+  team:
+    slots:
+      - {name: root, agent: Lead, is_root: true, cardinality: singleton, boot: eager}
+""",
+    )
+    lead = _delegating('Worker', answer='lead done')
+    worker = _busy_child()
+    host = _host(
+        tmp_path,
+        {'default': ScriptedLLM([]), 'lead-model': lead, 'worker-model': worker},
+        StringIO(),
+    )
+    try:
+        output = host.run_request(
+            RunRequest(prompt='go', config=str(config), topology='team', max_turns=2)
+        )
+    finally:
+        host.close()
+
+    assert output == 'lead done'
+    assert len(worker.calls) == 2
+
+
+def test_max_turns_tightens_explicit_slot_budgets_instead_of_breaking_assembly(
+    tmp_path: Path,
+) -> None:
+    config = _team(
+        tmp_path,
+        """
+topologies:
+  team:
+    slots:
+      - {name: root, agent: Lead, is_root: true, cardinality: singleton, boot: eager}
+      - {name: helper, agent: Worker, cardinality: singleton, boot: eager, budget: {turns: 5}}
+""",
+    )
+    lead = ScriptedLLM([ScriptedTurn(content='lead done')])
+    host = _host(tmp_path, {'default': ScriptedLLM([]), 'lead-model': lead}, StringIO())
+    try:
+        output = host.run_request(
+            RunRequest(prompt='go', config=str(config), topology='team', max_turns=2)
+        )
+    finally:
+        host.close()
+
+    assert output == 'lead done'
+
+
+def test_chat_max_turns_caps_every_agent_in_the_session(tmp_path: Path) -> None:
+    config = _team(tmp_path)
+    root = _delegating('Worker', answer='root done')
+    worker = _busy_child()
+    host = _host(tmp_path, {'default': root, 'worker-model': worker}, StringIO())
+    try:
+        target = host.open_chat(str(config), max_turns=2)
+        output = host.run_request(RunRequest(prompt='go', config=str(config), session=target))
+    finally:
+        host.close()
+
+    assert output == 'root done'
+    assert len(worker.calls) == 2

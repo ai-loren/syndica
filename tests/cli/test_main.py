@@ -34,6 +34,7 @@ class _Host:
         self.requests: list[RunRequest] = []
         self.inspections: list[InspectRequest] = []
         self.doctor_configs: list[str] = []
+        self.chat_turn_limits: list[int | None] = []
 
     def run_request(self, request: RunRequest) -> str:
         self.requests.append(request)
@@ -47,8 +48,9 @@ class _Host:
         self.doctor_configs.append(config)
         return 'healthy'
 
-    def open_chat(self, config: str) -> str:
+    def open_chat(self, config: str, max_turns: int | None = None) -> str:
         assert config == '.syndica.yaml'
+        self.chat_turn_limits.append(max_turns)
         return 'root-agent-id'
 
     def active_agents(self) -> str:
@@ -289,6 +291,23 @@ def test_invalid_run_arguments_fail_before_reaching_the_host(argv: list[str]) ->
     assert host.requests == []
 
 
+@pytest.mark.parametrize('value', ['0', '-2', 'many'])
+def test_invalid_chat_turn_limit_fails_before_opening_a_session(value: str) -> None:
+    host = _Host()
+    stderr = StringIO()
+
+    code = main(
+        ['chat', '--max-turns', value],
+        host=host,
+        io=CliIO(stdin=StringIO(':quit\n'), stdout=StringIO(), stderr=stderr),
+    )
+
+    assert code == 2
+    assert '--max-turns' in stderr.getvalue()
+    assert '下一步:' in stderr.getvalue()
+    assert host.chat_turn_limits == []
+
+
 @pytest.mark.parametrize(
     'flags',
     [
@@ -389,6 +408,7 @@ def test_chat_uses_run_requests_and_keeps_the_current_target_visible() -> None:
     )
 
     assert code == 0
+    assert host.chat_turn_limits == [None]
     assert [(request.prompt, request.session) for request in host.requests] == [
         ('first message', 'root-agent-id'),
         ('second message', 'worker-agent-id'),
@@ -396,6 +416,42 @@ def test_chat_uses_run_requests_and_keeps_the_current_target_visible() -> None:
     assert '[root-agent-id]> ' in stdout.getvalue()
     assert '[worker-agent-id]> ' in stdout.getvalue()
     assert 'worker-agent-id Worker zombie' in stdout.getvalue()
+
+
+def test_chat_forwards_its_turn_limit_to_the_host() -> None:
+    host = _Host()
+
+    code = main(
+        ['chat', '--max-turns', '4'],
+        host=host,
+        io=CliIO(stdin=StringIO(':quit\n'), stdout=StringIO(), stderr=StringIO()),
+    )
+
+    assert code == 0
+    assert host.chat_turn_limits == [4]
+
+
+def test_module_host_forwards_the_chat_turn_limit_to_the_runtime_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import syndica.cli.host as host_module
+    from syndica.__main__ import _LazyHost  # pyright: ignore[reportPrivateUsage]
+
+    opened: list[tuple[str, int | None]] = []
+
+    class RecordingHost:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def open_chat(self, config: str, max_turns: int | None = None) -> str:
+            opened.append((config, max_turns))
+            return 'root-agent-id'
+
+    monkeypatch.setattr(host_module, 'RuntimeCliHost', RecordingHost)
+    lazy = _LazyHost(CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()))
+
+    assert lazy.open_chat('.syndica.yaml', 3) == 'root-agent-id'
+    assert opened == [('.syndica.yaml', 3)]
 
 
 def test_module_entrypoint_lists_agents_without_model_configuration(
