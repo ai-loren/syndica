@@ -52,6 +52,29 @@ _TIMEOUT = 5.0
 # 而那种返回会被误读成超时。
 _UNREACHED_WAIT = 30.0
 
+
+async def _status_reaching(
+    runtime: Runtime, agent_id: str, status: AgentStatus
+) -> AgentStatus | None:
+    """轮询注册表直到读到 `status` 或 `_TIMEOUT` 用完，交回最后读到的状态。
+
+    工具置位「已进入等待」与注册表写下 WAITING 之间隔着几次 await，只读一次时余量恰好一跳，内核多
+    一个 await 就误报。WAITING 要等到答复或中止才会离开，所以轮询不会越过要观测的那个窗口。上界用
+    `asyncio.timeout` 而不是 `wait_for`：后者多包一层 Task，会插进一次调度跳转。
+    """
+    seen: AgentStatus | None = None
+    try:
+        async with asyncio.timeout(_TIMEOUT):
+            while seen is not status:
+                info = await runtime.find(agent_id)
+                seen = None if info is None else info.status
+                if seen is not status:
+                    await asyncio.sleep(0.005)
+    except TimeoutError:
+        pass
+    return seen
+
+
 # 一个 Agent 自己的工具排在编排五件套之前，而工具表的迭代顺序逐字进请求前缀（spec §5.2）。
 # 七个元素，既非升序（Delegate / Fork / KillAgent / Ledger / Probe / QueryAgent / SendMessage）
 # 亦非降序，反转后同样两者都不是。
@@ -316,20 +339,15 @@ async def test_a_runtime_drives_three_agents_that_message_each_other_and_one_res
     ]
     assert coordinator_ctx.stop_reason is StopReason.COMPLETED
 
-    # 轮中等待：一条按关联 ID 匹配的答复解开它。用默认的内存 store，置位与真正停下来之间不让出
-    # 控制权，因此这一问读到的是已经装好的那个等待。
+    # 轮中等待：一条按关联 ID 匹配的答复解开它。
     await asyncio.wait_for(entered['north-sign-off'].wait(), _TIMEOUT)
-    waiting = await runtime.find(surveyor)
-    assert waiting is not None
-    assert waiting.status is AgentStatus.WAITING
+    assert await _status_reaching(runtime, surveyor, AgentStatus.WAITING) is AgentStatus.WAITING
     answered = await runtime.send(surveyor, 'signed off', correlation_id='north-sign-off')
     assert answered.ok is True
 
     # 判据四（终止）：中止穿透一次在飞的等待——此刻 Surveyor 正卡在一轮的中间。
     await asyncio.wait_for(entered['second-sign-off'].wait(), _TIMEOUT)
-    mid_turn = await runtime.find(surveyor)
-    assert mid_turn is not None
-    assert mid_turn.status is AgentStatus.WAITING
+    assert await _status_reaching(runtime, surveyor, AgentStatus.WAITING) is AgentStatus.WAITING
 
     await runtime.abort(surveyor)
     aborting = await runtime.find(surveyor)
