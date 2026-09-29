@@ -46,6 +46,10 @@ class WaitState(Enum):
     四个都必须存在：`timeout` 是长跑的兜底，`aborted` 是协作式中止落在等待上的样子，`preempted`
     是「有人用一个新的等待顶掉了它」——三者的后续动作各不相同，塌成一个「没等到」就无从分辨。
 
+    `aborted` 也可能**一秒都没等**：发起等待时这个 Agent 已经在收尾（`abort` 或 `kill` 写下的
+    `aborting`），`Runtime.wait_for` 当场交回它，`waiter.timeout` 根本没交给 broker。不得把它读成
+    「等过一段时间」，更不能据此做超时重试。
+
     刻意**不**混入 `str`：混入后 `WaitState.TIMEOUT == 'timeout'` 为真，于是一个漏了 `.value`
     的比较、或一个拿字符串当状态用的调用方都不会报错，掩盖掉本该现身的错误。
     """
