@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
@@ -61,10 +62,34 @@ def _headers(value: object) -> dict[str, str]:
     return headers
 
 
+def _is_content_parts(items: list[Any]) -> bool:
+    return bool(items) and all(
+        isinstance(item, Mapping)
+        and isinstance(cast(Mapping[object, object], item).get('type'), str)
+        for item in items
+    )
+
+
+def _tool_content(content: str | list[Any] | None) -> str | list[Any]:
+    """tool 消息的 content 只能是字符串或内容块列表，缺键或别的形状都会被端点整条拒掉（HTTP 400）。
+
+    `ToolResult.output` 允许任意列表，所以不是内容块的列表在这里编码成 JSON 文本；
+    `ensure_ascii=False` 让模型读到原文而不是 `\\u` 转义。
+    """
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ''
+    if _is_content_parts(content):
+        return content
+    return json.dumps(content, ensure_ascii=False, default=str)
+
+
 def _message(block: ContextBlock) -> dict[str, Any]:
+    is_tool = block.role == 'tool'
     values: dict[str, Any] = {
         'role': block.role,
-        'content': block.content,
+        'content': _tool_content(block.content) if is_tool else block.content,
         'tool_calls': [
             {
                 'id': call.id,
@@ -75,7 +100,9 @@ def _message(block: ContextBlock) -> dict[str, Any]:
         ],
         'tool_call_id': block.tool_call_id,
     }
-    return {key: values[key] for key in _MESSAGE_KEYS if values[key]}
+    return {
+        key: values[key] for key in _MESSAGE_KEYS if values[key] or (is_tool and key == 'content')
+    }
 
 
 def _clean_schema(value: object, path: str = 'schema') -> object:

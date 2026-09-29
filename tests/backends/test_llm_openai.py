@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from syndica.backends.llm_openai import OpenAICompatible
+from syndica.kernel import LocalWorkspace, local_tools
 from syndica.kernel.context import ArtifactRef, ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError, LLMResponseError
 from syndica.kernel.llm import CachePrefixProvider, LLMConfig
@@ -110,6 +111,109 @@ async def test_message_keys_follow_role_content_tool_calls_tool_call_id() -> Non
         ['role', 'content', 'tool_calls'],
         ['role', 'content', 'tool_call_id'],
     ]
+
+
+async def _tool_message(content: str | list[Any] | None) -> dict[str, Any]:
+    call = ToolCall(id='call-1', name='Glob', arguments='{"pattern":"*"}')
+    request = await _request_for(
+        [
+            ContextBlock(role='assistant', tool_calls=[call]),
+            ContextBlock(role='tool', content=content, tool_call_id='call-1'),
+        ]
+    )
+    return json.loads(request.content)['messages'][1]
+
+
+async def test_tool_output_list_is_sent_as_json_text_in_its_original_order() -> None:
+    message = await _tool_message(['src', 'README.md', 'docs'])
+
+    assert message == {
+        'role': 'tool',
+        'content': '["src", "README.md", "docs"]',
+        'tool_call_id': 'call-1',
+    }
+
+
+async def test_structured_tool_output_keeps_non_ascii_text_and_nested_values() -> None:
+    output = [{'路径': '报告.md', '命中': 2}, ['嵌套', None, True]]
+
+    message = await _tool_message(output)
+
+    assert isinstance(message['content'], str)
+    assert '报告.md' in message['content']
+    assert json.loads(message['content']) == output
+
+
+@pytest.mark.parametrize(('output', 'expected'), [('', ''), ([], '[]'), (None, '')])
+async def test_empty_tool_output_still_carries_a_content_key(
+    output: str | list[Any] | None,
+    expected: str,
+) -> None:
+    message = await _tool_message(output)
+
+    assert list(message) == ['role', 'content', 'tool_call_id']
+    assert message['content'] == expected
+
+
+async def test_tool_content_parts_pass_through_unchanged() -> None:
+    parts = [{'type': 'text', 'text': 'first'}, {'type': 'text', 'text': 'second'}]
+
+    message = await _tool_message(parts)
+
+    assert message['content'] == parts
+
+
+@pytest.mark.parametrize(
+    'output',
+    [
+        [{'path': 'a.py', 'line': 3}, {'path': 'b.py', 'line': 7}],
+        [{'type': 'text', 'text': 'kept'}, {'path': 'b.py'}],
+        [{'type': 3, 'text': 'type is not a string'}],
+    ],
+)
+async def test_lists_that_are_not_content_parts_are_encoded_as_json_text(
+    output: list[Any],
+) -> None:
+    message = await _tool_message(output)
+
+    assert message['content'] == json.dumps(output, ensure_ascii=False)
+
+
+async def test_values_json_cannot_encode_are_sent_as_their_text() -> None:
+    message = await _tool_message([Path('docs/guide.md'), 'README.md'])
+
+    assert json.loads(message['content']) == ['docs/guide.md', 'README.md']
+
+
+async def test_real_glob_and_grep_results_become_string_tool_content(tmp_path: Path) -> None:
+    (tmp_path / 'notes.md').write_text('alpha\nbeta alpha\n', encoding='utf-8')
+    (tmp_path / 'README.md').write_text('alpha\n', encoding='utf-8')
+    workspace = LocalWorkspace(str(tmp_path), shell='/bin/sh', env={})
+    try:
+        tools = local_tools(workspace.portal())
+        globbed = await tools['Glob'].execute(pattern='*.md')
+        grepped = await tools['Grep'].execute(pattern='alpha')
+    finally:
+        await workspace.close()
+    calls = [
+        ToolCall(id='glob-1', name='Glob', arguments='{"pattern":"*.md"}'),
+        ToolCall(id='grep-1', name='Grep', arguments='{"pattern":"alpha"}'),
+    ]
+
+    request = await _request_for(
+        [
+            ContextBlock(role='assistant', tool_calls=calls),
+            ContextBlock(role='tool', content=globbed.output, tool_call_id='glob-1'),
+            ContextBlock(role='tool', content=grepped.output, tool_call_id='grep-1'),
+        ]
+    )
+    tool_messages = json.loads(request.content)['messages'][1:]
+
+    assert isinstance(globbed.output, list)
+    assert isinstance(grepped.output, list)
+    assert [type(message['content']) for message in tool_messages] == [str, str]
+    assert json.loads(tool_messages[0]['content']) == globbed.output
+    assert json.loads(tool_messages[1]['content']) == grepped.output
 
 
 def test_cache_prefix_units_reuse_the_exact_openai_message_and_tool_encoding() -> None:
