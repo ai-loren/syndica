@@ -104,6 +104,26 @@ _INTERRUPTED: dict[WaitState, str] = {
 }
 
 
+def _next_step(child_id: str, reason: StopReason | None) -> str:
+    """子 Agent 没干成时交给模型的下一步。
+
+    `max_turns` 那一格不能建议 SendMessage：轮数跨 `run()` 累计且永不重置（登记 B-21），唤醒它只会
+    让它立刻再次 `max_turns`，那条消息留在邮箱里随队列被摘掉——模型会一轮接一轮地叫醒一个再也
+    干不了活的 Agent，把自己的预算也耗光。
+    """
+    if reason is StopReason.MAX_TURNS:
+        return (
+            '它的轮次预算不会重置，再给它发 SendMessage 只会让它立刻停下、那条消息随之丢失；'
+            '自己把剩下的部分做完，或者用 Delegate 派一个新的 Agent，'
+            '只交给它一件更小、自带全部前提的事。'
+        )
+    return (
+        f'用 QueryAgent({child_id}) 看它的状态，'
+        f'用 SendMessage({child_id}, ...) 让它带着已有上下文继续；'
+        '要换条路就自己做，或者派给另一个角色。'
+    )
+
+
 def _delivered(child_id: str, ctx: Context) -> ToolResult:
     """把子 Agent 的终局翻译成模型看得懂的一段话。
 
@@ -127,9 +147,7 @@ def _delivered(child_id: str, ctx: Context) -> ToolResult:
         output=(
             f'期望: agent {child_id} 完成这件工作并给出结论。'
             f' 实际: {_UNFINISHED[reason]}。'
-            f' 下一步: 用 QueryAgent({child_id}) 看它的状态，'
-            f'用 SendMessage({child_id}, ...) 让它带着已有上下文继续；'
-            '要换条路就自己做，或者派给另一个角色。'
+            f' 下一步: {_next_step(child_id, reason)}'
         ),
         meta=meta,
         trust=trust,

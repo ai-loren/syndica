@@ -348,6 +348,74 @@ async def test_a_child_that_left_text_before_running_out_of_budget_is_still_repo
     await runtime.shutdown()
 
 
+def _out_of_budget_worker() -> AgentFactory:
+    return _worker(
+        [_call('Missing', '{}'), ScriptedTurn(content='would carry on if turns reset')],
+        max_turns=1,
+    )
+
+
+async def test_a_child_out_of_budget_cannot_be_woken_into_doing_more_work(
+    caplog: pytest.LogCaptureFixture,
+):
+    """轮数跨 `run()` 累计且永不重置（登记 B-21）：叫醒它只会让它立刻再次 max_turns，消息没被读到。
+
+    `Delegate` 在这一格不建议 SendMessage 的全部依据就是这件事；轮数哪天改成按周期重置，这条先红。
+    """
+    runtime = Runtime(agents={'Worker': _out_of_budget_worker()})
+    parent = await _idle_parent(runtime)
+    delegated = await asyncio.wait_for(
+        Delegate(runtime, parent).execute(agent='Worker', query='x'), timeout=_TIMEOUT
+    )
+    child_id = delegated.meta['agent_id']
+
+    sent = await asyncio.wait_for(
+        SendMessage(runtime, parent).execute(agent_id=child_id, content='keep going'),
+        timeout=_TIMEOUT,
+    )
+    ctx = await asyncio.wait_for(runtime.wait(child_id), timeout=_TIMEOUT)
+
+    assert sent.meta['ok'] is True
+    assert ctx.stop_reason is StopReason.MAX_TURNS
+    assert 'keep going' not in [block.content for block in ctx.current_traj]
+    assert [
+        record.args[0]
+        for record in caplog.records
+        if record.levelname == 'ERROR' and isinstance(record.args, tuple) and record.args
+    ] == [child_id]
+    await runtime.shutdown()
+
+
+async def test_a_child_out_of_budget_is_pointed_away_from_a_send_message_it_cannot_act_on():
+    runtime = Runtime(agents={'Worker': _out_of_budget_worker()})
+    parent = await _idle_parent(runtime)
+
+    result = await asyncio.wait_for(
+        Delegate(runtime, parent).execute(agent='Worker', query='x'), timeout=_TIMEOUT
+    )
+
+    next_step = str(result.output).split(_THREE_PART[2])[1]
+    assert result.meta['stop_reason'] == 'max_turns'
+    assert f'SendMessage({result.meta["agent_id"]}' not in next_step
+    assert 'Delegate' in next_step
+    assert '自己' in next_step
+    await runtime.shutdown()
+
+
+async def test_a_child_that_failed_is_still_offered_a_send_message_to_carry_on():
+    runtime = Runtime(agents={'Worker': _worker([ScriptedTurn(raises=RuntimeError('boom'))])})
+    parent = await _idle_parent(runtime)
+
+    result = await asyncio.wait_for(
+        Delegate(runtime, parent).execute(agent='Worker', query='x'), timeout=_TIMEOUT
+    )
+
+    next_step = str(result.output).split(_THREE_PART[2])[1]
+    assert result.meta['stop_reason'] == 'error'
+    assert f'SendMessage({result.meta["agent_id"]}, ...)' in next_step
+    await runtime.shutdown()
+
+
 async def test_killing_the_child_releases_a_parent_that_is_waiting_on_it():
     """这次等待没有墙钟上限（登记 D-47），而「被等的那一方在本 Runtime 手里」是那条裁决的全部
     依据——所以那三条出路里至少要有一条被真的走过一遍，否则依据就只是一句断言。
