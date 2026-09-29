@@ -18,13 +18,44 @@
 - M1 multi-agent 内核骨架已完成并审计通过。
 - CLI、声明式 Agent、Topology、本地工具、人工确认、AskUser、L2 scenario runner 已落地。
 - OpenAI-compatible backend 已支持真实模型调用。
-- OpenRouter 免费模型接入已在本地实现，免费模型门禁和错误提示已补强。
+- OpenRouter 免费模型接入已提交（`6f8471c`），免费模型门禁和错误提示已补强。
+- 2026-09-29 用 `cohere/north-mini-code:free` 跑通真实体验验收，并修掉验收暴露的四个问题（见下方
+  「真实体验验收记录」）。
 
 未完成：
 
-- OpenRouter 接入与体验文档相关改动还需提交。
-- 真实用户体验流程还没完整跑通；当前阻塞是 OpenRouter 免费日额度耗尽。
 - M2-M12 共 11 个里程碑尚未实现。
+- 真实体验验收留下的三条后续项（见「真实体验验收记录」）。
+
+---
+
+## 真实体验验收记录（2026-09-29）
+
+模型 `cohere/north-mini-code:free`，在去掉 `.git` 与密钥的仓库副本里运行。基础调用、Worker 读
+README、Orchestrator 委派 Explorer / Planner 并汇总、`chat --max-turns` 均通过；免费额度日用 44/50，
+花费 0。
+
+验收暴露并已修复的问题：
+
+1. `Glob` / `Grep` 交回的列表原样进 tool 消息 `content`，真实端点一律 HTTP 400（`content[0] must be
+   an object`），带这两个工具的 Agent 在真实模型下全部失败。OpenAI 兼容客户端现在把非内容块的列表
+   编码成 JSON 文本，空输出也保留 `content` 键。
+2. 子 Agent 失败只在根 Agent 也失败时才显示。CLI 现在把运行期间捕获的每条 Runtime 错误按
+   「角色名 + id + 三件套」写进 stderr。
+3. Agent 没留下文字回答时 CLI 空输出、退出码 0。`run` 现在以三件套错误和退出码 1 结束，chat 在
+   stderr 提示后继续；用完轮数截断的回答另有提醒；chat 只认这条消息之后的回答。
+4. `--max-turns` 只限制根 Agent，子 Agent 按角色预算（缺省 50 轮）跑满，一次委派就能耗尽免费日额度。
+   现在它收紧目录里每个角色的预算并同步收紧每个拓扑槽，`chat` 也支持 `--max-turns`。
+
+后续项：
+
+- [ ] `Delegate` 对以 `max_turns` 结束的子 Agent 仍建议「用 SendMessage 让它带着已有上下文继续」，
+  但 M1 的轮数跨 `run()` 累计且永不重置（登记 B-21），唤醒只会立刻再次 `max_turns` 并丢弃这条消息。
+  验收里 Orchestrator 因此白白用掉两轮。应按 stop reason 给出不同的下一步（归内核 orchestration）。
+- [ ] Agent 看不到自己还剩几轮，开放任务在紧预算下常常一直调工具、不收尾。归里程碑 8 的
+  `GetBudget` 与预算注入历史。
+- [ ] `--max-turns` 是每个 Agent 各自的上限，子 Agent 还能再委派，总请求数没有严格上界。归里程碑 8
+  的父子预算树。
 
 ---
 
@@ -32,15 +63,17 @@
 
 目标：把本轮已经完成的 OpenRouter 接入、错误提示优化和体验文档收口成可推送状态。
 
+状态：已完成。`6f8471c` 已在 `origin/main`；2026-09-29 本机复跑全量门禁全绿，密钥扫描无真实 key。
+
 TODO：
 
-- [ ] 复跑目标测试：
+- [x] 复跑目标测试：
 
   ```bash
   uv run pytest tests/cli/test_host.py tests/backends/test_llm_openai.py tests/cli/test_main.py -q
   ```
 
-- [ ] 复跑静态检查：
+- [x] 复跑静态检查：
 
   ```bash
   uv run ruff check src/syndica/cli/host.py src/syndica/backends/llm_openai/client.py tests/cli/test_host.py tests/backends/test_llm_openai.py tests/cli/test_main.py
@@ -49,7 +82,7 @@ TODO：
   git diff --check
   ```
 
-- [ ] 如时间允许，复跑全量：
+- [x] 如时间允许，复跑全量：
 
   ```bash
   uv run pytest -q
@@ -58,7 +91,7 @@ TODO：
   uv run pyright
   ```
 
-- [ ] 检查仓库没有真实 API key：
+- [x] 检查仓库没有真实 API key：
 
   ```bash
   rg "sk-or-v1|OPENROUTER_API_KEY|OPENAI_API_KEY" .
@@ -66,8 +99,8 @@ TODO：
 
   预期：只允许文档中的占位符和环境变量名，不允许真实 key。
 
-- [ ] 提交本地改动。
-- [ ] push 到 GitHub `main`。
+- [x] 提交本地改动。
+- [x] push 到 GitHub `main`。
 
 完成标准：
 
@@ -80,6 +113,9 @@ TODO：
 ## P1：真实用户体验验收
 
 目标：用真实 OpenRouter 免费模型跑通一次用户可感知的 multi-agent demo。
+
+状态：已完成，结果见「真实体验验收记录（2026-09-29）」。下面的命令是当时的计划原文；可复现的最新
+命令以本地验证流程文档为准（`--max-turns` 已收紧，委派用分工写死的 prompt）。
 
 前置条件：
 
@@ -94,19 +130,19 @@ TODO：
 
 TODO：
 
-- [ ] 跑 `doctor`：
+- [x] 跑 `doctor`：
 
   ```bash
   uv run python -m syndica doctor
   ```
 
-- [ ] 跑基础真实模型调用：
+- [x] 跑基础真实模型调用：
 
   ```bash
   uv run python -m syndica run "用三句话介绍你现在能做什么" --max-turns 3
   ```
 
-- [ ] 跑单 Agent + 本地工具：
+- [x] 跑单 Agent + 本地工具：
 
   ```bash
   uv run python -m syndica run \
@@ -115,7 +151,7 @@ TODO：
     --max-turns 8
   ```
 
-- [ ] 跑 multi-agent 委派：
+- [x] 跑 multi-agent 委派：
 
   ```bash
   uv run python -m syndica run \
@@ -123,7 +159,7 @@ TODO：
     --max-turns 12
   ```
 
-- [ ] 跑 `chat` 交互：
+- [x] 跑 `chat` 交互：
 
   ```bash
   uv run python -m syndica chat
@@ -230,8 +266,8 @@ uv run pytest tests/runner/test_scenario.py tests/integration/test_cli_human_sce
 
 TODO：
 
-- [ ] README 增加本地验证 runbook 链接。
-- [ ] README 增加“OpenRouter 免费额度限制”说明。
+- [x] README 增加本地验证 runbook 链接。
+- [x] README 增加“OpenRouter 免费额度限制”说明。
 - [ ] 如果真实体验验收发现免费模型工具调用不稳定，补一节“推荐模型与失败排查”。
 - [ ] 增加 `.env.example`，只放变量名和占位符，不放真实 key。
 - [ ] 未来发包前补英文版 Quick Start。

@@ -20,7 +20,7 @@
 
 | 项 | 值 |
 |---|---|
-| 仓 | `/Users/bytedance/Documents/syndica`（GitHub 私有，Loren Zhang / zhangzihao） |
+| 仓 | `/Users/loren/Documents/loren/syndica`（GitHub 私有，Loren Zhang / zhangzihao） |
 | 分支 | `main`（不要另开 worktree，除非用户明确要） |
 | 语言 | Python 3.11+，`uv` |
 | 写代码的约定 | 中文回复；注释只写**现在的硬约束**（不要写推理过程）；错误三件套；**不要**跑全仓 `make lint` / `make test` |
@@ -561,7 +561,7 @@ spec §15 已逐条取证；D-51、D-27、D-58、D-59、V-01、V-02 已关闭；
 
 ## 6. 下一任的第一条命令
 
-在 `/Users/bytedance/Documents/syndica`：
+在 `/Users/loren/Documents/loren/syndica`：
 
 ```bash
 git status -sb

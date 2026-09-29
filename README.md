@@ -97,7 +97,14 @@ export OPENROUTER_MODEL=cohere/north-mini-code:free
 
 OpenRouter mode takes precedence if OpenRouter and generic `OPENAI_*` variables are both present.
 Keep API keys in environment variables; `.env` files are ignored by Git and are not loaded
-automatically.
+automatically. Do not keep a key file inside a workspace that agents operate on: `Read` and
+`Grep` can read it and send it to the model provider.
+
+Free models share a daily request quota (50 requests per day on the OpenRouter free tier), and
+every agent turn is one request. Delegated agents run their own turns, so keep `--max-turns`
+small; it caps every agent in the run. The step-by-step local validation, including quota-aware
+commands and how to read 401 / 429 / 400 failures, is in
+[`docs/guides/2026-09-23-local-multi-agent-validation.md`](docs/guides/2026-09-23-local-multi-agent-validation.md).
 
 ## Quick Start
 
@@ -178,9 +185,17 @@ topologies:
 
 Important current limits:
 
-- Milestone 1 executes `--max-turns`.
+- Milestone 1 executes `--max-turns`. `--max-turns N` caps every agent in the run — the root,
+  delegated and forked agents, and every topology slot — at N turns each, never loosening a
+  smaller role budget. Parent-to-child budget splitting arrives with the budget tree in
+  Milestone 8.
 - `--max-cost`, `--max-tokens`, and `--max-wall-clock` are parsed but fail explicitly until the
   budget engine lands in Milestone 8.
+- Failures of delegated agents are printed to stderr as `Runtime 错误` entries even when the
+  root agent still answers. A run whose agent leaves no text answer (for example it ran out of
+  turns while still calling tools) fails with exit code 1 instead of printing nothing.
+- In `chat`, an agent's turn count accumulates across messages; once it is used up, start a new
+  `chat`.
 - `chat` sessions are process-local.
 - Cross-process `--session` recovery and `syndica sessions ...` require the SessionStore planned
   for Milestone 6.
@@ -189,7 +204,7 @@ Important current limits:
 
 ```text
 syndica run <prompt>
-syndica chat
+syndica chat [--max-turns <n>]
 syndica agents list | show <name>
 syndica topology list | show <name>
 syndica flags list | show <key>
@@ -204,7 +219,7 @@ syndica version
 --agent <name>
 --topology <name>
 --session <id>
---max-turns <n>
+--max-turns <n>           caps every agent in the run
 --max-cost <amount>
 --max-tokens <n>
 --max-wall-clock <seconds>
