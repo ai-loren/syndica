@@ -74,12 +74,20 @@
 | D-59 | `runtime._forkable_prefix` 与 `agent._unpaired_calls` 重复扫描尾部未配对批次 | `26f8a3c`：扫描收敛为 `context._trailing_unpaired_batch`；AST 守卫要求唯一实现与两处消费者接线，并证明扫描范围；恢复用例覆盖两个连续已配对 tool block。六个真实变异全部被杀死，修复后独立复审 APPROVE |
 | V-01 | 手工异常清单漏掉跨模块 `SyndicaError` 子类 | `test_errors.py` 从文件树独立证明全部 kernel 模块已导入，动态发现含嵌套类的全部子类，并逐字断言清单；三种往返对每个类执行。审计命令 20 passed |
 | V-02 | `parked` 状态下的接管 CAS 不是有效所有权守卫 | `ensure_active` 先以本进程活驱动为凭据，再只从 ZOMBIE CAS 激活；测试覆盖 parked、RUNNING / PAUSED / WAITING、ABORTING、外进程持有、shutdown 与未知 Agent。审计命令 7 passed |
+| D-61 | **`Delegate` 对以 `max_turns` 结束的子 Agent 仍建议「用 SendMessage 让它带着已有上下文继续」**（2026-09-29 真实体验验收发现）。轮数跨 `run()` 累计且永不重置（B-21），唤醒只会让它立刻再次 `max_turns`，那条消息留在邮箱里随队列被摘掉；验收里 Orchestrator 因此白白用掉两轮 | `orchestration._next_step`：`max_turns` 那一格改成「自己做完，或用 Delegate 派一个新的 Agent，只交给它一件更小、自带前提的事」，其余终局照旧建议 SendMessage。前提由 `test_a_child_out_of_budget_cannot_be_woken_into_doing_more_work` 钉住：把轮数改成按周期重置时它单独变红，届时这段建议要跟着改回去。两侧建议各有一条用例 |
+| M-4 | 端到端里对 `WAITING` 的断言只读一次注册表，调度余量恰好一跳（M1 交接文档 §4.0） | `test_multi_agent_lifecycle._status_reaching` 轮询到 `WAITING` 或 `_TIMEOUT`，上界用 `asyncio.timeout` 而不是 `wait_for`。让内核永不写 `WAITING` 时该用例照样变红 |
+| M-5 | D-53 正文夸大了「静默漂移」（M1 交接文档 §4.0） | D-53 关闭时条目已按实际改写，无需另改 |
+| M-8 | `WaitState.ABORTED` 的 docstring 只写「协作式中止落在等待上」（M1 交接文档 §4.0） | 补上 D-26 契约：发起等待时 Agent 已在收尾就当场交回、一秒都没等，不得读成等过一段时间，更不能据此做超时重试 |
 
 ## 明确不在里程碑 1（BEYOND-M1）
 
 > 计划 5 更新：本节旧条目里“D-29 未实现 / 宿主关不掉”描述的是发现缺口时的历史状态。现在
 > `SafetyModule.untrusted_high_risk` 已提供 `reject / ask / allow` 显式处置；B-15 / B-18 的
 > 溯源上界与误报本身仍留待里程碑 5。
+
+> 2026-09-29：每条的里程碑归属见路线图
+> [`docs/plans/2026-09-23-v1-milestone-roadmap.md`](../plans/2026-09-23-v1-milestone-roadmap.md)
+> 的「遗留项归属（2026-09-29）」一节；标为「接受」的条目不排期。
 
 | # | 内容 | 理由 |
 |---|---|---|
@@ -109,3 +117,5 @@
 | B-22 | **`KillAgent` 的后代判定每次都走一遍 `Runtime._descendants`（整棵子树的广度优先），远端注册表下是 O(子树) 次 `children_of`。** 另一半：第三方注册表若让 `children_of` 与 `parent_id` 不一致，「谁停得掉谁」与「`despawn` 会带走谁」会跟着分叉 | **刻意复用同一次遍历而不是顺着 `parent_id` 往上走**（后者只要 O(深度)）：两者一旦是两份实现，`KillAgent` 允许的集合与 `despawn` 级联的集合就会在任何一处收紧时静默分叉，而分叉出来的那一侧正是授权缺口。一致性因此比常数便宜。里程碑 1 只有内存注册表，代价可忽略；真要优化，前提是先给「后代」这个关系一个契约层面的单一定义（`AgentRegistry` 契约今天只写了 `children_of`），那属计划 4 动 store 契约的那一批 |
 | B-23 | **`_DRIVING_AGENT` 会被驱动任务里建出来的**任何**任务继承**，所以一个第三方 hook 在切点里 `create_task(...)`、再从那个任务里 `despawn` 这个 Agent，会被 `_refuse_self` 保守拒掉——而它其实不成环（那个任务不被驱动任务 await） | 保守方向是安全的那一侧：放行一次真的落在自己身上的等待是永久挂死、零日志，而误拒交回的是一条带下一步的 `ContractViolation`（「要让自己停下来用 abort」）。收窄它要求判「这个任务到底在不在驱动任务的 await 链上」，而 asyncio 不暴露这个关系；`_reap` 那一格能精确处理只是因为**它是内核自己建的**、内核知道它在事件循环之外。第三方建的任务内核无从知道，因此这条只能记着 |
 | B-07 | 关联 ID 是一个扁平命名空间（`tool_call_id` 由模型厂商生成、`correlation_id` 由 `Runtime.send` 写入，都不带前缀），一条对派活的回复原则上能解掉一次工具确认的等待 | 计划 2 Task 9 裁决**不加前缀**并写进 docstring：加前缀要求发答复的那一侧用同一套编码，两侧不一致的症状是答复躺在邮箱里、等待跑满超时、零日志，比当前无已知来源的碰撞风险更难查；而 `Confirmation` 等的是模型厂商生成的 ID，前缀会变成必须对外公开的编码契约 |
+| M-3 | **`provenance_of` / `strictest_trust` 不满足「公开签名需要它」却在承诺面**（M1 交接文档 §4.0） | 已导出再拿掉是破坏性变更，不在单点决定；归 M12 冻结 v1.0 公开 API 时与其余名字一起过一遍 |
+| M-6 / M-7 | **spec 与实现的命名不一致**：spec §4.2 写 `send(agent_id, message, ...)`、§4.3 写 `AgentInfo.type`，实现分别是 `content` 与 `agent_type`（后者避开内置名），`spawn` 的 `query` 也已收成 keyword-only（M1 交接文档 §4.0） | 以实现为准，不改名：改名会破坏已有调用方。归 M12 冻结公开 API 时按实现改写 spec 的签名清单 |

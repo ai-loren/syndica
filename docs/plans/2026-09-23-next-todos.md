@@ -25,7 +25,7 @@
 未完成：
 
 - M2-M12 共 11 个里程碑尚未实现。
-- 真实体验验收留下的三条后续项（见「真实体验验收记录」）。
+- 其余遗留项已逐条归入 M2-M12 或标为接受的限制，见路线图「遗留项归属（2026-09-29）」。
 
 ---
 
@@ -49,13 +49,13 @@ README、Orchestrator 委派 Explorer / Planner 并汇总、`chat --max-turns` �
 
 后续项：
 
-- [ ] `Delegate` 对以 `max_turns` 结束的子 Agent 仍建议「用 SendMessage 让它带着已有上下文继续」，
+- [x] `Delegate` 对以 `max_turns` 结束的子 Agent 仍建议「用 SendMessage 让它带着已有上下文继续」，
   但 M1 的轮数跨 `run()` 累计且永不重置（登记 B-21），唤醒只会立刻再次 `max_turns` 并丢弃这条消息。
-  验收里 Orchestrator 因此白白用掉两轮。应按 stop reason 给出不同的下一步（归内核 orchestration）。
-- [ ] Agent 看不到自己还剩几轮，开放任务在紧预算下常常一直调工具、不收尾。归里程碑 8 的
-  `GetBudget` 与预算注入历史。
-- [ ] `--max-turns` 是每个 Agent 各自的上限，子 Agent 还能再委派，总请求数没有严格上界。归里程碑 8
-  的父子预算树。
+  验收里 Orchestrator 因此白白用掉两轮。已修：这一格改为建议自己做完或另派新 Agent（登记 D-61）。
+- Agent 看不到自己还剩几轮，开放任务在紧预算下常常一直调工具、不收尾。已写进里程碑 8 的 TODO
+  （`GetBudget` 与预算注入历史）。
+- `--max-turns` 是每个 Agent 各自的上限，子 Agent 还能再委派，总请求数没有严格上界。已写进里程碑 8
+  的 TODO（父子预算树）。
 
 ---
 
@@ -253,7 +253,7 @@ uv run pytest tests/runner/test_scenario.py tests/integration/test_cli_human_sce
 每个里程碑开工时必须：
 
 - 写独立计划文档。
-- 列出本里程碑要关闭的 deferred items。
+- 列出本里程碑要关闭的 deferred items（归属见路线图「遗留项归属（2026-09-29）」）。
 - 明确哪些能力进入公开 API，哪些仍是内部实现。
 - 先写测试或 L2 场景，再实现。
 - 每个任务单独 commit；完成后独立审查。
@@ -268,9 +268,11 @@ TODO：
 
 - [x] README 增加本地验证 runbook 链接。
 - [x] README 增加“OpenRouter 免费额度限制”说明。
-- [ ] 如果真实体验验收发现免费模型工具调用不稳定，补一节“推荐模型与失败排查”。
-- [ ] 增加 `.env.example`，只放变量名和占位符，不放真实 key。
-- [ ] 未来发包前补英文版 Quick Start。
+- [x] 如果真实体验验收发现免费模型工具调用不稳定，补一节“推荐模型与失败排查”。已并进本地验证
+  流程文档：推荐模型、分工写死的委派 prompt、401 / 429 / 400 与 stderr `Runtime 错误` 的读法。
+- 不做 `.env.example`：key 文件不该放在 Agent 操作的工作区里，`Read` / `Grep` 读得到它；README 与
+  验证流程文档已写明放在仓库外。
+- [ ] 未来发包前补英文版 Quick Start（归 M12）。
 
 完成标准：
 
@@ -286,11 +288,11 @@ TODO：
 
 TODO：
 
-- [ ] 决定是否发 PyPI pre-release。
-- [ ] 增加 GitHub Actions：lint、typecheck、test、deps check。
-- [ ] 明确 release versioning 策略。
-- [ ] 增加 issue templates：bug、milestone task、UX validation。
-- [ ] 建立 changelog。
+- [ ] 决定是否发 PyPI pre-release（归 M12）。
+- [ ] 增加 GitHub Actions：lint、typecheck、test、deps check（归 M2，自举改代码之前先有自动门禁）。
+- [ ] 明确 release versioning 策略（归 M12）。
+- [ ] 增加 issue templates：bug、milestone task、UX validation（归 M12）。
+- [ ] 建立 changelog（归 M12）。
 
 完成标准：
 

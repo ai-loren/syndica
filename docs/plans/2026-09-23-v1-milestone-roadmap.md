@@ -56,6 +56,54 @@ uv run pytest -q
 | 11 | 训练出口 | 未开始 | 中立轨迹与 SFT/偏好/RL 导出 |
 | 12 | 发布准备 | 未开始 | 英文文档、CI 矩阵、v1.0 发布 |
 
+## 遗留项归属（2026-09-29）
+
+M1 登记表里「明确不在里程碑 1」的 26 条、2026-09-29 真实体验验收留下的后续项、M1 交接文档 §4.0
+的 Minor 与工程卫生项，在这里逐条给出归属。标为「接受」的是有意保留的限制，不排期，理由写在登记表
+对应条目里。归到某个里程碑的条目已同时写进该里程碑的 TODO；开工写计划时把它们列进「要关闭的
+deferred items」。
+
+| 条目 | 内容 | 归属 | 依据 |
+|---|---|---|---|
+| B-01 | 租约字段只能经无条件 `update` 写 | M6 | 跨进程恢复与孤儿回收要原子写租约 |
+| B-02 | `ControlBlock.wait_until_parked` 吞取消 | 接受，附触发条件 | 没有生产调用方；出现第一个时先按登记里的正解修 |
+| B-03 | `LLMConfig` 不可哈希 | 接受 | 失败是响亮的；有缓存需求时再加稳定身份 |
+| B-04 | `WaitResult` 成功路径不可哈希 | 接受 | 根因是 `Message` 可变，已写进 docstring |
+| B-05 | 异常链不过 copy / pickle | 接受 | 与标准库行为一致 |
+| B-06 | `ConfigError` 被借来表达调用方误用 | M12 | v1.0 冻结公开 API 时统一错误分类 |
+| B-07 | 关联 ID 是扁平命名空间 | 接受 | 已裁决不加前缀，理由在 `wait_for` docstring |
+| B-08 | 危险规则不认经中间工具执行、落盘后再执行 | M5 | 与安全矩阵、溯源链同期 |
+| B-09 | 未声明 `__tool_command_args__` 的非文本参数被静默跳过 | M4 | 第三方工具随 Module 装配时强制声明 |
+| B-10 | 未声明工具的文本参数被散文误报 | M4 | 同 B-09 |
+| B-11 | `DangerRequest` 不可哈希 | 接受 | 同 B-04 |
+| B-12 | 无 `functools.wraps` 的装饰器让声明落空 | 接受 | 管不了第三方装饰器，已写进 docstring |
+| B-13 | wrapper 兜底带来的误报 | M5 | wrapper 选项表与兜底并存 |
+| B-14 | `)` 分隔符零覆盖、续行正则精度 | M5 | 随危险规则改动补覆盖 |
+| B-15 | 溯源是「出现过」的上界，不是因果链 | M5 | 真实溯源链 |
+| B-17 | 并发段里的 `KeyboardInterrupt` / `SystemExit` 逃进事件循环 | 接受 | CPython Task 机制，配对不变式仍成立 |
+| B-18 | hook 改写参数且有兄弟时一律按不可信算 | M5 | 真实溯源链 |
+| B-19 | 段内 hook 写轨迹的顺序取决于调度 | M3 | 捕获与回放同源时复核 |
+| B-20 | 连续两个未配对批次留下孤儿 | 接受 | 不可达，且当前症状是响亮失败 |
+| B-21 | `SendMessage` 不限后代，唤醒会烧掉对方不可恢复的轮数 | M8 | 预算树决定这次唤醒记在谁账上 |
+| B-22 | `KillAgent` 的后代遍历是 O(子树) | M6 | Store 契约给「后代」一个单一定义 |
+| B-23 | `_DRIVING_AGENT` 被第三方任务继承导致保守误拒 | 接受 | asyncio 不暴露 await 链；误拒是安全侧 |
+| D-40 | `ReadOnlyKwarg` 只护顶层 | M5 | 真实溯源链让「作者」判据不再必要 |
+| D-42 | 可观察切点丢弃返回值，typing 看不见 | M4 | 切点 API 定型时复核；须在 M12 冻结前定 |
+| D-43 | 扩展切点分类冲突只沿向外方向查 | 接受 | 单向引用结构上补不全，危险方向已挡住 |
+| D-46 | 派活 / 分叉树没有上限也没有回收 | M8 | 预算树与回收策略 |
+| 验收后续 | Agent 看不到自己还剩几轮，紧预算下一直调工具不收尾 | M8 | `GetBudget` 与预算注入历史 |
+| 验收后续 | `--max-turns` 是每个 Agent 各自的上限，总请求数没有严格上界 | M8 | 父子预算树 |
+| D-61 | `Delegate` 对用完轮数的子 Agent 仍建议 SendMessage 继续 | 已修 | 登记表已关闭 |
+| M-3 | `provenance_of` / `strictest_trust` 不满足「公开签名需要它」 | M12 | API 冻结时决定是否扣留 |
+| M-4 | 端到端 WAITING 断言只有一跳调度余量 | 已修 | 登记表已关闭 |
+| M-5 | D-53 正文夸大「静默漂移」 | 已关闭 | D-53 关闭时条目已改写 |
+| M-6 | spec 写 `send(..., message)`，实现是 `content` | M12 | API 冻结时按实现改写 spec §4.2 的签名 |
+| M-7 | spec 写 `AgentInfo.type`，实现是 `agent_type` | M12 | 同 M-6（spec §4.3） |
+| M-8 | `WaitState.ABORTED` 的 docstring 缺 D-26 契约 | 已修 | 登记表已关闭 |
+| 卫生 | 基础 CI：每次 push 跑与本地一致的门禁 | M2 | 自举开始改代码之前先有自动门禁 |
+| 卫生 | CHANGELOG、PyPI 预发布、版本策略、issue 模板 | M12 | 发布准备 |
+| 卫生 | `.env.example` | 不做 | key 文件不该放在 Agent 操作的工作区里，`Read` / `Grep` 读得到它 |
+
 ---
 
 ## M1 内核骨架
@@ -156,6 +204,9 @@ syndica-dev topology
 - 增加测试结果解析器：pytest、ruff、pyright、依赖检查的退出码与关键错误摘要结构化入 `ToolResult.meta`。
 - 增加自举 handoff 生成器：记录目标、改动文件、验证命令、失败命令、下一步。
 - 增加可选 `--no-write` dry-run 模式，只规划与定位，不落盘。
+- 接入基础 CI：每次 push 在 GitHub Actions 上跑与本地一致的门禁（ruff format / check、pyright、
+  `scripts/check_deps.py`、pytest）。自举会让 Agent 改仓库代码，进 `main` 之前必须有一道不靠人记得
+  去跑的门禁。
 
 ### 具体实现逻辑
 
@@ -236,6 +287,8 @@ Runtime events
 - 增加 `syndica trace list/show/replay` CLI。
 - 增加 OTel exporter backend，但 kernel 只产中立 span。
 - 增加 trace 保留策略：结构永久、失败 payload、全量 payload 显式开启。
+- 复核 B-19：捕获与回放同源要求同一批调用留下同一份轨迹。段内 hook 往 `ctx` 写块的顺序若会让回放
+  分叉，就由 executor 按调用顺序回放这些写入，或把约束写进 hook 契约。
 
 ### 具体实现逻辑
 
@@ -307,6 +360,9 @@ RuntimeModule
 - 增加 flag 文档生成器，供 CLI、README、未来 Web UI 共用。
 - 增加 module discovery 但不自动启用；必须显式配置。
 - 增加示例第三方 module：声明 flag、工具、hook、扩展切点。
+- 处理 B-09 / B-10：第三方工具随 Module 装配时必须声明 `__tool_command_args__`，未声明就拒绝装配。
+- 复核 D-42：切点 API 定型时决定是否拆分可观察与可拦截的回调类型；它是公开 API 的破坏性变更，
+  必须在 M12 冻结之前定下。
 
 ### 具体实现逻辑
 
@@ -384,6 +440,8 @@ ProvenanceGraph
 - 把文件、命令、PTY、Skill、外部内容全部接入 `ProvenanceGraph`。
 - 收窄 M1 的保守溯源上界：高风险操作根据真实因果链升级，而不是整份 Context `any(UNTRUSTED)`。
 - 处理 `BEYOND-M1`：B-15、B-18、D-40 中与真实溯源链相关的误报与嵌套写入问题。
+- 处理 B-08 / B-13 / B-14：危险规则识别经中间工具转手执行（`xargs … sh -c`、`find -exec`）与落盘
+  后再执行；wrapper 建「哪些选项吃下一个词」的表并与现有兜底并存；补齐分隔符与续行的覆盖。
 
 ### 具体实现逻辑
 
@@ -466,6 +524,8 @@ MemoryStore
 - 实现压缩前快照、压缩点 trace、压缩后缓存键重建。
 - 实现全局/工作区两层记忆，只有根协调者可写全局。
 - 增加损坏数据加载策略：尽量修复、跳过坏子项、明确记录。
+- 处理 B-01：租约字段改为原子写，才能做跨进程的孤儿回收。
+- 处理 B-22：在 Store 契约里给「后代」一个单一定义，`KillAgent` 的授权与 `despawn` 的级联共用它。
 
 ### 具体实现逻辑
 
@@ -619,7 +679,9 @@ LongHorizonModule
 - 实现漂移检测：锚点检查常态，语义比对仅在可疑时触发。
 - 实现 ProgressLedger：以强制 Rubric 满足比例度量进度。
 - 实现基线 LongHorizonStrategy，并允许 Module 替换策略。
-- 处理 B-46/B-21：派活/分叉树的规模由预算树与回收策略控制。
+- 处理 D-46 / B-21：派活/分叉树的规模由预算树与回收策略控制。
+- 处理 2026-09-29 真实体验验收的两条后续项：Agent 看不到自己还剩几轮（`GetBudget` 与预算注入
+  历史）；`--max-turns` 目前是每个 Agent 各自的上限，由预算树换成父子切分。
 - 接入分级质量门：L1 每次产物变化，L2 阶段收尾，L3 里程碑处。
 
 ### 具体实现逻辑
@@ -915,6 +977,9 @@ docs site             guides + API reference + protocol contracts
 - 配置包发布：wheel/sdist、extras、server 静态资源打包、签名/校验。
 - 写迁移和兼容策略：semver、弃用周期、breaking change 流程。
 - 准备 demo：CLI 自举、Web 多 Agent、artifact verification、training export。
+- 处理 B-06（统一错误分类）、M-3（`provenance_of` / `strictest_trust` 是否扣留）、M-6 / M-7（spec
+  §4.2 / §4.3 的签名按实现改写）。
+- 建立 CHANGELOG，决定 PyPI 预发布与版本策略。
 
 ### 具体实现逻辑
 
