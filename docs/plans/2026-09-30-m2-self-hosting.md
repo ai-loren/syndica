@@ -445,6 +445,9 @@ sha256 基线覆盖本轮会改到的每个文件）→ 独立审查 → commit 
 
 #### T1 — 基础 CI
 
+**状态：completed**（`ce625ce`、`cc25006`；CI 运行 36704973780 在 Ubuntu 上跑完 2389 条测试、五道门禁全绿，
+没有暴露平台差异；8 条变异全部杀死，含一条 README 与 CI 同时删门禁的联合变异）
+
 **Files:** `.github/workflows/ci.yml`、`tests/test_ci_workflow.py`，以及 Linux 上暴露的差异修复。
 
 - checkout → setup-uv（固定版本）→ Python 3.11 → `uv sync --locked --extra openai --extra dev` → 五道门禁；
@@ -731,7 +734,8 @@ sha256 基线覆盖本轮会改到的每个文件）→ 独立审查 → commit 
 
 ## 意外发现
 
-（执行中记录。）
+- T1：`astral-sh/setup-uv` 从 v8 起只发布完整版本标签，`@v10` 解析不到，第一次 CI 在 Set up job 就失败。
+  改成 `@v10.2.0`，并加了一条要求完整标签的用例；`actions/checkout` 仍有 `v7` 这样的大版本标签。
 
 ## 完成复盘
 
