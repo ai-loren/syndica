@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import pickle
 import time
 from pathlib import Path
 from typing import Any
@@ -11,7 +13,15 @@ from typing import Any
 import httpx
 import pytest
 
-from syndica.backends.llm_openai import OpenAICompatible
+from syndica.backends.llm_openai import (
+    OpenAICompatible,
+    ProviderHTTPError,
+    recoverable,
+    retry_after,
+)
+from syndica.backends.llm_openai.client import (
+    _retry_after_seconds,  # pyright: ignore[reportPrivateUsage]
+)
 from syndica.kernel import LocalWorkspace, local_tools
 from syndica.kernel.context import ArtifactRef, ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError, LLMResponseError
@@ -214,6 +224,280 @@ async def test_real_glob_and_grep_results_become_string_tool_content(tmp_path: P
     assert [type(message['content']) for message in tool_messages] == [str, str]
     assert json.loads(tool_messages[0]['content']) == globbed.output
     assert json.loads(tool_messages[1]['content']) == grepped.output
+
+
+_SIGNATURE = {'google': {'thought_signature': 'real-signature-from-this-endpoint'}}
+_TEXT_SIGNATURE = {'google': {'thought_signature': 'signature-on-the-text-part'}}
+_PLACEHOLDER = {'google': {'thought_signature': 'skip_thought_signature_validator'}}
+
+
+def _signed_response(*call_extras: dict[str, Any] | None) -> httpx.Response:
+    calls: list[dict[str, Any]] = []
+    for index, extra in enumerate(call_extras, start=1):
+        call: dict[str, Any] = {
+            'id': f'call_{index}',
+            'type': 'function',
+            'function': {'name': 'Glob', 'arguments': '{"pattern":"*"}'},
+        }
+        if extra is not None:
+            call['extra_content'] = extra
+        calls.append(call)
+    message = {'role': 'assistant', 'content': None, 'tool_calls': calls}
+    message['extra_content'] = _TEXT_SIGNATURE
+    return httpx.Response(200, json={'choices': [{'message': message}]})
+
+
+def _config_for(model: str, **client_args: Any) -> LLMConfig:
+    return LLMConfig(
+        provider='openai-compatible',
+        model=model,
+        client_args={'base_url': 'https://llm.example.test/v1', **client_args},
+    )
+
+
+async def _second_request(
+    first: httpx.Response,
+    *,
+    producer: LLMConfig,
+    consumer: LLMConfig,
+) -> dict[str, Any]:
+    """`producer` 答出第一轮，`consumer` 带着这段历史发第二轮；交回第二轮的 assistant 消息。"""
+    seen: list[httpx.Request] = []
+    replies = [first, _response()]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return replies.pop(0)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        reply = await OpenAICompatible(producer, client=client).create(
+            [ContextBlock(role='user', content='go')]
+        )
+        history = [
+            ContextBlock(role='user', content='go'),
+            reply,
+            *(
+                ContextBlock(role='tool', content='["a"]', tool_call_id=call.id)
+                for call in reply.tool_calls
+            ),
+        ]
+        await OpenAICompatible(consumer, client=client).create(history)
+    return json.loads(seen[1].content)['messages'][1]
+
+
+async def test_provider_extra_content_goes_back_to_the_endpoint_that_produced_it() -> None:
+    config = _config_for('model-a', foreign_tool_call_extra=_PLACEHOLDER)
+
+    assistant = await _second_request(
+        _signed_response(_SIGNATURE), producer=config, consumer=config
+    )
+
+    assert assistant['tool_calls'][0]['extra_content'] == _SIGNATURE
+    assert assistant['extra_content'] == _TEXT_SIGNATURE
+    assert list(assistant) == ['role', 'tool_calls', 'extra_content']
+    assert list(assistant['tool_calls'][0]) == ['id', 'type', 'function', 'extra_content']
+
+
+async def test_an_own_tool_call_that_came_without_extra_content_gets_no_placeholder() -> None:
+    config = _config_for('model-a', foreign_tool_call_extra=_PLACEHOLDER)
+
+    assistant = await _second_request(
+        _signed_response(_SIGNATURE, None), producer=config, consumer=config
+    )
+
+    assert assistant['tool_calls'][0]['extra_content'] == _SIGNATURE
+    assert 'extra_content' not in assistant['tool_calls'][1]
+
+
+async def test_extra_content_from_another_model_on_the_same_url_is_treated_as_foreign() -> None:
+    assistant = await _second_request(
+        _signed_response(_SIGNATURE, _SIGNATURE),
+        producer=_config_for('model-a'),
+        consumer=_config_for('model-b', foreign_tool_call_extra=_PLACEHOLDER),
+    )
+
+    assert [call['extra_content'] for call in assistant['tool_calls']] == [_PLACEHOLDER] * 2
+    assert 'extra_content' not in assistant
+
+
+async def test_foreign_tool_calls_carry_nothing_when_no_placeholder_is_configured() -> None:
+    assistant = await _second_request(
+        _signed_response(_SIGNATURE),
+        producer=_config_for('model-a'),
+        consumer=_config_for('model-b'),
+    )
+
+    assert 'extra_content' not in assistant['tool_calls'][0]
+    assert 'extra_content' not in assistant
+
+
+async def test_a_reply_without_provider_extras_adds_nothing_to_extra() -> None:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: _response())) as client:
+        reply = await OpenAICompatible(_config(), client=client).create(
+            [ContextBlock(role='user', content='go')]
+        )
+
+    assert reply.extra == {}
+
+
+def test_foreign_tool_call_extra_must_be_a_json_object() -> None:
+    with pytest.raises(ConfigError) as caught:
+        OpenAICompatible(_config_for('model-a', foreign_tool_call_extra='skip'))
+
+    assert 'foreign_tool_call_extra' in caught.value.expected
+    assert "'skip'" in caught.value.received
+    assert caught.value.next_action
+
+
+def test_foreign_tool_call_extra_is_not_handed_to_httpx() -> None:
+    llm = OpenAICompatible(_config_for('model-a', foreign_tool_call_extra=_PLACEHOLDER))
+
+    assert 'foreign_tool_call_extra' not in llm._client_args  # pyright: ignore[reportPrivateUsage]
+
+
+async def _status_error(response: httpx.Response) -> LLMResponseError:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response)) as client:
+        with pytest.raises(LLMResponseError) as caught:
+            await OpenAICompatible(_config(), client=client).create(
+                [ContextBlock(role='user', content='go')]
+            )
+    return caught.value
+
+
+async def test_a_rate_limited_reply_carries_its_status_and_retry_after_seconds() -> None:
+    error = await _status_error(httpx.Response(429, headers={'Retry-After': '7'}, json={}))
+
+    assert isinstance(error, ProviderHTTPError)
+    assert error.status_code == 429
+    assert error.retry_after == 7.0
+    assert retry_after(error) == 7.0
+    assert 'HTTP 429' in error.received
+
+
+async def test_a_server_error_without_hints_has_a_status_and_no_retry_after() -> None:
+    error = await _status_error(httpx.Response(500, json={'error': 'boom'}))
+
+    assert isinstance(error, ProviderHTTPError)
+    assert error.status_code == 500
+    assert retry_after(error) is None
+
+
+def test_retry_after_is_none_for_errors_that_are_not_http_status_errors() -> None:
+    plain = LLMResponseError(expected='e', received='r', next_action='n')
+
+    assert retry_after(plain) is None
+    assert retry_after(RuntimeError('boom')) is None
+
+
+@pytest.mark.parametrize(
+    ('status', 'waiting_helps'),
+    [
+        (429, True),
+        (408, True),
+        (425, True),
+        (500, True),
+        (501, True),
+        (503, True),
+        (520, True),
+        (400, False),
+        (401, False),
+        (402, False),
+        (403, False),
+        (404, False),
+        (422, False),
+    ],
+)
+async def test_recoverable_tells_limits_and_outages_from_errors_waiting_cannot_fix(
+    status: int, waiting_helps: bool
+) -> None:
+    error = await _status_error(httpx.Response(status, json={}))
+
+    assert recoverable(error) is waiting_helps
+
+
+def test_failures_without_an_http_status_count_as_recoverable() -> None:
+    timeout = LLMResponseError(expected='e', received='请求在 60 秒内没有完成', next_action='n')
+
+    assert recoverable(timeout) is True
+    assert recoverable(ProviderHTTPError(expected='e', received='r', next_action='n')) is True
+    assert recoverable(RuntimeError('boom')) is True
+
+
+@pytest.mark.parametrize(
+    'body',
+    [
+        {
+            'error': {
+                'details': [
+                    {'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '31s'}
+                ]
+            }
+        },
+        [
+            {
+                'error': {
+                    'details': [
+                        {'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '31s'}
+                    ]
+                }
+            }
+        ],
+    ],
+)
+def test_google_retry_info_is_read_from_the_error_body(body: object) -> None:
+    assert _retry_after_seconds(httpx.Response(429, json=body), now=1000.0) == 31.0
+
+
+def test_an_openrouter_reset_timestamp_in_milliseconds_becomes_seconds_from_now() -> None:
+    response = httpx.Response(429, headers={'X-RateLimit-Reset': str(1_700_000_120_000)})
+
+    assert _retry_after_seconds(response, now=1_700_000_000.0) == 120.0
+
+
+def test_a_retry_after_http_date_becomes_seconds_from_now() -> None:
+    response = httpx.Response(503, headers={'Retry-After': 'Tue, 14 Nov 2023 22:14:20 GMT'})
+
+    assert _retry_after_seconds(response, now=1_700_000_000.0) == 60.0
+
+
+def test_the_latest_of_several_retry_hints_wins() -> None:
+    response = httpx.Response(
+        429,
+        headers={'Retry-After': '5', 'X-RateLimit-Reset': str(1_700_000_090_000)},
+        json=[
+            {
+                'error': {
+                    'details': [
+                        {'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '40s'}
+                    ]
+                }
+            }
+        ],
+    )
+
+    assert _retry_after_seconds(response, now=1_700_000_000.0) == 90.0
+
+
+def test_a_reset_time_already_in_the_past_means_retry_now() -> None:
+    response = httpx.Response(429, headers={'X-RateLimit-Reset': str(1_699_999_000_000)})
+
+    assert _retry_after_seconds(response, now=1_700_000_000.0) == 0.0
+
+
+def test_retry_hints_are_ignored_on_statuses_that_do_not_ask_for_a_retry() -> None:
+    response = httpx.Response(400, headers={'Retry-After': '30'})
+
+    assert _retry_after_seconds(response, now=1000.0) is None
+
+
+def test_provider_http_errors_keep_status_and_retry_after_across_copy_and_pickle() -> None:
+    error = ProviderHTTPError(
+        expected='e', received='r', next_action='n', status_code=429, retry_after=12.5
+    )
+
+    for clone in (copy.copy(error), copy.deepcopy(error), pickle.loads(pickle.dumps(error))):
+        assert isinstance(clone, ProviderHTTPError)
+        assert (clone.status_code, clone.retry_after) == (429, 12.5)
 
 
 def test_cache_prefix_units_reuse_the_exact_openai_message_and_tool_encoding() -> None:
