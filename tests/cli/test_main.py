@@ -17,11 +17,14 @@ from syndica.cli.main import CliIO, InspectRequest, RunRequest, main
 
 REPO_ROOT = Path(__file__).parents[2]
 _MODEL_ENV = {
+    'GEMINI_API_KEY',
+    'GEMINI_MODEL',
     'OPENAI_API_KEY',
     'OPENAI_BASE_URL',
     'OPENAI_MODEL',
     'OPENROUTER_API_KEY',
     'OPENROUTER_MODEL',
+    'SYNDICA_LLM_ORDER',
 }
 
 
@@ -544,6 +547,243 @@ def test_openrouter_configuration_uses_its_endpoint_key_and_attribution_headers(
             'X-Title': 'Syndica',
         },
     }
+
+
+def _only(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
+    for key in _MODEL_ENV:
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+
+def test_gemini_configuration_uses_its_openai_compatible_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from syndica.__main__ import _configured_model
+    from syndica.backends.llm_router import ModelRouter
+
+    _only(monkeypatch, GEMINI_API_KEY='test-gemini-key')
+
+    llm = _configured_model('default')
+
+    assert isinstance(llm, ModelRouter)
+    assert [health.name for health in llm.health()] == ['gemini']
+    assert llm.config.model == 'gemini-3.5-flash-lite'
+    assert llm.config.client_args == {
+        'base_url': 'https://generativelanguage.googleapis.com/v1beta/openai',
+        'api_key': 'test-gemini-key',
+        'foreign_tool_call_extra': {
+            'google': {'thought_signature': 'skip_thought_signature_validator'}
+        },
+    }
+
+
+def test_gemini_model_can_be_chosen_explicitly(monkeypatch: pytest.MonkeyPatch) -> None:
+    from syndica.__main__ import _configured_model
+
+    _only(monkeypatch, GEMINI_API_KEY='test-gemini-key', GEMINI_MODEL='gemini-3.8-flash')
+
+    assert _configured_model('default').config.model == 'gemini-3.8-flash'
+
+
+def test_a_gemini_model_without_a_key_is_rejected_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from syndica.__main__ import _configured_model
+    from syndica.kernel import ConfigError
+
+    _only(monkeypatch, GEMINI_MODEL='gemini-3.8-flash')
+
+    with pytest.raises(ConfigError) as caught:
+        _configured_model('default')
+
+    assert 'GEMINI_API_KEY' in caught.value.expected
+    assert 'GEMINI_API_KEY' in caught.value.next_action
+
+
+def test_gemini_and_openrouter_form_a_ring_with_gemini_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from syndica.__main__ import _configured_model
+    from syndica.backends.llm_openai import recoverable, retry_after
+    from syndica.backends.llm_router import ModelRouter
+
+    _only(monkeypatch, GEMINI_API_KEY='test-gemini-key', OPENROUTER_API_KEY='test-openrouter-key')
+
+    llm = _configured_model('default')
+
+    assert isinstance(llm, ModelRouter)
+    assert [health.name for health in llm.health()] == ['gemini', 'openrouter']
+    assert llm.config.model == 'gemini-3.5-flash-lite'
+    assert llm._retry_after is retry_after  # pyright: ignore[reportPrivateUsage]
+    assert llm._recoverable is recoverable  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ('env', 'platform'),
+    [
+        ({'GEMINI_API_KEY': 'test-gemini-key'}, 'gemini'),
+        ({'OPENROUTER_API_KEY': 'test-openrouter-key'}, 'openrouter'),
+        ({'OPENAI_BASE_URL': 'https://llm.example.test/v1', 'OPENAI_MODEL': 'm'}, 'openai'),
+    ],
+)
+def test_a_single_platform_is_retried_through_the_router(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+    platform: str,
+) -> None:
+    from syndica.__main__ import _configured_model
+    from syndica.backends.llm_openai import recoverable, retry_after
+    from syndica.backends.llm_router import ModelRouter
+
+    _only(monkeypatch, **env)
+
+    llm = _configured_model('default')
+
+    assert isinstance(llm, ModelRouter)
+    assert [health.name for health in llm.health()] == [platform]
+    assert llm._retry_after is retry_after  # pyright: ignore[reportPrivateUsage]
+    assert llm._recoverable is recoverable  # pyright: ignore[reportPrivateUsage]
+
+
+def test_an_explicit_model_name_is_retried_on_its_own_platform_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from syndica.__main__ import _configured_model
+    from syndica.backends.llm_openai import recoverable
+    from syndica.backends.llm_router import ModelRouter
+
+    _only(monkeypatch, GEMINI_API_KEY='test-gemini-key', OPENROUTER_API_KEY='test-openrouter-key')
+
+    llm = _configured_model('cohere/north-mini-code:free')
+
+    assert isinstance(llm, ModelRouter)
+    assert [health.name for health in llm.health()] == ['openrouter']
+    assert llm.config.model == 'cohere/north-mini-code:free'
+    assert llm._recoverable is recoverable  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_ring_follows_syndica_llm_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    from syndica.__main__ import _configured_model
+    from syndica.backends.llm_router import ModelRouter
+
+    _only(
+        monkeypatch,
+        GEMINI_API_KEY='test-gemini-key',
+        OPENROUTER_API_KEY='test-openrouter-key',
+        OPENAI_BASE_URL='https://llm.example.test/v1',
+        OPENAI_MODEL='model-a',
+        SYNDICA_LLM_ORDER='openai, openrouter,gemini',
+    )
+
+    llm = _configured_model('default')
+
+    assert isinstance(llm, ModelRouter)
+    assert [health.name for health in llm.health()] == ['openai', 'openrouter', 'gemini']
+
+
+def test_generic_openai_variables_stay_out_of_the_default_ring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from syndica.__main__ import _configured_model
+    from syndica.backends.llm_router import ModelRouter
+
+    _only(
+        monkeypatch,
+        GEMINI_API_KEY='test-gemini-key',
+        OPENROUTER_API_KEY='test-openrouter-key',
+        OPENAI_BASE_URL='https://paid.example.test/v1',
+        OPENAI_MODEL='paid-model',
+    )
+
+    llm = _configured_model('default')
+
+    assert isinstance(llm, ModelRouter)
+    assert [health.name for health in llm.health()] == ['gemini', 'openrouter']
+
+
+@pytest.mark.parametrize(
+    ('order', 'needle'),
+    [
+        ('gemini,claude', "'claude'"),
+        ('gemini,gemini', '重复'),
+        (' , ', '空'),
+        ('gemini,openrouter', 'OPENROUTER_API_KEY'),
+        ('openai', 'OPENAI_BASE_URL'),
+    ],
+)
+def test_an_unusable_ring_order_is_rejected_with_the_fix(
+    monkeypatch: pytest.MonkeyPatch,
+    order: str,
+    needle: str,
+) -> None:
+    from syndica.__main__ import _configured_model
+    from syndica.kernel import ConfigError
+
+    _only(monkeypatch, GEMINI_API_KEY='test-gemini-key', SYNDICA_LLM_ORDER=order)
+
+    with pytest.raises(ConfigError) as caught:
+        _configured_model('default')
+
+    error = caught.value
+    assert needle in f'{error.expected}{error.received}{error.next_action}'
+    assert 'SYNDICA_LLM_ORDER' in f'{error.expected}{error.received}'
+
+
+def test_with_no_platform_configured_the_error_offers_every_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from syndica.__main__ import _configured_model
+    from syndica.kernel import ConfigError
+
+    _only(monkeypatch)
+
+    with pytest.raises(ConfigError) as caught:
+        _configured_model('default')
+
+    next_action = caught.value.next_action
+    assert 'OPENAI_BASE_URL' in next_action
+    assert 'GEMINI_API_KEY' in next_action
+    assert 'OPENROUTER_API_KEY' in next_action
+
+
+def test_an_explicit_model_name_is_never_sent_to_gemini_and_the_error_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from syndica.__main__ import _configured_model
+    from syndica.kernel import ConfigError
+
+    _only(monkeypatch, GEMINI_API_KEY='test-gemini-key', GEMINI_MODEL='gemini-3.8-flash')
+
+    with pytest.raises(ConfigError) as caught:
+        _configured_model('gemini-3.8-pro')
+
+    next_action = caught.value.next_action
+    assert 'GEMINI_API_KEY' not in next_action
+    assert 'OPENROUTER_API_KEY' in next_action
+    assert 'default' in next_action
+    assert 'GEMINI_MODEL' in next_action
+
+
+def test_module_entrypoint_doctor_builds_a_two_platform_ring_without_network(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        [sys.executable, '-m', 'syndica', 'doctor'],
+        cwd=tmp_path,
+        env={
+            **_without_model_env(),
+            'GEMINI_API_KEY': 'must-not-appear',
+            'OPENROUTER_API_KEY': 'must-not-appear-either',
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines()[:2] == ['config: ok .syndica.yaml', 'models: ok default']
+    assert 'must-not-appear' not in completed.stdout + completed.stderr
 
 
 def test_module_entrypoint_rejects_a_paid_openrouter_model_before_network(
