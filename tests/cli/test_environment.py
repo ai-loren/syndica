@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from io import StringIO
 from pathlib import Path
@@ -51,10 +52,11 @@ agents:
     system_prompt: 按要求跑命令
     tools: [Bash]
 """
+# 经 Agent 的 Bash 只看环境与文件；git 怎么读这份环境在宿主一侧直接验证：Agent 的 `git config`
+# 不在只读子命令里，会被开发期守卫拦下。
 _PROBE = (
     'printenv; '
-    'printf "\\n[git]%s\\n" "$(git config --global --get safe.bareRepository)"; '
-    'test -f "$GIT_CONFIG_GLOBAL" && printf "[gitconfig-file]\\n"; '
+    'printf "\\n[gitconfig-begin]\\n"; cat "$GIT_CONFIG_GLOBAL"; printf "[gitconfig-end]\\n"; '
     'test -d "$GH_CONFIG_DIR" && printf "[gh-dir]\\n"; '
     'ls -A "$GH_CONFIG_DIR" | wc -l | tr -d " " | sed "s/^/[gh-entries]/"'
 )
@@ -101,7 +103,8 @@ _SHELL_OWN = {'PWD', 'SHLVL', '_', 'OLDPWD'}
 
 def _env_names(output: str) -> set[str]:
     stdout = output.split('stdout:\n', 1)[1].split('\nstderr:\n', 1)[0]
-    return {line.split('=', 1)[0] for line in stdout.splitlines() if '=' in line}
+    printenv = stdout.split('[gitconfig-begin]', 1)[0]
+    return {line.split('=', 1)[0] for line in printenv.splitlines() if '=' in line}
 
 
 def _run_probe(tmp_path: Path, llm: ScriptedLLM) -> str:
@@ -127,6 +130,14 @@ def test_the_agent_sees_the_whitelist_and_pass_env_but_no_secret_or_unlisted_var
     assert names - _SHELL_OWN == {*_WHITELIST, 'GIT_AUTHOR_NAME', *_HOST_SET}
 
 
+def test_the_agent_bash_runs_in_the_shell_this_test_run_selected(
+    tmp_path: Path, shell_path: str
+) -> None:
+    output = _run_probe(tmp_path, _probing_llm('printf "%s" "$0"'))
+
+    assert output.split('stdout:\n', 1)[1].split('\nstderr:\n', 1)[0] == shell_path
+
+
 def test_the_whitelist_is_exactly_the_documented_one() -> None:
     assert list(FIXED_PASS_ENV) == _WHITELIST
 
@@ -142,8 +153,9 @@ def test_the_git_and_gh_configs_are_fresh_outside_the_workspace_and_gone_after_t
 
     assert values['GIT_TERMINAL_PROMPT'] == '0'
     assert values['GIT_CONFIG_NOSYSTEM'] == '1'
-    assert '[git]explicit' in output
-    assert '[gitconfig-file]' in output and '[gh-dir]' in output
+    config_text = output.split('[gitconfig-begin]\n', 1)[1].split('[gitconfig-end]', 1)[0]
+    assert config_text == '[safe]\n\tbareRepository = explicit\n'
+    assert '[gh-dir]' in output
     assert '[gh-entries]0' in output
     assert not git_config.is_relative_to((tmp_path / 'ws').resolve())
     assert not git_config.exists()
@@ -167,6 +179,43 @@ def test_run_chat_and_doctor_hand_the_agent_the_same_environment(tmp_path: Path)
 
     assert chat_names == run_names
     assert set(doctor_line.removeprefix('env: ').split()) == run_names - _SHELL_OWN
+
+
+def test_a_topology_run_hands_its_slot_the_same_environment_and_output_limit(
+    tmp_path: Path,
+) -> None:
+    run_names = _env_names(_run_probe(tmp_path, _probing_llm()))
+    config = _config(tmp_path)
+    Path(config).write_text(
+        _CONFIG + 'topologies:\n  solo:\n    slots:\n      - {name: root, agent: Orchestrator, '
+        'is_root: true, cardinality: singleton, boot: eager}\n',
+        encoding='utf-8',
+    )
+    flood = json.dumps({'command': "printf 'x%.0s' $(seq 1 30000)"})
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(id='probe', name='Bash', arguments=json.dumps({'command': _PROBE}))
+                ]
+            ),
+            ScriptedTurn(tool_calls=[ToolCall(id='flood', name='Bash', arguments=flood)]),
+            ScriptedTurn(content='probed'),
+        ]
+    )
+    host = _host(tmp_path, llm)
+    try:
+        answer = host.run_request(RunRequest(prompt='probe', topology='solo', config=config))
+    finally:
+        host.close()
+    blocks = {
+        block.tool_call_id: str(block.content) for block in llm.calls[-1] if block.role == 'tool'
+    }
+    flooded = blocks['flood'].split('stdout:\n', 1)[1].split('\nstderr:\n', 1)[0]
+
+    assert answer == 'probed'
+    assert _env_names(blocks['probe']) == run_names
+    assert flooded.count('x') == 10_000
 
 
 def test_chat_removes_its_scratch_directory_when_the_host_closes(tmp_path: Path) -> None:
@@ -239,14 +288,44 @@ def test_a_temporary_directory_inside_the_workspace_is_refused(
     assert list((root / 'tmp').iterdir()) == []
 
 
-def test_the_agents_git_reads_exactly_one_setting_from_one_file(tmp_path: Path) -> None:
-    llm = _probing_llm('printf "%s\\n" "$GIT_CONFIG_GLOBAL"; git config --show-origin --list')
+def test_git_under_the_agent_environment_reads_one_setting_and_refuses_a_planted_bare_repo(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / 'ws'
+    planted = root / 'planted.git'
+    planted.mkdir(parents=True)
+    subprocess.run(['git', 'init', '-q', '--bare', str(planted)], check=True)
+    environment = agent_environment(_HOST_ENV, (), workspace_root=root)
+    try:
+        listed = subprocess.run(
+            ['git', 'config', '--show-origin', '--list'],
+            cwd=root,
+            env=dict(environment.values),
+            capture_output=True,
+            text=True,
+        )
+        bare = subprocess.run(
+            ['git', 'rev-parse', '--git-dir'],
+            cwd=planted,
+            env=dict(environment.values),
+            capture_output=True,
+            text=True,
+        )
+        without_the_setting = subprocess.run(
+            ['git', 'rev-parse', '--git-dir'],
+            cwd=planted,
+            env={**environment.values, 'GIT_CONFIG_GLOBAL': os.devnull},
+            capture_output=True,
+            text=True,
+        )
+        git_config = environment.values['GIT_CONFIG_GLOBAL']
+    finally:
+        environment.remove()
 
-    output = _run_probe(tmp_path, llm)
-    stdout = output.split('stdout:\n', 1)[1].split('\nstderr:\n', 1)[0]
-    git_config, *listed = [line for line in stdout.splitlines() if line]
-
-    assert listed == [f'file:{git_config}\tsafe.barerepository=explicit']
+    assert listed.stdout.splitlines() == [f'file:{git_config}\tsafe.barerepository=explicit']
+    assert bare.returncode == 128
+    assert 'safe.bareRepository' in bare.stderr
+    assert without_the_setting.returncode == 0
 
 
 @pytest.mark.skipif(shutil.which('gh') is None, reason='gh 没装，占位令牌无从验证')

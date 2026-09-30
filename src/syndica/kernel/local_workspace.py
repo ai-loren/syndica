@@ -397,8 +397,7 @@ class LocalWorkspace:
         完整性快照兜底。
         """
         real = self._inside(path)
-        parts = (*self._named_parts(path), *real.relative_to(self._root).parts)
-        if any(part.casefold() == '.git' for part in parts):
+        if self._in_git_dir(path, real):
             raise ConfigError(
                 expected='写入的位置不在 .git 里（git 的内部文件；worktree 的 .git 指针文件也算）',
                 received=f'path={path!r} 落在 .git 里',
@@ -408,6 +407,11 @@ class LocalWorkspace:
                 ),
             )
         return real
+
+    def _in_git_dir(self, path: str, real: Path) -> bool:
+        """给出的路径或解析后的路径里有一段是 `.git`（不分大小写）。"""
+        parts = (*self._named_parts(path), *real.relative_to(self._root).parts)
+        return any(part.casefold() == '.git' for part in parts)
 
     def _named_parts(self, path: str) -> tuple[str, ...]:
         """给出的路径在根下的各段；给的是根外的绝对路径时没有（越界另有 `_must_stay` 拒）。"""
@@ -420,12 +424,26 @@ class LocalWorkspace:
             return ()
 
     def _directory(self, path: str) -> Path:
+        """命令的工作目录：根内的目录，且不在 `.git` 里。
+
+        危险规则只看命令文本，从 `.git` 里出发的相对路径（`printf x >> config`、`rm -r objects`）
+        不带 `.git` 这一段，规则看不出它在改 git 状态，所以在这里按目录身份拒。
+        """
         real = self._inside(path)
         if not real.is_dir():
             raise ConfigError(
                 expected='cwd 指向工作区根目录内的目录',
                 received=f'cwd={path!r} 不是目录',
                 next_action='传入工作区根目录内的相对目录，或用 "." 表示根目录',
+            )
+        if self._in_git_dir(path, real):
+            raise ConfigError(
+                expected='命令的 cwd 不在 .git 里',
+                received=f'cwd={path!r} 落在 .git 里',
+                next_action=(
+                    '从工作区根（cwd 用 "."）或普通子目录运行命令；看 git 状态用 git status、'
+                    'git log 这类只读子命令，读 .git 下的文件用 Read'
+                ),
             )
         return real
 

@@ -2,6 +2,7 @@
 
 `SYNDICA_TEST_SHELL` 换掉真正执行命令的测试用的 shell：本机的 `/bin/sh` 是 bash，Ubuntu 的是 dash，
 `SYNDICA_TEST_SHELL=/bin/dash` 在本地近似 CI 上的 shell。只有测试读这个环境变量，内核不受影响。
+经公开 CLI 的用例同样跟着它走：CLI 宿主给 Agent 的 Bash 用的 shell 在每条用例里换成它。
 """
 
 from __future__ import annotations
@@ -31,3 +32,8 @@ def pytest_configure(config: pytest.Config) -> None:
 def shell_path() -> str:
     """真正执行命令的测试用的 shell 的绝对路径。"""
     return _shell_under_test()
+
+
+@pytest.fixture(autouse=True)
+def cli_agent_shell(monkeypatch: pytest.MonkeyPatch, shell_path: str) -> None:
+    monkeypatch.setattr('syndica.cli.host._SHELL', shell_path)

@@ -562,3 +562,70 @@ async def test_a_neighbour_of_dot_git_is_still_writable(exec_root: Path, target:
     await workspace.edit_text(target, 'ok', 'fine')
 
     assert (exec_root / target).read_text(encoding='utf-8') == 'fine\n'
+
+
+def _planted_git_dirs(root: Path) -> None:
+    (root / '.git' / 'hooks').mkdir(parents=True)
+    (root / '.GIT').mkdir(exist_ok=True)
+    (root / 'src').mkdir()
+    (root / 'hooks').symlink_to(root / '.git' / 'hooks')
+    (root / 'other' / 'gitdir').mkdir(parents=True)
+    (root / 'other' / '.git').symlink_to(root / 'other' / 'gitdir')
+    (root / 'sub' / '.git').mkdir(parents=True)
+
+
+_GIT_CWDS = ['.git', '.git/hooks', '.GIT', 'src/../.git', 'hooks', 'other/.git', 'sub/.git']
+
+
+def _markers(root: Path) -> list[Path]:
+    return list(root.rglob('marker'))
+
+
+@pytest.mark.parametrize('cwd', _GIT_CWDS)
+async def test_a_command_cannot_run_inside_dot_git(
+    exec_root: Path, shell_path: str, cwd: str
+) -> None:
+    _planted_git_dirs(exec_root)
+    workspace = LocalWorkspace(str(exec_root), shell=shell_path, env={})
+    try:
+        with pytest.raises(ConfigError) as ran:
+            await workspace.run('printf x > marker', timeout=5, cwd=cwd)
+        with pytest.raises(ConfigError) as started:
+            await workspace.start('printf x > marker', cwd=cwd)
+    finally:
+        await workspace.close()
+
+    assert f'cwd={cwd!r}' in ran.value.received
+    assert 'git status' in ran.value.next_action
+    assert '.git' in started.value.received
+    assert _markers(exec_root) == []
+
+
+async def test_the_absolute_path_of_dot_git_is_refused_as_a_cwd_too(
+    exec_root: Path, shell_path: str
+) -> None:
+    _planted_git_dirs(exec_root)
+    workspace = LocalWorkspace(str(exec_root), shell=shell_path, env={})
+    try:
+        with pytest.raises(ConfigError):
+            await workspace.run('printf x > marker', timeout=5, cwd=str(exec_root / '.git'))
+    finally:
+        await workspace.close()
+
+    assert _markers(exec_root) == []
+
+
+@pytest.mark.parametrize('cwd', ['.github', 'src/.gitkeep.d', 'git', 'other/gitdir-neighbour'])
+async def test_a_command_still_runs_next_to_dot_git(
+    exec_root: Path, shell_path: str, cwd: str
+) -> None:
+    (exec_root / '.git').mkdir()
+    (exec_root / cwd).mkdir(parents=True)
+    workspace = LocalWorkspace(str(exec_root), shell=shell_path, env={})
+    try:
+        result = await workspace.run('printf x > marker', timeout=5, cwd=cwd)
+    finally:
+        await workspace.close()
+
+    assert result.exit_code == 0
+    assert (exec_root / cwd / 'marker').read_text(encoding='utf-8') == 'x'

@@ -251,7 +251,7 @@ class Bash(Tool):
         要长期运行一个程序，让它本身就是这条命令并设 run_in_background，命令里不要再加 &。
         command: 要执行的 shell 命令
         timeout: 前台运行的超时秒数，默认 30；超时时终止整个进程组，交回已经收到的输出
-        cwd: 相对工作区根的工作目录，默认根目录
+        cwd: 相对工作区根的工作目录，默认根目录；不能在 .git 里
         run_in_background: 是否立即返回后台句柄
         """
         try:

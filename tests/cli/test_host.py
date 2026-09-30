@@ -295,7 +295,7 @@ topologies:
         'key': 'untrusted_high_risk',
         'default': 'reject',
         'description': '高风险调用可溯源到不可信内容时的处置',
-        'choices': ['reject', 'ask', 'allow'],
+        'choices': ['reject', 'ask'],
         'minimum': None,
         'maximum': None,
     }

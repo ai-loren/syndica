@@ -15,8 +15,10 @@ from types import MappingProxyType
 from typing import cast
 
 from syndica.cli.config import CliConfig, load_config
+from syndica.cli.dev_module import DevModule
 from syndica.cli.environment import AgentEnvironment, agent_environment
 from syndica.cli.main import CliIO, InspectRequest, RunRequest
+from syndica.cli.policy import dev_danger_options
 from syndica.kernel import (
     LLM,
     AgentCatalog,
@@ -32,6 +34,7 @@ from syndica.kernel import (
     LocalWorkspace,
     MailboxConfirmationHandler,
     Runtime,
+    RuntimeModule,
     SafetyModule,
     StopReason,
     Subscription,
@@ -49,6 +52,10 @@ _RUNTIME_LOGGER = 'syndica.kernel.runtime'
 # Bash 每条输出流最多展示给模型的字符数。整份 pytest 输出进上下文会挤掉别的一切，而汇总行在末尾，
 # local_tools 截断时留开头 20%、结尾 80%。
 _OUTPUT_LIMIT = 10_000
+# Agent 的 Bash 用的 shell。HostFacts 把它告诉模型，两处必须是同一个值。
+_SHELL = '/bin/sh'
+# CLI 拒收的 Flag 取值：`--flag` 报错，`flags show` 不列。
+_REFUSED_FLAG_VALUE = ('untrusted_high_risk', 'allow')
 
 
 class _RuntimeErrorCapture(logging.Handler):
@@ -86,6 +93,15 @@ def _default_config(path: Path) -> CliConfig:
 
 def _modules() -> tuple[SafetyModule, HumanInteractionModule]:
     return SafetyModule(), HumanInteractionModule()
+
+
+def _agent_modules(workspace_root: Path) -> tuple[RuntimeModule, ...]:
+    """run 与 chat 的 Runtime 装的 Module。
+
+    开发期 Module 排在最后：可拦截切点按注册顺序串行，前面的 hook 改过的参数传给后面的；排在它
+    后面的插件再改参数，守卫判的就是改之前的那一份。
+    """
+    return (*_modules(), DevModule(workspace_root))
 
 
 def _model_names(config: CliConfig) -> tuple[str, ...]:
@@ -275,6 +291,15 @@ def _request_flags(
                 f'收到 {value!r}',
                 f'改成 --flag {key}=<声明列出的值>',
             )
+        if (key, value) == _REFUSED_FLAG_VALUE:
+            raise _config_error(
+                'CLI 的 untrusted_high_risk 是 reject 或 ask',
+                '收到 untrusted_high_risk=allow',
+                (
+                    '改用 --flag untrusted_high_risk=ask（每次问你），或省略它（默认 reject）。'
+                    'allow 会让 Agent 读过命令输出之后的每一条高风险命令不经询问就在你的机器上执行'
+                ),
+            )
         if type(value) is int and declaration.minimum is not None and value < declaration.minimum:
             raise _config_error(
                 f'Flag {key!r} 大于或等于 {declaration.minimum}',
@@ -421,7 +446,11 @@ class RuntimeCliHost:
                     'key': declaration.key,
                     'default': declaration.default,
                     'description': declaration.description,
-                    'choices': list(declaration.choices),
+                    'choices': [
+                        choice
+                        for choice in declaration.choices
+                        if (declaration.key, choice) != _REFUSED_FLAG_VALUE
+                    ],
                     'minimum': declaration.minimum,
                     'maximum': declaration.maximum,
                 },
@@ -521,7 +550,7 @@ class RuntimeCliHost:
         )
         try:
             workspace = LocalWorkspace(
-                str(self._workspace_root), shell='/bin/sh', env=environment.values
+                str(self._workspace_root), shell=_SHELL, env=environment.values
             )
         except BaseException:
             environment.remove()
@@ -612,14 +641,17 @@ class RuntimeCliHost:
             tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
             names = _model_names(config)
             models: Mapping[str, LLM] = {name: self._model_factory(name) for name in names}
+            judge, policy = dev_danger_options(self._workspace_root)
             config.catalog.freeze(
                 tools,
                 models,
                 HostFacts(
                     os=platform.system().lower(),
                     platform=platform.platform(),
-                    shell='/bin/sh',
+                    shell=_SHELL,
                 ),
+                danger_judge=judge,
+                danger_policy=policy,
             )
         finally:
             try:
@@ -645,19 +677,22 @@ class RuntimeCliHost:
             models: Mapping[str, LLM] = {
                 name: self._model_factory(name) for name in _model_names(config)
             }
+            judge, policy = dev_danger_options(self._workspace_root)
             factories = catalog.freeze(
                 tools,
                 models,
                 HostFacts(
                     os=platform.system().lower(),
                     platform=platform.platform(),
-                    shell='/bin/sh',
+                    shell=_SHELL,
                 ),
+                danger_judge=judge,
+                danger_policy=policy,
             )
             runtime = Runtime(
                 agents=factories,
                 orchestration=True,
-                modules=_modules(),
+                modules=_agent_modules(self._workspace_root),
                 confirmation_handler=MailboxConfirmationHandler(timeout=300),
             )
             subscription = runtime.events.subscribe()
@@ -801,13 +836,16 @@ class RuntimeCliHost:
                 facts = HostFacts(
                     os=platform.system().lower(),
                     platform=platform.platform(),
-                    shell='/bin/sh',
+                    shell=_SHELL,
                 )
-                factories = catalog.freeze(tools, models, facts)
+                judge, policy = dev_danger_options(self._workspace_root)
+                factories = catalog.freeze(
+                    tools, models, facts, danger_judge=judge, danger_policy=policy
+                )
                 runtime = Runtime(
                     agents={} if request.topology is not None else factories,
                     orchestration=True,
-                    modules=_modules(),
+                    modules=_agent_modules(self._workspace_root),
                     flags=flags,
                     confirmation_handler=MailboxConfirmationHandler(timeout=300),
                 )
@@ -844,6 +882,8 @@ class RuntimeCliHost:
                             tools=tools,
                             models=models,
                             host=facts,
+                            danger_judge=judge,
+                            danger_policy=policy,
                         )
                         delivered = await runtime.send_to_slot(root_slot.name, request.prompt)
                         if not delivered.ok:
