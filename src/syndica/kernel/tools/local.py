@@ -27,19 +27,72 @@ __all__ = [
 ]
 
 _READ_LIMIT: int = 2000
+# 截断时每条流保留的开头占比，其余留给结尾：pytest、ruff 的汇总都在输出末尾。
+_HEAD_SHARE: float = 0.2
 
 
 def _told(exc: ConfigError) -> ToolResult:
     return ToolResult(output=exc.message)
 
 
-def _shown(result: ExecResult) -> str:
-    return (
+def _valid_output_limit(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigError(
+            expected='output_limit 是正整数（每条输出流最多展示的字符数），或 None 表示不截断',
+            received=f'output_limit={value!r}，类型是 {type(value).__name__}',
+            next_action='传一个大于 0 的 int，例如 10_000；不要传布尔值或浮点数',
+        )
+    return value
+
+
+def _clipped(text: str, limit: int | None) -> tuple[str, bool]:
+    """(展示给模型的文本, 是否截断)。stdout 与 stderr 各自截，不截拼好的整段。
+
+    按流截是承重的：pytest 的汇总在 stdout 末尾，而拼好的文本里 stderr 排在最后，截整段会先把
+    stdout 的结尾截掉。
+    """
+    if limit is None or len(text) <= limit:
+        return text, False
+    head = int(limit * _HEAD_SHARE)
+    tail = limit - head
+    omitted = len(text) - head - tail
+    marker = (
+        f'\n…[这条流的中间截掉了 {omitted} 个字符。要看被截掉的部分，把命令输出重定向到工作区里的'
+        "文件，再用 grep、sed -n '起,止p' 或 tail 分段看]…\n"
+    )
+    return text[:head] + marker + text[len(text) - tail :], True
+
+
+def _reported(
+    result: ExecResult, limit: int | None, *, meta: dict[str, object], note: str = ''
+) -> ToolResult:
+    """把一次命令的结果交给模型。`meta` 里的两条流就是展示出来的那两条（可能已截断）。"""
+    stdout, stdout_cut = _clipped(result.stdout, limit)
+    stderr, stderr_cut = _clipped(result.stderr, limit)
+    truncated = result.truncated or stdout_cut or stderr_cut
+    shown = (
+        f'{note}'
         f'running: {str(result.running).lower()}\n'
         f'exit_code: {result.exit_code}\n'
-        f'truncated: {str(result.truncated).lower()}\n'
-        f'stdout:\n{result.stdout}\n'
-        f'stderr:\n{result.stderr}'
+        f'truncated: {str(truncated).lower()}\n'
+        f'timed_out: {str(result.timed_out).lower()}\n'
+        f'stdout:\n{stdout}\n'
+        f'stderr:\n{stderr}'
+    )
+    return ToolResult(
+        output=shown,
+        meta={
+            **meta,
+            'exit_code': result.exit_code,
+            'running': result.running,
+            'truncated': truncated,
+            'timed_out': result.timed_out,
+            'stdout': stdout,
+            'stderr': stderr,
+        },
+        trust=TrustLevel.UNTRUSTED,
     )
 
 
@@ -181,8 +234,9 @@ class Bash(Tool):
     __tool_name__ = 'Bash'
     __tool_command_args__ = ('command',)
 
-    def __init__(self, portal: Portal) -> None:
+    def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal
+        self._output_limit = _valid_output_limit(output_limit)
 
     async def execute(
         self,
@@ -191,9 +245,12 @@ class Bash(Tool):
         cwd: str = '.',
         run_in_background: bool = False,
     ) -> ToolResult:
-        """在工作区目录内运行 shell 命令，可选择转入后台。
+        """在工作区目录内运行 shell 命令，可选择转入后台。stdin 是空的。
+
+        命令的 shell 一退出，它用 & 或 nohup 留下的进程最多再跑约 1 秒就被终止，前台后台都一样。
+        要长期运行一个程序，让它本身就是这条命令并设 run_in_background，命令里不要再加 &。
         command: 要执行的 shell 命令
-        timeout: 前台运行的超时秒数，默认 30
+        timeout: 前台运行的超时秒数，默认 30；超时时终止整个进程组，交回已经收到的输出
         cwd: 相对工作区根的工作目录，默认根目录
         run_in_background: 是否立即返回后台句柄
         """
@@ -209,7 +266,13 @@ class Bash(Tool):
             result = await self._portal.run(command, timeout=timeout, cwd=cwd)
         except ConfigError as exc:
             return _told(exc)
-        return ToolResult(output=_shown(result), trust=TrustLevel.UNTRUSTED)
+        note = (
+            f'命令超时：运行超过 {float(timeout):g} 秒，已终止整个进程组；'
+            '下面是终止前收到的输出。\n'
+            if result.timed_out
+            else ''
+        )
+        return _reported(result, self._output_limit, meta={}, note=note)
 
 
 class BashOutput(Tool):
@@ -218,26 +281,19 @@ class BashOutput(Tool):
     __tool_name__ = 'BashOutput'
     __tool_command_args__ = ()
 
-    def __init__(self, portal: Portal) -> None:
+    def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal
+        self._output_limit = _valid_output_limit(output_limit)
 
     async def execute(self, handle: str) -> ToolResult:
-        """查询后台命令；仍在运行时不等待它结束。
+        """查询后台命令；仍在运行时不等待它结束，交回到目前为止收到的输出。
         handle: Bash 启动后台命令后返回的句柄
         """
         try:
             result = await self._portal.poll(handle)
         except ConfigError as exc:
             return _told(exc)
-        return ToolResult(
-            output=_shown(result),
-            meta={
-                'handle': handle,
-                'running': result.running,
-                'exit_code': result.exit_code,
-            },
-            trust=TrustLevel.UNTRUSTED,
-        )
+        return _reported(result, self._output_limit, meta={'handle': handle})
 
 
 class KillBash(Tool):
@@ -260,15 +316,19 @@ class KillBash(Tool):
         return ToolResult(output=f'已终止后台命令，handle={handle}', meta={'handle': handle})
 
 
-def local_tools(portal: Portal) -> dict[str, Tool]:
-    """按固定顺序交出本地工具。后续任务只追加键，不改已有键的相对顺序。"""
+def local_tools(portal: Portal, *, output_limit: int | None = None) -> dict[str, Tool]:
+    """按固定顺序交出本地工具。后续任务只追加键，不改已有键的相对顺序。
+
+    `output_limit` 是 Bash 与 BashOutput 每条输出流最多展示的字符数，None 是不截断。
+    """
+    limit = _valid_output_limit(output_limit)
     read = Read(portal)
     write = Write(portal)
     edit = Edit(portal)
     glob = Glob(portal)
     grep = Grep(portal)
-    bash = Bash(portal)
-    bash_output = BashOutput(portal)
+    bash = Bash(portal, output_limit=limit)
+    bash_output = BashOutput(portal, output_limit=limit)
     kill_bash = KillBash(portal)
     return {
         read.name: read,

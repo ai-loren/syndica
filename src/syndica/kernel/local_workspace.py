@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.workspace import ExecResult, Portal
@@ -26,12 +26,58 @@ __all__ = ['LocalWorkspace']
 
 # 超过这个大小的文件拒绝整篇读入。模型上下文装不下，拒绝时必须报出实际字节数。
 _MAX_READ_BYTES: int = 1024 * 1024
+# 命令的 shell 退出之后，最多再等这么久让 `cmd &` 留下的子进程关掉输出管道，然后杀整个进程组。
+_PIPE_GRACE: float = 1.0
+# 发出 SIGKILL 之后等进程退出、管道关闭的上限。逃出进程组的进程（`setsid`、`setpgid`，如 GNU
+# `timeout` 不带 `--foreground`、bash 的 `set -m`）可以一直占着管道，过了这个上限就交回已经收到的
+# 输出、关掉读端。它们逃出了进程组，这里杀不到，真正的边界是 M5 的沙箱。
+_KILL_GRACE: float = 1.0
+_CHUNK: int = 64 * 1024
+# 每条流在内核里最多留的字节：开头一段加结尾一段，中间丢掉。后台的 `yes` 两秒就能写出 GB 级输出，
+# 而每次 poll 都要把留下的字节解码一遍——不设上限就是一次内存耗尽加上数秒的事件循环停顿。结尾留得
+# 多：pytest、ruff 的汇总在末尾。展示给模型的字符上限（`local_tools` 的 `output_limit`）在这之上
+# 再收窄。
+_CAPTURE_HEAD: int = 256 * 1024
+_CAPTURE_TAIL: int = 768 * 1024
 
 
-@dataclass
+class _Capture:
+    """一条输出流留下的字节：开头 `_CAPTURE_HEAD` 加结尾 `_CAPTURE_TAIL`，丢掉的只计数。"""
+
+    def __init__(self) -> None:
+        self._head = bytearray()
+        self._tail = bytearray()
+        self._dropped = 0
+
+    def extend(self, chunk: bytes) -> None:
+        if len(self._head) < _CAPTURE_HEAD:
+            room = _CAPTURE_HEAD - len(self._head)
+            self._head += chunk[:room]
+            chunk = chunk[room:]
+        self._tail += chunk
+        excess = len(self._tail) - _CAPTURE_TAIL
+        if excess > 0:
+            del self._tail[:excess]
+            self._dropped += excess
+
+    def rendered(self) -> tuple[str, bool]:
+        """(解码后的文本, 是否丢过字节)。"""
+        if not self._dropped:
+            return _decoded(self._head + self._tail), False
+        note = (
+            f'\n…[内核丢弃了这条流中间 {self._dropped} 个字节：每条流最多保留开头 '
+            f'{_CAPTURE_HEAD} 与结尾 {_CAPTURE_TAIL} 字节]…\n'
+        )
+        return _decoded(self._head) + note + _decoded(self._tail), True
+
+
+@dataclass(eq=False)
 class _ProcessRecord:
     process: asyncio.subprocess.Process
-    communicating: asyncio.Task[tuple[bytes, bytes]]
+    stdout: _Capture
+    stderr: _Capture
+    # 命令结束且进程组收拾完时完成；值是是否超时。完成之后组号可能已被复用，外面不能再按它发信号。
+    settled: asyncio.Task[bool]
 
 
 class LocalWorkspace:
@@ -42,6 +88,8 @@ class LocalWorkspace:
         self._shell = _executable(shell)
         self._env = _copied_env(env)
         self._processes: dict[str, _ProcessRecord] = {}
+        # 正在跑的前台命令。登记它们，`close()` 才杀得到：前台命令同样可能在关闭时还没结束。
+        self._foreground: set[_ProcessRecord] = set()
         self._process_lock = asyncio.Lock()
         self._closing: asyncio.Task[None] | None = None
         self._closed = False
@@ -93,7 +141,7 @@ class LocalWorkspace:
         return '\n'.join(lines[start : start + limit])
 
     async def write_text(self, path: str, content: str) -> None:
-        real = self._inside(path)
+        real = self._writable(path)
         if real.exists() and not real.is_file():
             raise ConfigError(
                 expected='path 指向根目录内的文件',
@@ -112,7 +160,7 @@ class LocalWorkspace:
                 received='old 是空串',
                 next_action='传入要替换的原文片段',
             )
-        real = self._inside(path)
+        real = self._writable(path)
         if not real.is_file():
             raise ConfigError(
                 expected='path 指向根目录内的文件',
@@ -178,34 +226,23 @@ class LocalWorkspace:
         return tuple(hits)
 
     async def run(self, command: str, *, timeout: float, cwd: str) -> ExecResult:
-        self._ensure_open()
         seconds = _positive_timeout(timeout)
-        record = await self._spawn_process(command, cwd)
+        async with self._process_lock:
+            self._ensure_open()
+            record = await self._spawned(command, cwd, timeout=seconds)
+            self._foreground.add(record)
+        record.settled.add_done_callback(lambda _: self._foreground.discard(record))
         try:
-            async with asyncio.timeout(seconds):
-                stdout, stderr = await asyncio.shield(record.communicating)
-        except TimeoutError as exc:
-            await _kill_process(record)
-            raise ConfigError(
-                expected=f'命令在 {seconds:g} 秒内完成',
-                received=f'命令超时：运行超过 {seconds:g} 秒，已终止整个进程组',
-                next_action='缩小命令范围、改为后台运行，或传入更大的正数 timeout',
-            ) from exc
+            timed_out = await asyncio.shield(record.settled)
         except BaseException:
-            await _kill_process(record)
+            _kill_unsettled(record)
             raise
-        return ExecResult(
-            exit_code=record.process.returncode,
-            stdout=_decoded(stdout),
-            stderr=_decoded(stderr),
-            truncated=False,
-            running=False,
-        )
+        return _result(record, timed_out=timed_out)
 
     async def start(self, command: str, *, cwd: str) -> str:
         async with self._process_lock:
             self._ensure_open()
-            record = await self._spawn_process(command, cwd)
+            record = await self._spawned(command, cwd, timeout=None)
             handle = uuid.uuid4().hex
             self._processes[handle] = record
             return handle
@@ -213,26 +250,23 @@ class LocalWorkspace:
     async def poll(self, handle: str) -> ExecResult:
         self._ensure_open()
         record = self._record(handle)
-        if not record.communicating.done():
+        if not record.settled.done():
+            stdout, stdout_dropped = record.stdout.rendered()
+            stderr, stderr_dropped = record.stderr.rendered()
             return ExecResult(
                 exit_code=None,
-                stdout='',
-                stderr='',
-                truncated=False,
+                stdout=stdout,
+                stderr=stderr,
+                truncated=stdout_dropped or stderr_dropped,
                 running=True,
             )
-        stdout, stderr = await record.communicating
-        return ExecResult(
-            exit_code=record.process.returncode,
-            stdout=_decoded(stdout),
-            stderr=_decoded(stderr),
-            truncated=False,
-            running=False,
-        )
+        return _result(record, timed_out=record.settled.result())
 
     async def kill(self, handle: str) -> None:
         self._ensure_open()
-        await _kill_process(self._record(handle))
+        record = self._record(handle)
+        _kill_unsettled(record)
+        await asyncio.shield(record.settled)
 
     async def close(self) -> None:
         if self._closed:
@@ -245,27 +279,85 @@ class LocalWorkspace:
             closing = self._closing
         await asyncio.shield(closing)
 
-    async def _spawn_process(self, command: str, cwd: str) -> _ProcessRecord:
+    async def _spawned(self, command: str, cwd: str, *, timeout: float | None) -> _ProcessRecord:
+        """拉起一条命令。取消不会打断拉起本身：进程一旦起来就一定有人收拾它的进程组。
+
+        `asyncio.create_subprocess_exec` 在 fork 之后自己还有一次挂起；那里到达的取消只会 SIGKILL
+        shell 本身（`Popen.kill()`），它这时可能已经拉起的子进程连同整个组就没人管了。所以拉起放进
+        一个独立任务、用 shield 等它；被取消时给它挂一个回调，拉起完成的那一刻杀掉整个组。
+        """
+        spawning = asyncio.ensure_future(self._spawn_process(command, cwd, timeout=timeout))
+        try:
+            return await asyncio.shield(spawning)
+        except BaseException:
+            spawning.add_done_callback(_kill_abandoned)
+            raise
+
+    async def _spawn_process(
+        self, command: str, cwd: str, *, timeout: float | None
+    ) -> _ProcessRecord:
         working_directory = self._directory(cwd)
-        process = await asyncio.create_subprocess_exec(
-            self._shell,
-            '-c',
-            command,
-            cwd=str(working_directory),
-            env=dict(self._env),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
+        # 两条输出管道自己建：读端的传输归这里，逃出进程组的进程占着写端时也能主动关掉；
+        # `Process.wait()` 也因此只看进程退出，不等管道关闭。读端先接好再拉起进程，拉起之后到
+        # 建好收拾它的任务之间没有挂起点。
+        unowned: list[int] = []
+        writers: list[int] = []
+        connected: list[_Pipe] = []
+        try:
+            for _ in range(2):
+                read_end, write_end = os.pipe()
+                unowned.append(read_end)
+                writers.append(write_end)
+            while unowned:
+                connected.append(await _pipe(unowned.pop(0)))
+            # stdin 接 /dev/null：读 stdin 的命令立刻得到 EOF，不与宿主抢终端输入、也不挂到超时。
+            # 新会话即新进程组，组号等于 shell 的 pid，超时、kill、close 都按组杀。
+            process = await asyncio.create_subprocess_exec(
+                self._shell,
+                '-c',
+                command,
+                cwd=str(working_directory),
+                env=dict(self._env),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=writers[0],
+                stderr=writers[1],
+                start_new_session=True,
+            )
+        except BaseException as exc:
+            for _, transport in connected:
+                transport.close()
+            for fd in unowned:
+                os.close(fd)
+            if isinstance(exc, OSError):
+                raise ConfigError(
+                    expected='能为这条命令建输出管道并拉起 shell',
+                    received=f'{type(exc).__name__}: {exc}',
+                    next_action=(
+                        '多半是文件描述符或进程数用尽：先用 KillBash 结束不再需要的后台命令，'
+                        '再重试这条命令'
+                    ),
+                ) from exc
+            raise
+        finally:
+            for fd in writers:
+                os.close(fd)
+        pipes = (connected[0], connected[1])
+        stdout, stderr = _Capture(), _Capture()
+        reading = asyncio.create_task(_read_both(pipes, stdout, stderr))
         return _ProcessRecord(
             process=process,
-            communicating=asyncio.create_task(process.communicate()),
+            stdout=stdout,
+            stderr=stderr,
+            settled=asyncio.create_task(_settle(process, reading, pipes, timeout)),
         )
 
     async def _close_processes(self) -> None:
         try:
-            for record in tuple(self._processes.values()):
-                await _kill_process(record)
+            records = (*self._processes.values(), *self._foreground)
+            for record in records:
+                _kill_unsettled(record)
+            for record in records:
+                await asyncio.shield(record.settled)
         finally:
             self._closed = True
 
@@ -291,6 +383,41 @@ class LocalWorkspace:
         real = self._resolved(path)
         self._must_stay(real)
         return real
+
+    def _writable(self, path: str) -> Path:
+        """写入目标：在根内，且写的是 `.git` 之外的位置。
+
+        给出的路径与解析后的路径都要看：`.git` 可能是指向别处的符号链接（给出的路径里有它），根内
+        也可能有指进 `.git` 的符号链接（解析后的路径里有它）。不分大小写：APFS 默认不区分，
+        `.GIT/hooks/x` 就是真的 hooks 目录。`.git` 是文件（worktree）时同样拒写。
+
+        认不出的：`.git` 是符号链接或 `gitdir:` 指针时，真正的 git 目录用它自己的名字写
+        （`other/gitdir/config`）；指向 `.git` 里文件的硬链接；检查与写入之间被别的进程换掉的路径。
+        后两者要靠 Bash 才造得出来，归 `shell.git_state_change`；顶层仓库的 git 目录另有宿主的
+        完整性快照兜底。
+        """
+        real = self._inside(path)
+        parts = (*self._named_parts(path), *real.relative_to(self._root).parts)
+        if any(part.casefold() == '.git' for part in parts):
+            raise ConfigError(
+                expected='写入的位置不在 .git 里（git 的内部文件；worktree 的 .git 指针文件也算）',
+                received=f'path={path!r} 落在 .git 里',
+                next_action=(
+                    '不要直接改 .git 下的文件：提交、分支、钩子、配置这类 git 状态由宿主在复核'
+                    '之后处理。只改工作区里的普通文件'
+                ),
+            )
+        return real
+
+    def _named_parts(self, path: str) -> tuple[str, ...]:
+        """给出的路径在根下的各段；给的是根外的绝对路径时没有（越界另有 `_must_stay` 拒）。"""
+        raw = Path(path)
+        if not raw.is_absolute():
+            return raw.parts
+        try:
+            return raw.relative_to(self._root).parts
+        except ValueError:
+            return ()
 
     def _directory(self, path: str) -> Path:
         real = self._inside(path)
@@ -354,22 +481,112 @@ def _positive_timeout(value: object) -> float:
     return seconds
 
 
-def _decoded(value: bytes) -> str:
-    return value.decode('utf-8', errors='replace')
+def _decoded(value: bytes | bytearray) -> str:
+    return bytes(value).decode('utf-8', errors='replace')
 
 
-async def _kill_process(record: _ProcessRecord) -> None:
-    if record.process.returncode is None:
-        try:
-            os.killpg(record.process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+def _result(record: _ProcessRecord, *, timed_out: bool) -> ExecResult:
+    stdout, stdout_dropped = record.stdout.rendered()
+    stderr, stderr_dropped = record.stderr.rendered()
+    return ExecResult(
+        exit_code=None if timed_out else record.process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        truncated=stdout_dropped or stderr_dropped,
+        running=False,
+        timed_out=timed_out,
+    )
+
+
+_Pipe = tuple[asyncio.StreamReader, asyncio.BaseTransport]
+
+
+async def _pipe(fd: int) -> _Pipe:
+    """把一条管道的读端接进事件循环。从调用起 fd 归它：失败时由它关掉，调用方不能再关一次。"""
+    reader = asyncio.StreamReader()
+    file = os.fdopen(fd, 'rb', buffering=0)
     try:
-        await asyncio.shield(record.communicating)
-    except asyncio.CancelledError:
-        if not record.communicating.done():
-            record.communicating.cancel()
+        transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(reader), file
+        )
+    except BaseException:
+        file.close()
         raise
+    return reader, transport
+
+
+async def _read_both(pipes: tuple[_Pipe, _Pipe], stdout: _Capture, stderr: _Capture) -> None:
+    await asyncio.gather(_drain(pipes[0][0], stdout), _drain(pipes[1][0], stderr))
+
+
+async def _drain(stream: asyncio.StreamReader, sink: _Capture) -> None:
+    while chunk := await stream.read(_CHUNK):
+        sink.extend(chunk)
+
+
+async def _finished_within(task: asyncio.Future[Any], seconds: float | None) -> bool:
+    """等 task 至多 seconds 秒（None 是不设上限），交回它是否已完成。超时不取消它。"""
+    done, _ = await asyncio.wait({task}, timeout=seconds)
+    return bool(done)
+
+
+async def _settle(
+    process: asyncio.subprocess.Process,
+    reading: asyncio.Task[None],
+    pipes: tuple[_Pipe, _Pipe],
+    timeout: float | None,
+) -> bool:
+    """等命令结束并收拾它的进程组；交回是否超时。
+
+    组长（shell）退出不等于命令结束：`cmd &` 留下的子进程还在组里、还占着输出管道。所以先最多等
+    `_PIPE_GRACE` 让管道关掉，然后**无条件**杀整个进程组——组比组长活得久。每一步等待都有上限：
+    逃出进程组的进程可以一直占着管道，那时交回已经收到的输出、关掉读端。
+    """
+    exiting = asyncio.ensure_future(process.wait())
+    try:
+        timed_out = not await _finished_within(exiting, timeout)
+        if not timed_out:
+            await _finished_within(reading, _PIPE_GRACE)
+        _kill_group(process.pid)
+        await _finished_within(exiting, _KILL_GRACE)
+        if not await _finished_within(reading, _KILL_GRACE):
+            reading.cancel()
+        return timed_out
+    except asyncio.CancelledError:
+        # 事件循环被拆掉而宿主没有调 close()：这时还没收拾完，组号仍是这条命令的，杀掉它再走。
+        _kill_group(process.pid)
+        raise
+    finally:
+        if not exiting.done():
+            exiting.cancel()
+        for _, transport in pipes:
+            transport.close()
+
+
+def _kill_group(pid: int) -> None:
+    # PermissionError：macOS 对只剩僵尸的组报 EPERM 而不是 ESRCH；吞掉它，close() 才会接着收拾
+    # 其余的组。
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _kill_unsettled(record: _ProcessRecord) -> None:
+    """外面要杀一条命令时用它：只在它还没收拾完时发信号。
+
+    收拾完的命令，组已经杀过、shell 也已回收，组号随时可能被一个无关的新进程组复用——这时再按它
+    发 SIGKILL 杀的就是别人。`kill` 对着一个早已结束的句柄、`close()` 收尾时都会走到这里。
+    """
+    if not record.settled.done():
+        _kill_group(record.process.pid)
+
+
+def _kill_abandoned(spawning: asyncio.Future[_ProcessRecord]) -> None:
+    """拉起途中被取消的命令：拉起一完成就杀掉它的组，`_settle` 随后收掉管道。"""
+    if spawning.cancelled() or spawning.exception() is not None:
+        return
+    _kill_unsettled(spawning.result())
 
 
 def _existing_absolute_dir(root: object) -> Path:

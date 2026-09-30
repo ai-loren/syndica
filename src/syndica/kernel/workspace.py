@@ -14,13 +14,17 @@ __all__ = ['ExecResult', 'Portal', 'Workspace']
 
 @dataclass(frozen=True)
 class ExecResult:
-    """一次命令的结果。后台仍在跑时 `exit_code is None` 且 `running is True`。"""
+    """一次命令的结果。后台仍在跑时 `exit_code is None` 且 `running is True`。
+
+    超时的前台命令不抛错：`timed_out is True`、`exit_code is None`，两条流是终止前已经收到的部分。
+    """
 
     exit_code: int | None
     stdout: str
     stderr: str
     truncated: bool
     running: bool
+    timed_out: bool = False
 
 
 class Portal(Protocol):
@@ -36,7 +40,9 @@ class Portal(Protocol):
 
     async def grep_text(self, pattern: str, path: str) -> tuple[str, ...]: ...
 
-    async def run(self, command: str, *, timeout: float, cwd: str) -> ExecResult: ...
+    async def run(self, command: str, *, timeout: float, cwd: str) -> ExecResult:
+        """前台运行；超时返回 `timed_out=True` 的结果，不抛错。"""
+        ...
 
     async def start(self, command: str, *, cwd: str) -> str: ...
 

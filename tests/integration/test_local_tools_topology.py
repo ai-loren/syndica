@@ -23,10 +23,10 @@ from syndica.kernel.tools.local import local_tools
 _TIMEOUT = 5.0
 
 
-async def test_worker_write_and_bash_touch_the_workspace(tmp_path: Path) -> None:
+async def test_worker_write_and_bash_touch_the_workspace(tmp_path: Path, shell_path: str) -> None:
     root = tmp_path / 'ws'
     root.mkdir()
-    workspace = LocalWorkspace(str(root), shell='/bin/sh', env={})
+    workspace = LocalWorkspace(str(root), shell=shell_path, env={})
     llm = ScriptedLLM(
         [
             ScriptedTurn(
