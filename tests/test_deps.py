@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).parent.parent
 CHECKER = REPO_ROOT / 'scripts' / 'check_deps.py'
 # 关掉 PEP 538 的 C locale 强制与 PEP 540 的 UTF-8 模式，只剩 locale 决定默认编码。缺任何一个，
@@ -109,6 +111,44 @@ def test_plain_import_statement_is_caught(tmp_path):
     assert result.returncode != 0, result.stdout + result.stderr
     assert 'kernel/flat.py' in result.stdout
     assert 'cli' in result.stdout
+
+
+@pytest.mark.parametrize(
+    'source',
+    [
+        'from syndica import cli\n',
+        'from syndica import kernel, cli\n',
+        'from syndica import cli as c\n',
+    ],
+)
+def test_importing_a_component_from_the_package_root_is_caught(tmp_path, source):
+    """`from syndica import cli` 与 `import syndica.cli` 是同一次依赖：几个名字里的第二个、改了名
+    的，照样是。"""
+    module = tmp_path / 'src' / 'syndica' / 'kernel' / 'rooted.py'
+    module.parent.mkdir(parents=True)
+    module.write_text(source)
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert 'kernel/rooted.py' in result.stdout
+    assert 'cli' in result.stdout
+
+
+def test_a_backend_importing_another_backend_by_name_is_caught(tmp_path):
+    module = tmp_path / 'src' / 'syndica' / 'backends' / 'alpha' / 'x.py'
+    module.parent.mkdir(parents=True)
+    module.write_text('from syndica.backends import beta\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert 'backends/alpha/x.py' in result.stdout
+    assert 'beta' in result.stdout
+
+
+def test_importing_a_plain_name_from_the_package_root_is_allowed(tmp_path):
+    module = tmp_path / 'src' / 'syndica' / 'kernel' / 'version.py'
+    module.parent.mkdir(parents=True)
+    module.write_text('from syndica import __version__\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_relative_import_crossing_boundary_is_caught(tmp_path):

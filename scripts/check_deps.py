@@ -79,7 +79,13 @@ def _component(parts: tuple[str, ...]) -> tuple[str, ...]:
 def _resolve_import_from(node: ast.ImportFrom, package: tuple[str, ...]) -> list[tuple[str, ...]]:
     """把一条 from-import 解析成绝对模块路径；相对导入以导入方所在包为基准。"""
     if node.level == 0:
-        return [tuple(node.module.split('.'))] if node.module else []
+        if not node.module:
+            return []
+        # 导入的名字可能就是组件本身：`from syndica import cli` 是 syndica.cli，
+        # `from syndica.backends import beta` 是 syndica.backends.beta。只记模块名就少了这一段，
+        # kernel 这样 import surface、backend 之间这样互相 import 都会整条漏过。
+        base = tuple(node.module.split('.'))
+        return [base if alias.name == '*' else (*base, alias.name) for alias in node.names]
     kept = len(package) - (node.level - 1)
     if kept <= 0:
         return []

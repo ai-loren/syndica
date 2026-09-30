@@ -1011,6 +1011,11 @@ GitHub Free 每月 2000 分钟的 Actions 额度在 2026-10 已经用完，下�
   引号。改为按 shell 的规则消掉反斜杠、解码 `$'…'`，heredoc 两种模式都认：写进文件的数据跳过，其余
   正文单独解析、引号吞不到结束标记之后。与 HEAD 在同一批 8253 条命令、四张判定表上差分，只少认一条：
   写进文件的 heredoc 数据正文里的 `rm -rf ./*`，默认规则以前把它当命令，是误报。
+- T8 生成样例时发现 `scripts/check_deps.py` 漏掉 `from syndica import cli` 这种写法（早于 M2）：from-import
+  只记模块名 `syndica`，没有组件可比，kernel 用这种写法 import surface 整条放过——`import syndica.cli`、
+  `from syndica.cli import x` 与相对导入都认得，偏偏最短的这一种不认。评审又指出同型的
+  `from syndica.backends import beta`（backend 之间互相 import）同样漏过。改为绝对 from-import 一律把导入的
+  名字接在模块后面，与相对导入那一支对称，单独修复并补用例（几个名字里的第二个、改了名的都算）。
 - T4，执行环境把同一条长命令执行了两遍、两遍时间上重叠：两个变异跑手同时改同一批文件，其中一个的
   `git add` 把另一个施加中的变异暂存了进去。基线自检（施加前先核对 sha256）当场报了漂移、没有带着残留
   继续跑。之后变异跑手加了进程锁、改在后台运行。
