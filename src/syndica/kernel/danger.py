@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import inspect
 import os
@@ -488,9 +489,48 @@ _REDIRECT_OPERATOR = frozenset('<>&|')
 # 取文本的两道上限，见 `_texts`。
 _MAX_TEXT_DEPTH = 8
 _MAX_TEXT_CHARS = 256 * 1024
-# 续行符在 shell 里被消费掉，`rm \<换行>-rf x` 是一条命令；不折叠它，`\n` 这个段边界会把标志切进
-# 下一段，`rm` 那一段于是看不到 `-rf`。
-_LINE_CONTINUATION = re.compile(r'\\\r?\n')
+
+
+# 续行符是反斜杠加 LF。`\` 加 CRLF 不是：CR 是普通字符，`\<CR>` 只是一个转义过的 CR，后面的 LF
+# 照样结束这一行——把它也当续行，`echo \<CR><LF>git push` 就把 git push 读成了 echo 的实参。
+_CONTINUATION = '\\\n'
+# 紧跟在这些字符之后的 `#` 在词首、起注释。`)` 与反引号不在内：`$(date)#tag` 与 `` `date`#tag ``
+# 的 `#` 在词中间，当成注释会把同一行后面的命令整个藏起来。CR 也不在内，理由同上。
+_WORD_BREAK = frozenset(' \t\n;|&(')
+
+
+def _escaped(text: str, index: int) -> bool:
+    """text[index] 前面紧挨着奇数个反斜杠。"""
+    run = index - 1
+    while run >= 0 and text[run] == '\\':
+        run -= 1
+    return (index - 1 - run) % 2 == 1
+
+
+def _comment_end(text: str, index: int, *, in_backticks: bool) -> int:
+    """index 处的 `#` 起的注释在哪结束：行尾；反引号里的注释到收尾的那个反引号为止——反引号里的
+    内容先被整段取出来再解析，`` echo `ls #`; sudo ls `` 里的 sudo 照样执行。"""
+    newline = text.find('\n', index)
+    end = len(text) if newline == -1 else newline
+    if in_backticks:
+        tick = text.find('`', index, end)
+        while tick != -1 and _escaped(text, tick):
+            tick = text.find('`', tick + 1, end)
+        if tick != -1:
+            return tick
+    return end
+
+
+def _starts_a_word(text: str, index: int) -> bool:
+    """text[index] 前面是开头或一个没被转义的 `_WORD_BREAK`。续行符不占位置：`a\\<换行>#b` 的 `#`
+    在词中间；`\\ #b` 的空格是转义过的字符，`#` 也在词中间。"""
+    while index > 0:
+        if not _escaped(text, index - 1):
+            return text[index - 1] in _WORD_BREAK
+        if text[index - 1] != '\n':
+            return False
+        index -= 2
+    return True
 
 
 def _basename(token: str) -> str:
@@ -526,9 +566,26 @@ def _first_operand(tokens: Sequence[str], start: int) -> str | None:
     return None
 
 
-def _runs_stdin(token: str) -> bool:
-    """会把 stdin 当脚本执行的程序：heredoc 喂给它们时，正文就是命令。"""
-    return _interpreter(token) is not None or _basename(token) in ('.', 'source')
+def _runs_a_script(tokens: Sequence[str]) -> bool:
+    """这一段启动解释器、`source`、`.` 或 `eval`：同一行的 heredoc 正文可能紧接着就被它执行
+    （`cat > f <<'EOF'; sh f`、`eval "$(cat <<'EOF' …)"`）。"""
+    return any(
+        _interpreter(tokens[index]) is not None
+        or _basename(tokens[index]) in ('.', 'source', 'eval')
+        for index in _program_candidates(tokens)
+    )
+
+
+def _runs_written_file(
+    segments: Sequence[tuple[bool, tuple[str, ...]]], targets: Sequence[str]
+) -> bool:
+    """同一行里有一段的程序词正是这一行重定向写出的文件（`cat > fix.sh <<'EOF' && ./fix.sh`）。"""
+    written = {posixpath.normpath(target) for target in targets}
+    return bool(written) and any(
+        posixpath.normpath(tokens[index]) in written
+        for _, tokens in segments
+        for index in _determinate_programs(tokens)
+    )
 
 
 def _end_of_redirection(text: str, start: int) -> int:
@@ -563,42 +620,248 @@ def _redirection(source: str, index: int, *, thorough: bool) -> tuple[str, int]:
     return _TARGET, _end_of_redirection(source, index)
 
 
+# 把 stdin 读成数据、从不当 shell 执行的程序：`cat > f <<EOF` 写文件、`grep x <<EOF` 过滤、
+# `git commit -F - <<EOF` 交提交说明、`read -r -d '' X <<EOF` 赋值、`: <<EOF` 块注释，正文都是数据。
+# 两个方向都承重：错放进来一个执行 stdin 的程序，它的正文就不再被看；漏掉一个，写数据的正文被当成
+# 命令判，而 git 的提交说明里出现 `rm -rf` 会让默认规则先命中、把本该问人的提交直接拦下。
+_STDIN_DATA = frozenset(
+    {
+        ':',
+        'awk',
+        'base64',
+        'cat',
+        'column',
+        'curl',
+        'cut',
+        'diff',
+        'egrep',
+        'envsubst',
+        'fgrep',
+        'fold',
+        'gawk',
+        'gh',
+        'git',
+        'grep',
+        'head',
+        'hexdump',
+        'jq',
+        'less',
+        'mapfile',
+        'more',
+        'nl',
+        'od',
+        'patch',
+        'pbcopy',
+        'read',
+        'readarray',
+        'rev',
+        'sed',
+        'sort',
+        'tac',
+        'tail',
+        'tee',
+        'tr',
+        'uniq',
+        'wc',
+        'xxd',
+        'yq',
+    }
+)
+
+
+@dataclass
+class _Heredoc:
+    """一个等着读正文的 heredoc。`owner` 是它所在那一段在段列表里的下标，那一段结束时才填上；
+    那一段一个词都没有（`( ssh host ) <<EOF` 喂的是前面的子 shell）时是 None。"""
+
+    delimiter: str
+    quoted: bool
+    strip_tabs: bool
+    owner: int | None = None
+
+
+def _reads_stdin_as_data(tokens: Sequence[str]) -> bool:
+    """没有程序词的一段（`X=1 <<EOF`）把正文读完即丢，也算数据。"""
+    return all(_basename(tokens[index]) in _STDIN_DATA for index in _determinate_programs(tokens))
+
+
+def _feeds_code(
+    segments: Sequence[tuple[bool, tuple[str, ...]]], owner: int | None, *, piped_out: bool
+) -> bool:
+    """owner 那一段读进来的 heredoc 正文会被当成代码执行：它自己不是只把 stdin 当数据的程序；这一行
+    它之后有一段经管道接进这样的程序（`cat <<'EOF' | sh`，以及正文经分组流进管道的
+    `{ cat <<'EOF'; } | ssh host`）；或者这一行以管道结尾（`cat <<'EOF' |`），看不到谁在读。
+
+    认不出的读者按执行算：`ssh host <<'EOF'` 与 `docker exec -i app sh <<'EOF'` 都执行正文，
+    正文写进文件（`ssh host <<'EOF' > log`）说明不了它有没有被执行；没有 owner 时读者是前面的
+    子 shell，同样认不出。"""
+    if owner is None or piped_out:
+        return True
+    if not _reads_stdin_as_data(segments[owner][1]):
+        return True
+    return any(
+        piped and not _reads_stdin_as_data(tokens) for piped, tokens in segments[owner + 1 :]
+    )
+
+
+class _Lines:
+    """一份文本逐行的索引：从某一行起找第一行等于某个结束标记的。按内容分桶、二分查找，找不到也只
+    花对数时间——逐行扫到末尾的话，一串找不到结束标记的 `<<`（`$((1<<0))`、C++ 的 `cout <<`）是
+    平方时间，而判定同步跑在事件循环上。被执行的正文是外层文本的一段，嵌套的各层共用最外层这一份
+    索引（位置都是最外层文本里的），每层各建一份是深度乘以长度。"""
+
+    def __init__(self, source: str) -> None:
+        self._starts: list[int] = []
+        self._exact: dict[str, list[int]] = {}
+        self._untabbed: dict[str, list[int]] = {}
+        position = 0
+        for number, line in enumerate(source.split('\n')):
+            self._starts.append(position)
+            content = line.rstrip('\r')
+            self._exact.setdefault(content, []).append(number)
+            self._untabbed.setdefault(content.lstrip('\t'), []).append(number)
+            position += len(line) + 1
+        self._end = len(source)
+
+    def find(
+        self, delimiter: str, strip_tabs: bool, position: int, limit: int
+    ) -> tuple[int, int] | None:
+        """[position, limit) 里第一行等于 delimiter 的：(那一行的起点, 它之后的位置)。position 是某
+        一行的起点。"""
+        numbers = (self._untabbed if strip_tabs else self._exact).get(delimiter)
+        if not numbers:
+            return None
+        following = bisect.bisect_left(numbers, bisect.bisect_left(self._starts, position))
+        if following == len(numbers) or self._starts[numbers[following]] >= limit:
+            return None
+        number = numbers[following]
+        after = self._starts[number + 1] if number + 1 < len(self._starts) else self._end
+        return self._starts[number], min(after, limit)
+
+
+def _substitution_end(text: str, start: int) -> int:
+    """`$(` 的内容从 start 起，交回收尾的那个 `)` 的位置；不闭合时交回末尾。"""
+    depth = 1
+    quote = ''
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote == "'":
+            quote = '' if char == "'" else quote
+        elif char == '\\':
+            index += 2
+            continue
+        elif quote == '"':
+            quote = '' if char == '"' else quote
+        elif char in _QUOTES:
+            quote = char
+        elif char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return len(text)
+
+
+def _arithmetic_end(text: str, start: int) -> int | None:
+    """`$((` 的内容从 start 起，交回收尾的 `))` 之后的位置。内容里有 `;`、换行、引号或反引号时不是
+    算术（`$((cd x; rm -rf y))` 是命令替换里套子 shell），交回 None。"""
+    depth = 2
+    for index in range(start, len(text)):
+        char = text[index]
+        if char in ';\n\'"`':
+            return None
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+def _heredoc_expansions(body: str) -> str:
+    """结束标记不带引号、不被执行的正文里真正执行的部分：`$(…)` 与反引号里的命令，各占一行。
+
+    正文的其余部分是数据：引号是字符、`#` 不起注释，反斜杠只转义 `$`、`` ` ``、`\\` 与换行。整份
+    按命令解析会把 Makefile 正文里的 `rm -rf build` 判成命令、把 `` \\`rm -rf build\\` `` 这种写出
+    字面反引号的写法判成执行，而正文里一个撇号又会把后面反引号里真正执行的命令吞进引号。
+    """
+    commands: list[str] = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == '\\':
+            index += 2
+        elif body.startswith('$((', index) and (end := _arithmetic_end(body, index + 3)):
+            index = end
+        elif body.startswith('$(', index):
+            end = _substitution_end(body, index + 2)
+            commands.append(body[index + 2 : end])
+            index = end + 1
+        elif char == '`':
+            end = index + 1
+            while end < len(body) and body[end] != '`':
+                end += 2 if body[end] == '\\' else 1
+            commands.append(body[index + 1 : end].replace('\\`', '`'))
+            index = end + 1
+        else:
+            index += 1
+    return '\n'.join(commands)
+
+
 def _heredoc_bodies(
     source: str,
     start: int,
-    heredocs: Sequence[tuple[str, bool, bool]],
-    line: Sequence[tuple[bool, tuple[str, ...]]],
-) -> tuple[int, list[str]]:
-    """(这一行登记的 heredoc 正文结束之后的位置, 要当命令单独解析的正文)。
+    heredocs: Sequence[_Heredoc],
+    lines: _Lines,
+    segments: Sequence[tuple[bool, tuple[str, ...]]],
+    line_start: int,
+    line_targets: Sequence[str],
+    *,
+    piped_out: bool,
+    offset: int,
+    spans: list[tuple[int, int, bool]] | None,
+) -> tuple[int, list[tuple[str, int | None]]]:
+    """(这一行登记的 heredoc 正文结束之后的位置, 要当命令单独解析的文本与它在最外层文本里的起点)；
+    每份正文的 (起, 止, 是否被执行) 按最外层文本的位置追加进 `spans`。
 
-    写进文件的数据跳过：结束标记带引号（正文不展开，里面的 `$(…)` 不执行），并且这一行既没有
-    管道、也没有会把 stdin 当脚本执行的程序（`sh <<'EOF'` 执行的正是正文）。管道单独算：接在后面
-    的程序不在解释器名单里（`| lua`）时，正文照样可能被执行。其余的正文交回去单独解析——单独，
-    是为了正文里的引号吞不到结束标记之后。
-    找不到结束标记就交回 start、不单独处理：续行符折叠、写错的标记都会让它落空，而跳到末尾会把
-    后面真正的命令一起藏起来。
+    正文可能被执行时整份解析：读它的那条管道会执行它（`_feeds_code`），或者同一行有解释器、
+    `eval`（`_runs_a_script`）、跑的正是这一行写出的文件（`_runs_written_file`）。不被执行的正文是
+    数据——写进文件（`cat > f <<'EOF'`）、显示或过滤（`grep x <<'EOF'`、
+    `git commit -m "$(cat <<'EOF' …)"`）——否则写 README、造模板里出现 `rm -rf` 就成了误报；其中
+    结束标记不带引号的只解析它展开时执行的部分（`_heredoc_expansions`）。写进文件、下一行才执行的
+    正文看不见，与 `echo '…' > f` 之后再执行同属模块开头的盲区。
+
+    单独解析是为了正文里的引号吞不到结束标记之后。结束标记找不齐就一份都不单独处理：跳到末尾会
+    把后面真正的命令一起藏起来。
     """
-    executed = any(
-        piped or any(_runs_stdin(tokens[index]) for index in _program_candidates(tokens))
-        for piped, tokens in line
-    )
     position = start
-    bodies: list[str] = []
-    for delimiter, quoted, strip_tabs in heredocs:
-        body_start = position
-        while True:
-            if position >= len(source):
-                return start, []
-            newline = source.find('\n', position)
-            stop = len(source) if newline == -1 else newline
-            text = source[position:stop]
-            line_start = position
-            position = stop + 1
-            if (text.lstrip('\t') if strip_tabs else text).rstrip('\r') == delimiter:
-                break
-        if executed or not quoted:
-            bodies.append(source[body_start:line_start])
-    return min(position, len(source)), bodies
+    located: list[tuple[_Heredoc, int, int]] = []
+    for heredoc in heredocs:
+        found = lines.find(
+            heredoc.delimiter, heredoc.strip_tabs, offset + position, offset + len(source)
+        )
+        if found is None:
+            return start, []
+        located.append((heredoc, position, found[0] - offset))
+        position = found[1] - offset
+    line = segments[line_start:]
+    runs_a_script = any(_runs_a_script(tokens) for _, tokens in line)
+    runs_a_script = runs_a_script or _runs_written_file(line, line_targets)
+    parsed: list[tuple[str, int | None]] = []
+    for heredoc, body_start, body_end in located:
+        body = source[body_start:body_end]
+        executed = runs_a_script or _feeds_code(segments, heredoc.owner, piped_out=piped_out)
+        if executed:
+            parsed.append((body, offset + body_start))
+        elif not heredoc.quoted:
+            parsed.append((_heredoc_expansions(body), None))
+        if spans is not None:
+            spans.append((offset + body_start, offset + body_end, executed))
+    return position, parsed
 
 
 # `$'…'` 里的反斜杠转义：`$'\x67it' push` 就是 `git push`。
@@ -630,7 +893,8 @@ def _ansi_c_escape(source: str, index: int) -> tuple[str, int]:
         return '\\', index + 1
     if following in _ANSI_C_SIMPLE:
         return _ANSI_C_SIMPLE[following], index + 2
-    if following == 'c' and index + 2 < len(source):
+    # bash 先按「反斜杠加一个字符」找出 `$'…'` 在哪结束、再解码：`\c` 后面的 `'` 仍是收尾的引号。
+    if following == 'c' and source[index + 2 : index + 3] not in ('', "'", '\\'):
         return chr(ord(source[index + 2]) & 0x1F), index + 3
     for letter, base, width in _ANSI_C_NUMERIC:
         if following == letter:
@@ -673,7 +937,13 @@ def _segments(text: str) -> list[tuple[bool, tuple[str, ...]]]:
 
 
 def _parse(
-    text: str, *, thorough: bool = False, nesting: int = 0
+    text: str,
+    *,
+    thorough: bool = False,
+    nesting: int = 0,
+    spans: list[tuple[int, int, bool]] | None = None,
+    offset: int = 0,
+    lines: _Lines | None = None,
 ) -> tuple[list[tuple[bool, tuple[str, ...]]], list[str]]:
     """(段, 整条命令里全部重定向的目标)。
 
@@ -683,25 +953,34 @@ def _parse(
     - 双引号里的 `$(…)` 与反引号照样执行，拆成新的一段；
     - here-string 的词既不是 token 也不是目标。
 
-    两种模式都按 shell 的规则消掉反斜杠与 `$'…'`：引号状态一旦算错，后面整条命令就被当成引号里的
-    字符、对所有规则隐身（`echo it\\'s; rm -rf /`）。heredoc 两种模式都认：写进文件的数据跳过，
-    其余正文单独解析，见 `_heredoc_bodies`。
+    两种模式都按 shell 的规则消掉反斜杠与 `$'…'`、跳过注释：引号状态一旦算错，后面整条命令就被
+    当成引号里的字符、对所有规则隐身（`echo it\\'s; rm -rf /`、`# Let's push` 之后的 `git push`）。
+    续行符只在 shell 真的续行的地方消掉——引号外与双引号里；单引号、注释、heredoc 正文里的 `\\` 加
+    换行照原样留着，否则正文最后一行的 `\\` 会把结束标记粘进正文。heredoc 两种模式都认，见
+    `_heredoc_bodies`。
 
     目标不挂在段上：只有重定向、没有命令词的一段（`: ; > /etc/x` 的后半）不产出段，挂在段上它的
     目标就丢了。`2>&1` 的目标是 `1`——相对的词，按路径看落在根里。
+
+    `spans` 收下每一层 heredoc 正文的 (起, 止, 是否被执行)，位置是最外层文本里的；`offset` 是这份
+    text 在最外层文本里的起点、`lines` 是最外层文本的逐行索引，递归解析被执行的正文时传下去。
     """
     segments: list[tuple[bool, tuple[str, ...]]] = []
     targets: list[str] = []
     tokens: list[str] = []
     token: list[str] = []
-    heredocs: list[tuple[str, bool, bool]] = []
+    heredocs: list[_Heredoc] = []
+    unowned: list[_Heredoc] = []
     closers: list[str] = []
     piped = False
     quote = ''
     quoted = False
     dropping = ''
     line_start = 0
-    source = _LINE_CONTINUATION.sub('', text)
+    target_line_start = 0
+    cut = False
+    in_backticks = False
+    source = text
     index = 0
 
     def end_token() -> None:
@@ -711,9 +990,11 @@ def _parse(
             if dropping == _TARGET:
                 targets.append(word)
             elif dropping in (_HEREDOC, _HEREDOC_TABS):
-                heredocs.append(
-                    (word.replace('\\', ''), quoted or '\\' in word, dropping == _HEREDOC_TABS)
+                heredoc = _Heredoc(
+                    word.replace('\\', ''), quoted or '\\' in word, dropping == _HEREDOC_TABS
                 )
+                heredocs.append(heredoc)
+                unowned.append(heredoc)
             elif not dropping:
                 tokens.append(word)
             dropping = ''
@@ -724,6 +1005,9 @@ def _parse(
         nonlocal piped, dropping
         end_token()
         dropping = ''
+        for heredoc in unowned:
+            heredoc.owner = len(segments) if tokens else None
+        unowned.clear()
         if tokens:
             segments.append((piped, tuple(tokens)))
             tokens.clear()
@@ -738,21 +1022,26 @@ def _parse(
         if quote == _ANSI_C:
             if char == '\\':
                 decoded, index = _ansi_c_escape(source, index)
-                token.append(decoded)
+                # bash 在 NUL 处截断这个词：`$'rm\0' -rf x` 跑的就是 rm。
+                cut = cut or '\x00' in decoded
+                if not cut:
+                    token.append(decoded)
                 continue
             if char == "'":
                 quote = ''
-            else:
+                cut = False
+            elif not cut:
                 token.append(char)
         elif quote:
-            if (
-                quote == '"'
-                and char == '\\'
-                and source[index + 1 : index + 2] in _DOUBLE_QUOTE_ESCAPES
-            ):
-                token.append(source[index + 1])
-                index += 2
-                continue
+            if quote == '"' and char == '\\':
+                following = source[index + 1 : index + 2]
+                if source.startswith(_CONTINUATION, index):
+                    index += 2
+                    continue
+                if following in _DOUBLE_QUOTE_ESCAPES:
+                    token.append(following)
+                    index += 2
+                    continue
             if char == quote:
                 quote = ''
             elif thorough and quote == '"' and (char == '`' or source.startswith('$(', index)):
@@ -764,17 +1053,44 @@ def _parse(
             else:
                 token.append(char)
         elif char == '\\':
-            # 引号外的反斜杠让下一个字符只是字符：`\'` 不开引号、`\;` 不分段、`r\m` 就是 rm。
-            if index + 1 < len(source):
-                token.append(source[index + 1])
+            # 引号外的反斜杠让下一个字符只是字符：`\'` 不开引号、`\;` 不分段、`r\m` 就是 rm。反斜杠
+            # 加换行是续行：`rm \<换行>-rf x` 是一条命令。反引号里的 `` \` `` 例外：它是嵌套的命令
+            # 替换，当它是边界，里面的命令才看得见；反引号外它只是一个字面的反引号。
+            if source.startswith(_CONTINUATION, index):
+                index += 2
+                continue
+            following = source[index + 1 : index + 2]
+            if following == '`' and (in_backticks or '`' in closers):
+                end_segment(False)
+                index += 2
+                continue
+            if following:
+                token.append(following)
                 quoted = True
                 index += 2
                 continue
             token.append(char)
-        elif closers and char == closers[-1]:
+        elif char == '#' and _starts_a_word(source, index):
+            # 词首的 `#` 起注释：注释里的撇号（`# Let's push`）不是开引号。
+            index = _comment_end(source, index, in_backticks=in_backticks or '`' in closers)
+            continue
+        elif closers and char == ')' and closers[-1] == '(':
+            closers.pop()
+            end_segment(False)
+        elif closers and char == closers[-1] != '(':
             closers.pop()
             end_segment(False)
             quote = '"'
+        elif source.startswith('$$', index):
+            # `$$` 是进程号；后面跟的 `'…'` 是普通单引号，不是 `$'…'`。
+            token.append('$$')
+            index += 2
+            continue
+        elif source.startswith('$((', index) and (end := _arithmetic_end(source, index + 3)):
+            # 算术展开是一个词，里面的 `<<` 是位移，不是 heredoc。
+            token.append(source[index:end])
+            index = end
+            continue
         elif char == '$' and source[index + 1 : index + 2] == "'":
             quote = _ANSI_C
             quoted = True
@@ -791,22 +1107,47 @@ def _parse(
             dropping, index = _redirection(source, index, thorough=thorough)
             continue
         elif char in _BOUNDARIES:
+            if closers and char == '(':
+                # 双引号里 `$(…)` 中的子 shell 与 `$((…))`：它们的 `)` 不结束这个替换，
+                # `"$( (true); git push )"` 里的 git push 才不会被当成引号里的字符。
+                closers.append('(')
+            if char == '`':
+                in_backticks = not in_backticks
             end_segment(char == _PIPE)
             if char == '\n':
-                line = segments[line_start:]
                 if heredocs and nesting < _MAX_HEREDOC_NESTING:
-                    index, bodies = _heredoc_bodies(source, index + 1, heredocs, line)
-                    for body in bodies:
+                    lines = _Lines(source) if lines is None else lines
+                    index, bodies = _heredoc_bodies(
+                        source,
+                        index + 1,
+                        heredocs,
+                        lines,
+                        segments,
+                        line_start,
+                        targets[target_line_start:],
+                        piped_out=piped,
+                        offset=offset,
+                        spans=spans,
+                    )
+                    for body, body_offset in bodies:
+                        # 只展开不执行的正文取出的是一份新文本：位置对不上外层，另起索引。
                         body_segments, body_targets = _parse(
-                            body, thorough=thorough, nesting=nesting + 1
+                            body,
+                            thorough=thorough,
+                            nesting=nesting + 1,
+                            spans=None if body_offset is None else spans,
+                            offset=0 if body_offset is None else body_offset,
+                            lines=None if body_offset is None else lines,
                         )
                         segments.extend(body_segments)
                         targets.extend(body_targets)
                     heredocs.clear()
                     line_start = len(segments)
+                    target_line_start = len(targets)
                     continue
                 heredocs.clear()
                 line_start = len(segments)
+                target_line_start = len(targets)
         elif char.isspace():
             end_token()
         else:
@@ -1014,7 +1355,9 @@ def _close_layer(layers: list[_Layer], *, closed: bool) -> bool:
     return hit
 
 
-def _without_download_substitutions(text: str) -> tuple[str, bool]:
+def _without_download_substitutions(
+    text: str, bodies: dict[int, tuple[int, bool]] | None = None, offset: int = 0
+) -> tuple[str, bool]:
     """把里面跑了下载器的命令替换（`$(…)`、反引号）换成 `_DOWNLOADED`、进程替换（`<(…)`）换成
     `_DOWNLOADED_FILE`，把接着从 stdin 读脚本的解释器的输出进程替换（`>(sh)`）换成 `_SINK`；
     嵌套的一层层往外传。另交回某一层自己是否已经在执行下载来的内容，见 `_close_layer`。
@@ -1024,13 +1367,36 @@ def _without_download_substitutions(text: str) -> tuple[str, bool]:
     `>(` 只在双引号外才是进程替换。单引号里的不换——它在这一层不执行；交给 `eval` 或 `sh -c` 的
     字符串在下一层执行，那是模块开头写明的盲区。
 
-    扫描不递归：嵌套深度由模型决定，递归会在一段畸形输入上撞出 RecursionError，而判定抛异常等于
+    替换的嵌套不递归：深度由模型决定，递归会在一段畸形输入上撞出 RecursionError，而判定抛异常等于
     让这次调用所在的整批失败。
+
+    heredoc 正文不跟着外面的引号状态扫：正文里的撇号（`it's done`、Python 的 `'don\\'t'`）不是外面
+    那条命令的开引号，当成开引号就把结束标记之后的 `sh -c "$(curl …)"` 一起吞进引号。不被执行的
+    正文原样放过，被执行的正文单独扫。正文在哪、执不执行由 `_parse` 判——同一个判据，扫描与分词
+    才不会各认一套；用 thorough，`"$(cat <<'EOF' …)"` 里的 heredoc 也认得出。各层正文的位置在最外层
+    解析一次就全部拿到（`bodies` 与 `offset` 往下传），每层各自重新解析是深度的平方；嵌套深度由
+    `_MAX_HEREDOC_NESTING` 封顶。不带引号的正文里 `$(curl … | sh)` 照样执行，由 `_parse` 解析正文
+    展开的部分时认出。
     """
+    if bodies is None:
+        found: list[tuple[int, int, bool]] = []
+        _parse(text, thorough=True, spans=found)
+        bodies = {start: (end, executed) for start, end, executed in found}
     layers = [_Layer('')]
     hit = False
     index = 0
     while index < len(text):
+        # 取走而不是查看：空正文的起止相同，只查看会在同一个位置上转个不停。
+        body = bodies.pop(offset + index, None)
+        if body is not None:
+            end = body[0] - offset
+            content = text[index:end]
+            if body[1]:
+                content, body_hit = _without_download_substitutions(content, bodies, offset + index)
+                hit = body_hit or hit
+            layers[-1].add(content)
+            index = end
+            continue
         layer = layers[-1]
         char = text[index]
         parenthesised = layer.opener not in ('', '`') and not layer.in_double
@@ -1051,6 +1417,14 @@ def _without_download_substitutions(text: str) -> tuple[str, bool]:
         ):
             hit = _close_layer(layers, closed=True) or hit
             index += 1
+        elif char == '#' and not layer.in_double and _starts_a_word(text, index):
+            # 词首的 `#` 起注释：注释里的撇号不是开引号，注释里的 `$(…)` 也不执行。
+            stop = _comment_end(text, index, in_backticks=layer.opener == '`')
+            layer.add(text[index:stop])
+            index = stop
+        elif text.startswith('$$', index):
+            layer.add('$$')
+            index += 2
         elif char == '$' and text[index + 1 : index + 2] == "'" and not layer.in_double:
             # `$'…'` 里的 `\'` 不结束字符串；当普通单引号扫，`$'\''` 之后整条命令都会落进引号。
             stop = index + 2
@@ -1148,8 +1522,8 @@ def _runs_downloaded_content(command: str) -> bool:
     已知盲区：带取值、而取值会被当代码加载的选项（`node -r <(curl …)`、
     `bash --rcfile <(curl …) -i`、`fish -C "$(curl …)"`）；解释器选项表里没有、又与 node 开关同前缀
     的带值选项；先跟一个位置实参的 wrapper（`flock /tmp/l $(curl …)`）；单独一个 `+`（`bash +`）；
-    以及模块开头写明的「代码在字符串里」。已知误报：heredoc 正文里像命令的文本——结束标记不带引号
-    时正文按命令单独解析；替换扫描不认 heredoc，带引号的正文里 `$(curl … | sh)` 也按命令判。
+    结束标记不带引号、不被执行的 heredoc 正文里套了两层的替换（`$(sh -c "$(curl …)")`，只看得见
+    外层展开时执行的那条命令）；以及模块开头写明的「代码在字符串里」。
     """
     reduced, hit = _without_download_substitutions(command)
     return hit or _runs_parsed(*_parse(reduced))

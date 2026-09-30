@@ -101,7 +101,7 @@
  ],
  [
   "rm \\\r\n-rf build",
-  "shell.recursive_force_remove"
+  "danger.no_rule_matched"
  ],
  [
   "chrt -f 99 rm -rf build",
