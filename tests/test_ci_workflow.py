@@ -40,12 +40,13 @@ def test_ci_runs_exactly_the_readme_gates_in_order_after_a_locked_sync() -> None
     assert _run_commands() == ['uv sync --locked --extra openai --extra dev', *_readme_gates()]
 
 
-def test_the_readme_lists_the_five_gates() -> None:
+def test_the_readme_lists_the_gates() -> None:
     assert _readme_gates() == [
         'uv run ruff format --check .',
         'uv run ruff check .',
         'uv run pyright',
         'uv run python scripts/check_deps.py',
+        'uv run python scripts/check_links.py',
         'uv run pytest -q',
     ]
 

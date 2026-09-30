@@ -61,8 +61,11 @@ _PROJECTS: dict[str, dict[str, str]] = {
         'src/syndica/cli/__init__.py': '',
         'src/syndica/kernel/__init__.py': 'import syndica.cli\n',
     },
+    'docs_good': {'README.md': 'See [the guide](docs/guide.md).\n', 'docs/guide.md': '# Guide\n'},
+    'docs_bad': {'README.md': 'See [the spec](docs/spec.md).\n'},
 }
 _CHECK_DEPS = f'uv run python {shlex.quote(str(_REPO / "scripts" / "check_deps.py"))}'
+_CHECK_LINKS = f'uv run python {shlex.quote(str(_REPO / "scripts" / "check_links.py"))}'
 # (样例名, 项目目录, 命令, 超时秒数)
 _CASES: tuple[tuple[str, str, str, float], ...] = (
     ('pytest_passed', 'good', 'uv run pytest -q', 120),
@@ -80,6 +83,8 @@ _CASES: tuple[tuple[str, str, str, float], ...] = (
     ('check_deps_passed', 'good', f'{_CHECK_DEPS} --root {shlex.quote(str(_REPO / "src"))}', 120),
     ('check_deps_failed', 'layering', f'{_CHECK_DEPS} --root src', 120),
     ('check_deps_error', 'good', f'{_CHECK_DEPS} --root missing', 120),
+    ('check_links_passed', 'docs_good', f'{_CHECK_LINKS} --root .', 120),
+    ('check_links_failed', 'docs_bad', f'{_CHECK_LINKS} --root .', 120),
     ('other_passed', 'good', 'printf hello', 30),
     # `ls` 找不到文件时 macOS 退出 1、GNU 退出 2；`false` 两边都是 1。
     ('other_failed', 'good', 'false', 30),

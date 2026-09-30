@@ -1,0 +1,7 @@
+{
+ "command": "uv run python /repo/scripts/check_links.py --root .",
+ "exit_code": 1,
+ "stdout": "README.md:1: 链接指向的 'docs/spec.md' 不存在。改成存在的相对路径（相对这份文档所在的目录），或者删掉这条链接。\n\n共 1 处断链。\n",
+ "stderr": "",
+ "timed_out": false
+}

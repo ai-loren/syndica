@@ -55,6 +55,8 @@ _EXPECTED: dict[str, CheckResult] = {
     'check_deps_passed': CheckResult('check_deps', 'passed', {'violations': 0}, 'passed'),
     'check_deps_failed': CheckResult('check_deps', 'failed', {'violations': 1}, 'violations=1'),
     'check_deps_error': CheckResult('check_deps', 'error', {'violations': 0}, 'exit 2'),
+    'check_links_passed': CheckResult('check_links', 'passed', {'broken': 0}, 'passed'),
+    'check_links_failed': CheckResult('check_links', 'failed', {'broken': 1}, 'broken=1'),
     'other_passed': CheckResult('other', 'passed', {}, 'passed'),
     'other_failed': CheckResult('other', 'failed', {}, 'exit 1'),
 }
@@ -95,7 +97,7 @@ def test_every_fixture_on_disk_has_an_expectation_and_the_reverse():
 
 
 def test_the_fixtures_cover_the_classes_the_roadmap_requires():
-    """每个已有的工具至少通过与失败两类；pytest 另有收集错误、超时、无输出与没有测试。"""
+    """每个工具至少通过与失败两类；pytest 另有收集错误、超时、无输出与没有测试。"""
     covered = {(result.tool, result.status) for result in _EXPECTED.values()}
 
     assert {
@@ -113,6 +115,8 @@ def test_the_fixtures_cover_the_classes_the_roadmap_requires():
         ('pyright', 'failed'),
         ('check_deps', 'passed'),
         ('check_deps', 'failed'),
+        ('check_links', 'passed'),
+        ('check_links', 'failed'),
         ('other', 'passed'),
         ('other', 'failed'),
     } <= covered

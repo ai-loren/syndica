@@ -225,6 +225,8 @@ uv run pytest            # 跑测试
 uv run ruff check .      # lint
 uv run ruff format .     # 格式化
 uv run pyright           # 类型检查
+uv run python scripts/check_deps.py   # 依赖方向
+uv run python scripts/check_links.py  # Markdown 相对链接
 ```
 
 ## 文档指路

@@ -341,6 +341,7 @@ uv run ruff format --check .
 uv run ruff check .
 uv run pyright
 uv run python scripts/check_deps.py
+uv run python scripts/check_links.py
 uv run pytest -q
 ```
 
