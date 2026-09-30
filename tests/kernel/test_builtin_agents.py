@@ -7,6 +7,7 @@ import pytest
 from syndica.kernel.agent import BaseAgent
 from syndica.kernel.agents import Orchestrator, register_builtins
 from syndica.kernel.catalog import AgentCatalog
+from syndica.kernel.danger import AllowAll, DangerJudge
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
@@ -72,6 +73,28 @@ def test_orchestrator_is_class_based_and_the_others_are_declarative() -> None:
     worker = factories['Worker'](HooksCenter(), EventBus())
     assert type(orchestrator) is Orchestrator
     assert type(worker) is BaseAgent
+
+
+def test_every_builtin_role_gets_the_host_danger_options_including_the_orchestrator() -> None:
+    catalog = _loaded()
+    judge = DangerJudge(())
+    policy = AllowAll()
+
+    factories = catalog.freeze(
+        _stubs(catalog),
+        {'default': ScriptedLLM([])},
+        danger_judge=judge,
+        danger_policy=policy,
+    )
+    agents = {name: factory(HooksCenter(), EventBus()) for name, factory in factories.items()}
+
+    assert type(agents['Orchestrator']) is Orchestrator
+    assert {name: agent.options.danger_judge for name, agent in agents.items()} == dict.fromkeys(
+        catalog.names(), judge
+    )
+    assert {name: agent.options.danger_policy for name, agent in agents.items()} == dict.fromkeys(
+        catalog.names(), policy
+    )
 
 
 def test_declarative_system_prompts_are_what_freeze_hands_the_agent() -> None:

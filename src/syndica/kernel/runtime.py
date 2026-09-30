@@ -134,6 +134,8 @@ from syndica.kernel.danger import (
     ConfirmationHandler,
     ConfirmationOutcome,
     ConfirmationRequest,
+    DangerJudge,
+    DangerPolicy,
     validate_confirmation_handler,
 )
 from syndica.kernel.errors import ConfigError, ContractViolation
@@ -2353,12 +2355,16 @@ class Runtime:
         tools: Mapping[str, Tool],
         models: Mapping[str, LLM],
         host: object = None,
+        danger_judge: DangerJudge | None = None,
+        danger_policy: DangerPolicy | None = None,
     ) -> None:
         """把拓扑装进本 Runtime。这不是 `start`，也不发 Runtime 启动切点。
 
         只 spawn `boot='eager'` 的 singleton。lazy 等 `send_to_slot`，manual 等 `occupy`。
         第二次调用是契约违反：要换形态就新 Runtime。中途 spawn 失败也已经算装过，避免重试把
-        已经起来的 eager 再 spawn 一遍。
+        已经起来的 eager 再 spawn 一遍。`danger_judge` / `danger_policy` 原样交给
+        `AgentCatalog.freeze`：目录冻结出的工厂都用它们，槽上建出的与 `Delegate` 按目录角色派出的
+        Agent 因此都受约束。`Runtime(agents=)` 里目录之外的名字仍是原来的工厂，不受这里的影响。
         """
         from syndica.kernel.catalog import AgentCatalog
         from syndica.kernel.topology import Topology
@@ -2395,7 +2401,13 @@ class Runtime:
             )
         tool_table = cast('Mapping[str, Tool]', received_tools)
         received_topology.validate(received_catalog)
-        frozen = received_catalog.freeze(tool_table, models, host)
+        frozen = received_catalog.freeze(
+            tool_table,
+            models,
+            host,
+            danger_judge=danger_judge,
+            danger_policy=danger_policy,
+        )
         for name, factory in frozen.items():
             if name in self._agents:
                 logger.info('catalog 覆盖了 Runtime(agents=) 里同名工厂 %s', name)

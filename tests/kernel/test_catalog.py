@@ -16,6 +16,7 @@ from syndica.kernel.catalog import (
     register_tool,
     resolve_tool_names,
 )
+from syndica.kernel.danger import AllowAll, DangerJudge
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
@@ -523,3 +524,62 @@ def test_extends_unknown_name_is_rejected():
     error = excinfo.value
     assert "'Ghost'" in error.received
     assert "'Scout'" in error.received
+
+
+def _three_roles() -> AgentCatalog:
+    catalog = AgentCatalog()
+    catalog.load_mapping(_agent_body('Planner', '规划范围时用我。', impl=_StubAgent))
+    catalog.load_mapping(_agent_body('Worker', '改文件时用我'))
+    catalog.load_mapping(_agent_body('Scout', '侦察'))
+    return catalog
+
+
+def test_freeze_hands_the_host_danger_options_to_every_role_including_class_roles():
+    judge = DangerJudge(())
+    policy = AllowAll()
+
+    factories = _three_roles().freeze({}, _models(), danger_judge=judge, danger_policy=policy)
+    agents = [_spawn(factories[name]) for name in ('Planner', 'Worker', 'Scout')]
+
+    assert [type(agent).__name__ for agent in agents] == ['_StubAgent', 'BaseAgent', 'BaseAgent']
+    assert [agent.options.danger_judge for agent in agents] == [judge, judge, judge]
+    assert [agent.options.danger_policy for agent in agents] == [policy, policy, policy]
+
+
+def test_freeze_without_danger_options_keeps_the_kernel_defaults():
+    factories = _three_roles().freeze({}, _models())
+    agents = [_spawn(factories[name]) for name in ('Planner', 'Worker', 'Scout')]
+
+    assert [agent.options.danger_judge for agent in agents] == [None, None, None]
+    assert [agent.options.danger_policy for agent in agents] == [None, None, None]
+
+
+def test_freeze_takes_the_danger_options_by_keyword_only():
+    parameters = inspect.signature(AgentCatalog.freeze).parameters
+
+    assert parameters['danger_judge'].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters['danger_policy'].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@pytest.mark.parametrize(
+    ('options', 'anchor'),
+    [
+        ({'danger_policy': AllowAll}, 'danger_policy'),
+        ({'danger_judge': DangerJudge}, 'danger_judge'),
+    ],
+)
+def test_an_empty_catalog_still_rejects_bad_danger_options_at_freeze(
+    options: dict[str, object], anchor: str
+):
+    with pytest.raises(ConfigError) as excinfo:
+        AgentCatalog().freeze({}, _models(), **options)  # pyright: ignore[reportArgumentType]
+
+    assert anchor in excinfo.value.expected
+
+
+def test_freeze_rejects_a_policy_class_where_an_instance_is_expected():
+    with pytest.raises(ConfigError) as excinfo:
+        _three_roles().freeze({}, _models(), danger_policy=AllowAll)  # pyright: ignore[reportArgumentType]
+
+    assert 'danger_policy' in excinfo.value.expected
+    assert '括号' in excinfo.value.received

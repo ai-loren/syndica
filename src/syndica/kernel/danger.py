@@ -58,6 +58,7 @@ __all__ = [
     'Disposition',
     'MailboxConfirmationHandler',
     'RiskLevel',
+    'RuleTablePolicy',
     'disposition_of',
     'validate_danger_options',
 ]
@@ -761,6 +762,27 @@ def _validated_rules(rules: object) -> tuple[DangerRule, ...]:
                 received=f'收到 {type(rule.matches).__name__}',
                 next_action='给这条规则一个 matches(text: str) -> bool 的纯函数',
             )
+        raw_level = cast(object, rule.level)
+        if not isinstance(raw_level, RiskLevel):
+            raise ConfigError(
+                expected=f'rules[{index}].level 是 RiskLevel 成员',
+                received=f'收到 {raw_level!r}，类型是 {type(raw_level).__name__}',
+                next_action=(
+                    '写成 RiskLevel.HIGH / RiskLevel.LOW。RiskLevel 不混入 str，'
+                    "'high' 既不 is 也不 == RiskLevel.HIGH：写错的规则会被当成没有风险放行，"
+                    '强制升级也跳过它'
+                ),
+            )
+        raw_id = cast(object, rule.rule_id)
+        if not isinstance(raw_id, str) or not raw_id.strip() or raw_id != raw_id.strip():
+            raise ConfigError(
+                expected=f'rules[{index}].rule_id 是不带首尾空白的非空字符串',
+                received=f'收到 {raw_id!r}，类型是 {type(raw_id).__name__}',
+                next_action=(
+                    '规则 ID 进日志、被宿主策略按字面匹配，写成 shell.privilege_escalation 这样的'
+                    '字符串，不带首尾空白'
+                ),
+            )
         validated.append(rule)
     return tuple(validated)
 
@@ -823,6 +845,57 @@ class AllowAll:
 
     def decide(self, request: DangerRequest) -> Disposition:
         return Disposition.ALLOW
+
+
+def _validated_table(table: object) -> dict[str, Disposition]:
+    if not isinstance(table, Mapping):
+        raise ConfigError(
+            expected='RuleTablePolicy 的 table 是「规则 ID → Disposition」的 Mapping',
+            received=f'收到 {type(table).__name__} 类型的 {table!r}',
+            next_action=(
+                '传 dict 给 RuleTablePolicy，例如 '
+                "RuleTablePolicy({'shell.privilege_escalation': Disposition.BLOCK})"
+            ),
+        )
+    checked: dict[str, Disposition] = {}
+    for key, value in cast('Mapping[object, object]', table).items():
+        if not isinstance(key, str) or not key.strip() or key != key.strip():
+            raise ConfigError(
+                expected='RuleTablePolicy 表里的键是不带首尾空白的非空规则 ID 字符串',
+                received=f'收到键 {key!r}，类型是 {type(key).__name__}',
+                next_action=(
+                    '把 RuleTablePolicy 的键写成 DangerVerdict.rule_id 的原样字符串，'
+                    "例如 'shell.privilege_escalation'；它按字面逐字匹配"
+                ),
+            )
+        if not isinstance(value, Disposition):
+            raise ConfigError(
+                expected=f'RuleTablePolicy 表里 {key!r} 的值是 Disposition 成员',
+                received=f'收到 {value!r}，类型是 {type(value).__name__}',
+                next_action=(
+                    '给 RuleTablePolicy 传 Disposition.BLOCK / Disposition.CONFIRM / '
+                    "Disposition.ALLOW；Disposition 不混入 str，'block' 这样的字符串不等于任何成员"
+                ),
+            )
+        checked[key] = value
+    return checked
+
+
+class RuleTablePolicy:
+    """按规则 ID 查表处置：表里有的照表；表外的高风险阻断，其余放行。
+
+    表外的高风险按 BLOCK 而不是 ALLOW：规则表会随宿主组合的规则变长，一条宿主还没来得及登记的
+    高风险规则不该被静默放行。表在构造时拷一份，交进来的 dict 此后被改，改不动已经建好的策略。
+    """
+
+    def __init__(self, table: object) -> None:
+        self._table = _validated_table(table)
+
+    def decide(self, request: DangerRequest) -> Disposition:
+        listed = self._table.get(request.verdict.rule_id)
+        if listed is not None:
+            return listed
+        return Disposition.BLOCK if request.verdict.level is RiskLevel.HIGH else Disposition.ALLOW
 
 
 def _received_instead(value: object) -> str:

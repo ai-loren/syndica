@@ -247,6 +247,7 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # - `LocalAgentTable`：spec §4.3 明文说它只在进程内有意义、不进 Protocol。
 # - `correlation_of`：`Waiter` 密封分发的内部收口，`wait_for` 自己调。
 # - 八个工具类不进承诺面，宿主用 `local_tools` 按键取。
+# - `RuleTablePolicy`：M2 开发期宿主用的按表处置；进不进承诺面在 M12 冻结公开 API 时定。
 _WITHHELD: tuple[str, ...] = (
     'Bash',
     'BashOutput',
@@ -267,6 +268,7 @@ _WITHHELD: tuple[str, ...] = (
     'QueryAgent',
     'Read',
     'ReadOnlyKwarg',
+    'RuleTablePolicy',
     'SendMessage',
     'ToolExecutor',
     'TurnGate',

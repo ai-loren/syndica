@@ -22,6 +22,7 @@ from types import MappingProxyType
 from typing import Literal, cast
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
+from syndica.kernel.danger import DangerJudge, DangerPolicy, validate_danger_options
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
@@ -206,8 +207,16 @@ class AgentCatalog:
         tools: object,
         models: object,
         host: object = None,
+        *,
+        danger_judge: DangerJudge | None = None,
+        danger_policy: DangerPolicy | None = None,
     ) -> Mapping[str, AgentFactory]:
-        """插值一次并收成「hooks, events → BaseAgent」工厂。键序与 names() 相同。"""
+        """插值一次并收成「hooks, events → BaseAgent」工厂。键序与 names() 相同。
+
+        `danger_judge` / `danger_policy` 交给每个建出的 Agent，类式角色也一样；`None` 用内核默认。
+        入口先校验：目录里一个角色都没有时不会建任何 `AgentOptions`，错的策略就没有别处能拦下。
+        """
+        validate_danger_options(danger_judge, danger_policy)
         host_facts = _host_facts(host)
         model_table = _model_table(models)
         self._reject_missing_models(model_table)
@@ -215,7 +224,12 @@ class AgentCatalog:
         factories: dict[str, AgentFactory] = {}
         for name in self._order:
             factories[name] = self._factory_for(
-                self._entries[name], tools=tools, models=model_table, host=host_facts
+                self._entries[name],
+                tools=tools,
+                models=model_table,
+                host=host_facts,
+                danger_judge=danger_judge,
+                danger_policy=danger_policy,
             )
         validate_agent_factories(factories)
         return MappingProxyType(factories)
@@ -245,6 +259,8 @@ class AgentCatalog:
         tools: object,
         models: Mapping[str, LLM],
         host: HostFacts | None,
+        danger_judge: DangerJudge | None,
+        danger_policy: DangerPolicy | None,
     ) -> AgentFactory:
         cls = self._resolve_class(manifest)
         tool_names = self._union_tool_names(manifest)
@@ -261,6 +277,8 @@ class AgentCatalog:
             tools=captured_tools,
             system_prompt=prompt,
             max_turns=_max_turns(manifest),
+            danger_judge=danger_judge,
+            danger_policy=danger_policy,
         )
 
         def factory(hooks: HooksCenter, events: EventBus) -> BaseAgent:

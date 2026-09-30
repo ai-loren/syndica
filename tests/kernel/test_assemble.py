@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import logging
 from collections.abc import Mapping
 
@@ -11,6 +12,8 @@ import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.catalog import AgentCatalog
+from syndica.kernel.context import ToolCall
+from syndica.kernel.danger import AllowAll, DangerJudge, DangerPolicy, DangerRule, RiskLevel
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
@@ -533,3 +536,104 @@ async def test_alias_collision_is_rejected() -> None:
         assert len(await runtime.registry.list()) == 1
     finally:
         await runtime.shutdown()
+
+
+class _Shell(Tool):
+    """命令文本进危险判定的工具，与 Bash 同形。"""
+
+    __tool_name__ = 'Shell'
+    __tool_command_args__ = ('command',)
+
+    def __init__(self) -> None:
+        self.ran: list[str] = []
+
+    async def execute(self, command: str) -> ToolResult:
+        """运行一条命令。
+        command: 命令文本
+        """
+        self.ran.append(command)
+        return ToolResult(output=f'ran {command}')
+
+
+_DEPLOY_RULE = DangerRule(
+    rule_id='test.deploy',
+    level=RiskLevel.HIGH,
+    reason='部署会改线上',
+    matches=lambda text: 'deploy' in text,
+)
+
+
+async def _run_one_command(
+    command: str,
+    *,
+    judge: DangerJudge | None = None,
+    policy: DangerPolicy | None = None,
+) -> tuple[list[str], str]:
+    shell = _Shell()
+    catalog = AgentCatalog()
+    catalog.load_mapping(_body('Worker', tools=['Shell']))
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(id='c1', name='Shell', arguments=json.dumps({'command': command}))
+                ]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    topology = Topology(
+        slots=(AgentSlot(name='root', agent='Worker', is_root=True, cardinality='singleton'),)
+    )
+    runtime = Runtime()
+    try:
+        await runtime.assemble(
+            topology,
+            catalog,
+            tools={'Shell': shell},
+            models={'default': llm},
+            danger_judge=judge,
+            danger_policy=policy,
+        )
+        delivered = await runtime.send_to_slot('root', 'go')
+        assert delivered.ok
+        agent_id = await runtime.resolve('root')
+        assert agent_id is not None
+        context = await runtime.wait(agent_id)
+    finally:
+        await runtime.shutdown()
+    outputs = [str(block.content) for block in context.current_traj if block.role == 'tool']
+    return shell.ran, '\n'.join(outputs)
+
+
+async def test_assemble_hands_the_host_danger_judge_to_the_agents_it_builds() -> None:
+    ran, outputs = await _run_one_command('deploy prod', judge=DangerJudge((_DEPLOY_RULE,)))
+
+    assert ran == []
+    assert 'test.deploy' in outputs
+
+
+async def test_assemble_without_a_danger_judge_keeps_the_kernel_rules() -> None:
+    ran, _ = await _run_one_command('deploy prod')
+
+    assert ran == ['deploy prod']
+
+
+async def test_assemble_hands_the_host_danger_policy_to_the_agents_it_builds() -> None:
+    ran, _ = await _run_one_command('sudo ls', policy=AllowAll())
+
+    assert ran == ['sudo ls']
+
+
+async def test_assemble_without_a_danger_policy_keeps_blocking_high_risk() -> None:
+    ran, outputs = await _run_one_command('sudo ls')
+
+    assert ran == []
+    assert 'shell.privilege_escalation' in outputs
+
+
+def test_assemble_takes_the_danger_options_by_keyword_only() -> None:
+    parameters = inspect.signature(Runtime.assemble).parameters
+
+    assert parameters['danger_judge'].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters['danger_policy'].kind is inspect.Parameter.KEYWORD_ONLY

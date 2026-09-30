@@ -10,6 +10,7 @@ import os
 from collections.abc import Iterator
 from collections.abc import Set as AbstractSet
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, cast
 
 import pytest
@@ -27,6 +28,7 @@ from syndica.kernel.danger import (
     DangerVerdict,
     Disposition,
     RiskLevel,
+    RuleTablePolicy,
     disposition_of,
 )
 from syndica.kernel.errors import ConfigError, ContractViolation
@@ -1191,3 +1193,116 @@ def test_judge_accepts_an_explicit_list_of_rules():
     )
     judge = DangerJudge([rule])
     assert judge.judge(_Undeclared(), {'anything': 'hello'}) == NO_RULE_MATCHED
+
+
+_TABLE = {
+    'shell.confirm_me': Disposition.CONFIRM,
+    'shell.block_me': Disposition.BLOCK,
+    'shell.allow_me': Disposition.ALLOW,
+}
+
+
+@pytest.mark.parametrize(
+    ('rule_id', 'level', 'expected'),
+    [
+        ('shell.confirm_me', RiskLevel.HIGH, Disposition.CONFIRM),
+        ('shell.block_me', RiskLevel.LOW, Disposition.BLOCK),
+        ('shell.allow_me', RiskLevel.HIGH, Disposition.ALLOW),
+        ('shell.not_in_table', RiskLevel.HIGH, Disposition.BLOCK),
+        ('shell.not_in_table', RiskLevel.LOW, Disposition.ALLOW),
+        ('danger.no_rule_matched', RiskLevel.NONE, Disposition.ALLOW),
+    ],
+)
+def test_rule_table_policy_follows_the_table_then_blocks_unknown_high_risk(
+    rule_id: str, level: RiskLevel, expected: Disposition
+):
+    policy = RuleTablePolicy(_TABLE)
+
+    assert policy.decide(_request(level, TrustLevel.TRUSTED, rule_id=rule_id)) is expected
+
+
+def test_rule_table_policy_is_a_danger_policy():
+    assert isinstance(RuleTablePolicy(_TABLE), DangerPolicy)
+
+
+def test_rule_table_policy_keeps_its_own_copy_of_the_table():
+    table = dict(_TABLE)
+    policy = RuleTablePolicy(table)
+    table['shell.confirm_me'] = Disposition.ALLOW
+
+    decided = policy.decide(
+        _request(RiskLevel.HIGH, TrustLevel.TRUSTED, rule_id='shell.confirm_me')
+    )
+
+    assert decided is Disposition.CONFIRM
+
+
+@pytest.mark.parametrize(
+    ('table', 'expected_anchor', 'received_anchor', 'next_anchor'),
+    [
+        ([('shell.block_me', Disposition.BLOCK)], 'Mapping', 'list', 'dict'),
+        ({1: Disposition.BLOCK}, '规则 ID', 'int', 'rule_id'),
+        ({'': Disposition.BLOCK}, '规则 ID', 'str', 'rule_id'),
+        ({'  ': Disposition.BLOCK}, '规则 ID', 'str', 'rule_id'),
+        ({' shell.block_me': Disposition.BLOCK}, '首尾空白', 'shell.block_me', 'rule_id'),
+        ({'shell.block_me': 'block'}, 'Disposition', 'str', 'Disposition.CONFIRM'),
+        ({'shell.block_me': True}, 'Disposition', 'bool', 'Disposition.CONFIRM'),
+    ],
+)
+def test_rule_table_policy_rejects_a_malformed_table_with_the_fix(
+    table: object, expected_anchor: str, received_anchor: str, next_anchor: str
+):
+    with pytest.raises(ConfigError) as caught:
+        RuleTablePolicy(table)
+
+    error = caught.value
+    assert expected_anchor in error.expected
+    assert received_anchor in error.received
+    assert next_anchor in error.next_action
+    assert 'RuleTablePolicy' in error.next_action
+
+
+def test_rule_table_policy_matches_rule_ids_literally():
+    policy = RuleTablePolicy({'Host.Deploy': Disposition.BLOCK})
+
+    exact = policy.decide(_request(RiskLevel.LOW, TrustLevel.TRUSTED, rule_id='Host.Deploy'))
+    other_case = policy.decide(_request(RiskLevel.LOW, TrustLevel.TRUSTED, rule_id='host.deploy'))
+
+    assert (exact, other_case) == (Disposition.BLOCK, Disposition.ALLOW)
+
+
+def test_rule_table_policy_can_list_the_no_rule_matched_verdict():
+    policy = RuleTablePolicy({NO_RULE_MATCHED.rule_id: Disposition.CONFIRM})
+
+    decided = policy.decide(
+        _request(RiskLevel.NONE, TrustLevel.TRUSTED, rule_id=NO_RULE_MATCHED.rule_id)
+    )
+
+    assert decided is Disposition.CONFIRM
+
+
+def test_rule_table_policy_accepts_any_mapping():
+    policy = RuleTablePolicy(MappingProxyType({'shell.block_me': Disposition.BLOCK}))
+
+    decided = policy.decide(_request(RiskLevel.LOW, TrustLevel.TRUSTED, rule_id='shell.block_me'))
+
+    assert decided is Disposition.BLOCK
+
+
+@pytest.mark.parametrize(
+    ('rule', 'anchor'),
+    [
+        (DangerRule(rule_id='x.y', level=cast(Any, 'high'), reason='r', matches=bool), 'RiskLevel'),
+        (
+            DangerRule(rule_id=cast(Any, ['x']), level=RiskLevel.HIGH, reason='r', matches=bool),
+            'rule_id',
+        ),
+        (DangerRule(rule_id='', level=RiskLevel.HIGH, reason='r', matches=bool), 'rule_id'),
+        (DangerRule(rule_id=' x.y', level=RiskLevel.HIGH, reason='r', matches=bool), 'rule_id'),
+    ],
+)
+def test_the_judge_rejects_a_rule_whose_level_or_id_is_malformed(rule: DangerRule, anchor: str):
+    with pytest.raises(ConfigError) as caught:
+        DangerJudge((rule,))
+
+    assert anchor in caught.value.expected
