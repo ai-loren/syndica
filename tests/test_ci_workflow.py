@@ -67,3 +67,14 @@ def test_ci_pins_python_3_11_and_an_exact_uv_version() -> None:
 
     assert options['python-version'] == '3.11'
     assert re.fullmatch(r'\d+\.\d+\.\d+', options['version'])
+
+
+def test_setup_uv_is_pinned_to_a_full_release_tag() -> None:
+    # setup-uv 从 v8 起不再发布 v10 这种浮动大版本标签；写成 @v10，CI 在 Set up job 就解析失败。
+    [uses] = [
+        str(step['uses'])
+        for step in _steps()
+        if str(step.get('uses', '')).startswith('astral-sh/setup-uv@')
+    ]
+
+    assert re.fullmatch(r'astral-sh/setup-uv@v\d+\.\d+\.\d+', uses)
