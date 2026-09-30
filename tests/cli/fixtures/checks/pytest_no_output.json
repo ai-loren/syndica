@@ -1,0 +1,7 @@
+{
+ "command": "uv run pytest -q > /dev/null 2>&1",
+ "exit_code": 0,
+ "stdout": "",
+ "stderr": "",
+ "timed_out": false
+}

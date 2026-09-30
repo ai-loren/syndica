@@ -1,0 +1,7 @@
+{
+ "command": "uv run pytest -v",
+ "exit_code": null,
+ "stdout": "============================= test session starts ==============================\nplatform darwin -- Python 3.11.16, pytest-9.1.1, pluggy-1.6.0 -- /repo/.venv/bin/python\ncachedir: .pytest_cache\nrootdir: /work/slow\nconfigfile: pytest.ini\nplugins: timeout-2.4.0, asyncio-1.4.0, anyio-4.15.1\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\ncollecting ... collected 2 items\n\ntests/test_slow.py::test_fast PASSED                                     [ 50%]\ntests/test_slow.py::test_slow ",
+ "stderr": "",
+ "timed_out": true
+}

@@ -1,0 +1,7 @@
+{
+ "command": "uv run ruff check .",
+ "exit_code": 0,
+ "stdout": "All checks passed!\n",
+ "stderr": "",
+ "timed_out": false
+}

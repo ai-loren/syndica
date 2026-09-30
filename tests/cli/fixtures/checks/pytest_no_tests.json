@@ -1,0 +1,7 @@
+{
+ "command": "uv run pytest -q",
+ "exit_code": 5,
+ "stdout": "\nno tests ran in 0.01s\n",
+ "stderr": "",
+ "timed_out": false
+}

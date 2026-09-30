@@ -1,0 +1,7 @@
+{
+ "command": "uv run ruff format --check .",
+ "exit_code": 1,
+ "stdout": "unformatted: File would be reformatted\n --> pkg/calc.py:2:1\n  |\n1 | import os\n2 +\n3 +\n4 | def add(a: int, b: int) -> int:\n5 |     return a - b\n6 +\n7 +\n8 | x: int = \"nope\"\n  |\n\n1 file would be reformatted, 2 files already formatted\n",
+ "stderr": "",
+ "timed_out": false
+}

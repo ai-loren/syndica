@@ -1,0 +1,7 @@
+{
+ "command": "uv run ruff check .",
+ "exit_code": 1,
+ "stdout": "I001 [*] Import block is un-sorted or un-formatted\n --> pkg/calc.py:1:1\n  |\n1 | import os\n  | ^^^^^^^^^\n2 | def add(a: int, b: int) -> int:\n3 |     return a - b\n  |\nhelp: Organize imports\n  |\n1 | import os\n2 +\n3 +\n4 | def add(a: int, b: int) -> int:\n  |\n\nF401 [*] `os` imported but unused\n --> pkg/calc.py:1:8\n  |\n1 | import os\n  |        ^^\n2 | def add(a: int, b: int) -> int:\n3 |     return a - b\n  |\nhelp: Remove unused import: `os`\n  |\n  - import os\n1 | def add(a: int, b: int) -> int:\n  |\n\nFound 2 errors.\n[*] 2 fixable with the `--fix` option.\n",
+ "stderr": "",
+ "timed_out": false
+}

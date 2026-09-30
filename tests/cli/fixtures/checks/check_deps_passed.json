@@ -1,0 +1,7 @@
+{
+ "command": "uv run python /repo/scripts/check_deps.py --root /repo/src",
+ "exit_code": 0,
+ "stdout": "",
+ "stderr": "",
+ "timed_out": false
+}

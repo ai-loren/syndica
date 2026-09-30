@@ -1,0 +1,7 @@
+{
+ "command": "uv run ruff format --check .",
+ "exit_code": 0,
+ "stdout": "3 files already formatted\n",
+ "stderr": "",
+ "timed_out": false
+}

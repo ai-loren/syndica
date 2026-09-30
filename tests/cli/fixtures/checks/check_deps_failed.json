@@ -1,0 +1,7 @@
+{
+ "command": "uv run python /repo/scripts/check_deps.py --root src",
+ "exit_code": 1,
+ "stdout": "kernel/__init__.py: kernel imports 'cli'. kernel 不得依赖 surface 或 backend（spec §3.2 规则 1）。 改为在 kernel 定义 Protocol，由 cli 提供实现并由宿主注入。\n\n共 1 处违规。\n",
+ "stderr": "",
+ "timed_out": false
+}

@@ -1,0 +1,7 @@
+{
+ "command": "uv run pyright pkg",
+ "exit_code": 0,
+ "stdout": "0 errors, 0 warnings, 0 informations\n",
+ "stderr": "",
+ "timed_out": false
+}

@@ -681,6 +681,18 @@ HIGH 本来就 BLOCK）。对抗评审报的 Critical 已修：Bash 的 `cwd` �
 
 #### T8 — 检查结果解析器与真实样例
 
+**状态：completed**（本地验证协议：定向用例与五道门禁全绿；第一轮 31 条变异全杀之后，对抗评审另找出 24 条存活
+与两个 High——同一个工具跑两次时前一次的失败被后一次的汇总盖住、check_deps 崩溃后退出码被 `| tail` 换成 0
+就报 passed；认工具与认汇总随之重写，第二轮 36 条变异全部杀死，含计划点名的四条。17 个样例由 `generate.py`
+经 `LocalWorkspace.run` 跑真实工具生成，覆盖五类加 `no_tests`，每个已有的工具至少通过与失败两类；落盘前换掉
+本机路径、用时换成固定值，替换后仍留着本机路径就拒绝落盘，重新生成两次逐字节相同。check_links 的样例随 T14
+补，解析器认 `共 N 处断链。`，与 check_deps 同一写法。工具只在 shell 段的命令词位置上认（跳过赋值与
+`uv run`、`python -m`、`timeout` 这类启动器，`--version` / `--help` 不算），两段各跑了工具就归 `other`；
+汇总只认形状对的最后一行（`-v` 的测试 id 与 `--diff` 的文件内容里可能正好有一段像汇总的话），计数最多 9 位。
+退出码 0 只在工具自己的汇总在场时才算 passed，成功时不出声的脚本要两条流都是空的；退出码 1 而没有汇总是
+`error`（缺模块、超时插件的 `os._exit(1)`、脚本崩溃）。摘要由计数拼出，不抄工具原文。Linux 补跑待 CI 额度
+恢复）
+
 **Files:** `cli/checks.py`、`tests/cli/fixtures/checks/`、`tests/cli/test_checks.py`。
 
 - 样例由真实工具跑出，存成数据文件（不用 `.py` 后缀，避开 ruff、pyright 与 pytest 收集），README 记录生成

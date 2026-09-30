@@ -1,0 +1,7 @@
+{
+ "command": "printf hello",
+ "exit_code": 0,
+ "stdout": "hello",
+ "stderr": "",
+ "timed_out": false
+}

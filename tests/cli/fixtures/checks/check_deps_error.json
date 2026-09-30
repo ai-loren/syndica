@@ -1,0 +1,7 @@
+{
+ "command": "uv run python /repo/scripts/check_deps.py --root missing",
+ "exit_code": 2,
+ "stdout": "",
+ "stderr": "依赖方向校验无法执行：期望 --root 指向存在的源码根目录，实际收到 'missing'：路径不存在或不是目录。 请从仓库根目录运行，或把 --root 指向包含 syndica/ 包的目录（默认 src）。\n",
+ "timed_out": false
+}

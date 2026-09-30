@@ -1,0 +1,7 @@
+{
+ "command": "uv run pyright pkg",
+ "exit_code": 1,
+ "stdout": "/work/bad/pkg/calc.py\n  /work/bad/pkg/calc.py:4:10 - error: Type \"Literal['nope']\" is not assignable to declared type \"int\"\n    \"Literal['nope']\" is not assignable to \"int\" (reportAssignmentType)\n1 error, 0 warnings, 0 informations\n",
+ "stderr": "",
+ "timed_out": false
+}
