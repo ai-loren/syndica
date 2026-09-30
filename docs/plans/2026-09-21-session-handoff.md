@@ -29,6 +29,7 @@
 | 写代码的约定 | 中文回复；注释只写**现在的硬约束**（不要写推理过程）；错误三件套；**不要**跑全仓 `make lint` / `make test` |
 | 本仓验证 | `uv run pytest <受影响路径>`、`uv run ruff check` / `ruff format --check`、`uv run pyright`、`python scripts/check_deps.py` |
 | git | 在 `main` 上开发；门禁与验证通过后 **commit 并 push**（用户 2026-09-29 定） |
+| CI | `.github/workflows/ci.yml` 跑五道门禁。GitHub Free 的月度额度 2026-10 已用完，恢复前按 M2 计划「验证」一节的本地验证协议推进，恢复后先补跑 CI |
 | 提交身份 | `ai-loren <1158083128@qq.com>`（全局 git config 已设好，提交前 `git config user.email` 核对） |
 | 提交时 | `git -c trace2.eventtarget= -c trace2.eventnesting= commit`（本机 git 会被 trace2 塞 Co-authored-by: Cursor） |
 | 本机环境 | `uv sync --extra openai --extra dev` 建 `.venv`（Python 3.11） |
