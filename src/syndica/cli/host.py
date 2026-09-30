@@ -24,13 +24,18 @@ from syndica.kernel import (
     AgentCatalog,
     AgentOptions,
     AgentSlot,
+    AskUser,
+    AskUserQuestion,
     ConfigError,
     Context,
     ContractViolation,
     ExitMode,
     FlagDeclaration,
+    HookResult,
+    HooksCenter,
     HostFacts,
     HumanInteractionModule,
+    Junction,
     LocalWorkspace,
     MailboxConfirmationHandler,
     Runtime,
@@ -39,11 +44,15 @@ from syndica.kernel import (
     StopReason,
     Subscription,
     SyndicaError,
+    Tool,
+    ToolCall,
+    ToolResult,
     Topology,
     TrustLevel,
     local_tools,
     register_builtins,
 )
+from syndica.kernel.tools import Delegate, Fork, KillAgent, QueryAgent, SendMessage
 
 __all__ = ['RuntimeCliHost']
 
@@ -56,6 +65,19 @@ _OUTPUT_LIMIT = 10_000
 _SHELL = '/bin/sh'
 # CLI 拒收的 Flag 取值：`--flag` 报错，`flags show` 不列。
 _REFUSED_FLAG_VALUE = ('untrusted_high_risk', 'allow')
+# `run --no-write` 在清单与槽里留下的工具。白名单而不是去掉几个写工具：以后新增的可写工具默认
+# 进不来。派活与问人的工具不经清单，由 Runtime 与 Module 另装。
+_READ_ONLY_TOOLS = frozenset({'Glob', 'Grep', 'Read'})
+# 只读 run 里放行的派活与问人的工具，按确切类型认：同名的替身（自己装一个叫 Delegate 的工具）不算。
+_AGENT_TOOL_TYPES: frozenset[type] = frozenset(
+    {AskUser, AskUserQuestion, Delegate, Fork, KillAgent, QueryAgent, SendMessage}
+)
+# 只读 run 交给 Agent 的第一段话前面加这一段：它的系统提示词里仍写着「改文件、跑命令」，不说清楚
+# 就只能靠一次次「未知工具」去撞。放在消息里而不是系统提示词里，系统提示词逐轮字节一致。
+_READ_ONLY_NOTICE = (
+    '（这次 run 是只读的（--no-write）：只有 Read、Grep、Glob 与派活、问人的工具，改文件、跑命令的'
+    '工具都用不了。需要改动时，把要改什么、怎么改写进最终回答。）\n\n'
+)
 
 
 class _RuntimeErrorCapture(logging.Handler):
@@ -95,13 +117,61 @@ def _modules() -> tuple[SafetyModule, HumanInteractionModule]:
     return SafetyModule(), HumanInteractionModule()
 
 
-def _agent_modules(workspace_root: Path) -> tuple[RuntimeModule, ...]:
-    """run 与 chat 的 Runtime 装的 Module。
+class _ReadOnlyGuard:
+    """`run --no-write` 在 PRE_TOOL_USE 上的闸：只放行宿主交出的三个只读工具实例与派活、问人的工具。
+
+    清单与槽的过滤管不到类式角色在 `install_own_tools` 里自己装的工具（配置里一行 `impl:` 就够），
+    也管不到以后新增的工具来源。按对象身份与确切类型认，自己装一个叫 Read 的工具照样拦下。
+    """
+
+    def __init__(self, read_tools: tuple[Tool, ...]) -> None:
+        self._read_tools = read_tools
+
+    @property
+    def name(self) -> str:
+        return 'read-only-guard'
+
+    def register(self, hooks: HooksCenter) -> None:
+        hooks.register(Junction.PRE_TOOL_USE, self._guard)
+
+    async def _guard(self, **kwargs: object) -> HookResult:
+        tool = kwargs['tool']
+        if type(tool) in _AGENT_TOOL_TYPES or any(tool is kept for kept in self._read_tools):
+            return HookResult()
+        name = cast(ToolCall, kwargs['tool_call']).name
+        return HookResult(
+            skip=True,
+            result=ToolResult(
+                output=(
+                    '已拦截：这次 run 用了 --no-write，只能用 Read、Grep、Glob 与派活、问人的'
+                    f'工具；收到的 {name!r} 不在其中。换成只读的做法继续；要改动就把改什么、怎么改'
+                    '写进最终回答，由人去掉 --no-write 再跑。'
+                ),
+                trust=TrustLevel.TRUSTED,
+            ),
+        )
+
+
+def _read_only_module(tools: Mapping[str, Tool]) -> RuntimeModule:
+    guard = _ReadOnlyGuard(tuple(tools[name] for name in sorted(_READ_ONLY_TOOLS)))
+
+    def plugin(runtime: object, agent: object, flags: object) -> _ReadOnlyGuard:
+        del runtime, agent, flags
+        return guard
+
+    return RuntimeModule('read-only', agent_plugins=(plugin,))
+
+
+def _agent_modules(
+    workspace_root: Path, read_only_tools: Mapping[str, Tool] | None = None
+) -> tuple[RuntimeModule, ...]:
+    """run 与 chat 的 Runtime 装的 Module；给了 `read_only_tools` 就另装只读闸。
 
     开发期 Module 排在最后：可拦截切点按注册顺序串行，前面的 hook 改过的参数传给后面的；排在它
     后面的插件再改参数，守卫判的就是改之前的那一份。
     """
-    return (*_modules(), DevModule(workspace_root))
+    read_only = () if read_only_tools is None else (_read_only_module(read_only_tools),)
+    return (*_modules(), *read_only, DevModule(workspace_root))
 
 
 def _model_names(config: CliConfig) -> tuple[str, ...]:
@@ -113,6 +183,22 @@ def _role_turns(catalog: AgentCatalog, name: str) -> int | None:
     return AgentOptions.max_turns if manifest.budget is None else manifest.budget['turns']
 
 
+def _rebuilt(catalog: AgentCatalog, edit: Callable[[str, dict[str, object]], None]) -> AgentCatalog:
+    """同一份目录的一份拷贝，每个角色的清单先交给 edit 改一遍。"""
+    rebuilt = AgentCatalog()
+    for name in catalog.names():
+        manifest = catalog.get(name)
+        data: dict[str, object] = {
+            field.name: getattr(manifest, field.name)
+            for field in fields(manifest)
+            if field.name != 'source'
+        }
+        edit(name, data)
+        # system_prompt 已是解析后的正文；留着 origin 会让它被当成相对路径再解析一次。
+        rebuilt.load_mapping(data, source=replace(manifest.source, origin=None))
+    return rebuilt
+
+
 def _turn_capped(catalog: AgentCatalog, max_turns: int | None) -> AgentCatalog:
     """同一份目录，但每个角色的轮数预算都不超过 max_turns。
 
@@ -121,19 +207,27 @@ def _turn_capped(catalog: AgentCatalog, max_turns: int | None) -> AgentCatalog:
     """
     if max_turns is None:
         return catalog
-    capped = AgentCatalog()
-    for name in catalog.names():
-        manifest = catalog.get(name)
+    limit = max_turns
+
+    def cap(name: str, data: dict[str, object]) -> None:
         role_limit = _role_turns(catalog, name)
-        data: dict[str, object] = {
-            field.name: getattr(manifest, field.name)
-            for field in fields(manifest)
-            if field.name != 'source'
-        }
-        data['budget'] = {'turns': max_turns if role_limit is None else min(role_limit, max_turns)}
-        # system_prompt 已是解析后的正文；留着 origin 会让它被当成相对路径再解析一次。
-        capped.load_mapping(data, source=replace(manifest.source, origin=None))
-    return capped
+        data['budget'] = {'turns': limit if role_limit is None else min(role_limit, limit)}
+
+    return _rebuilt(catalog, cap)
+
+
+def _read_only(catalog: AgentCatalog) -> AgentCatalog:
+    """同一份目录，但每个角色只留只读白名单里的工具。
+
+    编排工具由 Runtime 另装、不在清单里，所以只读 run 里照样能派活；派出去的子 Agent 也由这份
+    目录造出，同样只读。类式角色自己装的工具不经清单，由 `_ReadOnlyGuard` 在调用时拦。
+    """
+
+    def keep_read_only(_: str, data: dict[str, object]) -> None:
+        declared = cast('tuple[str, ...]', data['tools'])
+        data['tools'] = [tool for tool in declared if tool in _READ_ONLY_TOOLS]
+
+    return _rebuilt(catalog, keep_read_only)
 
 
 def _record_detail(record: logging.LogRecord) -> str:
@@ -370,6 +464,19 @@ def _with_turn_limit(
     return Topology(slots=tuple(slots))
 
 
+def _read_only_topology(topology: Topology) -> Topology:
+    """每个槽的 extra_tools 只留只读白名单里的：槽不能把写工具加回来。"""
+    return Topology(
+        slots=tuple(
+            replace(
+                slot,
+                extra_tools=tuple(tool for tool in slot.extra_tools if tool in _READ_ONLY_TOOLS),
+            )
+            for slot in topology.slots
+        )
+    )
+
+
 @dataclass
 class _ChatSession:
     config: str
@@ -407,6 +514,13 @@ class RuntimeCliHost:
     def run_request(self, request: RunRequest) -> str:
         flags = _validated_request(request)
         if request.session is not None:
+            if request.no_write:
+                raise _config_error(
+                    '--no-write 用于一次新的 run',
+                    f'同时收到 session={request.session!r}',
+                    '去掉 --session 开一次只读的新 run；会话里的 Agent 建好时已经带着写工具，'
+                    '中途收不回来',
+                )
             overrides = [
                 name
                 for name, value in (
@@ -825,6 +939,7 @@ class RuntimeCliHost:
     ) -> str:
         config = self._config(request.config)
         catalog = _turn_capped(config.catalog, request.max_turns)
+        prompt = _READ_ONLY_NOTICE + request.prompt if request.no_write else request.prompt
         workspace, environment = self._open_workspace(config)
         tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
         try:
@@ -842,10 +957,19 @@ class RuntimeCliHost:
                 factories = catalog.freeze(
                     tools, models, facts, danger_judge=judge, danger_policy=policy
                 )
+                if request.no_write:
+                    # 先按正常 run 冻结了一遍：过滤会把拼错的工具名一起滤掉，只读 run 不该放过
+                    # 正常 run 会拒的配置。
+                    catalog = _read_only(catalog)
+                    factories = catalog.freeze(
+                        tools, models, facts, danger_judge=judge, danger_policy=policy
+                    )
                 runtime = Runtime(
                     agents={} if request.topology is not None else factories,
                     orchestration=True,
-                    modules=_agent_modules(self._workspace_root),
+                    modules=_agent_modules(
+                        self._workspace_root, tools if request.no_write else None
+                    ),
                     flags=flags,
                     confirmation_handler=MailboxConfirmationHandler(timeout=300),
                 )
@@ -876,6 +1000,8 @@ class RuntimeCliHost:
                             request.max_turns,
                             config.catalog,
                         )
+                        if request.no_write:
+                            topology = _read_only_topology(topology)
                         await runtime.assemble(
                             topology,
                             catalog,
@@ -885,7 +1011,7 @@ class RuntimeCliHost:
                             danger_judge=judge,
                             danger_policy=policy,
                         )
-                        delivered = await runtime.send_to_slot(root_slot.name, request.prompt)
+                        delivered = await runtime.send_to_slot(root_slot.name, prompt)
                         if not delivered.ok:
                             raise _config_error(
                                 f'拓扑根槽 {root_slot.name!r} 接受输入',
@@ -905,7 +1031,7 @@ class RuntimeCliHost:
                             )
                         agent_id = await runtime.spawn(
                             factory,
-                            query=request.prompt,
+                            query=prompt,
                             exit_mode=ExitMode.ZOMBIE,
                         )
                     context = await self._wait_with_pump(runtime, agent_id, pump)

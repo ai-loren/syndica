@@ -128,6 +128,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
             'retry_enabled=true',
             '--flag',
             'attempts=3',
+            '--no-write',
         ],
         host=host,
         io=CliIO(stdin=StringIO(), stdout=explicit_out, stderr=StringIO()),
@@ -147,6 +148,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'max_tokens': None,
         'max_wall_clock': None,
         'flags': (),
+        'no_write': False,
     }
     assert asdict(host.requests[1]) == {
         'prompt': 'review this',
@@ -159,7 +161,38 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'max_tokens': 4096,
         'max_wall_clock': 30.0,
         'flags': ('retry_enabled=true', 'attempts=3'),
+        'no_write': True,
     }
+
+
+def test_run_help_explains_no_write() -> None:
+    stdout = StringIO()
+
+    code = main(['run', '--help'], host=_Host(), io=CliIO(StringIO(), stdout, StringIO()))
+
+    help_text = ' '.join(stdout.getvalue().split())
+    assert code == 0
+    assert '--no-write' in help_text
+    assert '只读' in help_text
+    assert all(tool in help_text for tool in ('Read', 'Grep', 'Glob'))
+    assert not any(tool in help_text for tool in ('Write', 'Edit', 'Bash'))
+
+
+def test_no_write_with_a_session_fails_before_reaching_the_host() -> None:
+    host = _Host()
+    stderr = StringIO()
+
+    code = main(
+        ['run', 'go', '--no-write', '--session', 'agent-1'],
+        host=host,
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
+    )
+
+    assert code == 2
+    assert '期望: --no-write 用于一次新的 run' in stderr.getvalue()
+    assert '--session agent-1' in stderr.getvalue()
+    assert '去掉 --session' in stderr.getvalue()
+    assert host.requests == []
 
 
 @pytest.mark.parametrize(

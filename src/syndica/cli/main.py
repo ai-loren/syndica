@@ -33,6 +33,7 @@ class RunRequest:
     max_tokens: int | None = None
     max_wall_clock: float | None = None
     flags: tuple[str, ...] = ()
+    no_write: bool = False
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,14 @@ def _parser() -> _ArgumentParser:
     run.add_argument('--max-tokens', type=_positive_int)
     run.add_argument('--max-wall-clock', type=_positive_float)
     run.add_argument('--flag', action='append', default=[])
+    run.add_argument(
+        '--no-write',
+        action='store_true',
+        help=(
+            '只读 run：Agent 只能用 Read、Grep、Glob 与派活、问人的工具，不会改动工作区；'
+            '不能与 --session 同用'
+        ),
+    )
     chat = commands.add_parser('chat')
     chat.add_argument('--max-turns', type=_positive_int)
     for resource in ('agents', 'topology', 'flags'):
@@ -309,6 +318,14 @@ def main(
         with redirect_stdout(streams.stdout), redirect_stderr(streams.stderr):
             namespace = parser.parse_args(args)
         flags = _flag_assignments(namespace.flag) if namespace.command == 'run' else ()
+        if namespace.command == 'run' and namespace.no_write and namespace.session is not None:
+            raise _ParserExit(
+                2,
+                '期望: --no-write 用于一次新的 run\n'
+                f'实际: 同时收到 --session {namespace.session}\n'
+                '下一步: 去掉 --session 开一次只读的新 run；会话里的 Agent 建好时已经带着写工具，'
+                '中途收不回来',
+            )
     except _ParserExit as exc:
         if exc.message:
             _write(streams.stderr, exc.message)
@@ -355,5 +372,6 @@ def main(
         max_tokens=namespace.max_tokens,
         max_wall_clock=namespace.max_wall_clock,
         flags=flags,
+        no_write=namespace.no_write,
     )
     return _host_call(lambda: host.run_request(request), streams)
