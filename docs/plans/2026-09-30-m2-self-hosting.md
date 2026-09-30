@@ -200,6 +200,11 @@ CONFIRM 只在可信轨迹里到得了人手上，也就是 Agent 还没读过�
   访问网络；Agent 写的代码（包括测试）在 Bash 与宿主复核里执行时同样如此；
 - 同一用户的进程读得到宿主进程启动时的环境（Linux 的 `/proc/<pid>/environ`、macOS 的 `ps -E`），在 shell
   里 export 的 API key 因此对它可见；
+- 登录钥匙串对同一用户的进程是开着的：`gh auth token --user <login>`、`security find-generic-password`
+  取得到 gh 与其它工具存的令牌；
+- `HOME` 照常交给 Agent（uv、pyright 的缓存与已装的解释器都在它下面），于是 `~/.netrc`、`~/.npmrc`、
+  `~/.pypirc`、`~/.docker/config.json` 这类凭证文件会被对应工具自动用上（git 的联网子命令都不在只读集合里，
+  已被 D4 拦下；`npm publish`、`twine upload` 这类不经 git 的写操作拦不住）；
 - 调用 `setsid` 或 `setpgid` 的进程（GNU `timeout` 不带 `--foreground`、bash 的 `set -m`）能逃出进程组
   清理（D9）；二次 fork 不改变进程组，逃不出去。
 
@@ -214,9 +219,15 @@ CONFIRM 只在可信轨迹里到得了人手上，也就是 Agent 还没读过�
   CREDENTIALS AUTH COOKIE` 之一（不区分大小写）就拒收，写在 `pass_env` 里也拒，报三件套错误说明原因。
   按词匹配而不是子串：`GIT_AUTHOR_NAME` 不是密钥，`SSH_AUTH_SOCK` 是（Agent 不拿 ssh agent）。这条规则只
   决定「不交给 Agent」；哪些值要打码是 D12 的另一条更窄的规则；
-- 宿主另设四个值：`GIT_TERMINAL_PROMPT=0`、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL` 指向本次 run 的
-  一个空文件、`GH_CONFIG_DIR` 指向本次 run 的一个空目录（两者都在工作区外的临时目录里，run 结束删除）。
-  Agent 于是用不上用户的 git 凭证助手、别名、hooksPath 与 `gh` 的登录。
+- 宿主另设六个值：`GIT_TERMINAL_PROMPT=0`、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL` 指向本次 run 的
+  一个只含 `safe.bareRepository=explicit` 的文件、`GH_CONFIG_DIR` 指向本次 run 的一个空目录（两者都在工作区
+  外的临时目录里，run 结束删除；临时目录按目录身份落在工作区里时拒绝运行，APFS 不分大小写，拼写比较不可靠），
+  以及 `GH_TOKEN`、`GH_ENTERPRISE_TOKEN` 两个占位令牌——配置目录里找不到登录时 gh 会去钥匙串里取，空目录
+  挡不住，占位令牌让它认证失败。Agent 于是用不上用户的 git 凭证助手、别名、hooksPath，失手调 gh 也不会在远端
+  留下效果（刻意去钥匙串取见 D5）；`safe.bareRepository` 那一项让工作区里种下的裸仓库不再被 git 自动用上
+  （默认值 `all`），它只在全局这类受保护配置里才被认。`pass_env` 不能透传这六个名字，也不能透传会重新打开
+  git / gh 配置的名字（`GIT_CONFIG*`、`GIT_SSH*`、`*ASKPASS`、`GIT_DIR`、`GIT_WORK_TREE`、`GIT_EXEC_PATH`、
+  `GH_*`）。
 
 值在建工作区时拷一份；run、chat、doctor 三处都用同一个函数。stdin 接 `/dev/null` 在内核做（D9）。
 
@@ -605,12 +616,17 @@ shell 开关。
 
 #### T5 — CLI：`workspace` 配置段与 Agent 命令环境
 
+**状态：completed**（本地验证协议：五道门禁全绿；CLI 用例都带自动装置，逐条断言没留下 Agent 的临时目录；
+变异见提交说明；对抗评审报的 gh 钥匙串、chat 收尾泄漏、APFS 大小写绕过、`pass_env` 透传 git 配置变量已修，
+`~/.netrc` 与钥匙串的刻意读取写进 D5 转 M5。Linux 补跑待 CI 额度恢复）
+
 **Files:** `cli/config.py`、`cli/host.py`、新模块 `cli/environment.py`、对应测试。
 
 - 用例：Agent 的 Bash 里 `printenv` 看得到 PATH、HOME，看不到宿主环境里的 `GEMINI_API_KEY`、
   `OPENROUTER_API_KEY`、`SSH_AUTH_SOCK`、`FOO_TOKEN`，也看不到不在白名单里的普通变量 `ZZZ_PLAIN`；
   `GIT_AUTHOR_NAME` 可以经 `pass_env` 透传；`pass_env: [MY_API_KEY]` 被拒；`GIT_CONFIG_GLOBAL` 与
-  `GH_CONFIG_DIR` 指向工作区外的空文件和空目录、run 结束后被删；`verify` 与 `protected` 的校验；CLI 确实把
+  `GH_CONFIG_DIR` 指向工作区外、只含 `safe.bareRepository=explicit` 的文件和空目录、run 结束后被删；
+  `verify` 与 `protected` 的校验；CLI 确实把
   `output_limit=10_000` 交给 `local_tools`；run、chat、doctor 三处各一条用例证明用的是同一份环境。
 - 变异：名字规则逐个删词；按子串匹配（`GIT_AUTHOR_NAME` 被拒）；漏掉 chat 路径；白名单换成全量减黑名单；
   不传 `output_limit`。
@@ -863,7 +879,8 @@ GitHub Free 每月 2000 分钟的 Actions 额度在 2026-10 已经用完，下�
   - 项目配置首次使用时的信任确认；清单 `system_prompt` 路径写错时静默当成提示词正文；按角色区分的危险策略（M4）；
   - `untrusted_high_risk` 的 `ask` / `allow` 让不可信轨迹里的高风险调用比宿主策略更松（M5，与溯源链一起重审）；
   - 沙箱与网络访问控制、Portal 层的正式输出上限、`setsid` / `setpgid` 逃出进程组；按组号杀进程时，组在
-    收拾期间变空、组号又被立刻复用的窄窗口（要按 cgroup 或会话杀才关得上）（M5）；
+    收拾期间变空、组号又被立刻复用的窄窗口（要按 cgroup 或会话杀才关得上）；给 Agent 一个临时 `HOME`
+    （同时把 uv、pyright 的缓存与解释器目录显式指回去），挡住 `~/.netrc` 这类被工具自动使用的凭证文件（M5）；
   - CLI 里的复核、handoff、git 收尾与环境过滤在 M9 的 server 需要复用时迁出 `syndica.cli`（surface 之间
     不能互相依赖）；
   - 从 `syndica-dev` 提炼通用开发预设（有需求时）；CI 矩阵（M12）。
@@ -934,6 +951,12 @@ GitHub Free 每月 2000 分钟的 Actions 额度在 2026-10 已经用完，下�
   6.2 GB、一次 poll 解码停顿 5.85 秒（改为每条流留开头与结尾各一段）；`kill` / `close()` 对早已结束的命令
   按旧组号发 SIGKILL，组号被复用时杀的是别人（改为只对没收拾完的命令发信号）；`create_subprocess_exec`
   在 fork 之后自己还有一次挂起，那里到达的取消只杀 shell、留下整个组（改为 shield 住拉起、完成时再杀）。
+- T5，对抗评审实测：`GH_CONFIG_DIR` 指向空目录时，gh 在本机照样从钥匙串取出令牌（`gh auth token`、
+  `gh auth git-credential get`），D6 原先「用不上 gh 的登录」的说法不成立，改为宿主另设占位令牌；`~/.netrc`
+  照样让 Agent 的 git 带上凭证（本机没有这个文件，没有实际暴露），写进 D5、临时 HOME 转 M5。同一轮还修了：
+  读人类输入的泵失败之后 chat 收尾不再删临时目录、`close()` 再抛一次；临时目录的「在工作区里」按拼写判，
+  APFS 上换个大小写就绕过（改为按目录身份）；`pass_env` 能透传 `GIT_CONFIG_PARAMETERS` 这类把凭证助手与
+  裸仓库重新打开的名字。
 - T4，执行环境把同一条长命令执行了两遍、两遍时间上重叠：两个变异跑手同时改同一批文件，其中一个的
   `git add` 把另一个施加中的变异暂存了进去。基线自检（施加前先核对 sha256）当场报了漂移、没有带着残留
   继续跑。之后变异跑手加了进程锁、改在后台运行。

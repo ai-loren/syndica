@@ -260,3 +260,165 @@ topologies:
     config = load_config(path)
     with pytest.raises(TypeError):
         config.topologies['other'] = config.topologies['default']  # pyright: ignore[reportIndexIssue]
+
+
+# --- workspace 段 --------------------------------------------------------------------------------
+
+
+def _workspace_config(tmp_path: Path, body: str) -> CliConfig:
+    return load_config(_write(tmp_path / 'syndica.yaml', f'version: 1\nworkspace:\n{body}'))
+
+
+def test_the_workspace_section_is_read_in_the_order_written(tmp_path: Path) -> None:
+    config = _workspace_config(
+        tmp_path,
+        '  pass_env: [NO_COLOR, GIT_AUTHOR_NAME]\n'
+        '  verify: [uv run ruff check ., uv run pytest -q]\n'
+        '  protected: [pyproject.toml, "scripts/**", "**/conftest.py"]\n',
+    )
+
+    assert config.workspace.pass_env == ('NO_COLOR', 'GIT_AUTHOR_NAME')
+    assert config.workspace.verify == ('uv run ruff check .', 'uv run pytest -q')
+    assert config.workspace.protected == ('pyproject.toml', 'scripts/**', '**/conftest.py')
+
+
+def test_a_config_without_a_workspace_section_has_an_empty_one(tmp_path: Path) -> None:
+    config = load_config(_write(tmp_path / 'syndica.yaml', 'version: 1\n'))
+
+    assert (config.workspace.pass_env, config.workspace.verify) == ((), ())
+    assert config.workspace.protected == ()
+
+
+@pytest.mark.parametrize(
+    'word',
+    [
+        'KEY',
+        'KEYS',
+        'TOKEN',
+        'TOKENS',
+        'SECRET',
+        'SECRETS',
+        'PASSWORD',
+        'PASSWD',
+        'PASS',
+        'PAT',
+        'CREDENTIAL',
+        'CREDENTIALS',
+        'AUTH',
+        'COOKIE',
+    ],
+)
+def test_every_secret_word_in_a_pass_env_name_is_refused(tmp_path: Path, word: str) -> None:
+    with pytest.raises(ConfigError) as caught:
+        _workspace_config(tmp_path, f'  pass_env: [MY_{word}_X]\n')
+
+    assert '密钥' in caught.value.expected
+    assert f'MY_{word}_X' in caught.value.received
+    assert 'Agent' in caught.value.next_action
+
+
+@pytest.mark.parametrize(
+    'name', ['MY_API_KEY', 'SSH_AUTH_SOCK', 'my_token', 'Github_Pat', 'FOO_TOKEN']
+)
+def test_a_pass_env_name_that_is_a_secret_by_word_is_refused(tmp_path: Path, name: str) -> None:
+    with pytest.raises(ConfigError):
+        _workspace_config(tmp_path, f'  pass_env: [{name}]\n')
+
+
+@pytest.mark.parametrize(
+    'name', ['GIT_AUTHOR_NAME', 'COMPASS_DIR', 'KEYBOARD_LAYOUT', 'PATHS_EXTRA', 'NO_COLOR']
+)
+def test_a_name_that_merely_contains_a_secret_word_is_accepted(tmp_path: Path, name: str) -> None:
+    assert _workspace_config(tmp_path, f'  pass_env: [{name}]\n').workspace.pass_env == (name,)
+
+
+@pytest.mark.parametrize(
+    'name', ['GIT_TERMINAL_PROMPT', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GH_CONFIG_DIR']
+)
+def test_a_variable_the_host_sets_itself_cannot_be_passed_through(
+    tmp_path: Path, name: str
+) -> None:
+    with pytest.raises(ConfigError) as caught:
+        _workspace_config(tmp_path, f'  pass_env: [{name}]\n')
+
+    assert '宿主' in caught.value.expected
+    assert name in caught.value.next_action
+
+
+@pytest.mark.parametrize('name', ['NAME=1', '1ABC', 'A-B', '"A B"'])
+def test_a_pass_env_entry_that_is_not_a_variable_name_is_refused(tmp_path: Path, name: str) -> None:
+    with pytest.raises(ConfigError) as caught:
+        _workspace_config(tmp_path, f'  pass_env: [{name}]\n')
+
+    assert '环境变量名' in caught.value.expected
+
+
+@pytest.mark.parametrize(
+    ('body', 'anchor'),
+    [
+        ('  verify: uv run pytest\n', 'YAML 列表'),
+        ('  verify: [""]\n', '非空白'),
+        ('  verify: ["  "]\n', '非空白'),
+        ('  verify: [3]\n', '非空白'),
+        ('  verify: ["a\\0b"]\n', 'NUL'),
+        ('  protected: ["x\\0"]\n', 'NUL'),
+        ('  protected: ["a/../b"]\n', '不含 ..'),
+        ('  pass_env: ["A\\n"]\n', '环境变量名'),
+        ('  verify: [a, a]\n', '只出现一次'),
+        ('  protected: [/etc/passwd]\n', '相对工作区根'),
+        ('  protected: ["../x/**"]\n', '不含 ..'),
+        ('  protected: [a, a]\n', '只出现一次'),
+        ('  pass_env: [A, A]\n', '只出现一次'),
+        ('  verfy: [x]\n', '只含'),
+    ],
+)
+def test_a_malformed_workspace_entry_is_refused_with_the_fix(
+    tmp_path: Path, body: str, anchor: str
+) -> None:
+    with pytest.raises(ConfigError) as caught:
+        _workspace_config(tmp_path, body)
+
+    assert anchor in caught.value.expected
+
+
+@pytest.mark.parametrize('value', ['[verify]', 'null', 'false', '[]', '"verify"'])
+def test_a_workspace_section_that_is_not_a_mapping_is_refused(tmp_path: Path, value: str) -> None:
+    with pytest.raises(ConfigError) as caught:
+        load_config(_write(tmp_path / 'syndica.yaml', f'version: 1\nworkspace: {value}\n'))
+
+    assert 'Mapping' in caught.value.expected
+
+
+@pytest.mark.parametrize(
+    'name',
+    [
+        'GIT_CONFIG_PARAMETERS',
+        'GIT_CONFIG_COUNT',
+        'GIT_CONFIG_VALUE_0',
+        'GIT_SSH_COMMAND',
+        'GIT_SSH',
+        'GIT_ASKPASS',
+        'SSH_ASKPASS',
+        'GIT_DIR',
+        'GIT_WORK_TREE',
+        'GIT_EXEC_PATH',
+        'GIT_NAMESPACE',
+        'GH_HOST',
+    ],
+)
+def test_a_name_that_reopens_git_or_gh_configuration_is_refused(tmp_path: Path, name: str) -> None:
+    with pytest.raises(ConfigError) as caught:
+        _workspace_config(tmp_path, f'  pass_env: [{name}]\n')
+
+    assert 'git' in caught.value.expected
+    assert name in caught.value.next_action
+
+
+def test_a_yaml_boolean_in_a_list_of_strings_is_refused_with_a_quoting_hint(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ConfigError) as caught:
+        _workspace_config(tmp_path, '  pass_env: [ON]\n')
+
+    assert 'bool' in caught.value.received
+    assert '引号' in caught.value.next_action

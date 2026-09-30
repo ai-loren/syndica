@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import platform
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, replace
@@ -14,6 +15,7 @@ from types import MappingProxyType
 from typing import cast
 
 from syndica.cli.config import CliConfig, load_config
+from syndica.cli.environment import AgentEnvironment, agent_environment
 from syndica.cli.main import CliIO, InspectRequest, RunRequest
 from syndica.kernel import (
     LLM,
@@ -44,6 +46,9 @@ __all__ = ['RuntimeCliHost']
 
 ModelFactory = Callable[[str], LLM]
 _RUNTIME_LOGGER = 'syndica.kernel.runtime'
+# Bash 每条输出流最多展示给模型的字符数。整份 pytest 输出进上下文会挤掉别的一切，而汇总行在末尾，
+# local_tools 截断时留开头 20%、结尾 80%。
+_OUTPUT_LIMIT = 10_000
 
 
 class _RuntimeErrorCapture(logging.Handler):
@@ -345,13 +350,18 @@ class _ChatSession:
     config: str
     runtime: Runtime
     workspace: LocalWorkspace
+    environment: AgentEnvironment
     agent_id: str
     subscription: Subscription
     pump: asyncio.Task[None]
 
 
 class RuntimeCliHost:
-    """Own Runtime and workspace lifecycles for synchronous console commands."""
+    """Own Runtime and workspace lifecycles for synchronous console commands.
+
+    `environ` 是宿主自己的环境（缺省 `os.environ`）；Agent 只拿到其中白名单里的那几项，见
+    `syndica.cli.environment`。
+    """
 
     def __init__(
         self,
@@ -359,10 +369,12 @@ class RuntimeCliHost:
         io: CliIO,
         model_factory: ModelFactory,
         workspace_root: str | Path,
+        environ: Mapping[str, str] | None = None,
     ) -> None:
         self._io = io
         self._model_factory = model_factory
         self._workspace_root = Path(workspace_root)
+        self._environ: Mapping[str, str] = os.environ if environ is None else environ
         self._runner = asyncio.Runner()
         self._closed = False
         self._sessions: dict[str, _ChatSession] = {}
@@ -502,6 +514,20 @@ class RuntimeCliHost:
             return _default_config(file)
         return load_config(file)
 
+    def _open_workspace(self, config: CliConfig) -> tuple[LocalWorkspace, AgentEnvironment]:
+        """run、chat、doctor 共用的入口：Agent 在哪条路径上都拿到同一份环境。"""
+        environment = agent_environment(
+            self._environ, config.workspace.pass_env, workspace_root=self._workspace_root
+        )
+        try:
+            workspace = LocalWorkspace(
+                str(self._workspace_root), shell='/bin/sh', env=environment.values
+            )
+        except BaseException:
+            environment.remove()
+            raise
+        return workspace, environment
+
     def _prompt(self, text: str) -> None:
         self._io.stdout.write(text)
         self._io.stdout.flush()
@@ -581,13 +607,9 @@ class RuntimeCliHost:
 
     async def _doctor(self, path: str) -> str:
         config = self._config(path)
-        workspace = LocalWorkspace(
-            str(self._workspace_root),
-            shell='/bin/sh',
-            env={},
-        )
+        workspace, environment = self._open_workspace(config)
         try:
-            tools = local_tools(workspace.portal())
+            tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
             names = _model_names(config)
             models: Mapping[str, LLM] = {name: self._model_factory(name) for name in names}
             config.catalog.freeze(
@@ -600,26 +622,26 @@ class RuntimeCliHost:
                 ),
             )
         finally:
-            await workspace.close()
+            try:
+                await workspace.close()
+            finally:
+                environment.remove()
         return (
             f'config: ok {config.source}\n'
             f'models: ok {", ".join(names)}\n'
-            f'workspace: ok {self._workspace_root}'
+            f'workspace: ok {self._workspace_root}\n'
+            f'env: {" ".join(environment.values)}'
         )
 
     async def _open_chat(self, path: str, max_turns: int | None) -> str:
         config = self._config(path)
         catalog = _turn_capped(config.catalog, max_turns)
-        workspace = LocalWorkspace(
-            str(self._workspace_root),
-            shell='/bin/sh',
-            env={},
-        )
+        workspace, environment = self._open_workspace(config)
         runtime: Runtime | None = None
         subscription: Subscription | None = None
         pump: asyncio.Task[None] | None = None
         try:
-            tools = local_tools(workspace.portal())
+            tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
             models: Mapping[str, LLM] = {
                 name: self._model_factory(name) for name in _model_names(config)
             }
@@ -652,19 +674,23 @@ class RuntimeCliHost:
                 config=path,
                 runtime=runtime,
                 workspace=workspace,
+                environment=environment,
                 agent_id=agent_id,
                 subscription=subscription,
                 pump=pump,
             )
             return agent_id
         except BaseException:
-            if runtime is not None:
-                await runtime.shutdown()
-            if pump is not None:
-                await pump
-            if subscription is not None:
-                subscription.close()
-            await workspace.close()
+            try:
+                if runtime is not None:
+                    await runtime.shutdown()
+                if pump is not None:
+                    await asyncio.gather(pump, return_exceptions=True)
+                if subscription is not None:
+                    subscription.close()
+                await workspace.close()
+            finally:
+                environment.remove()
             raise
 
     async def _run_session(self, session: _ChatSession, prompt: str) -> str:
@@ -731,10 +757,15 @@ class RuntimeCliHost:
         sessions = list(self._sessions.values())
         self._sessions.clear()
         for session in sessions:
-            await session.runtime.shutdown()
-            await session.pump
-            session.subscription.close()
-            await session.workspace.close()
+            # 读人类输入的泵失败时，它的异常在那一轮已经交给了调用方；收尾再抛一次会让后面的
+            # 工作区与临时目录都不再被收拾。
+            try:
+                await session.runtime.shutdown()
+                await asyncio.gather(session.pump, return_exceptions=True)
+                session.subscription.close()
+                await session.workspace.close()
+            finally:
+                session.environment.remove()
 
     async def _wait_with_pump(
         self,
@@ -759,12 +790,8 @@ class RuntimeCliHost:
     ) -> str:
         config = self._config(request.config)
         catalog = _turn_capped(config.catalog, request.max_turns)
-        workspace = LocalWorkspace(
-            str(self._workspace_root),
-            shell='/bin/sh',
-            env={},
-        )
-        tools = local_tools(workspace.portal())
+        workspace, environment = self._open_workspace(config)
+        tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
         try:
             with _CaptureRuntimeErrors() as runtime_errors:
                 model_names = _model_names(config)
@@ -854,4 +881,7 @@ class RuntimeCliHost:
                     await pump
                     subscription.close()
         finally:
-            await workspace.close()
+            try:
+                await workspace.close()
+            finally:
+                environment.remove()

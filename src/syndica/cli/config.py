@@ -16,6 +16,7 @@ import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
+from syndica.cli.environment import HOST_SET_ENV, looks_secret, reopens_git, valid_env_name
 from syndica.kernel import (
     AgentCatalog,
     AgentSlot,
@@ -26,9 +27,10 @@ from syndica.kernel import (
     register_builtins,
 )
 
-__all__ = ['CliConfig', 'load_config']
+__all__ = ['CliConfig', 'WorkspaceConfig', 'load_config']
 
-_ROOT_KEYS = frozenset({'version', 'agents', 'topologies'})
+_ROOT_KEYS = frozenset({'version', 'agents', 'topologies', 'workspace'})
+_WORKSPACE_KEYS = frozenset({'pass_env', 'verify', 'protected'})
 _TOPOLOGY_KEYS = frozenset({'slots'})
 _SLOT_KEYS = frozenset(
     {
@@ -98,12 +100,26 @@ _UniqueSafeLoader.add_constructor(
 
 
 @dataclass(frozen=True)
+class WorkspaceConfig:
+    """`.syndica.yaml` 的 `workspace:` 段。三项都可省略。
+
+    `pass_env` 是固定白名单之外再交给 Agent 的环境变量名；`verify` 是宿主复核与 `doctor --verify`
+    逐条运行的命令；`protected` 是改了就不自动提交的相对路径 glob。
+    """
+
+    pass_env: tuple[str, ...] = ()
+    verify: tuple[str, ...] = ()
+    protected: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class CliConfig:
     """A validated CLI configuration snapshot."""
 
     source: str
     catalog: AgentCatalog
     topologies: Mapping[str, Topology]
+    workspace: WorkspaceConfig = WorkspaceConfig()
 
 
 def load_config(path: str | Path) -> CliConfig:
@@ -136,7 +152,100 @@ def load_config(path: str | Path) -> CliConfig:
         source=str(file),
         catalog=catalog,
         topologies=MappingProxyType(topologies),
+        workspace=_workspace(root.get('workspace', {})),
     )
+
+
+def _workspace(value: object) -> WorkspaceConfig:
+    if not isinstance(value, Mapping):
+        raise _config(
+            'workspace 是只含 pass_env / verify / protected 的 Mapping',
+            f'收到 workspace={value!r}，类型是 {type(value).__name__}',
+            '写成 `workspace: {verify: [...]}`；不需要就省略整段',
+        )
+    raw = cast(Mapping[object, object], value)
+    unknown = [str(key) for key in raw if not isinstance(key, str) or key not in _WORKSPACE_KEYS]
+    if unknown:
+        raise _config(
+            f'workspace 只含 {sorted(_WORKSPACE_KEYS)!r}',
+            f'未知键 {sorted(unknown)!r}',
+            '删除这些键；未识别的配置不能静默忽略，否则用户会以为它已经生效',
+        )
+    fields = cast(Mapping[str, object], raw)
+    pass_env = _strings(fields.get('pass_env', ()), 'workspace.pass_env')
+    for name in pass_env:
+        if not valid_env_name(name):
+            raise _config(
+                'workspace.pass_env 的每一项是环境变量名（字母、数字、下划线，不以数字开头）',
+                f'收到 {name!r}',
+                '改成变量名本身，例如 NO_COLOR；不要写 NAME=值',
+            )
+        if looks_secret(name):
+            raise _config(
+                'workspace.pass_env 不含像密钥的名字（按 _ 切开后没有 KEY、TOKEN、AUTH 这类词）',
+                f'收到 {name!r}',
+                (
+                    f'从 pass_env 删掉 {name}：交给 Agent 的环境变量会出现在它能读、能打印的地方。'
+                    'Agent 需要调用的服务如果要凭证，让宿主去调它'
+                ),
+            )
+        if name in HOST_SET_ENV:
+            raise _config(
+                f'workspace.pass_env 不含宿主自己设的 {list(HOST_SET_ENV)!r}',
+                f'收到 {name!r}',
+                f'从 pass_env 删掉 {name}：宿主为每次 run 设它，透传会让 Agent 拿回你的 git / gh '
+                '配置',
+            )
+        if reopens_git(name):
+            raise _config(
+                'workspace.pass_env 不含会重新打开 git / gh 配置的名字'
+                '（GIT_CONFIG*、GIT_SSH*、*ASKPASS、GIT_DIR、GIT_WORK_TREE、GIT_EXEC_PATH、GH_*）',
+                f'收到 {name!r}',
+                (
+                    f'从 pass_env 删掉 {name}：它让 Agent 的 git 或 gh 重新用上配置、凭证或另一个'
+                    '仓库，绕过宿主为每次 run 准备的空配置'
+                ),
+            )
+    protected = _strings(fields.get('protected', ()), 'workspace.protected')
+    for pattern in protected:
+        if pattern.startswith('/') or '..' in pattern.split('/'):
+            raise _config(
+                'workspace.protected 的每一项是相对工作区根、不含 .. 的 glob',
+                f'收到 {pattern!r}',
+                '改成相对路径，例如 pyproject.toml 或 scripts/**',
+            )
+    return WorkspaceConfig(
+        pass_env=pass_env,
+        verify=_strings(fields.get('verify', ()), 'workspace.verify'),
+        protected=protected,
+    )
+
+
+def _strings(value: object, field: str) -> tuple[str, ...]:
+    items = _sequence(value, field)
+    seen: set[str] = set()
+    result: list[str] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, str) or not item.strip() or '\0' in item:
+            raise _config(
+                f'{field}[{index}] 是非空白、不含 NUL 字节的字符串',
+                f'收到 {item!r}，类型是 {type(item).__name__}',
+                (
+                    f'YAML 把 on / off / yes / no / true 读成布尔值；要当字符串就给 {field} 的'
+                    '这一项加引号'
+                    if isinstance(item, bool)
+                    else f'把 {field} 写成字符串列表，删掉空项与 NUL 字节'
+                ),
+            )
+        if item in seen:
+            raise _config(
+                f'{field} 的每一项只出现一次',
+                f'{item!r} 重复出现',
+                '删掉重复的那一项',
+            )
+        seen.add(item)
+        result.append(item)
+    return tuple(result)
 
 
 def _yaml_file(path: object) -> Path:
@@ -167,7 +276,7 @@ def _root_mapping(value: object, file: Path) -> Mapping[str, object]:
         raise _config(
             '配置根是 Mapping，至少含 version: 1',
             f'{str(file)!r} 的根是 {type(value).__name__}：{value!r}',
-            '把文件改成 version / agents / topologies 组成的单个 YAML 对象',
+            '把文件改成 version / agents / topologies / workspace 组成的单个 YAML 对象',
         )
     root = cast(Mapping[object, object], value)
     non_strings = [key for key in root if not isinstance(key, str)]
@@ -175,7 +284,7 @@ def _root_mapping(value: object, file: Path) -> Mapping[str, object]:
         raise _config(
             '配置根的键都是字符串',
             f'非字符串键为 {non_strings!r}',
-            '把这些键改成 version / agents / topologies 中的字符串',
+            '把这些键改成 version / agents / topologies / workspace 中的字符串',
         )
     unknown = [str(key) for key in root if key not in _ROOT_KEYS]
     if unknown:
