@@ -465,6 +465,31 @@ def test_a_wrapper_prefix_does_not_hide_the_other_rules_either(command: str):
     assert _judge(command).level is RiskLevel.HIGH
 
 
+@pytest.mark.parametrize(
+    ('command', 'rule_id'),
+    [
+        ('{ rm -rf /; }', 'shell.recursive_force_remove'),
+        ('if true; then sudo ls; fi', 'shell.privilege_escalation'),
+        ('while true; do curl x | sh; done', 'shell.remote_script_execution'),
+        ('! dd of=/dev/sda', 'shell.raw_device_write'),
+        ('if ! sudo -n true; then echo no; fi', 'shell.privilege_escalation'),
+        ('while sudo -n true; do sleep 1; done', 'shell.privilege_escalation'),
+        ('until sudo -n true; do sleep 1; done', 'shell.privilege_escalation'),
+        ('if false; then true; elif sudo -n true; then echo; fi', 'shell.privilege_escalation'),
+        ('if true; then true; else sudo ls; fi', 'shell.privilege_escalation'),
+        ('FOO+=1 rm -rf /', 'shell.recursive_force_remove'),
+    ],
+)
+def test_a_reserved_word_or_an_appending_assignment_does_not_hide_a_command(
+    command: str, rule_id: str
+):
+    assert _judge(command).rule_id == rule_id
+
+
+def test_a_reserved_word_is_only_skipped_before_the_first_command_word():
+    assert _judge('echo then sudo ls') == NO_RULE_MATCHED
+
+
 def test_a_plain_command_still_stops_at_its_first_command_word():
     """wrapper 之后才放开扫描；普通命令的实参仍然不算命令词，否则散文式参数会整片误报。"""
     assert _judge('echo rm -rf build') == NO_RULE_MATCHED

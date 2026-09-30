@@ -248,6 +248,7 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # - `correlation_of`：`Waiter` 密封分发的内部收口，`wait_for` 自己调。
 # - 八个工具类不进承诺面，宿主用 `local_tools` 按键取。
 # - `RuleTablePolicy`：M2 开发期宿主用的按表处置；进不进承诺面在 M12 冻结公开 API 时定。
+# - 三个规则工厂（`git_state_change_rule` 等）：M2 开发期宿主组合的可选规则，同上待 M12 定。
 _WITHHELD: tuple[str, ...] = (
     'Bash',
     'BashOutput',
@@ -276,8 +277,10 @@ _WITHHELD: tuple[str, ...] = (
     'Write',
     'correlation_of',
     'disposition_of',
+    'git_state_change_rule',
     'install_plugins',
     'parse_mapping',
+    'path_outside_workspace_rule',
     'register_tool',
     'resolve_tool_names',
     'tool_name_disagreement',
@@ -285,6 +288,7 @@ _WITHHELD: tuple[str, ...] = (
     'validate_danger_options',
     'validate_max_concurrency',
     'validate_tool_names',
+    'workspace_root_removal_rule',
 )
 
 

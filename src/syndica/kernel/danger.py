@@ -28,12 +28,17 @@
 
 from __future__ import annotations
 
+import fnmatch
 import inspect
+import os
+import posixpath
 import re
 from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Protocol, cast, runtime_checkable
 
 from syndica.kernel.context import ToolCall, TrustLevel
@@ -60,7 +65,10 @@ __all__ = [
     'RiskLevel',
     'RuleTablePolicy',
     'disposition_of',
+    'git_state_change_rule',
+    'path_outside_workspace_rule',
     'validate_danger_options',
+    'workspace_root_removal_rule',
 ]
 
 
@@ -234,11 +242,15 @@ class MailboxConfirmationHandler:
         )
 
 
-# 命令词之前可以出现的环境变量赋值（`FOO=1 rm -rf x`）。
-_ASSIGNMENT = re.compile(r'\A[A-Za-z_][A-Za-z0-9_]*=')
+# 命令词之前可以出现的环境变量赋值（`FOO=1 rm -rf x`，bash 还收 `FOO+=1 rm -rf x`）。
+_ASSIGNMENT = re.compile(r'\A[A-Za-z_][A-Za-z0-9_]*\+?=')
+# 开启一条命令、自己却不是命令的保留字：`{ rm -rf /; }`、`if x; then rm -rf /; fi` 里真正的命令词
+# 在它们后面。不当它们是命令词，`{ … }` 与 `then` 就能藏住任何一条命令。
+_RESERVED_WORDS = frozenset({'!', '{', 'do', 'elif', 'else', 'if', 'then', 'until', 'while'})
 # 这些命令后面跟的仍然是一条命令，因此命令词要继续往后找。
 _WRAPPERS = frozenset(
     {
+        'builtin',
         'chrt',
         'command',
         'doas',
@@ -282,6 +294,8 @@ _INTERPRETERS = frozenset(
         'zsh',
     }
 )
+# 会把 stdin 当脚本执行的程序：heredoc 喂给它们时，正文就是命令。
+_STDIN_RUNNERS = _INTERPRETERS | {'.', 'source'}
 # `/dev/` 下不是块设备的那些：写它们不毁任何原状。
 _PSEUDO_DEVICES = frozenset(
     {
@@ -328,37 +342,122 @@ def _end_of_redirection(text: str, start: int) -> int:
     return index
 
 
+# 重定向操作符之后那个词的去向，见 `_redirection`。
+_TARGET = 'target'
+_HEREDOC = 'heredoc'
+_HEREDOC_TABS = 'heredoc-tabs'
+_DISCARD = 'discard'
+
+
+def _redirection(source: str, index: int, *, thorough: bool) -> tuple[str, int]:
+    """(操作符后面那个词的去向, 操作符结束的位置)。"""
+    if thorough and source.startswith('<<<', index):
+        return _DISCARD, index + 3
+    if thorough and source.startswith('<<-', index):
+        return _HEREDOC_TABS, index + 3
+    if thorough and source.startswith('<<', index):
+        return _HEREDOC, index + 2
+    return _TARGET, _end_of_redirection(source, index)
+
+
+def _after_heredocs(
+    source: str,
+    start: int,
+    heredocs: Sequence[tuple[str, bool, bool]],
+    line: Sequence[tuple[bool, tuple[str, ...]]],
+) -> int:
+    """这一行登记的 heredoc 正文结束之后的位置；不该跳过时就是 start。
+
+    只跳过写进文件的数据：结束标记带引号（正文不展开，里面的 `$(…)` 不执行），并且这一行既没有
+    管道、也没有会把 stdin 当脚本执行的程序（`sh <<'EOF'` 执行的正是正文）。管道单独算：接在后面
+    的程序不在解释器名单里（`| lua`）时，正文照样可能被执行。
+    找不到结束标记也不跳：续行符折叠、写错的标记都会让它落空，而跳到末尾会把后面真正的命令一起
+    藏起来。
+    """
+    if not heredocs or not all(quoted for _, quoted, _ in heredocs):
+        return start
+    for piped, tokens in line:
+        if piped or any(
+            _basename(tokens[index]) in _STDIN_RUNNERS for index in _program_candidates(tokens)
+        ):
+            return start
+    position = start
+    for delimiter, _, strip_tabs in heredocs:
+        while True:
+            if position >= len(source):
+                return start
+            newline = source.find('\n', position)
+            stop = len(source) if newline == -1 else newline
+            text = source[position:stop]
+            position = stop + 1
+            if (text.lstrip('\t') if strip_tabs else text).rstrip('\r') == delimiter:
+                break
+    return min(position, len(source))
+
+
 def _segments(text: str) -> list[tuple[bool, tuple[str, ...]]]:
     """把一条命令拆成若干段，每段是 (是否由管道接在上一段之后, 去掉引号的 token)。
 
     重定向（`2>/dev/null`、`</dev/null`、`2>&1`、`&>log`）既不开新段也不留 token：fd 前缀与操作符
-    属于语法，目标是一个路径。**目标必须丢掉而不是留作 token**——留着它，`curl x | sh > /tmp/out`
-    的第二段就多出一个非选项词，「解释器带脚本实参」那条判据会把它读成「执行的是本地脚本」。
+    属于语法，目标是一个路径。**目标不能留作 token**——留着它，`curl x | sh > /tmp/out` 的第二段就
+    多出一个非选项词，「解释器带脚本实参」那条判据会把它读成「执行的是本地脚本」。要看目标的规则
+    用 `_parse`。
 
     引号不成对、反引号不闭合都不报错：这条文本来自模型，判定在它上面抛异常等于让一次畸形输入
     变成整轮失败。拆不干净的部分按原样留在 token 里，规则至多多认几种。
     """
+    return _parse(text)[0]
+
+
+def _parse(
+    text: str, *, thorough: bool = False
+) -> tuple[list[tuple[bool, tuple[str, ...]]], list[str]]:
+    """(段, 整条命令里全部重定向的目标)。
+
+    `thorough=False` 时段与 `_segments` 一字不差：默认规则的判定只取决于段。三族可选规则用
+    `thorough=True`，多做四件会改变段的事，所以它们不进默认规则：
+    - 空引号是一个词：`git -C '' push` 的 `''` 是 `-C` 的取值，丢掉它，`push` 就被当成取值吞掉；
+    - 双引号里的 `$(…)` 与反引号照样执行，拆成新的一段；
+    - `<<-` 是一个操作符；heredoc 的结束标记与 here-string 的词既不是 token 也不是目标；
+    - 跳过「写进文件的数据」那种 heredoc 正文，见 `_after_heredocs`。
+
+    目标不挂在段上：只有重定向、没有命令词的一段（`: ; > /etc/x` 的后半）不产出段，挂在段上它的
+    目标就丢了。`2>&1` 的目标是 `1`——相对的词，按路径看落在根里。
+    """
     segments: list[tuple[bool, tuple[str, ...]]] = []
+    targets: list[str] = []
     tokens: list[str] = []
     token: list[str] = []
+    heredocs: list[tuple[str, bool, bool]] = []
+    closers: list[str] = []
     piped = False
     quote = ''
-    dropping = False
+    quoted = False
+    dropping = ''
+    line_start = 0
     source = _LINE_CONTINUATION.sub('', text)
     index = 0
 
     def end_token() -> None:
-        nonlocal dropping
-        if token:
-            if not dropping:
-                tokens.append(''.join(token))
-            dropping = False
+        nonlocal dropping, quoted
+        if token or (thorough and quoted):
+            word = ''.join(token)
+            if dropping == _TARGET:
+                targets.append(word)
+            elif dropping in (_HEREDOC, _HEREDOC_TABS):
+                heredocs.append(
+                    (word.replace('\\', ''), quoted or '\\' in word, dropping == _HEREDOC_TABS)
+                )
+            elif not dropping:
+                tokens.append(word)
+            dropping = ''
             token.clear()
+        quoted = False
 
     def end_segment(next_piped: bool) -> None:
         nonlocal piped, dropping
         end_token()
-        dropping = False
+        dropping = ''
         if tokens:
             segments.append((piped, tuple(tokens)))
             tokens.clear()
@@ -373,27 +472,42 @@ def _segments(text: str) -> list[tuple[bool, tuple[str, ...]]]:
         if quote:
             if char == quote:
                 quote = ''
+            elif thorough and quote == '"' and (char == '`' or source.startswith('$(', index)):
+                closers.append('`' if char == '`' else ')')
+                quote = ''
+                end_segment(False)
+                index += 1 if char == '`' else 2
+                continue
             else:
                 token.append(char)
+        elif closers and char == closers[-1]:
+            closers.pop()
+            end_segment(False)
+            quote = '"'
         elif char in _QUOTES:
             quote = char
+            quoted = True
         elif char in _REDIRECTS or (char == '&' and source[index + 1 : index + 2] == '>'):
             if char in _REDIRECTS and ''.join(token).isdigit():
                 # `2>` 的 `2` 是 fd 编号、是操作符的一部分；`hi2>x` 的 `hi2` 才是一个词。
                 token.clear()
             end_token()
-            dropping = True
-            index = _end_of_redirection(source, index)
+            dropping, index = _redirection(source, index, thorough=thorough)
             continue
         elif char in _BOUNDARIES:
             end_segment(char == _PIPE)
+            if thorough and char == '\n':
+                index = _after_heredocs(source, index + 1, heredocs, segments[line_start:])
+                heredocs.clear()
+                line_start = len(segments)
+                continue
         elif char.isspace():
             end_token()
         else:
             token.append(char)
         index += 1
     end_segment(False)
-    return segments
+    return segments, targets
 
 
 def _command_word_slots(tokens: Sequence[str]) -> list[tuple[int, str]]:
@@ -406,12 +520,16 @@ def _command_word_slots(tokens: Sequence[str]) -> list[tuple[int, str]]:
     而 `nice -n 19 rm` 的 `19` 是 `-n` 的取值、`timeout 30 rm` 的 `30` 是位置实参：停在它上面就
     把真正的命令词整个吞掉，`nice -n 19 rm -rf /` 于是在默认规则表下一条闸都没有。代价是 wrapper
     之后的普通实参也算候选命令词（`command -v sudo` 会误报成提权），这个方向的错还能换个写法，
-    反方向的错是一句不说地放行。
+    反方向的错是一句不说地放行。第一个命令词之前的保留字（`{`、`then`、`!`）跳过。
     """
     slots: list[tuple[int, str]] = []
     wrapped = False
     for index, token in enumerate(tokens):
-        if token.startswith('-') or _ASSIGNMENT.match(token):
+        if (
+            token.startswith('-')
+            or _ASSIGNMENT.match(token)
+            or (not slots and token in _RESERVED_WORDS)
+        ):
             continue
         word = _basename(token)
         slots.append((index, word))
@@ -550,6 +668,621 @@ DEFAULT_RULES: tuple[DangerRule, ...] = (
         matches=_writes_a_raw_device,
     ),
 )
+
+
+# --- 三族可选规则：宿主按需组合，不进 DEFAULT_RULES -----------------------------------------------
+#
+# 三族对「哪个词是程序」用两种相反的保守方向，这是承重的：
+# - 找危险程序（git、rm）时宁可多判：每一个命令词槽、以及启动器展开出来的程序都算候选。只认一个
+#   「真实程序词」会让每个没进 `_WRAPPERS` 的 wrapper 都成为绕过口。
+# - 豁免程序词（越界判定）时宁可少判：只豁免确定的那一个程序词，认不出就不再往后豁免。
+
+
+@dataclass(frozen=True)
+class _Grammar:
+    """一个 wrapper 或启动器的选项表。认不出的选项让解析失败，而不是猜它吃不吃下一个词。"""
+
+    flags: frozenset[str] = frozenset()
+    valued: frozenset[str] = frozenset()
+    # 选项之后、程序词之前的位置实参个数（`timeout 60 cmd` 的 60）。
+    positionals: int = 0
+    # 选项之后允许出现 `NAME=VALUE`（`env -i A=1 cmd`）。
+    assignments: bool = False
+    # `-19` 这样的纯数字选项（`nice -19 cmd`）。
+    numeric: bool = False
+
+
+@dataclass(frozen=True)
+class _Launcher:
+    """转发启动器：`before` 是子命令之前的选项，`after` 是子命令与被启动程序之间的选项。"""
+
+    before: _Grammar
+    subcommands: tuple[tuple[str, ...], ...]
+    after: _Grammar = _Grammar()
+
+
+def _skip_options(tokens: Sequence[str], start: int, grammar: _Grammar) -> int | None:
+    """从 start 起跳过 grammar 认得的选项，交回第一个非选项的下标；选项认不出时交回 None。
+
+    `--名字=值` 认不认得都跳过：它从不吃下一个词，跳过它不会把程序词当成取值吞掉。
+    """
+    index = start
+    while index < len(tokens):
+        token = tokens[index]
+        if token in grammar.flags:
+            index += 1
+        elif token == '--':
+            return index + 1
+        elif not token.startswith('-') or token == '-':
+            return index
+        elif token.startswith('--') and '=' in token:
+            index += 1
+        elif token in grammar.valued:
+            index += 2
+        elif not token.startswith('--') and token[:2] in grammar.valued:
+            index += 1
+        elif grammar.numeric and token[1:].isdigit():
+            index += 1
+        else:
+            return None
+    return len(tokens)
+
+
+_WRAPPER_GRAMMARS: Mapping[str, _Grammar] = MappingProxyType(
+    {
+        'builtin': _Grammar(),
+        'command': _Grammar(flags=frozenset({'-p', '-v', '-V'})),
+        'env': _Grammar(
+            flags=frozenset({'-', '-0', '-i', '-v', '--debug', '--ignore-environment', '--null'}),
+            valued=frozenset({'-C', '-u', '--chdir', '--unset'}),
+            assignments=True,
+        ),
+        'exec': _Grammar(flags=frozenset({'-c', '-l'}), valued=frozenset({'-a'})),
+        'nice': _Grammar(valued=frozenset({'-n', '--adjustment'}), numeric=True),
+        'nohup': _Grammar(),
+        'setsid': _Grammar(flags=frozenset({'-c', '-f', '-w', '--ctty', '--fork', '--wait'})),
+        'stdbuf': _Grammar(valued=frozenset({'-e', '-i', '-o', '--error', '--input', '--output'})),
+        'time': _Grammar(
+            flags=frozenset(
+                {'-a', '-l', '-p', '-q', '-v', '--append', '--portability', '--quiet', '--verbose'}
+            ),
+            valued=frozenset({'-f', '-o', '--format', '--output'}),
+        ),
+        'timeout': _Grammar(
+            flags=frozenset({'-v', '--foreground', '--preserve-status', '--verbose'}),
+            valued=frozenset({'-k', '-s', '--kill-after', '--signal'}),
+            positionals=1,
+        ),
+    }
+)
+
+_UV_GLOBAL = _Grammar(
+    flags=frozenset(
+        {'-n', '-q', '-v', '--no-cache', '--no-config', '--no-progress', '--offline', '--quiet'}
+        | {'--verbose'}
+    ),
+    valued=frozenset({'--cache-dir', '--color', '--config-file', '--directory', '--project'}),
+)
+_UV_RUN = _Grammar(
+    flags=_UV_GLOBAL.flags
+    | {'-m', '-s', '--all-extras', '--frozen', '--isolated', '--locked', '--module', '--no-dev'}
+    | {'--no-project', '--no-sync', '--script'},
+    valued=_UV_GLOBAL.valued
+    | {'-p', '--env-file', '--extra', '--group', '--index', '--package', '--python', '--with'}
+    | {'--with-editable', '--with-requirements'},
+)
+_UVX = _Grammar(
+    flags=_UV_GLOBAL.flags | {'-U', '--isolated', '--upgrade'},
+    valued=_UV_GLOBAL.valued | {'-p', '--from', '--index', '--python', '--with'},
+)
+_POETRY = _Grammar(
+    flags=frozenset({'-n', '-q', '-v', '--ansi', '--no-ansi', '--no-interaction', '--quiet'})
+    | {'--verbose'},
+    valued=frozenset({'-C', '-P', '--directory', '--project'}),
+)
+_PIPX_GLOBAL = _Grammar(flags=frozenset({'-q', '-v', '--quiet', '--verbose'}))
+_PIPX_RUN = _Grammar(
+    flags=_PIPX_GLOBAL.flags | {'-e', '--editable', '--no-cache', '--path', '--pypackages'},
+    valued=frozenset({'--index-url', '--pip-args', '--python', '--spec'}),
+)
+_LAUNCHERS: Mapping[str, _Launcher] = MappingProxyType(
+    {
+        'uv': _Launcher(before=_UV_GLOBAL, subcommands=(('run',), ('tool', 'run')), after=_UV_RUN),
+        'uvx': _Launcher(before=_UVX, subcommands=((),)),
+        'poetry': _Launcher(before=_POETRY, subcommands=(('run',),), after=_POETRY),
+        'pipx': _Launcher(before=_PIPX_GLOBAL, subcommands=(('run',),), after=_PIPX_RUN),
+    }
+)
+
+
+def _wrapped_program(tokens: Sequence[str], index: int) -> int | None:
+    """index 上的 wrapper 启动的程序词下标；不是有选项表的 wrapper、或选项认不出时是 None。"""
+    grammar = _WRAPPER_GRAMMARS.get(_basename(tokens[index]))
+    if grammar is None:
+        return None
+    position = _skip_options(tokens, index + 1, grammar)
+    if position is None:
+        return None
+    if grammar.assignments:
+        while position < len(tokens) and _ASSIGNMENT.match(tokens[position]):
+            position += 1
+    position += grammar.positionals
+    return position if position < len(tokens) else None
+
+
+def _launched_program(tokens: Sequence[str], index: int) -> int | None:
+    """index 上的启动器启动的程序词下标。
+
+    不是启动器、或启动器后面没有程序时交回 `len(tokens)`；选项认不出时交回 None。
+    """
+    launcher = _LAUNCHERS.get(_basename(tokens[index]))
+    if launcher is None:
+        return len(tokens)
+    position = _skip_options(tokens, index + 1, launcher.before)
+    if position is None:
+        return None
+    for path in launcher.subcommands:
+        if tuple(tokens[position : position + len(path)]) == path:
+            return _skip_options(tokens, position + len(path), launcher.after)
+    return len(tokens)
+
+
+def _program_candidates(tokens: Sequence[str]) -> list[int]:
+    """一段里**可能**是程序词的下标：每一个命令词槽，以及启动器展开出来的程序。
+
+    启动器的选项认不出时，它后面每一个非选项词都算候选——这是找危险程序的方向，多判只是误报。
+    """
+    found = {index for index, _ in _command_word_slots(tokens)}
+    pending = sorted(found)
+    while pending:
+        index = pending.pop()
+        launched = _launched_program(tokens, index)
+        if launched is None:
+            more = [
+                later
+                for later in range(index + 1, len(tokens))
+                if not tokens[later].startswith('-') and not _ASSIGNMENT.match(tokens[later])
+            ]
+        else:
+            more = [launched + offset for offset, _ in _command_word_slots(tokens[launched:])]
+        for later in more:
+            if later not in found:
+                found.add(later)
+                pending.append(later)
+    return sorted(found)
+
+
+def _determinate_programs(tokens: Sequence[str]) -> set[int]:
+    """一段里**确定**是程序词的下标：第一个词，以及认得出的 wrapper 一层层启动的程序词。
+
+    认不出就停，之后的词全按实参看：`sudo`、`flock`、带着认不出的选项的 `timeout` 都是这样。
+    启动器同样停在它自己——它启动的常常是一个脚本文件（`uv run /tmp/x.py`），与被拦下的
+    `python3 /tmp/x.py` 是同一件事，豁免它就在那里开了一个口。
+    """
+    index = 0
+    while index < len(tokens) and (
+        _ASSIGNMENT.match(tokens[index]) or tokens[index] in _RESERVED_WORDS
+    ):
+        index += 1
+    programs: set[int] = set()
+    while index < len(tokens):
+        programs.add(index)
+        following = _wrapped_program(tokens, index)
+        if following is None:
+            break
+        index = following
+    return programs
+
+
+_GIT_READ_ONLY = frozenset(
+    {
+        'blame',
+        'cat-file',
+        'describe',
+        'diff',
+        'grep',
+        'help',
+        'log',
+        'ls-files',
+        'ls-tree',
+        'merge-base',
+        'name-rev',
+        'rev-parse',
+        'shortlog',
+        'show',
+        'status',
+        'version',
+    }
+)
+# 可以跳过的全局选项。`-c`、`--config-env`、`--exec-path`、`--git-dir`、`--work-tree` 刻意不在
+# 这几张表里：它们让只读子命令换一份配置、换一个仓库或换一套可执行文件（`-c core.fsmonitor=<命令>`
+# 让 `status` 执行任意命令），于是落到「认不出」那一支，出现即按改状态算。
+_GIT_VALUED = frozenset({'-C', '--namespace'})
+_GIT_EQUALS_ONLY = frozenset({'--attr-source', '--list-cmds'})
+# `--bare` 不在这里：它等于 `--git-dir=.`，让当前目录里的 `config`（及其中的别名）生效。
+_GIT_FLAGS = frozenset(
+    {
+        '-P',
+        '-h',
+        '-p',
+        '-v',
+        '--glob-pathspecs',
+        '--help',
+        '--html-path',
+        '--icase-pathspecs',
+        '--info-path',
+        '--literal-pathspecs',
+        '--man-path',
+        '--no-advice',
+        '--no-lazy-fetch',
+        '--no-optional-locks',
+        '--no-pager',
+        '--no-replace-objects',
+        '--noglob-pathspecs',
+        '--paginate',
+        '--version',
+    }
+)
+_GIT_ASSIGNMENT = re.compile(r'\AGIT_[A-Za-z0-9_]*\+?=')
+_GLOB = frozenset('*?[')
+
+
+def _opens_files_with_a_command(arguments: Sequence[str]) -> bool:
+    """`git grep` 的 `-O<命令>` / `--open-files-in-pager`：只读子命令里唯一自带执行命令的选项。
+
+    短选项可以成簇（`-nOvim`），长选项可以缩写到不歧义为止（`--op`）。
+    """
+    for word in arguments:
+        if word.startswith('--'):
+            name = word.split('=', 1)[0]
+            if len(name) >= len('--op') and '--open-files-in-pager'.startswith(name):
+                return True
+        elif word.startswith('-') and 'O' in word[1:]:
+            return True
+    return False
+
+
+def _git_changes_state(tokens: Sequence[str], index: int) -> bool:
+    """tokens[index] 是 git 时，这次调用会不会改 git 状态。认不出的全局选项按改状态算。"""
+    position = index + 1
+    while position < len(tokens):
+        token = tokens[position]
+        if not token.startswith('-') or token == '-':
+            break
+        name = token.split('=', 1)[0]
+        if token in _GIT_FLAGS or ('=' in token and name in _GIT_VALUED | _GIT_EQUALS_ONLY):
+            position += 1
+        elif token in _GIT_VALUED:
+            position += 2
+        else:
+            return True
+    else:
+        return False
+    subcommand = tokens[position]
+    if subcommand not in _GIT_READ_ONLY:
+        return True
+    return subcommand == 'grep' and _opens_files_with_a_command(tokens[position + 1 :])
+
+
+def _names_git_dir(path: str) -> bool:
+    """路径的某一段是 `.git`（不分大小写），或是一个会展开出 `.git` 的通配段（`.git*`、`.*`）。
+
+    通配段只在以 `.` 或 `[` 开头时才可能匹配 `.git`：shell 的 `*` 不匹配开头的点，`rm -rf *`
+    碰不到 `.git`。
+    """
+    for part in path.split('/'):
+        folded = part.casefold()
+        if folded == '.git':
+            return True
+        if (
+            folded[:1] in ('.', '[')
+            and not _GLOB.isdisjoint(folded)
+            and fnmatch.fnmatchcase('.git', folded)
+        ):
+            return True
+    return False
+
+
+def _changes_git_state(command: str) -> bool:
+    segments, targets = _parse(command, thorough=True)
+    if any(_names_git_dir(target) for target in targets):
+        return True
+    for _, tokens in segments:
+        for token in tokens:
+            value = token.split('=', 1)[1] if '=' in token else ''
+            # 紧贴在短选项后面的取值（`curl -o.git/hooks/x`）同样是一个路径。
+            attached = token[2:] if token.startswith('-') and not token.startswith('--') else ''
+            if _GIT_ASSIGNMENT.match(token) or any(
+                _names_git_dir(part) for part in (token, value, attached)
+            ):
+                return True
+        for index in _program_candidates(tokens):
+            word = _basename(tokens[index])
+            if word == 'git' and _git_changes_state(tokens, index):
+                return True
+            # `git-core/git-push` 这类带连字符的可执行文件：连字符后面就是子命令。
+            if word.startswith('git-') and word[4:] not in _GIT_READ_ONLY:
+                return True
+    return False
+
+
+def _within(path: str, root: str) -> bool:
+    """规范化后的 path 是 root 本身或在它之下。按路径段比，不按前缀：`/a/bc` 不在 `/a/b` 里。"""
+    return path == root or path.startswith(root.rstrip('/') + '/')
+
+
+_FD_DEVICE = re.compile(r'/dev/fd/[0-9]+')
+
+
+def _without_pwd(word: str) -> str:
+    """`$PWD` / `${PWD}` 开头的词换成 `.` 开头：它就是这条命令的工作目录。"""
+    for prefix in ('${PWD}', '$PWD'):
+        if word == prefix or word.startswith(prefix + '/'):
+            return '.' + word[len(prefix) :]
+    return word
+
+
+def _placements(root: str, word: str, shallowest: int) -> list[str]:
+    """相对的 word 在「Bash 的 cwd 是根下任意一层」时可能落到的绝对路径（规范化）。
+
+    只有开头那串 `..` 爬得出 cwd，所以 cwd 的深度只需从 0 试到 `..` 的个数：更深的 cwd 让它停在
+    根下面。第 k 个落点是从根往上 k 层再接上剩下的部分；`shallowest` 是从第几个开始要，0 就是
+    cwd 恰好在根上、word 原样接在根下。从根出发看不越界的 `../../agents/proj/x`，cwd 在 `src`
+    时落在 `/srv/agents/agents/proj/x`——只从根算会漏掉它。
+    """
+    parts = posixpath.normpath(word).split('/')
+    ups = next((index for index, part in enumerate(parts) if part != '..'), len(parts))
+    rest = '/'.join(parts[ups:])
+    placements: list[str] = []
+    base = root
+    for level in range(ups + 1):
+        if level >= shallowest:
+            placements.append(posixpath.normpath(posixpath.join(base, rest)) if rest else base)
+        base = posixpath.dirname(base)
+    return placements
+
+
+def _covers(root: str, path: str) -> bool:
+    """删掉 path 会不会连 root 一起删（两者都已规范化、折叠大小写）。
+
+    逐段比：path 的每一段都等于、或作为通配匹配 root 同一深度的那一段，path 就是 root 或它的祖先
+    （`/srv/*/proj` 也算）；比到 root 之下还剩一段时，它得是一个「全部」的通配（`root/*`）。
+    """
+    root_parts = [part for part in root.split('/') if part]
+    path_parts = [part for part in path.split('/') if part]
+    for depth, part in enumerate(path_parts):
+        if depth == len(root_parts):
+            return depth == len(path_parts) - 1 and _matches_everything(part)
+        if part != root_parts[depth] and (
+            _GLOB.isdisjoint(part) or not fnmatch.fnmatchcase(root_parts[depth], part)
+        ):
+            return False
+    return True
+
+
+def _matches_everything(pattern: str) -> bool:
+    """根下的这个通配算不算「全部」：连 `a` 与 `z` 这样的名字都匹配（`*`、`?*`、`[!.]*`、
+    `[a-z]*`）。`*.pyc`、`build*` 不算。"""
+    return not _GLOB.isdisjoint(pattern) and all(
+        fnmatch.fnmatchcase(probe, pattern) for probe in ('a', 'z')
+    )
+
+
+def _path_words(token: str) -> tuple[str, ...]:
+    """一个实参里要按路径看的部分：它自己，以及 `--选项=值` 的值。"""
+    if token.startswith('--') and '=' in token:
+        return (token, token.split('=', 1)[1])
+    return (token,)
+
+
+def _cd_leaves(arguments: Sequence[str]) -> bool:
+    """`cd` 不带目录（回 `$HOME`）或 `cd -`（回上一个目录）：去向都不在命令文本里。"""
+    operands = [word for word in arguments if word == '-' or not word.startswith('-')]
+    return not operands or operands[0] == '-'
+
+
+def _rm_operands(arguments: Sequence[str]) -> list[str]:
+    operands: list[str] = []
+    options_done = False
+    for word in arguments:
+        if not options_done and word == '--':
+            options_done = True
+        elif options_done or not word.startswith('-') or word == '-':
+            operands.append(word)
+    return operands
+
+
+@dataclass(frozen=True)
+class _WorkspaceRoot:
+    """构造规则时解析一次的工作区根。`matches` 只在这两个字符串上做字符串运算，不碰磁盘。
+
+    同时留字面形态与解析掉符号链接之后的形态：macOS 上 `/tmp/x` 解析成 `/private/tmp/x`，命令里
+    两种写法都会出现，只认一种就把另一种判成工作区外（越界）或判不出是根（删根）。
+    """
+
+    lexical: str
+    real: str
+
+    @classmethod
+    def of(cls, root: object, factory: str) -> _WorkspaceRoot:
+        shown, kind = repr(root), type(root).__name__
+        text: object = None
+        if isinstance(root, str | os.PathLike):
+            text = os.fspath(cast('str | os.PathLike[str]', root))
+        if not isinstance(text, str) or not text.startswith('/') or '\0' in text:
+            raise ConfigError(
+                expected=f'{factory} 的 root 是工作区根的绝对路径（str 或 os.PathLike）',
+                received=f'收到 {shown}，类型是 {kind}',
+                next_action=(
+                    f'宿主先把工作区根解析成绝对路径再交给 {factory}（例如 Path(root).resolve()）；'
+                    '规则不读 cwd，相对路径没有可以相对的地方'
+                ),
+            )
+        lexical = posixpath.normpath(text)
+        try:
+            real = str(Path(lexical).resolve())
+        except (OSError, RuntimeError) as exc:
+            raise ConfigError(
+                expected=f'{factory} 的 root 能解析掉符号链接',
+                received=f'解析 {lexical!r} 时 {type(exc).__name__}: {exc}',
+                next_action='检查工作区根路径上的符号链接（是否成环、是否有权限读），修好后再构造规则',
+            ) from exc
+        return cls(lexical=lexical, real=real)
+
+    def points_outside(self, word: str) -> bool:
+        word = _without_pwd(word)
+        if word.startswith('~'):
+            return True
+        if word in ('$HOME', '${HOME}') or word.startswith(('$HOME/', '${HOME}/')):
+            return True
+        if word.startswith('/'):
+            normalized = posixpath.normpath(word)
+            if normalized in _PSEUDO_DEVICES or _FD_DEVICE.fullmatch(normalized):
+                return False
+            return not any(_within(normalized, root) for root in (self.lexical, self.real))
+        # 相对路径由内核从 cwd 的真实目录解析 `..`，所以只接在解析掉符号链接的根上。
+        return any(
+            not _within(placement, self.real) for placement in _placements(self.real, word, 1)
+        )
+
+    def reaches_outside(self, command: str) -> bool:
+        segments, targets = _parse(command, thorough=True)
+        if any(self.points_outside(target) for target in targets):
+            return True
+        for _, tokens in segments:
+            programs = _determinate_programs(tokens)
+            if not programs:
+                continue
+            program = max(programs)
+            word = _basename(tokens[program])
+            if word in ('pushd', 'popd'):
+                return True
+            if word == 'cd' and _cd_leaves(tokens[program + 1 :]):
+                return True
+            for index in range(min(programs), len(tokens)):
+                token = tokens[index]
+                if index in programs:
+                    # 确定的程序词只在是绝对路径时放行（`/usr/bin/python3`）；`~/bin/x`、
+                    # `../other/run.sh` 执行的是工作区外的文件，与 `sh ../other/run.sh` 同一件事。
+                    if not token.startswith('/') and self.points_outside(token):
+                        return True
+                elif any(self.points_outside(part) for part in _path_words(token)):
+                    return True
+        return False
+
+    def covers_root(self, operand: str) -> bool:
+        """rm 这个目标会不会连根一起删：是根、是根的祖先，或逐段通配能匹配到它们，或是根下的
+        「全部」。相对目标按 Bash 的 cwd 在根下任意一层试（`_placements`），接在两种形态的根上。
+
+        不分大小写：APFS 默认不区分，`rm -r /USERS/...` 删的就是根；多判的代价只是一次误报。
+        """
+        word = _without_pwd(operand)
+        if not word:
+            return False
+        for root in (self.lexical, self.real):
+            placements = (
+                [posixpath.normpath(word)] if word.startswith('/') else _placements(root, word, 0)
+            )
+            if any(_covers(root.casefold(), placement.casefold()) for placement in placements):
+                return True
+        return False
+
+    def removes_root(self, command: str) -> bool:
+        for _, tokens in _parse(command, thorough=True)[0]:
+            for index in _program_candidates(tokens):
+                if _basename(tokens[index]) == 'rm' and any(
+                    self.covers_root(operand) for operand in _rm_operands(tokens[index + 1 :])
+                ):
+                    return True
+        return False
+
+
+def git_state_change_rule() -> DangerRule:
+    """`shell.git_state_change`：这条命令会改 git 状态。
+
+    命中：git 的子命令不在只读集合里（`git-push` 这类带连字符的可执行文件同样按子命令算）；
+    `-c`、`--config-env`、`--exec-path`、`--git-dir`、`--work-tree`、`--bare` 与认不出的全局选项；
+    `grep` 用 `-O` / `--open-files-in-pager` 执行命令；`GIT_` 开头的环境赋值（任何位置，`export`
+    也算）；任何实参、`=` 之后的值、紧贴短选项的取值（`-o.git/x`）或重定向目标里有一段是 `.git`
+    （不分大小写，含会展开出它的通配）。git 按命令词槽与启动器展开出来的程序找（`setsid git push`、
+    `uv run --with rich git push`、`{ git push; }`、双引号里的 `$(git push)`）。
+
+    已知误报：`find . -path ./.git -prune` 这类只读引用 `.git` 的命令；只读集合之外的只读用法
+    （`git branch`、`git stash list`、`git remote -v`、`git config --get`）；`echo GIT_DIR=x`；
+    wrapper 之后恰好写着 `git` 的普通实参；结束标记不带引号、喂进管道或交给解释器的 heredoc 正文。
+    已知盲区：`sh -c "…"`、`python -c "…"`、`make`、脚本文件里的 git，以及引号内代码里嵌的
+    `.git` 路径；`xargs` / `find -exec` 转手；变量（`$GIT push`）；反斜杠与 `$'…'` 转义
+    （`.g\\it`）；花括号展开（`{.git,x}`）；名单之外的启动器与 wrapper（`xcrun`、`pdm run`、
+    `eval`）。
+    """
+    return DangerRule(
+        rule_id='shell.git_state_change',
+        level=RiskLevel.HIGH,
+        reason=(
+            '这次调用会改变 git 状态（提交、推送、改引用或配置、写 .git/，或换一份 git 配置执行）；'
+            '提交与推送由宿主在复核之后执行'
+        ),
+        matches=_changes_git_state,
+    )
+
+
+def path_outside_workspace_rule(root: object) -> DangerRule:
+    """`shell.path_outside_workspace`：实参或重定向目标指向工作区之外。
+
+    `root` 是工作区根的绝对路径，构造时解析一次。命中：工作区外的绝对路径（`_PSEUDO_DEVICES`
+    与 `/dev/fd/N` 除外）、`~` 开头、`$HOME` / `${HOME}` 开头、会逃出去的 `..`（`$PWD` 当 `.`）；
+    `--选项=值` 按值判；不带目录的 `cd`、`cd -`、`pushd`、`popd`（`builtin cd`、`{ cd; }` 也算）。
+    包含关系按规范化后的路径段比，兄弟目录 `<根>-other` 在外面。相对路径按 Bash 的 `cwd` 在根下
+    任意一层都试一遍，接在解析掉符号链接的根上：从根看不越界的 `../../agents/proj/x`，cwd 在
+    `src` 时就在外面。
+
+    每段只豁免**确定的**程序词：第一个词，以及有选项表的 wrapper（`timeout 60`、`env -i`、
+    `nice -n 5` 等）启动的程序，并且只在它是绝对路径时豁免；认不出就不再往后豁免。
+    `timeout 60 cat /etc/passwd`、`setsid cat /etc/passwd`、`~/bin/x.sh`、`../other/run.sh` 因此
+    都命中，`/usr/bin/python3 x.py` 不命中。
+
+    已知盲区：`sh -c "…"`、`make`、脚本文件里的命令；变量与未加引号的命令替换（`$(pwd)`、
+    `${HOME%/}`）；引号内代码里嵌的路径；选项与取值粘在一起的写法（`-o/etc/x`）；`dd of=` 这类
+    不带 `--` 的 `名字=值`；工作区里指向外面的符号链接；以绝对路径给出的工作区外可执行文件
+    （`/tmp/x.sh`）。已知误报：以 `/` 开头的 sed / awk 脚本与搜索模式（`sed -n '/def x/,/^$/p'`）、
+    `/tmp` 下的临时文件、`echo $HOME`、`cd src && … && cd ..`（命令内的 `cd` 不跟踪）、结束标记
+    不带引号的 heredoc 正文里的路径。
+    """
+    workspace = _WorkspaceRoot.of(root, 'path_outside_workspace_rule')
+    return DangerRule(
+        rule_id='shell.path_outside_workspace',
+        level=RiskLevel.HIGH,
+        reason=(
+            '这次调用读写工作区之外的路径（绝对路径、~、$HOME、逃出根目录的 ..，'
+            '或离开工作区的 cd），超出了这次任务的范围'
+        ),
+        matches=workspace.reaches_outside,
+    )
+
+
+def workspace_root_removal_rule(root: object) -> DangerRule:
+    """`shell.workspace_root_removal`：`rm` 删掉工作区根本身、根下的全部内容，或根的祖先。
+
+    `root` 同 `path_outside_workspace_rule`。命中的目标规范化之后是根（`.`、`./`、`.//`、
+    `src/..`、`$PWD`、根的绝对路径、`../<根目录名>`）、根的祖先（`..`、`/`）、逐段通配能匹配到
+    根或其祖先（`/srv/*/proj`、`../*`），或根下的「全部」（`*`、`./*`、`?*`、`[!.]*`）。相对目标
+    按 Bash 的 `cwd` 在根下任意一层都试（cwd 在 `src` 时 `../../proj` 就是根），接在字面与解析掉
+    符号链接的两种根上。不看 `-r` / `-f`：`rm *` 不带 `-r` 也删光根下所有文件。rm 按命令词槽与
+    启动器展开出来的程序找。`rm -r build`、`rm *.pyc`、`rm -r ../build` 不命中。
+
+    已知误报：`rm -r ?`（连 `a` 与 `z` 都匹配的通配按「全部」算）；cwd 就在根上时的
+    `rm -r ../../<根目录名>`（删的是根外那个同名目录，照样按删根拦下）。已知盲区：`~` 与 `$PWD`
+    以外的变量不展开；`$(pwd)` 与反引号；
+    `find -delete`；`xargs rm`、`sh -c`、`make`；花括号展开（`{*,.*}`）；`git clean`（它归
+    `shell.git_state_change`）。
+    """
+    workspace = _WorkspaceRoot.of(root, 'workspace_root_removal_rule')
+    return DangerRule(
+        rule_id='shell.workspace_root_removal',
+        level=RiskLevel.HIGH,
+        reason='这次调用删除工作区根目录本身或根下的全部内容，删掉的东西没有回收站',
+        matches=workspace.removes_root,
+    )
 
 
 class _TooMuchText(Exception):

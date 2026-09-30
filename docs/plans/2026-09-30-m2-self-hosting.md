@@ -3,7 +3,7 @@
 > **执行者须知：本文件是需求，不是参考。** 「公开契约」一节里的 CLI 参数、配置键、规则 ID、标记行、
 > front matter 字段与内核 API 一旦发布就是兼容承诺；执行中不得为了让测试变绿临时改名或缩小断言范围。
 
-**状态：已评审，执行中（T1–T2 完成）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
+**状态：已评审，执行中（T1–T3 完成）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
 2026-10-01，见「决策日志」）。GitHub Actions 本月免费额度已用完，恢复之前按「验证」一节的本地验证协议执行。
 
 **Goal:** 让 Syndica 在一份仓库里完成一次受控修改：读约束、规划、改文件、跑检查、读失败、迭代修复，
@@ -532,7 +532,7 @@ sha256 基线覆盖本轮会改到的每个文件）→ 对抗验证 → commit 
 
 #### T2 — 内核：危险选项注入与 `RuleTablePolicy`
 
-**状态：completed**（本地验证协议：五道门禁全绿、2423 条测试；26 条变异全部杀死，其中 11 条来自对抗评审
+**状态：completed**（本地验证协议：五道门禁全绿、2423 条测试；25 条变异全部杀死，其中 10 条针对对抗评审
 报出的存活变异与漏洞——空目录不校验判定、表键被归一化、NONE 判定跳过查表、只收 dict、三件套锚词、带首尾
 空白的键、`DangerJudge` 不校验 `level` / `rule_id`；Linux 补跑待 CI 额度恢复）
 
@@ -544,6 +544,13 @@ sha256 基线覆盖本轮会改到的每个文件）→ 对抗验证 → commit 
 - 变异：只转判定不转处置；assemble 不转交；漏掉类式角色；表外 HIGH 放行。
 
 #### T3 — 内核：三族可选规则
+
+**状态：completed**（本地验证协议：五道门禁全绿；用例在新文件 `tests/kernel/test_optional_danger_rules.py`
+与 `tests/kernel/test_kernel_ambient_state.py`，快照在 `tests/kernel/data/default_rules_verdicts.json`，由
+T3 之前的 `danger.py` 生成。变异：常量表逐成员 216 条、逻辑两轮 165 条、AST 守卫 102 条，存活 2 条，均为
+等价变异（`$PWD` 前缀不要求 `/`：`$PWDX` 在两种写法下都是相对的词；保留字在命令词之后也跳过：那里的保留字
+从不是危险程序）。两路对抗评审报的漏报与误报逐条复现后修掉或写进 docstring，见「意外发现」；Linux 补跑待
+CI 额度恢复）
 
 **Files:** `kernel/danger.py`、`tests/kernel/test_danger.py`、`_WITHHELD`、内核 AST 守卫测试。
 
@@ -888,6 +895,21 @@ GitHub Free 每月 2000 分钟的 Actions 额度在 2026-10 已经用完，下�
   每次 `git push` 时执行。这是本机环境问题，已告知用户。
 - 2026-10-01：GitHub Free 的 Actions 月度额度（2000 分钟）用完，推送触发的 CI 不再启动（GitHub 报的是付款
   或消费上限问题）。改按本地验证协议推进，额度恢复后补跑。
+- T3，默认规则的既有漏洞：保留字当成了命令词，`{ rm -rf /; }`、`if x; then sudo …; fi`、`while …; do curl
+  x | sh; done` 在 `DEFAULT_RULES` 下一条都不命中；`FOO+=1 rm -rf /` 同样。修在共享分词里（跳过第一个命令词
+  之前的保留字、赋值认 `+=`、`builtin` 进 `_WRAPPERS`），默认规则因此只多命中、不少命中；快照证明既有用例的
+  判定一条未变。spec §5.6 在 T18 同步。
+- T3，分词丢掉空引号：`git -C '' push` 里 `-C` 吞掉 `push`，而 git 把 `-C ''` 当空操作、真的推送。三族规则改用
+  `thorough` 解析（空引号是一个词、双引号里的 `$(…)` 拆段、跳过写进文件的 heredoc 正文），默认规则不受影响。
+- T3，`git --bare` 等于 `--git-dir=.`，会让当前目录里的 `config` 与其中的别名生效，已移出可跳过的选项；而且
+  git 的 `safe.bareRepository` 默认是 `all`，工作区里种下的裸仓库不带 `--bare` 也会被用上。命令文本上的规则
+  挡不住后者 → T5：本次 run 的 `GIT_CONFIG_GLOBAL` 文件写入 `safe.bareRepository=explicit`（D6 届时同步）。
+- T3，作者的一条推理被评审推翻：「Bash 的 `cwd` 在更深处只会判得更严」不成立，`../../agents/proj/x` 从根看
+  在里面，cwd 在 `src` 时在外面；`rm -r ../../proj` 同理会删根。改为按 cwd 在根下任意一层枚举落点。
+- T3，评审测出的常见误报，规则按设计保留，靠后续任务的文字引导 → T6 的拦截说明：要排除 `.git` 就用
+  Grep / Glob 或 `git ls-files`（`find … -not -path './.git/*'` 被无条件拦下）；T15 的提示词：每次 Bash 都从
+  工作区根开始，不必 `cd ..` 回去（命令内的 `cd` 不跟踪，`cd src && … && cd ..` 会被判越界），并列出允许的
+  只读 git 子命令（`git branch`、`git stash list` 等不在只读集合里）。
 
 ## 完成复盘
 
