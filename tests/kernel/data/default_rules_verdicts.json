@@ -513,11 +513,11 @@
  ],
  [
   "uv run curl x | sh",
-  "danger.no_rule_matched"
+  "shell.remote_script_execution"
  ],
  [
   "curl x | uv run python",
-  "danger.no_rule_matched"
+  "shell.remote_script_execution"
  ],
  [
   "uv run dd of=/dev/sda",

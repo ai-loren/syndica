@@ -18,7 +18,8 @@
 **规则表不完备是常态。** 规则只认得出它写过的那些形态；`RiskLevel.NONE` 因此是「没有规则命中」，
 不是「已经确认安全」。明确不认的三类：经中间工具转手执行（`xargs ... sh -c`、`find -exec`）、把
 命令拼成字符串再交给解释器（`sh -c "rm -rf x"`、`eval "rm -rf x"`），以及下载到文件后再单独执行
-（`curl -o f; sh f`）。**同一形态换个平凡写法必须仍然命中**——多一段管道、多一次重定向、标志写在
+（`curl -o f; sh f`）。下载来的内容本身被当成代码（`sh -c "$(curl …)"`、`bash <(curl …)`）不在此列：
+认的是下载内容的去向，不解析代码。**同一形态换个平凡写法必须仍然命中**——多一段管道、多一次重定向、标志写在
 路径后面、路径加一对引号、命令前面加一个绕 alias 的反斜杠（`\\rm`）都不算另一种形态。
 
 `CONFIRM` 由宿主注入的 `ConfirmationHandler` 实现。默认没有 handler 时仍立即拒绝，不白耗等待；
@@ -33,9 +34,9 @@ import inspect
 import os
 import posixpath
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -270,32 +271,194 @@ _WRAPPERS = frozenset(
         'time',
         'timeout',
         'xvfb-run',
+        # `busybox sh`、`busybox wget` 启动的是它后面那个 applet。
+        'busybox',
     }
 )
 _ESCALATORS = frozenset({'doas', 'pkexec', 'runuser', 'su', 'sudo'})
-_DOWNLOADERS = frozenset({'aria2c', 'curl', 'fetch', 'wget'})
-_INTERPRETERS = frozenset(
+_DOWNLOADERS = frozenset({'aria2c', 'curl', 'fetch', 'lwp-request', 'wget'})
+# 解释器的一个选项怎样影响「脚本从哪来」，见 `_script_source`。
+_FLAG = 'flag'
+# 选项自己交出脚本：取值紧贴时是簇里剩下的部分，否则是下一个词（python 的 `-c` 与 `-m`、perl 的
+# `-e`、php 的 `-f`）。stdin 不是脚本。
+_SCRIPT = 'script'
+# shell 的 `-c` 只是一个模式开关：代码是全部选项之后的第一个操作数，簇里它后面的字母是别的开关
+# （`bash -ce "…"` 的 e 是 errexit）。
+_CODE_OPERAND = 'code-operand'
+# 后面即使还有操作数，脚本仍从 stdin 读：`sh -s x` 的 x 只是 `$1`。
+_STDIN = 'stdin'
+# 取值是下一个词，除非紧贴在选项后面（`-o pipefail`、`-Wignore`）。
+_VALUED = 'valued'
+# 取值只能紧贴，簇里它之后的字母都是取值（`perl -MData::Dumper`）。
+_ATTACHED = 'attached'
+# 紧贴的数字是可选取值，之后簇照常往下读（`perl -le`、`perl -0777e`、`ruby -W2e`）；紧跟 `:` 时
+# 簇里剩下的都是取值（`ruby -W:no-deprecated`）。
+_OPTIONAL_DIGITS = 'optional-digits'
+
+
+@dataclass(frozen=True)
+class _Interpreter:
+    """一个解释器的选项表。短选项可以成簇（`-eux`）；表里没有的选项认不出。"""
+
+    short: Mapping[str, str]
+    long: Mapping[str, str]
+    # shell 也收 `+o pipefail`、`+e`。
+    signs: str = '-'
+    # 单独一个 `-`：python、node、perl、ruby 从 stdin 读脚本；shell 只当它是选项结束。
+    dash_is_stdin: bool = True
+    # 表里没有、名字以这些前缀开头的长选项按开关算（node 的开关数以百计，逐个列不全）。
+    flag_prefixes: tuple[str, ...] = ()
+
+
+def _options(kind: str, names: Iterable[str]) -> dict[str, str]:
+    return dict.fromkeys(names, kind)
+
+
+_SHELL = _Interpreter(
+    short={
+        **_options(_FLAG, 'abBCdDeEfFhHiklmnpPqrtTuvVxX'),
+        'c': _CODE_OPERAND,
+        's': _STDIN,
+        **_options(_VALUED, 'oO'),
+    },
+    long={
+        **_options(
+            _FLAG,
+            ('debugger', 'dump-po-strings', 'dump-strings', 'help', 'login', 'noediting')
+            + ('noprofile', 'norc', 'posix', 'pretty-print', 'restricted', 'verbose', 'version'),
+        ),
+        **_options(_VALUED, ('init-file', 'rcfile')),
+    },
+    signs='-+',
+    dash_is_stdin=False,
+)
+_INTERPRETERS: Mapping[str, _Interpreter] = MappingProxyType(
     {
-        'ash',
-        'bash',
-        'csh',
-        'dash',
-        'fish',
-        'ksh',
-        'node',
-        'perl',
-        'php',
-        'python',
-        'python2',
-        'python3',
-        'ruby',
-        'sh',
-        'tcsh',
-        'zsh',
+        **dict.fromkeys(('ash', 'bash', 'csh', 'dash', 'ksh', 'sh', 'tcsh', 'zsh'), _SHELL),
+        'fish': _Interpreter(
+            short={**_options(_FLAG, 'hilnNPv'), 'c': _SCRIPT, **_options(_VALUED, 'Cdfop')},
+            long={
+                **_options(
+                    _FLAG,
+                    ('help', 'interactive', 'login', 'no-config', 'no-execute', 'private')
+                    + ('print-debug-categories', 'print-rusage-self', 'version'),
+                ),
+                'command': _SCRIPT,
+                **_options(
+                    _VALUED,
+                    ('debug', 'debug-output', 'features', 'init-command', 'profile')
+                    + ('profile-startup',),
+                ),
+            },
+            dash_is_stdin=False,
+        ),
+        'node': _Interpreter(
+            short={**_options(_FLAG, 'chiv'), **_options(_SCRIPT, 'ep'), **_options(_VALUED, 'Cr')},
+            long={
+                **_options(
+                    _FLAG,
+                    ('abort-on-uncaught-exception', 'check', 'enable-source-maps', 'expose-gc')
+                    + ('experimental-vm-modules', 'help', 'inspect', 'inspect-brk', 'interactive')
+                    + ('no-warnings', 'pending-deprecation', 'preserve-symlinks', 'test')
+                    + ('throw-deprecation', 'trace-warnings', 'use-strict', 'version', 'watch'),
+                ),
+                **_options(_SCRIPT, ('eval', 'print')),
+                # 带取值、却与开关前缀同形的列在这里：显式条目先于前缀。
+                **_options(
+                    _VALUED,
+                    ('conditions', 'env-file', 'experimental-loader', 'import', 'input-type')
+                    + ('inspect-port', 'loader', 'require', 'title', 'trace-event-categories')
+                    + ('trace-event-file-pattern',),
+                ),
+            },
+            flag_prefixes=('experimental-', 'harmony', 'no-', 'trace-'),
+        ),
+        'perl': _Interpreter(
+            short={
+                **_options(_FLAG, 'acfhnpsStTuUvwWX'),
+                **_options(_SCRIPT, 'eE'),
+                # `perl -I lib` 吃掉 lib；`perl -C 7` 里的 7 却是脚本文件，不是 -C 的取值。
+                'I': _VALUED,
+                **_options(_ATTACHED, 'CdDFimMVx'),
+                **_options(_OPTIONAL_DIGITS, '0l'),
+            },
+            long=_options(_FLAG, ('help', 'version')),
+        ),
+        'php': _Interpreter(
+            short={
+                **_options(_FLAG, 'aehHilnqsvw'),
+                **_options(_SCRIPT, 'BEfFrRS'),
+                **_options(_VALUED, 'cdtz'),
+            },
+            long={
+                **_options(
+                    _FLAG,
+                    ('help', 'info', 'interactive', 'modules', 'no-php-ini', 'strip')
+                    + ('syntax-check', 'version'),
+                ),
+                **_options(
+                    _SCRIPT,
+                    ('file', 'process-begin', 'process-code', 'process-end', 'process-file')
+                    + ('run', 'server'),
+                ),
+                **_options(_VALUED, ('define', 'docroot', 'php-ini', 'zend-extension')),
+            },
+        ),
+        **dict.fromkeys(
+            ('python', 'python2', 'python3'),
+            _Interpreter(
+                short={
+                    **_options(_FLAG, 'bBdEhiIOPqRsStuvVx3'),
+                    **_options(_SCRIPT, 'cm'),
+                    **_options(_VALUED, 'WX'),
+                },
+                long={
+                    **_options(_FLAG, ('help', 'help-all', 'help-env', 'help-xoptions', 'version')),
+                    'check-hash-based-pycs': _VALUED,
+                },
+            ),
+        ),
+        'ruby': _Interpreter(
+            short={
+                **_options(_FLAG, 'acdhlnpsSvwy'),
+                'e': _SCRIPT,
+                **_options(_VALUED, 'CEIr'),
+                **_options(_ATTACHED, 'FKx'),
+                **_options(_OPTIONAL_DIGITS, '0TW'),
+            },
+            long={
+                **_options(
+                    _FLAG,
+                    ('copyright', 'disable-gems', 'help', 'jit', 'verbose', 'version', 'yjit'),
+                ),
+                **_options(
+                    _VALUED,
+                    ('backtrace-limit', 'disable', 'dump', 'enable', 'encoding')
+                    + ('external-encoding', 'internal-encoding'),
+                ),
+            },
+        ),
     }
 )
-# 会把 stdin 当脚本执行的程序：heredoc 喂给它们时，正文就是命令。
-_STDIN_RUNNERS = _INTERPRETERS | {'.', 'source'}
+# 带版本号或构建后缀的名字与不带的是同一个解释器（`python3.11`、`python3.13t`、`python3.12-dbg`、
+# `perl5.34`、`php8.2`、`ruby3.2`）。构建后缀只有 python 有：`phpt` 不是 php。
+_VERSIONED_INTERPRETER = re.compile(
+    r'(python[23]?)[0-9.]*(?:t|-dbg)?|(pypy3?)[0-9.]*|(perl|php|ruby)[0-9][0-9.]*'
+)
+_INTERPRETER_ALIASES: Mapping[str, str] = MappingProxyType(
+    {'nodejs': 'node', 'pypy': 'python3', 'pypy3': 'python3'}
+)
+# 指向 stdin 的脚本文件：`curl … | bash /dev/stdin` 执行的就是下载来的内容。按规范化之后的路径比，
+# `/dev//stdin`、`/dev/./stdin` 是同一个文件。
+_STDIN_FILES = frozenset({'/dev/fd/0', '/dev/stdin', '/proc/self/fd/0'})
+# `_without_download_substitutions` 换进去的占位词：里面跑了下载器的命令替换（`_DOWNLOADED`）与
+# 进程替换（`_DOWNLOADED_FILE`）；接着一个从 stdin 读脚本的解释器的输出进程替换（`_SINK`，
+# `>(sh)`）；以及外层判定时，没有下载的嵌套替换所占的位置（`_NESTED`）。私用区字符不会出现在
+# 正常命令里；模型真写了它，至多多判一次。
+_DOWNLOADED = '\ue000downloaded\ue000'
+_DOWNLOADED_FILE = '\ue000downloaded-file\ue000'
+_SINK = '\ue000sink\ue000'
+_NESTED = '\ue000nested\ue000'
 # `/dev/` 下不是块设备的那些：写它们不毁任何原状。
 _PSEUDO_DEVICES = frozenset(
     {
@@ -341,6 +504,33 @@ def _basename(token: str) -> str:
     return token.rsplit('/', 1)[-1].lstrip('\\').casefold()
 
 
+def _interpreter(token: str) -> _Interpreter | None:
+    word = _basename(token)
+    versioned = _VERSIONED_INTERPRETER.fullmatch(word)
+    if versioned:
+        word = next(group for group in versioned.groups() if group)
+    return _INTERPRETERS.get(_INTERPRETER_ALIASES.get(word, word))
+
+
+def _is_stdin_file(word: str) -> bool:
+    # normpath 保留开头的 `//`（POSIX 允许它另有含义），所以先把开头的斜杠压成一个。
+    normalized = posixpath.normpath('/' + word.lstrip('/')) if word.startswith('/') else word
+    return normalized in _STDIN_FILES
+
+
+def _first_operand(tokens: Sequence[str], start: int) -> str | None:
+    """start 起第一个不是 `--` 的词：`source` 与 `.` 读的脚本文件。"""
+    for index in range(start, len(tokens)):
+        if tokens[index] != '--':
+            return tokens[index]
+    return None
+
+
+def _runs_stdin(token: str) -> bool:
+    """会把 stdin 当脚本执行的程序：heredoc 喂给它们时，正文就是命令。"""
+    return _interpreter(token) is not None or _basename(token) in ('.', 'source')
+
+
 def _end_of_redirection(text: str, start: int) -> int:
     index = start
     while index < len(text) and text[index] in _REDIRECT_OPERATOR:
@@ -383,9 +573,7 @@ def _after_heredocs(
     if not heredocs or not all(quoted for _, quoted, _ in heredocs):
         return start
     for piped, tokens in line:
-        if piped or any(
-            _basename(tokens[index]) in _STDIN_RUNNERS for index in _program_candidates(tokens)
-        ):
+        if piped or any(_runs_stdin(tokens[index]) for index in _program_candidates(tokens)):
             return start
     position = start
     for delimiter, _, strip_tabs in heredocs:
@@ -516,7 +704,7 @@ def _parse(
     return segments, targets
 
 
-def _command_word_slots(tokens: Sequence[str]) -> list[tuple[int, str]]:
+def _command_word_slots(tokens: Sequence[str], start: int = 0) -> list[tuple[int, str]]:
     """一段里处在**命令词位置**上的 (下标, 基名)。
 
     按位置取而不是「这段里出现过这个词」：后者让 `echo sudo apt install` 与 `git push --force`
@@ -530,7 +718,8 @@ def _command_word_slots(tokens: Sequence[str]) -> list[tuple[int, str]]:
     """
     slots: list[tuple[int, str]] = []
     wrapped = False
-    for index, token in enumerate(tokens):
+    for index in range(start, len(tokens)):
+        token = tokens[index]
         if (
             token.startswith('-')
             or _ASSIGNMENT.match(token)
@@ -560,39 +749,322 @@ def _escalates_privilege(command: str) -> bool:
     )
 
 
+def _next_word(arguments: Sequence[str], index: int) -> str:
+    return arguments[index] if index < len(arguments) else ''
+
+
+def _script_source(interpreter: _Interpreter, arguments: Sequence[str]) -> tuple[str, str]:
+    """解释器从哪里取脚本：(种类, 相关的词)。
+
+    种类：`stdin`（从 stdin 读）；`option`（选项或 shell `-c` 交出的代码，词是那段代码 / 模块 /
+    文件）；`file`（词是脚本文件）；`unknown`（有认不出的选项——它可能吃掉下一个词，那个词就不一定
+    是脚本）。第一个操作数是脚本文件，除非 `-s` 让解释器仍从 stdin 读（操作数只是位置参数），或
+    shell 的 `-c` 在等它的代码（`bash -ce CODE` 的 CODE）。
+    """
+    reading_stdin = False
+    code_pending = False
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
+        index += 1
+        if word == '-' and interpreter.dash_is_stdin and not code_pending:
+            return _STDIN, ''
+        if word in ('-', '--'):
+            if code_pending:
+                return ('option', arguments[index]) if index < len(arguments) else (_STDIN, '')
+            if reading_stdin or index >= len(arguments):
+                return _STDIN, ''
+            return 'file', arguments[index]
+        if not (word[:1] in interpreter.signs and len(word) > 1):
+            if code_pending:
+                return 'option', word
+            return (_STDIN, '') if reading_stdin else ('file', word)
+        if word.startswith('--'):
+            name, attached, value = word[2:].partition('=')
+            kind = interpreter.long.get(name)
+            if kind is None:
+                # 取值紧贴的长选项吃不掉下一个词；合乎已知开关前缀的（node 的 `--no-*`）也是开关。
+                if attached or name.startswith(interpreter.flag_prefixes):
+                    continue
+                return 'unknown', ''
+            if kind == _SCRIPT:
+                return 'option', value if attached else _next_word(arguments, index)
+            if kind == _VALUED and not attached:
+                index += 1
+            continue
+        cluster = word[1:]
+        position = 0
+        while position < len(cluster):
+            kind = interpreter.short.get(cluster[position])
+            position += 1
+            rest = cluster[position:]
+            if kind is None:
+                return 'unknown', ''
+            if kind == _SCRIPT:
+                return 'option', rest or _next_word(arguments, index)
+            if kind == _CODE_OPERAND:
+                code_pending = True
+            elif kind == _STDIN:
+                reading_stdin = True
+            elif kind == _VALUED:
+                if not rest:
+                    index += 1
+                break
+            elif kind == _ATTACHED:
+                break
+            elif kind == _OPTIONAL_DIGITS:
+                while position < len(cluster) and cluster[position].isdigit():
+                    position += 1
+                if position < len(cluster) and cluster[position] == ':':
+                    break
+    return _STDIN, ''
+
+
 def _reads_its_script_from_stdin(tokens: Sequence[str]) -> bool:
-    """这一段是不是「解释器把 stdin 当脚本执行」。
+    """这一段里有没有一个把 stdin 当脚本执行的程序。
 
     带脚本实参的解释器执行的是那个文件，管道送进来的只是它的 stdin——`curl … | python3 x.py` 是
-    每天都在跑的数据管道，判它远程脚本执行就是误报。选项与选项取值不算实参：`sh -s -- --flag`
-    读的仍是 stdin。
+    每天都在跑的数据管道，判它远程脚本执行就是误报。`sh -s x`、`python3 - x` 读的仍是 stdin，
+    `bash -o pipefail` 的 `pipefail` 也不是脚本文件；`bash /dev/stdin`、`source /dev/stdin` 读的同样
+    是 stdin（路径按规范化之后比）。解释器按候选程序词找，`uv run python` 同样算。
     """
-    for index, word in _command_word_slots(tokens):
-        if word not in _INTERPRETERS:
+    for index in _program_candidates(tokens):
+        if _basename(tokens[index]) in ('.', 'source'):
+            operand = _first_operand(tokens, index + 1)
+            if operand is not None and _is_stdin_file(operand):
+                return True
             continue
-        if not any(
-            not later.startswith('-') and not _ASSIGNMENT.match(later)
-            for later in tokens[index + 1 :]
-        ):
+        interpreter = _interpreter(tokens[index])
+        if interpreter is None:
+            continue
+        kind, word = _script_source(interpreter, tokens[index + 1 :])
+        # 选项交出的脚本文件同样可能就是 stdin（`php -f /dev/stdin`）。
+        if kind in (_STDIN, 'unknown') or (kind in ('file', 'option') and _is_stdin_file(word)):
             return True
     return False
 
 
-def _pipes_a_download_into_an_interpreter(command: str) -> bool:
-    """同一条管道链里，下载在前、解释器在后。
+def _carries_download(word: str) -> bool:
+    return _DOWNLOADED in word or _DOWNLOADED_FILE in word
 
-    链要按 `|` 断开重数：`curl x; sh y` 走的是文件、不是这条链，把 `;` 也算进来会让「下载过就算」
-    扩散到整条命令行。中间隔多少段与判定无关——`| tee /tmp/a |` 挡不住后面那个 shell。
+
+def _downloads(tokens: Sequence[str]) -> bool:
+    """这一段里下载器出现在程序词位置。与解释器按同一种候选找：`uv run curl`、`busybox wget`
+    也算。"""
+    return any(_basename(tokens[index]) in _DOWNLOADERS for index in _program_candidates(tokens))
+
+
+@dataclass
+class _Layer:
+    """扫描中还没闭合的一层替换。最外层的 `opener` 是空串。
+
+    `text` 是替换之后的文本；`probe` 是判定这一层用的文本——没有下载的嵌套替换在这里只占一个
+    `_NESTED`，于是每个字符只被判定一次：否则每一层都把里面整段重新分词，深度为 d 的嵌套就是
+    d 倍的输入长度。
     """
+
+    opener: str
+    text: list[str] = field(default_factory=list[str])
+    probe: list[str] = field(default_factory=list[str])
+    depth: int = 0
+    in_double: bool = False
+
+    def add(self, piece: str) -> None:
+        self.text.append(piece)
+        self.probe.append(piece)
+
+
+_PROCESS_OPENERS = ('<(', '>(')
+
+
+def _close_layer(layers: list[_Layer], *, closed: bool) -> bool:
+    """弹出最里面那一层，交给外层：占位词，或原样放回。
+
+    交回这一层自己的命令是不是已经在执行下载来的内容（`: $(curl … | sh)`）：换成占位词之后，外层
+    只看得见「这里有下载」，看不见它里面那条管道。
+    """
+    layer = layers.pop()
+    parent = layers[-1]
+    probe = ''.join(layer.probe)
+    segments, targets = _parse(probe)
+    hit = _runs_parsed(segments, targets)
+    if layer.opener == '>(':
+        # 输出进程替换把写进来的内容当 stdin：接的是从 stdin 读脚本的解释器，写进来的就会被执行。
+        if any(_reads_its_script_from_stdin(tokens) for _, tokens in segments):
+            parent.add(_SINK)
+            return hit
+    elif _carries_download(probe) or any(_downloads(tokens) for _, tokens in segments):
+        parent.add(_DOWNLOADED_FILE if layer.opener == '<(' else _DOWNLOADED)
+        return hit
+    closer = '`' if layer.opener == '`' else ')'
+    parent.text.append(layer.opener + ''.join(layer.text) + (closer if closed else ''))
+    parent.probe.append(_NESTED)
+    return hit
+
+
+def _without_download_substitutions(text: str) -> tuple[str, bool]:
+    """把里面跑了下载器的命令替换（`$(…)`、反引号）换成 `_DOWNLOADED`、进程替换（`<(…)`）换成
+    `_DOWNLOADED_FILE`，把接着从 stdin 读脚本的解释器的输出进程替换（`>(sh)`）换成 `_SINK`；
+    嵌套的一层层往外传。另交回某一层自己是否已经在执行下载来的内容，见 `_close_layer`。
+
+    替换之后，下载来的内容在命令里就是一个看得见的词：它是 `sh -c` 的代码、`eval` 的实参、`bash`
+    读的脚本文件，还是交给本地程序的普通实参，由各自的判据决定。`$((…))` 是算术不是替换；`<(`、
+    `>(` 只在双引号外才是进程替换。单引号里的不换——它在这一层不执行；交给 `eval` 或 `sh -c` 的
+    字符串在下一层执行，那是模块开头写明的盲区。
+
+    扫描不递归：嵌套深度由模型决定，递归会在一段畸形输入上撞出 RecursionError，而判定抛异常等于
+    让这次调用所在的整批失败。
+    """
+    layers = [_Layer('')]
+    hit = False
+    index = 0
+    while index < len(text):
+        layer = layers[-1]
+        char = text[index]
+        parenthesised = layer.opener not in ('', '`') and not layer.in_double
+        if char == '\\':
+            layer.add(text[index : index + 2])
+            index += 2
+        elif char == "'" and not layer.in_double:
+            end = text.find("'", index + 1)
+            stop = len(text) if end == -1 else end + 1
+            layer.add(text[index:stop])
+            index = stop
+        elif char == '"':
+            layer.in_double = not layer.in_double
+            layer.add(char)
+            index += 1
+        elif (char == '`' and layer.opener == '`') or (
+            char == ')' and parenthesised and not layer.depth
+        ):
+            hit = _close_layer(layers, closed=True) or hit
+            index += 1
+        elif text.startswith('$((', index):
+            layer.add('$')
+            index += 1
+        elif text.startswith('$(', index):
+            layers.append(_Layer('$('))
+            index += 2
+        elif char == '`':
+            layers.append(_Layer('`'))
+            index += 1
+        elif text.startswith(_PROCESS_OPENERS, index) and not layer.in_double:
+            layers.append(_Layer(text[index : index + 2]))
+            index += 2
+        else:
+            if parenthesised and char == '(':
+                layer.depth += 1
+            elif parenthesised and char == ')':
+                layer.depth -= 1
+            layer.add(char)
+            index += 1
+    while len(layers) > 1:
+        hit = _close_layer(layers, closed=False) or hit
+    return ''.join(layers[0].text), hit
+
+
+def _executes_a_download(tokens: Sequence[str]) -> bool:
+    """这一段自己执行下载来的内容：它就是程序词、是 `eval` 的实参、是解释器 `-c` 这类选项交出的
+    代码，或是解释器、`source`、`.` 读的脚本文件（进程替换）。
+
+    交给本地脚本的普通实参（`python3 x.py "$(curl …)"`）不算：那是数据，与管道里的判据同一个理由。
+    认不出选项的 wrapper 之后，第一个非选项词带着下载时它可能就是程序词（`xvfb-run $(curl …)`、
+    `ionice -c2 $(curl …)`）；更靠后的是那个程序的实参（`flock -n /tmp/l ./sync.sh "$(curl …)"`），
+    按数据算。
+    """
+    # 没有一个词带着下载，下面每一条都不可能成立；先挡掉，判定才不必对每一段都去找候选程序词。
+    if not any(_carries_download(token) for token in tokens):
+        return False
+    programs = _determinate_programs(tokens)
+    if any(_carries_download(tokens[index]) for index in programs):
+        return True
+    last = max(programs, default=None)
+    if last is not None and _basename(tokens[last]) in _WRAPPERS:
+        following = next(
+            (
+                token
+                for token in tokens[last + 1 :]
+                if not token.startswith('-') and not _ASSIGNMENT.match(token)
+            ),
+            None,
+        )
+        if following is not None and _carries_download(following):
+            return True
+    for index in _program_candidates(tokens):
+        arguments = tokens[index + 1 :]
+        name = _basename(tokens[index])
+        if name == 'eval':
+            if any(_carries_download(argument) for argument in arguments):
+                return True
+            continue
+        if name in ('.', 'source'):
+            operand = _first_operand(tokens, index + 1)
+            if operand is not None and _DOWNLOADED_FILE in operand:
+                return True
+            continue
+        interpreter = _interpreter(tokens[index])
+        if interpreter is None:
+            continue
+        kind, word = _script_source(interpreter, arguments)
+        if kind == 'option' and _carries_download(word):
+            return True
+        if kind == 'file' and _DOWNLOADED_FILE in word:
+            return True
+        if kind == 'unknown' and any(_carries_download(argument) for argument in arguments):
+            return True
+    return False
+
+
+def _runs_downloaded_content(command: str) -> bool:
+    """网络下载的内容被当成脚本执行：经管道进了一个从 stdin 读脚本的解释器，或经命令替换、进程
+    替换成了解释器要执行的代码或脚本文件。
+
+    管道链要按 `|` 断开重数：`curl x; sh y` 走的是文件、不是这条链，把 `;` 也算进来会让「下载过
+    就算」扩散到整条命令行。中间隔多少段与判定无关——`| tee /tmp/a |` 挡不住后面那个 shell。
+    重定向的目标里带着下载（`bash < <(curl …)`、`bash <<< "$(curl …)"`）时，从 stdin 读脚本的
+    程序同样算。命令里有下载、又有接着解释器的输出进程替换（`curl … | tee >(sh)`、`curl -o >(sh)`）
+    时也算：写进 `>(sh)` 的就是下载来的内容。后两条对整条命令判，不按管道链：多判一条牵强的组合，
+    代价只是一次误报。
+
+    已知盲区：带取值、而取值会被当代码加载的选项（`node -r <(curl …)`、
+    `bash --rcfile <(curl …) -i`、`fish -C "$(curl …)"`）；解释器选项表里没有、又与 node 开关同前缀
+    的带值选项；先跟一个位置实参的 wrapper（`flock /tmp/l $(curl …)`）；单独一个 `+`（`bash +`）；
+    heredoc 正文里像命令的文本（`_parse` 不认 heredoc）；以及模块开头写明的「代码在字符串里」。
+    """
+    reduced, hit = _without_download_substitutions(command)
+    return hit or _runs_parsed(*_parse(reduced))
+
+
+def _feeds_a_sink(tokens: Sequence[str]) -> bool:
+    """这一段把输出写进 `_SINK`：程序是 `tee`（`| tee >(sh)`）或下载器（`curl -o >(sh)`）。
+
+    只看文本里有没有 `>(sh)` 不够：注释（`… | jq . # see: tee >(sh)`）里也会有。
+    """
+    return any(_SINK in token for token in tokens) and any(
+        _basename(tokens[index]) == 'tee' or _basename(tokens[index]) in _DOWNLOADERS
+        for index in _program_candidates(tokens)
+    )
+
+
+def _runs_parsed(segments: Sequence[tuple[bool, tuple[str, ...]]], targets: Sequence[str]) -> bool:
+    """这条规则的全部判据，跑在替换已经换掉的一段命令上（整条命令，或其中的一层替换）。"""
+    redirected = any(_carries_download(target) for target in targets)
     downloaded = False
-    for piped, tokens in _segments(command):
+    any_download = redirected
+    for piped, tokens in segments:
         if not piped:
             downloaded = False
-        if downloaded and _reads_its_script_from_stdin(tokens):
+        fetches = _downloads(tokens) or any(_carries_download(token) for token in tokens)
+        if (downloaded or redirected) and _reads_its_script_from_stdin(tokens):
             return True
-        if any(word in _DOWNLOADERS for word in _command_words(tokens)):
+        if _executes_a_download(tokens):
+            return True
+        if (downloaded or redirected or fetches) and _feeds_a_sink(tokens):
+            return True
+        if fetches:
             downloaded = True
-    return False
+            any_download = True
+    return any_download and any(_SINK in target for target in targets)
 
 
 def _removes_recursively_and_forcibly(command: str) -> bool:
@@ -659,7 +1131,7 @@ DEFAULT_RULES: tuple[DangerRule, ...] = (
         rule_id='shell.remote_script_execution',
         level=RiskLevel.HIGH,
         reason='这次调用把网络下载的内容直接交给解释器执行，执行前没有任何人看过它的内容',
-        matches=_pipes_a_download_into_an_interpreter,
+        matches=_runs_downloaded_content,
     ),
     DangerRule(
         rule_id='shell.recursive_force_remove',
@@ -840,17 +1312,21 @@ def _program_candidates(tokens: Sequence[str]) -> list[int]:
     """
     found = {index for index, _ in _command_word_slots(tokens)}
     pending = sorted(found)
+    # 从这里到末尾的非选项词都已经是候选。每个选项认不出的启动器都要「后面全算」，只扫还没扫过的
+    # 那一截：每次都从头扫，一串 `uv -X uv -X …` 就是平方时间，而判定跑在每一次工具调用上。
+    swept = len(tokens)
     while pending:
         index = pending.pop()
         launched = _launched_program(tokens, index)
         if launched is None:
             more = [
                 later
-                for later in range(index + 1, len(tokens))
+                for later in range(index + 1, swept)
                 if not tokens[later].startswith('-') and not _ASSIGNMENT.match(tokens[later])
             ]
+            swept = min(swept, index + 1)
         else:
-            more = [launched + offset for offset, _ in _command_word_slots(tokens[launched:])]
+            more = [later for later, _ in _command_word_slots(tokens, launched)]
         for later in more:
             if later not in found:
                 found.add(later)
