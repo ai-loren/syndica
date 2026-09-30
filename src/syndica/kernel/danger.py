@@ -331,8 +331,14 @@ _LINE_CONTINUATION = re.compile(r'\\\r?\n')
 
 
 def _basename(token: str) -> str:
-    # 前导 `\` 一并去掉：`\rm` 是绕开 `alias rm='rm -i'` 的标准写法，与 `/bin/rm`、`"rm"` 同族。
-    return token.rsplit('/', 1)[-1].lstrip('\\')
+    """命令词的身份：基名，去掉前导 `\\`，折叠大小写。
+
+    前导 `\\` 一并去掉：`\\rm` 是绕开 `alias rm='rm -i'` 的标准写法，与 `/bin/rm`、`"rm"` 同族。
+    折叠大小写：APFS 默认不区分大小写，macOS 上 `GIT push`、`RM -rf /`、`SUDO ls` 找到的就是
+    git、rm、sudo；逐字节比较让每一条按程序名认的规则都能靠换个大小写绕过。Linux 上大写的名字多半
+    根本不存在，多判只是误报。
+    """
+    return token.rsplit('/', 1)[-1].lstrip('\\').casefold()
 
 
 def _end_of_redirection(text: str, start: int) -> int:

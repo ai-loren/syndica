@@ -976,6 +976,10 @@ GitHub Free 每月 2000 分钟的 Actions 额度在 2026-10 已经用完，下�
 - 阶段一审计：CLI 宿主把 Agent 的 shell 写死成 `/bin/sh`，`SYNDICA_TEST_SHELL=/bin/dash` 从没作用到经 CLI
   的用例上，T5 的 dash 复跑对 CLI 用例其实没换 shell（本机 `/bin/sh` 是 bash 3.2）。改为宿主一个常量、测试侧
   自动装置换掉它，另用一条子进程用例证明换得过去；T11、T12、T17 的 CLI 用例从此也在 dash 下跑。
+- T6 收尾时本机实测：APFS 默认不区分大小写，`GIT push`、`RM -r .`、`SUDO ls`、`CURL … | SH` 在 macOS 上
+  跑的就是 git、rm、sudo、curl 与 sh，而每一条按程序名认的规则都逐字节比较，于是换个大小写就一条都不命中
+  （开发期守卫也拦不住 `GIT push`）。改为命令词折叠大小写后再认；Linux 上大写的名字多半不存在，多判只是
+  误报。spec §5.6 在 T18 同步。
 - T6 评审顺带发现默认规则 `shell.remote_script_execution` 的漏报：`curl … | sh -s -- foo`、`| bash -s x`、
   `| python3 - --opt v`、`| bash -o pipefail` 一条都不命中——解释器之后任何一个非选项词都被当成脚本文件，
   而 `-s`、`-` 让解释器仍从 stdin 读脚本，`-o` 的取值也不是文件。单独提交修复（M1 的内核代码，不属 T6）。

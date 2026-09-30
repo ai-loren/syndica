@@ -114,7 +114,9 @@ _LEAD = {
         ('setsid git push', 'shell.git_state_change'),
         ('uv run git push', 'shell.git_state_change'),
         ('git commit --allow-empty -m sneaky', 'shell.git_state_change'),
+        ('GIT commit --allow-empty -m sneaky', 'shell.git_state_change'),
         ('rm -r .', 'shell.workspace_root_removal'),
+        ('RM -r .', 'shell.workspace_root_removal'),
     ],
 )
 def test_a_git_write_or_root_removal_is_blocked_and_the_agent_carries_on(

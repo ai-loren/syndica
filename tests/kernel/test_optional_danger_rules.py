@@ -412,6 +412,23 @@ def test_a_wrapper_option_that_takes_a_value_does_not_hide_git(command: str):
 
 @pytest.mark.parametrize(
     'command',
+    ['GIT push', 'Git commit -m x', 'SETSID GIT push', 'UV run GIT push', '/USR/BIN/GIT push'],
+)
+def test_git_is_recognised_whatever_the_case_of_its_name(command: str):
+    assert _git(command)
+
+
+def test_a_read_only_subcommand_stays_read_only_whatever_the_case_of_git():
+    assert not _git('GIT status')
+
+
+@pytest.mark.parametrize('command', ['RM -r .', 'Rm -r ./*', 'ENV RM -r .'])
+def test_removing_the_root_is_recognised_whatever_the_case_of_rm(command: str):
+    assert _removes_root(command)
+
+
+@pytest.mark.parametrize(
+    'command',
     [
         'uv run git push',
         'uv run --with rich git push',
