@@ -3,7 +3,7 @@
 > **执行者须知：本文件是需求，不是参考。** 「公开契约」一节里的 CLI 参数、配置键、规则 ID、标记行、
 > front matter 字段与内核 API 一旦发布就是兼容承诺；执行中不得为了让测试变绿临时改名或缩小断言范围。
 
-**状态：已评审，执行中（T1–T7 完成，阶段一已审计）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
+**状态：已评审，执行中（T1–T8、T10 完成，阶段一已审计）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
 2026-10-01，见「决策日志」）。GitHub Actions 本月免费额度已用完，恢复之前按「验证」一节的本地验证协议执行。
 
 **Goal:** 让 Syndica 在一份仓库里完成一次受控修改：读约束、规划、改文件、跑检查、读失败、迭代修复，
@@ -215,8 +215,10 @@ CONFIRM 只在可信轨迹里到得了人手上，也就是 Agent 还没读过�
 
 - 透传固定白名单 `PATH HOME USER LOGNAME LANG LC_ALL LC_CTYPE TMPDIR XDG_CACHE_HOME UV_CACHE_DIR` 加
   `workspace.pass_env`，都只取实际存在的；
-- 名字按 `_` 切词后，任一词是 `KEY KEYS TOKEN TOKENS SECRET SECRETS PASSWORD PASSWD PASS PAT CREDENTIAL
-  CREDENTIALS AUTH COOKIE` 之一（不区分大小写）就拒收，写在 `pass_env` 里也拒，报三件套错误说明原因。
+- 名字按 `_` 切词后，任一词是 `KEY KEYS APIKEY TOKEN TOKENS SECRET SECRETS PASSWORD PASSWD PASS PASSPHRASE
+  PW PWD PAT CREDENTIAL CREDENTIALS AUTH COOKIE SESSION DSN AK SK` 之一（不区分大小写）、以 `KEY PASSWORD
+  PASSWD SECRET TOKEN` 之一结尾（`PGPASSWORD`、`NGROK_AUTHTOKEN`），或相邻两词是 `CONNECTION STRING`，就拒收，
+  写在 `pass_env` 里也拒，报三件套错误说明原因。shell 自己的 `PWD`、`OLDPWD` 不算。
   按词匹配而不是子串：`GIT_AUTHOR_NAME` 不是密钥，`SSH_AUTH_SOCK` 是（Agent 不拿 ssh agent）。这条规则只
   决定「不交给 Agent」；哪些值要打码是 D12 的另一条更窄的规则；
 - 宿主另设六个值：`GIT_TERMINAL_PROMPT=0`、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL` 指向本次 run 的
@@ -289,18 +291,21 @@ handoff 的状态是 `read_only`。依据路线图静态验收「写工具不可
 **D12 最小脱敏器（CLI surface，`cli/redaction.py`）。** M3 建统一 `Redactor` 时并进去。规则各有稳定 ID，
 替换成 `[REDACTED:<规则 ID>]`，不留原文：
 
-- `secret.env_value`：宿主环境里名字按 D6 判为密钥、且值像凭证（不是绝对路径、不是不带凭证的 URL、长度
-  不少于 8）的变量，按值逐字替换，长的先换。值是长度不少于 20、没有 `/` 与空白的令牌时，另把去掉公开前缀
-  （如 `sk-or-v1-`）之后、长度不少于 16 的任意片段也替换，被截断的 key 也认得出；
+- `secret.env_value`：宿主环境里名字按 D6 判为密钥、且值像凭证（不是存在的绝对路径、不是不带凭证的 URL、
+  长度不少于 8）的变量，按值逐字替换（值与去掉首尾空白的值），长的先换。值是长度不少于 20、没有空白的令牌
+  （带 `/` 的只在不含 `.`、不是 URL 时算，相对路径不算）时，另把去掉公开前缀（如 `sk-or-v1-`）之后、长度
+  不少于 16 的任意片段也替换，被截断的 key 也认得出；
 - `secret.private_key_block`、`secret.authorization_header`（`Authorization:` 之后的 Bearer / token /
   Basic 凭证）、`secret.url_userinfo`（URL 里 `user:pass@` 的部分）；
 - `secret.openrouter_key`、`secret.openai_key`、`secret.google_api_key`、`secret.github_token`、
   `secret.aws_access_key`、`secret.slack_token`：各自完整的公开格式（只有前缀不算）。
 
 用在：handoff 文件与 stdout；`--handoff` 下 stdout 与 stderr 都经同一个脱敏写入器；提交消息。暂存区 diff
-的提交闸（D14）只用逐字值与格式规则，不用片段匹配：片段匹配允许误报，拦提交不允许。一条 AST 守卫保证
-`syndica/cli` 里的写文件调用要么不带内容（空文件、空目录、锁、内容恰为 `*` 的 `.gitignore`），要么写的是
-脱敏器的输出；`--handoff` 的两条流必须经那个写入器。
+的提交闸（D14）只用逐字值（16 个字符以上、至少两类字符）、格式规则（文档示例与一串 x 这类占位除外）与真有
+一整行密钥的私钥，不用片段匹配，也不认 `Authorization:` 与 URL 里的 `user:pass@`：片段匹配允许误报，拦提交
+不允许，文档里的 `Bearer $TOKEN` 不是泄露。一条 AST 守卫保证 `syndica/cli` 里的写文件调用要么不带内容（空
+文件、空目录、锁、内容恰为 `*` 的 `.gitignore`），要么写的是脱敏器的输出，子进程的参数与 stdin 同样按内容
+看；`--handoff` 的两条流必须经那个写入器。
 
 ### 复核、交接与 git
 
@@ -714,6 +719,17 @@ HIGH 本来就 BLOCK）。对抗评审报的 Critical 已修：Bash 的 `cwd` �
 
 #### T10 — 最小脱敏器
 
+**状态：completed**（本地验证协议：定向用例与六道门禁全绿；对抗评审找出 3 High / 6 Medium 与 14 条存活变异，
+全部修掉后变异 133 条全杀。十条规则各有命中与形似不命中的样例，全部运行时拼出（定种子的伪随机串：按位置算的串
+是周期的，片段会重复）。格式规则在抹掉颜色码、`\n` 这类转义与 `%XX` 的副本上找，结尾不要求词界；以 `/` 开头
+而不存在的值、带尾随换行的值照样按值替换；PGP、RFC 4716、PuTTY 私钥与带 `Proc-Type:` 头的截断私钥都换掉；
+`Authorization` 认字典与 JSON 的写法、`HTTP_AUTHORIZATION=` 与 `\r\n` 之后，凭证要像凭证。片段按 16 字符窗口
+在逐字节标记表上涂，线性时间与线性内存。提交闸只用逐字值（16 个字符以上、至少两类字符）、格式规则（文档示例
+与占位除外）与真有一整行密钥的私钥，结果按行号排序；`Authorization:` 与 URL 里的 `user:pass@` 不进提交闸。
+写入点守卫另查子进程：参数列表字面量里 `-m` / `--message` 后面那一项与 `input=` 按内容看，`stdout=` /
+`stderr=` 只许管道，不许 shell；`gzip.open`、`zipfile.ZipFile`、`logging.FileHandler`、`os.dup2` 等同样不许。
+`--handoff` 两条流的脱敏写入器随 T11 接上。Linux 补跑待 CI 额度恢复）
+
 **Files:** `cli/redaction.py`、`tests/cli/test_redaction.py`、写入点 AST 守卫。
 
 - 样例一律是运行时拼出的合成假值，不在源码里逐字出现（否则仓库自己的提交会撞上提交闸）。用例：每条规则
@@ -1051,6 +1067,11 @@ GitHub Free 每月 2000 分钟的 Actions 额度在 2026-10 已经用完，下�
   `from syndica.cli import x` 与相对导入都认得，偏偏最短的这一种不认。评审又指出同型的
   `from syndica.backends import beta`（backend 之间互相 import）同样漏过。改为绝对 from-import 一律把导入的
   名字接在模块后面，与相对导入那一支对称，单独修复并补用例（几个名字里的第二个、改了名的都算）。
+- T10 写样例时发现 D6 的密钥词不认 `GPG_PASSPHRASE`、`SENDGRID_APIKEY`：按 `_` 切词后 PASSPHRASE、APIKEY
+  各是一个词，不在词表里。这样的名字能经 `pass_env` 透传给 Agent，脱敏器也不按值替换它们。补进词表。对抗评审
+  又找出一整类连写与缩写：`PGPASSWORD`、`MYSQL_PWD`、`NGROK_AUTHTOKEN`、`VOLC_SECRETKEY`、`BW_SESSION`、
+  `QIANFAN_AK`、`AZURE_STORAGE_CONNECTION_STRING`。逐个补词追不完，改为另按词尾认，并补几个常见缩写；代价是
+  `MONKEY_MODE` 这种以 KEY 结尾的普通名字也被拒收（报错说清原因，值只在像凭证时才打码）。
 - T4，执行环境把同一条长命令执行了两遍、两遍时间上重叠：两个变异跑手同时改同一批文件，其中一个的
   `git add` 把另一个施加中的变异暂存了进去。基线自检（施加前先核对 sha256）当场报了漂移、没有带着残留
   继续跑。之后变异跑手加了进程锁、改在后台运行。

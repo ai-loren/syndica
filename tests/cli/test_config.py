@@ -301,11 +301,19 @@ def test_a_config_without_a_workspace_section_has_an_empty_one(tmp_path: Path) -
         'PASSWORD',
         'PASSWD',
         'PASS',
+        'PASSPHRASE',
         'PAT',
         'CREDENTIAL',
         'CREDENTIALS',
         'AUTH',
         'COOKIE',
+        'APIKEY',
+        'AK',
+        'SK',
+        'PW',
+        'PWD',
+        'DSN',
+        'SESSION',
     ],
 )
 def test_every_secret_word_in_a_pass_env_name_is_refused(tmp_path: Path, word: str) -> None:
@@ -315,6 +323,32 @@ def test_every_secret_word_in_a_pass_env_name_is_refused(tmp_path: Path, word: s
     assert '密钥' in caught.value.expected
     assert f'MY_{word}_X' in caught.value.received
     assert 'Agent' in caught.value.next_action
+
+
+@pytest.mark.parametrize(
+    'name',
+    [
+        'PGPASSWORD',
+        'NGROK_AUTHTOKEN',
+        'VOLC_SECRETKEY',
+        'CLIENTSECRET',
+        'PGPASSWD',
+        'AZURE_STORAGE_CONNECTION_STRING',
+    ],
+)
+def test_a_secret_word_written_together_or_as_a_pair_is_refused(tmp_path: Path, name: str) -> None:
+    """连写的词按词尾认，`CONNECTION_STRING` 按相邻两词认。"""
+    with pytest.raises(ConfigError):
+        _workspace_config(tmp_path, f'  pass_env: [{name}]\n')
+
+
+@pytest.mark.parametrize('name', ['PWD', 'OLDPWD', 'CONNECTION_POOL', 'STRING_TABLE'])
+def test_the_shells_own_directory_variables_and_lone_words_are_not_secrets(
+    tmp_path: Path, name: str
+) -> None:
+    config = _workspace_config(tmp_path, f'  pass_env: [{name}]\n')
+
+    assert config.workspace.pass_env == (name,)
 
 
 @pytest.mark.parametrize(

@@ -44,22 +44,35 @@ FIXED_PASS_ENV: tuple[str, ...] = (
 # `GIT_AUTHOR_NAME` 不是密钥，`SSH_AUTH_SOCK` 是（Agent 不拿 ssh agent）。
 _SECRET_WORDS = frozenset(
     {
+        'AK',
+        'APIKEY',
         'AUTH',
         'COOKIE',
         'CREDENTIAL',
         'CREDENTIALS',
+        'DSN',
         'KEY',
         'KEYS',
         'PASS',
+        'PASSPHRASE',
         'PASSWD',
         'PASSWORD',
         'PAT',
+        'PW',
+        'PWD',
         'SECRET',
         'SECRETS',
+        'SESSION',
+        'SK',
         'TOKEN',
         'TOKENS',
     }
 )
+# 连写的词（`PGPASSWORD`、`NGROK_AUTHTOKEN`、`VOLC_SECRETKEY`、`CLIENTSECRET`）按词尾认。
+_SECRET_SUFFIXES = ('KEY', 'PASSWORD', 'PASSWD', 'SECRET', 'TOKEN')
+_SECRET_PAIRS = frozenset({('CONNECTION', 'STRING')})
+# shell 自己的工作目录变量，不是密码。
+_NOT_SECRET = frozenset({'PWD', 'OLDPWD'})
 # 宿主自己设的值；`pass_env` 不能透传它们，否则 Agent 就拿回了用户的 git 与 gh 配置。
 HOST_SET_ENV: tuple[str, ...] = (
     'GIT_TERMINAL_PROMPT',
@@ -84,8 +97,14 @@ _NO_GH_LOGIN = 'syndica-agent-has-no-github-login'
 
 
 def looks_secret(name: str) -> bool:
-    """这个变量名像不像装着密钥：按 `_` 切词，任一词是 KEY / TOKEN / AUTH 这类。"""
-    return any(word.upper() in _SECRET_WORDS for word in name.split('_'))
+    """这个变量名像不像装着密钥：按 `_` 切词，任一词是 KEY / TOKEN / AUTH 这类、以 KEY / PASSWORD
+    这类结尾，或相邻两词是 CONNECTION STRING。"""
+    if name in _NOT_SECRET:
+        return False
+    words = [word.upper() for word in name.split('_')]
+    if any(word in _SECRET_WORDS or word.endswith(_SECRET_SUFFIXES) for word in words):
+        return True
+    return any(pair in _SECRET_PAIRS for pair in zip(words, words[1:], strict=False))
 
 
 def valid_env_name(name: str) -> bool:
