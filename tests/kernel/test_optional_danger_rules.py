@@ -434,6 +434,41 @@ def test_removing_the_root_is_recognised_whatever_the_case_of_rm(command: str):
 @pytest.mark.parametrize(
     'command',
     [
+        "echo it\\'s; git push",
+        'echo \\"; git push',
+        'echo "a\\"b"; git push',
+        "echo $'\\''; git push",
+        'g\\it push',
+        "$'\\x67it' push",
+        "$'\\147it' push",
+        "$'\\u0067it' push",
+        "$'\\U00000067it' push",
+        "cat > README.md <<EOF\nIt's a tool\nEOF\ngit push",
+        'cat x > .g\\it/config',
+    ],
+)
+def test_escapes_and_heredoc_quotes_never_hide_a_git_write(command: str):
+    """反斜杠、`$'…'` 与 heredoc 正文里的引号都按 shell 的规则处理；算错一次，开发期守卫就看不见
+    后面的 `git push`。"""
+    assert _git(command)
+
+
+def test_an_unknown_ansi_c_escape_keeps_its_backslash():
+    assert not _git("$'g\\it' push")
+
+
+def test_an_escaped_dollar_in_double_quotes_is_not_a_substitution():
+    assert not _git('echo "\\$(git push)"')
+
+
+def test_escapes_never_hide_a_root_removal_or_an_outside_path():
+    assert _removes_root("echo it\\'s; rm -r .")
+    assert _outside("echo it\\'s; cat /etc/passwd")
+
+
+@pytest.mark.parametrize(
+    'command',
+    [
         'uv run git push',
         'uv run --with rich git push',
         'uv run --python 3.11 git push',

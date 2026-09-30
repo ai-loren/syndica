@@ -546,47 +546,116 @@ _DISCARD = 'discard'
 
 
 def _redirection(source: str, index: int, *, thorough: bool) -> tuple[str, int]:
-    """(操作符后面那个词的去向, 操作符结束的位置)。"""
+    """(操作符后面那个词的去向, 操作符结束的位置)。
+
+    heredoc 两种模式都认：正文要单独处理，否则正文里一个撇号（`it's`）会被当成开引号，把结束标记
+    之后真正的命令一起吞掉。here-string 只在 `thorough` 下丢掉；默认规则要把它当目标，
+    `bash <<< "$(curl …)"` 的下载才看得见。
+    """
     if thorough and source.startswith('<<<', index):
         return _DISCARD, index + 3
-    if thorough and source.startswith('<<-', index):
+    if source.startswith('<<<', index):
+        return _TARGET, _end_of_redirection(source, index)
+    if source.startswith('<<-', index):
         return _HEREDOC_TABS, index + 3
-    if thorough and source.startswith('<<', index):
+    if source.startswith('<<', index):
         return _HEREDOC, index + 2
     return _TARGET, _end_of_redirection(source, index)
 
 
-def _after_heredocs(
+def _heredoc_bodies(
     source: str,
     start: int,
     heredocs: Sequence[tuple[str, bool, bool]],
     line: Sequence[tuple[bool, tuple[str, ...]]],
-) -> int:
-    """这一行登记的 heredoc 正文结束之后的位置；不该跳过时就是 start。
+) -> tuple[int, list[str]]:
+    """(这一行登记的 heredoc 正文结束之后的位置, 要当命令单独解析的正文)。
 
-    只跳过写进文件的数据：结束标记带引号（正文不展开，里面的 `$(…)` 不执行），并且这一行既没有
+    写进文件的数据跳过：结束标记带引号（正文不展开，里面的 `$(…)` 不执行），并且这一行既没有
     管道、也没有会把 stdin 当脚本执行的程序（`sh <<'EOF'` 执行的正是正文）。管道单独算：接在后面
-    的程序不在解释器名单里（`| lua`）时，正文照样可能被执行。
-    找不到结束标记也不跳：续行符折叠、写错的标记都会让它落空，而跳到末尾会把后面真正的命令一起
-    藏起来。
+    的程序不在解释器名单里（`| lua`）时，正文照样可能被执行。其余的正文交回去单独解析——单独，
+    是为了正文里的引号吞不到结束标记之后。
+    找不到结束标记就交回 start、不单独处理：续行符折叠、写错的标记都会让它落空，而跳到末尾会把
+    后面真正的命令一起藏起来。
     """
-    if not heredocs or not all(quoted for _, quoted, _ in heredocs):
-        return start
-    for piped, tokens in line:
-        if piped or any(_runs_stdin(tokens[index]) for index in _program_candidates(tokens)):
-            return start
+    executed = any(
+        piped or any(_runs_stdin(tokens[index]) for index in _program_candidates(tokens))
+        for piped, tokens in line
+    )
     position = start
-    for delimiter, _, strip_tabs in heredocs:
+    bodies: list[str] = []
+    for delimiter, quoted, strip_tabs in heredocs:
+        body_start = position
         while True:
             if position >= len(source):
-                return start
+                return start, []
             newline = source.find('\n', position)
             stop = len(source) if newline == -1 else newline
             text = source[position:stop]
+            line_start = position
             position = stop + 1
             if (text.lstrip('\t') if strip_tabs else text).rstrip('\r') == delimiter:
                 break
-    return min(position, len(source))
+        if executed or not quoted:
+            bodies.append(source[body_start:line_start])
+    return min(position, len(source)), bodies
+
+
+# `$'…'` 里的反斜杠转义：`$'\x67it' push` 就是 `git push`。
+_ANSI_C = "$'"
+_ANSI_C_SIMPLE: Mapping[str, str] = MappingProxyType(
+    {
+        'a': '\a',
+        'b': '\b',
+        'e': '\x1b',
+        'E': '\x1b',
+        'f': '\f',
+        'n': '\n',
+        'r': '\r',
+        't': '\t',
+        'v': '\v',
+        '\\': '\\',
+        "'": "'",
+        '"': '"',
+        '?': '?',
+    }
+)
+_ANSI_C_NUMERIC = (('x', 16, 2), ('u', 16, 4), ('U', 16, 8))
+
+
+def _ansi_c_escape(source: str, index: int) -> tuple[str, int]:
+    """source[index] 是 `$'…'` 里的反斜杠：(解码出的文本, 转义之后的位置)。认不出的原样留下。"""
+    following = source[index + 1 : index + 2]
+    if not following:
+        return '\\', index + 1
+    if following in _ANSI_C_SIMPLE:
+        return _ANSI_C_SIMPLE[following], index + 2
+    if following == 'c' and index + 2 < len(source):
+        return chr(ord(source[index + 2]) & 0x1F), index + 3
+    for letter, base, width in _ANSI_C_NUMERIC:
+        if following == letter:
+            digits = ''
+            for char in source[index + 2 : index + 2 + width]:
+                if char not in '0123456789abcdefABCDEF':
+                    break
+                digits += char
+            if digits and int(digits, base) <= 0x10FFFF:
+                return chr(int(digits, base)), index + 2 + len(digits)
+            return '\\' + following, index + 2
+    if following in '01234567':
+        digits = ''
+        for char in source[index + 1 : index + 4]:
+            if char not in '01234567':
+                break
+            digits += char
+        return chr(int(digits, 8) & 0xFF), index + 1 + len(digits)
+    return '\\' + following, index + 2
+
+
+# 双引号里反斜杠只转义这几个字符，别的反斜杠照原样留着。
+_DOUBLE_QUOTE_ESCAPES = frozenset('"\\$`')
+# heredoc 正文里又套 heredoc 时单独解析的层数上限；超过就按原来的方式接着往下分词。
+_MAX_HEREDOC_NESTING = 16
 
 
 def _segments(text: str) -> list[tuple[bool, tuple[str, ...]]]:
@@ -604,16 +673,19 @@ def _segments(text: str) -> list[tuple[bool, tuple[str, ...]]]:
 
 
 def _parse(
-    text: str, *, thorough: bool = False
+    text: str, *, thorough: bool = False, nesting: int = 0
 ) -> tuple[list[tuple[bool, tuple[str, ...]]], list[str]]:
     """(段, 整条命令里全部重定向的目标)。
 
     `thorough=False` 时段与 `_segments` 一字不差：默认规则的判定只取决于段。三族可选规则用
-    `thorough=True`，多做四件会改变段的事，所以它们不进默认规则：
+    `thorough=True`，多做三件会改变段的事，所以它们不进默认规则：
     - 空引号是一个词：`git -C '' push` 的 `''` 是 `-C` 的取值，丢掉它，`push` 就被当成取值吞掉；
     - 双引号里的 `$(…)` 与反引号照样执行，拆成新的一段；
-    - `<<-` 是一个操作符；heredoc 的结束标记与 here-string 的词既不是 token 也不是目标；
-    - 跳过「写进文件的数据」那种 heredoc 正文，见 `_after_heredocs`。
+    - here-string 的词既不是 token 也不是目标。
+
+    两种模式都按 shell 的规则消掉反斜杠与 `$'…'`：引号状态一旦算错，后面整条命令就被当成引号里的
+    字符、对所有规则隐身（`echo it\\'s; rm -rf /`）。heredoc 两种模式都认：写进文件的数据跳过，
+    其余正文单独解析，见 `_heredoc_bodies`。
 
     目标不挂在段上：只有重定向、没有命令词的一段（`: ; > /etc/x` 的后半）不产出段，挂在段上它的
     目标就丢了。`2>&1` 的目标是 `1`——相对的词，按路径看落在根里。
@@ -663,7 +735,24 @@ def _parse(
 
     while index < len(source):
         char = source[index]
-        if quote:
+        if quote == _ANSI_C:
+            if char == '\\':
+                decoded, index = _ansi_c_escape(source, index)
+                token.append(decoded)
+                continue
+            if char == "'":
+                quote = ''
+            else:
+                token.append(char)
+        elif quote:
+            if (
+                quote == '"'
+                and char == '\\'
+                and source[index + 1 : index + 2] in _DOUBLE_QUOTE_ESCAPES
+            ):
+                token.append(source[index + 1])
+                index += 2
+                continue
             if char == quote:
                 quote = ''
             elif thorough and quote == '"' and (char == '`' or source.startswith('$(', index)):
@@ -674,10 +763,23 @@ def _parse(
                 continue
             else:
                 token.append(char)
+        elif char == '\\':
+            # 引号外的反斜杠让下一个字符只是字符：`\'` 不开引号、`\;` 不分段、`r\m` 就是 rm。
+            if index + 1 < len(source):
+                token.append(source[index + 1])
+                quoted = True
+                index += 2
+                continue
+            token.append(char)
         elif closers and char == closers[-1]:
             closers.pop()
             end_segment(False)
             quote = '"'
+        elif char == '$' and source[index + 1 : index + 2] == "'":
+            quote = _ANSI_C
+            quoted = True
+            index += 2
+            continue
         elif char in _QUOTES:
             quote = char
             quoted = True
@@ -690,11 +792,21 @@ def _parse(
             continue
         elif char in _BOUNDARIES:
             end_segment(char == _PIPE)
-            if thorough and char == '\n':
-                index = _after_heredocs(source, index + 1, heredocs, segments[line_start:])
+            if char == '\n':
+                line = segments[line_start:]
+                if heredocs and nesting < _MAX_HEREDOC_NESTING:
+                    index, bodies = _heredoc_bodies(source, index + 1, heredocs, line)
+                    for body in bodies:
+                        body_segments, body_targets = _parse(
+                            body, thorough=thorough, nesting=nesting + 1
+                        )
+                        segments.extend(body_segments)
+                        targets.extend(body_targets)
+                    heredocs.clear()
+                    line_start = len(segments)
+                    continue
                 heredocs.clear()
                 line_start = len(segments)
-                continue
         elif char.isspace():
             end_token()
         else:
@@ -939,6 +1051,13 @@ def _without_download_substitutions(text: str) -> tuple[str, bool]:
         ):
             hit = _close_layer(layers, closed=True) or hit
             index += 1
+        elif char == '$' and text[index + 1 : index + 2] == "'" and not layer.in_double:
+            # `$'…'` 里的 `\'` 不结束字符串；当普通单引号扫，`$'\''` 之后整条命令都会落进引号。
+            stop = index + 2
+            while stop < len(text) and text[stop] != "'":
+                stop += 2 if text[stop] == '\\' else 1
+            layer.add(text[index : stop + 1])
+            index = stop + 1
         elif text.startswith('$((', index):
             layer.add('$')
             index += 1
@@ -1029,7 +1148,8 @@ def _runs_downloaded_content(command: str) -> bool:
     已知盲区：带取值、而取值会被当代码加载的选项（`node -r <(curl …)`、
     `bash --rcfile <(curl …) -i`、`fish -C "$(curl …)"`）；解释器选项表里没有、又与 node 开关同前缀
     的带值选项；先跟一个位置实参的 wrapper（`flock /tmp/l $(curl …)`）；单独一个 `+`（`bash +`）；
-    heredoc 正文里像命令的文本（`_parse` 不认 heredoc）；以及模块开头写明的「代码在字符串里」。
+    以及模块开头写明的「代码在字符串里」。已知误报：heredoc 正文里像命令的文本——结束标记不带引号
+    时正文按命令单独解析；替换扫描不认 heredoc，带引号的正文里 `$(curl … | sh)` 也按命令判。
     """
     reduced, hit = _without_download_substitutions(command)
     return hit or _runs_parsed(*_parse(reduced))
@@ -1693,9 +1813,9 @@ def git_state_change_rule() -> DangerRule:
     （`git branch`、`git stash list`、`git remote -v`、`git config --get`）；`echo GIT_DIR=x`；
     wrapper 之后恰好写着 `git` 的普通实参；结束标记不带引号、喂进管道或交给解释器的 heredoc 正文。
     已知盲区：`sh -c "…"`、`python -c "…"`、`make`、脚本文件里的 git，以及引号内代码里嵌的
-    `.git` 路径；`xargs` / `find -exec` 转手；变量（`$GIT push`）；反斜杠与 `$'…'` 转义
-    （`.g\\it`）；花括号展开（`{.git,x}`）；名单之外的启动器与 wrapper（`xcrun`、`pdm run`、
-    `eval`）。
+    `.git` 路径；`xargs` / `find -exec` 转手；变量（`$GIT push`）；花括号展开（`{.git,x}`）；
+    名单之外的启动器与 wrapper（`xcrun`、`pdm run`、`eval`）。反斜杠与 `$'…'` 转义按 shell 的
+    规则消掉（`g\\it push`、`$'\\x67it' push` 都命中）。
     """
     return DangerRule(
         rule_id='shell.git_state_change',
