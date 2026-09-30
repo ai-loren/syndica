@@ -6,6 +6,8 @@
 ## 当前状态
 
 里程碑 1 已完成，审计记录见 [`docs/audits/2026-09-23-m1-final-audit.md`](../audits/2026-09-23-m1-final-audit.md)。
+2026-09-29 用真实免费模型跑通体验验收，并补上 M2 之前的一项基础设施：多平台模型轮换（Gemini 在前、
+OpenRouter 兜底，每个平台各自指数退避，spec 决策 #89）。
 
 当前主线约束：
 
@@ -58,8 +60,8 @@ uv run pytest -q
 
 ## 遗留项归属（2026-09-29）
 
-M1 登记表里「明确不在里程碑 1」的 26 条、2026-09-29 真实体验验收留下的后续项、M1 交接文档 §4.0
-的 Minor 与工程卫生项，在这里逐条给出归属。标为「接受」的是有意保留的限制，不排期，理由写在登记表
+M1 登记表里「明确不在里程碑 1」的 26 条、2026-09-29 真实体验验收与多平台轮换留下的后续项、M1 交接
+文档 §4.0 的 Minor 与工程卫生项，在这里逐条给出归属。标为「接受」的是有意保留的限制，不排期，理由写在登记表
 对应条目里。归到某个里程碑的条目已同时写进该里程碑的 TODO；开工写计划时把它们列进「要关闭的
 deferred items」。
 
@@ -93,6 +95,8 @@ deferred items」。
 | D-46 | 派活 / 分叉树没有上限也没有回收 | M8 | 预算树与回收策略 |
 | 验收后续 | Agent 看不到自己还剩几轮，紧预算下一直调工具不收尾 | M8 | `GetBudget` 与预算注入历史 |
 | 验收后续 | `--max-turns` 是每个 Agent 各自的上限，总请求数没有严格上界 | M8 | 父子预算树 |
+| 轮换后续 | `ModelRouter` 不实现 `CachePrefixProvider`：经它的漂移检测只做逻辑比对，换平台记成一次 `identity` 漂移 | M3 | LLM span 记下作答平台，并转发成员的精确前缀单位 |
+| 轮换后续 | 清单显式写的模型名只走 OpenRouter / `OPENAI_*`，一次 run 只能用一个 Gemini 型号 | M4 | 第三方 backend 装配定型时，给清单的 `model` 一个「平台 + 型号」的写法 |
 | D-61 | `Delegate` 对用完轮数的子 Agent 仍建议 SendMessage 继续 | 已修 | 登记表已关闭 |
 | M-3 | `provenance_of` / `strictest_trust` 不满足「公开签名需要它」 | M12 | API 冻结时决定是否扣留 |
 | M-4 | 端到端 WAITING 断言只有一跳调度余量 | 已修 | 登记表已关闭 |
@@ -289,6 +293,8 @@ Runtime events
 - 增加 trace 保留策略：结构永久、失败 payload、全量 payload 显式开启。
 - 复核 B-19：捕获与回放同源要求同一批调用留下同一份轨迹。段内 hook 往 `ctx` 写块的顺序若会让回放
   分叉，就由 executor 按调用顺序回放这些写入，或把约束写进 hook 契约。
+- LLM span 记下多平台轮换里实际作答的平台（`extra['llm_route']`）与每次平台故障；`ModelRouter`
+  转发作答成员的 `cache_prefix_units`，让经过轮换的漂移检测也是精确比对。
 
 ### 具体实现逻辑
 
@@ -363,6 +369,8 @@ RuntimeModule
 - 处理 B-09 / B-10：第三方工具随 Module 装配时必须声明 `__tool_command_args__`，未声明就拒绝装配。
 - 复核 D-42：切点 API 定型时决定是否拆分可观察与可拦截的回调类型；它是公开 API 的破坏性变更，
   必须在 M12 冻结之前定下。
+- 给清单的 `model` 字段一个「平台 + 型号」的写法，让显式模型名也能指到 Gemini 等任一已装配平台；
+  清单字段属于公开 API，写法定下后不能再改。
 
 ### 具体实现逻辑
 
@@ -1023,7 +1031,8 @@ docs site             guides + API reference + protocol contracts
 2. 对照当时仓库状态重新校准 TODO；本文不是跳过调研的理由。
 3. 拆成可独立提交的小任务，每个任务包含 RED/GREEN/变异/独立审查。
 4. 完成后更新本文状态、spec §15、审计记录和遗留登记。
-5. 除非用户明确要求，不 push。
+5. 在 `main` 上开发，门禁与验证通过后 commit 并 push（用户 2026-09-29 定）。提交身份是
+   `ai-loren <1158083128@qq.com>`，一律用 `git -c trace2.eventtarget= -c trace2.eventnesting= commit`。
 
 ## 里程碑之间的硬依赖
 

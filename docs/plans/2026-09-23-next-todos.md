@@ -21,6 +21,8 @@
 - OpenRouter 免费模型接入已提交（`6f8471c`），免费模型门禁和错误提示已补强。
 - 2026-09-29 用 `cohere/north-mini-code:free` 跑通真实体验验收，并修掉验收暴露的四个问题（见下方
   「真实体验验收记录」）。
+- 2026-09-29 接入 Gemini（免费档）并加上多平台模型轮换：Gemini 在前、OpenRouter 兜底，每个平台
+  各自指数退避；只配一个平台时按退避重试它（见下方「多平台模型轮换」）。
 
 未完成：
 
@@ -56,6 +58,37 @@ README、Orchestrator 委派 Explorer / Planner 并汇总、`chat --max-turns` �
   （`GetBudget` 与预算注入历史）。
 - `--max-turns` 是每个 Agent 各自的上限，子 Agent 还能再委派，总请求数没有严格上界。已写进里程碑 8
   的 TODO（父子预算树）。
+
+---
+
+## 多平台模型轮换（2026-09-29）
+
+用户同时有 Gemini AI Studio（免费档）与 OpenRouter 的 key，要求：按各平台自己的规范构造请求，一个
+平台不通就换下一个，每个失败的平台单独指数退避。M2 之前完成，设计见 spec §5.7 补充与决策 #89。
+
+- `backends/llm_router` 的 `ModelRouter`：按声明顺序轮换，失败的平台单独退避（2 秒起、翻倍、上限
+  5 分钟、±20% 抖动），平台给的重试时间更晚时以平台为准；所有平台都在退避时最多等到请求开始后
+  120 秒，等也不会好的失败（认证、请求不合法）不等。每次平台故障留一条 WARNING。
+- OpenAI 兼容后端：HTTP 错误带 `status_code` / `retry_after`，解析 `Retry-After`、OpenRouter 的
+  `X-RateLimit-Reset`、Google 的 `RetryInfo`；Gemini 3 的 `thought_signature` 只回送给产出它的端点，
+  别家平台产出的函数调用挂 Google 给的占位签名。
+- 装配层：`GEMINI_API_KEY` / `GEMINI_MODEL` / `SYNDICA_LLM_ORDER`，默认 Gemini 在前；模型总是经
+  `ModelRouter` 调用，只配一个平台时就是按退避重试它。
+
+真实验收（2026-09-30，`gemini-3.5-flash-lite` + `cohere/north-mini-code:free`，在去掉 `.git` 与 key
+的仓库副本里跑）：
+
+- 跨平台接续两个方向都是 200：OpenRouter 答出的工具调用交给 Gemini（挂 1 个占位签名）；Gemini 答出的
+  调用交给 OpenRouter（不外泄签名），再回到 Gemini（带自己的真实签名）。
+- runbook 第 2–5 步全部通过。委派那一步 Gemini 连续两次 503 high demand，路由器把请求交给 OpenRouter
+  并留下两条 WARNING；Explorer 的下一次请求直接跳过还在退避的 Gemini；退避到期后 Gemini 重新接手，
+  带着占位签名接住 OpenRouter 答出的 `Delegate` 调用。
+- 第 7 步故障切换通过：OpenRouter 的 401 之后立刻换到 Gemini。两个 key 都错时 2 秒内报错，不空等。
+  Gemini 对无效 key 返回的是 400（`Please pass a valid API key`），报错的下一步已按原因描述。
+- OpenRouter 免费额度用 5/50，401 不计数；花费 0。
+
+后续项（已归入路线图「遗留项归属」）：经路由器的前缀漂移检测只做逻辑比对（M3）；清单显式写的模型名
+只走 OpenRouter / `OPENAI_*`（M4）。
 
 ---
 
@@ -306,8 +339,8 @@ TODO：
 
 接下来最短路径：
 
-1. 提交并 push 当前 OpenRouter / 错误提示 / 文档改动。
-2. 等 OpenRouter 免费额度恢复后，按本地验证 runbook 跑真实体验。
-3. 把真实体验结果登记到文档或 issue。
-4. 开始 M2 自举计划。
+1. ~~提交并 push 当前 OpenRouter / 错误提示 / 文档改动。~~ 已完成。
+2. ~~按本地验证 runbook 跑真实体验，并登记结果。~~ 已完成，见「真实体验验收记录」。
+3. ~~多平台模型轮换。~~ 已完成，见「多平台模型轮换」。
+4. 写 M2 自举计划，给用户 review 后开工；基础 CI 排在任何让 Agent 改仓库代码的任务之前。
 5. 按 v1 路线图依次推进 M3-M12。

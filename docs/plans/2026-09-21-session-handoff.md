@@ -1,9 +1,12 @@
 # 会话交接：里程碑 1 做到哪、接着做什么
 
-写于 2026-09-21，2026-09-23 更新。本文给下一任（人或 Agent）接着干，不替代 spec / 计划 / 登记表。
+写于 2026-09-21，2026-09-23、2026-09-29 更新。本文给下一任（人或 Agent）接着干，不替代 spec /
+计划 / 登记表。
 
 **一句话现状：** 里程碑 1 已完成最终审计，计划 1–6、CLI、人机交互、人工确认与 L2 场景回放
-均已落地。**下一步是单独规划里程碑 2（自举）**；不要重做 M1，也不要添加 `Runtime.start`。
+均已落地。2026-09-29 用真实免费模型跑通体验验收并修掉暴露的问题，又补了 M2 之前的基础设施：
+多平台模型轮换（spec §5.7 补充、决策 #89）。**下一步是单独规划里程碑 2（自举）**，计划写好先给
+用户 review；不要重做 M1，也不要添加 `Runtime.start`。
 
 **先读顺序**
 
@@ -25,19 +28,17 @@
 | 语言 | Python 3.11+，`uv` |
 | 写代码的约定 | 中文回复；注释只写**现在的硬约束**（不要写推理过程）；错误三件套；**不要**跑全仓 `make lint` / `make test` |
 | 本仓验证 | `uv run pytest <受影响路径>`、`uv run ruff check` / `ruff format --check`、`uv run pyright`、`python scripts/check_deps.py` |
-| git | 本项目此前默认**改完即 commit、不 push**，除非用户再说「推」 |
+| git | 在 `main` 上开发；门禁与验证通过后 **commit 并 push**（用户 2026-09-29 定） |
+| 提交身份 | `ai-loren <1158083128@qq.com>`（全局 git config 已设好，提交前 `git config user.email` 核对） |
 | 提交时 | `git -c trace2.eventtarget= -c trace2.eventnesting= commit`（本机 git 会被 trace2 塞 Co-authored-by: Cursor） |
+| 本机环境 | `uv sync --extra openai --extra dev` 建 `.venv`（Python 3.11） |
+| 模型 key | 放在仓库外的 `~/.config/syndica/gemini.env`、`openrouter.env`（权限 600），用 `set -a; source <文件>; set +a` 导入。**不要**放进仓库或任何 Agent 操作的工作区：`Read` / `Grep` 读得到，key 会随请求发给模型提供方 |
+| 模型 | **只用免费模型**：Gemini 免费档项目（没开计费）在前、OpenRouter `:free` 兜底，见 README「Retries and several platforms」与本地验证流程第 1、7 步 |
 
-**本文对照的基线是里程碑 1 最终审计提交。** 动手前以 `git log -5 --oneline` 与
-`git status -sb` 为准。工作区干净、比 `origin/main` 超前即可续写。
+动手前以 `git log -5 --oneline` 与 `git status -sb` 为准。2026-09-29 起所有提交都已 push 到
+`origin/main`，工作区干净、与 `origin/main` 一致即可续写。
 
-```
-$ git status -sb
-## main...origin/main [ahead 64]
-（工作区干净，无未提交改动）
-```
-
-`origin/main` **还没有**计划 2 收口之后的本地提交。**未 push。** 最新提交如下：
+下表是里程碑 1 收口时的提交记录，只留作历史：
 
 | sha | 内容 |
 |---|---|
@@ -536,7 +537,8 @@ uv run pytest tests/kernel/test_<本任务>.py tests/kernel/test_public_api.py -
 
 审计记录：[`docs/audits/2026-09-23-m1-final-audit.md`](../audits/2026-09-23-m1-final-audit.md)。
 spec §15 已逐条取证；D-51、D-27、D-58、D-59、V-01、V-02 已关闭；全量
-`2245 passed`，Ruff、格式、Pyright、依赖守卫与 L2 场景均通过。按用户要求仍未 push。
+`2245 passed`，Ruff、格式、Pyright、依赖守卫与 L2 场景均通过。当时按用户要求未 push；2026-09-29
+已全部 push。
 
 ### 4.6 明确不在里程碑 1
 
@@ -574,8 +576,9 @@ git log -3 --oneline
 然后：
 
 1. 先读 M1 最终审计记录，不重做计划 1–6。
-2. 用户要继续时，为 spec §15 的里程碑 2（自举）单独写计划并等待 review。
-3. 未收到明确指令前仍不要 push。
+2. 用户要继续时，为 spec §15 的里程碑 2（自举）单独写计划并等待 review。基础 CI 要排在任何让
+   Agent 改仓库代码的任务之前（路线图「遗留项归属」）。
+3. 每个任务门禁与验证通过后 commit 并 push 到 `main`。
 
 ---
 

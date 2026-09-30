@@ -95,15 +95,73 @@ easier to diagnose than the router:
 export OPENROUTER_MODEL=cohere/north-mini-code:free
 ```
 
-OpenRouter mode takes precedence if OpenRouter and generic `OPENAI_*` variables are both present.
+### Gemini API
+
+Gemini is reached through Google's OpenAI-compatible endpoint, so it needs no extra dependency:
+
+```bash
+export GEMINI_API_KEY=your-gemini-key
+export GEMINI_MODEL=gemini-3.5-flash-lite
+```
+
+`GEMINI_MODEL` is optional and defaults to `gemini-3.5-flash-lite`. Google bills the project a key
+belongs to, and the key itself does not reveal which kind of project that is. A project without
+billing uses only the free tier and answers HTTP 429 once a quota runs out; a project with billing
+enabled is charged for every request. Use a key from a project without billing if inference must
+stay free.
+
+### Retries and several platforms
+
+Models are always called through a rotation. With one platform configured, a failed request is
+retried on that platform after a backoff. With several, every role whose manifest leaves `model` as
+`default` (all built-in roles do) shares one rotation across them:
+
+- A request goes to the first platform that is not backing off. If that platform fails, the same
+  request goes to the next one right away, and the failed platform backs off: about 2 seconds after
+  its first consecutive failure, then 4, 8, and so on up to 5 minutes, each with ±20% jitter.
+- When the platform says how long to wait (`Retry-After`, OpenRouter's `X-RateLimit-Reset`, or
+  Google's `RetryInfo`), the longer wait wins, so a platform whose daily quota ran out is skipped
+  until the quota resets.
+- A success clears that platform's backoff, and the first platform takes over again as soon as its
+  backoff ends.
+- When every platform is backing off, the request waits for the earliest one to recover if that
+  happens within 2 minutes of the request starting. Failures that waiting cannot fix are not waited
+  for: any HTTP 4xx other than 408, 425 and 429, such as a bad key or an unknown model. If nothing
+  worth waiting for recovers in time, the request fails right away, listing each platform's last
+  error and when it will be tried again.
+- Errors that another platform cannot fix (configuration errors, contract violations, context
+  overflow) are raised immediately.
+- Every platform failure is logged as a warning on stderr. Without it, a primary platform that keeps
+  failing would go unnoticed while the fallback quietly spends its own quota.
+
+The default order is Gemini, then OpenRouter, limited to the ones you configured. Set
+`SYNDICA_LLM_ORDER` to choose the platforms and their order. `openai` names the generic `OPENAI_*`
+endpoint, which is otherwise used only when neither Gemini nor OpenRouter is configured:
+
+```bash
+export SYNDICA_LLM_ORDER=openrouter,gemini
+```
+
+A run can move between platforms mid-conversation. Gemini 3 rejects a conversation whose earlier
+function calls lack their thought signature, so Syndica returns each signature only to the endpoint
+(base URL and model) that produced it. Function calls answered by another platform are sent to
+Gemini with the placeholder signature Google documents for that case.
+
+A model name written explicitly in a role manifest belongs to a single platform and is not rotated:
+it goes to OpenRouter when OpenRouter is configured, and to the generic `OPENAI_*` endpoint
+otherwise.
+
+### Keys and quotas
+
 Keep API keys in environment variables; `.env` files are ignored by Git and are not loaded
 automatically. Do not keep a key file inside a workspace that agents operate on: `Read` and
 `Grep` can read it and send it to the model provider.
 
-Free models share a daily request quota (50 requests per day on the OpenRouter free tier), and
-every agent turn is one request. Delegated agents run their own turns, so keep `--max-turns`
-small; it caps every agent in the run. The step-by-step local validation, including quota-aware
-commands and how to read 401 / 429 / 400 failures, is in
+Free tiers limit requests, and every agent turn is one request. OpenRouter allows 50 free-model
+requests per day. Gemini limits requests per minute and per day for each model; your limits are
+listed in Google AI Studio, and daily quotas reset at midnight Pacific time. Delegated agents run
+their own turns, so keep `--max-turns` small; it caps every agent in the run. The step-by-step local
+validation, including quota-aware commands and how to read 401 / 429 / 400 failures, is in
 [`docs/guides/2026-09-23-local-multi-agent-validation.md`](docs/guides/2026-09-23-local-multi-agent-validation.md).
 
 ## Quick Start

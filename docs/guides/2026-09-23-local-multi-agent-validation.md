@@ -2,8 +2,9 @@
 
 本文用于在本地快速体验 Syndica 里程碑 1 的 multi-agent 能力，并判断每一步是否符合预期。
 
-当前状态：Syndica 已支持真实 OpenAI-compatible / OpenRouter 模型调用，也支持不联网的 scripted L2
-场景回放。真实模型体验依赖 OpenRouter API key 与免费额度；离线验证不消耗额度。
+当前状态：Syndica 已支持真实 OpenAI-compatible / Gemini / OpenRouter 模型调用，配了多个平台时自动
+组成轮换；也支持不联网的 scripted L2 场景回放。真实模型体验依赖 Gemini 或 OpenRouter 的 API key 与
+免费额度；离线验证不消耗额度。
 
 ---
 
@@ -29,17 +30,23 @@ uv sync --extra openai --extra dev
 
 ---
 
-## 1. 配置 OpenRouter 免费模型
+## 1. 配置模型平台（Gemini 和 / 或 OpenRouter）
 
-目的：给真实模型体验提供 API key，同时避免把 key 写入仓库、shell history 或文档。
+目的：给真实模型体验提供 API key，同时避免把 key 写入仓库、shell history 或文档。两个平台配一个
+就能跑；两个都配就组成轮换，Gemini 在前、OpenRouter 兜底。
 
 ```bash
+read -rs "GEMINI_API_KEY?Gemini API key: "
+echo
+export GEMINI_API_KEY
+export GEMINI_MODEL=gemini-3.5-flash-lite
+
 read -rs "OPENROUTER_API_KEY?OpenRouter API key: "
 echo
 export OPENROUTER_API_KEY
 export OPENROUTER_MODEL=cohere/north-mini-code:free
 
-unset OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY
+unset OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY SYNDICA_LLM_ORDER
 ```
 
 符合预期：
@@ -47,6 +54,8 @@ unset OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY
 - 输入 key 时终端不回显。
 - 关闭当前终端后环境变量失效。
 - `OPENROUTER_MODEL` 以 `:free` 结尾，符合 Syndica 的免费模型门禁。
+- Gemini key 来自**没开计费**的 Google 项目。开了计费的项目每次请求都收费，而 Syndica 从 key 上
+  看不出区别。
 
 不符合预期：
 
@@ -59,10 +68,14 @@ unset OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY
   Agent 会操作的工作区里：`Read` / `Grep` 读得到它，key 会随请求发给模型提供方。
 - `cohere/north-mini-code:free` 是一个可用于首轮验证的免费模型示例。OpenRouter 免费模型列表会变化；
   如果该模型不可用，改用 OpenRouter 当前模型列表中标记为免费且支持 `tools` 的模型。
-- 免费档每天只有 50 次免费模型请求，每个 Agent 的每一轮就是一次请求。下面的命令都用
-  `--max-turns` 给**每个** Agent（含委派出去的子 Agent）设了上限，按顺序跑完一遍大约 20 次请求。
+- OpenRouter 免费档每天只有 50 次免费模型请求；Gemini 免费档按型号限制每分钟与每天的请求数（在
+  Google AI Studio 里查看），日额度在太平洋时间午夜重置（北京时间夏令时 15:00、冬令时 16:00）。
+  每个 Agent 的每一轮就是一次请求。下面的命令都用 `--max-turns` 给**每个** Agent（含委派出去的
+  子 Agent）设了上限，按顺序跑完一遍大约 20 次请求。
 - 如果只设置 `OPENROUTER_API_KEY` 而不设置 `OPENROUTER_MODEL`，Syndica 会默认使用
   `openrouter/free` 路由器；路由器更方便，但具体失败原因有时不如显式模型好诊断。
+- 要换轮换顺序或只用其中一个平台，设 `SYNDICA_LLM_ORDER`，例如 `openrouter,gemini` 或 `gemini`。
+  通用的 `OPENAI_*` 端点叫 `openai`，只有被点名或两个免费平台都没配时才会用到。
 
 ---
 
@@ -85,10 +98,13 @@ workspace: ok /Users/loren/Documents/loren/syndica
 
 不符合预期：
 
-- `OPENROUTER_API_KEY 未设置或为空`：重新执行第 1 步。
+- `OPENROUTER_API_KEY 未设置或为空` / `GEMINI_API_KEY 未设置或为空`：设了该平台的模型却没设 key，
+  重新执行第 1 步。
 - `OpenRouter 只使用 openrouter/free 或以 :free 结尾的免费模型`：说明模型名不是免费模型，改回
   `cohere/north-mini-code:free` 或其他 `:free` 模型。
-- `OPENAI_BASE_URL=None`：说明没有进入 OpenRouter 模式，通常是没有设置 `OPENROUTER_API_KEY`。
+- 报错提到 `SYNDICA_LLM_ORDER`：里面有未知平台名、重复项、空项，或点名了一个没配 key 的平台。
+  按报错的下一步改，或 `unset SYNDICA_LLM_ORDER` 用默认顺序。
+- `OPENAI_BASE_URL=None`：说明 Gemini 和 OpenRouter 都没配置，第 1 步的 key 没有导出到当前 shell。
 
 ---
 
@@ -108,10 +124,20 @@ uv run python -m syndica run "用三句话介绍你现在能做什么" --max-tur
 
 不符合预期：
 
-- `HTTP 401`：API key 不正确或已失效。
+- `HTTP 401`，或 Gemini 的 `HTTP 400` 且提到 `API key`：API key 不正确或已失效。
 - `HTTP 429 Too Many Requests` 且包含 `free-models-per-day`：OpenRouter 免费日额度耗尽。等待
   `X-RateLimit-Reset` 指定时间、换未耗尽的 key，或给 OpenRouter 充值提升免费额度上限。
+- `HTTP 429` 且包含 `RESOURCE_EXHAUSTED`：Gemini 免费档额度用完。每分钟额度一分钟内恢复，轮换会按
+  Google 给的 `retryDelay` 等它；日额度要等太平洋时间午夜重置。
+- `HTTP 503` 且提到 high demand：Gemini 一时过载，通常几秒后就好，轮换会自动换平台或稍后重试。
 - `HTTP 400`：模型名、请求参数或模型能力不兼容。优先换一个当前免费且支持 `tools` 的模型。
+- stderr 有 `轮换中的平台 gemini 失败（连续第 1 次），接下来 2.1 秒跳过它：…`，stdout 仍有回答：这个
+  平台失败了，同一请求已交给下一个平台，回答有效。同一个平台反复出现就按冒号后面的原因查它的 key
+  或额度，否则兜底平台会一直替它答、替它耗额度。
+- `轮换中的 2 个平台里，至少一个在 120 秒内答出这次请求`（只配一个平台时是 `平台 gemini 在 120 秒内
+  答出这次请求`）：所有平台都失败了。限流和服务端故障会先按退避重试，最多等到请求开始后 120 秒；
+  401、403、400、404 这类等也不会好的失败不等，立刻报错（两个 key 都错时两秒内就会看到它）。报错逐个列出每个平台最后一次的失败原因和
+  多少秒后才会再试，按原因处理即可。
 
 ---
 
@@ -232,7 +258,34 @@ chat 里同一个 Agent 的轮数跨消息累计，`--max-turns 6` 是它整个�
 
 ---
 
-## 7. 不消耗额度的离线 L2 验证
+## 7. 验证多平台轮换与故障切换（两个平台都配了时）
+
+目的：确认排在前面的平台失败时，同一请求会交给下一个平台，并在 stderr 留下记录。这里故意把
+OpenRouter 排在前面、给它一个错误的 key：401 不计入 OpenRouter 免费额度，这一步只用 Gemini 的一两次
+请求。
+
+```bash
+SYNDICA_LLM_ORDER=openrouter,gemini OPENROUTER_API_KEY=invalid-key \
+  uv run python -m syndica run "用一句话回答：1 加 1 等于几？" --max-turns 2
+```
+
+符合预期：
+
+- stdout 有回答，由 Gemini 答出。
+- stderr 有一行 `轮换中的平台 openrouter 失败（连续第 1 次），接下来 1.9 秒跳过它：HTTP 请求失败：
+  HTTP 401 …`（秒数带 ±20% 抖动）。
+- 401 之后请求立刻交给 Gemini，不为 OpenRouter 等待；总耗时基本就是 Gemini 作答的时间，Gemini
+  过载时可能要几十秒。
+
+不符合预期：
+
+- 以 `轮换中的 2 个平台里，至少一个在 120 秒内答出这次请求` 结束、stdout 没有回答：Gemini 也失败了，
+  按报错里 gemini 那一段的原因处理，多半是 key 或额度。
+- stderr 没有 openrouter 那一行：`SYNDICA_LLM_ORDER` 没生效，或者这个 key 意外是有效的。
+
+---
+
+## 8. 不消耗额度的离线 L2 验证
 
 目的：在 OpenRouter 额度耗尽或网络不可用时，验证 Syndica 的真实 Runtime、多 Agent、工具、人类确认
 和 YAML 场景回放。这个流程只把 LLM 替换成 `ScriptedLLM`，不调用真实模型。
@@ -254,7 +307,7 @@ uv run pytest tests/runner/test_scenario.py tests/integration/test_cli_human_sce
 
 ---
 
-## 8. 推荐的完整验证顺序
+## 9. 推荐的完整验证顺序
 
 首次本地体验建议按顺序执行：
 
@@ -262,16 +315,21 @@ uv run pytest tests/runner/test_scenario.py tests/integration/test_cli_human_sce
 cd /Users/loren/Documents/loren/syndica
 uv sync --extra openai --extra dev
 
+read -rs "GEMINI_API_KEY?Gemini API key: "
+echo
+export GEMINI_API_KEY
+export GEMINI_MODEL=gemini-3.5-flash-lite
 read -rs "OPENROUTER_API_KEY?OpenRouter API key: "
 echo
 export OPENROUTER_API_KEY
 export OPENROUTER_MODEL=cohere/north-mini-code:free
-unset OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY
+unset OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY SYNDICA_LLM_ORDER
 
 uv run python -m syndica doctor
 uv run python -m syndica run "用三句话介绍你现在能做什么" --max-turns 3
 uv run python -m syndica run "读取 README.md，并总结 Syndica 当前完成了哪些能力。不要修改文件。" --agent Worker --max-turns 6
 uv run python -m syndica run "不要修改文件。请严格按顺序执行三步。第一步：调用 Delegate，agent 填 Explorer，query 原样填写「只调用一次 Glob（pattern 用 *）列出仓库顶层条目，然后立刻用两三句话总结仓库结构，不要调用任何其他工具。」第二步：调用 Delegate，agent 填 Planner，query 原样填写「不要调用任何工具。Syndica 的里程碑 1 已完成，下一个里程碑是自举：让框架修改自己的代码并跑测试。直接写出三条下一阶段计划，每条一句话。」第三步：用中文汇总 Explorer 和 Planner 的结论后结束，不要再调用工具。" --max-turns 4
+SYNDICA_LLM_ORDER=openrouter,gemini OPENROUTER_API_KEY=invalid-key uv run python -m syndica run "用一句话回答：1 加 1 等于几？" --max-turns 2
 ```
 
 如果真实模型额度不可用，执行：
@@ -282,10 +340,12 @@ uv run pytest tests/runner/test_scenario.py tests/integration/test_cli_human_sce
 
 ---
 
-## 9. 当前已知限制
+## 10. 当前已知限制
 
 - OpenRouter 免费模型每天有额度限制。`free-models-per-day` 429 是外部额度耗尽，不是 Syndica 逻辑
-  错误。
+  错误。Gemini 免费档同样按型号限额。
+- 轮换只覆盖清单里 `model` 为 `default` 的角色（内置角色都是）。显式写了模型名的角色只走 OpenRouter
+  或 `OPENAI_*`，一次 run 里也只能用一个 Gemini 型号；「平台 + 型号」的写法归里程碑 4。
 - 免费模型质量和工具调用能力不稳定；同一个 prompt 可能有时不触发 Delegate。
 - M1 没有跨进程 session 持久化；`chat` 里的活动 Agent 只存在于当前 CLI 进程。
 - M1 没有 Web UI / HTTP server / SSE server；当前体验入口是 CLI 和 L2 scenario runner。
