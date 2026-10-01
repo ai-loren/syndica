@@ -321,10 +321,11 @@ def summary(
     verdict: str,
     protected: Sequence[str],
     pre_existing: int,
+    title: str,
 ) -> str:
-    """提问前最后一段输出：分支与上游（推送真正去的地址）、改动（最多 30 条再给总数，标出不是
-    Write / Edit 产生的）、受保护路径、运行前就有的改动、提交时会跑的钩子、复核结果与 Reviewer
-    结论。字符串都来自宿主或经过转义。"""
+    """提问前最后一段输出：分支与上游（推送真正去的地址）、提交标题、改动（最多 30 条再给总数，
+    标出不是 Write / Edit 产生的）、受保护路径、运行前就有的改动、提交时会跑的钩子、复核结果与
+    Reviewer 结论。字符串都来自宿主或经过转义。"""
     upstream = '没有上游'
     if before.upstream is not None:
         remote, merge = before.upstream
@@ -334,6 +335,7 @@ def summary(
         upstream = f'上游 {one_line(remote)}/{one_line(merge.removeprefix("refs/heads/"))}{urls}'
     lines = [
         f'git 收尾：分支 {one_line(before.branch or "?")} → {upstream}',
+        f'提交标题：{one_line(title)}',
         f'改动（{len(changes)} 处）：',
     ]
     for change in changes[:30]:
@@ -906,6 +908,9 @@ def finish(
         return Finish('not_offered', _not_offered(choices))
     if mode == 'manual':
         return Finish('declined', f'`--git-mode manual`：没有提交。{_MANUAL}')
+    message = commit_message(
+        redactor.redact(title) if title is not None else None, redactor.redact(prompt), verify
+    )
     if mode is not None:
         if choices.protected:
             return _refused(
@@ -929,6 +934,7 @@ def finish(
             verdict=verdict,
             protected=choices.protected,
             pre_existing=len(before_changes or ()),
+            title=message.split('\n', 1)[0],
         )
         answer = ask(stdin, stderr, text, choices)
         if answer == '3':
@@ -943,9 +949,6 @@ def finish(
             )
         push = answer == '1'
         chosen = '提交并推送' if push else '只提交'
-    message = commit_message(
-        redactor.redact(title) if title is not None else None, redactor.redact(prompt), verify
-    )
     try:
         outcome = execute(
             git,

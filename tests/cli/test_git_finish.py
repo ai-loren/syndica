@@ -436,6 +436,7 @@ def test_the_summary_caps_the_list_at_30_and_escapes_paths():
         verdict='pass',
         protected=(),
         pre_existing=0,
+        title='t',
     )
 
     assert text.count('\n- `??` ') == 30
@@ -492,6 +493,7 @@ def test_the_summary_lists_exactly_30_changes_without_a_total():
         verdict='pass',
         protected=(),
         pre_existing=0,
+        title='t',
     )
 
     assert text.count('\n- `??` ') == 30
@@ -507,8 +509,10 @@ def test_the_summary_names_pre_existing_changes_and_the_hooks_that_will_run():
         verdict='pass',
         protected=(),
         pre_existing=2,
+        title='修好 \x1b calc',
     )
 
+    assert '提交标题：修好 \\x1b calc' in text.splitlines()
     assert '运行前就有的 2 处改动不进提交' in text
     assert '提交时会运行钩子（在 Agent 的环境里，拿不到 ssh agent 与密钥）：commit-msg' in text
     assert 'pre-commit.sample' not in text
@@ -616,6 +620,7 @@ def test_the_question_goes_to_stderr_with_all_three_options(tmp_path: Path):
     upstream = f'git 收尾：分支 main → 上游 origin/main（推送到 {tmp_path / "remote.git"}）'
     assert upstream in run.stderr
     assert '宿主复核：passed；Reviewer 结论（模型给出）：pass' in run.stderr
+    assert '提交标题：add new' in run.stderr.splitlines()
 
 
 def test_without_an_upstream_only_2_and_3_are_offered_and_1_is_refused(tmp_path: Path):
