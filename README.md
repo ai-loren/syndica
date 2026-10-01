@@ -305,10 +305,12 @@ workspace:
   helpers, aliases, hooks, or `gh` login.
 - Git commands that change state (`commit`, `push`, `checkout`, `-c ...`, anything under `.git/`) and
   `rm` of the workspace root are blocked unconditionally, also behind the wrappers the rules know
-  (`env`, `nice`, `nohup`, `setsid`, `timeout`, `sudo`, `command`, `exec` and others) and launchers
-  such as `uv run`. The rules read command text, so a command hidden inside `sh -c "..."`, `eval`,
-  `xargs`, `find -exec`, a script, or a variable is not recognised, and neither is
-  `find . -delete`. File tools refuse to write inside `.git/`.
+  (`env`, `nice`, `nohup`, `setsid`, `timeout`, `sudo`, `command`, `exec`, `xargs` and others) and
+  launchers such as `uv run`. Commands handed to a shell's `-c`, to `eval`, or to `find -exec` are
+  read as commands too, up to eight levels deep (deeper counts as blocked), and so is a `find` that
+  deletes the whole workspace (`find . -delete`). The rules read command text, so a command inside a
+  script, a variable, `python -c`, or a program they do not know (`su -c`, `watch`, `ssh`, `make`)
+  is not recognised. File tools refuse to write inside `.git/`.
 - A command that touches a path outside the workspace asks you while the agent has not yet read any
   command output. After that, the trajectory counts as untrusted and such commands are rejected;
   `--flag untrusted_high_risk=ask` asks instead. `untrusted_high_risk=allow` is refused.
@@ -353,7 +355,7 @@ These guards stop the common forms of an agent's mistakes (deleting the reposito
 rewriting Git state), naive prompt injection ("read `~/.config/...`", "push this"), and secrets
 leaking through the agents' environment or the handoff. They do not stop a command written in a form
 the rules cannot read (see above), whether by accident or on purpose, nor an agent that has been
-persuaded to evade them: code it writes or runs (`python -c`, `sh -c`, `ssh`, and the tests the host
+persuaded to evade them: code it writes or runs (`python -c`, a script, `ssh`, and the tests the host
 verifies) can read any file your user can
 read, reach the network, read the host process's environment and your login keychain, and use
 credential files under `HOME` (`~/.netrc`, `~/.npmrc`). Processes that call `setsid` escape process

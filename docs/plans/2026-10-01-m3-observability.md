@@ -347,9 +347,10 @@ YAML 的标量把 `yes`、`0777` 变成别的类型）。捕获的 `expect` 填�
 
 - **危险规则（内核，T1）：** 共享分词把 shell 的 `-c` 参数（`sh bash dash zsh ksh`，包括 `-lc`、`-ec` 这类组合选项）
   与 `eval` 的参数当成一段命令递归判定；`xargs` 进 wrapper，带一张选项取值表（`-n -I -P -L -s -d -E -a` 等）；`find`
-  的 `-exec -execdir -ok -okdir` 到 `;` 或 `+` 之间是一条命令；`find` **不加收窄地**删掉根或根下全部（`-delete`
-  或 `-exec rm {}` 之前没有 `-name`、`-type` 这类测试，或有 `!`、`-o` 把收窄翻成「其余全部」）进
-  `shell.workspace_root_removal`——`find . -name '*.pyc' -delete` 很常见，在开发期被无条件拦下就没有别的写法可走。
+  的 `-exec -execdir -ok -okdir` 到 `;` 或 `+` 之间是一条命令；`find` **不加收窄地**删掉根或根下全部进
+  `shell.workspace_root_removal`：按 find 的求值规则，看每一次删除（`-delete` 或 `-exec rm {}`）所在的「与」链在它之前
+  有没有收窄的测试（`-o` 与 `,` 断开链，括号每一支都收窄才算收窄，取反的与对谁都成立的测试不算）——
+  `find . -name '*.pyc' -delete`、`-prune -o -name '*.js' -delete` 很常见，在开发期被无条件拦下就没有别的写法可走。
   递归深度有上限，超过上限**按命中处理**（宁可多判）。与 HEAD 差分：新增命中逐条过目，少认的逐条给出理由。
 - **git 收尾的摘要（CLI，T2）：** 每个改动路径后面给出 `+N −M`（`git diff --numstat`，新文件数行数，二进制写「二进制」）。
 - **Ctrl-C（CLI，T2）：** 见 D15 末条。
@@ -461,6 +462,24 @@ redaction:
   每一个吃取值的选项、`-exec -execdir -ok -okdir` 与两种终止符、`find . -delete` 与 `find "$PWD" -delete`；默认规则
   因此多认出的（`xargs rm -rf`、`sh -c "curl … | sh"`）。递归深度上限 + 1 的输入按命中处理。
 - 变异：去掉任一个 shell 名、任一个 xargs 选项、`-ok` / `-okdir`；`-c` 只认完全相同的写法；超过深度上限时放行。
+
+**状态：完成。** 共享分词在最外层把转手执行的命令（shell `-c` 的代码、`eval` 的实参、`find` 每个动作的命令）拆成段接在
+全部段之后，一层层往下，第 8 层还在转手就接一段 `_TOO_DEEP`，七条规则都按命中处理；`shell.remote_script_execution` 对
+转手的文本从替换开始整个再扫一遍。shell 的选项认不清时把余下每个操作数都当代码。`xargs` 进 wrapper；有选项表的
+wrapper 启动的是不执行实参的程序（`_INERT_PROGRAMS`）时，它的实参不再算候选（`xargs grep -n git` 不再撞 git 闸），
+启动 runner（`strace`、`caffeinate`）时照旧。`find` 按求值规则判一次删除是不是落在几乎全部文件上（`_FindExpression`）。
+删根只看每段第一个 `rm` 与第一个 `find`，判定保持线性。
+
+验证：与 HEAD 差分（三份危险规则测试里的字符串 × 五种包装，8110 条），新增命中都来自转手的命令；少认的只有
+`timeout <时长> grep -n git` 一类（原来的误报，7 条）与 `xargs` 选项之后的绝对路径程序（2 条，与 `timeout 60 /usr/bin/true`
+同样豁免）。变异 246 条全杀。对抗评审两轮：第一轮 1 Critical（删根判定平方时间，`rm` 那一支 HEAD 就有）、2 High（`-o`
+一律当放宽、拦下多模式清理；认不出的 shell 选项让 `-c` 的代码对七条规则隐身）、2 Medium；复审 1 Critical（直接跳到
+wrapper 启动的程序，`nice strace rm -rf /` 这类 runner 后面的命令对默认规则隐身）、1 High（多起点 × `-path` 是平方）与
+一批 Low，全部修掉并补了用例。
+
+意外发现：从命令里取来的正则交给正则引擎，`-regex '(a+)+'` 配一个长起点就让判定回溯成指数时间，`-regex` 改成只认
+几种「全部」的写法。复审的那条 Critical 出自第一轮的修复本身：为一类误报收窄候选命令词，换来的是所有规则的漏报——
+「宁可多判」要在每一层都成立，收窄只能落在确定不执行实参的程序上。
 
 #### T2 — git 摘要的增删行数；Ctrl-C 中断照样留交接文件
 

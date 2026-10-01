@@ -16,10 +16,12 @@
 这一条。
 
 **规则表不完备是常态。** 规则只认得出它写过的那些形态；`RiskLevel.NONE` 因此是「没有规则命中」，
-不是「已经确认安全」。明确不认的三类：经中间工具转手执行（`xargs ... sh -c`、`find -exec`）、把
-命令拼成字符串再交给解释器（`sh -c "rm -rf x"`、`eval "rm -rf x"`），以及下载到文件后再单独执行
+不是「已经确认安全」。转手执行的命令当命令再拆一遍：shell `-c` 交出的代码、`eval` 的实参、`xargs`
+与 `find -exec` 启动的命令，一层层往下，超过 `_MAX_HANDOFF_DEPTH` 层按命中处理。明确不认的：非 shell
+解释器的代码（`python -c "…"`）、名单之外转手执行的程序（`su -c`、`watch`、`ssh`、`make`）、变量与
+管道送进 shell 的文本（`sh -c "$CMD"`、`echo … | sh`），以及下载到文件后再单独执行
 （`curl -o f; sh f`）。下载来的内容本身被当成代码（`sh -c "$(curl …)"`、`bash <(curl …)`）不在此列：
-认的是下载内容的去向，不解析代码。**同一形态换个平凡写法必须仍然命中**——多一段管道、多一次重定向、标志写在
+认的是下载内容的去向。**同一形态换个平凡写法必须仍然命中**——多一段管道、多一次重定向、标志写在
 路径后面、路径加一对引号、命令前面加一个绕 alias 的反斜杠（`\\rm`）都不算另一种形态。
 
 `CONFIRM` 由宿主注入的 `ConfirmationHandler` 实现。默认没有 handler 时仍立即拒绝，不白耗等待；
@@ -35,6 +37,8 @@ import inspect
 import os
 import posixpath
 import re
+import shlex
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
@@ -271,10 +275,19 @@ _WRAPPERS = frozenset(
         'taskset',
         'time',
         'timeout',
+        'xargs',
         'xvfb-run',
         # `busybox sh`、`busybox wget` 启动的是它后面那个 applet。
         'busybox',
     }
+)
+# 不把实参当命令执行的程序：有选项表的 wrapper 启动它们时，它们的实参不算候选命令词，见
+# `_command_word_slots`。只放确定不执行实参的；拿不准的不放，不放的代价只是一次误报。
+_INERT_PROGRAMS = frozenset(
+    {'ack', 'ag', 'basename', 'cat', 'chmod', 'cmp', 'cp', 'cut', 'diff', 'dirname', 'du', 'echo'}
+    | {'egrep', 'fgrep', 'file', 'grep', 'head', 'ln', 'ls', 'md5sum', 'mkdir', 'mv', 'printf'}
+    | {'readlink', 'realpath', 'rg', 'sha256sum', 'shasum', 'sort', 'stat', 'tail', 'touch', 'tr'}
+    | {'uniq', 'wc'}
 )
 _ESCALATORS = frozenset({'doas', 'pkexec', 'runuser', 'su', 'sudo'})
 _DOWNLOADERS = frozenset({'aria2c', 'curl', 'fetch', 'lwp-request', 'wget'})
@@ -441,6 +454,10 @@ _INTERPRETERS: Mapping[str, _Interpreter] = MappingProxyType(
         ),
     }
 )
+# `-c` 交出的是 shell 代码的解释器，`_handoffs` 把那段代码再拆一遍。别的解释器的代码不是 shell
+# 语法，当 shell 拆只会认出一堆不存在的命令。
+_SHELLS = (_SHELL, _INTERPRETERS['fish'])
+_FIND_ACTIONS = frozenset({'-exec', '-execdir', '-ok', '-okdir'})
 # 带版本号或构建后缀的名字与不带的是同一个解释器（`python3.11`、`python3.13t`、`python3.12-dbg`、
 # `perl5.34`、`php8.2`、`ruby3.2`）。构建后缀只有 python 有：`phpt` 不是 php。
 _VERSIONED_INTERPRETER = re.compile(
@@ -920,6 +937,11 @@ def _ansi_c_escape(source: str, index: int) -> tuple[str, int]:
 _DOUBLE_QUOTE_ESCAPES = frozenset('"\\$`')
 # heredoc 正文里又套 heredoc 时单独解析的层数上限；超过就按原来的方式接着往下分词。
 _MAX_HEREDOC_NESTING = 16
+# 转手执行的命令（`_handoffs`）一层层再拆的层数上限。再往下还有转手就按命中处理：层数由模型决定，
+# 读不到的那一层里可能正是要拦的命令。
+_MAX_HANDOFF_DEPTH = 8
+# 代替读不到的那一层的段，每条规则都按命中处理。命令里照抄这个词，后果只是多判。
+_TOO_DEEP = '\ue000too-deep\ue000'
 
 
 def _segments(text: str) -> list[tuple[bool, tuple[str, ...]]]:
@@ -944,6 +966,7 @@ def _parse(
     spans: list[tuple[int, int, bool]] | None = None,
     offset: int = 0,
     lines: _Lines | None = None,
+    handoffs: bool = True,
 ) -> tuple[list[tuple[bool, tuple[str, ...]]], list[str]]:
     """(段, 整条命令里全部重定向的目标)。
 
@@ -964,6 +987,9 @@ def _parse(
 
     `spans` 收下每一层 heredoc 正文的 (起, 止, 是否被执行)，位置是最外层文本里的；`offset` 是这份
     text 在最外层文本里的起点、`lines` 是最外层文本的逐行索引，递归解析被执行的正文时传下去。
+
+    `handoffs` 时转手执行的命令也拆成段、接在后面，见 `_with_handoffs`。递归解析正文时不接：
+    正文的段并进了这一层，由最外层一次接完，否则同一条命令要拆两遍。
     """
     segments: list[tuple[bool, tuple[str, ...]]] = []
     targets: list[str] = []
@@ -1138,6 +1164,7 @@ def _parse(
                             spans=None if body_offset is None else spans,
                             offset=0 if body_offset is None else body_offset,
                             lines=None if body_offset is None else lines,
+                            handoffs=False,
                         )
                         segments.extend(body_segments)
                         targets.extend(body_targets)
@@ -1154,7 +1181,102 @@ def _parse(
             token.append(char)
         index += 1
     end_segment(False)
+    if handoffs:
+        _with_handoffs(segments, targets, thorough=thorough)
     return segments, targets
+
+
+def _with_handoffs(
+    segments: list[tuple[bool, tuple[str, ...]]], targets: list[str], *, thorough: bool
+) -> None:
+    """把每段转手执行的命令拆出来的段与重定向目标接在全部段之后，一层层往下。第
+    `_MAX_HANDOFF_DEPTH` 层的段还在转手时接一段 `_TOO_DEEP`。同一份文本只拆一次。
+
+    接上的段的 `piped` 只在它自己那份文本里有意义，所以读管道链的 `shell.remote_script_execution`
+    不用这里，自己逐层扫（`_runs_downloaded_content`）。
+    """
+    level: list[tuple[str, ...]] = [tokens for _, tokens in segments]
+    seen: set[str] = set()
+    for depth in range(_MAX_HANDOFF_DEPTH + 1):
+        texts = [text for tokens in level for text in _handoffs(tokens) if text not in seen]
+        if not texts:
+            return
+        if depth == _MAX_HANDOFF_DEPTH:
+            segments.append((False, (_TOO_DEEP,)))
+            return
+        level = []
+        for text in dict.fromkeys(texts):
+            seen.add(text)
+            inner, inner_targets = _parse(text, thorough=thorough, handoffs=False)
+            segments.extend(inner)
+            targets.extend(inner_targets)
+            level.extend(tokens for _, tokens in inner)
+
+
+def _handoffs(tokens: Sequence[str]) -> list[str]:
+    """这一段转手执行的命令，每条是一份要再拆一遍的文本：shell `-c` 交出的代码、`eval` 拼起来的
+    实参，或 `find` 每个动作执行的命令（argv 原样转回文本，见 `_find_actions`）。
+
+    只认一段里第一个转手的程序：它之后的词是它的实参。`sudo eval eval …` 里每个 `eval` 都是候选
+    命令词，每个都取一遍「它之后的全部」就是平方，而判定跑在每一次工具调用上。不交代码的 shell
+    之后从它的第一个操作数接着找：它可能只是认不出的 wrapper 选项的取值（`sudo -u bash sh -c …`），
+    但它的选项与取值不再当候选——`env sh -o sh -o …` 里每个 `sh` 都从头扫一遍选项，也是平方。
+    shell 的选项认不清时（见下面那个分支）把余下每个操作数都交出去：漏掉 `-c` 的代码，七条规则就
+    一起看不见它。
+    """
+    resume = 0
+    for index in _program_candidates(tokens):
+        if index < resume:
+            continue
+        name = _basename(tokens[index])
+        if name == 'eval':
+            return [' '.join(tokens[index + 1 :])] if index + 1 < len(tokens) else []
+        if name == 'find':
+            return [shlex.join(command) for _, command in _find_actions(tokens[index + 1 :])]
+        interpreter = _interpreter(tokens[index])
+        if interpreter in _SHELLS:
+            kind, code, resume = _script_scan(interpreter, tokens, index + 1)
+            if kind == 'option':
+                return [code]
+            if kind == 'unknown' or any(_names_dash_c(word) for word in tokens[index + 1 : resume]):
+                # 认不出的选项可能正是吃掉 `-c` 的那个，`-c` 也可能被当成了别的选项的取值（zsh 的
+                # `-O` 是开关，选项表按 bash 让它吃一个词）：认不清就把余下每个操作数都当代码。
+                return [word for word in tokens[resume:] if not word.startswith(('-', '+'))]
+    return []
+
+
+def _names_dash_c(word: str) -> bool:
+    """一个短选项（或短选项簇）里有 `c`。"""
+    return len(word) > 1 and word[0] in '-+' and word[1] != '-' and 'c' in word[1:]
+
+
+def _find_actions(arguments: Sequence[str]) -> list[tuple[int, tuple[str, ...]]]:
+    """`find` 的每个 `-exec` / `-execdir` / `-ok` / `-okdir`：(动作的下标, 它执行的命令)。命令到
+    终止符为止（`_ends_find_command`），没有终止符就到段尾——不带反斜杠的 `;` 在 shell 里先把段
+    断开了。"""
+    actions: list[tuple[int, tuple[str, ...]]] = []
+    index = 0
+    while index < len(arguments):
+        if arguments[index] in _FIND_ACTIONS:
+            end = index + 1
+            while end < len(arguments) and not _ends_find_command(arguments, end):
+                end += 1
+            if end > index + 1:
+                actions.append((index, tuple(arguments[index + 1 : end])))
+            index = end
+        index += 1
+    return actions
+
+
+def _ends_find_command(arguments: Sequence[str], index: int) -> bool:
+    """`-exec` 的命令在这里结束：`+` 只在紧跟 `{}` 时才是终止符（别处是普通实参），以 `;` 开头的词
+    都是（BSD 的 find 就这么认，`';x'` 也结束命令）。"""
+    word = arguments[index]
+    return word.startswith(';') or (word == '+' and index > 0 and arguments[index - 1] == '{}')
+
+
+def _too_deep(segments: Sequence[tuple[bool, tuple[str, ...]]]) -> bool:
+    return any(tokens == (_TOO_DEEP,) for _, tokens in segments)
 
 
 def _command_word_slots(tokens: Sequence[str], start: int = 0) -> list[tuple[int, str]]:
@@ -1168,22 +1290,41 @@ def _command_word_slots(tokens: Sequence[str], start: int = 0) -> list[tuple[int
     把真正的命令词整个吞掉，`nice -n 19 rm -rf /` 于是在默认规则表下一条闸都没有。代价是 wrapper
     之后的普通实参也算候选命令词（`command -v sudo` 会误报成提权），这个方向的错还能换个写法，
     反方向的错是一句不说地放行。第一个命令词之前的保留字（`{`、`then`、`!`）跳过。
+
+    例外只有一种：有选项表的 wrapper（`_WRAPPER_GRAMMARS`）选项全认得出，启动的又是不执行实参的程序
+    （`_INERT_PROGRAMS`）。这时它的实参不算候选——`xargs grep -n git src/` 里的 `git` 是 grep 的
+    模式，当成程序词，开发期的 git 闸就会无条件拦下一次普通的搜索。启动的是名单之外的程序时照旧，
+    之后每个词都算候选：`nice strace rm -rf /` 的 `strace` 自己就会执行后面的命令，而这类 runner 列
+    不全，不执行实参的那一边才列得全。启动的是 wrapper 时接着往下认。
     """
     slots: list[tuple[int, str]] = []
     wrapped = False
-    for index in range(start, len(tokens)):
+    index = start
+    while index < len(tokens):
         token = tokens[index]
         if (
             token.startswith('-')
             or _ASSIGNMENT.match(token)
             or (not slots and token in _RESERVED_WORDS)
         ):
+            index += 1
             continue
         word = _basename(token)
         slots.append((index, word))
-        if not wrapped and word not in _WRAPPERS:
-            break
-        wrapped = True
+        if not wrapped:
+            if word not in _WRAPPERS:
+                break
+            following = _wrapped_program(tokens, index)
+            if following is not None:
+                program = _basename(tokens[following])
+                if program in _WRAPPERS:
+                    index = following
+                    continue
+                if program in _INERT_PROGRAMS:
+                    slots.append((following, program))
+                    break
+            wrapped = True
+        index += 1
     return slots
 
 
@@ -1197,8 +1338,9 @@ def _escalates_privilege(command: str) -> bool:
     `sudo -v`（刷新凭据）与 `sudo -l`（列权限）也算：它们不执行别的命令，判 HIGH 是刻意的——
     区分「这次 sudo 会不会真做事」要认全每个 sudo 选项，而认漏一个就是一道闸没了。
     """
-    return any(
-        word in _ESCALATORS for _, tokens in _segments(command) for word in _command_words(tokens)
+    segments = _segments(command)
+    return _too_deep(segments) or any(
+        word in _ESCALATORS for _, tokens in segments for word in _command_words(tokens)
     )
 
 
@@ -1214,24 +1356,35 @@ def _script_source(interpreter: _Interpreter, arguments: Sequence[str]) -> tuple
     是脚本）。第一个操作数是脚本文件，除非 `-s` 让解释器仍从 stdin 读（操作数只是位置参数），或
     shell 的 `-c` 在等它的代码（`bash -ce CODE` 的 CODE）。
     """
+    kind, word, _ = _script_scan(interpreter, arguments, 0)
+    return kind, word
+
+
+def _script_scan(
+    interpreter: _Interpreter, tokens: Sequence[str], start: int
+) -> tuple[str, str, int]:
+    """`_script_source`，从 `tokens[start]` 读起，另交回停在哪个下标：它之前的词都是解释器的选项与
+    选项取值。不切片：对一段里每个候选命令词各切一次就是平方。"""
     reading_stdin = False
     code_pending = False
-    index = 0
-    while index < len(arguments):
-        word = arguments[index]
+    index = start
+    while index < len(tokens):
+        word = tokens[index]
         index += 1
         if word == '-' and interpreter.dash_is_stdin and not code_pending:
-            return _STDIN, ''
+            return _STDIN, '', index
         if word in ('-', '--'):
             if code_pending:
-                return ('option', arguments[index]) if index < len(arguments) else (_STDIN, '')
-            if reading_stdin or index >= len(arguments):
-                return _STDIN, ''
-            return 'file', arguments[index]
+                if index < len(tokens):
+                    return 'option', tokens[index], index
+                return _STDIN, '', index
+            if reading_stdin or index >= len(tokens):
+                return _STDIN, '', index
+            return 'file', tokens[index], index
         if not (word[:1] in interpreter.signs and len(word) > 1):
             if code_pending:
-                return 'option', word
-            return (_STDIN, '') if reading_stdin else ('file', word)
+                return 'option', word, index - 1
+            return (_STDIN, '', index - 1) if reading_stdin else ('file', word, index - 1)
         if word.startswith('--'):
             name, attached, value = word[2:].partition('=')
             kind = interpreter.long.get(name)
@@ -1239,9 +1392,9 @@ def _script_source(interpreter: _Interpreter, arguments: Sequence[str]) -> tuple
                 # 取值紧贴的长选项吃不掉下一个词；合乎已知开关前缀的（node 的 `--no-*`）也是开关。
                 if attached or name.startswith(interpreter.flag_prefixes):
                     continue
-                return 'unknown', ''
+                return 'unknown', '', index
             if kind == _SCRIPT:
-                return 'option', value if attached else _next_word(arguments, index)
+                return 'option', value if attached else _next_word(tokens, index), index
             if kind == _VALUED and not attached:
                 index += 1
             continue
@@ -1252,9 +1405,9 @@ def _script_source(interpreter: _Interpreter, arguments: Sequence[str]) -> tuple
             position += 1
             rest = cluster[position:]
             if kind is None:
-                return 'unknown', ''
+                return 'unknown', '', index
             if kind == _SCRIPT:
-                return 'option', rest or _next_word(arguments, index)
+                return 'option', rest or _next_word(tokens, index), index
             if kind == _CODE_OPERAND:
                 code_pending = True
             elif kind == _STDIN:
@@ -1270,7 +1423,7 @@ def _script_source(interpreter: _Interpreter, arguments: Sequence[str]) -> tuple
                     position += 1
                 if position < len(cluster) and cluster[position] == ':':
                     break
-    return _STDIN, ''
+    return _STDIN, '', index
 
 
 def _reads_its_script_from_stdin(tokens: Sequence[str]) -> bool:
@@ -1330,16 +1483,18 @@ class _Layer:
 _PROCESS_OPENERS = ('<(', '>(')
 
 
-def _close_layer(layers: list[_Layer], *, closed: bool) -> bool:
+def _close_layer(layers: list[_Layer], *, closed: bool, handoffs: list[str]) -> bool:
     """弹出最里面那一层，交给外层：占位词，或原样放回。
 
     交回这一层自己的命令是不是已经在执行下载来的内容（`: $(curl … | sh)`）：换成占位词之后，外层
-    只看得见「这里有下载」，看不见它里面那条管道。
+    只看得见「这里有下载」，看不见它里面那条管道。这一层转手执行的命令收进 `handoffs`：换成占位
+    词、或放回双引号里的那一层，外层的分词都不会再把它拆出来。
     """
     layer = layers.pop()
     parent = layers[-1]
     probe = ''.join(layer.probe)
-    segments, targets = _parse(probe)
+    segments, targets = _parse(probe, handoffs=False)
+    handoffs.extend(text for _, tokens in segments for text in _handoffs(tokens))
     hit = _runs_parsed(segments, targets)
     if layer.opener == '>(':
         # 输出进程替换把写进来的内容当 stdin：接的是从 stdin 读脚本的解释器，写进来的就会被执行。
@@ -1356,7 +1511,10 @@ def _close_layer(layers: list[_Layer], *, closed: bool) -> bool:
 
 
 def _without_download_substitutions(
-    text: str, bodies: dict[int, tuple[int, bool]] | None = None, offset: int = 0
+    text: str,
+    handoffs: list[str],
+    bodies: dict[int, tuple[int, bool]] | None = None,
+    offset: int = 0,
 ) -> tuple[str, bool]:
     """把里面跑了下载器的命令替换（`$(…)`、反引号）换成 `_DOWNLOADED`、进程替换（`<(…)`）换成
     `_DOWNLOADED_FILE`，把接着从 stdin 读脚本的解释器的输出进程替换（`>(sh)`）换成 `_SINK`；
@@ -1365,7 +1523,8 @@ def _without_download_substitutions(
     替换之后，下载来的内容在命令里就是一个看得见的词：它是 `sh -c` 的代码、`eval` 的实参、`bash`
     读的脚本文件，还是交给本地程序的普通实参，由各自的判据决定。`$((…))` 是算术不是替换；`<(`、
     `>(` 只在双引号外才是进程替换。单引号里的不换——它在这一层不执行；交给 `eval` 或 `sh -c` 的
-    字符串在下一层执行，那是模块开头写明的盲区。
+    字符串在下一层执行，各层转手执行的命令收进 `handoffs`，由 `_runs_downloaded_content` 当一份新
+    文本再扫一遍。
 
     替换的嵌套不递归：深度由模型决定，递归会在一段畸形输入上撞出 RecursionError，而判定抛异常等于
     让这次调用所在的整批失败。
@@ -1380,7 +1539,7 @@ def _without_download_substitutions(
     """
     if bodies is None:
         found: list[tuple[int, int, bool]] = []
-        _parse(text, thorough=True, spans=found)
+        _parse(text, thorough=True, spans=found, handoffs=False)
         bodies = {start: (end, executed) for start, end, executed in found}
     layers = [_Layer('')]
     hit = False
@@ -1392,7 +1551,9 @@ def _without_download_substitutions(
             end = body[0] - offset
             content = text[index:end]
             if body[1]:
-                content, body_hit = _without_download_substitutions(content, bodies, offset + index)
+                content, body_hit = _without_download_substitutions(
+                    content, handoffs, bodies, offset + index
+                )
                 hit = body_hit or hit
             layers[-1].add(content)
             index = end
@@ -1415,7 +1576,7 @@ def _without_download_substitutions(
         elif (char == '`' and layer.opener == '`') or (
             char == ')' and parenthesised and not layer.depth
         ):
-            hit = _close_layer(layers, closed=True) or hit
+            hit = _close_layer(layers, closed=True, handoffs=handoffs) or hit
             index += 1
         elif char == '#' and not layer.in_double and _starts_a_word(text, index):
             # 词首的 `#` 起注释：注释里的撇号不是开引号，注释里的 `$(…)` 也不执行。
@@ -1452,7 +1613,7 @@ def _without_download_substitutions(
             layer.add(char)
             index += 1
     while len(layers) > 1:
-        hit = _close_layer(layers, closed=False) or hit
+        hit = _close_layer(layers, closed=False, handoffs=handoffs) or hit
     return ''.join(layers[0].text), hit
 
 
@@ -1522,11 +1683,29 @@ def _runs_downloaded_content(command: str) -> bool:
     已知盲区：带取值、而取值会被当代码加载的选项（`node -r <(curl …)`、
     `bash --rcfile <(curl …) -i`、`fish -C "$(curl …)"`）；解释器选项表里没有、又与 node 开关同前缀
     的带值选项；先跟一个位置实参的 wrapper（`flock /tmp/l $(curl …)`）；单独一个 `+`（`bash +`）；
-    结束标记不带引号、不被执行的 heredoc 正文里套了两层的替换（`$(sh -c "$(curl …)")`，只看得见
-    外层展开时执行的那条命令）；以及模块开头写明的「代码在字符串里」。
+    以及模块开头写明的那几类转手。
+
+    转手执行的命令（`sh -c` 的代码、`eval` 的实参、`find -exec`）是一份新文本，从替换开始整个再扫
+    一遍：单引号里的 `$(curl …)` 在这一层不执行，到了下一层才执行。层数上限与其余规则相同。
     """
-    reduced, hit = _without_download_substitutions(command)
-    return hit or _runs_parsed(*_parse(reduced))
+    pending = deque([(command, 0)])
+    seen = {command}
+    while pending:
+        text, depth = pending.popleft()
+        handoffs: list[str] = []
+        reduced, hit = _without_download_substitutions(text, handoffs)
+        segments, targets = _parse(reduced, handoffs=False)
+        if hit or _runs_parsed(segments, targets):
+            return True
+        handoffs.extend(code for _, tokens in segments for code in _handoffs(tokens))
+        for code in handoffs:
+            if code in seen:
+                continue
+            if depth == _MAX_HANDOFF_DEPTH:
+                return True
+            seen.add(code)
+            pending.append((code, depth + 1))
+    return False
 
 
 def _feeds_a_sink(tokens: Sequence[str]) -> bool:
@@ -1570,7 +1749,10 @@ def _removes_recursively_and_forcibly(command: str) -> bool:
 
     `--` 之后停止扫标志：那之后的每个词都是文件名，`rm -- -rf` 删的是一个叫 `-rf` 的文件。
     """
-    for _, tokens in _segments(command):
+    segments = _segments(command)
+    if _too_deep(segments):
+        return True
+    for _, tokens in segments:
         if 'rm' not in _command_words(tokens):
             continue
         recursive = force = False
@@ -1601,7 +1783,10 @@ def _writes_a_raw_device(command: str) -> bool:
     无害目标——`of=/dev/null` 是量读吞吐的教科书写法，`/dev/stdout` 与 `/dev/tty` 只是把输出换个
     去处，它们都不碰块设备。
     """
-    for _, tokens in _segments(command):
+    segments = _segments(command)
+    if _too_deep(segments):
+        return True
+    for _, tokens in segments:
         words = _command_words(tokens)
         if any(word.startswith('mkfs') for word in words):
             return True
@@ -1656,8 +1841,10 @@ class _Grammar:
 
     flags: frozenset[str] = frozenset()
     valued: frozenset[str] = frozenset()
-    # 选项之后、程序词之前的位置实参个数（`timeout 60 cmd` 的 60）。
+    # 选项之后、程序词之前的位置实参个数（`timeout 60 cmd` 的 60）与它们的形状。形状不对就按认不出
+    # 算：`timeout git push` 的 `git` 当成时长吞掉，程序词就成了 `push`。
     positionals: int = 0
+    positional: re.Pattern[str] | None = None
     # 选项之后允许出现 `NAME=VALUE`（`env -i A=1 cmd`）。
     assignments: bool = False
     # `-19` 这样的纯数字选项（`nice -19 cmd`）。
@@ -1724,6 +1911,16 @@ _WRAPPER_GRAMMARS: Mapping[str, _Grammar] = MappingProxyType(
             flags=frozenset({'-v', '--foreground', '--preserve-status', '--verbose'}),
             valued=frozenset({'-k', '-s', '--kill-after', '--signal'}),
             positionals=1,
+            positional=re.compile(r'[0-9]+(\.[0-9]*)?[smhd]?|\.[0-9]+[smhd]?'),
+        ),
+        # GNU 与 BSD 的并集。`-e` `-i` `-l` 只收紧贴的取值（`-i{}`），单独写时是开关；放进 valued
+        # 就会把后面的程序词当取值吞掉，豁免落到它的实参上。
+        'xargs': _Grammar(
+            flags=frozenset({'-0', '-e', '-i', '-l', '-o', '-p', '-r', '-t', '-x', '--exit'})
+            | {'--interactive', '--no-run-if-empty', '--null', '--open-tty', '--verbose'},
+            valued=frozenset({'-a', '-d', '-E', '-I', '-J', '-L', '-n', '-P', '-R', '-S', '-s'})
+            | {'--arg-file', '--delimiter', '--max-args', '--max-chars', '--max-lines'}
+            | {'--max-procs'},
         ),
     }
 )
@@ -1778,6 +1975,9 @@ def _wrapped_program(tokens: Sequence[str], index: int) -> int | None:
     if grammar.assignments:
         while position < len(tokens) and _ASSIGNMENT.match(tokens[position]):
             position += 1
+    for word in tokens[position : position + grammar.positionals]:
+        if grammar.positional is not None and not grammar.positional.fullmatch(word):
+            return None
     position += grammar.positionals
     return position if position < len(tokens) else None
 
@@ -1961,7 +2161,7 @@ def _names_git_dir(path: str) -> bool:
 
 def _changes_git_state(command: str) -> bool:
     segments, targets = _parse(command, thorough=True)
-    if any(_names_git_dir(target) for target in targets):
+    if _too_deep(segments) or any(_names_git_dir(target) for target in targets):
         return True
     for _, tokens in segments:
         for token in tokens:
@@ -2068,6 +2268,207 @@ def _rm_operands(arguments: Sequence[str]) -> list[str]:
     return operands
 
 
+# 起点之前的选项：GNU 的 `-H` `-L` `-P` `-D 调试项` `-O级别`，BSD 的 `-E` `-X` `-d` `-s` `-x` 与
+# `-f 起点`。
+_FIND_LEADING_FLAGS = frozenset({'-E', '-H', '-L', '-P', '-X', '-d', '-s', '-x'})
+_FIND_OPTIMISATION = re.compile(r'-O[0-9]*')
+# 收窄的测试：只对一部分文件成立。名单之外的测试按不收窄算：漏认一个收窄只是一次误报，多认一个
+# 就是删根放行。除 `_FIND_NULLARY_TESTS` 之外都带一个取值；`-newerXY` 按 `_FIND_NEWER` 认。
+_FIND_TESTS = frozenset(
+    {'-Bmin', '-Bnewer', '-Btime'}
+    | {'-amin', '-anewer', '-atime', '-cmin', '-cnewer', '-ctime', '-empty', '-executable'}
+    | {'-false', '-fstype', '-gid', '-group', '-ilname', '-iname', '-inum', '-ipath', '-iregex'}
+    | {'-iwholename', '-links', '-lname', '-mmin', '-mtime', '-name', '-newer', '-nogroup'}
+    | {'-nouser', '-path', '-perm', '-readable', '-regex', '-samefile', '-size', '-type', '-uid'}
+    | {'-used', '-user', '-wholename', '-writable', '-xtype'}
+)
+_FIND_NULLARY_TESTS = frozenset(
+    {'-empty', '-executable', '-false', '-nogroup', '-nouser', '-readable', '-writable'}
+)
+_FIND_NEWER = re.compile(r'-newer[aBcmt][aBcmt]')
+# 不收窄、不删除，但吃掉后面几个词的选项与动作；没列的按不吃词算。
+_FIND_ARITY: Mapping[str, int] = MappingProxyType(
+    {
+        '-files0-from': 1,
+        '-fls': 1,
+        '-fprint': 1,
+        '-fprint0': 1,
+        '-fprintf': 2,
+        '-maxdepth': 1,
+        '-mindepth': 1,
+        '-printf': 1,
+        '-regextype': 1,
+    }
+)
+_FIND_OR = frozenset({'-o', '-or', ','})
+_FIND_NOT = frozenset({'!', '-not'})
+# 对谁都成立的 `-regex` 只认这几种写法。从命令里取来的正则不交给正则引擎：模式与起点都由模型定，
+# 一个嵌套量词（`(a+)+`）就让回溯成指数时间，而判定跑在每一次工具调用上。
+_EVERY_PATH_REGEX = frozenset({'.*', '^.*', '.*$', '^.*$', '.+', '^.+$', '..*', '.*/.*', '\\./.*'})
+# 括号与取反的嵌套层数上限，超过就按删光算：层数由模型决定，递归下去会撞 RecursionError。
+_MAX_FIND_NESTING = 64
+_FIND_PATH_TESTS = frozenset({'-path', '-ipath', '-wholename', '-iwholename'})
+# 有路径测试时逐个起点判的起点数上限：逐个判是起点数乘表达式长度。起点再多，路径测试就一律按
+# 不收窄算，宁可多判。
+_MAX_PROBED_STARTS = 8
+
+
+def _wholly_deleted_starting_points(arguments: Sequence[str]) -> list[str]:
+    """`find` 整个删掉的起点：表达式里有一次删除落在（几乎）全部文件上，见 `_FindExpression`。
+    没写起点时是 `.`。删的不是全部时交回空表。"""
+    points: list[str] = []
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
+        if word in _FIND_LEADING_FLAGS or _FIND_OPTIMISATION.fullmatch(word):
+            index += 1
+        elif word in ('-D', '-f'):
+            if word == '-f':
+                points.append(_next_word(arguments, index + 1))
+            index += 2
+        else:
+            break
+    while index < len(arguments) and not (
+        arguments[index].startswith('-') or arguments[index] in ('(', '!', ')', ',')
+    ):
+        points.append(arguments[index])
+        index += 1
+    starts = points or ['.']
+    expression = arguments[index:]
+    if len(starts) > _MAX_PROBED_STARTS or not any(word in _FIND_PATH_TESTS for word in expression):
+        return starts if _FindExpression(expression, None).deletes_wholesale() else []
+    # 路径测试对不同的起点答案不同（`find other . -path 'other/*'` 删的只是 other 下的）：
+    # 逐个起点判。
+    return [start for start in starts if _FindExpression(expression, start).deletes_wholesale()]
+
+
+class _TooNested(Exception):
+    """find 表达式的嵌套超过 `_MAX_FIND_NESTING`。内部信号。"""
+
+
+class _FindExpression:
+    """find 的表达式里，有没有一次删除（`-delete`，或执行带 `{}` 的 `rm`）落在起点下（几乎）全部
+    文件上。
+
+    按 find 的求值规则：一次删除只作用于它所在的每一层「与」链在它之前都为真的文件。链里有一个
+    收窄的测试（`-name '*.pyc'`），删的就只是筛出来的那些。`-o` 与 `,` 断开链：`-o` 之后那一支看到的
+    是前面没选中的文件，仍然几乎是全部。括号算一个原语，每一支都收窄它才算收窄。取反的测试
+    （`! -name keep`）选中的是「其余全部」，对谁都成立的测试（`-name '*'`）也不算收窄。`-exec … ;`
+    里的词是那条命令的实参，不是测试。每一次删除都要看，不只第一次。
+    """
+
+    def __init__(self, tokens: Sequence[str], start: str | None) -> None:
+        """`start` 是路径测试要对着判的那一个起点；None 时路径测试一律按不收窄算。"""
+        self._tokens = tokens
+        self._start = start
+        self._index = 0
+        self._depth = 0
+
+    def deletes_wholesale(self) -> bool:
+        try:
+            found = False
+            while self._index < len(self._tokens):
+                _, deletes = self._alternatives(narrowed=False)
+                found = found or deletes
+                # 多出来的 `)`：跳过它接着读，后面的删除照样要看。
+                self._index += 1
+            return found
+        except _TooNested:
+            return True
+
+    def _peek(self) -> str | None:
+        return self._tokens[self._index] if self._index < len(self._tokens) else None
+
+    def _alternatives(self, *, narrowed: bool) -> tuple[bool, bool]:
+        """(每一支都收窄, 有一次删除落在全部上)。每一支看到的都是外层链的范围。"""
+        every_branch_narrows = True
+        deletes = False
+        while True:
+            narrows, branch_deletes = self._chain(narrowed=narrowed)
+            every_branch_narrows = every_branch_narrows and narrows
+            deletes = deletes or branch_deletes
+            if self._peek() not in _FIND_OR:
+                return every_branch_narrows, deletes
+            self._index += 1
+
+    def _chain(self, *, narrowed: bool) -> tuple[bool, bool]:
+        deletes = False
+        while (word := self._peek()) is not None and word not in _FIND_OR and word != ')':
+            # `-a` / `-and` 落到不收窄、不吃词的原语那一支，与省略它一样。
+            narrows, primary_deletes = self._primary(narrowed=narrowed)
+            deletes = deletes or primary_deletes
+            narrowed = narrowed or narrows
+        return narrowed, deletes
+
+    def _primary(self, *, narrowed: bool) -> tuple[bool, bool]:
+        """(这个原语收窄, 它里面有一次删除落在全部上)。"""
+        word = self._tokens[self._index]
+        self._index += 1
+        if word in _FIND_NOT or word == '(':
+            self._depth += 1
+            if self._depth > _MAX_FIND_NESTING:
+                raise _TooNested
+            try:
+                if word == '(':
+                    narrows, deletes = self._alternatives(narrowed=narrowed)
+                    if self._peek() == ')':
+                        self._index += 1
+                    return narrows, deletes
+                if self._peek() is None:
+                    return False, False
+                return False, self._primary(narrowed=narrowed)[1]
+            finally:
+                self._depth -= 1
+        if word == '-delete':
+            return False, not narrowed
+        if word in _FIND_ACTIONS:
+            start = self._index
+            while self._index < len(self._tokens) and not _ends_find_command(
+                self._tokens, self._index
+            ):
+                self._index += 1
+            command = self._tokens[start : self._index]
+            self._index += 1
+            return False, not narrowed and _removes_found(command)
+        if word in _FIND_TESTS or _FIND_NEWER.fullmatch(word):
+            if word in _FIND_NULLARY_TESTS:
+                return True, False
+            argument = self._peek() or ''
+            self._index += 1
+            return not self._selects_everything(word, argument), False
+        self._index += _FIND_ARITY.get(word, 0)
+        return False, False
+
+    def _selects_everything(self, test: str, pattern: str) -> bool:
+        """对起点下每个文件都成立的测试：`-name '*'`、`-path '*'`、`-path './*'`、`-regex '.*'`。
+        `-lname '*'` 不算：它只对符号链接成立。"""
+        folded = test in ('-iname', '-ipath', '-iwholename')
+        if test in ('-name', '-iname'):
+            return _matches_everything(pattern.casefold() if folded else pattern)
+        if test in ('-regex', '-iregex'):
+            return pattern in _EVERY_PATH_REGEX
+        if test not in _FIND_PATH_TESTS:
+            return False
+        if self._start is None:
+            return True
+        probes = [f'{self._start.rstrip("/") or "/"}/{name}'.replace('//', '/') for name in 'az']
+        return all(
+            fnmatch.fnmatchcase(probe.casefold(), pattern.casefold())
+            if folded
+            else fnmatch.fnmatchcase(probe, pattern)
+            for probe in probes
+        )
+
+
+def _removes_found(command: Sequence[str]) -> bool:
+    """`find` 的动作执行的是 `rm`，实参里有 `{}`（找到的那个文件）。只看第一个 `rm` 候选：它之后的
+    词都是它的操作数，后面那些候选的操作数是它的一部分。"""
+    for index in _program_candidates(command):
+        if _basename(command[index]) == 'rm':
+            return any('{}' in operand for operand in _rm_operands(command[index + 1 :]))
+    return False
+
+
 @dataclass(frozen=True)
 class _WorkspaceRoot:
     """构造规则时解析一次的工作区根。`matches` 只在这两个字符串上做字符串运算，不碰磁盘。
@@ -2123,7 +2524,7 @@ class _WorkspaceRoot:
 
     def reaches_outside(self, command: str) -> bool:
         segments, targets = _parse(command, thorough=True)
-        if any(self.points_outside(target) for target in targets):
+        if _too_deep(segments) or any(self.points_outside(target) for target in targets):
             return True
         for _, tokens in segments:
             programs = _determinate_programs(tokens)
@@ -2164,11 +2565,24 @@ class _WorkspaceRoot:
         return False
 
     def removes_root(self, command: str) -> bool:
-        for _, tokens in _parse(command, thorough=True)[0]:
+        segments = _parse(command, thorough=True)[0]
+        if _too_deep(segments):
+            return True
+        for _, tokens in segments:
+            # 每种程序只看第一个候选：wrapper 之后每个词都是候选，后面那些同名候选的操作数是第一个的
+            # 一部分；每个都重扫一遍就是平方，而这条规则在开发期跑在每一次工具调用上。
+            looked: set[str] = set()
             for index in _program_candidates(tokens):
-                if _basename(tokens[index]) == 'rm' and any(
-                    self.covers_root(operand) for operand in _rm_operands(tokens[index + 1 :])
-                ):
+                name = _basename(tokens[index])
+                if name not in ('rm', 'find') or name in looked:
+                    continue
+                looked.add(name)
+                arguments = tokens[index + 1 :]
+                if name == 'rm':
+                    operands = _rm_operands(arguments)
+                else:
+                    operands = _wholly_deleted_starting_points(arguments)
+                if any(self.covers_root(operand) for operand in operands):
                     return True
         return False
 
@@ -2181,15 +2595,16 @@ def git_state_change_rule() -> DangerRule:
     `grep` 用 `-O` / `--open-files-in-pager` 执行命令；`GIT_` 开头的环境赋值（任何位置，`export`
     也算）；任何实参、`=` 之后的值、紧贴短选项的取值（`-o.git/x`）或重定向目标里有一段是 `.git`
     （不分大小写，含会展开出它的通配）。git 按命令词槽与启动器展开出来的程序找（`setsid git push`、
-    `uv run --with rich git push`、`{ git push; }`、双引号里的 `$(git push)`）。
+    `uv run --with rich git push`、`{ git push; }`、双引号里的 `$(git push)`），转手执行的命令里
+    同样找（`sh -c 'git push'`、`eval`、`xargs git add`、`find … -exec git add {} +`）。
 
     已知误报：`find . -path ./.git -prune` 这类只读引用 `.git` 的命令；只读集合之外的只读用法
     （`git branch`、`git stash list`、`git remote -v`、`git config --get`）；`echo GIT_DIR=x`；
-    wrapper 之后恰好写着 `git` 的普通实参；结束标记不带引号、喂进管道或交给解释器的 heredoc 正文。
-    已知盲区：`sh -c "…"`、`python -c "…"`、`make`、脚本文件里的 git，以及引号内代码里嵌的
-    `.git` 路径；`xargs` / `find -exec` 转手；变量（`$GIT push`）；花括号展开（`{.git,x}`）；
-    名单之外的启动器与 wrapper（`xcrun`、`pdm run`、`eval`）。反斜杠与 `$'…'` 转义按 shell 的
-    规则消掉（`g\\it push`、`$'\\x67it' push` 都命中）。
+    没有选项表、或有认不出的选项的 wrapper（`sudo`、`flock`）之后恰好写着 `git` 的普通实参；结束
+    标记不带引号、喂进管道或交给解释器的 heredoc 正文。
+    已知盲区：`python -c "…"`、`make`、脚本文件里的 git；模块开头写明的那几类转手；变量
+    （`$GIT push`）；花括号展开（`{.git,x}`）；名单之外的启动器与 wrapper（`xcrun`、`pdm run`）。
+    反斜杠与 `$'…'` 转义按 shell 的规则消掉（`g\\it push`、`$'\\x67it' push` 都命中）。
     """
     return DangerRule(
         rule_id='shell.git_state_change',
@@ -2215,14 +2630,16 @@ def path_outside_workspace_rule(root: object) -> DangerRule:
     每段只豁免**确定的**程序词：第一个词，以及有选项表的 wrapper（`timeout 60`、`env -i`、
     `nice -n 5` 等）启动的程序，并且只在它是绝对路径时豁免；认不出就不再往后豁免。
     `timeout 60 cat /etc/passwd`、`setsid cat /etc/passwd`、`~/bin/x.sh`、`../other/run.sh` 因此
-    都命中，`/usr/bin/python3 x.py` 不命中。
+    都命中，`/usr/bin/python3 x.py` 不命中。转手执行的命令（`sh -c 'cat /etc/hosts'`、`eval`、
+    `find -exec`）按同样的规则判。
 
-    已知盲区：`sh -c "…"`、`make`、脚本文件里的命令；变量与未加引号的命令替换（`$(pwd)`、
-    `${HOME%/}`）；引号内代码里嵌的路径；选项与取值粘在一起的写法（`-o/etc/x`）；`dd of=` 这类
-    不带 `--` 的 `名字=值`；工作区里指向外面的符号链接；以绝对路径给出的工作区外可执行文件
-    （`/tmp/x.sh`）。已知误报：以 `/` 开头的 sed / awk 脚本与搜索模式（`sed -n '/def x/,/^$/p'`）、
-    `/tmp` 下的临时文件、`echo $HOME`、`cd src && … && cd ..`（命令内的 `cd` 不跟踪）、结束标记
-    不带引号的 heredoc 正文里的路径。
+    已知盲区：`make`、脚本文件与非 shell 解释器代码里的路径；模块开头写明的那几类转手；变量与
+    未加引号的命令替换（`$(pwd)`、`${HOME%/}`）；选项与取值粘在一起的写法（`-o/etc/x`）；
+    `dd of=` 这类不带 `--` 的 `名字=值`；工作区里指向外面的符号链接；以绝对路径给出的工作区外
+    可执行文件（`/tmp/x.sh`）。
+    已知误报：以 `/` 开头的 sed / awk 脚本与搜索模式（`sed -n '/def x/,/^$/p'`）、`/tmp` 下的临时
+    文件、`echo $HOME`、`cd src && … && cd ..`（命令内的 `cd` 不跟踪）、结束标记不带引号的 heredoc
+    正文里的路径。
     """
     workspace = _WorkspaceRoot.of(root, 'path_outside_workspace_rule')
     return DangerRule(
@@ -2237,19 +2654,27 @@ def path_outside_workspace_rule(root: object) -> DangerRule:
 
 
 def workspace_root_removal_rule(root: object) -> DangerRule:
-    """`shell.workspace_root_removal`：`rm` 删掉工作区根本身、根下的全部内容，或根的祖先。
+    """`shell.workspace_root_removal`：`rm` 或 `find` 删掉工作区根本身、根下的全部内容，或根的祖先。
 
     `root` 同 `path_outside_workspace_rule`。命中的目标规范化之后是根（`.`、`./`、`.//`、
     `src/..`、`$PWD`、根的绝对路径、`../<根目录名>`）、根的祖先（`..`、`/`）、逐段通配能匹配到
     根或其祖先（`/srv/*/proj`、`../*`），或根下的「全部」（`*`、`./*`、`?*`、`[!.]*`）。相对目标
     按 Bash 的 `cwd` 在根下任意一层都试（cwd 在 `src` 时 `../../proj` 就是根），接在字面与解析掉
-    符号链接的两种根上。不看 `-r` / `-f`：`rm *` 不带 `-r` 也删光根下所有文件。rm 按命令词槽与
-    启动器展开出来的程序找。`rm -r build`、`rm *.pyc`、`rm -r ../build` 不命中。
+    符号链接的两种根上。不看 `-r` / `-f`：`rm *` 不带 `-r` 也删光根下所有文件。`find` 的目标是
+    它的起点（没写时是 `.`），只在有一次删除（`-delete`，或执行带 `{}` 的 `rm`）落在起点下几乎全部
+    文件上时算：按 find 的求值规则，它所在的「与」链在它之前没有收窄的测试（`-name`、`-type`、
+    `-mtime` 等；取反的、对谁都成立的如 `-name '*'` 不算），见 `_FindExpression`。rm 与 find 按命令
+    词槽、启动器展开出来的程序与转手执行的命令找（`sh -c 'rm -rf .'`）。`rm -r build`、`rm *.pyc`、
+    `rm -r ../build`、`find . -name '*.pyc' -delete`、`find . \\( -name a -o -name b \\) -delete`、
+    `find . -path ./x -prune -o -name '*.js' -delete` 不命中。
 
-    已知误报：`rm -r ?`（连 `a` 与 `z` 都匹配的通配按「全部」算）；cwd 就在根上时的
-    `rm -r ../../<根目录名>`（删的是根外那个同名目录，照样按删根拦下）。已知盲区：`~` 与 `$PWD`
-    以外的变量不展开；`$(pwd)` 与反引号；
-    `find -delete`；`xargs rm`、`sh -c`、`make`；花括号展开（`{*,.*}`）；`git clean`（它归
+    已知误报：连 `a` 与 `z` 都匹配的通配按「全部」算（`rm -r ?`、`find . -name '[a-z]*' -delete`、
+    `-path './?'`）；cwd 就在根上时的 `rm -r ../../<根目录名>`（删的是根外那个同名目录，照样按删根
+    拦下）；名单之外的 find 测试（`-context`）不算收窄，双重取反（`! ! -name x`）也不算；有路径测试
+    又有 8 个以上起点时，路径测试一律不算收窄。已知盲区：`~` 与 `$PWD` 以外的变量不展开；`$(pwd)`
+    与反引号；`xargs rm`（目标从 stdin 来）、经 shell 转手删找到的文件
+    （`find -exec sh -c 'rm "$1"' _ {} \\;`）、`make`；`-regex` 只认 `_EVERY_PATH_REGEX` 里那几种
+    「全部」的写法，别的都算收窄；花括号展开（`{*,.*}`）；`git clean`（它归
     `shell.git_state_change`）。
     """
     workspace = _WorkspaceRoot.of(root, 'workspace_root_removal_rule')
