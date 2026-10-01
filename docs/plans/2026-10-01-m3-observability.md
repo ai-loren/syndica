@@ -167,7 +167,11 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
   （agent id、turn），llm_call =（agent id、turn、第几次调用：首次与每次重试分开），tool_call 与 confirmation =
   （agent id、周期、turn、批内位置），wait =（agent id、该 Agent 的第几次等待）。模型给的 `tool_call.id` 只作属性记录
   （脱敏后），不进键：它可以重复、可以是空串。
-- 时间：`Tracer` 收可注入的时钟（纳秒，默认 `time.time_ns`）。状态：`ok`、`error`、`cancelled`。
+- 时间：`Tracer` 收可注入的时钟（纳秒，默认 `time.time_ns`）。墙钟可以回拨（`CLOCK_REALTIME`，NTP 校时），而模型拒收
+  结束早于开始的 span：开始时间取墙钟，结束时间 = 开始时间 + 单调时钟（`time.monotonic_ns`）量出的时长，回拨既造不出
+  倒着走的 span，也不会让 `finish` 失败（T5 评审）。状态：`ok`、`error`、`cancelled`。
+- span 只有收尾之后才进 store（模型里没有开着的 span）：`finish` 时还开着的 span 一律以 `cancelled` 收尾再写；SIGKILL
+  丢掉还在内存里的 span 与缓冲，这是已知的边界（T5 评审）。
 
 **D4 统一 `Redactor`：幂等、逐叶、带类型闸。**
 
@@ -226,8 +230,15 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
 - 读：`traces()`（按开始时间、再按 id 排序）、`find(prefix)`（唯一前缀才返回，歧义报错）、`get(trace_id)`、
   `spans(trace_id)`、`edges(trace_id)`、`payload(ref)`、`replay(trace_id)`；`delete(trace_id)`。读到的是快照：改
   返回值嵌套的属性，**再读同一个 trace** 不受影响。
-- 同一个 trace 的追加按调用顺序保序；并发追加不丢不乱序。内存实现进 `kernel/stores/`；文件实现（T11）同样在内核
-  （只用标准库）；两者过同一套契约。spec §4.4 补上第五个 Store。
+- 同一个 trace 的追加按调用顺序保序；一次 `append` 是原子的（整批出现、不被别的 `append` 插进来，混着坏项的整批一项都
+  不写）；同一个 trace id 并发 `begin`、并发 `put_replay` 恰好一个成功；`delete` 之后的写报错（攥着目录 fd 的文件实现
+  要自己确认 trace 还在）；payload 的引用属于它的 trace；读回的自由文本是普通 `str`，与引用的 sha256 对不上时报错。
+  内存实现进 `kernel/stores/`（`InMemoryTraceStore`，与另两个内存 store 同名法）；文件实现（T11）同样在内核（只用
+  标准库），它收一个 `Redactor`：span 与头经 `encode_redacted` 编码、经 `write_redacted` 写；两者过同一套契约。
+  spec §4.4 补上第五个 Store。
+- 头里的用户规则存成 `RedactionRule` 记录：存成 (id, pattern) 两项时 `encode_redacted` 把它当成一对键值，id 像密钥名
+  （`custom.api_token`）的 pattern 会被换掉，回放就重建不出规则集。模型的字段名与字符串属性的键都不许像密钥名（一条
+  用例钉住）：否则落盘时值会被换掉。
 
 **D7 文件布局与落盘安全（用户裁决：文件）。**
 
@@ -454,11 +465,12 @@ redaction:
 
 - `Runtime(..., tracer=None, ids=None)`；`LocalWorkspace(..., private=())`；`path_outside_workspace_rule(root, *,
   real=None)` 与 `workspace_root_removal_rule(root, *, real=None)`。
-- `syndica.kernel.trace`：`Tracer`、`NoopTracer`、`TraceRecorder`、`Span`、`CausalityEdge`、`SpanKind`、`EdgeKind`、
-  `TraceLevel`、`TraceHeader`、`PayloadRef`；`syndica.kernel.protocols.trace.TraceStore`；`MemoryTraceStore`、
+- `syndica.kernel.trace`：`Tracer`、`NoopTracer`、`TraceRecorder`、`Span`、`SpanEvent`、`CausalityEdge`、`SpanKind`、
+  `EdgeKind`、`SpanStatus`、`TraceLevel`、`TraceHeader`、`TraceRedaction`、`TraceSource`、`PayloadRef`、
+  `ATTRIBUTE_KINDS`、`ATTRIBUTE_DOMAINS`；`syndica.kernel.protocols.trace.TraceStore`；`InMemoryTraceStore`、
   `FileTraceStore`；契约套件 `TraceStoreContract`；回放文档的 schema 模块。
 - `syndica.kernel.redaction`：`Redactor`、`RuleRedactor`、`RedactionRule`、`RedactedText`、`encode_redacted`、
-  `Finding`、`RULE_IDS`、`RULES_VERSION`、`looks_secret`。
+  `write_redacted`、`write_all`、`Finding`、`RULE_IDS`、`RULES_VERSION`、`looks_secret`。
 - 哪些进 `kernel.__all__`、哪些进 `_WITHHELD`，在各自任务里按「宿主不用它就做不成某件事」判定并写进
   `tests/kernel/test_public_api.py`。
 
@@ -600,7 +612,7 @@ PEM 与 PuTTY 块）；8 条是 URL 里已知密钥值的占位符名字不同�
   Glob / Grep 显式指向它们时同样拒；`.syndica/tmp/…` 照常可读写（Worker 的提示词用它）；Bash 不受影响；错误说明写明
   为什么。
 
-**状态：完成。** 守卫（`tests/test_write_points.py`）扫整个 `src/syndica`：五个扫描根各有锚文件，另用一次
+**状态：完成（6937784）。** 守卫（`tests/test_write_points.py`）扫整个 `src/syndica`：五个扫描根各有锚文件，另用一次
 `os.walk` 核对范围；在每个根里种的违规样例（写文件、`client.post(json=...)`、`def redact`、`cast(RedactedText,
 ...)`、白名单目录里的新文件、白名单文件里多出来的一处）都被报出。白名单按文件、按写法与次数逐条写死：模型提供方的
 请求、Agent 的文件工具与命令管道、`write_all` 里把短写写完的那一处 `os.write`。落盘原语收进 `kernel/redaction.py`：
@@ -634,6 +646,24 @@ M2 的交接文件写入一直是单次调用。
   `find` 的唯一与歧义、`traces()` 的顺序（三个 trace，开始时间非单调地写入）、`delete`、并发追加（三个任务，每次追加
   之间 `await asyncio.sleep(0)`）。
 - 故意违约的子类（丢掉最后一条、不深拷贝、`finish` 后仍收、接受 `str`）让契约变红；枚举成员→取值表整体断言。
+
+**状态：完成。** 模型（`kernel/trace.py`）：span、事件、边、头、规则集记录、来源、payload 引用，全部冻结、构造时
+校验；属性是闭集（键 → 种类），整数限在 int64 之内、布尔不算整数，取值有限的属性（`tool.outcome`、`stop_reason`、
+`confirmation.outcome`、`wait.kind` / `wait.outcome`、`danger.risk` / `decided_by` / `disposition`）只收表里的值，
+与内核枚举一致由用例钉住。`TraceStore` 协议、`InMemoryTraceStore`、`TraceStoreContract`（25 条）。公开面：全部
+扣留到 `TraceRecorder`（第一个收 TraceStore 的公开入口），契约随协议一起进承诺面。
+
+验证：对抗评审一路，结论是契约太弱：18 个故意违约的 store 过了全部 17 条契约，它施加的 21 条变异全部存活。2 High
+（头读回不全没人查——级别、规则集、来源可以写死；固定装置的父 span、结局、事件、列表、布尔与 None 都只有一种取值，
+写死、排序、丢掉的实现照样过）、4 Medium（被拒的写留下一半；`delete` 之后的写照收；逐叶编码器把 id 像密钥名的
+用户规则的 pattern 换掉；只有 `append` 有并发用例）与一批 Low（`find` 的索引不随 `finish` 更新、只比 8 个字符；
+`finish(None, None)` 静默通过；整数不设上限；取值有限的属性收拼错的值；`None` 当序列给时报裸 `TypeError`）。全部
+修掉：契约补到 25 条（每个字段都不止一种取值的固定装置与头、混着坏边的整批、`delete` 之后的写、payload 引用属于
+它的 trace、读回是普通 `str`、交回的列表是快照、`find` 的边界、`finish` 的参数、并发的 `begin` 与 `put_replay`），
+22 个故意违约的 store 各自让对应的那条契约变红；规则集改成 `RedactionRule` 记录；字段名与字符串属性键不许像密钥名
+（用例当场查出 `llm.input_tokens` 这三个计数像密钥名——整数不受影响，用例改成只管字符串）。变异：第一轮 34 条，
+33 条杀、1 条等价（内容相同的 payload 重写一遍）；评审之后为它的 21 条存活变异与新代码写的 27 条全杀。零存活只对
+这些变异集成立。
 
 #### T6 — 可复现的 id 与「当前工具调用」
 
@@ -675,7 +705,8 @@ M2 的交接文件写入一直是单次调用。
 
 **Files:** `kernel/trace.py`（或 `kernel/trace_recorder.py`）、测试。
 
-- `TraceRecorder(store, redactor, *, level, clock)` 实现 `Tracer`：同步缓冲、一个写入任务按序落盘、`finish` 排空；
+- `TraceRecorder(store, redactor, *, level, clock)` 实现 `Tracer`：同步缓冲、一个写入任务按序落盘、`finish` 排空
+  （还开着的 span 以 `cancelled` 收尾再写，见 D3）；
   按 D8 的级别决定记什么；所有字符串经 `encode_redacted`；请求按 D11 取逐单元指纹（按单元原文的 sha256 缓存）；人的
   答复由宿主报给它。宿主档案的 schema 到 T12 才有，T9 与 T11 不写它，从 T12 起写、T14 补进往返。
 - 脱敏用例：每个通道一个**不同的**假密钥（提示词、命令行参数、工具参数、工具输出、`meta`、模型回复、`extra`、
@@ -701,8 +732,9 @@ M2 的交接文件写入一直是单次调用。
 
 **Files:** `kernel/stores/file_trace.py`、`cli/host.py`、`cli/main.py`、`cli/config.py`、`src/syndica/__main__.py`、测试。
 
-- 见 D6、D7、D8、D15。`FileTraceStore` 过契约套件；`O_NOFOLLOW` / `dir_fd`（在 run 中途把 `payloads` 换成符号链接，
-  写入被拒、不写到链接指向的地方）、`O_EXCL` 与 sha256 核对各一条；写失败（目录只读）时 run 照常、stderr 一条说明。
+- 见 D6、D7、D8、D15。`FileTraceStore(root, redactor)` 过契约套件；`O_NOFOLLOW` / `dir_fd`（在 run 中途把 `payloads`
+  换成符号链接，写入被拒、不写到链接指向的地方）、`O_EXCL` 与 sha256 核对各一条；写失败（目录只读、`.syndica` 被 Bash
+  建成了文件）时 run 照常、stderr 一条说明；攥着目录 fd 时，`delete` 之后的写要报错而不是写进一个已经删掉的目录。
 - CLI：`run` / `chat` 默认记录（`chat` 最高 `structure`，D15）、四个级别、`trace.level` 快照、人的答复报给 recorder、
   交接文件写 trace 目录、`.syndica/.gitignore` 照样建、Ctrl-C 时以 `cancelled` 收尾。宿主档案（规则带参数、处置表、
   Flag、`--max-turns`、`--no-write`、模块、拓扑与入口）从 T12 起报。
@@ -751,7 +783,8 @@ M2 的交接文件写入一直是单次调用。
 
 - `show` 的三个回答各一条用例（三个以上 Agent、非单调的创建顺序；等待链；最慢的三个工具调用按耗时排序）；所有来自
   模型或文件系统的字符串经 `terminal_safe()`。`replay` 三种退出码各一条，且它自己记的 trace 指向原 trace；`prune` 只删
-  trace 目录、按开始时间保留最近的。
+  trace 目录、按开始时间保留最近的，且不删还没有结局的 trace（一次长跑的 trace 开始得最早、却还在写；崩掉的 trace
+  同样没有结局，要删它得显式点名）。`list` 的大小由文件实现自己报（协议里没有这一项，需要时在这里加）。
 
 #### T16 — OTLP/HTTP JSON 导出
 
@@ -841,6 +874,9 @@ M2 的交接文件写入一直是单次调用。
 - 2026-10-02 T4 评审之后：D5 不再信任「标注为 `RedactedText` 的参数」（pyright 挡不住 `Any`，从 JSON 读出的值就是
   `Any`），改为落盘只经 `kernel/redaction.py` 的 `write_redacted`（运行时检查类型）与 `write_all`（内容在调用处按
   写入点规则看）；两者都把短写接着写完。D17 的名字比较加上按字面折叠 `..` 与根的别名。
+- 2026-10-02 T5 评审之后：D6 的契约收紧到「一次写是原子的」（`append` 整批、并发 `begin` / `put_replay` 恰好一个
+  成功）、`delete` 之后的写报错、读回是普通 `str`；头里的用户规则存成 `RedactionRule` 记录；span 的结束时间由单调时钟
+  量出的时长算（D3），`finish` 时还开着的 span 以 `cancelled` 收尾；`prune` 不删没有结局的 trace（T15）。
 
 ## 风险与遗留（开工前登记）
 
