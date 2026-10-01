@@ -20,8 +20,8 @@ from typing import TextIO, cast
 
 from syndica.cli.dev_module import DevLogSnapshot
 from syndica.cli.host_git import Change
-from syndica.cli.redaction import Redactor
 from syndica.cli.terminal import one_line, terminal_safe
+from syndica.kernel.redaction import Redactor
 
 __all__ = [
     'SCHEMA',

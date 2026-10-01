@@ -75,6 +75,7 @@ from syndica.kernel.modules import FlagDeclaration, RuntimeModule, SafetyModule
 from syndica.kernel.plugins import Plugin
 from syndica.kernel.prefix_drift import PrefixDriftModule, PrefixDriftRecord, PrefixDriftService
 from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback
+from syndica.kernel.redaction import Finding, RedactionRule, RuleRedactor
 from syndica.kernel.retry import RetryModule
 from syndica.kernel.runtime import AgentFactory, Runtime
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
@@ -134,6 +135,7 @@ __all__ = [
     'EventBus',
     'ExecResult',
     'ExitMode',
+    'Finding',
     'FlagDeclaration',
     'HookCallback',
     'HookResult',
@@ -162,10 +164,12 @@ __all__ = [
     'PrefixDriftModule',
     'PrefixDriftRecord',
     'PrefixDriftService',
+    'RedactionRule',
     'Reply',
     'RetryModule',
     'RiskLevel',
     'Role',
+    'RuleRedactor',
     'Runtime',
     'RuntimeModule',
     'SafetyModule',

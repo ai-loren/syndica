@@ -32,8 +32,9 @@ from syndica.cli.handoff import (
     write_handoff,
 )
 from syndica.cli.host_git import Change
-from syndica.cli.redaction import Redactor
+from syndica.cli.redaction import host_redactor
 from syndica.cli.terminal import one_line
+from syndica.kernel.redaction import Redactor
 
 _SECRET = 'Zq9' + 'Lm4Xw7Pk2Rt8Vb5Nc3Jd6'
 
@@ -425,7 +426,7 @@ def test_the_lock_survives_the_agent_deleting_the_syndica_directory(tmp_path: Pa
 
 
 def _redactor() -> Redactor:
-    return Redactor({'SERVICE_TOKEN': _SECRET})
+    return host_redactor({'SERVICE_TOKEN': _SECRET})
 
 
 def test_the_handoff_is_written_redacted_with_mode_0600(tmp_path: Path):

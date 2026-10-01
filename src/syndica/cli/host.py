@@ -59,7 +59,7 @@ from syndica.cli.handoff import (
 from syndica.cli.host_git import Change, GitUnavailable, HostGit
 from syndica.cli.main import EXIT_INTERRUPTED, CliIO, CliOutcome, InspectRequest, RunRequest
 from syndica.cli.policy import dev_danger_options
-from syndica.cli.redaction import Redactor
+from syndica.cli.redaction import host_redactor
 from syndica.cli.terminal import one_line, terminal_safe
 from syndica.kernel import (
     LLM,
@@ -96,6 +96,7 @@ from syndica.kernel import (
     local_tools,
     register_builtins,
 )
+from syndica.kernel.redaction import Redactor
 from syndica.kernel.tools import Delegate, Fork, KillAgent, QueryAgent, SendMessage
 
 __all__ = ['RuntimeCliHost']
@@ -1442,7 +1443,8 @@ class RuntimeCliHost:
                     '（`run --handoff` 会因此判复核失败）。下一步：让这些命令只读地跑，或把它们'
                     '生成的文件加进 .gitignore'
                 )
-        return CliOutcome(Redactor(self._environ).redact('\n'.join(lines)), 1 if failed else 0)
+        redactor = host_redactor(self._environ, config.redaction_rules)
+        return CliOutcome(redactor.redact('\n'.join(lines)), 1 if failed else 0)
 
     async def _describe(self, portal: Portal, where: str) -> str:
         """找到了的程序怎么写进那一行：内建命令不跑；解析到工作区里的不跑（那是项目自己的代码，只有
@@ -1772,7 +1774,7 @@ class RuntimeCliHost:
         `verify`、`protected`、`pass_env` 都取开始时加载的配置：Agent 中途改 `.syndica.yaml`
         不影响。"""
         config = self._config(request.config)
-        redactor = Redactor(self._environ)
+        redactor = host_redactor(self._environ, config.redaction_rules)
         try:
             lock = lock_workspace(self._workspace_root)
         except HandoffLocked as exc:

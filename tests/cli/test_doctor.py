@@ -129,6 +129,21 @@ def test_paths_in_the_config_and_workspace_lines_are_escaped(tmp_path: Path):
     assert 'ws\\x1b[31mRED' in _line(outcome, 'config:')
 
 
+def test_the_user_redaction_rules_apply_to_the_doctor_output(tmp_path: Path):
+    root = _workspace(tmp_path, git=False, name='ws-corp-db7.internal')
+    config = root / 'syndica.yaml'
+    config.write_text(
+        'version: 1\nredaction:\n  rules:\n'
+        "    - {id: custom.host, pattern: 'corp-[a-z0-9]+\\.internal'}\n",
+        encoding='utf-8',
+    )
+
+    outcome = _doctor(tmp_path, root, config)
+
+    assert 'corp-db7.internal' not in outcome.output
+    assert 'ws-[REDACTED:custom.host]' in _line(outcome, 'workspace:')
+
+
 def test_the_env_line_has_names_only(tmp_path: Path):
     root = _workspace(tmp_path)
 

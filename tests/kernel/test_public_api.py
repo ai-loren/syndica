@@ -58,6 +58,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'EventBus',
     'ExecResult',
     'ExitMode',
+    'Finding',
     'FlagDeclaration',
     'HookCallback',
     'HookResult',
@@ -86,10 +87,12 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'PrefixDriftModule',
     'PrefixDriftRecord',
     'PrefixDriftService',
+    'RedactionRule',
     'Reply',
     'RetryModule',
     'RiskLevel',
     'Role',
+    'RuleRedactor',
     'Runtime',
     'RuntimeModule',
     'SafetyModule',
@@ -249,6 +252,12 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # - 八个工具类不进承诺面，宿主用 `local_tools` 按键取。
 # - `RuleTablePolicy`：M2 开发期宿主用的按表处置；进不进承诺面在 M12 冻结公开 API 时定。
 # - 三个规则工厂（`git_state_change_rule` 等）：M2 开发期宿主组合的可选规则，同上待 M12 定。
+# - `RedactedText` / `encode_redacted`：还没有公开入口收它们（trace 的写入面是第一个，到那时再判）。
+# - `Redactor`：还没有公开入口收一个脱敏器，宿主直接用 `RuleRedactor`。第一个收它的入口（trace 的
+#   写入面）还要规则集的摘要，协议的形状到那时连同这个成员一起定。
+# - `RULE_IDS` / `RULES_VERSION`：宿主不需要它们就能构造与使用脱敏器；两者都算进了
+#   `RuleRedactor.digest`，判断两套规则是不是同一套比摘要即可。
+# - `looks_secret`：宿主从自己的环境里挑密钥值时用；内核的公开入口只收挑好的值。
 _WITHHELD: tuple[str, ...] = (
     'Bash',
     'BashOutput',
@@ -267,8 +276,12 @@ _WITHHELD: tuple[str, ...] = (
     'NullTurnGate',
     'OBSERVABLE',
     'QueryAgent',
+    'RULES_VERSION',
+    'RULE_IDS',
     'Read',
     'ReadOnlyKwarg',
+    'RedactedText',
+    'Redactor',
     'RuleTablePolicy',
     'SendMessage',
     'ToolExecutor',
@@ -277,8 +290,10 @@ _WITHHELD: tuple[str, ...] = (
     'Write',
     'correlation_of',
     'disposition_of',
+    'encode_redacted',
     'git_state_change_rule',
     'install_plugins',
+    'looks_secret',
     'parse_mapping',
     'path_outside_workspace_rule',
     'register_tool',

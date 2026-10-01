@@ -42,8 +42,7 @@ from syndica.cli.git_finish import (
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.host_git import Change, HostGit
 from syndica.cli.main import CliIO, main
-from syndica.cli.redaction import Redactor
-from syndica.kernel import ContextBlock, ScriptedLLM, ScriptedTurn, ToolCall
+from syndica.kernel import ContextBlock, RuleRedactor, ScriptedLLM, ScriptedTurn, ToolCall
 
 _SECRET = 'Zq9' + 'Lm4Xw7Pk2Rt8Vb5Nc3Jd6'
 _MESSAGE = 'add new\n\n宿主复核：\n- 通过：true —— passed\n'
@@ -811,7 +810,7 @@ def test_an_interrupted_hooked_commit_stops_its_whole_process_group(
         git_finish._hooked(  # pyright: ignore[reportPrivateUsage]
             HostGit(root, _env(tmp_path)),
             _env(tmp_path),
-            Redactor({}),
+            RuleRedactor(),
             ['commit', '-q', '-F', '-'],
             message='m',
         )
@@ -977,7 +976,7 @@ def _hooked_commit(tmp_path: Path, root: Path) -> Any:
     return git_finish._hooked(  # pyright: ignore[reportPrivateUsage]
         HostGit(root, _env(tmp_path)),
         _env(tmp_path),
-        Redactor({}),
+        RuleRedactor(),
         ['commit', '-q', '-F', '-'],
         message='m',
     )
@@ -1075,7 +1074,7 @@ def test_ctrl_c_during_the_commit_unstages_the_new_files_it_staged(
             message='m\n',
             push=False,
             before=before,
-            redactor=Redactor({}),
+            redactor=RuleRedactor(),
             hook_env=_env(tmp_path),
         )
 
@@ -1117,7 +1116,7 @@ def test_ctrl_c_when_head_cannot_be_read_leaves_the_index_alone(
             message='m\n',
             push=False,
             before=before,
-            redactor=Redactor({}),
+            redactor=RuleRedactor(),
             hook_env=_env(tmp_path),
         )
 
@@ -1155,7 +1154,7 @@ def test_ctrl_c_after_the_commit_was_made_leaves_the_index_alone_and_says_so(
             message='m\n',
             push=push,
             before=before,
-            redactor=Redactor({}),
+            redactor=RuleRedactor(),
             hook_env=_env(tmp_path),
         )
 
@@ -1191,7 +1190,7 @@ def test_ctrl_c_that_leaves_an_index_lock_behind_says_so(
             message='m\n',
             push=False,
             before=before,
-            redactor=Redactor({}),
+            redactor=RuleRedactor(),
             hook_env=_env(tmp_path),
         )
 

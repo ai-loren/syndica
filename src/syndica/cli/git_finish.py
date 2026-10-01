@@ -22,8 +22,8 @@ from typing import TextIO
 
 from syndica.cli.handoff import quoted
 from syndica.cli.host_git import LOCAL_TIMEOUT, Change, GitUnavailable, HostGit, host_environment
-from syndica.cli.redaction import Redactor
 from syndica.cli.terminal import one_line
+from syndica.kernel.redaction import Redactor
 
 __all__ = [
     'PUSH_TIMEOUT',

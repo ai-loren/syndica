@@ -1,0 +1,19 @@
+# 名字像密钥、值却在说别的东西的写法。脱敏器在这里一处都不该换：任何一处被换，说明「值像凭证」的
+# 判断放宽了，正文与提交消息里的这类写法会被成片地换成占位符。
+key: npm-cache-v2-linux-x64-node20
+cache_key = "pip-cache-v3-ubuntu-py311"
+SSH_KEY=id_ed25519_github.pub
+KEY_FILE=service-account-prod-2024.json
+KEY_PATH=config/keys/service-account-prod2.json
+secret_key = settings.SECRET_KEY_FROM_ENV_2
+api_key = os.environ.API_KEY_NAME_2
+integrity_key: sha384-oqVuAfXRKap7fdgcCY5uykM6R9GqQ8Kuxy9rx7HNQlGYl1kPzQho1wx4JwY8wC
+SECRET_NAME=projects/my-project/secrets/db-password/versions/3
+TOKEN_VERSION=1.2.3-alpha.4567890
+API_KEY=your-api-key-goes-here-12345
+"auth_token": "dummy-auth-token-0123456789"
+password: changeme123456789abc
+api_token: placeholder-token-value-1234
+SESSION_TTL_SECONDS=86400
+PASSWORD_MIN_LENGTH=12
+token_url: https://example.com/oauth/token/v2

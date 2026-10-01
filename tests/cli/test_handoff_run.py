@@ -181,6 +181,23 @@ def test_a_root_failing_on_a_syndica_error_is_one_whole_section_in_the_handoff(t
         assert '\x1b' not in stream
 
 
+def test_the_user_redaction_rules_apply_to_the_handoff_and_its_printout(tmp_path: Path):
+    root = _workspace(tmp_path)
+    config = _config(tmp_path, verify=['true'])
+    with config.open('a', encoding='utf-8') as file:
+        file.write(
+            "redaction:\n  rules:\n    - {id: custom.host, pattern: 'corp-[a-z0-9]+\\.internal'}\n"
+        )
+    answer = 'done, deployed to corp-db7.internal\ncommit_title: add new'
+
+    run = _run(tmp_path, _reviewed(answer=answer), config=config, root=root)
+
+    (path,) = run.files
+    document = path.read_text(encoding='utf-8')
+    assert 'corp-db7.internal' not in document + run.stdout + run.stderr
+    assert 'deployed to [REDACTED:custom.host]' in document
+
+
 def test_a_topology_run_hands_off_like_a_single_agent_run(tmp_path: Path):
     root = _workspace(tmp_path)
     config = _config(tmp_path, verify=['true'])

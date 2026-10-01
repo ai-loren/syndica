@@ -294,6 +294,25 @@ workspace:
   pass_env: [NO_COLOR]         # extra variables agents may see, beyond the fixed allowlist
 ```
 
+In `run --handoff` the host redacts what it writes and prints: both output streams, the handoff
+file, and the commit message; `doctor` output is redacted too. Plain `run` and `chat` print what the
+agents print. Values of environment variables whose names look secret, private keys,
+`Authorization` credentials, passwords in URLs, well-known token formats, and credential-like values
+assigned to secret-looking names (`STRIPE_KEY=…`) become `[REDACTED:<rule>]`. A project can add
+patterns of its own; their ids start with `custom.`, and a pattern that matches the empty string or
+a placeholder is refused:
+
+```yaml
+redaction:
+  rules:
+    - {id: custom.internal_host, pattern: 'corp-[a-z0-9]+\.internal'}
+```
+
+Custom patterns only redact. The check that refuses to commit a secret looks for long environment
+values, well-known token formats and private keys, never for custom patterns: one misfiring
+pattern would block every commit. Patterns run inside the host process like the rest of
+`.syndica.yaml`, so one with catastrophic backtracking hangs it.
+
 **What every CLI run enforces.**
 
 - Agents' commands see only `PATH HOME USER LOGNAME LANG LC_ALL LC_CTYPE TMPDIR XDG_CACHE_HOME

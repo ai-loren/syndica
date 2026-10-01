@@ -456,3 +456,89 @@ def test_a_yaml_boolean_in_a_list_of_strings_is_refused_with_a_quoting_hint(
 
     assert 'bool' in caught.value.received
     assert '引号' in caught.value.next_action
+
+
+# --- redaction 段 ------------------------------------------------------------------------------
+
+
+def _redaction_config(tmp_path: Path, body: str) -> CliConfig:
+    return load_config(_write(tmp_path / 'syndica.yaml', f'version: 1\nredaction:\n{body}'))
+
+
+def test_user_redaction_rules_are_read_in_the_order_written(tmp_path: Path) -> None:
+    config = _redaction_config(
+        tmp_path,
+        '  rules:\n'
+        "    - {id: custom.internal_host, pattern: 'corp-[a-z0-9]+\\.internal'}\n"
+        "    - {id: custom.ticket, pattern: 'TICKET-[0-9]{4,}'}\n",
+    )
+
+    assert [(rule.rule_id, rule.pattern) for rule in config.redaction_rules] == [
+        ('custom.internal_host', r'corp-[a-z0-9]+\.internal'),
+        ('custom.ticket', 'TICKET-[0-9]{4,}'),
+    ]
+
+
+def test_a_config_without_a_redaction_section_has_no_user_rules(tmp_path: Path) -> None:
+    assert load_config(_write(tmp_path / 'syndica.yaml', 'version: 1\n')).redaction_rules == ()
+
+
+@pytest.mark.parametrize(
+    ('body', 'expected', 'where'),
+    [
+        ('  rules: [{id: internal, pattern: corp}]\n', '以 custom. 开头', 'redaction.rules[0]'),
+        (
+            "  rules: [{id: custom.x, pattern: 'corp-('}]\n",
+            '合法的 Python 正则',
+            'redaction.rules[0]',
+        ),
+        ("  rules: [{id: custom.x, pattern: '[a-z]*'}]\n", '不能匹配空串', 'redaction.rules[0]'),
+        (
+            '  rules: [{id: secret.github_token, pattern: x}]\n',
+            '内置规则重名',
+            'redaction.rules[0]',
+        ),
+        ('  rules: [{id: custom.x, pattern: REDACTED}]\n', '不匹配任何占位符', 'redaction.rules'),
+        (
+            '  rules: [{id: custom.x, pattern: a}, {id: custom.x, pattern: b}]\n',
+            '互不重复',
+            'redaction.rules',
+        ),
+        ('  rules: [{id: custom.x}]\n', '恰好含 id 与 pattern', 'redaction.rules[0]'),
+        ('  rules: [{id: custom.x, pattern: a, flags: i}]\n', '恰好含 id 与 pattern', 'rules[0]'),
+        ('  rules: [custom.x]\n', '恰好含 id 与 pattern', 'redaction.rules[0]'),
+        ('  rules: {id: custom.x}\n', 'YAML 列表', 'redaction.rules'),
+        ('  rule: []\n', "只含 ['rules']", 'rule'),
+        ('  rules: [{id: 7, pattern: a}]\n', '是字符串', 'redaction.rules[0]'),
+    ],
+    ids=[
+        'prefix',
+        'bad-regex',
+        'empty-match',
+        'built-in-name',
+        'matches-a-placeholder',
+        'duplicate-id',
+        'missing-pattern',
+        'extra-key',
+        'not-a-mapping',
+        'rules-not-a-list',
+        'unknown-key',
+        'id-not-a-string',
+    ],
+)
+def test_a_malformed_redaction_rule_is_refused_with_where_and_why(
+    tmp_path: Path, body: str, expected: str, where: str
+) -> None:
+    with pytest.raises(ConfigError) as caught:
+        _redaction_config(tmp_path, body)
+
+    assert expected in caught.value.expected
+    assert where in caught.value.received
+    assert caught.value.next_action
+
+
+def test_a_redaction_section_that_is_not_a_mapping_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError) as caught:
+        load_config(_write(tmp_path / 'syndica.yaml', 'version: 1\nredaction: [custom.x]\n'))
+
+    assert '只含 rules 的 Mapping' in caught.value.expected

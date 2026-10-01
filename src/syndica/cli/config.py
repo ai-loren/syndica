@@ -16,21 +16,26 @@ import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
-from syndica.cli.environment import HOST_SET_ENV, looks_secret, reopens_git, valid_env_name
+from syndica.cli.environment import HOST_SET_ENV, reopens_git, valid_env_name
 from syndica.kernel import (
     AgentCatalog,
     AgentSlot,
     ConfigError,
     ExitMode,
     ManifestSource,
+    RedactionRule,
+    RuleRedactor,
     Topology,
     register_builtins,
 )
+from syndica.kernel.redaction import looks_secret
 
 __all__ = ['CliConfig', 'WorkspaceConfig', 'load_config']
 
-_ROOT_KEYS = frozenset({'version', 'agents', 'topologies', 'workspace'})
+_ROOT_KEYS = frozenset({'version', 'agents', 'topologies', 'workspace', 'redaction'})
 _WORKSPACE_KEYS = frozenset({'pass_env', 'verify', 'protected'})
+_REDACTION_KEYS = frozenset({'rules'})
+_RULE_KEYS = frozenset({'id', 'pattern'})
 _TOPOLOGY_KEYS = frozenset({'slots'})
 _SLOT_KEYS = frozenset(
     {
@@ -114,12 +119,16 @@ class WorkspaceConfig:
 
 @dataclass(frozen=True)
 class CliConfig:
-    """A validated CLI configuration snapshot."""
+    """A validated CLI configuration snapshot.
+
+    `redaction_rules` 是 `redaction.rules` 里用户追加的脱敏规则，按声明顺序排在内置规则之后。
+    """
 
     source: str
     catalog: AgentCatalog
     topologies: Mapping[str, Topology]
     workspace: WorkspaceConfig = WorkspaceConfig()
+    redaction_rules: tuple[RedactionRule, ...] = ()
 
 
 def load_config(path: str | Path) -> CliConfig:
@@ -153,7 +162,46 @@ def load_config(path: str | Path) -> CliConfig:
         catalog=catalog,
         topologies=MappingProxyType(topologies),
         workspace=_workspace(root.get('workspace', {})),
+        redaction_rules=_redaction(root.get('redaction', {})),
     )
+
+
+def _redaction(value: object) -> tuple[RedactionRule, ...]:
+    if not isinstance(value, Mapping):
+        raise _config(
+            'redaction 是只含 rules 的 Mapping',
+            f'收到 redaction={value!r}，类型是 {type(value).__name__}',
+            '写成 `redaction: {rules: [{id: custom.internal_host, pattern: ...}]}`；'
+            '不需要就省略整段',
+        )
+    raw = cast(Mapping[object, object], value)
+    unknown = [str(key) for key in raw if not isinstance(key, str) or key not in _REDACTION_KEYS]
+    if unknown:
+        raise _config(
+            f'redaction 只含 {sorted(_REDACTION_KEYS)!r}',
+            f'未知键 {sorted(unknown)!r}',
+            '删除这些键；未识别的配置不能静默忽略，否则用户会以为它已经生效',
+        )
+    rules: list[RedactionRule] = []
+    for index, item in enumerate(_sequence(raw.get('rules', ()), 'redaction.rules')):
+        field = f'redaction.rules[{index}]'
+        entry = cast(Mapping[object, object], item) if isinstance(item, Mapping) else None
+        exact = entry is not None and len(entry) == len(_RULE_KEYS)
+        if entry is None or not exact or any(key not in entry for key in _RULE_KEYS):
+            raise _config(
+                '每条脱敏规则是恰好含 id 与 pattern 两个键的 Mapping',
+                f'{field} 是 {item!r}',
+                '写成 `{id: custom.internal_host, pattern: corp-[a-z0-9]+\\.internal}`',
+            )
+        try:
+            rules.append(RedactionRule(cast(str, entry['id']), cast(str, entry['pattern'])))
+        except ConfigError as exc:
+            raise _config(exc.expected, f'{field}：{exc.received}', exc.next_action) from exc
+    try:
+        RuleRedactor(rules=rules)
+    except ConfigError as exc:
+        raise _config(exc.expected, f'redaction.rules：{exc.received}', exc.next_action) from exc
+    return tuple(rules)
 
 
 def _workspace(value: object) -> WorkspaceConfig:
@@ -276,7 +324,7 @@ def _root_mapping(value: object, file: Path) -> Mapping[str, object]:
         raise _config(
             '配置根是 Mapping，至少含 version: 1',
             f'{str(file)!r} 的根是 {type(value).__name__}：{value!r}',
-            '把文件改成 version / agents / topologies / workspace 组成的单个 YAML 对象',
+            '把文件改成 version / agents / topologies / workspace / redaction 组成的单个 YAML 对象',
         )
     root = cast(Mapping[object, object], value)
     non_strings = [key for key in root if not isinstance(key, str)]
@@ -284,7 +332,7 @@ def _root_mapping(value: object, file: Path) -> Mapping[str, object]:
         raise _config(
             '配置根的键都是字符串',
             f'非字符串键为 {non_strings!r}',
-            '把这些键改成 version / agents / topologies / workspace 中的字符串',
+            '把这些键改成 version / agents / topologies / workspace / redaction 中的字符串',
         )
     unknown = [str(key) for key in root if key not in _ROOT_KEYS]
     if unknown:

@@ -180,8 +180,11 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
   按长度、字符集与熵收紧，并以「在 `src/` 与测试固定装置里零命中」为误报门槛——过不了就推迟这条规则并登记，不放宽
   门槛。它**不进 `scan`**：`scan` 是 git 收尾的提交闸，一处误报就让 Agent 的每次提交都被拦。映射里的键值对
   （`{"STRIPE_KEY": "sk_live_…"}`）由 `encode_redacted` 按映射判，逐叶脱敏看不见键与值的关系。
-- **占位符对所有后续规则不透明**：`redact` 先按已有的占位符切段，只在段内匹配，所以 `redact(redact(x)) == redact(x)`
-  对所有规则成立；修掉 M2 `url_userinfo` 吃占位符的问题。用户规则 `RedactionRule(rule_id, pattern)` 的 ID 必须以
+- **占位符对所有后续规则不透明**：每条规则在同一份视图上找出要换的区间，相互重叠的并成一段、换成其中最长那条规则
+  的占位符（一样长时上下文规则盖住嵌在里面的逐字值，逐字值盖住格式规则）；已经找到的区间与输入里原有的占位符在
+  视图里涂成不透明的空白再找一轮，直到找不出新的东西。所以 `redact(redact(x)) == redact(x)`，占位符不会被任何规则
+  再次命中，上下文规则（`Authorization`、URL、赋值）也总看到完整的凭证。（T3 实现时从「按占位符切段、规则依次在
+  段内匹配」改成这样：依次段内匹配会让嵌着一个已知密钥值的凭证只换掉一半，见决策日志。）用户规则 `RedactionRule(rule_id, pattern)` 的 ID 必须以
   `custom.` 开头且不与内置重名，加载时拒绝能匹配空串或能匹配任一占位符的模式。
 - 内核不读环境变量：CLI 保留「从宿主环境里取密钥值」那一段（遍历环境、像不像凭证、是不是存在的路径），交给
   `RuleRedactor(secrets=...)`。CLI 里与协议重名的类删除。
@@ -446,7 +449,7 @@ redaction:
   `TraceLevel`、`TraceHeader`、`PayloadRef`；`syndica.kernel.protocols.trace.TraceStore`；`MemoryTraceStore`、
   `FileTraceStore`；契约套件 `TraceStoreContract`；回放文档的 schema 模块。
 - `syndica.kernel.redaction`：`Redactor`、`RuleRedactor`、`RedactionRule`、`RedactedText`、`encode_redacted`、
-  `Finding`、`RULE_IDS`、`looks_secret`。
+  `Finding`、`RULE_IDS`、`RULES_VERSION`、`looks_secret`。
 - 哪些进 `kernel.__all__`、哪些进 `_WITHHELD`，在各自任务里按「宿主不用它就做不成某件事」判定并写进
   `tests/kernel/test_public_api.py`。
 
@@ -495,7 +498,7 @@ wrapper 启动的程序，`nice strace rm -rf /` 这类 runner 后面的命令�
 - Ctrl-C：run 期间、复核期间、git 收尾期间各一条用例（D15 末条的三种情形），退出 130 且优先于 1 与 3；stderr 没有
   traceback；临时目录与子进程照样收拾。
 
-**状态：完成。** 摘要的行数在路径前面固定的一栏（`line_counts`）：跟踪的文件按 `git diff --numstat -M --relative HEAD`，
+**状态：完成（17651f3）。** 摘要的行数在路径前面固定的一栏（`line_counts`）：跟踪的文件按 `git diff --numstat -M --relative HEAD`，
 新文件由宿主数（只读到打开时的大小、开头 8000 字节里有 NUL 就停、超过 512 MiB 不数、不跟符号链接、打开之后再认一次
 类型），git 没认出的改名新旧两半合成一条。Ctrl-C：`run --handoff` 期间由宿主的 `_CtrlC` 按阶段处理（干活时取消干活的
 子任务；收尾时只记下；git 收尾时第一次按键当场停下 git，之后的按键不打断收拾；结论定了之后什么都不改；结论定下之前
@@ -540,6 +543,41 @@ Ctrl-C 也停不下来；强制退出按累计次数算，已经起过作用的�
   `{"STRIPE_KEY": "sk_live_…"}` 经 `encode_redacted` 后值被替换。
 - 变异：漏掉一条内置规则；用户规则排在内置之前；去掉占位符切段（幂等破坏）；`encode_redacted` 改成先编码后脱敏；
   `named_assignment` 的值判定放宽到任意值（误报）或收紧到只认固定格式（漏报）。
+
+**状态：完成。** 按修订后的 D4 落地：每条规则在同一份视图上找区间，相互重叠的区间并成一段、换成其中最长那一条的
+占位符（一样长时内置在前，用户规则按声明顺序）；已找到的区间与输入里原有的占位符在视图里涂成不透明的空白再找，
+至多 4 轮到不动点——第二次 `redact` 看到的就是第一次最后看到的视图，所以幂等、占位符不被再次命中。私钥块在把空白
+看成空格、把 JSON 的 `\n` 看成换行的视图上找；紧贴在一个格式命中后面的格式在同一轮里认完。`encode_redacted` 逐叶
+脱敏后编码：名字像密钥的键下面（任意层）仍像凭证的字符串叶子换成 `secret.named_assignment`，`Authorization` 键按
+头脱敏，`name`/`value` 环境变量表按名字判，两项的字符串列表按一对键值读，撞键按原键排序加 `#n`；输出是一行、总能
+编码成 UTF-8（U+2028、U+2029、U+0085、DEL 与 C1 控制字符、落单的代理项都转义）。`secret.named_assignment` 认
+`=`、`:`、`:=`、`=>`、`--flag=`、`os.environ[...]`、Kubernetes 环境变量表，值判定排除路径、文件名、版本号、属性
+路径、短词串、资源路径、摘要与示例词，熵门槛 3.5（够长的十六进制 3.0）；在 `src/`、测试固定装置、`tests/scenarios`、
+`tests/kernel/data` 与一份近似样例文件上零命中；不进 `scan`。用户规则经 `.syndica.yaml` 的 `redaction.rules` 进来，
+只脱敏、不拦提交。公开面：`Finding`、`RedactionRule`、`RuleRedactor` 进承诺面；`Redactor` 协议、`encode_redacted`、
+`RedactedText`、`RULE_IDS`、`RULES_VERSION`、`looks_secret` 扣留到第一个收它们的公开入口（trace 的写入面）。
+`RULES_VERSION=1` 由一份自成一体的黄金语料钉住（含编码器的输出；样例取自 sha256 而不是 `random`，后者的序列不保证
+跨 Python 版本不变），`RuleRedactor.digest` 的算法另有一条逐字用例。
+
+对照 M2（212 条样例）：11 条不同。3 条是 M2 的泄露，现在关掉了（JSON 字符串里截断的私钥；第一行恰好是密钥值的截断
+PEM 与 PuTTY 块）；8 条是 URL 里已知密钥值的占位符名字不同（M2 的 URL 规则吞掉占位符里的冒号；现在那个值留着
+`secret.env_value` 的名字），密钥照样全部藏住。M2 不幂等的 6 条，新输出等于 M2 第一遍的输出。
+
+验证：对抗评审两路。泄露猎手看的是第一版（逐条规则、按占位符切段）：2 High（段内匹配让上下文规则只看到半截凭证——
+宿主环境里有一个 JWT 时，`Authorization: Bearer` 后面另一个同头部的 JWT 漏出 payload 与签名；`encode_redacted` 漏掉
+请求头映射里的 Bearer）、5 Medium（粘连的格式令牌与带锚点的用户规则不幂等；零误报门槛几乎没考到值判定；
+`named_assignment` 漏报；私钥匹配平方时间，M2 就有）与一批 Low。根子在切段的设计本身，于是整体重写成上面的结构。
+契约与设计评审看的也是重写之前的版本：2 High（同一条泄露；`secrets=` 收下字符串、映射与 None 不报错）、7 Medium
+与一批 Low；重写之后仍成立的逐条修掉：`secrets=` 的整体校验；`Redactor` 扣留；黄金语料自成一份、按 sha256 取样、
+含编码器输出；密钥键下嵌套的映射与列表；编码输出单行且总能编码成 UTF-8；`redact` / `scan` / `encode_redacted` 的
+入口类型；用户规则报错里的占位符按规则顺序取；README 不再说「全部输出都脱敏」，并写明用户规则只脱敏不拦提交、病态
+正则会卡住宿主；误报门槛扩到 `tests/scenarios` 与 `tests/kernel/data`；CLI 的相对路径用例。变异：重写版 79 条
+（74 条直接杀、3 条补用例后杀、2 条指向多余代码、已删）；评审修复之后为新代码写的 21 条全杀。粘连模糊测试：幂等语料
+两两粘连（无分隔、空格、换行）共 286,443 条，不幂等 0；有分隔时格式令牌泄露 0，泄露都在 key 紧贴字母数字的位置（见
+风险一节）。零存活只对这些变异集成立。
+
+意外发现：D4 原文「按占位符切段、各段内匹配」本身就会泄露——占位符对后面的规则不透明，而上下文规则要看到完整的
+凭证；两者只能靠「先找全、合并、到不动点为止」同时满足（决策日志 2026-10-02）。
 
 #### T4 — 守卫扩到全仓；`RedactedText` 类型闸；宿主私有目录
 
@@ -761,6 +799,14 @@ Ctrl-C 也停不下来；强制退出按累计次数算，已经起过作用的�
   Agent（chat 在 M3 只记 `structure`，回放随 M6 做）。Low：记录时建 `.syndica/.gitignore`；`trace export` 失败退出 1；
   T14 分两次 run；指纹按单元缓存；「`extra` 不发给提供方」这条理由是错的（OpenAI 兼容客户端会回传 `extra_content`）；
   宿主档案从 T12 起写。
+- 2026-10-02 T3 对抗评审推翻了 D4 的字面做法：「按占位符切段、规则依次在段内匹配」让上下文规则看不到被前一条规则换掉
+  的那一段——宿主环境里有一个 JWT 时，`Authorization: Bearer` 后面另一个同头部的 JWT 只换掉共用的片段，payload 与
+  签名原样留下，M2 反而不漏。改为「每条规则在同一份视图上找全、重叠的区间合并、到不动点为止」，D4 的承诺（幂等、占位符
+  不被再次命中）由不动点保证，D4 已按此改写。
+- 2026-10-02 T3 的契约评审之后：`Redactor` 协议不进承诺面（还没有公开入口收它，trace 的写入面还要规则集摘要，协议的
+  形状到那时连同这个成员一起定）；`RULES_VERSION` 也覆盖 `encode_redacted` 的行为（指纹按脱敏之后的编码算）；
+  `RedactedText` 保证是一行、总能编码成 UTF-8，T11 的 JSONL 因此可以按行切而不必另做转义；用户规则的病态正则按
+  「`.syndica.yaml` 是你运行的代码」处理，不在加载时猜回溯（嵌套量词的启发式会拒掉 `(?:[a-z]+\.)+corp` 这类常见写法）。
 
 ## 风险与遗留（开工前登记）
 
@@ -770,6 +816,12 @@ Ctrl-C 也停不下来；强制退出按累计次数算，已经起过作用的�
   「整段脱敏」不同，表现为一次误报的分叉；`--allow-divergence` 与报告里的单元定位让它可以被认出来。
 - **体量。** 「可回放」级别逐字存工具结果（`Read` 一次最多 2000 行）；按内容寻址去重之后，T18 记下真实 run 的大小。
 - **第三方并发工具的写法被冻结拦下**（T10）：有意的契约收紧，写进 hook 契约与发布说明。
+- **用户脱敏规则里的病态正则会卡住宿主**（T3）：`re` 的匹配不响应 Ctrl-C，一条灾难性回溯的 `redaction.rules` 能让
+  `run --handoff` 停在脱敏上，只能 `kill`。与 `workspace.verify` 一样按「`.syndica.yaml` 是你运行的代码」处理，README
+  写明；要挡得换带超时的正则引擎（第三方依赖，内核不收）或把用户规则放进子进程。
+- **紧贴在字母数字后面的格式 key 认不出**（T3）：格式规则刻意不从一个词的中间起头（否则 `task-…`、`risk-…` 这类长词
+  会被当成 `sk-` key），所以 `xsk-proj-…`、`fooAKIA…` 这种粘连只靠逐字值与片段兜住（宿主环境里有这个 key 时）。M2 的
+  `\b` 同样如此。
 - **宿主私有目录只挡文件工具**（D17）：Bash 照样读写得到，Bash 写下的文件经 `Read` 读回也照样成了可信内容；真正的
   边界是 M5 的沙箱。
 - **chat 里过期的提问会吞掉下一行**（T2 评审发现，M2 就有）：chat 的提示符在 `main` 里直接读 stdin，不经宿主的
