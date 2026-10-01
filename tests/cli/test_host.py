@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from syndica.cli.host import RuntimeCliHost
-from syndica.cli.main import CliIO, InspectRequest, RunRequest
+from syndica.cli.main import CliIO, InspectRequest, RunRequest, main
 from syndica.kernel import (
     ConfigError,
     Context,
@@ -21,8 +24,10 @@ from syndica.kernel import (
     ScriptedLLM,
     ScriptedTurn,
     StopReason,
+    SyndicaError,
     ToolCall,
 )
+from syndica.kernel.runtime import _DRIVING_AGENT  # pyright: ignore[reportPrivateUsage]
 
 
 def test_run_request_uses_the_real_runtime_with_an_injected_model(
@@ -506,6 +511,321 @@ def test_agent_error_does_not_print_runtime_traceback_to_cli(
     assert 'free-models-per-day' in excinfo.value.received
     assert 'Rate limit exceeded' in excinfo.value.received
     assert logger_output.getvalue() == ''
+
+
+def test_a_root_agent_failing_on_a_syndica_error_shows_that_error_once(tmp_path: Path) -> None:
+    error = LLMResponseError(
+        expected='模型服务返回一条 assistant 消息',
+        received='HTTP 429：免费额度用完了',
+        next_action='换一个模型，或等额度恢复后重试',
+    )
+    llm = ScriptedLLM([ScriptedTurn(raises=error)])
+    stderr = StringIO()
+    io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr)
+    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=tmp_path)
+    try:
+        code = main(['run', '--agent', 'Worker', 'fail'], host=host, io=io)
+    finally:
+        host.close()
+
+    text = stderr.getvalue()
+    assert code == 1
+    assert text.count('下一步') == 1
+    assert '下一步: 换一个模型，或等额度恢复后重试' in text
+    assert '实际: HTTP 429：免费额度用完了' in text
+    assert re.search(r'^Agent Worker（[^）]+）以错误结束：$', text, flags=re.MULTILINE)
+    assert 'Runtime 最近错误' not in text
+
+
+def test_after_a_subagent_failed_the_roots_own_error_is_the_one_shown(tmp_path: Path) -> None:
+    child_error = LLMResponseError(
+        expected='子 Agent 的模型返回一条消息',
+        received='子 Agent 的请求超时',
+        next_action='子 Agent 的下一步',
+    )
+    root_error = LLMResponseError(
+        expected='根 Agent 的模型返回一条消息',
+        received='根 Agent 的请求被限流',
+        next_action='根 Agent 的下一步',
+    )
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        id='d',
+                        name='Delegate',
+                        arguments=json.dumps({'agent': 'Worker', 'query': 'go'}),
+                    )
+                ]
+            ),
+            ScriptedTurn(raises=child_error),
+            ScriptedTurn(raises=root_error),
+        ]
+    )
+    stderr = StringIO()
+    io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr)
+    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=tmp_path)
+    try:
+        code = main(['run', 'fail twice'], host=host, io=io)
+    finally:
+        host.close()
+
+    text = stderr.getvalue()
+    final = text.split('以错误结束：', 1)[1]
+    assert code == 1
+    assert '下一步: 根 Agent 的下一步' in final
+    assert '子 Agent 的下一步' not in final
+    assert 'Runtime 错误 1/1' in text.split('以错误结束：', 1)[0]
+
+
+def test_a_chat_agent_failing_on_a_syndica_error_is_named_with_its_own_error(
+    tmp_path: Path,
+) -> None:
+    error = LLMResponseError(
+        expected='模型服务返回一条 assistant 消息',
+        received='HTTP 429：免费额度用完了',
+        next_action='换一个模型，或等额度恢复后重试',
+    )
+    llm = ScriptedLLM([ScriptedTurn(raises=error)])
+    stderr = StringIO()
+    host = RuntimeCliHost(
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
+        model_factory=lambda _: llm,
+        workspace_root=tmp_path,
+    )
+    try:
+        target = host.open_chat('.syndica.yaml')
+        with pytest.raises(ContractViolation) as excinfo:
+            host.run_request(RunRequest(prompt='hello', session=target))
+    finally:
+        host.close()
+
+    assert excinfo.value.next_action == '换一个模型，或等额度恢复后重试'
+    assert getattr(excinfo.value, 'headline', None) == f'Agent Orchestrator（{target}）以错误结束：'
+    assert '以错误结束' not in stderr.getvalue()
+
+
+class _PerAgentLLM(ScriptedLLM):
+    """按正在驱动的那个 Agent 分发（内核的 contextvar）：并发的几个 Agent 各走各的剧本。"""
+
+    def __init__(
+        self, behave: Callable[[str, int, list[ContextBlock]], Awaitable[ContextBlock]]
+    ) -> None:
+        super().__init__([])
+        self._behave = behave
+        self._counts: dict[str, int] = {}
+
+    async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        agent = _DRIVING_AGENT.get()
+        assert agent is not None
+        turn = self._counts.get(agent, 0)
+        self._counts[agent] = turn + 1
+        return await self._behave(agent, turn, messages)
+
+
+def _tool_turn(name: str, **arguments: object) -> ContextBlock:
+    call = ToolCall(id=f'{name}-call', name=name, arguments=json.dumps(arguments))
+    return ContextBlock(role='assistant', content='', tool_calls=[call])
+
+
+_ROOT_ERROR = LLMResponseError(
+    expected='根 Agent 的模型返回一条消息',
+    received='根 Agent 的请求被限流',
+    next_action='根 Agent 的下一步',
+)
+_CHILD_ERROR = LLMResponseError(
+    expected='子 Agent 的模型返回一条消息',
+    received='子 Agent 的请求超时',
+    next_action='子 Agent 的下一步',
+)
+
+
+def _cli_run(tmp_path: Path, llm: ScriptedLLM, argv: list[str]) -> tuple[int, str]:
+    stderr = StringIO()
+    io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr)
+    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=tmp_path)
+    try:
+        code = main(argv, host=host, io=io)
+    finally:
+        host.close()
+    return code, stderr.getvalue()
+
+
+def test_a_root_failure_followed_by_its_abandoned_input_note_is_still_its_own_error(
+    tmp_path: Path,
+) -> None:
+    ids: dict[str, str] = {}
+
+    async def behave(agent: str, turn: int, _: list[ContextBlock]) -> ContextBlock:
+        ids.setdefault('root', agent)
+        if agent == ids['root']:
+            if turn == 0:
+                return _tool_turn('Delegate', agent='Worker', query='go')
+            raise _ROOT_ERROR
+        if turn == 0:
+            return _tool_turn(
+                'SendMessage', agent_id=ids['root'], content='fyi', trigger='deferred'
+            )
+        return ContextBlock(role='assistant', content='child done')
+
+    code, text = _cli_run(tmp_path, _PerAgentLLM(behave), ['run', 'fail'])
+
+    earlier, final = text.split('以错误结束：', 1)
+    assert code == 1
+    assert [line for line in final.splitlines() if line.startswith('下一步')] == [
+        '下一步: 根 Agent 的下一步'
+    ]
+    assert 'Runtime 错误 1/1' in earlier
+
+
+def test_a_child_failing_right_after_the_root_does_not_take_the_roots_place(
+    tmp_path: Path,
+) -> None:
+    ids: dict[str, str] = {}
+    root_logged = asyncio.Event()
+
+    class _OnRootRecord(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.exc_info is not None and record.exc_info[1] is _ROOT_ERROR:
+                root_logged.set()
+
+    async def behave(agent: str, turn: int, _: list[ContextBlock]) -> ContextBlock:
+        ids.setdefault('root', agent)
+        if agent == ids['root']:
+            if turn == 0:
+                return _tool_turn('Delegate', agent='Worker', query='go')
+            if turn == 1:
+                return _tool_turn('SendMessage', agent_id=ids['child'], content='again')
+            raise _ROOT_ERROR
+        ids.setdefault('child', agent)
+        if turn == 0:
+            return ContextBlock(role='assistant', content='child done')
+        await root_logged.wait()
+        raise _CHILD_ERROR
+
+    handler = _OnRootRecord(logging.ERROR)
+    logger = logging.getLogger('syndica.kernel.runtime')
+    logger.addHandler(handler)
+    try:
+        code, text = _cli_run(tmp_path, _PerAgentLLM(behave), ['run', 'fail'])
+    finally:
+        logger.removeHandler(handler)
+
+    final = text.split('以错误结束：', 1)[1]
+    assert code == 1
+    assert f'Agent Orchestrator（{ids["root"]}）以错误结束：' in text
+    assert '下一步: 根 Agent 的下一步' in final
+    assert '子 Agent' not in final
+
+
+def test_a_root_crash_after_a_childs_syndica_error_stays_nested_with_the_roots_crash(
+    tmp_path: Path,
+) -> None:
+    ids: dict[str, str] = {}
+
+    async def behave(agent: str, turn: int, _: list[ContextBlock]) -> ContextBlock:
+        ids.setdefault('root', agent)
+        if agent == ids['root']:
+            if turn == 0:
+                return _tool_turn('Delegate', agent='Worker', query='go')
+            raise RuntimeError('root crashed')
+        raise _CHILD_ERROR
+
+    code, text = _cli_run(tmp_path, _PerAgentLLM(behave), ['run', 'fail'])
+
+    final = text.split('期望: CLI 请求对应的 Agent', 1)[1]
+    assert code == 1
+    assert '以错误结束：' not in text
+    assert 'root crashed' in final
+    assert '子 Agent 的下一步' not in final
+
+
+def test_the_whole_underlying_error_is_shown_including_a_multiline_received(
+    tmp_path: Path,
+) -> None:
+    error = LLMResponseError(
+        expected='端点返回一条 assistant 消息',
+        received='HTTP 429\n{"error":"free-models-per-day"}',
+        next_action='换一个模型',
+    )
+
+    code, text = _cli_run(
+        tmp_path, ScriptedLLM([ScriptedTurn(raises=error)]), ['run', '--agent', 'Worker', 'x']
+    )
+
+    assert code == 1
+    assert '期望: 端点返回一条 assistant 消息' in text
+    assert '{"error":"free-models-per-day"}' in text
+    assert 'completed / max_turns / aborted' not in text
+
+
+@pytest.mark.parametrize('kind', [SyndicaError, ConfigError, ContractViolation])
+def test_every_kind_of_syndica_error_is_shown_de_nested(
+    tmp_path: Path, kind: type[SyndicaError]
+) -> None:
+    error = kind(expected='某个前提', received='它不成立', next_action='修好前提再跑')
+
+    code, text = _cli_run(
+        tmp_path, ScriptedLLM([ScriptedTurn(raises=error)]), ['run', '--agent', 'Worker', 'x']
+    )
+
+    assert code == 1
+    assert text.count('下一步') == 1
+    assert '下一步: 修好前提再跑' in text
+
+
+def test_the_headline_escapes_an_agent_name_from_the_config(tmp_path: Path) -> None:
+    (tmp_path / 'p.md').write_text('You work.\n', encoding='utf-8')
+    config = tmp_path / 'evil.yaml'
+    config.write_text(
+        'version: 1\nagents:\n  - name: "Evil\\e]0;pwned\\a"\n    description: d\n'
+        '    system_prompt: p.md\n    tools: [Read]\n',
+        encoding='utf-8',
+    )
+    error = LLMResponseError(expected='e', received='r', next_action='n')
+
+    code, text = _cli_run(
+        tmp_path,
+        ScriptedLLM([ScriptedTurn(raises=error)]),
+        ['--config', str(config), 'run', '--agent', 'Evil\x1b]0;pwned\x07', 'x'],
+    )
+
+    assert code == 1
+    assert 'Agent Evil\\x1b]0;pwned\\x07（' in text
+    assert '\x1b' not in text and '\x07' not in text
+
+
+def test_a_chat_target_chosen_by_id_is_the_one_named(tmp_path: Path) -> None:
+    ids: dict[str, str] = {}
+    child_error = LLMResponseError(expected='子 期望', received='子 实际', next_action='子 收尾')
+
+    async def behave(agent: str, turn: int, _: list[ContextBlock]) -> ContextBlock:
+        ids.setdefault('root', agent)
+        if agent == ids['root']:
+            if turn == 0:
+                return _tool_turn('Delegate', agent='Worker', query='go')
+            return ContextBlock(role='assistant', content='root ok')
+        ids.setdefault('child', agent)
+        if turn == 0:
+            return ContextBlock(role='assistant', content='child ok')
+        raise child_error
+
+    llm = _PerAgentLLM(behave)
+    host = RuntimeCliHost(
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
+        model_factory=lambda _: llm,
+        workspace_root=tmp_path,
+    )
+    try:
+        target = host.open_chat('.syndica.yaml')
+        assert host.run_request(RunRequest(prompt='first', session=target)) == 'root ok'
+        with pytest.raises(ContractViolation) as excinfo:
+            host.run_request(RunRequest(prompt='again', session=ids['child']))
+    finally:
+        host.close()
+
+    assert getattr(excinfo.value, 'headline', None) == f'Agent Worker（{ids["child"]}）以错误结束：'
 
 
 def test_running_a_topology_without_a_root_fails_with_actionable_guidance(

@@ -120,7 +120,7 @@ uv run python -m syndica run "用三句话介绍你现在能做什么" --max-tur
 
 - 终端输出一段自然语言回复。
 - 不出现 traceback。
-- 不出现 `Context.stop_reason 是 error`。
+- 退出码是 0；stderr 里没有「以错误结束」，也没有 `Context.stop_reason 是 error`。
 
 不符合预期：
 
@@ -189,7 +189,7 @@ uv run python -m syndica run \
 - 最终输出包含仓库结构调研结果和下一阶段计划。
 - 行为上应体现至少两个角色分工：`Explorer` 负责观察/调研，`Planner` 负责计划整理。
 - 不出现 traceback。
-- 不出现 `Context.stop_reason 是 error`。
+- 退出码是 0；stderr 里没有「以错误结束」，也没有 `Context.stop_reason 是 error`。
 - stderr 没有 `Runtime 错误` 条目。
 
 不符合预期：

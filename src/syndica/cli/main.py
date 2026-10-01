@@ -271,11 +271,13 @@ def _host_failure(exc: Exception, streams: CliIO) -> int:
         expected = 'CLI host 完成当前命令'
         received = f'{type(exc).__name__}: {exc}'
         next_action = '检查 Runtime host 配置和错误日志后重试'
+    text = f'期望: {expected}\n实际: {received}\n下一步: {next_action}'
+    # 宿主可以给一行说明放在三件套前面（比如是哪个 Agent 以错误结束）。
+    headline = getattr(exc, 'headline', None)
+    if isinstance(headline, str) and headline.strip():
+        text = f'{headline}\n{text}'
     # 异常文字可能带着模型或提供方回来的内容：转义之后才进终端。
-    _write(
-        streams.stderr,
-        terminal_safe(f'期望: {expected}\n实际: {received}\n下一步: {next_action}'),
-    )
+    _write(streams.stderr, terminal_safe(text))
     return 1
 
 

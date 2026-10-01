@@ -289,6 +289,11 @@ def _record_detail(record: logging.LogRecord) -> str:
     return record.getMessage()
 
 
+def _syndica_cause(record: logging.LogRecord) -> SyndicaError | None:
+    error = record.exc_info[1] if record.exc_info is not None else None
+    return error if isinstance(error, SyndicaError) else None
+
+
 def _runtime_error_report(
     record: logging.LogRecord, names: Mapping[str, str], position: str
 ) -> str:
@@ -298,11 +303,39 @@ def _runtime_error_report(
     return f'Runtime 错误 {position}{where}:\n{indent(_record_detail(record), "  ")}'
 
 
-def _error_failure(records: list[logging.LogRecord]) -> ContractViolation:
+class _AgentFailure(ContractViolation):
+    """目标 Agent 以错误结束：它自己那个错误的三件套，外加一行说明是哪个 Agent（`headline`）。
+    CLI 与交接文件都把这一行放在三件套前面：分开写的话，交接模式下这一行进 stderr、三件套进交接
+    文件，两边各缺一半。"""
+
+    def __init__(
+        self, *, expected: str, received: str, next_action: str, headline: str = ''
+    ) -> None:
+        super().__init__(expected=expected, received=received, next_action=next_action)
+        self.headline = headline
+
+
+def _own_failure(records: list[logging.LogRecord], agent_id: str) -> logging.LogRecord | None:
+    """这个 Agent 自己以异常结束时 Runtime 记下的那一条：参数里的第一个是它的 id，且带着异常。
+    之后别的 Agent 的失败、它自己收尾时没带异常的告警（被丢下的输入）都不是它的结局。"""
+    for record in reversed(records):
+        args = record.args if isinstance(record.args, tuple) else ()
+        if args and args[0] == agent_id and record.exc_info is not None:
+            return record
+    return None
+
+
+def _failure_text(exc: BaseException) -> str:
+    """一个失败写进交接文件时的文字：带 `headline` 的把它放在三件套前面。"""
+    headline = getattr(exc, 'headline', None)
+    return f'{headline}\n{exc}' if isinstance(headline, str) and headline else str(exc)
+
+
+def _error_failure(final: logging.LogRecord | None) -> ContractViolation:
     received = 'Context.stop_reason 是 error'
     next_action = '查看当前命令之前输出的 Runtime 错误日志，修复失败的 LLM、工具或 hook'
-    if records:
-        received = f'{received}；Runtime 最近错误：{_record_detail(records[-1])}'
+    if final is not None:
+        received = f'{received}；Runtime 最近错误：{_record_detail(final)}'
         next_action = '先处理 Runtime 最近错误；如果它来自外部模型服务，修复配置、额度或稍后重试'
     return ContractViolation(
         expected='CLI 请求对应的 Agent 以 completed / max_turns / aborted 之一结束',
@@ -1018,6 +1051,7 @@ class RuntimeCliHost:
         context: Context,
         records: list[logging.LogRecord],
         *,
+        agent_id: str,
         start: int,
         fail_without_text: bool,
         reports: list[str] | None = None,
@@ -1030,14 +1064,27 @@ class RuntimeCliHost:
         """
         names = {info.agent_id: info.name for info in await runtime.registry.list()}
         failed = context.stop_reason is StopReason.ERROR
-        listed = records[:-1] if failed else records
+        final = _own_failure(records, agent_id) if failed else None
+        if failed and final is None and records:
+            final = records[-1]
+        listed = [record for record in records if record is not final]
         for position, record in enumerate(listed, start=1):
             report = _runtime_error_report(record, names, f'{position}/{len(listed)}')
             self._warn(report)
             if reports is not None:
                 reports.append(report)
         if failed:
-            raise _error_failure(records)
+            cause = _syndica_cause(final) if final is not None else None
+            if cause is None:
+                raise _error_failure(final)
+            # 底层错误自己的三件套就是用户该看的：再套一层「实际：……」，「下一步」就出现两次，
+            # 外层那条还是泛泛的「先处理上面的错误」。
+            raise _AgentFailure(
+                expected=cause.expected,
+                received=cause.received,
+                next_action=cause.next_action,
+                headline=f'Agent {names.get(agent_id, "?")}（{agent_id}）以错误结束：',
+            )
         text = last_answer(context, start)
         if text is None:
             missing = _no_answer(context.stop_reason)
@@ -1270,6 +1317,7 @@ class RuntimeCliHost:
                 session.runtime,
                 context,
                 runtime_errors,
+                agent_id=session.agent_id,
                 start=_after_message(context, delivered.message_id),
                 fail_without_text=False,
             )
@@ -1461,6 +1509,7 @@ class RuntimeCliHost:
                         runtime,
                         context,
                         runtime_errors,
+                        agent_id=agent_id,
                         start=0,
                         fail_without_text=True,
                         reports=reports,
@@ -1542,7 +1591,7 @@ class RuntimeCliHost:
                     request, flags, config=config, logs=logs, stops=stops, reports=reports
                 )
             except Exception as exc:
-                failure = str(exc)
+                failure = _failure_text(exc)
             # 「run 正常结束」（D14）指根 Agent 以 completed 结束：轮数用完、被中止时它留下的文字
             # 可能只做了一半。
             if failure is None and stops and stops[0] is not StopReason.COMPLETED:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 from datetime import UTC, datetime
@@ -17,7 +18,7 @@ import syndica.cli.host as host_module
 from syndica.cli.handoff import lock_workspace
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, RunRequest, main
-from syndica.kernel import ConfigError, ScriptedLLM, ScriptedTurn, ToolCall
+from syndica.kernel import ConfigError, LLMResponseError, ScriptedLLM, ScriptedTurn, ToolCall
 
 _SECRET = 'Zq9' + 'Lm4Xw7Pk2Rt8Vb5Nc3Jd6'
 
@@ -146,6 +147,34 @@ def _run(
     finally:
         host.close()
     return _Run(code, stdout.getvalue(), stderr.getvalue(), root)
+
+
+def test_a_root_failing_on_a_syndica_error_is_one_whole_section_in_the_handoff(tmp_path: Path):
+    root = _workspace(tmp_path)
+    error = LLMResponseError(
+        expected='模型服务返回一条 assistant 消息',
+        received=f'HTTP 429 token={_SECRET} \x1b]0;pwned\x07 尾巴',
+        next_action='换一个模型，或等额度恢复后重试',
+    )
+
+    run = _run(
+        tmp_path, ScriptedLLM([ScriptedTurn(raises=error)]), config=_config(tmp_path), root=root
+    )
+
+    (path,) = run.files
+    document = path.read_text(encoding='utf-8')
+    section = document.split('run 没有正常结束：', 1)[1].split('## ', 1)[0]
+    assert run.code == 1
+    assert run.matter['status'] == 'run_failed'
+    assert re.search(r'^> Agent Lead（[^）]+）以错误结束：$', section, flags=re.MULTILINE)
+    assert [line for line in section.splitlines() if line.startswith('> 下一步')] == [
+        '> 下一步: 换一个模型，或等额度恢复后重试'
+    ]
+    assert document.count('换一个模型，或等额度恢复后重试') == 1
+    assert '以错误结束' not in run.stderr
+    for stream in (run.stdout, run.stderr, document):
+        assert _SECRET not in stream
+        assert '\x1b' not in stream
 
 
 def test_a_topology_run_hands_off_like_a_single_agent_run(tmp_path: Path):

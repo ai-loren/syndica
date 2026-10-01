@@ -490,8 +490,10 @@ PATH 里指向工作区的目录）不跑：只有 `run --handoff` 与 `doctor -
 围栏代码块与行内代码；进本仓 verify 与 CI。
 
 **D19 `CliOutcome` 与报错去嵌套。** `CliHost.run_request` 与 `doctor` 改为可以返回
-`CliOutcome(output, exit_code)`；`_host_call` 照旧接受 `str`（退出 0）。根 Agent 失败且最近的 Runtime 错误
-是 SyndicaError 时，stderr 直接给它的三件套，前面加一句「Agent X 以错误结束」，不再在「实际」里套一层。
+`CliOutcome(output, exit_code)`；`_host_call` 照旧接受 `str`（退出 0）。目标 Agent 失败、且它**自己**那条
+失败记录（Runtime 记下的、参数里是它的 id、带着异常的那一条）是 SyndicaError 时，stderr 直接给它的三件套，
+前面紧挨着一句「Agent X 以错误结束」，不再在「实际」里套一层；别的 Agent 随后的失败、它收尾时的告警照常列成
+更早的 Runtime 错误，不顶替它。交接模式下这一句与三件套一起进交接文件「run 没有正常结束」一节。
 
 **D20 CI 只跑 Ubuntu + Python 3.11。** push 到 main 与 pull request 触发；`uv sync --locked`（锁文件过期
 即失败）加六道门禁（ruff format / check、pyright、check_deps、check_links、pytest；check_links 随 T14 加入），
@@ -940,6 +942,15 @@ D17 同步；`uv.toml` 与 `.python-version` 进受保护路径。用例按评�
 - 变异：删掉 Orchestrator 覆盖里的 Reviewer；删掉 Worker 的 git 禁令；verify 少一条；标记行写法与语法不一致。
 
 #### T16 — 根 Agent 失败时报错去嵌套
+
+**状态：completed**（本地验证协议：定向用例与六道门禁全绿。对抗评审找出 1 Medium / 3 Low 与 8 条存活变异：
+取的是「最后一条 Runtime 错误」，而它不一定是目标 Agent 自己的——根失败之后紧跟着失败的子 Agent 会被报成根
+的错误，根收尾时那条「丢下了输入」的告警会把它打回嵌套；交接模式下「以错误结束」那一句进 stderr、三件套进
+交接文件，两边各缺一半；一份验证指南拿「不出现 `Context.stop_reason 是 error`」当通过判据，从此判不出失败。
+改为按 Agent id 找它自己那条带异常的失败记录，其余照常列成更早的错误（「丢下了输入」那条是这次丢失唯一的
+痕迹，不能吞）；那一句作为错误的 headline，CLI 与交接文件都把它放在三件套正上方。用例补上子 Agent 在根之后
+失败、收尾告警、根崩在子 Agent 的错误之后、多行的「实际」、配置里带控制字符的 Agent 名、按 id 选的 chat 目标、
+每一种 SyndicaError、交接文件里那一节。两轮变异共 24 条全部杀死。Linux 补跑待 CI 额度恢复）
 
 **Files:** `cli/host.py`、`tests/cli/test_host.py`。
 
