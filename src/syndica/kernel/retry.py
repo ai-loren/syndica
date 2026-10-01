@@ -141,8 +141,9 @@ class _RetryPlugin:
         for attempt in range(1, self._attempts + 1):
             await self._sleep(self._backoff_seconds)
             try:
-                with llm_attempt(self._original):
+                with llm_attempt(self._original) as traced:
                     response = await self._original.create(messages, **call_kwargs)
+                    traced.observe(response)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -152,8 +153,9 @@ class _RetryPlugin:
         for name, candidate in self._fallbacks:
             await self._sleep(self._backoff_seconds)
             try:
-                with llm_attempt(candidate):
+                with llm_attempt(candidate) as traced:
                     response = await candidate.create(messages, **call_kwargs)
+                    traced.observe(response)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

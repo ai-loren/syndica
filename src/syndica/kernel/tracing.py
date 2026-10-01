@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import logging
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from types import TracebackType
@@ -415,23 +415,96 @@ class _LlmScope:
             _reset_quietly(cast(ContextVar[object], _LLM_CALL), cast(Token[object], self._token))
 
 
+_TOKEN_COUNTS = (
+    ('input_tokens', 'llm.input_tokens'),
+    ('output_tokens', 'llm.output_tokens'),
+    ('cached_input_tokens', 'llm.cached_input_tokens'),
+)
+# trace 的整数是 int64（OTLP 与 SQLite 都是 64 位）：超出的整个 span 都写不出去。
+_MAX_COUNT = 2**63 - 1
+
+
+def _count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MAX_COUNT
+
+
+def _model_of(llm: object) -> str | None:
+    """`llm.config.model`（`LLM` 协议给的是 config）；不是非空字符串时 None。"""
+    model = getattr(getattr(llm, 'config', None), 'model', None)
+    return model if isinstance(model, str) and model else None
+
+
 class _Attempt:
     """一次 `llm.create`：在当前模型调用里数一次、开一个 llm_call span，在飞期间「当前 LLM 调用」
     有值。"""
 
-    def __init__(self, call: _LlmCall | None, model: object) -> None:
+    def __init__(self, call: _LlmCall | None, llm: object) -> None:
         self._call = call
-        self._model = model
+        self._llm = llm
         self._span: _Span | None = None
 
-    def __enter__(self) -> None:
+    def observe(self, reply: object) -> None:
+        """把回复里 backend 报的事实记到这次的 span 上：哪个平台答的（`extra['llm_route']`）、同一次
+        调用里先换掉了哪些平台（`extra['llm_failures']`，各记一个 `llm.platform_failed` 事件）、
+        token 计数（`extra['usage']`）。类型不对的不记：trace 的属性是闭集，一个越界的整数会让
+        整个 span 写不出去。
+
+        模型名在这里重取一次：轮换里的包装器在调用之前报的是上一次作答的平台，这次换了平台，
+        开始时记下的就是另一个平台的模型。
+
+        读回复出错不改变 run：这是一份已经付过钱的回复，记不下它的事实不是重新调模型的理由。
+        """
+        if self._span is None or self._call is None:
+            return
+        try:
+            self._record(reply, self._span.span.attributes, self._call.tracing)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as error:
+            logger.error(
+                '期望: 模型回复的 extra 是一个读得出的映射。'
+                ' 实际: 读它时抛出 %s: %s；这一次的平台与 token 计数没记下，run 照常进行。'
+                ' 下一步: 检查这个 LLM backend 交回的 ContextBlock.extra。',
+                type(error).__name__,
+                error,
+            )
+
+    def _record(
+        self, reply: object, attributes: dict[str, AttributeValue], tracing: _Tracing
+    ) -> None:
+        model = _model_of(self._llm)
+        if model is not None:
+            attributes['llm.model'] = model
+        extra = cast(object, getattr(reply, 'extra', None))
+        if not isinstance(extra, Mapping):
+            return
+        reported = cast(Mapping[str, object], extra)
+        route = reported.get('llm_route')
+        if isinstance(route, str) and route:
+            attributes['llm.platform'] = route
+        failures = reported.get('llm_failures')
+        if isinstance(failures, list | tuple):
+            for failure in cast(Sequence[object], failures):
+                event = _failure_event(failure)
+                if event is not None:
+                    tracing.event('llm.platform_failed', event)
+        usage = reported.get('usage')
+        if isinstance(usage, Mapping):
+            counts = cast(Mapping[str, object], usage)
+            for reported_key, attribute in _TOKEN_COUNTS:
+                value = counts.get(reported_key)
+                if value is None or _count(value):
+                    attributes[attribute] = cast(int | None, value)
+
+    def __enter__(self) -> _Attempt:
         call = self._call
         if call is None:
-            return
+            return self
         call.attempts += 1
         attributes: dict[str, AttributeValue] = {'llm.attempt': call.attempts}
-        if isinstance(self._model, str) and self._model:
-            attributes['llm.model'] = self._model
+        model = _model_of(self._llm)
+        if model is not None:
+            attributes['llm.model'] = model
         self._span = call.tracing.span(
             SpanKind.LLM_CALL,
             (call.agent_id, call.turn, call.attempts),
@@ -441,6 +514,7 @@ class _Attempt:
         )
         self._span.__enter__()
         call.in_flight = True
+        return self
 
     def __exit__(
         self,
@@ -454,8 +528,20 @@ class _Attempt:
             self._span.__exit__(exc_type, exc, tb)
 
 
+def _failure_event(failure: object) -> dict[str, AttributeValue] | None:
+    """轮换记录里的一条平台故障 → 事件属性；形状不对的不记。"""
+    if not isinstance(failure, Mapping):
+        return None
+    record = cast(Mapping[str, object], failure)
+    platform, error, status = record.get('platform'), record.get('error'), record.get('status')
+    if not (isinstance(platform, str) and platform and isinstance(error, str) and error):
+        return None
+    event: dict[str, AttributeValue] = {'llm.platform': platform, 'llm.error': error}
+    event['llm.status'] = cast(int, status) if _count(status) else None
+    return event
+
+
 def llm_attempt(llm: object) -> _Attempt:
     """包住一次 `llm.create`。不在 Agent 的模型调用里（没有 `llm_call` 作用域）时什么都不做。模型名
     取 `llm.config.model`（`LLM` 协议给的是 config）。"""
-    config = getattr(llm, 'config', None)
-    return _Attempt(_LLM_CALL.get(), getattr(config, 'model', None))
+    return _Attempt(_LLM_CALL.get(), llm)

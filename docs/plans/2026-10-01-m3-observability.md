@@ -756,7 +756,7 @@ Runtime 之内唯一，写进 D10 与 `IdSource` 的文档。宿主自己写的 
 - 失败隔离：每次都抛 `Exception` 的 tracer 不影响 run 的结局，日志恰好一条 ERROR（断言 `record.args` 里的 tracer、
   步骤与级别），关闭时报出失败次数；抛 `CancelledError` 的照常上抛。
 
-**状态：完成。** `kernel/tracing.py`：同步的 `Tracer` 协议（`start_span` / `end_span` / `add_event` / `add_edge`，时间
+**状态：完成（b4add64）。** `kernel/tracing.py`：同步的 `Tracer` 协议（`start_span` / `end_span` / `add_event` / `add_edge`，时间
 由 tracer 自己取）、`NullTracer`、长度前缀且带类型标记的 `span_id_of`、当前 span 与「当前 LLM 调用」两个 contextvar、
 `_Tracing`（每个 Runtime 一份，交给它的 Agent 与执行器）。插桩点：agent（每个周期，脱离父）、turn、llm_call（首次、
 重试与备用模型各一次，`llm.model` 取 `config.model`）、tool_call（每处追加结果块，含未执行与恢复时补的）、
@@ -787,6 +787,24 @@ LLM 调用」（清掉，并且只在 `create` 在飞时有值——hook 与工�
 
 - 见 D13。`usage` 有、没有、缺一部分各一条；`extra` 不进请求（逐字比对发出的 JSON）；换平台时 `llm_failures` 按顺序
   列出被换掉的三个平台；`cache_prefix_units` 不换平台时与作答成员逐字节相同。
+
+**状态：完成。** OpenAI 兼容客户端给每个回复带上 `extra['usage']`（三个计数；端点没报、类型不对或超出 int64 的记
+None，猜一个数比没有更糟）与 `extra['finish_reason']`，它们不随历史发回（第二轮请求体逐字节比对；`_message` 只回传
+`_EXTRA_KEY` 下的内容）。`ModelRouter` 交回作答成员回复的一份副本（不就地改成员的对象：会缓存回复的成员下次交回
+同一个对象），带上 `llm_route` 与同一次调用里按先后被换掉的平台 `llm_failures`（平台名、错误类型、HTTP 状态——状态
+按属性认，只收整数：backend 之间不互相依赖）；实现 `CachePrefixProvider`，`config` 与前缀单位按**调用方**最近一次
+作答的成员取（contextvar：路由器被几个 Agent 共用，全局的「最近一次」会把别的 Agent 的换平台算到这个 Agent 头上），
+那个成员给不出单位时交回 None——`CachePrefixProvider` 因此放宽成可以交回 None，漂移检测退回逻辑单位并标成不精确。
+内核的 llm_call span 记下作答平台、token 计数（越界与负数不记）与这次调用之后的模型名（轮换在调用前报的是上一次
+作答的平台），每个被换掉的平台各一个 `llm.platform_failed` 事件（`llm.platform`、`llm.error`、`llm.status`，路线图
+「LLM span 记下每次平台故障」）；首次、重试与备用模型各记自己那一次的回复；读回复出错只记一条 ERROR，不把一次付过
+钱的回复变成模型失败。
+
+验证：对抗评审一路，1 High（`retry.py` 的 `with llm_attempt(...) as attempt` 遮住了重试序号，评审期间已在全套里抓到
+并改掉——只跑变异用的三个文件看不见它，变异集从此带上 `test_retry_module.py`）、3 Medium（超出 int64 的计数会让记录器
+丢掉整个 span 并把错算到 tracer 头上；换平台时一个 span 里是两个平台；共用路由器的漂移记录记到没换平台的 Agent 头上）、
+4 Low（`exact` 被冒充、缓存回复带着旧的轮换记录、`observe` 不隔离失败、注释与计划说多了），另有 12 条存活变异。全部
+修掉。变异：44 条全杀（评审的 12 条存活与修复的反向变异都在里面）。
 
 #### T9 — `TraceRecorder`：缓冲、写入任务、逐叶脱敏、级别、指纹
 

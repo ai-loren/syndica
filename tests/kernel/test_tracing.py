@@ -113,7 +113,7 @@ class _Recorder:
     ) -> None:
         if span_id in self.started:
             self.problems.append(f'{kind.value} span {span_id} started twice')
-        self.started[span_id] = _Started(parent_span_id, kind, name, agent_id, attributes)
+        self.started[span_id] = _Started(parent_span_id, kind, name, agent_id, dict(attributes))
 
     def end_span(
         self, span_id: str, status: SpanStatus, attributes: dict[str, AttributeValue]
@@ -2453,3 +2453,281 @@ async def test_nothing_suspends_between_starting_a_delegation_wait_and_installin
         await runtime.shutdown()
 
     assert violations == []
+
+
+# --- T8: what the backend reported about the answer --------------------------------------------
+
+
+class _Reporting:
+    """按剧本交回带 `extra` 的回复；剧本里的异常就抛。"""
+
+    def __init__(self, model: str, script: list[BaseException | dict[str, Any]]) -> None:
+        self.config = LLMConfig(provider='fake', model=model)
+        self._script = list(script)
+
+    async def create(self, messages: list[Any], **kwargs: Any) -> Any:
+        from syndica.kernel.context import ContextBlock
+
+        outcome = self._script.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return ContextBlock(role='assistant', content='answer', extra=dict(outcome))
+
+
+async def test_an_attempt_records_which_platform_answered_and_the_token_counts():
+    llm = _Reporting(
+        'routed',
+        [
+            {
+                'llm_route': 'gemini',
+                'usage': {'input_tokens': 120, 'output_tokens': 7, 'cached_input_tokens': None},
+            }
+        ],
+    )
+    runtime, recorder = _traced()
+    try:
+        agent_id = await _run_one(runtime, _factory('Root', cast(Any, llm)))
+    finally:
+        await runtime.shutdown()
+
+    assert recorder.attributes(span_id_of(SpanKind.LLM_CALL, agent_id, 1, 1)) == {
+        'llm.attempt': 1,
+        'llm.model': 'routed',
+        'llm.platform': 'gemini',
+        'llm.input_tokens': 120,
+        'llm.output_tokens': 7,
+        'llm.cached_input_tokens': None,
+    }
+
+
+async def test_what_a_backend_reports_in_the_wrong_shape_is_not_recorded():
+    llm = _Reporting(
+        'odd',
+        [{'llm_route': '', 'usage': {'input_tokens': True, 'output_tokens': '7', 'other': 1}}],
+    )
+    runtime, recorder = _traced()
+    try:
+        agent_id = await _run_one(runtime, _factory('Root', cast(Any, llm)))
+    finally:
+        await runtime.shutdown()
+
+    assert recorder.attributes(span_id_of(SpanKind.LLM_CALL, agent_id, 1, 1)) == {
+        'llm.attempt': 1,
+        'llm.model': 'odd',
+        'llm.cached_input_tokens': None,
+    }
+
+
+async def test_each_retry_and_fallback_records_its_own_answer():
+    original = _Reporting(
+        'main', [RuntimeError('down'), {'llm_route': 'main-b', 'usage': {'input_tokens': 5}}]
+    )
+    backup = _Reporting('backup', [{'llm_route': 'backup-a', 'usage': {'output_tokens': 9}}])
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    first_runtime, first = _traced(
+        modules=[RetryModule({}, sleep=no_sleep)], flags={'llm_retry_attempts': 1}
+    )
+    try:
+        first_agent = await _run_one(first_runtime, _factory('Root', cast(Any, original)))
+    finally:
+        await first_runtime.shutdown()
+    second_runtime, second = _traced(
+        modules=[RetryModule({'backup': cast(Any, backup)}, sleep=no_sleep)],
+        flags={'llm_fallbacks': 'backup'},
+    )
+    failing = _Reporting('main', [RuntimeError('down')])
+    try:
+        second_agent = await _run_one(second_runtime, _factory('Root', cast(Any, failing)))
+    finally:
+        await second_runtime.shutdown()
+
+    retried = first.attributes(span_id_of(SpanKind.LLM_CALL, first_agent, 1, 2))
+    assert (retried['llm.platform'], retried['llm.input_tokens']) == ('main-b', 5)
+    assert 'llm.platform' not in first.attributes(span_id_of(SpanKind.LLM_CALL, first_agent, 1, 1))
+    fallback = second.attributes(span_id_of(SpanKind.LLM_CALL, second_agent, 1, 2))
+    assert (fallback['llm.model'], fallback['llm.platform'], fallback['llm.output_tokens']) == (
+        'backup',
+        'backup-a',
+        9,
+    )
+
+
+async def _attempt_attributes(llm: object) -> dict[str, AttributeValue]:
+    runtime, recorder = _traced()
+    try:
+        agent_id = await _run_one(runtime, _factory('Root', cast(Any, llm)))
+    finally:
+        await runtime.shutdown()
+    return recorder.attributes(span_id_of(SpanKind.LLM_CALL, agent_id, 1, 1))
+
+
+async def test_token_counts_outside_int64_or_negative_are_not_recorded():
+    attributes = await _attempt_attributes(
+        _Reporting(
+            'big',
+            [
+                {
+                    'usage': {
+                        'input_tokens': 2**63,
+                        'output_tokens': -5,
+                        'cached_input_tokens': 2**63 - 1,
+                    }
+                }
+            ],
+        )
+    )
+
+    assert 'llm.input_tokens' not in attributes and 'llm.output_tokens' not in attributes
+    assert attributes['llm.cached_input_tokens'] == 2**63 - 1
+
+
+async def test_a_route_that_is_not_text_is_not_recorded():
+    attributes = await _attempt_attributes(_Reporting('odd', [{'llm_route': 7}]))
+
+    assert 'llm.platform' not in attributes
+
+
+async def test_usage_given_as_any_mapping_is_read():
+    from types import MappingProxyType
+
+    attributes = await _attempt_attributes(
+        _Reporting('proxy', [{'usage': MappingProxyType({'input_tokens': 3})}])
+    )
+
+    assert attributes['llm.input_tokens'] == 3
+
+
+async def test_each_platform_failed_over_from_is_an_event_on_the_attempt():
+    runtime, recorder = _traced()
+    llm = _Reporting(
+        'routed',
+        [
+            {
+                'llm_route': 'groq',
+                'llm_failures': [
+                    {'platform': 'gemini', 'error': 'ProviderHTTPError', 'status': 429},
+                    {'platform': 'openrouter', 'error': 'TimeoutError', 'status': '503'},
+                    {'platform': '', 'error': 'X', 'status': 1},
+                    'not a record',
+                ],
+            }
+        ],
+    )
+    try:
+        agent_id = await _run_one(runtime, _factory('Root', cast(Any, llm)))
+    finally:
+        await runtime.shutdown()
+
+    attempt = span_id_of(SpanKind.LLM_CALL, agent_id, 1, 1)
+    assert [(span, name, attributes) for span, name, attributes in recorder.events] == [
+        (
+            attempt,
+            'llm.platform_failed',
+            {'llm.platform': 'gemini', 'llm.error': 'ProviderHTTPError', 'llm.status': 429},
+        ),
+        (
+            attempt,
+            'llm.platform_failed',
+            {'llm.platform': 'openrouter', 'llm.error': 'TimeoutError', 'llm.status': None},
+        ),
+    ]
+
+
+async def test_after_a_failover_the_attempt_names_the_model_of_the_platform_that_answered():
+    from syndica.backends.llm_router import ModelRouter
+
+    class _Member:
+        def __init__(self, model: str, outcome: BaseException | None) -> None:
+            self.config = LLMConfig(provider='fake', model=model)
+            self._outcome = outcome
+
+        async def create(self, messages: list[Any], **kwargs: Any) -> Any:
+            from syndica.kernel.context import ContextBlock
+
+            if self._outcome is not None:
+                raise self._outcome
+            return ContextBlock(role='assistant', content='answer')
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    router = ModelRouter(
+        [
+            ('gemini', cast(Any, _Member('gemini-model', RuntimeError('503')))),
+            ('openrouter', cast(Any, _Member('openrouter-model', None))),
+        ],
+        sleep=no_sleep,
+    )
+    attributes = await _attempt_attributes(router)
+
+    assert (attributes['llm.model'], attributes['llm.platform']) == (
+        'openrouter-model',
+        'openrouter',
+    )
+
+
+async def test_a_reply_without_a_readable_extra_records_nothing_and_logs_nothing(
+    caplog: pytest.LogCaptureFixture,
+):
+    class _NoExtra:
+        config = LLMConfig(provider='fake', model='plain')
+
+        async def create(self, messages: list[Any], **kwargs: Any) -> Any:
+            from syndica.kernel.context import ContextBlock
+
+            reply = ContextBlock(role='assistant', content='answer')
+            object.__setattr__(reply, 'extra', None)
+            return reply
+
+    attributes = await _attempt_attributes(_NoExtra())
+
+    assert attributes == {'llm.attempt': 1, 'llm.model': 'plain'}
+    assert [r for r in caplog.records if r.name == 'syndica.kernel.tracing'] == []
+
+
+async def test_a_reply_whose_extra_cannot_be_read_is_paid_for_once_and_reported(
+    caplog: pytest.LogCaptureFixture,
+):
+    class _Exploding(dict[str, Any]):
+        def get(self, key: str, default: Any = None) -> Any:
+            raise RuntimeError('cannot read')
+
+    calls: list[int] = []
+
+    class _Odd:
+        config = LLMConfig(provider='fake', model='odd')
+
+        async def create(self, messages: list[Any], **kwargs: Any) -> Any:
+            from syndica.kernel.context import ContextBlock
+
+            calls.append(1)
+            reply = ContextBlock(role='assistant', content='answer')
+            object.__setattr__(reply, 'extra', _Exploding())
+            return reply
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    runtime, _ = _traced(modules=[RetryModule({}, sleep=no_sleep)], flags={'llm_retry_attempts': 1})
+    try:
+        agent_id = await runtime.spawn(_factory('Root', cast(Any, _Odd())), query='go')
+        context = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+
+    assert context.stop_reason is StopReason.COMPLETED
+    assert calls == [1]
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.tracing']
+    assert cast(tuple[object, ...], record.args)[0] == 'RuntimeError'
+
+
+def test_observing_outside_a_model_call_does_nothing(caplog: pytest.LogCaptureFixture):
+    from syndica.kernel.context import ContextBlock
+
+    with llm_attempt(ScriptedLLM([])) as attempt:
+        attempt.observe(ContextBlock(role='assistant', content='x', extra={'llm_route': 'a'}))
+
+    assert caplog.records == []

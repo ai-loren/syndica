@@ -23,9 +23,12 @@ __all__ = ['OpenAICompatible', 'ProviderHTTPError', 'recoverable', 'retry_after'
 _PROVIDER = 'openai-compatible'
 _MESSAGE_KEYS: tuple[str, ...] = ('role', 'content', 'tool_calls', 'tool_call_id')
 _RESERVED_REQUEST_KEYS: frozenset[str] = frozenset({'messages', 'model'})
-# 本 backend 在 assistant block 的 `extra` 里只写这一个键：端点要求原样回传的 `extra_content`
-# （Gemini 的 thought_signature 就在这里），连同产生它的端点身份。
+# 端点要求原样回传的 `extra_content`（Gemini 的 thought_signature 就在这里）连同产生它的端点
+# 身份，放在 assistant block 的 `extra` 的这个键下。`extra` 里只有这个键的内容会随历史发回（见
+# `_message`）；同样写在 `extra` 里的 `usage`、`finish_reason` 只给 trace 与宿主读。
 _EXTRA_KEY = 'openai_compatible'
+# token 计数的上限：trace 的整数是 int64（OTLP 与 SQLite 都是 64 位），超出的写不出去。
+_MAX_COUNT = 2**63 - 1
 _EXPECTED_REPLY = 'OpenAI 兼容端点返回一条可解析的 assistant 消息'
 # 重试提示只在这两种状态上表示「多久之后再试」（RFC 6585 / RFC 9110）；别的状态上出现也不作数。
 _HINTED_STATUSES: frozenset[int] = frozenset({429, 503})
@@ -230,6 +233,9 @@ def _message(
 ) -> dict[str, Any]:
     """一块历史的线上形态。
 
+    `extra` 里只有 `_EXTRA_KEY` 下的内容进请求：别的键（`usage`、`finish_reason`、轮换记录）写给
+    trace 与宿主，发出去就是把这次运行的内部事实交给了模型提供方。
+
     `extra_content` 只回给产生它的那个端点（同一 URL 换了模型也不算）：签名这类字段是签发它的
     模型的私有状态，换一个模型不保证认，发给别家还会把它漏过去。别家答出的工具调用改挂
     `foreign_tool_call_extra`——Gemini 3.x 拒收没有 thought_signature 的函数调用，跨平台轮换时
@@ -386,6 +392,31 @@ def _provider_extras(message: Mapping[str, object], endpoint: str) -> dict[str, 
     return {_EXTRA_KEY: {'endpoint': endpoint, **state}} if state else {}
 
 
+def _count(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MAX_COUNT:
+        return value
+    return None
+
+
+def _usage(value: object) -> dict[str, int | None]:
+    """端点报的 token 计数。没报的、报成别的类型的记 None：猜一个数比没有更糟，费用与上下文预算
+    都会照着它算。"""
+    usage: Mapping[str, object] = (
+        cast(Mapping[str, object], value) if isinstance(value, Mapping) else {}
+    )
+    details = usage.get('prompt_tokens_details')
+    cached = (
+        cast(Mapping[str, object], details).get('cached_tokens')
+        if isinstance(details, Mapping)
+        else None
+    )
+    return {
+        'input_tokens': _count(usage.get('prompt_tokens')),
+        'output_tokens': _count(usage.get('completion_tokens')),
+        'cached_input_tokens': _count(cached),
+    }
+
+
 def _assistant(response: httpx.Response, endpoint: str) -> ContextBlock:
     try:
         payload = cast(Mapping[str, object], response.json())
@@ -409,11 +440,16 @@ def _assistant(response: httpx.Response, endpoint: str) -> ContextBlock:
             f'choices[0].message.content 是 {type(content).__name__}',
             '让端点返回字符串、内容块列表或 null',
         )
+    finish_reason = first.get('finish_reason')
     return ContextBlock(
         role='assistant',
         content=cast(str | list[Any] | None, content),
         tool_calls=_tool_calls(message.get('tool_calls')),
-        extra=_provider_extras(message, endpoint),
+        extra={
+            **_provider_extras(message, endpoint),
+            'usage': _usage(payload.get('usage')),
+            'finish_reason': finish_reason if isinstance(finish_reason, str) else None,
+        },
     )
 
 

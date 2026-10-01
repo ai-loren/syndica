@@ -67,7 +67,10 @@ def _labels(count: int) -> tuple[str, ...]:
 def _checked_units(value: object, provider: object) -> tuple[bytes, ...]:
     if not isinstance(value, tuple):
         raise ContractViolation(
-            expected=f'{type(provider).__name__}.cache_prefix_units 返回 tuple[bytes, ...]',
+            expected=(
+                f'{type(provider).__name__}.cache_prefix_units 返回 tuple[bytes, ...]，'
+                '给不出精确单位时返回 None'
+            ),
             received=f'收到 {type(value).__name__} 类型的 {value!r}',
             next_action='把每个有序请求单位编码为 bytes，并用 tuple 按缓存前缀顺序返回',
         )
@@ -118,7 +121,9 @@ class PrefixDriftService:
         messages = cast(list[ContextBlock], request['messages'])
         kwargs = {key: value for key, value in request.items() if key != 'messages'}
         if isinstance(llm, CachePrefixProvider):
-            return _checked_units(llm.cache_prefix_units(messages, **kwargs), llm), True
+            units = cast(object, llm.cache_prefix_units(messages, **kwargs))
+            if units is not None:
+                return _checked_units(units, llm), True
         return _logical_cache_prefix_units(llm.config, messages, kwargs), False
 
     def _observe(self, agent_id: str, llm: LLM, request: dict[str, Any]) -> None:

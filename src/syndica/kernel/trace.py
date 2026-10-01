@@ -87,6 +87,8 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'turn': 'int',
         'stop_reason': 'str',
         'llm.platform': 'str',
+        'llm.error': 'str',
+        'llm.status': 'int?',
         'llm.model': 'str',
         'llm.attempt': 'int',
         'llm.input_tokens': 'int?',

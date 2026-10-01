@@ -6,14 +6,19 @@ import asyncio
 import logging
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from syndica.backends.llm_router import BackoffPolicy, MemberHealth, ModelRouter
 from syndica.kernel import LLM, ConfigError, ContractViolation, LLMConfig, LLMResponseError
 from syndica.kernel.context import ContextBlock
-from syndica.kernel.llm.base import ContextOverflowError
+from syndica.kernel.llm import CachePrefixProvider
+from syndica.kernel.llm.base import (
+    ContextOverflowError,
+    _logical_cache_prefix_units,  # pyright: ignore[reportPrivateUsage]
+)
+from syndica.kernel.prefix_drift import PrefixDriftService
 
 
 class _Clock:
@@ -492,6 +497,242 @@ async def test_the_reply_records_which_member_answered() -> None:
     reply = await router.create(_ask())
 
     assert reply.extra['llm_route'] == 'openrouter'
+
+
+class _HTTPDown(LLMResponseError):
+    def __init__(self, status: int) -> None:
+        super().__init__(
+            expected='一条可用的回复', received=f'HTTP {status}', next_action='稍后重试'
+        )
+        self.status_code = status
+
+
+async def test_the_reply_lists_the_platforms_this_call_failed_over_from_in_order() -> None:
+    router, _, _ = _router(
+        [
+            ('gemini', [_HTTPDown(429)]),
+            ('openrouter', [RuntimeError('connection reset')]),
+            ('groq', [_HTTPDown(503)]),
+            ('backup', ['from backup']),
+        ]
+    )
+
+    reply = await router.create(_ask())
+
+    assert reply.extra['llm_route'] == 'backup'
+    assert reply.extra['llm_failures'] == [
+        {'platform': 'gemini', 'error': '_HTTPDown', 'status': 429},
+        {'platform': 'openrouter', 'error': 'RuntimeError', 'status': None},
+        {'platform': 'groq', 'error': '_HTTPDown', 'status': 503},
+    ]
+
+
+async def test_a_reply_without_failover_has_no_failure_list() -> None:
+    router, _, _ = _router([('gemini', ['from gemini']), ('openrouter', ['unused'])])
+
+    reply = await router.create(_ask())
+
+    assert 'llm_failures' not in reply.extra
+
+
+async def test_failures_while_waiting_for_a_platform_to_recover_are_all_listed() -> None:
+    router, _, _ = _router([('only', [_HTTPDown(429), _HTTPDown(503), 'finally'])])
+
+    reply = await router.create(_ask())
+
+    assert reply.extra['llm_failures'] == [
+        {'platform': 'only', 'error': '_HTTPDown', 'status': 429},
+        {'platform': 'only', 'error': '_HTTPDown', 'status': 503},
+    ]
+
+
+async def test_a_status_that_is_not_an_integer_is_not_reported() -> None:
+    odd = _HTTPDown(500)
+    odd.status_code = cast(Any, True)
+    router, _, _ = _router([('gemini', [odd]), ('openrouter', ['ok'])])
+
+    reply = await router.create(_ask())
+
+    assert reply.extra['llm_failures'] == [
+        {'platform': 'gemini', 'error': '_HTTPDown', 'status': None}
+    ]
+
+
+class _UnitMember(_Member):
+    def cache_prefix_units(self, messages: list[ContextBlock], **kwargs: Any) -> tuple[bytes, ...]:
+        return (self.name.encode(), repr(sorted(kwargs)).encode(), str(len(messages)).encode())
+
+
+async def test_prefix_units_come_from_the_member_that_answered_last() -> None:
+    calls: list[str] = []
+    router = ModelRouter(
+        [
+            ('gemini', _UnitMember('gemini', [_down()], calls)),
+            ('openrouter', _UnitMember('openrouter', ['ok'], calls)),
+        ],
+        sleep=_Clock().sleep,
+    )
+    before = router.cache_prefix_units(_ask(), tools=[])
+
+    await router.create(_ask())
+
+    assert isinstance(router, CachePrefixProvider)
+    assert before == (b'gemini', b"['tools']", b'1')
+    assert router.cache_prefix_units(_ask(), tools=[]) == (b'openrouter', b"['tools']", b'1')
+
+
+async def test_a_member_without_prefix_units_gives_none_so_drift_is_marked_inexact() -> None:
+    router, _, _ = _router([('gemini', [_down()]), ('openrouter', ['ok'])])
+    await router.create(_ask())
+    service = PrefixDriftService(lambda unit: len(unit))
+    request = {'messages': _ask(), 'temperature': 0}
+
+    assert router.cache_prefix_units(_ask(), temperature=0) is None
+    assert service._units(router, request) == (  # pyright: ignore[reportPrivateUsage]
+        _logical_cache_prefix_units(router.config, _ask(), {'temperature': 0}),
+        False,
+    )
+    assert router.config.model == 'openrouter-model'
+
+
+async def test_a_router_over_members_with_units_is_exact_for_drift() -> None:
+    calls: list[str] = []
+    router = ModelRouter([('gemini', _UnitMember('gemini', ['ok'], calls))], sleep=_Clock().sleep)
+    service = PrefixDriftService(lambda unit: len(unit))
+
+    units, exact = service._units(router, {'messages': _ask()})  # pyright: ignore[reportPrivateUsage]
+
+    assert (units, exact) == ((b'gemini', b'[]', b'1'), True)
+
+
+async def test_each_caller_sees_the_platform_that_answered_it_not_the_last_one_overall() -> None:
+    calls: list[str] = []
+    router = ModelRouter(
+        [
+            ('a', _UnitMember('a', ['for x', _down(), 'for x again'], calls)),
+            ('b', _UnitMember('b', ['for y'], calls)),
+        ],
+        sleep=_Clock().sleep,
+        clock=_Clock(),
+    )
+    seen: dict[str, object] = {}
+    y_done = asyncio.Event()
+
+    async def agent_x() -> None:
+        await router.create(_ask())
+        await y_done.wait()
+        seen['x units'] = router.cache_prefix_units(_ask())
+        seen['x model'] = router.config.model
+
+    async def agent_y() -> None:
+        await asyncio.sleep(0)
+        await router.create(_ask())
+        seen['y model'] = router.config.model
+        y_done.set()
+
+    await asyncio.gather(agent_x(), agent_y())
+
+    assert seen == {
+        'x units': (b'a', b'[]', b'1'),
+        'x model': 'a-model',
+        'y model': 'b-model',
+    }
+
+
+async def test_a_caller_that_never_called_sees_the_last_platform_that_answered_anyone() -> None:
+    router, _, _ = _router([('gemini', [_down()]), ('openrouter', ['ok'])])
+    called = asyncio.Event()
+    seen: list[str] = []
+
+    async def bystander() -> None:
+        await called.wait()
+        seen.append(router.config.model)
+
+    watching = asyncio.create_task(bystander())
+    await router.create(_ask())
+    called.set()
+    await watching
+
+    assert seen == ['openrouter-model']
+
+
+async def test_failures_waiting_cannot_fix_are_listed_too() -> None:
+    router, _, _ = _router(
+        [('gemini', [_HTTPDown(401)]), ('openrouter', ['ok'])],
+        recoverable=lambda error: False,
+    )
+
+    reply = await router.create(_ask())
+
+    assert reply.extra['llm_failures'] == [
+        {'platform': 'gemini', 'error': '_HTTPDown', 'status': 401}
+    ]
+
+
+@pytest.mark.parametrize('status', ['503', 503.0, True], ids=['string', 'float', 'bool'])
+async def test_a_status_that_is_not_an_integer_is_reported_as_none(status: object) -> None:
+    odd = _HTTPDown(500)
+    odd.status_code = cast(Any, status)
+    router, _, _ = _router([('gemini', [odd]), ('openrouter', ['ok'])])
+
+    reply = await router.create(_ask())
+
+    assert reply.extra['llm_failures'][0]['status'] is None
+
+
+async def test_the_reply_is_a_copy_and_a_cached_reply_carries_no_stale_record() -> None:
+    shared = ContextBlock(role='assistant', content='cached')
+
+    class _Caching:
+        config = LLMConfig(provider='fake', model='caching-model')
+
+        async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+            return shared
+
+    calls: list[str] = []
+    router = ModelRouter(
+        [('flaky', _Member('flaky', [_down(), 'unused'], calls)), ('cache', cast(Any, _Caching()))],
+        sleep=_Clock().sleep,
+        clock=_Clock(),
+        policy=BackoffPolicy(base=1000.0, maximum=1000.0, max_wait=0),
+    )
+
+    first = await router.create(_ask())
+    second = await router.create(_ask())
+
+    assert shared.extra == {}
+    assert first.extra['llm_failures'] == [
+        {'platform': 'flaky', 'error': 'LLMResponseError', 'status': None}
+    ]
+    assert 'llm_failures' not in second.extra and second.extra['llm_route'] == 'cache'
+
+
+async def test_an_outer_router_replaces_the_record_an_inner_router_left() -> None:
+    calls: list[str] = []
+    inner = ModelRouter(
+        [
+            ('inner-a', _Member('inner-a', [_down()], calls)),
+            ('inner-b', _Member('inner-b', ['ok'], calls)),
+        ],
+        sleep=_Clock().sleep,
+    )
+    outer = ModelRouter([('outer-1', inner)], sleep=_Clock().sleep)
+
+    reply = await outer.create(_ask())
+
+    assert reply.extra['llm_route'] == 'outer-1'
+    assert 'llm_failures' not in reply.extra
+
+
+async def test_a_failure_is_named_by_its_class_not_its_qualified_path() -> None:
+    class _LocalError(Exception):
+        pass
+
+    router, _, _ = _router([('gemini', [_LocalError('x')]), ('openrouter', ['ok'])])
+
+    reply = await router.create(_ask())
+
+    assert reply.extra['llm_failures'][0]['error'] == '_LocalError'
 
 
 async def test_config_reports_the_member_that_answered_last() -> None:

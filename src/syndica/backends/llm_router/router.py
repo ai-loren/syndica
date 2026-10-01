@@ -13,12 +13,13 @@ import math
 import random
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from syndica.kernel.context import ContextBlock
 from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError, SyndicaError
-from syndica.kernel.llm import LLM, ContextOverflowError, LLMConfig
+from syndica.kernel.llm import LLM, CachePrefixProvider, ContextOverflowError, LLMConfig
 
 __all__ = ['BackoffPolicy', 'MemberHealth', 'ModelRouter']
 
@@ -124,6 +125,25 @@ def _always_recoverable(error: Exception) -> bool:
     return True
 
 
+def _routed(reply: ContextBlock, name: str, failures: list[dict[str, object]]) -> ContextBlock:
+    """作答成员的回复，带上这次轮换的记录。交回一份新的而不是改成员的那一份：会缓存回复的成员
+    下次交回的还是同一个对象，就地写过的记录会跟着它出现在一次没换过平台的调用上。内层路由器
+    留下的记录换成这一层的。"""
+    extra = {
+        key: value for key, value in reply.extra.items() if key not in ('llm_route', 'llm_failures')
+    }
+    extra['llm_route'] = name
+    if failures:
+        extra['llm_failures'] = failures
+    return replace(reply, extra=extra)
+
+
+def _status(error: Exception) -> int | None:
+    """平台错误带的 HTTP 状态码。按属性认而不按类型认：backend 之间不互相依赖。"""
+    status = getattr(error, 'status_code', None)
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
 def _summary(error: Exception) -> str:
     text = error.received if isinstance(error, SyndicaError) else f'{type(error).__name__}: {error}'
     return text if len(text) <= _ERROR_PREVIEW else f'{text[:_ERROR_PREVIEW]}…'
@@ -202,14 +222,25 @@ class ModelRouter:
         self._rand = rand
         self._state = {name: _State() for name, _ in self._members}
         self._answered: LLM = self._members[0][1]
+        # 这个调用方上一次是谁答的。路由器由几个 Agent 共用，而 `config` 与前缀单位要回答的是
+        # 「我这次是谁答的」：只看全局的最近一次，别的 Agent 的一次换平台就会算到这个 Agent 头上。
+        # 每个 Agent 在自己的任务里调 `create`，contextvar 在任务之间互不串。
+        self._answered_here: ContextVar[LLM | None] = ContextVar(
+            f'syndica_model_router_{id(self)}', default=None
+        )
+
+    def _last_answerer(self) -> LLM:
+        here = self._answered_here.get()
+        return self._answered if here is None else here
 
     @property
     def config(self) -> LLMConfig:
-        """最近一次作答的那个平台的 config；还没答过就是排在最前的那个。
+        """这个调用方最近一次作答的那个平台的 config；它还没调过就取所有调用方里最近作答的那个，
+        还没人答过就是排在最前的那个。
 
         包装器转发委托对象的 config（见 `LLM.config`）；轮换里的委托对象随调用而变。
         """
-        return self._answered.config
+        return self._last_answerer().config
 
     def health(self) -> tuple[MemberHealth, ...]:
         return tuple(
@@ -222,8 +253,24 @@ class ModelRouter:
             for name, _ in self._members
         )
 
+    def cache_prefix_units(
+        self,
+        messages: list[ContextBlock],
+        **kwargs: Any,
+    ) -> tuple[bytes, ...] | None:
+        """这个调用方最近一次作答的那个平台的前缀单位：前缀缓存在平台那一侧，换了平台就是另一份
+        缓存。两个平台的 provider 与模型名都相同时单位也相同，这种换平台看不出来。那个平台给不出
+        单位时交回 None，漂移检测按 config 取逻辑单位并标成不精确。"""
+        answered = self._last_answerer()
+        if isinstance(answered, CachePrefixProvider):
+            return answered.cache_prefix_units(messages, **kwargs)
+        return None
+
     async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
         deadline = self._clock() + self._policy.max_wait
+        # 这次调用里被换掉的平台，按换掉的先后。主力平台在退避期里被跳过时不在这里：它失败的那一次
+        # 已经记在当时那条回复上。
+        failures: list[dict[str, object]] = []
         while True:
             for name, llm in self._members:
                 state = self._state[name]
@@ -235,14 +282,17 @@ class ModelRouter:
                     raise
                 except Exception as exc:
                     self._fail(name, state, exc)
+                    failures.append(
+                        {'platform': name, 'error': type(exc).__name__, 'status': _status(exc)}
+                    )
                     continue
                 state.failures = 0
                 state.retry_at = -math.inf
                 state.last_error = None
                 state.recoverable = True
                 self._answered = llm
-                reply.extra['llm_route'] = name
-                return reply
+                self._answered_here.set(llm)
+                return _routed(reply, name, failures)
             wake = min(
                 (state.retry_at for state in self._state.values() if state.recoverable),
                 default=math.inf,

@@ -126,13 +126,16 @@ class CachePrefixProvider(Protocol):
 
     顺序固定为 provider/model、最终请求参数、system、tools、逐条历史。每项必须是稳定编码后的
     `bytes`；只有在末尾追加历史时，旧 tuple 才会是新 tuple 的前缀。
+
+    交回 None 表示这一次给不出精确的单位（包装器转发给的那个模型自己没有）：漂移检测退回按
+    `config` 取的逻辑单位，并把记录标成不精确，而不是把逻辑单位冒充成精确的。
     """
 
     def cache_prefix_units(
         self,
         messages: list[ContextBlock],
         **kwargs: Any,
-    ) -> tuple[bytes, ...]: ...
+    ) -> tuple[bytes, ...] | None: ...
 
 
 def _stable_json_bytes(value: object) -> bytes:

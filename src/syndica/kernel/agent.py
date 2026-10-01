@@ -849,8 +849,10 @@ class BaseAgent:
         messages = request['messages']
         kwargs = {key: value for key, value in request.items() if key != 'messages'}
         try:
-            with llm_attempt(self.options.llm):
-                return await self.options.llm.create(messages, **kwargs)
+            with llm_attempt(self.options.llm) as attempt:
+                reply = await self.options.llm.create(messages, **kwargs)
+                attempt.observe(reply)
+                return reply
         except ContextOverflowError as exc:
             outcome = await self._hooks.trigger(
                 Junction.CONTEXT_OVERFLOW, ctx=ctx, request=request, error=exc

@@ -331,13 +331,13 @@ async def test_foreign_tool_calls_carry_nothing_when_no_placeholder_is_configure
     assert 'extra_content' not in assistant
 
 
-async def test_a_reply_without_provider_extras_adds_nothing_to_extra() -> None:
+async def test_a_reply_without_provider_extras_keeps_nothing_to_send_back() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: _response())) as client:
         reply = await OpenAICompatible(_config(), client=client).create(
             [ContextBlock(role='user', content='go')]
         )
 
-    assert reply.extra == {}
+    assert sorted(reply.extra) == ['finish_reason', 'usage']
 
 
 def test_foreign_tool_call_extra_must_be_a_json_object() -> None:
@@ -706,6 +706,127 @@ async def test_response_parses_text_and_tool_calls() -> None:
     assert result.role == 'assistant'
     assert result.content == 'working'
     assert result.tool_calls == [ToolCall(id='call-9', name='Read', arguments='{"path":"a.txt"}')]
+
+
+_ABSENT = object()
+
+
+def _completion(*, usage: object = _ABSENT, finish_reason: object = _ABSENT) -> httpx.Response:
+    choice: dict[str, Any] = {'message': {'role': 'assistant', 'content': 'done'}}
+    if finish_reason is not _ABSENT:
+        choice['finish_reason'] = finish_reason
+    body: dict[str, Any] = {'choices': [choice]}
+    if usage is not _ABSENT:
+        body['usage'] = usage
+    return httpx.Response(200, json=body)
+
+
+async def _reply_to(response: httpx.Response) -> ContextBlock:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response)) as client:
+        return await OpenAICompatible(_config(), client=client).create(
+            [ContextBlock(role='user', content='go')]
+        )
+
+
+_NO_COUNTS = {'input_tokens': None, 'output_tokens': None, 'cached_input_tokens': None}
+
+
+@pytest.mark.parametrize(
+    ('usage', 'expected'),
+    [
+        (
+            {
+                'prompt_tokens': 120,
+                'completion_tokens': 7,
+                'prompt_tokens_details': {'cached_tokens': 96},
+            },
+            {'input_tokens': 120, 'output_tokens': 7, 'cached_input_tokens': 96},
+        ),
+        (
+            {'prompt_tokens': 120, 'completion_tokens': 0},
+            {'input_tokens': 120, 'output_tokens': 0, 'cached_input_tokens': None},
+        ),
+        (
+            {'completion_tokens': 7, 'prompt_tokens_details': None},
+            {'input_tokens': None, 'output_tokens': 7, 'cached_input_tokens': None},
+        ),
+        (_ABSENT, _NO_COUNTS),
+        (None, _NO_COUNTS),
+        ('12 tokens', _NO_COUNTS),
+        (
+            {
+                'prompt_tokens': True,
+                'completion_tokens': -1,
+                'prompt_tokens_details': {'cached_tokens': 3.0},
+            },
+            _NO_COUNTS,
+        ),
+        (
+            {'prompt_tokens': 2**63, 'completion_tokens': 2**63 - 1},
+            {'input_tokens': None, 'output_tokens': 2**63 - 1, 'cached_input_tokens': None},
+        ),
+    ],
+    ids=[
+        'all',
+        'no-cache-detail',
+        'partial',
+        'absent',
+        'null',
+        'not-an-object',
+        'wrong-types',
+        'int64-bounds',
+    ],
+)
+async def test_the_reply_carries_the_token_counts_the_endpoint_reported(
+    usage: object, expected: dict[str, int | None]
+) -> None:
+    reply = await _reply_to(_completion(usage=usage))
+
+    assert reply.extra['usage'] == expected
+
+
+@pytest.mark.parametrize(
+    ('finish_reason', 'expected'),
+    [('stop', 'stop'), ('length', 'length'), (_ABSENT, None), (None, None), (3, None)],
+    ids=['stop', 'length', 'absent', 'null', 'not-a-string'],
+)
+async def test_the_reply_carries_the_finish_reason(finish_reason: object, expected: str | None):
+    reply = await _reply_to(_completion(finish_reason=finish_reason))
+
+    assert reply.extra['finish_reason'] == expected
+
+
+async def test_token_counts_and_finish_reason_are_never_sent_back_to_the_model() -> None:
+    async def second_body(first: httpx.Response) -> bytes:
+        seen: list[httpx.Request] = []
+        replies = [first, _response()]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return replies.pop(0)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatible(_config(), client=client)
+            reply = await llm.create([ContextBlock(role='user', content='go')])
+            await llm.create(
+                [
+                    ContextBlock(role='user', content='go'),
+                    reply,
+                    ContextBlock(role='user', content='and then?'),
+                ]
+            )
+        return seen[1].content
+
+    counted = _completion(
+        usage={
+            'prompt_tokens': 9,
+            'completion_tokens': 4,
+            'prompt_tokens_details': {'cached_tokens': 2},
+        },
+        finish_reason='stop',
+    )
+
+    assert await second_body(counted) == await second_body(_completion())
 
 
 async def test_malformed_response_is_a_three_part_llm_error() -> None:
