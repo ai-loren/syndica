@@ -434,7 +434,7 @@ commit-msg 钩子可能追加内容）写进 handoff。
   run 中途新建的 `.env`）变成「新改动」；
 - `workspace.protected`：一组相对工作区根的 glob。`**` 跨任意层目录，`*` 与 `?` 不跨 `/`，对 POSIX 形式的
   相对路径做整串匹配（不用 `PurePath.match`：3.11 的它不递归 `**`）。本仓配置保护 `pyproject.toml`、
-  `uv.lock`、`**/conftest.py`、`pytest.ini`、`.pytest.ini`、`pyrightconfig.json`、`**/ruff.toml`、
+  `uv.lock`、`uv.toml`、`.python-version`、`**/conftest.py`、`pytest.ini`、`.pytest.ini`、`pyrightconfig.json`、`**/ruff.toml`、
   `**/.ruff.toml`、`setup.cfg`、`tox.ini`、`scripts/**`、`.syndica.yaml`、`docs/agents/**`、
   `.github/**`、`AGENTS.md`——它们决定了「检查通过」是什么意思，Agent 改它们等于改考卷。
 
@@ -465,18 +465,26 @@ PATH 里指向工作区的目录）不跑：只有 `run --handoff` 与 `doctor -
 
 提示词要求：
 
-- Worker 与 Reviewer 先读 `AGENTS.md` 的硬约束、错误消息、测试三节（先 Grep 节标题再按行读，不整篇
-  读——整篇约 50 KB，几个 Agent 各读一遍会撞免费档的每分钟 token 上限）；
-- 不执行 git 写命令（提交与推送由宿主在人选择之后做）；
-- 跑检查时用 Bash 工具的 `timeout` 参数（全量测试给 300 秒），加 `-q --tb=short`；只写 POSIX sh（CI 的
-  `/bin/sh` 是 dash；本机没有 `timeout` 命令）；读代码用 Read / Grep，不用以 `/` 开头的 sed / awk 脚本；
-  不在工作区外建临时文件（D3 的已知误报）；
-- Worker 每次改动后跑最小相关测试；
-- Reviewer 看 `git diff`，按硬约束逐条过，不改任何文件（包括不跑格式化这类会写文件的命令），单独一行写
-  `verdict: <pass|partial|block|unverified>` 并给理由；
-- Orchestrator 按「Planner → Explorer → Worker → Reviewer」推进。Reviewer 给 `block` 时，另派一个新的
-  Worker 并把理由与上下文写进派活内容，而不是给原 Worker 发消息（M1 的轮数跨消息累计、不重置）；Worker
-  改完一定再派一次 Reviewer；最终回答里单独一行给出 `commit_title: <一句话>`。
+- Worker 与 Reviewer 先读 `AGENTS.md` 的硬约束、错误消息两节，「测试」一节只读开头的表格（先 Grep `^##`
+  拿节标题与行号再按行读——「测试」一节约 41 KB、占全文八成，大半是变异验证的经验，读进来之后每一轮都留在
+  上下文里，几个 Agent 各读一遍会撞免费档的每分钟 token 上限）；AGENTS.md 里给人做的步骤（真去改坏代码
+  验证、新文件先 `git add`）在这里不适用；
+- 不执行 git 写命令（提交与推送由宿主在人选择之后做）；只读的 `git status / diff / log / show` 可以用，
+  `git branch`、`git stash list` 会被拦下；
+- 跑检查时用 Bash 工具的 `timeout` 参数（全量测试给 300 秒），加 `-q --tb=short`，不放到后台跑；只写
+  POSIX sh（CI 的 `/bin/sh` 是 dash；本机没有 `timeout` 命令）；每次 Bash 都从工作区根开始（命令里的 `cd`
+  不跟踪，`cd src && … && cd ..` 会被当成越界，要在子目录里跑就用 Bash 的 cwd 参数）；读代码用 Read / Grep，
+  不用以 `/` 开头的 sed / awk 脚本；不在工作区外建临时文件（D3 的已知误报），长输出存到 `.syndica/tmp/` 下；
+- Worker 每次改动后跑最小相关测试，收尾前把六道门禁都跑一遍（本仓用单引号，`ruff format --check` 没过就
+  `ruff format` 修好）——没有这一条，模型写出的双引号代码一律在复核的第一道门上失败；
+- Reviewer 先 `git diff --stat` 再按文件看 diff（整份太长会被截断），按硬约束逐条过，测试够不够强靠读来判断；
+  不改任何文件（包括不跑格式化这类会写文件的命令）、不放后台命令、不派活——三者任一都让它的结论不算数；
+  单独一行写 `verdict: <pass|partial|block|unverified>` 并给理由，且知道只有 pass 会让宿主提供提交；
+- Orchestrator 按「Planner → Explorer → Worker → Reviewer」推进。Reviewer 给 `block` 或 `partial` 时，另派
+  一个新的 Worker 并把理由与上下文写进派活内容，而不是给原 Worker 发消息（M1 的轮数跨消息累计、不重置）；
+  Worker 改完一定再派一次 Reviewer，每次评审都派新的 Reviewer（同样是轮数累计：第二次评审用完轮数，结论就
+  不算数）；最终回答里单独一行给出 `commit_title: <一句话>`。示例里的标题写成占位符，不给一个能被照抄进
+  历史的真实标题。
 
 **D18 `scripts/check_links.py`。** 检查 Markdown 相对链接指向的文件存在（锚点不查），跳过外链、纯锚点、
 围栏代码块与行内代码；进本仓 verify 与 CI。
@@ -908,6 +916,16 @@ FIFO 跳过，输出固定 UTF-8。与旧版在八个兄弟仓上差分，唯一
 ### 阶段三：角色、验收与收口
 
 #### T15 — `syndica-dev`：本仓项目配置、提示词、Reviewer
+
+**状态：completed**（本地验证协议：定向用例与六道门禁全绿。对抗评审确认配置与 D15、D17 逐字一致，找出
+2 High / 7 Medium，都在提示词里：「不整篇读」实际仍要读 84% 的 AGENTS.md（「测试」一节 41 KB）；没有哪个
+角色被要求过第一道门禁 `ruff format --check`，模型写出的双引号代码会一律复核失败；Reviewer 会因后台命令、
+派活或第二次评审用完轮数而让自己的结论作废，提示词都没挡；`partial` 被说成「不阻塞」，而只有 pass 才提供
+提交；计划要 T15 写进提示词的两条（每次 Bash 从工作区根开始、`git branch` 会被拦）漏了。逐条写进提示词，
+D17 同步；`uv.toml` 与 `.python-version` 进受保护路径。用例按评审补上各角色确切的工具表、拓扑确切的槽、
+更深一层的受保护路径、每条提示词要求一个锚词、无 BOM、提示词引用的 AGENTS.md 节确实存在、Worker 列出全部
+六道门禁。相对的 `--config` 改为按工作区根解析：根目录有了 `.syndica.yaml` 之后，从仓库里跑的宿主用例不能
+再读到它。两轮变异共 60 条全部杀死。Linux 补跑待 CI 额度恢复）
 
 **Files:** `.syndica.yaml`、`docs/agents/{orchestrator,planner,explorer,worker,reviewer}.md`、
 `tests/cli/test_repo_config.py`。

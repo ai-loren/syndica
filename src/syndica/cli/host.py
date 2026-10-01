@@ -979,9 +979,11 @@ class RuntimeCliHost:
         self._runner.close()
 
     def _config(self, path: str) -> CliConfig:
-        file = Path(path)
+        """相对路径按工作区根解析：配置属于工作区，不属于进程碰巧所在的目录（`python -m syndica`
+        的工作区就是当前目录，两者一致）。"""
+        file = self._workspace_root / path
         if path == '.syndica.yaml' and not file.exists():
-            return _default_config(file)
+            return _default_config(Path(path))
         return load_config(file)
 
     def _open_workspace(self, config: CliConfig) -> tuple[LocalWorkspace, AgentEnvironment]:
