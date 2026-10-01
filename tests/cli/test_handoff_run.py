@@ -148,6 +148,78 @@ def _run(
     return _Run(code, stdout.getvalue(), stderr.getvalue(), root)
 
 
+def test_a_topology_run_hands_off_like_a_single_agent_run(tmp_path: Path):
+    root = _workspace(tmp_path)
+    config = _config(tmp_path, verify=['true'])
+    slot = {'name': 'root', 'agent': 'Lead', 'is_root': True, 'cardinality': 'singleton'}
+    with config.open('a', encoding='utf-8') as file:
+        file.write(f'topologies: {json.dumps({"dev": {"slots": [slot]}})}\n')
+    stdout, stderr = StringIO(), StringIO()
+    io = CliIO(stdin=StringIO(''), stdout=stdout, stderr=stderr)
+    llm = _reviewed()
+    host = RuntimeCliHost(
+        io=io, model_factory=lambda _: llm, workspace_root=root, environ=_env(tmp_path)
+    )
+    try:
+        code = main(
+            ['--config', str(config), 'run', '--handoff', '--topology', 'dev', 'work on it'],
+            host=host,
+            io=io,
+        )
+    finally:
+        host.close()
+    run = _Run(code, stdout.getvalue(), stderr.getvalue(), root)
+
+    assert run.code == 0
+    assert run.matter['status'] == 'verified'
+    assert (run.matter['host_verify'], run.matter['reviewer_verdict']) == ('passed', 'pass')
+    assert '- `??` src/new.py\n' in run.stdout
+    (path,) = run.files
+    assert path.read_text(encoding='utf-8') == run.stdout
+
+
+def test_a_topology_root_that_runs_out_of_turns_is_a_failed_run(tmp_path: Path):
+    root = _workspace(tmp_path)
+    config = _config(tmp_path, verify=['true'])
+    slot = {'name': 'root', 'agent': 'Lead', 'is_root': True, 'cardinality': 'singleton'}
+    with config.open('a', encoding='utf-8') as file:
+        file.write(f'topologies: {json.dumps({"dev": {"slots": [slot]}})}\n')
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('w', 'Write', path='src/new.py', content='NEW = 1\n')]),
+            ScriptedTurn(content='half done', tool_calls=[_call('b', 'Bash', command='true')]),
+        ]
+    )
+    stdout = StringIO()
+    io = CliIO(stdin=StringIO(''), stdout=stdout, stderr=StringIO())
+    host = RuntimeCliHost(
+        io=io, model_factory=lambda _: llm, workspace_root=root, environ=_env(tmp_path)
+    )
+    try:
+        code = main(
+            [
+                '--config',
+                str(config),
+                'run',
+                '--handoff',
+                '--topology',
+                'dev',
+                '--max-turns',
+                '2',
+                'work on it',
+            ],
+            host=host,
+            io=io,
+        )
+    finally:
+        host.close()
+    run = _Run(code, stdout.getvalue(), '', root)
+
+    assert run.code == 1
+    assert (run.matter['status'], run.matter['host_verify']) == ('run_failed', 'skipped')
+    assert '根 Agent 以 max_turns 结束' in run.stdout
+
+
 def test_a_verified_run_prints_the_handoff_once_and_writes_the_same_file(tmp_path: Path):
     root = _workspace(tmp_path)
 
