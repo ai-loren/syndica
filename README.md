@@ -8,7 +8,7 @@ acceptance criteria, and eventually training-data export.
 
 > Status: **pre-release**.
 >
-> Milestone 1 is complete on `main`. The project is still pre-v1.0, so public APIs may
+> Milestones 1 and 2 are complete on `main`. The project is still pre-v1.0, so public APIs may
 > change until the release boundary is frozen.
 
 ## Why Syndica Exists
@@ -46,6 +46,19 @@ Milestone 1 provides a working local multi-agent kernel:
 - OpenAI-compatible LLM backend.
 
 Milestone 1 audit: [`docs/audits/2026-09-23-m1-final-audit.md`](docs/audits/2026-09-23-m1-final-audit.md).
+
+Milestone 2 makes Syndica able to change its own repository under a host that checks the work (see
+[Development Mode](#development-mode)):
+
+- `run --handoff`: the host re-runs the project's verify commands, takes the Reviewer's verdict only
+  from a review of the final tree, writes a redacted handoff, and commits or pushes only after a
+  human chooses to.
+- `run --no-write` for read-only planning, `doctor --verify`, and this repository's own
+  `syndica-dev` roles, prompts, and topology.
+- Guards for every CLI run: an allowlisted command environment, unconditional blocks on Git writes and
+  removing the workspace root, process-group cleanup and output limits for commands and searches.
+
+Milestone 2 audit: [`docs/audits/2026-10-01-m2-final-audit.md`](docs/audits/2026-10-01-m2-final-audit.md).
 
 ## Install From Source
 
@@ -258,6 +271,95 @@ Important current limits:
 - Cross-process `--session` recovery and `syndica sessions ...` require the SessionStore planned
   for Milestone 6.
 
+## Development Mode
+
+Milestone 2 lets a team of agents change a repository, including this one, while the host process
+(the CLI itself, not a model) checks the result and a human decides what reaches Git history:
+
+```bash
+syndica run --handoff --topology syndica-dev "add the missing test for ..."
+syndica run --no-write --handoff --agent Planner "plan how to ..."
+syndica doctor --verify
+```
+
+This repository's own roles, prompts, and topology live in [`.syndica.yaml`](.syndica.yaml) and
+[`docs/agents/`](docs/agents/). A project enables the host checks with a `workspace` section:
+
+```yaml
+workspace:
+  verify:                      # run by the host after the agents finish, and by doctor --verify
+    - uv run ruff format --check .
+    - uv run pytest -q
+  protected: [pyproject.toml, "scripts/**"]   # changes here are never committed unattended
+  pass_env: [NO_COLOR]         # extra variables agents may see, beyond the fixed allowlist
+```
+
+**What every CLI run enforces.**
+
+- Agents' commands see only `PATH HOME USER LOGNAME LANG LC_ALL LC_CTYPE TMPDIR XDG_CACHE_HOME
+  UV_CACHE_DIR`, `workspace.pass_env`, and six Git and `gh` settings the host adds. A name that
+  looks like a secret is refused even in `pass_env`: one of its `_`-separated words is `KEY`,
+  `TOKEN`, `SECRET`, `PASSWORD`, `AUTH`, `SESSION` or a similar word, or ends in `KEY`, `TOKEN`,
+  `SECRET`, `PASSWORD` or `PASSWD` (`SSH_AUTH_SOCK` counts, so agents get no ssh agent; so does
+  `MONKEY_MODE`). Git and `gh` get a per-run configuration, so agents cannot use your credential
+  helpers, aliases, hooks, or `gh` login.
+- Git commands that change state (`commit`, `push`, `checkout`, `-c ...`, anything under `.git/`) and
+  `rm` of the workspace root are blocked unconditionally, also behind the wrappers the rules know
+  (`env`, `nice`, `nohup`, `setsid`, `timeout`, `sudo`, `command`, `exec` and others) and launchers
+  such as `uv run`. The rules read command text, so a command hidden inside `sh -c "..."`, `eval`,
+  `xargs`, `find -exec`, a script, or a variable is not recognised, and neither is
+  `find . -delete`. File tools refuse to write inside `.git/`.
+- A command that touches a path outside the workspace asks you while the agent has not yet read any
+  command output. After that, the trajectory counts as untrusted and such commands are rejected;
+  `--flag untrusted_high_risk=ask` asks instead. `untrusted_high_risk=allow` is refused.
+
+**What `run --handoff` adds.** After the agents finish, the host runs every `workspace.verify`
+command itself; what an agent says it ran is listed but never trusted. It accepts a Reviewer's
+`verdict:` line only from a Reviewer run that completed, changed nothing, and saw exactly the tree
+that was verified; among those, the one that finished last counts. The handoff (goal, changes, checks the agents ran, host verification,
+the agents' conclusion, next steps, Git outcome) is redacted, written to
+`.syndica/handoffs/<time>-<id>.md` with mode 0600, and printed to stdout. Only one `--handoff` run
+can hold a workspace at a time.
+
+When verification passed and the Reviewer said `pass`, the host shows the branch, upstream, commit
+title, and changed paths, then asks:
+
+```text
+1  commit and push      2  commit only      3  I'll handle it
+```
+
+End of input, an empty line, or anything else means `3`, so a run with `</dev/null` never commits.
+`--git-mode commit|push|manual` answers in advance for unattended runs; `commit` and `push` exit 3
+without touching Git when their preconditions do not hold (a failed run or failed verification
+still exits 1). The host commits only the paths this run changed, scans the
+added lines for secrets first, runs your commit hooks with the agents' environment rather than yours,
+and checks the resulting commit before pushing that commit to the recorded upstream with local
+hooks off and never with `--force`. Push is not offered when there is no upstream, when a
+`pre-push` or `reference-transaction` hook exists (push it yourself so your hook runs), when the
+workspace had changes before the run, or when local commits were already ahead of the upstream.
+
+`run --no-write` keeps only `Read Grep Glob AskUser AskUserQuestion` (orchestration tools such as
+`Delegate` stay) and never verifies or commits. Exit codes: `0` success; `1` the run failed, verification failed, the workspace is busy,
+or a commit or push that had started failed; `2` usage error; `3` `--git-mode` preconditions not
+met.
+
+**Trust and threat model.** `.syndica.yaml` is code you run: `run --handoff` and `doctor --verify`
+execute `workspace.verify` on your machine without danger checks, so using them in a repository you
+do not trust is the same as running its test scripts. Changes to protected paths (always
+`.gitignore` and `.gitattributes`, plus `workspace.protected`) are highlighted and block
+`--git-mode` commits, because they decide what "checks passed" means.
+
+These guards stop the common forms of an agent's mistakes (deleting the repository, pushing,
+rewriting Git state), naive prompt injection ("read `~/.config/...`", "push this"), and secrets
+leaking through the agents' environment or the handoff. They do not stop a command written in a form
+the rules cannot read (see above), whether by accident or on purpose, nor an agent that has been
+persuaded to evade them: code it writes or runs (`python -c`, `sh -c`, `ssh`, and the tests the host
+verifies) can read any file your user can
+read, reach the network, read the host process's environment and your login keychain, and use
+credential files under `HOME` (`~/.netrc`, `~/.npmrc`). Processes that call `setsid` escape process
+group cleanup. The real boundary is the sandbox planned for Milestone 5; until then, use development
+mode only on trusted input such as your own repository and prompts.
+
 ## CLI Reference
 
 ```text
@@ -267,7 +369,7 @@ syndica agents list | show <name>
 syndica topology list | show <name>
 syndica flags list | show <key>
 syndica sessions list | show <id> | resume <id> | rm <id>   # reserved for M6
-syndica doctor
+syndica doctor [--verify]
 syndica version
 ```
 
@@ -282,10 +384,15 @@ syndica version
 --max-tokens <n>
 --max-wall-clock <seconds>
 --flag <key=value>        repeatable
+--no-write                read-only tools only
+--handoff                 host verification, a redacted handoff file, and the Git question
+--git-mode <mode>         commit | push | manual, answered in advance; requires --handoff
 ```
 
-`--agent`, `--topology`, and `--session` are mutually exclusive. `--flag` keys are validated
-against installed Runtime Module declarations.
+`--agent`, `--topology`, and `--session` are mutually exclusive, and `--no-write` excludes
+`--session` and `--git-mode`. `--flag` keys are validated against installed Runtime Module
+declarations. `doctor` checks the configuration, models, workspace, the agents' environment, Git,
+Python, and every executable the verify commands use; `--verify` then runs each verify command.
 
 ## Architecture
 
@@ -380,7 +487,7 @@ The v1.0 roadmap has 12 internal milestones:
 | # | Milestone | Status |
 |---|---|---|
 | 1 | Kernel skeleton | Done |
-| 2 | Self-bootstrapping | Planned |
+| 2 | Self-bootstrapping | Done |
 | 3 | Observability + redaction | Planned |
 | 4 | Complete extension system | Planned |
 | 5 | Complete execution layer + provenance | Planned |

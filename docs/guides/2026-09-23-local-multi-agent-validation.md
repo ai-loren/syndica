@@ -1,6 +1,7 @@
 # Syndica 本地 Multi-Agent 体验与验证流程
 
-本文用于在本地快速体验 Syndica 里程碑 1 的 multi-agent 能力，并判断每一步是否符合预期。
+本文用于在本地快速体验 Syndica 里程碑 1 的 multi-agent 能力与里程碑 2 的自举（第 10 步），并判断每一步
+是否符合预期。
 
 当前状态：Syndica 已支持真实 OpenAI-compatible / Gemini / OpenRouter 模型调用，配了多个平台时自动
 组成轮换；也支持不联网的 scripted L2 场景回放。真实模型体验依赖 Gemini 或 OpenRouter 的 API key 与
@@ -340,7 +341,51 @@ uv run pytest tests/runner/test_scenario.py tests/integration/test_cli_human_sce
 
 ---
 
-## 10. 当前已知限制
+## 10. 自举：让 Agent 团队改仓库（里程碑 2）
+
+目的：验证 Agent 团队按本仓的 `syndica-dev` 拓扑改代码、宿主独立复核、写交接文件、由你决定提交与
+推送。第一次在仓库副本里跑，不在你正在用的仓库里跑：
+
+```bash
+git clone /Users/loren/Documents/loren/syndica /tmp/syndica-copy
+cd /tmp/syndica-copy
+git remote remove origin
+git init -q --bare /tmp/syndica-copy.git
+git remote add origin /tmp/syndica-copy.git
+git push -q -u origin main
+uv sync --locked --extra openai --extra dev
+
+uv run python -m syndica doctor --verify
+uv run python -m syndica run --no-write --handoff --agent Planner "规划：……（点名要看的文件）"
+uv run python -m syndica run --handoff --topology syndica-dev "……（点名要改的文件与函数）"
+```
+
+符合预期：
+
+- `doctor --verify` 对 `.syndica.yaml` 里的每条 verify 命令各一行，全部 passed。
+- `--no-write` 的 run：交接文件 `status: read_only`，没有复核与 git 收尾。
+- 拓扑 run：stderr 先打出交接文件的路径；复核全过且 Reviewer 给了 pass 时，接着打出 git 收尾的摘要
+  （分支、上游、提交标题、改动列表）与「1 提交并推送 / 2 只提交 / 3 我来处理」；回答之后 stdout 是
+  完整的交接文件，`.syndica/handoffs/` 下有同一份（权限 0600）。
+- 回答之前自己看一遍 `git diff`：宿主复核与 Reviewer 都看不出「删掉了一条无关的用例」——删了用例，
+  测试照样是绿的。
+
+不符合预期 / 常见情况：
+
+- 只有 2 和 3：推送没有提供，摘要写了原因——没有上游；钩子目录里有 `pre-push`（全局 `core.hooksPath`
+  指向的目录也算，推送要用你的 ssh agent，宿主不替你的钩子做决定）；运行前工作区里就有改动；本地已有
+  没推的提交。
+- `status: verification_failed`：宿主复核没过，看「宿主复核」一节；「Agent 的结论」里说全部通过不算数。
+- `status: unverified`：没有可用的 Reviewer pass（没派 Reviewer、它之后又有改动、它自己改了文件）。
+- `status: run_failed` 且写着用完了轮次预算：免费模型常一轮只调一个工具。把需求拆小，在需求里点名文件
+  与函数。
+- 一次 run 用几十到上百次请求：一个 Worker 最多 30 轮，用完还会另派一个。Gemini 免费档的每分钟请求数与
+  token 数先撞上限，轮换把请求交给 OpenRouter，而 OpenRouter 一天只有 50 次。
+- Ctrl-C 中断的 run 不留交接文件：交接文件在 Agent 都结束之后才写。
+
+---
+
+## 11. 当前已知限制
 
 - OpenRouter 免费模型每天有额度限制。`free-models-per-day` 429 是外部额度耗尽，不是 Syndica 逻辑
   错误。Gemini 免费档同样按型号限额。

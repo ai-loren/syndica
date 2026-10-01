@@ -36,22 +36,22 @@ agents:
     description: 划定范围、要改的文件、验证方式与成功判据时用我；我不改文件
     system_prompt: docs/agents/planner.md
     tools: [Read, Grep, Glob]
-    budget: {turns: 8}
+    budget: {turns: 16}
   - name: Explorer
     description: 定位文件、符号、调用点与相关测试时用我；我不改文件
     system_prompt: docs/agents/explorer.md
     tools: [Read, Grep, Glob]
-    budget: {turns: 10}
+    budget: {turns: 16}
   - name: Worker
     description: 改文件、跑检查、用检查结果验证时用我
     system_prompt: docs/agents/worker.md
     tools: [Read, Grep, Glob, Write, Edit, Bash, BashOutput, KillBash]
-    budget: {turns: 24}
+    budget: {turns: 30}
   - name: Reviewer
     description: Worker 改完之后审改动时用我；我不改文件，最后一行给出 verdict
     system_prompt: docs/agents/reviewer.md
     tools: [Read, Grep, Glob, Bash]
-    budget: {turns: 10}
+    budget: {turns: 16}
   - name: Orchestrator
     description: 把一项改动按 Planner、Explorer、Worker、Reviewer 推进到可以交接，自己不改文件
     impl: syndica.kernel.agents.orchestrator:Orchestrator

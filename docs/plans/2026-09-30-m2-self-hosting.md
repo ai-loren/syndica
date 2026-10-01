@@ -3,7 +3,7 @@
 > **执行者须知：本文件是需求，不是参考。** 「公开契约」一节里的 CLI 参数、配置键、规则 ID、标记行、
 > front matter 字段与内核 API 一旦发布就是兼容承诺；执行中不得为了让测试变绿临时改名或缩小断言范围。
 
-**状态：已评审，执行中（T1–T17 完成，阶段一、阶段二已审计）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
+**状态：已完成（T1–T18），阶段一、阶段二与[收口审计](../audits/2026-10-01-m2-final-audit.md)已完成。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
 2026-10-01，见「决策日志」）。GitHub Actions 本月免费额度已用完，恢复之前按「验证」一节的本地验证协议执行。
 
 **Goal:** 让 Syndica 在一份仓库里完成一次受控修改：读约束、规划、改文件、跑检查、读失败、迭代修复，
@@ -260,7 +260,10 @@ handoff 的状态是 `read_only`。依据路线图静态验收「写工具不可
 - **输出上限**：`local_tools(portal, *, output_limit=None)`；给定时 Bash 与 BashOutput 对 stdout、stderr
   **分别**截断，每条流保留前 20% 与后 80%，中间一行说明截掉多少、怎么看被截掉的部分（重定向到文件再用
   grep / `sed -n` / tail，Read 拒读超过 1 MiB 的文件），`truncated` 如实为 true。CLI 传每条流 10,000 字符。
-  按流截断是承重的：pytest 的汇总在 stdout 末尾，而渲染文本里 stderr 排在最后。
+  按流截断是承重的：pytest 的汇总在 stdout 末尾，而渲染文本里 stderr 排在最后。T18 起 Glob 与 Grep 同受这个
+  上限约束：结果按顺序只列放得下的几条，最后一条写明共几条、怎么缩小（第一条就放不下时截短它并说明）；
+  `LocalWorkspace` 的搜索不进以 . 开头的目录与文件（模式或 path 点了名的除外），Grep 跳过开头 8 KiB 里有
+  NUL 的文件——真实运行里一次 `Grep` 交回过约 16 万 token，而只加上限时排在最前的全是 `.git` 与字节码。
 - **`.git/` 保护**：文件工具拒写路径分量里有 `.git` 的位置，比较不分大小写（APFS 默认不区分大小写，
   `.GIT/hooks/x` 就是真的 hooks 目录）；`.git` 是文件（worktree）时同样拒写。命令的 `cwd` 同样不能落在
   `.git` 里：危险规则只看命令文本，从 `.git` 里出发的 `printf x >> config`、`rm -r objects` 不带 `.git` 这一段。
@@ -355,7 +358,7 @@ handoff 的状态是 `read_only`。依据路线图静态验收「写工具不可
 `-c core.fsmonitor=false` 与 `--attr-source=HEAD`（工作树里 Agent 写的 `.gitattributes` 选不中配置里的
 filter 驱动，需要 git 2.40 以上）；以参数数组直接调 git，不经 shell；stdin 接 `/dev/null`（提交消息除外）；
 本地操作超时 60 秒、推送 120 秒。**提交（`git add`、`git commit` 与撤回暂存）在 Agent 的环境里跑**，只把
-git 配置的位置（`GIT_CONFIG_GLOBAL`、`GIT_CONFIG_NOSYSTEM`）换回宿主的，再加上面三个变量与
+git 配置的位置（`GIT_CONFIG_GLOBAL`、`GIT_CONFIG_NOSYSTEM`、`XDG_CONFIG_HOME`）换回宿主的，再加上面三个变量与
 `GIT_TRACE2_EVENT=0`：钩子与配置里的程序（`gpg.program` 之类）执行的往往是工作区里 Agent 能改的代码
 （husky、lint-staged、pre-commit 框架、`npm test`），在宿主环境里跑等于把 ssh agent 与全部密钥交给 Agent；
 在 Agent 的环境里跑，它们只拿到 Agent 本来就有的东西，身份、钩子目录与签名照旧来自宿主的配置。工作区可以在
@@ -387,8 +390,9 @@ Reviewer（包括从来没有派过 Reviewer）时结论是 `unverified`。hando
 - 本次有改动；没有「运行前已改动、本次又改」的文件；没有运行前被忽略的文件出现在改动里；受保护路径
   （D15）没有改动——这一条只挡 `--git-mode`，交互询问时醒目列出，由人决定。
 
-推送另要求：有上游；钩子目录里没有推送时在本地运行的钩子（`pre-push`、`reference-transaction`：推送要用
-宿主的 ssh agent 与凭证，钩子会拿到它们）；运行前工作区里没有改动（复核时它们在场、提交里没有它们，这个
+推送另要求：有上游；钩子目录里没有推送时在本地运行的钩子（`pre-push`、`reference-transaction`，只算有执行位
+的，名字不分大小写——APFS 上 `Pre-Push` 跑起来就是 `pre-push`：推送要用宿主的 ssh agent 与凭证，钩子会拿到
+它们）；运行前工作区里没有改动（复核时它们在场、提交里没有它们，这个
 提交没有被单独复核过）；提交前 `git rev-list @{u}..HEAD` 为空（不顺带推走人以前没推的提交）。只满足提交的
 前置条件时，只提供「只提交」与「我来处理」，并说明为什么没有推送选项。
 
@@ -471,12 +475,18 @@ PATH 里指向工作区的目录）不跑：只有 `run --handoff` 与 `doctor -
   验证、新文件先 `git add`）在这里不适用；
 - 不执行 git 写命令（提交与推送由宿主在人选择之后做）；只读的 `git status / diff / log / show` 可以用，
   `git branch`、`git stash list` 会被拦下；
-- 跑检查时用 Bash 工具的 `timeout` 参数（全量测试给 300 秒），加 `-q --tb=short`，不放到后台跑；只写
+- 每一轮是一次请求而 Agent 看不到还剩几轮（M1 的限制，可感知预算归 M8）：互不依赖的只读调用放在同一轮里
+  一起发出，需求里点名的文件直接读、不先 Glob——T18 的第一次真实运行里，Planner 每轮只调一个工具，8 轮全用在
+  Grep、Glob 与 Read 上，没写出计划就用完了预算；
+- 跑检查时用 Bash 工具的 `timeout` 参数（全量测试给 900 秒：本机空闲时全量约 290 秒，机器忙时实测 432 秒），
+  加 `-q --tb=short`，不放到后台跑；只写
   POSIX sh（CI 的 `/bin/sh` 是 dash；本机没有 `timeout` 命令）；每次 Bash 都从工作区根开始（命令里的 `cd`
   不跟踪，`cd src && … && cd ..` 会被当成越界，要在子目录里跑就用 Bash 的 cwd 参数）；读代码用 Read / Grep，
   不用以 `/` 开头的 sed / awk 脚本；不在工作区外建临时文件（D3 的已知误报），长输出存到 `.syndica/tmp/` 下；
 - Worker 每次改动后跑最小相关测试，收尾前把六道门禁都跑一遍（本仓用单引号，`ruff format --check` 没过就
-  `ruff format` 修好）——没有这一条，模型写出的双引号代码一律在复核的第一道门上失败；
+  `ruff format` 修好）——没有这一条，模型写出的双引号代码一律在复核的第一道门上失败；门禁各跑各的、不用 `&&`
+  串成一条（前一道失败后面的不跑，交接文件也认不出那条命令是哪道检查），失败就照实写、无关的失败说清为什么
+  无关——T18 的文档场景里 Worker 把门禁串成一条，最终回答写「全量 4871 项全部通过」，而宿主复核有 2 条失败；
 - Reviewer 先 `git diff --stat` 再按文件看 diff（整份太长会被截断），按硬约束逐条过，测试够不够强靠读来判断；
   不改任何文件（包括不跑格式化这类会写文件的命令）、不放后台命令、不派活——三者任一都让它的结论不算数；
   单独一行写 `verdict: <pass|partial|block|unverified>` 并给理由，且知道只有 pass 会让宿主提供提交；
@@ -484,7 +494,14 @@ PATH 里指向工作区的目录）不跑：只有 `run --handoff` 与 `doctor -
   一个新的 Worker 并把理由与上下文写进派活内容，而不是给原 Worker 发消息（M1 的轮数跨消息累计、不重置）；
   Worker 改完一定再派一次 Reviewer，每次评审都派新的 Reviewer（同样是轮数累计：第二次评审用完轮数，结论就
   不算数）；最终回答里单独一行给出 `commit_title: <一句话>`。示例里的标题写成占位符，不给一个能被照抄进
-  历史的真实标题。
+  历史的真实标题；
+- T18 的真实运行之后补的，每条对应一次实测失败：Worker 开工先看 `git diff`（前一个 Worker 用完轮数时已经改过
+  文件，后一个又写了一份重复的用例）；Edit 的 old_string 只含要改的行（拿相邻用例的开头当锚点，把那条用例整个
+  换掉了）；大文件先 Grep 再一次读够（40～60 行一段地往下翻，两个 Worker 各用完 30 轮）；Bash 默认超时只有
+  30 秒，单个测试文件也要给 timeout（两次单文件 pytest 超时）；Reviewer 逐条看删掉的行（删掉一条无关用例时
+  全部测试照样是绿的，两个 Reviewer 都给了 pass，是人在提交前拦下的）；Orchestrator 派 Reviewer 时写进需求
+  原文（只说「审阅当前的 git diff」时，Reviewer 判断不了哪些改动超出了需求）；提交标题不超过 72 个字符（85 个
+  字符的标题被截成半句、带着省略号进了历史）。
 
 **D18 `scripts/check_links.py`。** 检查 Markdown 相对链接指向的文件存在（锚点不查），跳过外链、纯锚点、
 围栏代码块与行内代码；进本仓 verify 与 CI。
@@ -589,7 +606,8 @@ git 收尾完成之前的文件里（D13 第 5 步）；最终文件与 stdout �
 - `AgentCatalog.freeze(..., *, danger_judge=None, danger_policy=None)`；
   `Runtime.assemble(..., danger_judge=None, danger_policy=None)`。
 - `ExecResult` 追加 `timed_out: bool = False`；`LocalWorkspace.run` 超时时返回部分输出而不是抛错。
-- `local_tools(portal, *, output_limit=None)`；Bash 与 BashOutput 结果的 `meta`。
+- `local_tools(portal, *, output_limit=None)`；Bash 与 BashOutput 结果的 `meta`；`Glob(portal, *,
+  output_limit=None)` 与 `Grep(portal, *, output_limit=None)`（T18，`local_tools` 把同一个上限交给它们）。
 - `danger.py` 里的 `RuleTablePolicy` 与三个规则工厂（进 `_WITHHELD`）。
 
 ---
@@ -994,6 +1012,26 @@ locale、倒序各跑三遍）、不碰仓库、夹具不被任何工具当成�
 
 #### T18 — 真实模型 E2E、文档与收口
 
+**状态：completed**（本地验证协议：六道门禁全绿。四个场景在仓库副本里用默认轮换跑过，逐场景记录在
+[next-todos](./2026-09-23-next-todos.md) 的「真实模型 E2E 记录」：文档自举修对了断链，Worker 自称全量通过而宿主
+复核有 2 条失败，复核挡住了这次伪装成功；夹具包里的失败测试一次修好；`--no-write` 的 Planner 第一次 8 轮用完，
+调轮数与提示词之后交出计划，还指出需求里说缺的那条用例其实已经有了；本仓的真实小改动跑了三次——第一次
+`verified` 但 diff 删掉了一条无关的已有用例、两个 Reviewer 都给了 pass，人选 3；第二次一次 `Grep` 把约 16 万
+token 塞进上下文，中止；第三次 43 次请求（含 1 次 429）、23 分钟，`verified`，人看过 diff 选 1，宿主推到本地 bare remote，这个
+提交原样带进本仓（`a2d0af6`）。真实运行带出的改动：Glob 与 Grep 受 `output_limit` 约束、本地搜索默认不进以 .
+开头的目录与文件并跳过二进制文件（`4d1fd58`；对抗评审测出只加上限时，事故里那次搜索显示的 44 条全是
+`.pyc`）；提示词按每一次实测失败补齐，角色轮数调成 Planner 16、Explorer 16、Worker 30、Reviewer 16（D17）；
+`test_git_finish.py` 三个读钩子文件的用例给钩子留足启动时间（`fe6346a`）。D22 的真实 SSH 推送按用户的选择保留
+本机的 DLP `pre-push` 钩子：在 GitHub 上建临时分支并设为上游，脚本化的 `--handoff` 对着真实上游跑，宿主因
+pre-push 钩子不提供推送并写明原因，选 2 只提交；再用普通 `git push`（钩子照常运行）推上去、`ls-remote` 核对、
+删除分支。这一轮还测出摘要把 `pre-push` 列成了「提交时会运行的钩子」，改为只列提交会触发的、可执行的钩子，
+四条变异全杀。宿主经 SSH 推送那一段没有在真实远端跑过，登记为遗留。收口的对抗评审测出 README 把开发期
+拦截写成「无论怎么包装都拦」，而 `sh -c`、`eval`、`xargs`、`find -exec` 与 `find . -delete` 一条都不命中：改为
+照实列出认得与认不出的写法，扩大判定登记为遗留；spec §5.6 的「只多命中、不少命中」改为写明少认的几类；Worker
+提示词里「不传 limit 整个读完」不成立（Read 一次最多 2000 行、不提示）；钩子清单补上 `pre-auto-gc`、名字不分
+大小写，推送只看有执行位的钩子，提交环境沿用宿主的 `XDG_CONFIG_HOME`（否则快照看的钩子目录与提交跑的不是
+同一个），九条变异全杀。Linux 补跑待 CI 额度恢复）
+
 - 在副本里（D22）用默认轮换、`--handoff` 跑四个场景，每次记下请求数、额度与 429 次数、误报次数：
   1. 文档自举：修一处断链或过期描述，跑链接检查；
   2. 代码自举：夹具包里修一个失败测试；
@@ -1232,6 +1270,15 @@ GitHub Free 每月 2000 分钟的 Actions 额度在 2026-10 已经用完，下�
 - T17，场景 1 偶发失败：Worker 改错的那一版与改对的那一版等长，两次 Edit 常落在同一秒内，而 `.pyc` 按
   （mtime 秒, 字节数）判失效，第二次 pytest 用上了第一次的字节码，「改对之后测试通过」不成立。改错的那一版
   换成不等长的写法，原因写在用例里。AGENTS.md「测试」一节对变异验证记过同一现象，这次出现在场景用例本身。
+- T18，Glob 与 Grep 的结果没有上限（D9 只管了 Bash）：真实运行里一次 `Grep("run", "tests/cli")` 交回约 16 万
+  token，此后这个 Worker 的每一次请求都带着它们，Gemini 按每分钟 token 数拒绝，Worker 用完了轮数。加上限之后
+  对抗评审又测出本地搜索会进 `.git` 与 `__pycache__`，它们按字典序排在最前，同一次搜索显示的 44 条全是
+  `.pyc`、1035 条源码一条没有。两处一起修（`4d1fd58`）。L2 场景碰不到这一类：脚本化的模型不会发起宽泛的搜索。
+- T18，本机全局 `core.hooksPath`（`~/.git-hooks`）里的 `pre-push` 是企业 DLP 钩子（QQPCPolicyMgr，没有监管
+  通道时转调 `git lfs pre-push`）。按 D14，本机的任何仓库里宿主都不会提供推送；仓库副本里把 `core.hooksPath`
+  设成空目录才跑到推送那一格，D22 的真实 SSH 推送按用户的选择保留了这个钩子。
+- T18，D22 对着真实上游跑时测出摘要把 `pre-push` 列成「提交时会运行的钩子」：它列的是钩子目录里所有不带
+  `.sample` 的文件。改为只列 `git add` / `git commit` 会触发的、有执行位的钩子。
 - T4，执行环境把同一条长命令执行了两遍、两遍时间上重叠：两个变异跑手同时改同一批文件，其中一个的
   `git add` 把另一个施加中的变异暂存了进去。基线自检（施加前先核对 sha256）当场报了漂移、没有带着残留
   继续跑。之后变异跑手加了进程锁、改在后台运行。

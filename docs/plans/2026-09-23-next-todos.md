@@ -23,10 +23,15 @@
   「真实体验验收记录」）。
 - 2026-09-29 接入 Gemini（免费档）并加上多平台模型轮换：Gemini 在前、OpenRouter 兜底，每个平台
   各自指数退避；只配一个平台时按退避重试它（见下方「多平台模型轮换」）。
+- 2026-10-01 M2 自举完成：护栏（CI、危险规则、Agent 命令环境、开发期无条件拦截）、`run --no-write`、
+  `run --handoff` 的宿主复核与交接文件、人选择宿主执行的 git 收尾、`doctor --verify`、本仓的
+  `syndica-dev` 配置；真实免费模型在仓库副本里完成了一次 `verified` 的自改动并推到本地 bare remote，
+  那个提交原样进了本仓。收口审计见 [`docs/audits/2026-10-01-m2-final-audit.md`](../audits/2026-10-01-m2-final-audit.md)。
 
 未完成：
 
-- M2-M12 共 11 个里程碑尚未实现。
+- M3-M12 共 10 个里程碑尚未实现。
+- GitHub Actions 本月额度用完：M2 的提交都只按本地验证协议验证过，额度恢复后在 Linux 上补跑 CI。
 - 其余遗留项已逐条归入 M2-M12 或标为接受的限制，见路线图「遗留项归属（2026-09-29）」。
 
 ---
@@ -249,20 +254,51 @@ uv run pytest tests/runner/test_scenario.py tests/integration/test_cli_human_sce
 入口文档：
 
 - [`docs/plans/2026-09-23-v1-milestone-roadmap.md#M2 自举`](./2026-09-23-v1-milestone-roadmap.md#m2-自举)
+- 实现计划：[`2026-09-30-m2-self-hosting.md`](./2026-09-30-m2-self-hosting.md)
 
 开工前 TODO：
 
-- [ ] 单独写 M2 实现计划。
-- [ ] 明确 M2 的自举拓扑、角色提示词、命令安全策略和验证命令解析器。
-- [ ] 先用 fixture 仓库做离线 E2E，不直接让 Agent 改真实仓库。
-- [ ] 加 dry-run / no-write 模式，避免自举初期误写。
+- [x] 单独写 M2 实现计划。
+- [x] 明确 M2 的自举拓扑、角色提示词、命令安全策略和验证命令解析器。
+- [x] 先用 fixture 仓库做离线 E2E，不直接让 Agent 改真实仓库（T17 的七个场景）。
+- [x] 加 dry-run / no-write 模式，避免自举初期误写（`run --no-write`）。
 
 完成标准：
 
-- Syndica 能在临时工作区完成一次文档自举。
-- Syndica 能在 fixture 项目中修复一个小型失败测试。
-- 危险命令被拦截。
-- handoff 文档能记录改动、验证和下一步。
+- [x] Syndica 能在临时工作区完成一次文档自举。
+- [x] Syndica 能在 fixture 项目中修复一个小型失败测试。
+- [x] 危险命令被拦截。
+- [x] handoff 文档能记录改动、验证和下一步。
+
+### 真实模型 E2E 记录（2026-10-01，M2 T18）
+
+在仓库副本里跑（D22：clone、删掉原 remote、本地 bare 仓库作上游、`uv sync --locked`、key 文件在副本
+之外），默认轮换（Gemini `gemini-3.5-flash-lite` 在前、OpenRouter `cohere/north-mini-code:free` 兜底），
+`--handoff`。请求数按 httpx 的请求日志计：表里分列成功的请求与 429，正文里的总数是两者之和；误报指开发期
+策略拦下了正当的命令。
+
+| 场景 | 结果 | 成功请求 Gemini / OpenRouter | 429 | 误报 |
+|---|---|---|---|---|
+| 3：`--no-write` 规划（Planner） | 第一次 Planner 每轮只调一个工具，8 轮用完没写出计划，`run_failed`；调轮数、要求一轮里并行调用之后 `read_only`、退出 0，还指出需求里说缺的那条用例其实已经有了 | 24 / 0（含两次失败与一次诊断重跑） | 0 | 0 |
+| 2：夹具包里修一个失败测试（内置 Worker） | 改对；交接列出改动与两次 pytest（failed → passed），复核通过；没派 Reviewer，所以 `unverified`、不提供提交 | 8 / 0 | 0 | 0 |
+| 1：文档自举（本仓 Worker） | 断链修对；Worker 把门禁用 `&&` 串成一条，最终回答写「全量 4871 项全部通过」，宿主复核有 2 条失败（副本漏同步了一个测试文件），`verification_failed`、退出 1、不提供提交 | 14 / 0 | 0 | 0 |
+| 4：本仓真实小改动（`syndica-dev` 拓扑），第一次 | 两个 Worker 各用完 30 轮；宿主复核全过、Reviewer pass、`verified`，但 diff 删掉了一条无关的已有用例，两个 Reviewer 都没看出来；人选 3 | 75 / 8 | 2 | 未记录 |
+| 4：第二次 | 一次 `Grep` 把约 16 万 token 的匹配行塞进 Worker 的上下文，此后每次请求都带着它，Gemini 按每分钟 token 数拒绝；中止 | 22 / 15 | 4 | 未记录 |
+| 4：第三次（补了提示词、Glob / Grep 加上限之后） | 23 分钟；Worker 一轮发出六道门禁、24 轮内交回，Reviewer 拿到需求原文；宿主复核全过（4905 条测试）、Reviewer pass、`verified`；人看过 diff 选 1，宿主提交并推到本地 bare remote。这个提交原样带进本仓（`a2d0af6`） | 39 / 3 | 1 | 0 |
+
+几条跨场景的观察：
+
+- 免费档的 429 都是每分钟的请求数或 token 数（Google 给的重试时间 12–48 秒），一天里没有撞上日额度；
+  轮换把这些请求交给 OpenRouter，当天它用了 26 次。
+- 免费模型倾向每轮只调一个工具、40～60 行一段地翻大文件；提示词要求同一轮并行调用、先 Grep 定位
+  之后，同样的任务请求数从 85 降到 43（都含 429）。
+- 宿主复核挡住了一次「自称全量通过」；挡不住「删掉一条无关用例」——删了用例测试照样是绿的，两个
+  Reviewer 也都给了 pass，是人在提交前看 diff 拦下的。
+- 本机全局 `core.hooksPath` 里有企业 DLP 的 `pre-push` 钩子，按 D14 宿主不会提供推送；副本里把
+  `core.hooksPath` 设成空目录才跑到推送那一格（推向本地 bare remote）。
+- D22 的真实 SSH 推送保留了这个钩子：GitHub 上的临时分支作上游，脚本化的 `--handoff` 里宿主不提供推送、写明
+  原因，选 2 只提交；普通 `git push` 推上去、`ls-remote` 核对、删除分支。宿主自己经 SSH 推送那一段没有在
+  真实远端跑过。
 
 ---
 
@@ -322,7 +358,7 @@ TODO：
 TODO：
 
 - [ ] 决定是否发 PyPI pre-release（归 M12）。
-- [ ] 增加 GitHub Actions：lint、typecheck、test、deps check（归 M2，自举改代码之前先有自动门禁）。
+- [x] 增加 GitHub Actions：lint、typecheck、test、deps check（M2 T1，加上链接检查共六道门禁）。
 - [ ] 明确 release versioning 策略（归 M12）。
 - [ ] 增加 issue templates：bug、milestone task、UX validation（归 M12）。
 - [ ] 建立 changelog（归 M12）。
@@ -342,6 +378,7 @@ TODO：
 1. ~~提交并 push 当前 OpenRouter / 错误提示 / 文档改动。~~ 已完成。
 2. ~~按本地验证 runbook 跑真实体验，并登记结果。~~ 已完成，见「真实体验验收记录」。
 3. ~~多平台模型轮换。~~ 已完成，见「多平台模型轮换」。
-4. 按 M2 自举计划（[`2026-09-30-m2-self-hosting.md`](./2026-09-30-m2-self-hosting.md)，已评审）逐个任务推进，
-   第一个任务是基础 CI。
-5. 按 v1 路线图依次推进 M3-M12。
+4. ~~按 M2 自举计划（[`2026-09-30-m2-self-hosting.md`](./2026-09-30-m2-self-hosting.md)）逐个任务推进。~~
+   已完成，见 [M2 收口审计](../audits/2026-10-01-m2-final-audit.md)。
+5. 额度恢复后在 Linux 上补跑 CI；然后写 M3（可观测性 + 脱敏收口）的实现计划，按 v1 路线图依次推进
+   M3-M12。M3 起可以用 `syndica run --handoff --topology syndica-dev` 让 Syndica 帮着改自己。
