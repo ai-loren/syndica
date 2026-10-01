@@ -3,7 +3,7 @@
 > **执行者须知：本文件是需求，不是参考。** 「公开契约」一节里的 CLI 参数、配置键、规则 ID、标记行、
 > front matter 字段与内核 API 一旦发布就是兼容承诺；执行中不得为了让测试变绿临时改名或缩小断言范围。
 
-**状态：已评审，执行中（T1–T8、T10、T14 完成，阶段一已审计）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
+**状态：已评审，执行中（T1–T10、T14 完成，阶段一已审计）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
 2026-10-01，见「决策日志」）。GitHub Actions 本月免费额度已用完，恢复之前按「验证」一节的本地验证协议执行。
 
 **Goal:** 让 Syndica 在一份仓库里完成一次受控修改：读约束、规划、改文件、跑检查、读失败、迭代修复，
@@ -280,11 +280,13 @@ handoff 的状态是 `read_only`。依据路线图静态验收「写工具不可
   不用 `AGENT_SPAWN`：它不带角色，而且在子 Agent 已经开始跑之后才触发。
 - `PRE_TOOL_USE`：D4 的无条件拦截。
 - `POST_TOOL_USE`：Bash 前台结果与第一次观察到已结束的 BashOutput 结果（按 handle 去重，handle 到命令的
-  对应在 Bash 启动时记下）写 `meta['check']`；每次 Write、Edit、Bash 调用按同一个全局序号记进服务
-  `runtime.dev_log`（Agent id、角色、工具、命令或路径、退出码、检查结果）；`trust` 原样交回。
+  对应在 Bash 启动时记下）写 `meta['check']`；每次写成了的 Write、Edit（结果的 `meta['path']`，内核随 T9
+  加上）与每次 Bash 调用按同一个全局序号记进服务 `runtime.dev_log`（Agent id、角色、工具、命令或路径、
+  退出码、检查结果、后台命令的 handle）；`trust` 原样交回。被拦下、没执行的调用不记。
 - `AGENT_START` / `AGENT_END`：对 Reviewer 角色各取一次工作树指纹（D14 的宿主 git：改动列表加每个文件的
-  blob hash）；`AGENT_END` 另记下每个 Agent 的角色、结局与最后一段文字。钩子里出错时不静默吞掉，而是记成
-  「指纹缺失」，D14 据此按 `unverified` 处理。
+  blob hash 与文件类型、可执行位）；每次运行在开始与结束时各取一个全局序号；`AGENT_END` 另记下结局与这次
+  运行最后一个 assistant 块里的文字（那一块只调了工具就是没有文字，不再往前找；分段内容拼起文本段）。钩子
+  里出错时不静默吞掉，而是记成「指纹缺失」，D14 据此按 `unverified` 处理。
 
 `dev_log` 交出只读快照。
 
@@ -338,10 +340,14 @@ stdout 只有 handoff。
 
 **D14 git 收尾：人选择，宿主执行。** 只在 `run --handoff` 且不是 `--no-write` 时进行。
 
-**宿主 git 环境。** 快照、状态、hash、提交、推送都在同一个环境里跑：宿主自己的环境（含 ssh agent）加
-`GIT_TERMINAL_PROMPT=0`、`GIT_LITERAL_PATHSPECS=1`；每条都加 `-c core.fsmonitor=false`；以参数数组直接
-调 git，不经 shell；stdin 接 `/dev/null`（提交消息除外）；本地操作超时 60 秒、推送 120 秒。复核命令则在
-Agent 环境里跑：复核验证的是 Agent 能跑出的东西。
+**宿主 git 环境。** 快照、状态、hash、提交、推送都在同一个环境里跑：宿主自己的环境（含 ssh agent，去掉
+`GIT_DIR`、`GIT_WORK_TREE`、`GIT_INDEX_FILE`、`GIT_CONFIG_PARAMETERS` 这类会把 git 指到别的仓库或注入
+配置的变量）加 `GIT_TERMINAL_PROMPT=0`、`GIT_LITERAL_PATHSPECS=1`、`GIT_OPTIONAL_LOCKS=0`；每条都加
+`-c core.fsmonitor=false` 与 `--attr-source=HEAD`（工作树里 Agent 写的 `.gitattributes` 选不中配置里的
+filter 驱动，需要 git 2.40 以上）；以参数数组直接调 git，不经 shell；stdin 接 `/dev/null`（提交消息除外）；
+本地操作超时 60 秒、推送 120 秒。工作区可以在仓库的子目录里：状态只看这个目录（`-- .`），路径相对工作区；
+改动里有嵌套仓库或子模块时取不到指纹（里面的改动看不见），按取不到处理。复核命令则在 Agent 环境里跑：
+复核验证的是 Agent 能跑出的东西。
 
 **完整性快照（run 开始前取）：** `git rev-parse --show-toplevel`、HEAD、当前分支、上游（remote 与
 merge ref）、所有 remote 的 URL、`git rev-parse --git-path config` 指向的文件 hash、
@@ -708,6 +714,15 @@ HIGH 本来就 BLOCK）。对抗评审报的 Critical 已修：Bash 的 `cwd` �
 - 变异：pytest 汇总只认 passed；收集错误当失败；超时当失败；退出码 5 当失败。
 
 #### T9 — 开发期 Module 的记录
+
+**状态：completed**（本地验证协议：定向用例与六道门禁全绿，定向用例在 `/bin/dash` 下同样通过；对抗评审找出
+3 High / 6 Medium / 8 Low 与 17 条存活变异，修掉之后变异 71 条全杀。宿主 git 层 `cli/host_git.py` 随 T9
+建起来，T11、T12 复用：去掉把 git 指到别的仓库的环境变量，`--attr-source=HEAD` 让 Agent 写的
+`.gitattributes` 选不中 filter 驱动，工作区在仓库子目录里时只看这个目录、路径相对工作区，改动带文件类型与
+可执行位，有嵌套仓库或子模块时取不到指纹。记录：Write / Edit 只记写成了的（内核的成功结果在 `meta['path']`
+里带上路径），每次运行在开始与结束时各取全局序号，最后一段文字取这次运行最后一个 assistant 块、不往前找。
+留着没修、写进审计的：被拦下的调用不记；后台命令按 handle 字符串去重；被取消的 git 线程最多还跑 60 秒。
+Linux 补跑待 CI 额度恢复）
 
 **Files:** `cli/dev_module.py`、对应用例。
 
@@ -1078,6 +1093,10 @@ GitHub Free 每月 2000 分钟的 Actions 额度在 2026-10 已经用完，下�
   `from syndica.cli import x` 与相对导入都认得，偏偏最短的这一种不认。评审又指出同型的
   `from syndica.backends import beta`（backend 之间互相 import）同样漏过。改为绝对 from-import 一律把导入的
   名字接在模块后面，与相对导入那一支对称，单独修复并补用例（几个名字里的第二个、改了名的都算）。
+- T9 评审发现 Write / Edit 写成了与被拒的结果都只是一段话（`meta` 都是空的），开发期记录分不出来：没写成的
+  Edit 被记成「Write / Edit 产生的」，之后 Bash 改同一个文件就被错标。内核的成功结果随 T9 在 `meta['path']`
+  里带上路径（向后兼容的追加）。同一次评审发现取指纹的 `git status` 会跑仓库配置里的 filter 驱动、而驱动可以
+  由工作树里 Agent 写的 `.gitattributes` 选中：宿主 git 改用 `--attr-source=HEAD`，从此需要 git 2.40 以上。
 - T10 写样例时发现 D6 的密钥词不认 `GPG_PASSPHRASE`、`SENDGRID_APIKEY`：按 `_` 切词后 PASSPHRASE、APIKEY
   各是一个词，不在词表里。这样的名字能经 `pass_env` 透传给 Agent，脱敏器也不按值替换它们。补进词表。对抗评审
   又找出一整类连写与缩写：`PGPASSWORD`、`MYSQL_PWD`、`NGROK_AUTHTOKEN`、`VOLC_SECRETKEY`、`BW_SESSION`、

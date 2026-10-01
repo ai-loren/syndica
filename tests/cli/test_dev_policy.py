@@ -94,6 +94,7 @@ def _run(
         )
     finally:
         host.close()
+    assert isinstance(answer, str)
     return answer, stdout.getvalue()
 
 
@@ -335,7 +336,7 @@ class _Declares(Tool):
 
 async def _guarded(tmp_path: Path, tool: Tool, args: dict[str, str]) -> bool:
     hooks = HooksCenter()
-    guard = cast(Any, DevModule(tmp_path / 'ws').agent_plugins[0])(None, None, {})
+    guard = cast(Any, DevModule(tmp_path / 'ws', {}).agent_plugins[0])(None, None, {})
     guard.register(hooks)
     return (await hooks.trigger(Junction.PRE_TOOL_USE, tool=tool, args=args)).skip
 

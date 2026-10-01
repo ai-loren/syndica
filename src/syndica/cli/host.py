@@ -163,7 +163,9 @@ def _read_only_module(tools: Mapping[str, Tool]) -> RuntimeModule:
 
 
 def _agent_modules(
-    workspace_root: Path, read_only_tools: Mapping[str, Tool] | None = None
+    workspace_root: Path,
+    environ: Mapping[str, str],
+    read_only_tools: Mapping[str, Tool] | None = None,
 ) -> tuple[RuntimeModule, ...]:
     """run 与 chat 的 Runtime 装的 Module；给了 `read_only_tools` 就另装只读闸。
 
@@ -171,7 +173,7 @@ def _agent_modules(
     后面的插件再改参数，守卫判的就是改之前的那一份。
     """
     read_only = () if read_only_tools is None else (_read_only_module(read_only_tools),)
-    return (*_modules(), *read_only, DevModule(workspace_root))
+    return (*_modules(), *read_only, DevModule(workspace_root, environ))
 
 
 def _model_names(config: CliConfig) -> tuple[str, ...]:
@@ -806,7 +808,7 @@ class RuntimeCliHost:
             runtime = Runtime(
                 agents=factories,
                 orchestration=True,
-                modules=_agent_modules(self._workspace_root),
+                modules=_agent_modules(self._workspace_root, self._environ),
                 confirmation_handler=MailboxConfirmationHandler(timeout=300),
             )
             subscription = runtime.events.subscribe()
@@ -968,7 +970,7 @@ class RuntimeCliHost:
                     agents={} if request.topology is not None else factories,
                     orchestration=True,
                     modules=_agent_modules(
-                        self._workspace_root, tools if request.no_write else None
+                        self._workspace_root, self._environ, tools if request.no_write else None
                     ),
                     flags=flags,
                     confirmation_handler=MailboxConfirmationHandler(timeout=300),

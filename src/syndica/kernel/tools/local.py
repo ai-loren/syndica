@@ -162,7 +162,8 @@ class Write(Tool):
             await self._portal.write_text(path, content)
         except ConfigError as exc:
             return _told(exc)
-        return ToolResult(output=f'已写入 {path}')
+        # `meta['path']` 只在写成了时有：开发期记录靠它分辨写成的与被拒的（被拒的文字也是一段话）。
+        return ToolResult(output=f'已写入 {path}', meta={'path': path})
 
 
 class Edit(Tool):
@@ -184,7 +185,7 @@ class Edit(Tool):
             await self._portal.edit_text(path, old_string, new_string)
         except ConfigError as exc:
             return _told(exc)
-        return ToolResult(output=f'已替换 {path} 中的一处文本')
+        return ToolResult(output=f'已替换 {path} 中的一处文本', meta={'path': path})
 
 
 class Glob(Tool):
