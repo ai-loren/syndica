@@ -21,9 +21,11 @@
 from __future__ import annotations
 
 import bisect
+import errno
 import hashlib
 import json
 import math
+import os
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -42,6 +44,8 @@ __all__ = [
     'RuleRedactor',
     'encode_redacted',
     'looks_secret',
+    'write_all',
+    'write_redacted',
 ]
 
 RULE_IDS: tuple[str, ...] = (
@@ -268,14 +272,36 @@ class Redactor(Protocol):
     def scan(self, text: str) -> tuple[Finding, ...]: ...
 
 
+_MINT = object()
+
+
 @final
 class RedactedText(str):
     """`encode_redacted` 的输出：每个字符串叶子都已脱敏、再做规范 JSON 编码的一行文本（没有任何
-    `str.splitlines()` 会断开的字符，总能编码成 UTF-8）。只有 `encode_redacted` 构造它：收持久化内容
-    的接口靠这个类型认出「已经逐叶脱敏」。拼接、切片交回的是普通 `str`，所以改过的文本不再带这个
-    类型。"""
+    `str.splitlines()` 会断开的字符，总能编码成 UTF-8）。只有 `encode_redacted` 构造它：收持久化
+    内容的接口靠这个类型认出「已经逐叶脱敏」，所以直接调构造器（含 `type(x)(...)`）报
+    `ContractViolation`。拼接、切片交回的是普通 `str`，改过的文本不再带这个类型；`copy` 交回它
+    自己，`pickle` 读回的是普通 `str`。"""
 
     __slots__ = ()
+
+    def __new__(cls, text: str, *, _mint: object = None) -> RedactedText:
+        if _mint is not _MINT:
+            raise ContractViolation(
+                expected='RedactedText 只由 encode_redacted 构造',
+                received=f'有代码直接构造了 {cls.__name__}',
+                next_action='把值交给 encode_redacted(value, redactor)：它先逐叶脱敏再编码',
+            )
+        return super().__new__(cls, text)
+
+    def __copy__(self) -> RedactedText:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> RedactedText:
+        return self
+
+    def __reduce__(self) -> tuple[type[str], tuple[str]]:
+        return (str, (str(self),))
 
 
 @dataclass(frozen=True)
@@ -758,7 +784,36 @@ def encode_redacted(value: object, redactor: Redactor) -> RedactedText:
             received=f'编码失败：{exc}',
             next_action='把过大的整数转成字符串之后再编码',
         ) from exc
-    return RedactedText(_RAW_IN_JSON.sub(lambda match: f'\\u{ord(match.group()):04x}', text))
+    escaped = _RAW_IN_JSON.sub(lambda match: f'\\u{ord(match.group()):04x}', text)
+    return RedactedText(escaped, _mint=_MINT)
+
+
+def write_all(fd: int, data: bytes) -> None:
+    """把 `data` 完整写进 `fd`。`os.write` 可以只写进一部分而不报错（文件大小上限、磁盘将满）：
+    只调一次会留下一个被截断、却没有任何报错的文件。写入点守卫把它当 `os.write` 看，内容照样逐个
+    检查。"""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written == 0:
+            raise OSError(
+                errno.EIO,
+                '期望 os.write 至少写进一个字节；实际写进 0 个。'
+                '腾出磁盘空间或调高文件大小上限再重试',
+            )
+        view = view[written:]
+
+
+def write_redacted(fd: int, text: RedactedText, *, newline: bool = False) -> None:
+    """把一段 `RedactedText` 完整写进 `fd`（`newline` 时再写一个换行：它保证只有一行）。运行时检查
+    类型：静态类型挡不住 `Any`，从 JSON 里读出来的值就是 `Any`。"""
+    if not isinstance(cast(object, text), RedactedText):
+        raise ContractViolation(
+            expected='write_redacted 只写 RedactedText（逐叶脱敏之后的编码）',
+            received=f'收到 {type(text).__name__}',
+            next_action='先经 encode_redacted 编码再写；普通 str 可能带着密钥',
+        )
+    write_all(fd, text.encode('utf-8') + (b'\n' if newline else b''))
 
 
 def _redacted(value: object, redactor: Redactor, path: str, *, secret: bool) -> object:

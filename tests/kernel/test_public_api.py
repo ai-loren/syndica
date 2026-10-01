@@ -258,6 +258,8 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # - `RULE_IDS` / `RULES_VERSION`：宿主不需要它们就能构造与使用脱敏器；两者都算进了
 #   `RuleRedactor.digest`，判断两套规则是不是同一套比摘要即可。
 # - `looks_secret`：宿主从自己的环境里挑密钥值时用；内核的公开入口只收挑好的值。
+# - `write_all` / `write_redacted`：包内落盘只经它们（写入点守卫认得的写法）；宿主不需要它们就能
+#   用任何一个公开入口。
 _WITHHELD: tuple[str, ...] = (
     'Bash',
     'BashOutput',
@@ -304,6 +306,8 @@ _WITHHELD: tuple[str, ...] = (
     'validate_max_concurrency',
     'validate_tool_names',
     'workspace_root_removal_rule',
+    'write_all',
+    'write_redacted',
 )
 
 

@@ -17,7 +17,7 @@ import stat
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from syndica.kernel.errors import ConfigError
@@ -82,12 +82,25 @@ class _ProcessRecord:
 
 
 class LocalWorkspace:
-    """根目录、shell、子进程环境都由宿主传入。"""
+    """根目录、shell、子进程环境都由宿主传入。
 
-    def __init__(self, root: str, *, shell: str, env: Mapping[str, str]) -> None:
+    `private` 是宿主留给自己的目录（相对根）：文件工具（读、写、改，以及显式指向它们的 glob 与
+    grep）碰不到，隐式的 glob 与 grep 结果里也不出现。比较不分大小写，给出的路径与解析后的路径都
+    看。命令不受影响：shell 写下的东西本来就不可信，真正的边界是沙箱。
+    """
+
+    def __init__(
+        self,
+        root: str,
+        *,
+        shell: str,
+        env: Mapping[str, str],
+        private: Iterable[str] = (),
+    ) -> None:
         self._root = _existing_absolute_dir(root)
         self._shell = _executable(shell)
         self._env = _copied_env(env)
+        self._private = _private_dirs(private)
         self._processes: dict[str, _ProcessRecord] = {}
         # 正在跑的前台命令。登记它们，`close()` 才杀得到：前台命令同样可能在关闭时还没结束。
         self._foreground: set[_ProcessRecord] = set()
@@ -116,6 +129,7 @@ class LocalWorkspace:
                 next_action='传入大于等于 1 的行数上限',
             )
         real = self._inside(path)
+        self._refuse_private(path, real)
         if not real.is_file():
             raise ConfigError(
                 expected='path 指向根目录内的文件',
@@ -197,13 +211,20 @@ class LocalWorkspace:
                 received=f'pattern={pattern!r} 含父目录段 ..',
                 next_action='去掉 ..，从工作区根目录开始写相对模式',
             )
+        self._refuse_private(pattern, None)
         named = [part for part in Path(pattern).parts if part.startswith('.')]
         found: list[str] = []
         for match in self._root.glob(pattern):
-            if not self._stays(match):
+            try:
+                real = match.resolve().relative_to(self._root)
+            except ValueError:
                 continue
             relative = match.relative_to(self._root)
             if any(_hidden(part) and not _named(part, named) for part in relative.parts):
+                continue
+            if self._private and (
+                self._private_dir(relative.parts) or self._private_dir(real.parts)
+            ):
                 continue
             found.append(relative.as_posix())
         found.sort()
@@ -219,9 +240,12 @@ class LocalWorkspace:
                 next_action='修正正则后再搜',
             ) from exc
         start = self._inside('.' if path in ('', '.') else path)
+        self._refuse_private(path, start)
         files = _files_under(start, self._root)
         hits: list[str] = []
         for file in files:
+            if self._private_dir(file.relative_to(self._root).parts):
+                continue
             rel = file.relative_to(self._root).as_posix()
             data = file.read_bytes()
             # 开头 8 KiB 里有 NUL 就当二进制文件跳过（git 与 grep 的同一判据）：字节码里偶然匹配上的
@@ -416,22 +440,67 @@ class LocalWorkspace:
                     '之后处理。只改工作区里的普通文件'
                 ),
             )
+        self._refuse_private(path, real)
+        for parts in (*self._named_parts(path), real.relative_to(self._root).parts):
+            folded = tuple(part.casefold() for part in parts)
+            for shown, private in self._private:
+                if folded and len(folded) < len(private) and private[: len(folded)] == folded:
+                    raise ConfigError(
+                        expected=f'写下的文件不占住宿主保留的目录 {shown} 的位置',
+                        received=f'path={path!r} 是 {shown} 的上级目录',
+                        next_action='换一个文件名：在这里建了文件，宿主就建不出它要用的目录',
+                    )
         return real
+
+    def _private_dir(self, parts: Iterable[str]) -> str | None:
+        """相对根的这些段落在哪个私有目录里（不分大小写）；不在任何一个里时是 None。"""
+        folded = tuple(part.casefold() for part in parts)
+        for shown, private in self._private:
+            if folded[: len(private)] == private:
+                return shown
+        return None
+
+    def _refuse_private(self, path: str, real: Path | None) -> None:
+        """给出的路径或解析后的路径落在私有目录里就拒：经符号链接、`..`、根的别名与大小写变体进去的
+        都算。"""
+        candidates = list(self._named_parts(path))
+        if real is not None:
+            candidates.append(real.relative_to(self._root).parts)
+        shown = next(filter(None, map(self._private_dir, candidates)), None)
+        if shown is None:
+            return
+        reserved = '、'.join(name for name, _ in self._private)
+        raise ConfigError(
+            expected=f'文件工具的路径不在宿主保留的目录里（{reserved}）',
+            received=f'path={path!r} 落在 {shown} 里',
+            next_action=(
+                '这些目录只归宿主读写：里面是宿主自己的记录，含此前标成不可信的工具输出，经文件工具'
+                '读回来就成了可信内容。换一个不在这些目录下的路径'
+            ),
+        )
 
     def _in_git_dir(self, path: str, real: Path) -> bool:
         """给出的路径或解析后的路径里有一段是 `.git`（不分大小写）。"""
-        parts = (*self._named_parts(path), *real.relative_to(self._root).parts)
+        given = [part for parts in self._named_parts(path) for part in parts]
+        parts = (*given, *real.relative_to(self._root).parts)
         return any(part.casefold() == '.git' for part in parts)
 
-    def _named_parts(self, path: str) -> tuple[str, ...]:
-        """给出的路径在根下的各段；给的是根外的绝对路径时没有（越界另有 `_must_stay` 拒）。"""
-        raw = Path(path)
-        if not raw.is_absolute():
-            return raw.parts
-        try:
-            return raw.relative_to(self._root).parts
-        except ValueError:
-            return ()
+    def _named_parts(self, path: str) -> tuple[tuple[str, ...], ...]:
+        """给出的路径在根下的各段：照写的样子一份，`.` 与 `..` 按字面折叠之后一份（相同时只交
+        一份）。两份都要：`src/../.syndica/traces` 折叠之后才看得出点了谁，`.git/../x` 照写的样子
+        才看得出经过了谁。给的是根外的绝对路径时没有（越界另有 `_must_stay` 拒）；绝对路径可以经根
+        的别名给出（macOS 的 `/tmp` 是 `/private/tmp`），所以从最近的一级往上找解析之后就是根的
+        那一级。"""
+        found: list[tuple[str, ...]] = []
+        for raw in (Path(path), Path(os.path.normpath(path))):
+            if not raw.is_absolute():
+                found.append(raw.parts)
+                continue
+            for ancestor in (raw, *raw.parents):
+                if ancestor.resolve() == self._root:
+                    found.append(raw.relative_to(ancestor).parts)
+                    break
+        return tuple(dict.fromkeys(found))
 
     def _directory(self, path: str) -> Path:
         """命令的工作目录：根内的目录，且不在 `.git` 里。
@@ -471,13 +540,6 @@ class LocalWorkspace:
                 received=f'解析后的路径落在根目录外（收到 {real.name!r}）',
                 next_action='改用根目录内的相对路径',
             ) from None
-
-    def _stays(self, path: Path) -> bool:
-        try:
-            path.resolve().relative_to(self._root)
-        except ValueError:
-            return False
-        return True
 
 
 def _read_utf8(path: Path, received: str) -> str:
@@ -657,6 +719,27 @@ def _executable(shell: object) -> str:
             next_action='传入一个可执行的绝对路径',
         )
     return shell
+
+
+def _private_dirs(private: object) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """(显示用的写法, 不分大小写的各段)。"""
+    if isinstance(private, str | bytes) or not isinstance(private, Iterable):
+        raise ConfigError(
+            expected='private 是相对根目录的目录路径列表',
+            received=f'private 的类型是 {type(private).__name__}',
+            next_action="传一个列表，例如 private=['.syndica/traces']：一个字符串会被逐字符拆开",
+        )
+    dirs: list[tuple[str, tuple[str, ...]]] = []
+    for index, item in enumerate(cast('Iterable[object]', private)):
+        path = PurePosixPath(item) if isinstance(item, str) else None
+        if path is None or path.is_absolute() or not path.parts or '..' in path.parts:
+            raise ConfigError(
+                expected='private 的每一项是根目录下的相对目录，不含 ..、不是根本身',
+                received=f'private[{index}]={item!r}',
+                next_action="写成相对根的路径，例如 '.syndica/traces'",
+            )
+        dirs.append((path.as_posix(), tuple(part.casefold() for part in path.parts)))
+    return tuple(dirs)
 
 
 def _copied_env(env: object) -> dict[str, str]:

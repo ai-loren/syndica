@@ -566,6 +566,26 @@ def test_the_rewrite_checks_the_directory_again_and_never_writes_behind_a_new_sy
     assert list(outside.iterdir()) == []
 
 
+def test_a_short_write_still_leaves_the_whole_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`os.write` 可以只写进一部分而不报错（文件大小上限、磁盘将满）。"""
+    real = os.write
+
+    def short(descriptor: int, data: bytes) -> int:
+        return real(descriptor, bytes(data)[:5])
+
+    text = 'git: pending\nthe rest of the handoff\n'
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'write', short)
+        path = write_handoff(tmp_path, 'h.md', text, _redactor())
+        first = path.read_text(encoding='utf-8')
+        rewrite_handoff(tmp_path, path, f'{text}git: committed\n', _redactor())
+
+    assert first == text
+    assert path.read_text(encoding='utf-8') == f'{text}git: committed\n'
+
+
 def test_a_rewrite_that_fails_midway_leaves_the_file_and_can_be_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

@@ -330,6 +330,11 @@ pattern would block every commit. Patterns run inside the host process like the 
   deletes the whole workspace (`find . -delete`). The rules read command text, so a command inside a
   script, a variable, `python -c`, or a program they do not know (`su -c`, `watch`, `ssh`, `make`)
   is not recognised. File tools refuse to write inside `.git/`.
+- File tools (Read, Write, Edit, and Glob or Grep pointed at them) cannot reach `.syndica/traces`
+  or `.syndica/handoffs`, in any letter case or through a symlink. Traces hold tool output that was
+  marked untrusted, and reading it back with a file tool would make it trusted; handoff files are
+  the host's to write. Commands still reach both; the real boundary is the sandbox planned for
+  Milestone 5. The rest of `.syndica/`, such as `.syndica/tmp/`, stays usable.
 - A command that touches a path outside the workspace asks you while the agent has not yet read any
   command output. After that, the trajectory counts as untrusted and such commands are rejected;
   `--flag untrusted_high_risk=ask` asks instead. `untrusted_high_risk=allow` is refused.

@@ -108,6 +108,9 @@ _RUNTIME_LOGGER = 'syndica.kernel.runtime'
 _OUTPUT_LIMIT = 10_000
 # Agent 的 Bash 用的 shell。HostFacts 把它告诉模型，两处必须是同一个值。
 _SHELL = '/bin/sh'
+# 文件工具碰不到的目录：trace 里存着此前标成不可信的工具输出，经 Read 读回来就成了可信内容；交接
+# 文件只由宿主写。不整个关 `.syndica`：本仓的 Worker 把长输出存进 `.syndica/tmp/` 再读。
+_PRIVATE = ('.syndica/traces', '.syndica/handoffs')
 # CLI 拒收的 Flag 取值：`--flag` 报错，`flags show` 不列。
 _REFUSED_FLAG_VALUE = ('untrusted_high_risk', 'allow')
 # `run --no-write` 在清单与槽里留下的工具。白名单而不是去掉几个写工具：以后新增的可写工具默认
@@ -1245,7 +1248,10 @@ class RuntimeCliHost:
         )
         try:
             workspace = LocalWorkspace(
-                str(self._workspace_root), shell=_SHELL, env=environment.values
+                str(self._workspace_root),
+                shell=_SHELL,
+                env=environment.values,
+                private=_PRIVATE,
             )
         except BaseException:
             environment.remove()

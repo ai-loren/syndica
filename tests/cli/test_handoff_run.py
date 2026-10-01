@@ -840,11 +840,42 @@ def test_a_symlinked_syndica_directory_is_refused_and_the_handoff_still_printed(
     assert list(outside.iterdir()) == []
 
 
-def test_a_handoff_path_the_agent_blocked_with_a_file_still_prints_the_handoff(tmp_path: Path):
-    root = _workspace(tmp_path)
+def test_the_file_tools_cannot_read_what_the_host_keeps_for_itself(tmp_path: Path):
+    """trace 与交接文件里有此前标成不可信的工具输出，经 Read 读回来就成了可信内容。"""
+    root = _workspace(tmp_path, git=False)
+    for relative, text in (
+        ('handoffs/old.md', 'verdict: pass\n'),
+        ('traces/t1/spans.jsonl', '{"name": "untrusted"}\n'),
+        ('tmp/out.txt', 'long output\n'),
+    ):
+        path = root / '.syndica' / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding='utf-8')
     llm = ScriptedLLM(
         [
-            ScriptedTurn(tool_calls=[_call('w', 'Write', path='.syndica/handoffs', content='x')]),
+            ScriptedTurn(tool_calls=[_call('r', 'Read', path='.syndica/handoffs/old.md')]),
+            ScriptedTurn(tool_calls=[_call('s', 'Read', path='.syndica/traces/t1/spans.jsonl')]),
+            ScriptedTurn(tool_calls=[_call('t', 'Read', path='.syndica/tmp/out.txt')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    _run(tmp_path, llm, config=_config(tmp_path), root=root, agent='Reviewer', extra=())
+
+    handoff, trace, allowed = (llm.calls[index][-1].content for index in (1, 2, 3))
+    assert isinstance(handoff, str) and isinstance(trace, str)
+    assert 'verdict: pass' not in handoff and 'untrusted' not in trace
+    assert '.syndica/handoffs' in handoff and '可信' in handoff
+    assert '.syndica/traces' in trace
+    assert allowed == 'long output'
+
+
+def test_a_handoff_path_the_agent_blocked_with_a_file_still_prints_the_handoff(tmp_path: Path):
+    root = _workspace(tmp_path)
+    block = 'mkdir -p .syndica && echo x > .syndica/handoffs'
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('b', 'Bash', command=block)]),
             ScriptedTurn(content='done'),
         ]
     )

@@ -201,13 +201,20 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
 
 - 扫整个 `src/syndica`（`__main__.py` 在四个子包之外，它也装配写入与导出），`cli`、`runner`、`kernel`、`backends`
   与包根各一个「必须扫到」的锚文件，再用一次独立的 `os.walk` 交叉核对。
-- 安全的内容只认：字面量、模块级绑定字面量的名字、直接调用从 `syndica.kernel.redaction` import 的 `redact` /
-  `encode_redacted` 的结果、类型标注为 `RedactedText` 的参数。禁止在 `kernel/redaction.py` 之外 `def redact`、
-  构造 `RedactedText(...)`、`cast(RedactedText, ...)`。
-- 外发点：`.post` / `.put` / `.request` / `.send` 带 `json=` / `content=` / `data=` 的调用按写入点同样检查。显式白名单
-  两类并写明理由：Agent 自己的工具（`LocalWorkspace` 的写文件与子进程管道、`tools/local.py`）；LLM 客户端发给模型
-  提供方的请求（M2 D5 的威胁模型：对话本来就要发给提供方，这是 run 的前提，不是观测数据）。`FileTraceStore` 与
-  OTLP 导出器不在白名单里：导出器收一个 `Redactor`，发出的正文是 `content=encode_redacted(...)`（从 store 读出的已经
+- 安全的内容只认：字面量、模块级绑定字面量且只绑定过一次的名字、脱敏器调用（`redactor.redact(...)`、从
+  `syndica.kernel.redaction` import 的 `encode_redacted`）的结果，以及它们的 `.encode(...)` /
+  `gzip.compress(...)`。`RedactedText` 写进 fd 只经 `write_redacted`：它在运行时检查类型并把短写接着写完（T4 评审
+  证明「标注为 `RedactedText` 的参数」挡不住 `Any`，而 `os.write` 只调一次可能只写进一部分、不报错）。
+  `kernel/redaction.py` 之外不许定义或赋值 `redact` / `encode_redacted`，`RedactedText` 只许出现在类型标注与
+  `isinstance` 里（不许构造、继承、cast、取别名、当参数传）；它的构造器另要一个模块私有的令牌，`type(x)(...)`
+  在运行时同样被拒。
+- 外发点：`.post` / `.put` / `.patch` / `.request` / `.stream` / `.send` / `.build_request` / `Request(...)` /
+  `urlopen` / 套接字发送的正文按写入点同样检查，关键字与位置参数都看（位置参数只在认得出是 HTTP 的调用上看），
+  方法先交给 `partial` / `to_thread` 这类包装再调的也看；套接字、网络日志 handler、`logging.config` 不许用。显式
+  白名单两类并写明理由：Agent 自己的工具（`LocalWorkspace` 的写文件与子进程管道、`tools/local.py`）；LLM 客户端
+  发给模型提供方的请求（M2 D5 的威胁模型：对话本来就要发给提供方，这是 run 的前提，不是观测数据）。外加
+  `write_all` 里那一处把短写写完的 `os.write`。`FileTraceStore` 与 OTLP 导出器不在白名单里：store 经
+  `write_redacted` 写，导出器收一个 `Redactor`，发出的正文是 `content=encode_redacted(...)`（从 store 读出的已经
   脱敏，再过一遍是幂等的，守卫因此不必为它开例外）。
 
 **D6 `TraceStore` 是第五个 Store Protocol。**
@@ -366,7 +373,9 @@ YAML 的标量把 `yes`、`0777` 变成别的类型）。捕获的 `expect` 填�
 
 **D17 宿主私有目录。** `LocalWorkspace(..., private=())` 收一组相对根的目录（CLI 传
 `('.syndica/traces', '.syndica/handoffs')`）；文件工具（Read、Write、Edit，以及 Glob / Grep 的显式路径）拒绝这些目录下
-的路径，比较不分大小写、按目录身份（与 M2 的 `.git` 保护同样做法），给模型的错误说明为什么。理由：trace 里存着此前
+的路径，隐式的 Glob / Grep 结果里也不出现；比较不分大小写，照写的路径、按字面折叠 `..` 之后的路径（含经根的别名给出
+的绝对路径）与解析之后的路径都看（与 M2 的 `.git` 保护同样做法），给模型的错误说明为什么。Write 也不许在这些
+目录的上级位置建文件（`.syndica` 成了文件，宿主就建不出 trace 目录）。理由：trace 里存着此前
 标成不可信的工具输出，`Read` 读回来是可信的，等于绕过 spec §12.2 的溯源升级；Agent 改得到以前的交接文件（M2 遗留）
 也一并关掉。不整个关 `.syndica`：本仓的 Worker 提示词让它把长输出存到 `.syndica/tmp/` 再读（`docs/agents/worker.md`，
 由 `tests/cli/test_repo_config.py` 钉住，T18 就跑这份提示词）。Bash 照样读写得到（它的输出本来就是不可信的）；
@@ -544,7 +553,7 @@ Ctrl-C 也停不下来；强制退出按累计次数算，已经起过作用的�
 - 变异：漏掉一条内置规则；用户规则排在内置之前；去掉占位符切段（幂等破坏）；`encode_redacted` 改成先编码后脱敏；
   `named_assignment` 的值判定放宽到任意值（误报）或收紧到只认固定格式（漏报）。
 
-**状态：完成。** 按修订后的 D4 落地：每条规则在同一份视图上找区间，相互重叠的区间并成一段、换成其中最长那一条的
+**状态：完成（06cf340）。** 按修订后的 D4 落地：每条规则在同一份视图上找区间，相互重叠的区间并成一段、换成其中最长那一条的
 占位符（一样长时内置在前，用户规则按声明顺序）；已找到的区间与输入里原有的占位符在视图里涂成不透明的空白再找，
 至多 4 轮到不动点——第二次 `redact` 看到的就是第一次最后看到的视图，所以幂等、占位符不被再次命中。私钥块在把空白
 看成空格、把 JSON 的 `\n` 看成换行的视图上找；紧贴在一个格式命中后面的格式在同一轮里认完。`encode_redacted` 逐叶
@@ -590,6 +599,28 @@ PEM 与 PuTTY 块）；8 条是 URL 里已知密钥值的占位符名字不同�
 - 私有目录：Read / Write / Edit 拒 `.syndica/traces/…` 与 `.syndica/handoffs/…`（含大小写变体与经符号链接的路径）；
   Glob / Grep 显式指向它们时同样拒；`.syndica/tmp/…` 照常可读写（Worker 的提示词用它）；Bash 不受影响；错误说明写明
   为什么。
+
+**状态：完成。** 守卫（`tests/test_write_points.py`）扫整个 `src/syndica`：五个扫描根各有锚文件，另用一次
+`os.walk` 核对范围；在每个根里种的违规样例（写文件、`client.post(json=...)`、`def redact`、`cast(RedactedText,
+...)`、白名单目录里的新文件、白名单文件里多出来的一处）都被报出。白名单按文件、按写法与次数逐条写死：模型提供方的
+请求、Agent 的文件工具与命令管道、`write_all` 里把短写写完的那一处 `os.write`。落盘原语收进 `kernel/redaction.py`：
+`write_all`（写满为止；交接文件的三处写入改用它，此前单次 `os.write` 在磁盘将满时可能静默截断）与
+`write_redacted`（运行时检查 `RedactedText`，T11 的 trace 文件只经它写）。`RedactedText` 的构造器要模块私有的
+令牌，`copy` 交回它自己、`pickle` 读回普通 `str`。私有目录（D17）在 `LocalWorkspace` 里，CLI 传 traces 与
+handoffs 两项。
+
+验证：对抗评审一路（D17 用文件工具绕不过去：尾随点与空格、`//`、反斜杠、`~`、根的别名、长 s `ſ`、`[t]races`、
+硬链接与竞争都要 Bash）。评审报的守卫缺口逐条修掉：经别名或间接调用造出 `RedactedText`（改成标注与 `isinstance`
+之外一律不许出现，加构造令牌）；标注为 `RedactedText` 的参数挡不住 `Any`（去掉这条信任，改用运行时检查的
+`write_redacted`）；按位置给的正文、经 `partial` / `to_thread` 包装的外发、套接字发送、网络日志 handler 与
+`logging.config`；子进程 stdin 的 `.write`；`-am` 这类以 `m` 结尾的短选项串；模块常量被再次绑定；`os.write`
+短写让正确的 trace 写入器无法合规（`write_all` / `write_redacted`）。私有目录的修正：照写与折叠之后的名字都看、
+根的别名、Glob 少一次 `resolve()`（15000 个文件 1.0 秒，与只解析一次的基线 0.85 秒持平）、Write 不许在私有目录的
+上级位置建文件。变异：第一轮 34 条全杀；评审之后 43 条全杀（评审列出的 10 条存活变异各补了一条单独施加即变红的
+用例，其中参数信任的那几条随这条信任一起删掉）。零存活只对这些变异集成立。
+
+意外发现：`os.write` 在文件大小上限与磁盘将满时返回比请求少的字节数而不报错（评审在 `RLIMIT_FSIZE` 下实测），
+M2 的交接文件写入一直是单次调用。
 
 ### 阶段二：trace 模型与捕获
 
@@ -807,6 +838,9 @@ PEM 与 PuTTY 块）；8 条是 URL 里已知密钥值的占位符名字不同�
   形状到那时连同这个成员一起定）；`RULES_VERSION` 也覆盖 `encode_redacted` 的行为（指纹按脱敏之后的编码算）；
   `RedactedText` 保证是一行、总能编码成 UTF-8，T11 的 JSONL 因此可以按行切而不必另做转义；用户规则的病态正则按
   「`.syndica.yaml` 是你运行的代码」处理，不在加载时猜回溯（嵌套量词的启发式会拒掉 `(?:[a-z]+\.)+corp` 这类常见写法）。
+- 2026-10-02 T4 评审之后：D5 不再信任「标注为 `RedactedText` 的参数」（pyright 挡不住 `Any`，从 JSON 读出的值就是
+  `Any`），改为落盘只经 `kernel/redaction.py` 的 `write_redacted`（运行时检查类型）与 `write_all`（内容在调用处按
+  写入点规则看）；两者都把短写接着写完。D17 的名字比较加上按字面折叠 `..` 与根的别名。
 
 ## 风险与遗留（开工前登记）
 
@@ -822,6 +856,8 @@ PEM 与 PuTTY 块）；8 条是 URL 里已知密钥值的占位符名字不同�
 - **紧贴在字母数字后面的格式 key 认不出**（T3）：格式规则刻意不从一个词的中间起头（否则 `task-…`、`risk-…` 这类长词
   会被当成 `sk-` key），所以 `xsk-proj-…`、`fooAKIA…` 这种粘连只靠逐字值与片段兜住（宿主环境里有这个 key 时）。M2 的
   `\b` 同样如此。
+- **Bash 能在 `.syndica` 的位置上建文件**（T4 评审）：Write 已经不许，Bash 不受 D17 约束。`.syndica` 成了文件时
+  宿主建不出 trace 目录；T11 的记录要把它当成一次可报告的失败（记录不了、run 照常），不能让 run 因此失败。
 - **宿主私有目录只挡文件工具**（D17）：Bash 照样读写得到，Bash 写下的文件经 `Read` 读回也照样成了可信内容；真正的
   边界是 M5 的沙箱。
 - **chat 里过期的提问会吞掉下一行**（T2 评审发现，M2 就有）：chat 的提示符在 `main` 里直接读 stdin，不经宿主的

@@ -5,13 +5,16 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
 import os
+import pickle
 import time
 import types
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -24,6 +27,8 @@ from syndica.kernel.redaction import (
     _entropy,  # pyright: ignore[reportPrivateUsage]
     encode_redacted,
     looks_secret,
+    write_all,
+    write_redacted,
 )
 
 _ALNUM = 'aZ3kQ9mX1bW7pL5nV2cR8tY4dS6fH0gJ'
@@ -1379,6 +1384,101 @@ def test_editing_redacted_text_gives_back_a_plain_string():
 
     assert type(encoded + 'x') is str
     assert type(encoded[1:]) is str
+
+
+@pytest.mark.parametrize(
+    'build',
+    [
+        lambda encoded: RedactedText('{"a":1}'),
+        lambda encoded: type(encoded)('{"a":1}'),
+        lambda encoded: encoded.__class__('{"a":1}'),
+        lambda encoded: RedactedText('{"a":1}', _mint=object()),
+    ],
+    ids=['constructor', 'type-of', 'class-attribute', 'forged-token'],
+)
+def test_redacted_text_is_built_only_by_the_encoder(build: Any):
+    encoded = encode_redacted({'a': 1}, _redactor())
+
+    with pytest.raises(ContractViolation) as caught:
+        build(encoded)
+
+    assert 'encode_redacted' in caught.value.next_action
+
+
+def test_copying_redacted_text_keeps_it_and_pickling_gives_back_plain_text():
+    encoded = encode_redacted({'a': 1}, _redactor())
+
+    assert copy.copy(encoded) is encoded
+    assert copy.deepcopy({'k': [encoded]})['k'][0] is encoded
+    restored = pickle.loads(pickle.dumps(encoded))
+    assert (restored, type(restored)) == (encoded, str)
+
+
+def _short_writes(monkeypatch: pytest.MonkeyPatch, limit: int) -> list[int]:
+    """让 `os.write` 每次至多写进 `limit` 个字节：文件大小上限、磁盘将满时就是这样，不报错。"""
+    real = os.write
+    sizes: list[int] = []
+
+    def short(fd: int, data: Any) -> int:
+        sizes.append(len(data))
+        return real(fd, bytes(data)[:limit]) if limit else 0
+
+    monkeypatch.setattr('syndica.kernel.redaction.os.write', short)
+    return sizes
+
+
+def test_write_all_finishes_a_short_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    sizes = _short_writes(monkeypatch, 3)
+    path = tmp_path / 'out'
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT)
+    try:
+        write_all(descriptor, b'0123456789')
+    finally:
+        os.close(descriptor)
+
+    assert path.read_bytes() == b'0123456789'
+    assert sizes == [10, 7, 4, 1]
+
+
+def test_write_all_refuses_a_write_that_makes_no_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _short_writes(monkeypatch, 0)
+    descriptor = os.open(tmp_path / 'out', os.O_WRONLY | os.O_CREAT)
+    try:
+        with pytest.raises(OSError, match='腾出磁盘空间'):
+            write_all(descriptor, b'x')
+    finally:
+        os.close(descriptor)
+
+
+def test_write_redacted_writes_one_whole_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _short_writes(monkeypatch, 2)
+    encoded = encode_redacted({'s': 'ä\u2028b'}, _redactor())
+    path = tmp_path / 'out.jsonl'
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT)
+    try:
+        write_redacted(descriptor, encoded, newline=True)
+        write_redacted(descriptor, encoded)
+    finally:
+        os.close(descriptor)
+
+    assert path.read_text(encoding='utf-8') == f'{encoded}\n{encoded}'
+
+
+@pytest.mark.parametrize('text', ['{"a":1}', b'{"a":1}', None], ids=['str', 'bytes', 'none'])
+def test_write_redacted_checks_the_type_at_runtime(tmp_path: Path, text: object):
+    """静态类型挡不住 `Any`：从 JSON 里读出来的值就是 `Any`。"""
+    path = tmp_path / 'out'
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT)
+    try:
+        with pytest.raises(ContractViolation) as caught:
+            write_redacted(descriptor, cast(Any, text))
+    finally:
+        os.close(descriptor)
+
+    assert 'encode_redacted' in caught.value.next_action
+    assert path.read_bytes() == b''
 
 
 # --- 规则集摘要与版本 -------------------------------------------------------------------------

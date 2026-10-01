@@ -21,7 +21,7 @@ from typing import TextIO, cast
 from syndica.cli.dev_module import DevLogSnapshot
 from syndica.cli.host_git import Change
 from syndica.cli.terminal import one_line, terminal_safe
-from syndica.kernel.redaction import Redactor
+from syndica.kernel.redaction import Redactor, write_all
 
 __all__ = [
     'SCHEMA',
@@ -298,7 +298,7 @@ def _handoff_directory(root: Path) -> Path:
         pass
     else:
         try:
-            os.write(descriptor, b'*\n')
+            write_all(descriptor, b'*\n')
         finally:
             os.close(descriptor)
     handoffs = own / _HANDOFFS
@@ -314,7 +314,7 @@ def write_handoff(root: Path, name: str, text: str, redactor: Redactor) -> Path:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         try:
-            os.write(descriptor, redactor.redact(text).encode('utf-8', 'backslashreplace'))
+            write_all(descriptor, redactor.redact(text).encode('utf-8', 'backslashreplace'))
         finally:
             os.close(descriptor)
     except BaseException:
@@ -337,7 +337,7 @@ def rewrite_handoff(root: Path, path: Path, text: str, redactor: Redactor) -> No
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         try:
-            os.write(descriptor, redactor.redact(text).encode('utf-8', 'backslashreplace'))
+            write_all(descriptor, redactor.redact(text).encode('utf-8', 'backslashreplace'))
         finally:
             os.close(descriptor)
         os.replace(temporary, path)
