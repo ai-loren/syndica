@@ -17,7 +17,7 @@ import subprocess
 import termios
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
 from typing import Any, TextIO, cast
@@ -222,6 +222,7 @@ def _run(
     protected: list[str] | None = None,
     flags: Sequence[str] = (),
     stderr: StringIO | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> _Run:
     model = llm if isinstance(llm, ScriptedLLM) else ScriptedLLM(llm)
     config = _config(tmp_path, verify, protected)
@@ -231,7 +232,10 @@ def _run(
         stdin=StringIO(stdin) if isinstance(stdin, str) else stdin, stdout=stdout, stderr=stderr
     )
     host = RuntimeCliHost(
-        io=io, model_factory=lambda _: model, workspace_root=root, environ=_env(tmp_path)
+        io=io,
+        model_factory=lambda _: model,
+        workspace_root=root,
+        environ=_env(tmp_path) if environ is None else dict(environ),
     )
     extra = [*flags, *(['--git-mode', git_mode] if git_mode is not None else [])]
     try:
@@ -396,15 +400,15 @@ def test_each_reason_for_not_being_verified_is_named(
         ({'ahead': 1}, '本地已经领先上游 1 个提交'),
         (
             {
-                'before': _integrity(hooks=(('pre-push', 'e' * 40),)),
-                'now': _integrity(hooks=(('pre-push', 'e' * 40),)),
+                'before': _integrity(hooks=(('pre-push', 'x ' + 'e' * 40),)),
+                'now': _integrity(hooks=(('pre-push', 'x ' + 'e' * 40),)),
             },
             '推送时会在本地运行的钩子（pre-push）',
         ),
         (
             {
-                'before': _integrity(hooks=(('reference-transaction', 'e' * 40),)),
-                'now': _integrity(hooks=(('reference-transaction', 'e' * 40),)),
+                'before': _integrity(hooks=(('reference-transaction', 'x ' + 'e' * 40),)),
+                'now': _integrity(hooks=(('reference-transaction', 'x ' + 'e' * 40),)),
             },
             '（reference-transaction）',
         ),
@@ -505,7 +509,9 @@ def test_the_summary_lists_exactly_30_changes_without_a_total():
 
 def test_the_summary_names_pre_existing_changes_and_the_hooks_that_will_run():
     text = summary(
-        before=_integrity(hooks=(('commit-msg', 'e' * 40), ('pre-commit.sample', 'f' * 40))),
+        before=_integrity(
+            hooks=(('commit-msg', 'x ' + 'e' * 40), ('pre-commit.sample', 'x ' + 'f' * 40))
+        ),
         changes=[Change('src/new.py', '??', 'b' * 40)],
         written=lambda path: True,
         host_verify='passed',
@@ -519,6 +525,85 @@ def test_the_summary_names_pre_existing_changes_and_the_hooks_that_will_run():
     assert '运行前就有的 2 处改动不进提交' in text
     assert '提交时会运行钩子（在 Agent 的环境里，拿不到 ssh agent 与密钥）：commit-msg' in text
     assert 'pre-commit.sample' not in text
+
+
+def test_the_summary_names_only_executable_hooks_that_a_commit_runs():
+    hooks = (
+        ('commit-msg', 'x ' + 'a' * 40),
+        ('post-commit', '- ' + 'b' * 40),
+        ('post-index-change', 'x ' + 'c' * 40),
+        ('pre-push', 'x ' + 'd' * 40),
+        ('reference-transaction', 'x ' + 'e' * 40),
+    )
+    text = summary(
+        before=_integrity(hooks=hooks),
+        changes=[Change('src/new.py', '??', 'b' * 40)],
+        written=lambda path: True,
+        host_verify='passed',
+        verdict='pass',
+        protected=(),
+        pre_existing=0,
+        title='t',
+    )
+
+    line = '提交时会运行钩子（在 Agent 的环境里，拿不到 ssh agent 与密钥）：'
+    assert f'{line}commit-msg、post-index-change、reference-transaction' in text.splitlines()
+
+
+def test_the_summary_names_every_hook_a_commit_can_run():
+    names = (
+        'commit-msg',
+        'post-commit',
+        'post-index-change',
+        'pre-auto-gc',
+        'pre-commit',
+        'prepare-commit-msg',
+        'reference-transaction',
+    )
+    text = summary(
+        before=_integrity(hooks=tuple((name, 'x ' + 'a' * 40) for name in names)),
+        changes=[Change('src/new.py', '??', 'b' * 40)],
+        written=lambda path: True,
+        host_verify='passed',
+        verdict='pass',
+        protected=(),
+        pre_existing=0,
+        title='t',
+    )
+
+    line = '提交时会运行钩子（在 Agent 的环境里，拿不到 ssh agent 与密钥）：'
+    assert f'{line}{"、".join(names)}' in text.splitlines()
+
+
+def test_a_commit_hook_named_in_another_case_is_still_named():
+    text = summary(
+        before=_integrity(hooks=(('Pre-Commit', 'x ' + 'a' * 40),)),
+        changes=[Change('src/new.py', '??', 'b' * 40)],
+        written=lambda path: True,
+        host_verify='passed',
+        verdict='pass',
+        protected=(),
+        pre_existing=0,
+        title='t',
+    )
+
+    line = '提交时会运行钩子（在 Agent 的环境里，拿不到 ssh agent 与密钥）：'
+    assert f'{line}Pre-Commit' in text.splitlines()
+
+
+def test_the_summary_has_no_hook_line_when_only_push_time_hooks_exist():
+    text = summary(
+        before=_integrity(hooks=(('pre-push', 'x ' + 'd' * 40),)),
+        changes=[Change('src/new.py', '??', 'b' * 40)],
+        written=lambda path: True,
+        host_verify='passed',
+        verdict='pass',
+        protected=(),
+        pre_existing=0,
+        title='t',
+    )
+
+    assert '提交时会运行钩子' not in text
 
 
 def test_an_answer_that_is_not_utf8_means_3():
@@ -1397,6 +1482,65 @@ def test_a_push_time_hook_means_no_push_option(tmp_path: Path):
     assert '推送时会在本地运行的钩子（pre-push）' in asked.stderr
     assert asked.git == 'declined'
     assert not ran.exists()
+
+
+def test_a_push_time_hook_named_in_another_case_still_means_no_push_option(tmp_path: Path):
+    root = _repository(tmp_path)
+    _hook(tmp_path, 'Pre-Push', 'exit 0')
+
+    asked = _run(tmp_path, _script(), root=root, stdin='1\n')
+
+    assert '1. 提交并推送' not in asked.stderr
+    assert '推送时会在本地运行的钩子（Pre-Push）' in asked.stderr
+    assert asked.git == 'declined'
+
+
+def test_a_push_time_hook_without_the_executable_bit_leaves_the_push_option(tmp_path: Path):
+    root = _repository(tmp_path)
+    ran = tmp_path / 'ran'
+    _hook(tmp_path, 'pre-push', f'touch {ran}').chmod(0o644)
+
+    run = _run(tmp_path, _script(), root=root, stdin='1\n')
+
+    assert run.git == 'pushed'
+    assert not ran.exists()
+
+
+def test_the_summary_lists_the_executable_commit_hooks_of_the_real_hooks_directory(
+    tmp_path: Path,
+):
+    root = _repository(tmp_path)
+    _hook(tmp_path, 'pre-commit', 'exit 0')
+    _hook(tmp_path, 'post-commit', 'exit 0').chmod(0o644)
+    _hook(tmp_path, 'pre-push', 'exit 0')
+
+    run = _run(tmp_path, _script(), root=root, stdin='3\n')
+
+    line = '提交时会运行钩子（在 Agent 的环境里，拿不到 ssh agent 与密钥）：'
+    assert f'{line}pre-commit' in run.stderr.splitlines()
+
+
+def test_the_commit_uses_the_global_config_found_under_xdg_config_home(tmp_path: Path):
+    root = _repository(tmp_path)
+    hooks = tmp_path / 'xdg-hooks'
+    hooks.mkdir()
+    marker = tmp_path / 'xdg-hook-ran'
+    hook = hooks / 'commit-msg'
+    hook.write_text(f'#!/bin/sh\ntouch {marker}\n', encoding='utf-8')
+    hook.chmod(0o755)
+    (tmp_path / 'xdg' / 'git').mkdir(parents=True)
+    (tmp_path / 'xdg' / 'git' / 'config').write_text(
+        f'[user]\n\tname = Xdg User\n\temail = xdg@example.com\n[core]\n\thooksPath = {hooks}\n',
+        encoding='utf-8',
+    )
+    environ = {key: value for key, value in _env(tmp_path).items() if key != 'GIT_CONFIG_GLOBAL'}
+    environ['XDG_CONFIG_HOME'] = str(tmp_path / 'xdg')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit', environ=environ)
+
+    assert run.git == 'committed'
+    assert marker.exists()
+    assert _git(root, tmp_path, 'log', '-1', '--format=%an').strip() == 'Xdg User'
 
 
 def test_a_push_time_hook_makes_git_mode_push_exit_3(tmp_path: Path):

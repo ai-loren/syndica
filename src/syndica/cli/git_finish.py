@@ -58,13 +58,27 @@ _IN_PROGRESS = (
     ('BISECT_LOG', 'bisect'),
 )
 # 推送时会在本地运行的钩子。推送要用宿主的环境（ssh agent、凭证），钩子会拿到它们，而钩子执行的往往
-# 是工作区里 Agent 能改的代码：有这样的钩子就不提供推送，推送时也关掉本地钩子。
+# 是工作区里 Agent 能改的代码：有这样的钩子（可执行的）就不提供推送，推送时也关掉本地钩子。
 _PUSH_HOOKS = frozenset({'pre-push', 'reference-transaction'})
+# 宿主的 `git add` 与 `git commit` 会触发的钩子（`pre-auto-gc` 在提交顺带触发自动 gc 时跑）。
+_COMMIT_HOOKS = frozenset(
+    {
+        'pre-commit',
+        'prepare-commit-msg',
+        'commit-msg',
+        'post-commit',
+        'post-index-change',
+        'reference-transaction',
+        'pre-auto-gc',
+    }
+)
 # 本机可能经 trace2 事件目标挂着一个改写提交消息的进程（会追加署名），而提交消息要与生成的逐字
 # 一致：提交与它触发的钩子都不发 trace2 事件。全局配置里的事件目标只有这个环境变量盖得过，
 # 命令行 `-c` 盖不过。
 _NO_TRACE2_EVENTS = {'GIT_TRACE2_EVENT': '0'}
-_HOST_GIT_CONFIG = ('GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM')
+# 决定 git 去哪里找配置的变量：没设 `GIT_CONFIG_GLOBAL` 时，全局配置在
+# `$XDG_CONFIG_HOME/git/config`。
+_HOST_GIT_CONFIG = ('GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'XDG_CONFIG_HOME')
 _FIELDS = (
     ('toplevel', '顶层目录'),
     ('head', 'HEAD'),
@@ -88,8 +102,8 @@ _TAMPERED = (
 def hook_environment(host: Mapping[str, str], agent: Mapping[str, str]) -> dict[str, str]:
     """提交（以及它触发的钩子、`gpg.program` 这类配置里的程序）在这个环境里跑：它们执行的往往是
     工作区里 Agent 能改的代码，只能拿到 Agent 本来就有的东西——没有 ssh agent、没有像密钥的变量。
-    git 配置仍用宿主的（身份、钩子目录、签名）：`GIT_CONFIG_GLOBAL` / `GIT_CONFIG_NOSYSTEM` 取宿主
-    的值，宿主没设就不设。"""
+    git 配置仍用宿主的（身份、钩子目录、签名）：`GIT_CONFIG_GLOBAL`、`GIT_CONFIG_NOSYSTEM` 与
+    `XDG_CONFIG_HOME` 取宿主的值，宿主没设就不设——否则快照看的钩子目录与提交真正跑的不是同一个。"""
     values = {name: value for name, value in agent.items() if name not in _HOST_GIT_CONFIG}
     values.update({name: host[name] for name in _HOST_GIT_CONFIG if name in host})
     return {**host_environment(values), **_NO_TRACE2_EVENTS}
@@ -122,8 +136,14 @@ class Integrity:
     in_progress: tuple[str, ...]
 
     @property
+    def executable_hooks(self) -> tuple[str, ...]:
+        """git 会跑的钩子：有执行位的那些（标记在 `integrity` 里写下）。"""
+        return tuple(name for name, mark in self.hooks if mark.startswith('x '))
+
+    @property
     def push_hooks(self) -> tuple[str, ...]:
-        return tuple(name for name, _ in self.hooks if name in _PUSH_HOOKS)
+        # 名字不分大小写比：APFS 默认不区分大小写，git 在那里把 `Pre-Push` 当成 `pre-push` 跑。
+        return tuple(name for name in self.executable_hooks if name.lower() in _PUSH_HOOKS)
 
 
 def _git_path(git: HostGit, name: str) -> Path:
@@ -348,7 +368,7 @@ def summary(
         lines += [f'- {one_line(path)}' for path in protected]
     if pre_existing:
         lines.append(f'运行前就有的 {pre_existing} 处改动不进提交（复核时它们在工作区里）。')
-    hooks = [name for name, _ in before.hooks if not name.endswith('.sample')]
+    hooks = [name for name in before.executable_hooks if name.lower() in _COMMIT_HOOKS]
     if hooks:
         lines.append(
             f'提交时会运行钩子（在 Agent 的环境里，拿不到 ssh agent 与密钥）：'
