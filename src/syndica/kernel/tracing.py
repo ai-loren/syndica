@@ -25,10 +25,15 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from syndica.kernel.errors import ContractViolation
 from syndica.kernel.trace import AttributeValue, CausalityEdge, EdgeKind, SpanKind, SpanStatus
+
+if TYPE_CHECKING:
+    from syndica.kernel.context import ContextBlock
+    from syndica.kernel.message import Message
+    from syndica.kernel.tool import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +78,31 @@ class Tracer(Protocol):
 
     def add_edge(self, edge: CausalityEdge) -> None: ...
 
+    def llm_exchange(
+        self,
+        span_id: str,
+        request: Mapping[str, Any],
+        reply: ContextBlock | None,
+        error: BaseException | None,
+    ) -> None:
+        """一次模型调用（`span_id` 那个 llm_call span）的请求与结局：回复，或它抛出的异常。在 span
+        收尾之前到达。对象由内核持有，要留着内容就在这次调用里取走。"""
+        ...
+
+    def tool_result(
+        self, span_id: str, result: ToolResult | None, error: BaseException | None
+    ) -> None:
+        """一次工具执行（`span_id` 那个 tool_call span）交回的结果，或它抛出的异常——工具自己的
+        结局，`POST_TOOL_USE` 改写之前；被 `PRE_TOOL_USE` 跳过的调用交的是跳过它的那个结果。在 span
+        收尾之前到达。内核自己写的结局（未知工具、坏参数、阻断、确认的结局）不经这里：回放时内核
+        照样写得出来。"""
+        ...
+
+    def wait_answer(self, span_id: str, message: Message) -> None:
+        """一次 `wait_for`（`span_id` 那个 wait span）等到的那条消息。只在等到了时到达，在 span
+        收尾之前：此刻这条消息已经离开邮箱，由内核交给等待它的工具。"""
+        ...
+
 
 class NullTracer:
     """默认 tracer：什么都不记。"""
@@ -97,6 +127,23 @@ class NullTracer:
         return None
 
     def add_edge(self, edge: CausalityEdge) -> None:
+        return None
+
+    def llm_exchange(
+        self,
+        span_id: str,
+        request: Mapping[str, Any],
+        reply: ContextBlock | None,
+        error: BaseException | None,
+    ) -> None:
+        return None
+
+    def tool_result(
+        self, span_id: str, result: ToolResult | None, error: BaseException | None
+    ) -> None:
+        return None
+
+    def wait_answer(self, span_id: str, message: Message) -> None:
         return None
 
 
@@ -396,6 +443,16 @@ class _Tracing:
         """一轮里的模型调用：首次与重试共用这一份计数（D3 / D11）。"""
         return _LlmScope(_LlmCall(self, agent_id, turn))
 
+    def tool_result(
+        self, span: _OpenSpan, result: ToolResult | None, error: BaseException | None
+    ) -> None:
+        span_id = span.span_id
+        self.call('tool_result', lambda tracer: tracer.tool_result(span_id, result, error))
+
+    def wait_answer(self, span: _OpenSpan, message: Message) -> None:
+        span_id = span.span_id
+        self.call('wait_answer', lambda tracer: tracer.wait_answer(span_id, message))
+
 
 class _LlmScope:
     def __init__(self, call: _LlmCall) -> None:
@@ -438,9 +495,11 @@ class _Attempt:
     """一次 `llm.create`：在当前模型调用里数一次、开一个 llm_call span，在飞期间「当前 LLM 调用」
     有值。"""
 
-    def __init__(self, call: _LlmCall | None, llm: object) -> None:
+    def __init__(self, call: _LlmCall | None, llm: object, request: Mapping[str, Any]) -> None:
         self._call = call
         self._llm = llm
+        self._request = request
+        self._reply: object = None
         self._span: _Span | None = None
 
     def observe(self, reply: object) -> None:
@@ -456,6 +515,7 @@ class _Attempt:
         """
         if self._span is None or self._call is None:
             return
+        self._reply = reply
         try:
             self._record(reply, self._span.span.attributes, self._call.tracing)
         except (KeyboardInterrupt, SystemExit):
@@ -524,8 +584,18 @@ class _Attempt:
     ) -> None:
         if self._call is not None:
             self._call.in_flight = False
-        if self._span is not None:
-            self._span.__exit__(exc_type, exc, tb)
+        if self._span is None or self._call is None:
+            return
+        # 取消不是这次调用的结局：被取消的调用没有回复也没有错误可回放（D11：回放在同一处阻塞）。
+        if exc is None or isinstance(exc, Exception):
+            span_id = self._span.span.span_id
+            request, error = self._request, exc
+            reply = cast('ContextBlock | None', self._reply) if exc is None else None
+            self._call.tracing.call(
+                'llm_exchange',
+                lambda tracer: tracer.llm_exchange(span_id, request, reply, error),
+            )
+        self._span.__exit__(exc_type, exc, tb)
 
 
 def _failure_event(failure: object) -> dict[str, AttributeValue] | None:
@@ -541,7 +611,8 @@ def _failure_event(failure: object) -> dict[str, AttributeValue] | None:
     return event
 
 
-def llm_attempt(llm: object) -> _Attempt:
+def llm_attempt(llm: object, request: Mapping[str, Any] | None = None) -> _Attempt:
     """包住一次 `llm.create`。不在 Agent 的模型调用里（没有 `llm_call` 作用域）时什么都不做。模型名
-    取 `llm.config.model`（`LLM` 协议给的是 config）。"""
-    return _Attempt(_LLM_CALL.get(), llm)
+    取 `llm.config.model`（`LLM` 协议给的是 config）。`request` 是这次交给 `create` 的消息与参数
+    （`{'messages': ..., **kwargs}`），随结局一起交给 tracer。"""
+    return _Attempt(_LLM_CALL.get(), llm, {} if request is None else request)

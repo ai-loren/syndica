@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from syndica.kernel.context import StopReason
+from syndica.kernel.context import StopReason, TrustLevel
 from syndica.kernel.danger import ConfirmationOutcome, Disposition, RiskLevel
 from syndica.kernel.errors import ContractViolation
 from syndica.kernel.redaction import RedactionRule, RuleRedactor, encode_redacted, looks_secret
@@ -132,12 +132,16 @@ def test_the_attribute_set_is_exactly_the_schema():
         'llm.output_tokens': 'int?',
         'llm.cached_input_tokens': 'int?',
         'llm.request_digest': 'str',
+        'llm.request_units': 'payload',
+        'llm.request': 'payload',
+        'llm.response': 'payload',
         'tool.name': 'str',
         'tool.call_id': 'str',
         'tool.index': 'int',
         'tool.outcome': 'str',
         'tool.exit_code': 'int?',
         'tool.timed_out': 'bool',
+        'tool.result': 'payload',
         'danger.rule_ids': 'str[]',
         'danger.risk': 'str',
         'danger.provenance': 'str',
@@ -147,6 +151,7 @@ def test_the_attribute_set_is_exactly_the_schema():
         'wait.kind': 'str',
         'wait.target': 'str',
         'wait.outcome': 'str',
+        'wait.answer': 'payload',
         'message.id': 'str',
         'message.to': 'str',
         'child.agent_id': 'str',
@@ -161,6 +166,7 @@ def test_the_attributes_with_a_fixed_set_of_values_follow_the_kernel_enums():
     }
     assert ATTRIBUTE_DOMAINS['wait.outcome'] == {member.value for member in WaitState}
     assert ATTRIBUTE_DOMAINS['danger.risk'] == {member.value for member in RiskLevel}
+    assert ATTRIBUTE_DOMAINS['danger.provenance'] == {member.value for member in TrustLevel}
     assert ATTRIBUTE_DOMAINS['danger.disposition'] == {member.value for member in Disposition}
     assert ATTRIBUTE_DOMAINS['wait.kind'] == {'agent', 'human'}
     assert ATTRIBUTE_DOMAINS['danger.decided_by'] == {'flag', 'policy'}
@@ -215,6 +221,8 @@ def test_a_value_outside_a_fixed_set_is_refused(key: str):
         ('danger.rule_ids', ['shell.write', 'git.state', 'path.outside']),
         ('danger.rule_ids', ['shell.write', 'shell.write']),
         ('danger.rule_ids', ('shell.write',)),
+        ('tool.result', '0f' * 32),
+        ('wait.answer', '9' * 64),
     ],
 )
 def test_an_attribute_of_the_right_kind_is_kept(key: str, value: object):
@@ -247,6 +255,21 @@ def test_an_attribute_of_the_wrong_kind_is_refused(key: str, value: object):
 
     assert key in caught.value.expected
     assert '布尔值不算整数' in caught.value.next_action
+
+
+@pytest.mark.parametrize(
+    'value',
+    ['0F' * 32, '0f' * 31, '0f' * 33, ' ' + '0f' * 32, 'see the attached reply', None, 64, True],
+    ids=['uppercase', 'short', 'long', 'padded', 'text', 'none', 'int', 'bool'],
+)
+def test_a_payload_attribute_takes_only_a_digest_and_never_echoes_what_it_got(value: object):
+    with pytest.raises(ContractViolation) as caught:
+        _span(attributes={'llm.response': value})
+
+    assert 'llm.response' in caught.value.expected and 'sha256' in caught.value.expected
+    assert 'put_payload' in caught.value.next_action
+    if isinstance(value, str):
+        assert value not in caught.value.received
 
 
 @pytest.mark.parametrize('key', ['tool.nmae', 'Turn', 3])
@@ -476,7 +499,11 @@ def test_no_name_that_looks_secret_holds_text():
     """trace 落盘前经 `encode_redacted`：名字像密钥的键下面、像凭证的字符串会被换成占位符，于是摘要
     与 id 都会丢。整数与布尔它不碰，`llm.input_tokens` 这类计数可以叫这个名字。"""
     fields = {field.name for model in _MODELS for field in dataclasses.fields(model)}
-    textual = {key for key, kind in ATTRIBUTE_KINDS.items() if kind.rstrip('?') in {'str', 'str[]'}}
+    textual = {
+        key
+        for key, kind in ATTRIBUTE_KINDS.items()
+        if kind.rstrip('?') in {'str', 'str[]', 'payload'}
+    }
 
     assert sorted(name for name in fields | textual if looks_secret(name)) == []
     assert sorted(key for key in ATTRIBUTE_KINDS if looks_secret(key)) == [

@@ -42,8 +42,10 @@ __all__ = [
     'RedactionRule',
     'Redactor',
     'RuleRedactor',
+    'encode_digests',
     'encode_redacted',
     'looks_secret',
+    'redact_argv',
     'write_all',
     'write_redacted',
 ]
@@ -786,6 +788,43 @@ def encode_redacted(value: object, redactor: Redactor) -> RedactedText:
         ) from exc
     escaped = _RAW_IN_JSON.sub(lambda match: f'\\u{ord(match.group()):04x}', text)
     return RedactedText(escaped, _mint=_MINT)
+
+
+_SHA256 = re.compile(r'[0-9a-f]{64}')
+
+
+def encode_digests(digests: Sequence[str]) -> RedactedText:
+    """一组 sha256 摘要的规范 JSON 编码，不经脱敏：里面没有自由文本，而用户规则可能认得一段
+    十六进制，换掉之后摘要就对不上了。每一项必须是 64 个小写十六进制字符——这道校验是它不经脱敏的
+    前提。"""
+    items = list(cast(Sequence[object], digests))
+    for index, item in enumerate(items):
+        if not isinstance(item, str) or _SHA256.fullmatch(item) is None:
+            shape = f'长度 {len(item)} 的字符串' if isinstance(item, str) else type(item).__name__
+            raise ContractViolation(
+                expected='encode_digests 的每一项是 64 个小写十六进制字符的 sha256',
+                received=f'第 {index} 项是 {shape}',
+                next_action='别的内容走 encode_redacted：只有摘要可以不经脱敏',
+            )
+    return RedactedText(json.dumps(items, separators=(',', ':')), _mint=_MINT)
+
+
+def redact_argv(argv: Sequence[str], redactor: Redactor) -> tuple[str, ...]:
+    """命令行参数逐项脱敏。逐项看不见两项之间的关系：`--api-key <值>` 分成两项时，名字像密钥的
+    开关让紧跟它的那一项按凭证判，脱敏之后仍像凭证就换成 `secret.named_assignment` 的占位符——与
+    `encode_redacted` 里一对键值的判法相同。写成一项的 `--api-key=<值>` 由规则本身认。"""
+    redacted: list[str] = []
+    for index, item in enumerate(argv):
+        text = redactor.redact(item)
+        flag = argv[index - 1] if index else ''
+        if (
+            flag.startswith('-')
+            and looks_secret(flag.lstrip('-'))
+            and _credential_value(text, quoted=True)
+        ):
+            text = _placeholder('secret.named_assignment')
+        redacted.append(text)
+    return tuple(redacted)
 
 
 def write_all(fd: int, data: bytes) -> None:

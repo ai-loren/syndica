@@ -238,6 +238,20 @@ def _checked_ids(ids: object) -> IdSource:
     return cast(IdSource, ids)
 
 
+def _checked_tracer(tracer: object) -> Tracer:
+    if isinstance(tracer, type) or not isinstance(tracer, Tracer):
+        raise ConfigError(
+            expected='tracer 是一个实现了 Tracer 全部同步方法的实例',
+            received=f'收到 {tracer!r}（{type(tracer).__name__}）',
+            next_action=(
+                '传 start_span / end_span / add_event / add_edge / llm_exchange / tool_result / '
+                'wait_answer 都在的实例（例如 TraceRecorder；只想覆盖其中几个就继承 NullTracer），'
+                '不要传类'
+            ),
+        )
+    return tracer
+
+
 def _fresh_id(produce: Callable[[StableKey], str], key: StableKey, what: str) -> str:
     try:
         value = cast(object, produce(key))
@@ -848,11 +862,13 @@ class Runtime:
         flags: Mapping[str, FlagValue] | None = None,
         confirmation_handler: ConfirmationHandler | None = None,
         ids: IdSource | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
         validate_confirmation_handler(confirmation_handler)
         self._ids: IdSource = RandomIds() if ids is None else _checked_ids(ids)
+        checked_tracer = None if tracer is None else _checked_tracer(tracer)
         # 既不在工具调用里、也没有属主的 spawn 与 send 是宿主自己的代码，按宿主的第几次取键；经拓扑
         # 槽的按槽、键与第几个（M3 D10）。宿主自己并发地 spawn 时这个序号随到达的先后。
         self._host_spawns = 0
@@ -865,7 +881,7 @@ class Runtime:
         self._request_keys: dict[tuple[str, str], list[StableKey]] = {}
         # 插桩（M3 D2）：交给这里管的每个 Agent 与执行器。不在工具调用、也没有属主时发起的等待按
         # 宿主的第几次取 span 的结构键。
-        self._tracing = _Tracing()
+        self._tracing = _Tracing(checked_tracer)
         self._host_waits = 0
         module_assembly = _RuntimeModuleAssembly(modules, flags)
         self.registry: AgentRegistry = (
@@ -2191,13 +2207,7 @@ class Runtime:
         还有 span 开着时拒绝：开始已经交给了旧的，结束会落到新的上，两边都配不上对。旧 tracer 的
         失败在换掉之前报掉，失败计数清零——总数报给谁就得是谁的。
         """
-        given = cast(object, tracer)
-        if isinstance(given, type) or not isinstance(given, Tracer):
-            raise ConfigError(
-                expected='tracer 是一个实现了 Tracer 四个同步方法的实例',
-                received=f'收到 {tracer!r}（{type(tracer).__name__}）',
-                next_action='传 start_span / end_span / add_event / add_edge 都在的实例，不要传类',
-            )
+        _checked_tracer(tracer)
         if self._tracing.open_spans:
             raise ConfigError(
                 expected='换 tracer 时没有开着的 span',
@@ -2464,8 +2474,9 @@ class Runtime:
         几次调用各等各的，编号不随调度变。人等的对象记成请求键，等 `Reply` 的记成关联 ID。
         """
         key = next_key('request')
-        if not isinstance(cast(object, agent_id), str):
-            # 不记 span：拒绝由 `_wait_for` 给出，它说得清期望什么。
+        if not isinstance(cast(object, agent_id), str) or agent_id not in self._slots:
+            # 不记 span：拒绝由 `_wait_for` 给出，它说得清期望什么；调用方给的一个不认识的 id 也
+            # 不该原样成为 trace 里一个 span 的 agent id。
             return await self._registered_wait(agent_id, waiter, key)
         if isinstance(waiter, Reply):
             correlation = cast(object, waiter.correlation_id)
@@ -2475,6 +2486,8 @@ class Runtime:
         with self._wait_span(agent_id, key, kind, target) as span:
             result = await self._registered_wait(agent_id, waiter, key)
             span.attributes['wait.outcome'] = result.state.value
+            if result.message is not None:
+                self._tracing.wait_answer(span, result.message)
             return result
 
     def _wait_span(self, agent_id: str, key: StableKey | None, kind: str, target: str) -> _Span:

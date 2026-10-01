@@ -16,7 +16,10 @@ from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
 from syndica.kernel.llm import ScriptedLLM
+from syndica.kernel.redaction import RuleRedactor
 from syndica.kernel.runtime import Runtime
+from syndica.kernel.stores import InMemoryTraceStore
+from syndica.kernel.trace_recorder import TraceRecorder
 
 # 逐字写死，**不从 `kernel.__all__` 推导**：删一个导出、加一个导出都必须先在这里变红。用被测对象
 # 自己的导出面算出来的期望值（「每个名字都解析得到」「列表有序」）两条都由构造恒成立，测的是恒等式
@@ -34,9 +37,11 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'ArtifactRef',
     'AskUser',
     'AskUserQuestion',
+    'AttributeValue',
     'BaseAgent',
     'BlockHighRisk',
     'CachePrefixProvider',
+    'CausalityEdge',
     'ConfigError',
     'Confirmation',
     'ConfirmationHandler',
@@ -54,6 +59,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'DangerVerdict',
     'DeliveryResult',
     'Disposition',
+    'EdgeKind',
     'Event',
     'EventBus',
     'ExecResult',
@@ -68,6 +74,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'IdSource',
     'InMemoryAgentRegistry',
     'InMemoryMessageBroker',
+    'InMemoryTraceStore',
     'Junction',
     'JunctionKind',
     'JunctionRef',
@@ -81,8 +88,10 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'MessageBroker',
     'MissingQueueCallback',
     'NO_RULE_MATCHED',
+    'NullTracer',
     'Orchestrator',
     'OverrideRecord',
+    'PayloadRef',
     'Plugin',
     'Portal',
     'PrefixDriftModule',
@@ -99,6 +108,10 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'SafetyModule',
     'ScriptedLLM',
     'ScriptedTurn',
+    'Span',
+    'SpanEvent',
+    'SpanKind',
+    'SpanStatus',
     'StableKey',
     'StopReason',
     'Subscription',
@@ -108,6 +121,13 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'ToolFatalError',
     'ToolResult',
     'Topology',
+    'TraceHeader',
+    'TraceLevel',
+    'TraceRecorder',
+    'TraceRedaction',
+    'TraceSource',
+    'TraceStore',
+    'Tracer',
     'Trigger',
     'TrustLevel',
     'UserInput',
@@ -126,6 +146,7 @@ _CONTRACT_EXPORTS: tuple[str, ...] = (
     'AgentRegistryContract',
     'ContractSuite',
     'MessageBrokerContract',
+    'TraceStoreContract',
     'UPDATE_PROTECTED_FIELDS',
     'UPDATE_PROTECTED_FIELD_OWNERS',
     'UPDATE_WRITABLE_FIELDS',
@@ -178,6 +199,22 @@ _BASE_AGENT_SURFACE: tuple[str, ...] = (
     'register_hook',
     'run',
 )
+# `TraceRecorder` 的公开面：宿主的生命周期（begin / finish / dropped / trace_id / level）加
+# `Tracer` 协议的七个方法。
+_TRACE_RECORDER_SURFACE: tuple[str, ...] = (
+    'add_edge',
+    'add_event',
+    'begin',
+    'dropped',
+    'end_span',
+    'finish',
+    'level',
+    'llm_exchange',
+    'start_span',
+    'tool_result',
+    'trace_id',
+    'wait_answer',
+)
 # `Runtime.__init__` / `BaseAgent.__init__` 的参数名、种类、有没有默认值。`dir()` 看不见构造
 # 签名：加一个关键字参数、把必填改成可选、把 keyword-only 改成位置参数，公开面守卫全绿。
 # 第三列是「有没有默认值」而不是默认值本身——默认值改了是行为变更，这条守卫管的是形状。
@@ -192,6 +229,7 @@ _RUNTIME_INIT: tuple[tuple[str, str, bool], ...] = (
     ('flags', 'KEYWORD_ONLY', True),
     ('confirmation_handler', 'KEYWORD_ONLY', True),
     ('ids', 'KEYWORD_ONLY', True),
+    ('tracer', 'KEYWORD_ONLY', True),
 )
 _RUNTIME_SPAWN: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),
@@ -271,28 +309,22 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 _WITHHELD: tuple[str, ...] = (
     'ATTRIBUTE_DOMAINS',
     'ATTRIBUTE_KINDS',
-    'AttributeValue',
     'Bash',
     'BashOutput',
     'BrokerTurnGate',
-    'CausalityEdge',
     'ControlBlock',
     'DEFAULT_MAX_TOOL_CONCURRENCY',
     'Delegate',
     'Edit',
-    'EdgeKind',
     'Fork',
     'Glob',
     'Grep',
     'INTERCEPTABLE',
-    'InMemoryTraceStore',
     'KillAgent',
     'KillBash',
     'LocalAgentTable',
-    'NullTracer',
     'NullTurnGate',
     'OBSERVABLE',
-    'PayloadRef',
     'QueryAgent',
     'RULES_VERSION',
     'RULE_IDS',
@@ -303,20 +335,9 @@ _WITHHELD: tuple[str, ...] = (
     'Redactor',
     'RuleTablePolicy',
     'SendMessage',
-    'Span',
-    'SpanEvent',
-    'SpanKind',
-    'SpanStatus',
     'TRACE_SCHEMA',
     'ToolCallKey',
     'ToolExecutor',
-    'TraceHeader',
-    'TraceLevel',
-    'TraceRedaction',
-    'TraceSource',
-    'TraceStore',
-    'TraceStoreContract',
-    'Tracer',
     'TurnGate',
     'TurnGateDecision',
     'Write',
@@ -329,6 +350,7 @@ _WITHHELD: tuple[str, ...] = (
     'current_span_id',
     'current_tool_call',
     'disposition_of',
+    'encode_digests',
     'encode_redacted',
     'entering_owner',
     'entering_tool_call',
@@ -343,6 +365,7 @@ _WITHHELD: tuple[str, ...] = (
     'parse_mapping',
     'path_outside_workspace_rule',
     'peek_key',
+    'redact_argv',
     'register_tool',
     'releasing_agent_id',
     'resolve_tool_names',
@@ -538,6 +561,14 @@ def test_the_base_agent_surface_is_exactly_this():
     """同样按实例：`agent_id` / `options` 是 `__init__` 里赋的，而宿主读的正是它们。"""
     assert sorted(name for name in dir(_agent()) if not name.startswith('_')) == sorted(
         _BASE_AGENT_SURFACE
+    )
+
+
+def test_the_trace_recorder_surface_is_exactly_this():
+    """按实例：`TraceRecorder` 随 `kernel.__all__` 只导出类名，类上新增的方法在别处都不会变红。"""
+    recorder = TraceRecorder(InMemoryTraceStore(), RuleRedactor())
+    assert sorted(name for name in dir(recorder) if not name.startswith('_')) == sorted(
+        _TRACE_RECORDER_SURFACE
     )
 
 

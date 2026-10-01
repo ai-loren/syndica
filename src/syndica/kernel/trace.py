@@ -78,8 +78,9 @@ class TraceLevel(Enum):
     FULL = 'full'
 
 
-# 属性的闭集：键 → 取值的种类。`?` 表示还可以是 None；`str[]` 是字符串列表。读者（`trace show`、
-# 导出器）按这张表认字段，新增一个属性就是在这里加一行。
+# 属性的闭集：键 → 取值的种类。`?` 表示还可以是 None；`str[]` 是字符串列表；`payload` 是同一个
+# trace 里一份 payload 的引用（内容的 sha256，64 个小写十六进制）。读者（`trace show`、导出器、
+# 回放）按这张表认字段，新增一个属性就是在这里加一行。
 ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
     {
         'agent.role': 'str',
@@ -95,12 +96,16 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'llm.output_tokens': 'int?',
         'llm.cached_input_tokens': 'int?',
         'llm.request_digest': 'str',
+        'llm.request_units': 'payload',
+        'llm.request': 'payload',
+        'llm.response': 'payload',
         'tool.name': 'str',
         'tool.call_id': 'str',
         'tool.index': 'int',
         'tool.outcome': 'str',
         'tool.exit_code': 'int?',
         'tool.timed_out': 'bool',
+        'tool.result': 'payload',
         'danger.rule_ids': 'str[]',
         'danger.risk': 'str',
         'danger.provenance': 'str',
@@ -110,6 +115,7 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'wait.kind': 'str',
         'wait.target': 'str',
         'wait.outcome': 'str',
+        'wait.answer': 'payload',
         'message.id': 'str',
         'message.to': 'str',
         'child.agent_id': 'str',
@@ -118,8 +124,8 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
 )
 
 # 取值有限的属性：键 → 允许的取值。与内核枚举同名的几项（`StopReason`、`ConfirmationOutcome`、
-# `WaitState`、`RiskLevel`、`Disposition`）取它们的 `.value`；写在这里而不是 import，是为了不让模型
-# 依赖执行层。`tool.outcome` 与追加结果块的位置一一对应（M3 trace schema）。
+# `WaitState`、`RiskLevel`、`Disposition`、`TrustLevel`）取它们的 `.value`；写在这里而不是 import，
+# 是为了不让模型依赖执行层。`tool.outcome` 与追加结果块的位置一一对应（M3 trace schema）。
 ATTRIBUTE_DOMAINS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         'stop_reason': frozenset({'completed', 'aborted', 'error', 'max_turns'}),
@@ -143,6 +149,7 @@ ATTRIBUTE_DOMAINS: Mapping[str, frozenset[str]] = MappingProxyType(
             }
         ),
         'danger.risk': frozenset({'none', 'low', 'high'}),
+        'danger.provenance': frozenset({'trusted', 'untrusted'}),
         'danger.decided_by': frozenset({'flag', 'policy'}),
         'danger.disposition': frozenset({'allow', 'block', 'confirm'}),
         'confirmation.outcome': frozenset(
@@ -174,6 +181,8 @@ def _accepts(kind: str, value: object) -> bool:
         )
     if base == 'bool':
         return isinstance(value, bool)
+    if base == 'payload':
+        return isinstance(value, str) and _DIGEST.fullmatch(value) is not None
     return isinstance(value, list | tuple) and all(
         isinstance(item, str) for item in cast(Sequence[object], value)
     )
@@ -205,6 +214,17 @@ def _attributes(value: object, where: str) -> dict[str, AttributeValue]:
                 expected=f'{where} 的属性键取自 ATTRIBUTE_KINDS（闭集）',
                 received=f'收到键 {key!r}',
                 next_action='改成表里的键；要新增属性，先在 ATTRIBUTE_KINDS 里加一行并写明类型',
+            )
+        if not _accepts(kind, item) and kind == 'payload':
+            # 不回显取值：放错进来的可能正是本该进 payload、还没脱敏的内容。
+            shape = f'长度 {len(item)} 的字符串' if isinstance(item, str) else type(item).__name__
+            raise ContractViolation(
+                expected=(
+                    f'{where} 的属性 {key} 是 payload 引用：同一个 trace 里一份 payload 的 sha256'
+                    '（64 个小写十六进制）'
+                ),
+                received=f'收到 {shape}',
+                next_action=f'{key} 填 put_payload 交回的那个摘要；内容本身写进 payload',
             )
         if not _accepts(kind, item):
             raise ContractViolation(
@@ -371,8 +391,8 @@ class TraceRedaction:
 
 @dataclass(frozen=True)
 class TraceSource:
-    """这个 trace 从哪来：命令行参数（脱敏之后）、配置文件的 sha256、syndica 版本、
-    git commit，以及回放的是哪个 trace。"""
+    """这个 trace 从哪来：命令行参数、配置文件的 sha256、syndica 版本、git commit，以及回放的是
+    哪个 trace。`argv` 原样交进来：`TraceRecorder` 写下头之前逐项脱敏。"""
 
     argv: tuple[str, ...] = ()
     config_sha256: str | None = None

@@ -459,14 +459,35 @@ redaction:
   `llm.model` str、`llm.attempt` int、`llm.input_tokens` / `llm.output_tokens` / `llm.cached_input_tokens` int 或 null、
   `llm.request_digest` str、`tool.name` str（未知工具为 `<unknown>`）、`tool.call_id` str、`tool.index` int、
   `tool.outcome` str、`tool.exit_code` int 或 null、`tool.timed_out` bool、`danger.rule_ids` list[str]、
-  `danger.risk` str、`danger.provenance` str、`danger.decided_by` str（`flag policy`）、`danger.disposition` str、
+  `danger.risk` str、`danger.provenance` str（`trusted untrusted`）、`danger.decided_by` str（`flag policy`）、
+  `danger.disposition` str、
   `confirmation.outcome` str（取内核 `ConfirmationOutcome` 的值：`approved rejected timeout preempted aborted`）、
   `wait.kind` str（`agent human`）、`wait.target` str、`wait.outcome` str（取 `WaitState` 的值）、`message.id` str、
-  `message.to` str（发送事件上）、`child.agent_id` str（派生边上）、`agent.id` str（拆除事件上）。`wait.target`：人等
+  `message.to` str（发送事件上）、`child.agent_id` str（派生边上）、`agent.id` str（拆除事件上）、`llm.error` str 与
+  `llm.status` int 或 null（平台故障事件上）。`wait.target`：人等
   的是请求键（JSON；宿主直接发起、没有请求键的是空串），Delegate / Fork 等的是子 Agent 的 id，等 `Reply` 的是关联
   id。`danger.rule_ids` 没有规则命中时是空表。
+- payload 引用（种类 `payload`：同一个 trace 里一份 payload 的 sha256，64 个小写十六进制；`replay` 级起才有）：
+  `llm.request_units`（逐单元指纹的列表）、`llm.request`（`full` 才有：`{messages, params}`）、`llm.response`
+  （`{kind: reply, role, content, tool_calls: [{id, name, arguments}], tool_call_id, extra, trust}`，参数是解析后的
+  值、解析  不了的是原串；或 `{kind: error, type, message, status_code?, retry_after?}`，`type` 是 `模块.限定名`）、`tool.result`
+  （工具自己交回的、`POST_TOOL_USE` 改写之前的 `{kind: result, output, meta, trust, artifacts}`，或它抛出的
+  `{kind: error, …}`；被 `PRE_TOOL_USE` 跳过的调用是跳过它的那个结果；内核自己写的结局——未知工具、坏参数、
+  阻断、确认的结局——没有，回放时内核照样写得出来）、`wait.answer`（只在人等的 span 上：`{kind: answer, sender,
+  content, trigger, trust}`，不记关联 id；宿主直接发来的消息与等待过期后才到的答复是宿主的动作，进 `host_actions`）。
+  被取消的调用没有回复也没有错误。值里 JSON 表达不了的写成文字：环写成 `<cycle>`，一份 payload 超过 10 万个节点的
+  部分写成 `<truncated>`，超过 8192 位的整数写成十六进制，默认 repr 写成类型名（带内存地址的文字每次运行都不同）。
+- 脱敏：span 名、字符串属性（含列表的每一项）、事件、边的属性、payload、头里的命令行参数逐叶脱敏；内核生成的标识与
+  摘要（`agent.id`、`child.agent_id`、`message.id`、`message.to`、`llm.request_digest`、逐单元指纹的列表）、`payload`
+  引用与有固定取值的属性原样记——用户规则可能认得一段十六进制或一个词，换掉之后引用就断了、span 就校验不过。
+  `wait.target` 按自由文本脱敏（等 `Reply` 时它是调用方给的关联 id）：用户规则认得 id 时它会被换掉，Agent 之间的
+  关系以边为准。
+- 不完整的 trace：store 失败、或一条记录编码不出来时，recorder 只丢那一条（计入 `dropped`，记一条 ERROR）并且不写
+  结局——头里 `status` 为空的 trace 是记录到一半就断了的，回放与导出据此拒绝它。
 - 事件：`message.sent`（发送方的 span 上，投递成功才记，带 `message.id`、`message.to`）、`agent.despawned`（发起拆除
-  的 span 上，带 `agent.id`；宿主、EXIT 收尾、kill 的收尾、关机发起的拆除不在任何 span 里，不记）。
+  的 span 上，带 `agent.id`；宿主、EXIT 收尾、kill 的收尾、关机发起的拆除不在任何 span 里，不记）、
+  `llm.platform_failed`（llm_call span 上，同一次调用里每个被换掉的平台一个，带 `llm.platform`、`llm.error`、
+  `llm.status`）。
 - `tool.outcome` 取值：`ok error aborted judge_failed not_executed skipped blocked rejected timeout preempted
   confirmation_aborted no_channel unknown_tool bad_arguments interrupted`，与追加结果块的位置一一对应：`rejected
   timeout preempted confirmation_aborted` 是确认的四种结局（`_confirmation_result`）；`aborted` 是一次调用抛出、整批
@@ -788,7 +809,7 @@ LLM 调用」（清掉，并且只在 `create` 在飞时有值——hook 与工�
 - 见 D13。`usage` 有、没有、缺一部分各一条；`extra` 不进请求（逐字比对发出的 JSON）；换平台时 `llm_failures` 按顺序
   列出被换掉的三个平台；`cache_prefix_units` 不换平台时与作答成员逐字节相同。
 
-**状态：完成。** OpenAI 兼容客户端给每个回复带上 `extra['usage']`（三个计数；端点没报、类型不对或超出 int64 的记
+**状态：完成（5a56765）。** OpenAI 兼容客户端给每个回复带上 `extra['usage']`（三个计数；端点没报、类型不对或超出 int64 的记
 None，猜一个数比没有更糟）与 `extra['finish_reason']`，它们不随历史发回（第二轮请求体逐字节比对；`_message` 只回传
 `_EXTRA_KEY` 下的内容）。`ModelRouter` 交回作答成员回复的一份副本（不就地改成员的对象：会缓存回复的成员下次交回
 同一个对象），带上 `llm_route` 与同一次调用里按先后被换掉的平台 `llm_failures`（平台名、错误类型、HTTP 状态——状态
@@ -813,7 +834,8 @@ None，猜一个数比没有更糟）与 `extra['finish_reason']`，它们不随
 - `TraceRecorder(store, redactor, *, level, clock)` 实现 `Tracer`：同步缓冲、一个写入任务按序落盘、`finish` 排空
   （还开着的 span 以 `cancelled` 收尾再写，见 D3）；
   按 D8 的级别决定记什么；所有字符串经 `encode_redacted`；请求按 D11 取逐单元指纹（按单元原文的 sha256 缓存）；人的
-  答复由宿主报给它。宿主档案的 schema 到 T12 才有，T9 与 T11 不写它，从 T12 起写、T14 补进往返。
+  答复由内核在等待等到它时交给 tracer（见下面的状态）。宿主档案的 schema 到 T12 才有，T9 与 T11 不写它，从 T12 起写、
+  T14 补进往返。
 - 脱敏用例：每个通道一个**不同的**假密钥（提示词、命令行参数、工具参数、工具输出、`meta`、模型回复、`extra`、
   提供方错误文本、未知工具名、模型给的调用 id、环境变量样例），每个规则族至少一个；断言 store 里解码后的每个字符串
   与每个 16 字符片段都不含任何原文，**且**每个通道的位置上确实是预期的占位符（防止「什么都没记」也通过）。
@@ -822,6 +844,39 @@ None，猜一个数比没有更糟）与 `extra['finish_reason']`，它们不随
   （`agent.py`、`retry.py`）随之改；结构性的 id（span id、agent id、消息 id）不是自由文本，不经逐叶脱敏——32 位十六
   进制挂在像密钥名的键下会被换掉（T6 复评那条 `key` 字段就是这么丢的）。`Runtime(tracer=)` 在这里公开，`Tracer`
   与它用到的模型类型一起进承诺面。
+
+**状态：完成。** `kernel/trace_recorder.py`：`TraceRecorder` 实现 `Tracer`——同步方法只往内存记、往队列放，一个
+写入任务按收到的先后成批落盘（一批里 payload 先于引用它的 span），`finish` 把还开着的 span 以 `cancelled` 收尾、
+等写入任务排空（被取消也排空）、写下结局。时间只在 `begin` 读一次墙钟，此后按单调时钟往后推、不回退，span 不会
+落在 trace 之外。级别按 D8；指纹按 D11（模型参数是内核交给 `create` 的关键字参数，后端的配置不在其中，模型名记在
+`llm.model`）；逐单元指纹的列表经新的 `encode_digests` 编码——只收 64 位十六进制、不经脱敏。新增属性种类 `payload`
+（模型校验它是摘要）；`danger.provenance` 进闭集。
+
+与计划不同之处：(1) 人的答复由内核交：`Tracer` 加 `wait_answer`，`wait_for` 等到消息时在 span 收尾之前交出，
+recorder 只记人等的那一种——由宿主报，答复要赶在等待消费它之前报，第三方宿主漏报就静默丢了；(2) 命令行参数由
+recorder 脱敏（`redact_argv`，`--api-key <值>` 分成两项时也认），`TraceSource.argv` 原样交进来；(3) 内核生成的
+标识、摘要与闭集取值不经脱敏；(4) 被 `PRE_TOOL_USE` 跳过的调用经 `tool_result` 交出跳过它的结果（D11 要「原样再
+跳过」）；(5) 回复多记 `trust`（不进指纹）。T11 的 `FileTraceStore` 只用内置规则再编码：宿主的用户规则在 recorder
+那里已经用过，在 store 再用一遍只会换掉 id 与摘要。
+
+记录不改变 run：store 失败时第一次一条 ERROR，此后只计数（`dropped`，按 payload、span、边逐条、不多不少；
+`finish` 之后才到的 span 与边也算）；store 交回的引用与内容对不上（摘要或 trace id）算 store 故障，下一步写成
+「修 store」；`begin` 失败原样上抛给宿主，此后只计数；一条记录编码不出来只丢那一条（第一次一条 ERROR），这两种
+情况都不写结局。`Runtime(tracer=)`、`Tracer`、`NullTracer`、`TraceRecorder`、`TraceStore`、`InMemoryTraceStore`、
+`TraceStoreContract` 与 trace 模型类型进承诺面；`TraceRecorder` 的实例公开面逐字钉住。`Tracer` 协议以后再加通道，
+从头实现它的 tracer 会被 `Runtime` 拒掉：第三方继承 `NullTracer`（`Runtime` 的报错里写着）。
+
+验证：自己的变异 79 条，存活 1 条（`_fail` 里「只记一次」的守卫两个调用方都已挡住，是死代码，删掉，另两条变异证明
+调用方钉住了这件事）。对抗评审一路：没有脱敏泄漏；1 High（请求里一个落单的代理字符让此后每一次模型交换都记不下、
+`dropped` 仍是 0——缓存键按 UTF-8 编码；同族的还有 `str(error)` 自己抛出、超过 4300 位的整数）、3 Medium（用户
+规则认得十六进制时逐单元指纹被换成占位符；`_jsonable` 对共享与成环的结构按路径展开，三个节点的双向链表能把事件
+循环按住几个小时；默认级别缺跳过调用的结果与回复的 `trust`）、若干 Low（时钟的类型、`finish` 的收尾、两个时间
+基准、`wait_for` 给一个不认识的 agent id 开 span、`span id` 重开、`begin` 在飞时 `finish`、引用的 trace id 不核对、
+`_fail` 的下一步、`tracing.py` 两处到不了的守卫、实例公开面没钉、默认 repr 带内存地址），外加 23 条存活变异（每个
+通道用的是不是宿主的整套脱敏器、元组列表、覆盖次序、答复与结果的取值、`retry.py` 交不交请求）。全部修掉；没采纳
+的两条写进契约：`wait.target` 仍按自由文本脱敏（等 `Reply` 时它是调用方的文字，拆属性收益小于改模型的代价），
+用户规则的 pattern 照记在头里（回放靠它重建规则集，规则写在仓库的配置里）。变异：修复后 49 条、旧集里仍适用的 56 条
+与改写的 23 条，全杀。
 
 #### T10 — B-19：并发窗口里不许写轨迹
 
@@ -844,8 +899,9 @@ None，猜一个数比没有更糟）与 `extra['finish_reason']`，它们不随
 - 见 D6、D7、D8、D15。`FileTraceStore(root, redactor)` 过契约套件；`O_NOFOLLOW` / `dir_fd`（在 run 中途把 `payloads`
   换成符号链接，写入被拒、不写到链接指向的地方）、`O_EXCL` 与 sha256 核对各一条；写失败（目录只读、`.syndica` 被 Bash
   建成了文件）时 run 照常、stderr 一条说明；攥着目录 fd 时，`delete` 之后的写要报错而不是写进一个已经删掉的目录。
-- CLI：`run` / `chat` 默认记录（`chat` 最高 `structure`，D15）、四个级别、`trace.level` 快照、人的答复报给 recorder、
-  交接文件写 trace 目录、`.syndica/.gitignore` 照样建、Ctrl-C 时以 `cancelled` 收尾。宿主档案（规则带参数、处置表、
+- CLI：`run` / `chat` 默认记录（`chat` 最高 `structure`，D15）、四个级别、`trace.level` 快照、命令行参数原样交给
+  `TraceSource`（recorder 写头之前脱敏）、交接文件写 trace 目录、`.syndica/.gitignore` 照样建、Ctrl-C 时以 `cancelled`
+  收尾、`begin` 失败（store 写不进去）时 stderr 一条说明且照常跑。人的答复不用宿主报：内核在等待等到它时交给 recorder。宿主档案（规则带参数、处置表、
   Flag、`--max-turns`、`--no-write`、模块、拓扑与入口）从 T12 起报。
 
 #### T12 — 场景格式 v2：内核的 schema 与 runner 的两种读法

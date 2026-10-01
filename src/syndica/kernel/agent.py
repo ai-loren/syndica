@@ -849,7 +849,7 @@ class BaseAgent:
         messages = request['messages']
         kwargs = {key: value for key, value in request.items() if key != 'messages'}
         try:
-            with llm_attempt(self.options.llm) as attempt:
+            with llm_attempt(self.options.llm, request) as attempt:
                 reply = await self.options.llm.create(messages, **kwargs)
                 attempt.observe(reply)
                 return reply

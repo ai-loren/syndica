@@ -1026,7 +1026,10 @@ class ToolExecutor:
             Junction.PRE_TOOL_USE, tool_call=call, tool=tool, args=handed
         )
         if pre.skip:
-            return _skipped_result(call, pre.result), 'skipped'
+            skipped = _skipped_result(call, pre.result)
+            if traced is not None:
+                self._tracing.tool_result(traced[1], skipped, None)
+            return skipped, 'skipped'
         rewritten_args = pre.get('args', handed)
         if not isinstance(rewritten_args, dict):
             raise _rewrite_rejected(Junction.PRE_TOOL_USE, 'args', dict, rewritten_args)
@@ -1070,12 +1073,19 @@ class ToolExecutor:
             outcome = 'ok'
             try:
                 returned = cast(object, await tool.execute(**args))
-            except SyndicaError:
+            except SyndicaError as exc:
                 # 三件套写给程序员或运维，模型执行不了它的 next_action。
+                if traced is not None:
+                    self._tracing.tool_result(traced[1], None, exc)
                 raise
             except Exception as exc:
+                if traced is not None:
+                    self._tracing.tool_result(traced[1], None, exc)
                 returned = _tool_raised_result(call, exc)
                 outcome = 'error'
+            else:
+                if traced is not None and isinstance(returned, ToolResult):
+                    self._tracing.tool_result(traced[1], returned, None)
             if not isinstance(returned, ToolResult):
                 raise _bad_tool_return(call, tool, returned)
             result = returned

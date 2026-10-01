@@ -28,6 +28,7 @@ from syndica.kernel import (
     HooksCenter,
     HumanInteractionModule,
     Junction,
+    Message,
     Reply,
     RetryModule,
     RiskLevel,
@@ -41,6 +42,7 @@ from syndica.kernel import (
     Trigger,
     TrustLevel,
 )
+from syndica.kernel.context import ContextBlock
 from syndica.kernel.danger import DangerRequest, DangerVerdict
 from syndica.kernel.llm import LLMConfig
 from syndica.kernel.local_table import LocalAgentTable
@@ -97,6 +99,17 @@ class _Recorder:
         default_factory=list[tuple[str, str, dict[str, AttributeValue]]]
     )
     edges: list[CausalityEdge] = field(default_factory=list[CausalityEdge])
+    exchanges: list[tuple[str, Mapping[str, Any], ContextBlock | None, BaseException | None]] = (
+        field(
+            default_factory=list[
+                tuple[str, Mapping[str, Any], ContextBlock | None, BaseException | None]
+            ]
+        )
+    )
+    tool_results: list[tuple[str, ToolResult | None, BaseException | None]] = field(
+        default_factory=list[tuple[str, ToolResult | None, BaseException | None]]
+    )
+    answers: list[tuple[str, Message]] = field(default_factory=list[tuple[str, Message]])
     problems: list[str] = field(default_factory=list[str])
 
     def __post_init__(self) -> None:
@@ -129,6 +142,37 @@ class _Recorder:
 
     def add_edge(self, edge: CausalityEdge) -> None:
         self.edges.append(edge)
+
+    def llm_exchange(
+        self,
+        span_id: str,
+        request: Mapping[str, Any],
+        reply: ContextBlock | None,
+        error: BaseException | None,
+    ) -> None:
+        self._before_end(span_id, SpanKind.LLM_CALL, 'llm exchange', reply, error)
+        self.exchanges.append((span_id, request, reply, error))
+
+    def tool_result(
+        self, span_id: str, result: ToolResult | None, error: BaseException | None
+    ) -> None:
+        self._before_end(span_id, SpanKind.TOOL_CALL, 'tool result', result, error)
+        self.tool_results.append((span_id, result, error))
+
+    def wait_answer(self, span_id: str, message: Message) -> None:
+        self._before_end(span_id, SpanKind.WAIT, 'wait answer', message, None)
+        self.answers.append((span_id, message))
+
+    def _before_end(
+        self, span_id: str, kind: SpanKind, what: str, value: object, error: object
+    ) -> None:
+        started = self.started.get(span_id)
+        if started is None or span_id in self.ended:
+            self.problems.append(f'{what} on span {span_id} that is not open')
+        elif started.kind is not kind:
+            self.problems.append(f'{what} on {started.kind.value} span {span_id}')
+        if (value is None) == (error is None):
+            self.problems.append(f'{what} on span {span_id} with {value!r} and {error!r}')
 
     def of(self, kind: SpanKind) -> list[str]:
         return [span_id for span_id, started in self.started.items() if started.kind is kind]
@@ -801,6 +845,8 @@ async def test_a_human_wait_names_its_request_and_its_outcome(answered: bool):
         'wait.target': json.dumps(key),
         'wait.outcome': 'answered' if answered else 'timeout',
     }
+    answers = [(span, message.sender, message.content) for span, message in recorder.answers]
+    assert answers == ([(wait, 'human', 'this one')] if answered else [])
 
 
 async def test_a_wait_cut_short_by_an_abort_is_aborted():
@@ -820,6 +866,7 @@ async def test_a_wait_cut_short_by_an_abort_is_aborted():
 
     [wait] = recorder.of(SpanKind.WAIT)
     assert recorder.attributes(wait)['wait.outcome'] == 'aborted'
+    assert recorder.answers == []
 
 
 async def test_a_delegation_waits_on_the_child_and_spawns_it_from_the_delegate_call():
@@ -850,6 +897,7 @@ async def test_a_delegation_waits_on_the_child_and_spawns_it_from_the_delegate_c
         'wait.target': child,
         'wait.outcome': 'answered',
     }
+    assert recorder.answers == []
 
 
 class _AwaitReply(Tool):
@@ -915,6 +963,7 @@ async def test_a_reply_from_another_agents_call_links_to_the_wait_it_ended():
         'wait.target': 'q1',
         'wait.outcome': 'answered',
     }
+    assert [(span, message.content) for span, message in recorder.answers] == [(wait, 'answer')]
     [edge] = recorder.edges
     assert (edge.kind, edge.source_span_id, edge.target_span_id) == (
         EdgeKind.MESSAGE,
@@ -947,6 +996,7 @@ async def test_two_waits_the_host_starts_get_their_own_spans():
         span_id_of(SpanKind.WAIT, 'host', 'wait', 1),
     ]
     assert {recorder.started[span].agent_id for span in recorder.of(SpanKind.WAIT)} == {agent_id}
+    assert [span for span, _ in recorder.answers] == recorder.of(SpanKind.WAIT)
 
 
 async def test_an_agent_run_directly_inside_a_span_does_not_hang_under_it():
@@ -1423,7 +1473,7 @@ class _Broken:
         self.calls += 1
         raise self.error
 
-    start_span = end_span = add_event = add_edge = _fail
+    start_span = end_span = add_event = add_edge = llm_exchange = tool_result = wait_answer = _fail
 
 
 async def test_a_tracer_that_always_raises_changes_nothing_and_is_reported_once_then_counted(
@@ -2725,9 +2775,258 @@ async def test_a_reply_whose_extra_cannot_be_read_is_paid_for_once_and_reported(
 
 
 def test_observing_outside_a_model_call_does_nothing(caplog: pytest.LogCaptureFixture):
-    from syndica.kernel.context import ContextBlock
-
     with llm_attempt(ScriptedLLM([])) as attempt:
         attempt.observe(ContextBlock(role='assistant', content='x', extra={'llm_route': 'a'}))
 
     assert caplog.records == []
+
+
+# --- replay channels -------------------------------------------------------------------------
+
+
+async def _no_sleep(seconds: float) -> None:
+    return None
+
+
+def _outcomes(
+    recorder: _Recorder,
+) -> list[tuple[str, str | None, BaseException | None]]:
+    return [
+        (span, None if reply is None else cast(str | None, reply.content), error)
+        for span, _, reply, error in recorder.exchanges
+    ]
+
+
+async def test_each_model_call_hands_over_the_request_it_sent_and_the_reply_it_got():
+    llm = ScriptedLLM([ScriptedTurn(tool_calls=[_call('c', 'Echo')]), ScriptedTurn(content='ok')])
+    runtime, recorder = _traced()
+    try:
+        agent_id = await _run_one(runtime, _factory('Root', llm, {'Echo': _Echo()}))
+    finally:
+        await runtime.shutdown()
+
+    assert _outcomes(recorder) == [
+        (span_id_of(SpanKind.LLM_CALL, agent_id, 1, 1), None, None),
+        (span_id_of(SpanKind.LLM_CALL, agent_id, 2, 1), 'ok', None),
+    ]
+    first_reply = cast(ContextBlock, recorder.exchanges[0][2])
+    assert [call.name for call in first_reply.tool_calls] == ['Echo']
+    for (_, request, _, _), sent, sent_kwargs in zip(
+        recorder.exchanges, llm.calls, llm.call_kwargs, strict=True
+    ):
+        assert list(request) == ['messages', 'tools']
+        messages = cast(list[ContextBlock], request['messages'])
+        assert [(block.role, block.content) for block in messages] == [
+            (block.role, block.content) for block in sent
+        ]
+        assert request['tools'] == sent_kwargs['tools']
+
+
+async def test_a_failed_model_call_hands_over_its_error_and_each_retry_its_own_outcome():
+    error = RuntimeError('rate limited')
+    llm = ScriptedLLM([ScriptedTurn(raises=error), ScriptedTurn(content='finally')])
+    runtime, recorder = _traced(
+        modules=[RetryModule({}, sleep=_no_sleep)], flags={'llm_retry_attempts': 1}
+    )
+    try:
+        agent_id = await _run_one(runtime, _factory('Root', llm))
+    finally:
+        await runtime.shutdown()
+
+    assert _outcomes(recorder) == [
+        (span_id_of(SpanKind.LLM_CALL, agent_id, 1, 1), None, error),
+        (span_id_of(SpanKind.LLM_CALL, agent_id, 1, 2), 'finally', None),
+    ]
+    assert [_sent(request) for _, request, _, _ in recorder.exchanges] == [
+        [('system', ''), ('user', 'go')]
+    ] * 2
+
+
+def _sent(request: Mapping[str, Any]) -> list[tuple[str, object]]:
+    return [(block.role, block.content) for block in cast(list[ContextBlock], request['messages'])]
+
+
+async def test_a_fallback_model_hands_over_the_same_request_and_its_own_reply():
+    error = RuntimeError('main is down')
+    main = ScriptedLLM([ScriptedTurn(raises=error)])
+    backup = ScriptedLLM([ScriptedTurn(content='from backup')])
+    runtime, recorder = _traced(
+        modules=[RetryModule({'backup': cast(Any, backup)}, sleep=_no_sleep)],
+        flags={'llm_fallbacks': 'backup'},
+    )
+    try:
+        agent_id = await _run_one(runtime, _factory('Root', main))
+    finally:
+        await runtime.shutdown()
+
+    assert _outcomes(recorder) == [
+        (span_id_of(SpanKind.LLM_CALL, agent_id, 1, 1), None, error),
+        (span_id_of(SpanKind.LLM_CALL, agent_id, 1, 2), 'from backup', None),
+    ]
+    assert [_sent(request) for _, request, _, _ in recorder.exchanges] == [
+        [('system', ''), ('user', 'go')]
+    ] * 2
+
+
+class _HangingModel:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.config = LLMConfig(provider='fake', model='hangs')
+
+    async def create(self, messages: list[Any], **kwargs: Any) -> Any:
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
+async def test_a_model_call_cut_off_by_a_kill_hands_over_nothing():
+    llm = _HangingModel()
+    runtime, recorder = _traced()
+    try:
+        agent_id = await runtime.spawn(_factory('Root', cast(Any, llm)), query='go')
+        await asyncio.wait_for(llm.entered.wait(), _TIMEOUT)
+        await asyncio.wait_for(runtime.kill(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+
+    [span] = recorder.of(SpanKind.LLM_CALL)
+    assert recorder.status(span) is SpanStatus.CANCELLED
+    assert recorder.exchanges == []
+
+
+async def test_a_tool_hands_over_its_own_result_and_not_what_post_tool_use_made_of_it():
+    llm = ScriptedLLM(
+        [ScriptedTurn(tool_calls=[_call('c', 'Echo', text='original')]), ScriptedTurn(content='ok')]
+    )
+
+    async def rewrite(**_: Any) -> HookResult:
+        return HookResult(modified={'result': ToolResult(output='rewritten')})
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = _factory('Root', llm, {'Echo': _Echo()})(hooks, events)
+        agent.register_hook(Junction.POST_TOOL_USE, rewrite)
+        return agent
+
+    runtime, recorder = _traced()
+    try:
+        agent_id = await _run_one(runtime, build)
+    finally:
+        await runtime.shutdown()
+
+    [(span, result, error)] = recorder.tool_results
+    assert (span, cast(ToolResult, result).output, error) == (
+        span_id_of(SpanKind.TOOL_CALL, agent_id, 1, 1, 0),
+        'original',
+        None,
+    )
+    assert llm.calls[1][-1].content == 'rewritten'
+
+
+@pytest.mark.parametrize(
+    'error',
+    [RuntimeError('disk on fire'), ConfigError(expected='e', received='r', next_action='n')],
+    ids=['exception', 'syndica-error'],
+)
+async def test_a_tool_that_raises_hands_over_the_exception_it_raised(error: Exception):
+    llm = ScriptedLLM([ScriptedTurn(tool_calls=[_call('c', 'Raises')]), ScriptedTurn(content='ok')])
+    runtime, recorder = _traced()
+    try:
+        agent_id = await _run_one(runtime, _factory('Root', llm, {'Raises': _Raises(error)}))
+    finally:
+        await runtime.shutdown()
+
+    assert recorder.tool_results == [
+        (span_id_of(SpanKind.TOOL_CALL, agent_id, 1, 1, 0), None, error)
+    ]
+
+
+class _ReturnsText(Tool):
+    __tool_name__ = 'ReturnsText'
+    __tool_command_args__ = ()
+
+    async def execute(self) -> ToolResult:
+        """交回一个不是 ToolResult 的值。"""
+        return cast(ToolResult, 'plain text')
+
+
+async def _skip_echo(**_: Any) -> HookResult:
+    return HookResult(skip=True, result=ToolResult(output='skipped by the host'))
+
+
+@pytest.mark.parametrize(
+    'call',
+    [
+        _call('c', 'Nope'),
+        ToolCall(id='c', name='Echo', arguments='{not json'),
+        _call('c', 'ReturnsText'),
+    ],
+    ids=['unknown-tool', 'bad-arguments', 'not-a-tool-result'],
+)
+async def test_a_call_whose_tool_gave_back_no_result_hands_over_nothing(call: ToolCall):
+    llm = ScriptedLLM([ScriptedTurn(tool_calls=[call]), ScriptedTurn(content='ok')])
+    tools: dict[str, Tool] = {'Echo': _Echo(), 'ReturnsText': _ReturnsText()}
+    runtime, recorder = _traced()
+    try:
+        await _run_one(runtime, _factory('Root', llm, tools))
+    finally:
+        await runtime.shutdown()
+
+    assert len(recorder.of(SpanKind.TOOL_CALL)) == 1
+    assert recorder.tool_results == []
+
+
+async def test_a_skipped_call_hands_over_the_result_that_skipped_it():
+    llm = ScriptedLLM([ScriptedTurn(tool_calls=[_call('c', 'Echo')]), ScriptedTurn(content='ok')])
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = _factory('Root', llm, {'Echo': _Echo()})(hooks, events)
+        agent.register_hook(Junction.PRE_TOOL_USE, _skip_echo)
+        return agent
+
+    runtime, recorder = _traced()
+    try:
+        agent_id = await _run_one(runtime, build)
+    finally:
+        await runtime.shutdown()
+
+    span = span_id_of(SpanKind.TOOL_CALL, agent_id, 1, 1, 0)
+    [(handed, result, error)] = recorder.tool_results
+    assert (handed, cast(ToolResult, result).output, error) == (span, 'skipped by the host', None)
+    assert recorder.attributes(span)['tool.outcome'] == 'skipped'
+
+
+class _ResultKind(ToolResult):
+    pass
+
+
+class _ReturnsSubclass(Tool):
+    __tool_name__ = 'ReturnsSubclass'
+    __tool_command_args__ = ()
+
+    async def execute(self) -> ToolResult:
+        """交回一个 ToolResult 子类的实例。"""
+        return _ResultKind(output='from a subclass')
+
+
+async def test_a_tool_result_subclass_is_handed_over_like_a_tool_result():
+    llm = ScriptedLLM(
+        [ScriptedTurn(tool_calls=[_call('c', 'ReturnsSubclass')]), ScriptedTurn(content='ok')]
+    )
+    runtime, recorder = _traced()
+    try:
+        await _run_one(runtime, _factory('Root', llm, {'ReturnsSubclass': _ReturnsSubclass()}))
+    finally:
+        await runtime.shutdown()
+
+    [(_, result, _)] = recorder.tool_results
+    assert isinstance(result, _ResultKind) and result.output == 'from a subclass'
+
+
+async def test_a_wait_on_an_agent_this_runtime_does_not_hold_opens_no_span():
+    runtime, recorder = _traced()
+    try:
+        with pytest.raises(ContractViolation):
+            await runtime.wait_for('someone-else', Reply(correlation_id='q', timeout=_TIMEOUT))
+    finally:
+        await runtime.shutdown()
+
+    assert recorder.started == {}

@@ -75,11 +75,11 @@ from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.modules import FlagDeclaration, RuntimeModule, SafetyModule
 from syndica.kernel.plugins import Plugin
 from syndica.kernel.prefix_drift import PrefixDriftModule, PrefixDriftRecord, PrefixDriftService
-from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback
+from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback, TraceStore
 from syndica.kernel.redaction import Finding, RedactionRule, RuleRedactor
 from syndica.kernel.retry import RetryModule
 from syndica.kernel.runtime import AgentFactory, Runtime
-from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
+from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker, InMemoryTraceStore
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tools import (
     AskUser,
@@ -89,6 +89,22 @@ from syndica.kernel.tools import (
 )
 from syndica.kernel.tools.local import local_tools
 from syndica.kernel.topology import AgentSlot, Topology
+from syndica.kernel.trace import (
+    AttributeValue,
+    CausalityEdge,
+    EdgeKind,
+    PayloadRef,
+    Span,
+    SpanEvent,
+    SpanKind,
+    SpanStatus,
+    TraceHeader,
+    TraceLevel,
+    TraceRedaction,
+    TraceSource,
+)
+from syndica.kernel.trace_recorder import TraceRecorder
+from syndica.kernel.tracing import NullTracer, Tracer
 from syndica.kernel.waiting import (
     Confirmation,
     Reply,
@@ -112,9 +128,11 @@ __all__ = [
     'ArtifactRef',
     'AskUser',
     'AskUserQuestion',
+    'AttributeValue',
     'BaseAgent',
     'BlockHighRisk',
     'CachePrefixProvider',
+    'CausalityEdge',
     'ConfigError',
     'Confirmation',
     'ConfirmationHandler',
@@ -132,6 +150,7 @@ __all__ = [
     'DangerVerdict',
     'DeliveryResult',
     'Disposition',
+    'EdgeKind',
     'Event',
     'EventBus',
     'ExecResult',
@@ -146,6 +165,7 @@ __all__ = [
     'IdSource',
     'InMemoryAgentRegistry',
     'InMemoryMessageBroker',
+    'InMemoryTraceStore',
     'Junction',
     'JunctionKind',
     'JunctionRef',
@@ -159,8 +179,10 @@ __all__ = [
     'MessageBroker',
     'MissingQueueCallback',
     'NO_RULE_MATCHED',
+    'NullTracer',
     'Orchestrator',
     'OverrideRecord',
+    'PayloadRef',
     'Plugin',
     'Portal',
     'PrefixDriftModule',
@@ -177,6 +199,10 @@ __all__ = [
     'SafetyModule',
     'ScriptedLLM',
     'ScriptedTurn',
+    'Span',
+    'SpanEvent',
+    'SpanKind',
+    'SpanStatus',
     'StableKey',
     'StopReason',
     'Subscription',
@@ -186,6 +212,13 @@ __all__ = [
     'ToolFatalError',
     'ToolResult',
     'Topology',
+    'TraceHeader',
+    'TraceLevel',
+    'TraceRecorder',
+    'TraceRedaction',
+    'TraceSource',
+    'TraceStore',
+    'Tracer',
     'Trigger',
     'TrustLevel',
     'UserInput',
