@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import math
 import os
 import re
@@ -196,11 +197,15 @@ class LocalWorkspace:
                 received=f'pattern={pattern!r} 含父目录段 ..',
                 next_action='去掉 ..，从工作区根目录开始写相对模式',
             )
+        named = [part for part in Path(pattern).parts if part.startswith('.')]
         found: list[str] = []
         for match in self._root.glob(pattern):
             if not self._stays(match):
                 continue
-            found.append(match.relative_to(self._root).as_posix())
+            relative = match.relative_to(self._root)
+            if any(_hidden(part) and not _named(part, named) for part in relative.parts):
+                continue
+            found.append(relative.as_posix())
         found.sort()
         return tuple(found)
 
@@ -218,8 +223,13 @@ class LocalWorkspace:
         hits: list[str] = []
         for file in files:
             rel = file.relative_to(self._root).as_posix()
+            data = file.read_bytes()
+            # 开头 8 KiB 里有 NUL 就当二进制文件跳过（git 与 grep 的同一判据）：字节码里偶然匹配上的
+            # 「行」只会占掉输出的配额。
+            if b'\0' in data[:8192]:
+                continue
             # 搜索遇到非 utf-8 用替换字符：一次坏文件不能让整次搜索失败。
-            text = file.read_text(encoding='utf-8', errors='replace')
+            text = data.decode('utf-8', errors='replace')
             for lineno, line in enumerate(text.splitlines(), start=1):
                 if compiled.search(line):
                     hits.append(f'{rel}:{lineno}:{line}')
@@ -684,6 +694,8 @@ def _files_under(start: Path, root: Path) -> tuple[Path, ...]:
         )
     files: list[Path] = []
     for match in start.rglob('*'):
+        if any(_hidden(part) for part in match.relative_to(start).parts):
+            continue
         try:
             real = match.resolve()
             real.relative_to(root)
@@ -693,3 +705,13 @@ def _files_under(start: Path, root: Path) -> tuple[Path, ...]:
             files.append(real)
     files.sort()
     return tuple(files)
+
+
+def _hidden(part: str) -> bool:
+    """以 . 开头的目录与文件（.git、.venv、.env、各种缓存）。搜索只在调用方点名时才进去：
+    它们按字典序排在最前，输出有上限时整段配额都会花在它们身上。"""
+    return part.startswith('.')
+
+
+def _named(part: str, named: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(part, pattern) for pattern in named)

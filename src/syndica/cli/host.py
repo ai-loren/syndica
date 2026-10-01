@@ -96,8 +96,8 @@ __all__ = ['RuntimeCliHost']
 
 ModelFactory = Callable[[str], LLM]
 _RUNTIME_LOGGER = 'syndica.kernel.runtime'
-# Bash 每条输出流最多展示给模型的字符数。整份 pytest 输出进上下文会挤掉别的一切，而汇总行在末尾，
-# local_tools 截断时留开头 20%、结尾 80%。
+# Bash 每条输出流、Glob 与 Grep 每次结果最多展示给模型的字符数。整份 pytest 输出进上下文会挤掉别的
+# 一切，而汇总行在末尾，local_tools 截断时留开头 20%、结尾 80%；一次宽泛的 Grep 同理。
 _OUTPUT_LIMIT = 10_000
 # Agent 的 Bash 用的 shell。HostFacts 把它告诉模型，两处必须是同一个值。
 _SHELL = '/bin/sh'

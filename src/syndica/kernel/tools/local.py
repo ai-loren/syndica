@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 from syndica.kernel.context import TrustLevel
 from syndica.kernel.errors import ConfigError
@@ -40,7 +41,10 @@ def _valid_output_limit(value: object) -> int | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ConfigError(
-            expected='output_limit 是正整数（每条输出流最多展示的字符数），或 None 表示不截断',
+            expected=(
+                'output_limit 是正整数（每条输出流、每次搜索结果最多展示的字符数），'
+                '或 None 表示不截断'
+            ),
             received=f'output_limit={value!r}，类型是 {type(value).__name__}',
             next_action='传一个大于 0 的 int，例如 10_000；不要传布尔值或浮点数',
         )
@@ -63,6 +67,39 @@ def _clipped(text: str, limit: int | None) -> tuple[str, bool]:
         "文件，再用 grep、sed -n '起,止p' 或 tail 分段看]…\n"
     )
     return text[:head] + marker + text[len(text) - tail :], True
+
+
+def _listed(items: Sequence[str], limit: int | None, narrow: str) -> list[str]:
+    """搜索结果交给模型：总字符数超过上限时按顺序只列放得下的几条，最后一条写明共几条、怎么缩小。
+
+    一次宽泛的搜索就能把整个目录的匹配行塞进上下文，此后这个 Agent 的每一次请求都带着它们。
+    第一条就放不下时截短它而不是一条都不给，并说明它被截了：缩小搜索范围不会让一行变短。
+    上限按结果本身的字符数算，后端编码时加的引号与转义不算在内，所以它是近似的。
+    """
+    if limit is None:
+        return list(items)
+    shown: list[str] = []
+    room = limit
+    for item in items:
+        if len(item) > room:
+            break
+        shown.append(item)
+        room -= len(item)
+    else:
+        return shown
+    if shown:
+        return [
+            *shown,
+            f'…[共 {len(items)} 条，只列出前 {len(shown)} 条：结果超过 {limit} 个字符的上限。'
+            f'{narrow}]',
+        ]
+    first = items[0]
+    rest = f'共 {len(items)} 条，其余没有列出：{narrow}' if len(items) > 1 else ''
+    return [
+        f'{first[:limit]}…',
+        f'…[第一条结果有 {len(first)} 个字符，只显示了前 {limit} 个，要看全文用 Read 读它所在的'
+        f'文件。{rest}]',
+    ]
 
 
 def _reported(
@@ -194,18 +231,21 @@ class Glob(Tool):
     __tool_name__ = 'Glob'
     __tool_command_args__ = ()
 
-    def __init__(self, portal: Portal) -> None:
+    def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal
+        self._output_limit = _valid_output_limit(output_limit)
 
     async def execute(self, pattern: str) -> ToolResult:
         """按相对工作区根的模式查找路径，结果按字典序排列。
+        结果太多时可能只列出前面一部分，并写明共几条；以 . 开头的目录与文件可能不列，要找它们就在
+        pattern 里写出来（例如 .github/**）。
         pattern: 相对工作区根的 glob 模式
         """
         try:
             paths = await self._portal.glob_paths(pattern)
         except ConfigError as exc:
             return _told(exc)
-        return ToolResult(output=list(paths))
+        return ToolResult(output=_listed(paths, self._output_limit, '缩小 pattern 再找。'))
 
 
 class Grep(Tool):
@@ -214,11 +254,14 @@ class Grep(Tool):
     __tool_name__ = 'Grep'
     __tool_command_args__ = ()
 
-    def __init__(self, portal: Portal) -> None:
+    def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal
+        self._output_limit = _valid_output_limit(output_limit)
 
     async def execute(self, pattern: str, path: str = '.') -> ToolResult:
         """按 Python 正则搜索文件，每条结果包含相对路径、行号和行内容。
+        结果太多时可能只列出前面一部分，并写明共几条；以 . 开头的目录与文件、二进制文件可能不搜，
+        要搜某个以 . 开头的目录或文件就把它写进 path。
         pattern: Python 正则表达式
         path: 相对工作区根的文件或目录，默认搜索整个工作区
         """
@@ -226,7 +269,7 @@ class Grep(Tool):
             hits = await self._portal.grep_text(pattern, path)
         except ConfigError as exc:
             return _told(exc)
-        return ToolResult(output=list(hits))
+        return ToolResult(output=_listed(hits, self._output_limit, '缩小 pattern 或 path 再搜。'))
 
 
 class Bash(Tool):
@@ -320,14 +363,15 @@ class KillBash(Tool):
 def local_tools(portal: Portal, *, output_limit: int | None = None) -> dict[str, Tool]:
     """按固定顺序交出本地工具。后续任务只追加键，不改已有键的相对顺序。
 
-    `output_limit` 是 Bash 与 BashOutput 每条输出流最多展示的字符数，None 是不截断。
+    `output_limit` 是 Bash 与 BashOutput 每条输出流、Glob 与 Grep 每次结果最多展示的字符数，
+    None 是不截断。
     """
     limit = _valid_output_limit(output_limit)
     read = Read(portal)
     write = Write(portal)
     edit = Edit(portal)
-    glob = Glob(portal)
-    grep = Grep(portal)
+    glob = Glob(portal, output_limit=limit)
+    grep = Grep(portal, output_limit=limit)
     bash = Bash(portal, output_limit=limit)
     bash_output = BashOutput(portal, output_limit=limit)
     kill_bash = KillBash(portal)
