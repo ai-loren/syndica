@@ -13,8 +13,18 @@ from typing import Literal, NoReturn, Protocol, TextIO, cast
 from syndica import __version__
 from syndica.cli.terminal import terminal_safe
 
-__all__ = ['CliHost', 'CliIO', 'CliOutcome', 'InspectRequest', 'RunRequest', 'main']
+__all__ = [
+    'EXIT_INTERRUPTED',
+    'CliHost',
+    'CliIO',
+    'CliOutcome',
+    'InspectRequest',
+    'RunRequest',
+    'main',
+]
 
+# 被 Ctrl-C 中断：优先于 1（没通过）与 3（被拒绝），中断本身就是没做完的原因。
+EXIT_INTERRUPTED = 130
 _COMMANDS = frozenset(
     {'run', 'chat', 'agents', 'topology', 'sessions', 'flags', 'doctor', 'version'}
 )
@@ -337,8 +347,21 @@ def main(
     io: CliIO | None = None,
 ) -> int:
     """Route one CLI invocation."""
-    received = list(sys.argv[1:] if argv is None else argv)
     streams = io or CliIO(stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
+    try:
+        return _route(list(sys.argv[1:] if argv is None else argv), host, streams)
+    except KeyboardInterrupt:
+        # `run --handoff` 的 Ctrl-C 在宿主里处理并写明停在哪；到这里的是普通 run、chat、强制退出，
+        # 以及落在宿主交回结论与打印之间的按键——那时命令已经做完，所以只能说「可能」。
+        _write(
+            streams.stderr,
+            '被中断（Ctrl-C）：命令可能没有做完。`run --handoff` 写过交接文件的话，路径打在上面的 '
+            'stderr 里，以那个文件为准；没有的话重跑这条命令。',
+        )
+        return EXIT_INTERRUPTED
+
+
+def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
     first = _first_positional(received)
     if first is not None and first.startswith('-') and first not in {'-h', '--help'}:
         _write(

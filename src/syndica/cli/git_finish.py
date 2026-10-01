@@ -28,6 +28,7 @@ from syndica.cli.terminal import one_line
 __all__ = [
     'PUSH_TIMEOUT',
     'Finish',
+    'GitInterrupted',
     'Integrity',
     'Offer',
     'Outcome',
@@ -39,6 +40,7 @@ __all__ = [
     'hook_environment',
     'ignored_paths',
     'integrity',
+    'line_counts',
     'offer',
     'summary',
     'verification_gaps',
@@ -46,6 +48,12 @@ __all__ = [
 
 PUSH_TIMEOUT = 120.0
 _TITLE_LIMIT = 72
+# git 判二进制只看开头这么多字节（`FIRST_FEW_BYTES`）：新文件按同一个
+# 判据，才与提交之后 `git diff` 的说法一致。
+_BINARY_PROBE = 8000
+# 比这大的新文件不数行：数行要把整个文件读一遍，而这发生在提问之前，几个 GB 的产物会让人干等。
+# 取 git 的 `core.bigFileThreshold` 默认值。
+_COUNT_LIMIT = 512 * 1024 * 1024
 # 超时之后先 SIGTERM 整组（git 借此删掉自己的锁文件），等这么久还没退出再 SIGKILL。
 _STOP_GRACE = 5.0
 # 进行中的操作在 git 目录里留下的标记。
@@ -332,6 +340,127 @@ def offer(
     return Offer(tuple(reasons), push_reason, tuple(sorted(protected)), tampered=bool(changed))
 
 
+def line_counts(git: HostGit, changes: Sequence[Change]) -> dict[str, str]:
+    """每处改动的增删行数：`+N −M`，二进制写「二进制」；数不出的（git 失败、FIFO 这类特殊文件、
+    读到一半被换掉的文件）不在表里。跟踪的文件按 `git diff HEAD` 数，是不是二进制是 git 的说法
+    （带 `-diff` 属性的文本文件 git 也说是二进制）；git 没认出来的改名，新旧两半合成一条。新文件
+    按内容数，不看属性；符号链接数链接文字，不跟着读。"""
+    tracked = [change for change in changes if change.status != '??']
+    numstat = _numstat(git, tracked) if tracked else {}
+    counts: dict[str, str] = {}
+    for change in changes:
+        if change.status == '??':
+            count = _new_file_count(git.root / change.path)
+        else:
+            count = _tracked_count(numstat, change)
+        if count is not None:
+            counts[change.path] = count
+    return counts
+
+
+def _tracked_count(numstat: Mapping[str, tuple[int, int] | None], change: Change) -> str | None:
+    if change.path not in numstat:
+        return None
+    lines = numstat[change.path]
+    if change.origin is not None and change.origin in numstat:
+        # git 没把它认成改名：旧路径一条全删、新路径一条全增，合起来才是这一处改动。
+        old = numstat[change.origin]
+        if lines is None or old is None:
+            return '二进制'
+        lines = (lines[0] + old[0], lines[1] + old[1])
+    return '二进制' if lines is None else f'+{lines[0]} −{lines[1]}'
+
+
+def _numstat(git: HostGit, changes: Sequence[Change]) -> dict[str, tuple[int, int] | None]:
+    """`git diff --numstat` 按路径给的 (增, 删)，二进制是 None。"""
+    paths = [path for change in changes for path in (change.origin, change.path) if path]
+    try:
+        completed = git.attempt(
+            'diff',
+            '--numstat',
+            '-z',
+            '-M',
+            '--relative',
+            '--no-color',
+            '--no-ext-diff',
+            '--no-textconv',
+            'HEAD',
+            '--',
+            *paths,
+        )
+    except GitUnavailable:
+        return {}
+    if completed.returncode != 0:
+        return {}
+    counts: dict[str, tuple[int, int] | None] = {}
+    fields = completed.stdout.decode('utf-8', 'surrogateescape').split('\0')
+    index = 0
+    while index < len(fields) and fields[index]:
+        added, deleted, path = fields[index].split('\t', 2)
+        index += 1
+        if not path:
+            # 改名：`-z` 下旧路径与新路径各占一个字段。
+            path = fields[index + 1] if index + 1 < len(fields) else ''
+            index += 2
+        if added == '-':
+            counts[path] = None
+        elif added.isdigit() and deleted.isdigit():
+            counts[path] = (int(added), int(deleted))
+    return counts
+
+
+def _new_file_count(full: Path) -> str | None:
+    try:
+        mode = os.lstat(full).st_mode
+    except OSError:
+        return None
+    if stat.S_ISLNK(mode):
+        try:
+            target = os.readlink(full)
+        except OSError:
+            return None
+        return _counted(target.encode('utf-8', 'surrogateescape'))
+    # 打开之前先按 lstat 认：打开设备文件本身就可能有副作用。
+    if not stat.S_ISREG(mode):
+        return None
+    # 非阻塞、不跟链接，打开之后再认一次类型：lstat 之后换成 FIFO 的文件不能让提问永远等下去。
+    try:
+        descriptor = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if info.st_size > _COUNT_LIMIT:
+            return f'大文件，{info.st_size // (1024 * 1024)} MiB，没有数行'
+        head = b''
+        lines = 0
+        last = b''
+        # 只读到打开时的大小：还在被写的文件不能让提问一直等下去。
+        remaining = info.st_size
+        while remaining > 0 and (chunk := os.read(descriptor, min(1 << 16, remaining))):
+            remaining -= len(chunk)
+            if len(head) < _BINARY_PROBE:
+                head += chunk[: _BINARY_PROBE - len(head)]
+                if b'\0' in head:
+                    return '二进制'
+            lines += chunk.count(b'\n')
+            last = chunk[-1:]
+    finally:
+        os.close(descriptor)
+    if last not in (b'', b'\n'):
+        lines += 1
+    return f'+{lines} −0'
+
+
+def _counted(data: bytes) -> str:
+    lines = data.count(b'\n')
+    if data and not data.endswith(b'\n'):
+        lines += 1
+    return f'+{lines} −0'
+
+
 def summary(
     *,
     before: Integrity,
@@ -342,10 +471,12 @@ def summary(
     protected: Sequence[str],
     pre_existing: int,
     title: str,
+    counts: Mapping[str, str] | None = None,
 ) -> str:
     """提问前最后一段输出：分支与上游（推送真正去的地址）、提交标题、改动（最多 30 条再给总数，
-    标出不是 Write / Edit 产生的）、受保护路径、运行前就有的改动、提交时会跑的钩子、复核结果与
-    Reviewer 结论。字符串都来自宿主或经过转义。"""
+    每条在路径前面带 `counts` 里的增删行数，标出不是 Write / Edit 产生的）、受保护路径、运行前就有
+    的改动、提交时会跑的钩子、复核结果与 Reviewer 结论。字符串都来自宿主或经过转义。"""
+    counts = counts or {}
     upstream = '没有上游'
     if before.upstream is not None:
         remote, merge = before.upstream
@@ -360,7 +491,10 @@ def summary(
     ]
     for change in changes[:30]:
         note = '' if written(change.path) else '（不是 Write / Edit 产生的）'
-        lines.append(f'- `{change.status}` {one_line(change.path)}{note}')
+        # 行数是路径前面固定的一栏，数不出也占着位置：文件名可以写成像一个计数的样子，
+        # 这一栏它占不了。
+        count = counts.get(change.path, '?')
+        lines.append(f'- `{change.status}` `{count}` {one_line(change.path)}{note}')
     if len(changes) > 30:
         lines.append(f'- ……共 {len(changes)} 处')
     if protected:
@@ -500,18 +634,27 @@ def _secrets(git: HostGit, changes: Sequence[Change], redactor: Redactor) -> lis
 
 
 def _stop(process: subprocess.Popen[bytes]) -> None:
-    """超时之后停下整组：先 SIGTERM（git 借此删掉自己的锁文件），等不到再 SIGKILL。钩子起的子进程
-    与 git 同组，不能比它活得久。"""
+    """超时或被中断之后停下整组：先 SIGTERM（git 借此删掉自己的锁文件），等不到再 SIGKILL。钩子起的
+    子进程与 git 同组，不能比它活得久。
+
+    SIGKILL 放在 finally 里：等 SIGTERM 生效的那几秒里人再按一次 Ctrl-C，不放就留下一个不理 SIGTERM
+    的钩子接着跑。PermissionError：macOS 对只剩僵尸的组报 EPERM 而不是 ESRCH。最后一次等待也有上限：
+    逃出进程组的进程可以一直占着管道。"""
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.communicate(timeout=_STOP_GRACE)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.communicate()
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=_STOP_GRACE)
+        except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
+            pass
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            process.communicate(timeout=_STOP_GRACE)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _hooked(
@@ -537,7 +680,9 @@ def _hooked(
         stdout, stderr = process.communicate(
             input=redactor.redact(message).encode('utf-8'), timeout=LOCAL_TIMEOUT
         )
-    except subprocess.TimeoutExpired:
+    except BaseException:
+        # 超时与 Ctrl-C 一样：组在自己的会话里，终端的 SIGINT 到不了它，不停下它，宿主退出之后
+        # 这次提交还会接着做完。
         _stop(process)
         raise
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
@@ -596,6 +741,78 @@ def _push_failure(detail: str) -> str:
     return f'期望推送成功，实际失败：{detail}。按这个原因处理之后手动 `git push`。提交已经在本地。'
 
 
+def _unstage(git: HostGit, env: Mapping[str, str], redactor: Redactor, new: Sequence[str]) -> bool:
+    """把为提交暂存的新文件撤回暂存区之外（尽力而为），交回是否撤回了。"""
+    try:
+        return (
+            _hooked(
+                git, env, redactor, ['rm', '--cached', '-q', '--ignore-unmatch', '--', *new]
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _tidy(
+    git: HostGit, env: Mapping[str, str], redactor: Redactor, new: Sequence[str]
+) -> list[str]:
+    """提交没做成之后收拾暂存区：撤回为提交暂存的新文件，查有没有留下 index.lock。交回给人看的
+    几句说明。"""
+    notes = ['改动还在工作区里']
+    if new:
+        if _unstage(git, env, redactor, new):
+            notes.append('为提交暂存的新文件已经撤回')
+        else:
+            notes.append(f'这些新文件还在暂存区里：{", ".join(map(one_line, new))}')
+    try:
+        lock = _git_path(git, 'index.lock')
+    except GitUnavailable:
+        lock = None
+    if lock is not None and lock.exists():
+        notes.append(f'仓库里留下了 {lock}：确认没有别的 git 进程在跑之后删掉它')
+    return notes
+
+
+class GitInterrupted(KeyboardInterrupt):
+    """git 收尾被 Ctrl-C 打断。`detail` 是打断之后宿主看到的仓库状态（提交了没有、暂存区收拾了
+    没有），给人决定下一步；推送到没到远端宿主不知道。"""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _interrupted(
+    git: HostGit,
+    *,
+    before: Integrity,
+    env: Mapping[str, str],
+    redactor: Redactor,
+    new: Sequence[str],
+    push: bool,
+) -> GitInterrupted:
+    """提交或推送被 Ctrl-C 打断之后看清仓库停在哪。HEAD 动了就是提交已经做了，暂存区不能再碰：
+    撤回会把刚提交的新文件暂存成删除。没动就与超时一样收拾暂存区。"""
+    head = _attempt(git, 'rev-parse', '-q', '--verify', 'HEAD')
+    if head is None and before.head is not None:
+        return GitInterrupted(
+            '确认不了有没有提交（`git rev-parse HEAD` 失败），暂存区没有动：先用 `git status` 与 '
+            '`git log -1` 看清楚，再决定怎么做。'
+        )
+    if head != before.head and push:
+        return GitInterrupted(
+            f'提交已经在本地（{head}），推送做到了哪一步不知道：先看这个提交（`git show --stat '
+            f'{head}`）与 `git status` 里它和上游的关系，再决定要不要推送。'
+        )
+    if head != before.head:
+        return GitInterrupted(
+            f'提交已经在本地（{head}），没有推送：先看这个提交（`git show --stat {head}`），确认'
+            '它就是这次要提交的改动。'
+        )
+    return GitInterrupted(f'没有提交；{"；".join(_tidy(git, env, redactor, new))}。')
+
+
 def _commit_failed(
     git: HostGit,
     *,
@@ -616,27 +833,7 @@ def _commit_failed(
             detail=f'git 提交没有正常结束（{what}），但提交已经在本地：没有推送。先看这个提交'
             f'（`git show --stat {head}`），没有问题再自己推送。',
         )
-    notes = ['改动还在工作区里']
-    if new:
-        try:
-            unstaged = (
-                _hooked(
-                    git, env, redactor, ['rm', '--cached', '-q', '--ignore-unmatch', '--', *new]
-                ).returncode
-                == 0
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            unstaged = False
-        if unstaged:
-            notes.append('为提交暂存的新文件已经撤回')
-        else:
-            notes.append(f'这些新文件还在暂存区里：{", ".join(map(one_line, new))}')
-    try:
-        lock = _git_path(git, 'index.lock')
-    except GitUnavailable:
-        lock = None
-    if lock is not None and lock.exists():
-        notes.append(f'仓库里留下了 {lock}：确认没有别的 git 进程在跑之后删掉它')
+    notes = _tidy(git, env, redactor, new)
     return Outcome(
         'failed',
         detail=f'期望 git 提交成功，实际{what}。{"；".join(notes)}。按这个原因处理之后手动提交。',
@@ -655,7 +852,35 @@ def execute(
 ) -> Outcome:
     """提交这次 run 的改动（`changes` 来自快照 A），按需推送。提交之前再比一次完整性快照、再算一次
     hash、做 D12 扫描；提交在 `hook_env` 里跑；提交之后核对父提交、改到的路径集合与每个 blob；
-    推送之前再比一次完整性快照，推的是这个提交本身。任何一步对不上都不再往下走。"""
+    推送之前再比一次完整性快照，推的是这个提交本身。任何一步对不上都不再往下走。被 Ctrl-C 打断时
+    抛 `GitInterrupted`，写明仓库停在哪。"""
+    try:
+        return _execute(
+            git,
+            changes=changes,
+            message=message,
+            push=push,
+            before=before,
+            redactor=redactor,
+            hook_env=hook_env,
+        )
+    except KeyboardInterrupt:
+        new = [change.path for change in changes if change.status == '??']
+        raise _interrupted(
+            git, before=before, env=hook_env, redactor=redactor, new=new, push=push
+        ) from None
+
+
+def _execute(
+    git: HostGit,
+    *,
+    changes: Sequence[Change],
+    message: str,
+    push: bool,
+    before: Integrity,
+    redactor: Redactor,
+    hook_env: Mapping[str, str],
+) -> Outcome:
     try:
         now = integrity(git)
         current = git.changes()
@@ -955,8 +1180,12 @@ def finish(
             protected=choices.protected,
             pre_existing=len(before_changes or ()),
             title=message.split('\n', 1)[0],
+            counts=line_counts(git, run_changes[:30]),
         )
-        answer = ask(stdin, stderr, text, choices)
+        try:
+            answer = ask(stdin, stderr, text, choices)
+        except KeyboardInterrupt:
+            raise GitInterrupted('在提问时被打断：没有提交，改动还在工作区里。') from None
         if answer == '3':
             return Finish(
                 'declined',

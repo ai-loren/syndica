@@ -11,14 +11,19 @@ import platform
 import re
 import secrets
 import shlex
-from collections.abc import Callable, Generator, Mapping, Sequence
+import signal
+import threading
+import time
+from collections import deque
+from collections.abc import Callable, Coroutine, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from textwrap import indent
 from types import MappingProxyType
-from typing import TextIO, cast
+from typing import Any, TextIO, TypeVar, cast
 
 from syndica.cli.checks import parse_check
 from syndica.cli.config import CliConfig, load_config
@@ -26,6 +31,7 @@ from syndica.cli.dev_module import DevLog, DevLogSnapshot, DevModule, last_answe
 from syndica.cli.environment import AgentEnvironment, agent_environment
 from syndica.cli.git_finish import (
     Finish,
+    GitInterrupted,
     Integrity,
     finish,
     hook_environment,
@@ -51,7 +57,7 @@ from syndica.cli.handoff import (
     write_handoff,
 )
 from syndica.cli.host_git import Change, GitUnavailable, HostGit
-from syndica.cli.main import CliIO, CliOutcome, InspectRequest, RunRequest
+from syndica.cli.main import EXIT_INTERRUPTED, CliIO, CliOutcome, InspectRequest, RunRequest
 from syndica.cli.policy import dev_danger_options
 from syndica.cli.redaction import Redactor
 from syndica.cli.terminal import one_line, terminal_safe
@@ -767,6 +773,215 @@ def _how_it_failed(result: ExecResult) -> str:
 
 _PENDING = 'git 收尾还没做：文件停在这里，说明 run 在收尾之前被打断了。'
 _NOT_WRITTEN = '交接文件没写成，宿主没有做 git 收尾：提交与推送由人来做。'
+_T = TypeVar('_T')
+_INTERRUPTED_RUN = '被中断（Ctrl-C）：run 没有跑完，Agent 的回答可能只做了一半。'
+_INTERRUPTED_VERIFY = '被中断（Ctrl-C）：宿主复核没有跑完。'
+_INTERRUPTED_NO_GIT = '被中断（Ctrl-C），不做 git 收尾：工作区里的改动还在，没有提交。'
+_INTERRUPTED_GIT = (
+    '被中断（Ctrl-C）：git 收尾停在提问或提交的中途，磁盘上的交接文件停在 `git: pending`。先用 '
+    '`git status` 与 `git log -1` 看清楚有没有提交，再决定怎么做。'
+)
+
+
+class _Lines:
+    """宿主读人的答复（Agent 的提问、git 收尾的选择）的唯一入口。
+
+    readline 在守护线程里跑，停不下来：等它的人走了（Ctrl-C、问题过期），它还卡着等下一行，同一个
+    流上后来的 readline 都排在它后面，人敲的下一行被它读走。所以同一时刻至多一个 readline，读到的
+    行记下到达时间排队；每次等只收开始等之后到达的行，早于它的是答给已经不等了的那个问题的。
+    不用默认线程池：Runner 关闭与解释器退出时都要等池里的线程结束，宿主于是一直等人敲回车。
+    """
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+        self._lock = threading.Lock()
+        self._arrived = threading.Condition(self._lock)
+        self._queue: deque[tuple[float, str, Exception | None]] = deque()
+        self._reading = False
+        self._wakeups: list[Callable[[], None]] = []
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def readline(self) -> str:
+        """同步地等下一行（git 收尾的提问）。等待收得到信号：Ctrl-C 处理抛出的 KeyboardInterrupt
+        从这里出去，那次 readline 读到的行留给下一次等。"""
+        since = time.monotonic()
+        with self._lock:
+            while (taken := self._take(since)) is None:
+                self._arrived.wait()
+        return _line_of(taken)
+
+    async def next_line(self) -> str:
+        """在事件循环里等下一行（Agent 的提问）。被取消时那次 readline 照样跑完。"""
+        since = time.monotonic()
+        loop = asyncio.get_running_loop()
+        while True:
+            woken: asyncio.Future[None] = loop.create_future()
+            with self._lock:
+                taken = self._take(since)
+                if taken is None:
+                    self._wakeups.append(partial(_wake, loop, woken))
+            if taken is not None:
+                return _line_of(taken)
+            await woken
+
+    def _take(self, since: float) -> tuple[str, Exception | None] | None:
+        """持锁调用：交回 `since` 之后到达的第一行，早于它的丢掉；还没有就保证有一个 readline
+        在跑。"""
+        while self._queue:
+            arrived, line, error = self._queue.popleft()
+            if arrived >= since:
+                return line, error
+        if not self._reading:
+            self._reading = True
+            threading.Thread(target=self._read, name='syndica-stdin', daemon=True).start()
+        return None
+
+    def _read(self) -> None:
+        error: Exception | None = None
+        try:
+            line = self._stream.readline()
+        except Exception as exc:
+            line, error = '', exc
+        with self._lock:
+            self._queue.append((time.monotonic(), line, error))
+            self._reading = False
+            wakeups, self._wakeups = self._wakeups, []
+            self._arrived.notify_all()
+        for wake in wakeups:
+            wake()
+
+
+def _line_of(taken: tuple[str, Exception | None]) -> str:
+    line, error = taken
+    if error is not None:
+        raise error
+    return line
+
+
+def _wake(loop: asyncio.AbstractEventLoop, woken: asyncio.Future[None]) -> None:
+    def settle() -> None:
+        if not woken.done():
+            woken.set_result(None)
+
+    try:
+        loop.call_soon_threadsafe(settle)
+    except RuntimeError:
+        # 事件循环已经关了：没有人在等这一行。
+        pass
+
+
+class _CtrlC:
+    """`run --handoff` 期间的 SIGINT 处理，取代 `asyncio.Runner` 的那一个，按阶段处理每一次按键。
+
+    Runner 的做法是取消主任务：落在同步代码里时只留下一个挂着的取消，Python 3.11 撤不掉它，协程一
+    返回写好的结论就被丢掉、换成 KeyboardInterrupt；第二次按键直接抛出，交接文件写不成。所以宿主
+    自己按阶段处理：
+    - 干活（run、复核，经 `_interruptible`）：取消干活的那个子任务，主任务从不被取消；
+    - 收尾（快照、写交接文件）：只记下按过，交接文件照写，不做 git 收尾；
+    - git 收尾（`raising`）：进来之前按过就不开始；开始之后第一次按键当场抛 KeyboardInterrupt，提问
+      的等待才停得下。之后的按键只提示一次：停钩子、撤回暂存都有时限，打断它们只会留下半个暂存区；
+    - 结论定了之后（git 收尾结束、`settle`）：按键什么都不改，打印的交接文件与退出码一致。
+    结论定下之前、git 收尾之外，按到第三次强制退出（抛 KeyboardInterrupt）：收尾卡住时人还有路可走。
+    """
+
+    _FORCE = 3
+
+    def __init__(self, warn: Callable[[str], None]) -> None:
+        self._warn = warn
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._raising = False
+        self._unwinding = 0
+        self._settled = False
+        self.presses = 0
+        self.target: asyncio.Future[Any] | None = None
+
+    @property
+    def pressed(self) -> bool:
+        return self.presses > 0
+
+    def __call__(self, signum: int, frame: object) -> None:
+        self.presses += 1
+        if self._settled:
+            return
+        if self._raising:
+            self._unwinding += 1
+            if self._unwinding == 1:
+                raise KeyboardInterrupt
+            if self._unwinding == 2:
+                self._say(
+                    'git 收尾正在停下（停钩子、撤回为提交暂存的新文件），都有时限，等它做完。'
+                )
+            return
+        if self.presses >= self._FORCE:
+            raise KeyboardInterrupt
+        if self.presses == 1:
+            self._say(
+                '被中断（Ctrl-C）：正在停下 Agent、写交接文件，不做 git 收尾。再按两次强制退出。'
+            )
+        else:
+            self._say('还在收尾：再按一次强制退出，交接文件可能写不成或停在 git: pending。')
+        target = self.target
+        if target is not None and not target.done():
+            target.cancel()
+            if self._loop is not None:
+                # 事件循环可能正堵在 select 上：叫醒它，取消才送得进去。
+                self._loop.call_soon_threadsafe(lambda: None)
+
+    def _say(self, text: str) -> None:
+        try:
+            self._warn(text)
+        except RuntimeError:
+            # 主线程正往同一个流里写时，信号处理再写会报 reentrant call：丢掉这一句，按键照常处理。
+            pass
+
+    @contextmanager
+    def installed(self) -> Generator[None, None, None]:
+        """装上这个处理，结束时换回原来的。继承来的「忽略 SIGINT」照旧忽略；不在主线程时什么都不装
+        （只有主线程装得了信号处理）。"""
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        previous = signal.getsignal(signal.SIGINT)
+        if previous is signal.SIG_IGN:
+            yield
+            return
+        self._loop = asyncio.get_running_loop()
+        signal.signal(signal.SIGINT, self)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
+
+    @contextmanager
+    def raising(self) -> Generator[bool, None, None]:
+        """git 收尾这一段：交回 False 表示进来之前已经按过，不要开始。开始之后第一次按键当场抛
+        KeyboardInterrupt。这一段结束，结论就定了。"""
+        self._raising = True
+        try:
+            started = not self.pressed
+            if not started:
+                self._raising = False
+            yield started
+        finally:
+            self._raising = False
+            self._settled = True
+
+    def settle(self) -> None:
+        self._settled = True
+
+
+async def _interruptible(ctrl_c: _CtrlC, work: Coroutine[Any, Any, _T]) -> _T:
+    """把这一段放进一个子任务里跑：Ctrl-C 取消的是它，不是主任务。已经按过就直接取消。"""
+    task = asyncio.ensure_future(work)
+    ctrl_c.target = task
+    if ctrl_c.pressed:
+        task.cancel()
+    try:
+        return await task
+    finally:
+        ctrl_c.target = None
 
 
 class _HandoffFailure(Exception):
@@ -843,6 +1058,7 @@ class RuntimeCliHost:
         environ: Mapping[str, str] | None = None,
     ) -> None:
         self._io = io
+        self._lines = _Lines(io.stdin)
         self._model_factory = model_factory
         self._workspace_root = Path(workspace_root)
         self._environ: Mapping[str, str] = os.environ if environ is None else environ
@@ -1041,6 +1257,11 @@ class RuntimeCliHost:
         stream.write(terminal_safe(text))
         stream.flush()
 
+    def _answers(self) -> TextIO | None:
+        """git 收尾读答复的流：经 `_Lines`，与 Agent 的提问共用一个读者。没有 stdin（`sys.stdin`
+        是 None）时交回 None，`ask` 按「我来处理」算。"""
+        return None if cast(object, self._io.stdin) is None else cast(TextIO, self._lines)
+
     def _warn(self, text: str) -> None:
         """写到 stderr 的告警与运行时错误报告：里面有异常文字与 Agent 起的名字，转义之后才进
         终端。"""
@@ -1120,7 +1341,7 @@ class RuntimeCliHost:
                 eof_action = 'reject'
             else:
                 continue
-            answer = await asyncio.to_thread(self._io.stdin.readline)
+            answer = await self._lines.next_line()
             if answer == '' and eof_action == 'abort':
                 await runtime.abort(event.agent_id)
                 continue
@@ -1370,6 +1591,8 @@ class RuntimeCliHost:
             # 工作区与临时目录都不再被收拾。
             try:
                 await session.runtime.shutdown()
+                # Runtime 关了，泵即使收到答复也送不出去；它可能正等着人敲回车，不取消就一直等。
+                session.pump.cancel()
                 await asyncio.gather(session.pump, return_exceptions=True)
                 session.subscription.close()
                 await session.workspace.close()
@@ -1448,6 +1671,7 @@ class RuntimeCliHost:
                     self._event_pump(runtime, subscription),
                     name='cli-human-events',
                 )
+                failure: BaseException | None = None
                 try:
                     if request.topology is not None:
                         topology = config.topologies.get(request.topology)
@@ -1516,10 +1740,25 @@ class RuntimeCliHost:
                         fail_without_text=True,
                         reports=reports,
                     )
+                except BaseException as exc:
+                    failure = exc
+                    raise
                 finally:
                     await runtime.shutdown()
-                    await pump
+                    # Runtime 关了，泵即使收到答复也送不出去；它可能正等着人敲回车（被 Ctrl-C 取消、
+                    # 问题已经超时而 Agent 先结束），不取消就一直等下去。
+                    if not pump.done():
+                        pump.cancel()
+                    (outcome,) = await asyncio.gather(pump, return_exceptions=True)
                     subscription.close()
+                    # run 自己的错误（含 Ctrl-C 的取消）优先：泵的错误不能把它换掉。
+                    if isinstance(outcome, Exception) and outcome is not failure:
+                        if failure is None:
+                            raise outcome
+                        self._warn(
+                            f'另外，读人的答复时也出了错：{type(outcome).__name__}: {outcome}。'
+                            '它不改变这次 run 的结论，先处理 run 的那个错误。'
+                        )
         finally:
             try:
                 await workspace.close()
@@ -1542,8 +1781,10 @@ class RuntimeCliHost:
                 f'{self._workspace_root} 正被另一个 run 锁着',
                 '等那个 run 结束（它退出时会把交接文件路径打到 stderr），或者到别的工作区里跑',
             ) from exc
+        ctrl_c = _CtrlC(self._warn)
         try:
-            return await self._handoff(request, flags, config, redactor)
+            with ctrl_c.installed():
+                return await self._handoff(request, flags, config, redactor, ctrl_c)
         except Exception as exc:
             raise _handoff_failure(exc, redactor) from exc
         finally:
@@ -1555,6 +1796,7 @@ class RuntimeCliHost:
         flags: Mapping[str, bool | int | str],
         config: CliConfig,
         redactor: Redactor,
+        ctrl_c: _CtrlC,
     ) -> CliOutcome:
         root = self._workspace_root
         git = HostGit(root, self._environ)
@@ -1587,28 +1829,54 @@ class RuntimeCliHost:
             stderr=cast(TextIO, writers[1]),
         )
         self._prompts_to_stderr = True
+        # Ctrl-C 落在哪一段：交接文件照样写，原因写这一段的说明，复核标 skipped，退出 130。
+        interrupted: str | None = None
         try:
             try:
-                answer = await self._run_request(
-                    request, flags, config=config, logs=logs, stops=stops, reports=reports
+                answer = await _interruptible(
+                    ctrl_c,
+                    self._run_request(
+                        request, flags, config=config, logs=logs, stops=stops, reports=reports
+                    ),
                 )
+            except asyncio.CancelledError:
+                if not ctrl_c.pressed:
+                    raise
+                interrupted = _INTERRUPTED_RUN
             except Exception as exc:
                 failure = _failure_text(exc)
+            # 取消在 run 里面被转成了别的错误：同样是被中断。
+            if interrupted is None and ctrl_c.pressed:
+                interrupted = _INTERRUPTED_RUN
             # 「run 正常结束」（D14）指根 Agent 以 completed 结束：轮数用完、被中止时它留下的文字
             # 可能只做了一半。
             if failure is None and stops and stops[0] is not StopReason.COMPLETED:
                 reason = stops[0].value if stops[0] is not None else 'unknown'
                 failure = f'根 Agent 以 {reason} 结束，不是正常完成：它的回答可能只做了一半。'
             snapshot_a, changes_error = _changes(git)
-            if failure is not None or request.no_write:
+            verified = False
+            if interrupted is not None or failure is not None or request.no_write:
                 host_verify = 'skipped'
             elif not config.workspace.verify:
                 host_verify = 'not_configured'
             else:
+                verified = True
+                host_verify = 'failed'
                 try:
-                    results = await self._verify(config)
+                    results = await _interruptible(ctrl_c, self._verify(config))
+                except asyncio.CancelledError:
+                    if not ctrl_c.pressed:
+                        raise
+                    interrupted = _INTERRUPTED_VERIFY
                 except Exception as exc:
                     verify_error = f'复核命令没能跑完：{type(exc).__name__}: {exc}'
+                if interrupted is None and ctrl_c.pressed:
+                    interrupted = _INTERRUPTED_VERIFY
+            if interrupted is not None:
+                failure = interrupted
+                results = ()
+                host_verify = 'skipped'
+            elif verified:
                 snapshot_b, error_b = _changes(git)
                 # 在 git 仓库里而快照 A 或 B 没取到（复核命令弄坏了仓库、留下读不了的文件），就不
                 # 知道复核改了什么：按失败算。不在 git 仓库里是本来就比不了，交接文件写明了原因。
@@ -1686,39 +1954,68 @@ class RuntimeCliHost:
             self._warn(redactor.redact(f'交接文件没写成，内容照样打印在 stdout 上：\n{exc}'))
             return CliOutcome(redactor.redact(document('not_offered', 1, _NOT_WRITTEN)), 1)
         self._warn(redactor.redact(f'交接文件：{path}'))
+        # 写交接文件期间按的 Ctrl-C 只记下了：现在才决定不做 git 收尾。
+        if interrupted is None and ctrl_c.pressed:
+            interrupted = _INTERRUPTED_NO_GIT
         if request.no_write:
             result = Finish('not_offered', '只读 run 不改动工作区，不做 git 收尾。')
+        elif interrupted is not None:
+            result = Finish('not_offered', _INTERRUPTED_NO_GIT)
         else:
             stderr = RedactingWriter(self._io.stderr, redactor)
             agent = agent_environment(self._environ, config.workspace.pass_env, workspace_root=root)
             try:
-                result = finish(
-                    git,
-                    mode=request.git_mode,
-                    start=start,
-                    ignored_before=ignored_before,
-                    before_changes=before,
-                    status=status,
-                    host_verify=host_verify,
-                    verdict=verdict,
-                    run_changes=run_changes,
-                    touched_again=facts.touched_again,
-                    protected=protected_changed,
-                    written=lambda changed: path_key(changed) in facts.written,
-                    title=commit_title(answer),
-                    prompt=request.prompt,
-                    verify=[(item.command, item.summary) for item in results],
-                    stdin=self._io.stdin,
-                    stderr=cast(TextIO, stderr),
-                    redactor=redactor,
-                    hook_env=hook_environment(self._environ, agent.values),
+                with ctrl_c.raising() as started:
+                    if started:
+                        result = finish(
+                            git,
+                            mode=request.git_mode,
+                            start=start,
+                            ignored_before=ignored_before,
+                            before_changes=before,
+                            status=status,
+                            host_verify=host_verify,
+                            verdict=verdict,
+                            run_changes=run_changes,
+                            touched_again=facts.touched_again,
+                            protected=protected_changed,
+                            written=lambda changed: path_key(changed) in facts.written,
+                            title=commit_title(answer),
+                            prompt=request.prompt,
+                            verify=[(item.command, item.summary) for item in results],
+                            stdin=self._answers(),
+                            stderr=cast(TextIO, stderr),
+                            redactor=redactor,
+                            hook_env=hook_environment(self._environ, agent.values),
+                        )
+                    else:
+                        interrupted = _INTERRUPTED_NO_GIT
+                        result = Finish('not_offered', _INTERRUPTED_NO_GIT)
+            except KeyboardInterrupt as exc:
+                # 推送到没到远端宿主不知道：磁盘上那份按 M2 D13 停在 `git: pending`，不改写它；
+                # 宿主看到的仓库状态写进打印的那份与 stderr。
+                seen = exc.detail if isinstance(exc, GitInterrupted) else None
+                self._warn(
+                    redactor.redact(
+                        f'git 收尾被中断（Ctrl-C）：{path} 停在 git: pending'
+                        + (f'。{seen}' if seen else '')
+                    )
+                )
+                section = _INTERRUPTED_GIT + (f'\n\n宿主看到的：{seen}' if seen else '')
+                return CliOutcome(
+                    redactor.redact(document('pending', EXIT_INTERRUPTED, section)),
+                    EXIT_INTERRUPTED,
                 )
             finally:
                 agent.remove()
                 stderr.flush()
+        # 结论到这里定了：之后的按键不再改变它，打印的交接文件与退出码一致。
+        ctrl_c.settle()
         exit_code = exit_code_of(status, result.state)
         if exit_code == 0 and result.refused:
             exit_code = 3
+        if interrupted is not None:
+            exit_code = EXIT_INTERRUPTED
         final = document(result.state, exit_code, result.section)
         try:
             rewrite_handoff(root, path, final, redactor)
@@ -1730,7 +2027,7 @@ class RuntimeCliHost:
                     f'stdout 上：\n{exc}'
                 )
             )
-            exit_code = 1
+            exit_code = EXIT_INTERRUPTED if interrupted is not None else 1
             final = document(
                 result.state,
                 exit_code,

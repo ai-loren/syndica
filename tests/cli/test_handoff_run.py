@@ -3,17 +3,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import syndica.cli.git_finish as git_finish
 import syndica.cli.host as host_module
 from syndica.cli.handoff import lock_workspace
 from syndica.cli.host import RuntimeCliHost
@@ -408,6 +412,311 @@ def test_an_interruption_before_the_final_rewrite_leaves_the_file_pending(
     assert 'git: pending\n' in text
     assert 'exit_code: null\n' in text
     assert run.stdout == ''
+
+
+def _press() -> None:
+    """按一次 Ctrl-C：直接调宿主装上的处理，与真的 SIGINT 走同一段代码，却不会打断 pytest。"""
+    handler = signal.getsignal(signal.SIGINT)
+    assert callable(handler) and handler is not signal.default_int_handler
+    handler(signal.SIGINT, None)
+
+
+def _pressed_after(original: Any) -> Any:
+    """原样做完 `original`，在它最后一次 await 之后的同步代码里按一次 Ctrl-C。"""
+
+    async def wrapped(*args: Any, **kwargs: Any) -> Any:
+        result = await original(*args, **kwargs)
+        _press()
+        return result
+
+    return wrapped
+
+
+def test_a_ctrl_c_at_the_end_of_the_run_still_hands_off_and_exits_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    original = RuntimeCliHost._run_request  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(RuntimeCliHost, '_run_request', _pressed_after(original))
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    (path,) = run.files
+    assert run.code == 130
+    assert (run.matter['status'], run.matter['host_verify'], run.matter['git']) == (
+        'run_failed',
+        'skipped',
+        'not_offered',
+    )
+    assert '被中断（Ctrl-C）：run 没有跑完' in run.stdout
+    assert path.read_text(encoding='utf-8') == run.stdout
+
+
+def test_a_ctrl_c_at_the_end_of_verification_skips_it_and_exits_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    original = RuntimeCliHost._verify  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(RuntimeCliHost, '_verify', _pressed_after(original))
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    assert run.code == 130
+    assert (run.matter['status'], run.matter['host_verify']) == ('run_failed', 'skipped')
+    assert '被中断（Ctrl-C）：宿主复核没有跑完。' in run.stdout
+    assert '没有复核：' in run.stdout and '- 通过：`true`' not in run.stdout
+
+
+def _pressed_once_finished(original: Any) -> Any:
+    """原样做完 `original`，在它的任务结束之后、等它的宿主醒来之前按一次 Ctrl-C。"""
+
+    async def wrapped(*args: Any, **kwargs: Any) -> Any:
+        result = await original(*args, **kwargs)
+        asyncio.get_running_loop().call_soon(_press)
+        return result
+
+    return wrapped
+
+
+def test_a_ctrl_c_just_after_verification_finished_drops_its_results_and_exits_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    original = RuntimeCliHost._verify  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(RuntimeCliHost, '_verify', _pressed_once_finished(original))
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    assert run.code == 130
+    assert (run.matter['status'], run.matter['host_verify']) == ('run_failed', 'skipped')
+    assert '被中断（Ctrl-C）：宿主复核没有跑完。' in run.stdout
+    assert '没有复核：' in run.stdout and '- 通过：`true`' not in run.stdout
+
+
+def test_a_ctrl_c_while_the_handoff_is_written_skips_the_git_step_and_exits_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    head = _git(root, _env(tmp_path), 'rev-parse', 'HEAD')
+    original = host_module.write_handoff
+
+    def write_then_interrupted(*args: Any, **kwargs: Any) -> Any:
+        written = original(*args, **kwargs)
+        _press()
+        return written
+
+    monkeypatch.setattr(host_module, 'write_handoff', write_then_interrupted)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    (path,) = run.files
+    assert run.code == 130
+    assert (run.matter['git'], run.matter['exit_code']) == ('not_offered', '130')
+    assert '被中断（Ctrl-C），不做 git 收尾' in run.stdout
+    assert path.read_text(encoding='utf-8') == run.stdout
+    assert _git(root, _env(tmp_path), 'rev-parse', 'HEAD') == head
+
+
+def test_an_interrupted_run_whose_final_rewrite_fails_still_exits_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    original = RuntimeCliHost._run_request  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(RuntimeCliHost, '_run_request', _pressed_after(original))
+
+    def failing(*args: object) -> None:
+        raise OSError('disk full')
+
+    monkeypatch.setattr(host_module, 'rewrite_handoff', failing)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    assert run.code == 130
+    assert run.matter['exit_code'] == '130'
+    assert '交接文件没能更新成这一版' in run.stdout
+
+
+def test_a_ctrl_c_after_the_git_step_leaves_the_outcome_and_its_exit_code_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    original = host_module.rewrite_handoff
+
+    def interrupted_then_rewritten(*args: Any, **kwargs: Any) -> Any:
+        _press()
+        _press()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(host_module, 'rewrite_handoff', interrupted_then_rewritten)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    (path,) = run.files
+    assert (run.code, run.matter['exit_code'], run.matter['git']) == (0, '0', 'declined')
+    assert path.read_text(encoding='utf-8') == run.stdout
+    assert '被中断' not in run.stderr
+
+
+def test_a_ctrl_c_after_a_read_only_run_is_settled_leaves_its_outcome_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    original = host_module.rewrite_handoff
+
+    def interrupted_then_rewritten(*args: Any, **kwargs: Any) -> Any:
+        _press()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(host_module, 'rewrite_handoff', interrupted_then_rewritten)
+
+    run = _run(
+        tmp_path,
+        ScriptedLLM([ScriptedTurn(content='nothing to change')]),
+        config=_config(tmp_path),
+        root=root,
+        extra=('--handoff', '--no-write'),
+    )
+
+    assert (run.code, run.matter['exit_code']) == (0, '0')
+    assert '被中断' not in run.stderr
+
+
+def test_a_ctrl_c_just_before_the_git_step_skips_it_without_saying_it_was_cut_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    head = _git(root, _env(tmp_path), 'rev-parse', 'HEAD')
+    written: list[bool] = []
+    original_write = host_module.write_handoff
+    original_environment = host_module.agent_environment
+
+    def write(*args: Any, **kwargs: Any) -> Any:
+        path = original_write(*args, **kwargs)
+        written.append(True)
+        return path
+
+    def pressed_once_written(*args: Any, **kwargs: Any) -> Any:
+        if written:
+            _press()
+        return original_environment(*args, **kwargs)
+
+    monkeypatch.setattr(host_module, 'write_handoff', write)
+    monkeypatch.setattr(host_module, 'agent_environment', pressed_once_written)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    (path,) = run.files
+    assert run.code == 130
+    assert (run.matter['git'], run.matter['exit_code']) == ('not_offered', '130')
+    assert '被中断（Ctrl-C），不做 git 收尾' in run.stdout
+    assert 'git 收尾被中断' not in run.stderr
+    assert path.read_text(encoding='utf-8') == run.stdout
+    assert _git(root, _env(tmp_path), 'rev-parse', 'HEAD') == head
+
+
+def test_presses_while_an_interrupted_commit_unwinds_do_not_stop_the_unstaging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    head = _git(root, _env(tmp_path), 'rev-parse', 'HEAD')
+    real_hooked = git_finish._hooked  # pyright: ignore[reportPrivateUsage]
+
+    def hooked(*args: Any, **kwargs: Any) -> Any:
+        if args[3][0] == 'commit':
+            _press()
+        if args[3][0] == 'rm':
+            _press()
+            _press()
+        return real_hooked(*args, **kwargs)
+
+    monkeypatch.setattr(git_finish, '_hooked', hooked)
+
+    run = _run(
+        tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root, stdin='2\n'
+    )
+
+    assert run.code == 130
+    assert run.matter['exit_code'] == '130'
+    assert '宿主看到的：没有提交；改动还在工作区里；为提交暂存的新文件已经撤回。' in run.stdout
+    assert run.stderr.count('git 收尾正在停下') == 1
+    assert _git(root, _env(tmp_path), 'diff', '--cached', '--name-only') == ''
+    assert _git(root, _env(tmp_path), 'rev-parse', 'HEAD') == head
+
+
+def test_presses_after_the_outcome_is_settled_never_force_an_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    original_run = RuntimeCliHost._run_request  # pyright: ignore[reportPrivateUsage]
+    original_rewrite = host_module.rewrite_handoff
+
+    async def pressed_twice(*args: Any, **kwargs: Any) -> Any:
+        result = await original_run(*args, **kwargs)
+        _press()
+        _press()
+        return result
+
+    def pressed_then_rewritten(*args: Any, **kwargs: Any) -> Any:
+        _press()
+        return original_rewrite(*args, **kwargs)
+
+    monkeypatch.setattr(RuntimeCliHost, '_run_request', pressed_twice)
+    monkeypatch.setattr(host_module, 'rewrite_handoff', pressed_then_rewritten)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    (path,) = run.files
+    assert run.code == 130
+    assert (run.matter['git'], run.matter['exit_code']) == ('not_offered', '130')
+    assert path.read_text(encoding='utf-8') == run.stdout
+
+
+def test_a_ctrl_c_the_run_turns_into_another_error_still_counts_as_an_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+
+    async def interrupted_then_failed(*args: object, **kwargs: object) -> str:
+        _press()
+        raise RuntimeError('the run gave up when it was cancelled')
+
+    monkeypatch.setattr(RuntimeCliHost, '_run_request', interrupted_then_failed)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    assert run.code == 130
+    assert '被中断（Ctrl-C）：run 没有跑完' in run.stdout
+
+
+def test_a_ctrl_c_verification_turns_into_another_error_still_counts_as_an_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+
+    async def interrupted_then_failed(*args: object, **kwargs: object) -> object:
+        _press()
+        raise RuntimeError('verification gave up when it was cancelled')
+
+    monkeypatch.setattr(RuntimeCliHost, '_verify', interrupted_then_failed)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    assert run.code == 130
+    assert '被中断（Ctrl-C）：宿主复核没有跑完。' in run.stdout
+
+
+def test_a_cancellation_that_is_not_a_ctrl_c_is_not_mistaken_for_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+
+    async def cancelled(*args: object, **kwargs: object) -> str:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(RuntimeCliHost, '_run_request', cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
 
 
 def test_a_failure_after_the_writers_are_removed_is_still_redacted_and_escaped(

@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from syndica.cli.main import CliIO, CliOutcome, InspectRequest, RunRequest, main
+from syndica.cli.main import (
+    EXIT_INTERRUPTED,
+    CliIO,
+    CliOutcome,
+    InspectRequest,
+    RunRequest,
+    main,
+)
 
 if TYPE_CHECKING:
     from syndica.cli.host import RuntimeCliHost
@@ -290,10 +298,21 @@ class _LazyHost:
 def entrypoint() -> None:
     io = CliIO(stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
     host = _LazyHost(io)
+    code = EXIT_INTERRUPTED
     try:
         code = main(host=host, io=io)
+    except KeyboardInterrupt:
+        # main 正在打印第一次 Ctrl-C 的说明时又按了一次：照样不打 traceback。
+        code = EXIT_INTERRUPTED
     finally:
-        host.close()
+        try:
+            host.close()
+        except KeyboardInterrupt:
+            # 关 Runtime 时按的 Ctrl-C 不改变已经打印出去的结论，退出码照旧与它一致。
+            pass
+    # 只剩解释器退出：这时的 Ctrl-C 要么在退出途中打出一段 traceback，要么在解释器把处理换回默认
+    # 之后连进程一起杀掉（退出码成了 -2），都改变不了已经打印出去的结论。
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     raise SystemExit(code)
 
 

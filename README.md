@@ -324,7 +324,7 @@ the agents' conclusion, next steps, Git outcome) is redacted, written to
 can hold a workspace at a time.
 
 When verification passed and the Reviewer said `pass`, the host shows the branch, upstream, commit
-title, and changed paths, then asks:
+title, and changed paths with the lines each one adds and removes, then asks:
 
 ```text
 1  commit and push      2  commit only      3  I'll handle it
@@ -343,7 +343,14 @@ workspace had changes before the run, or when local commits were already ahead o
 `run --no-write` keeps only `Read Grep Glob AskUser AskUserQuestion` (orchestration tools such as
 `Delegate` stay) and never verifies or commits. Exit codes: `0` success; `1` the run failed, verification failed, the workspace is busy,
 or a commit or push that had started failed; `2` usage error; `3` `--git-mode` preconditions not
-met.
+met; `130` interrupted with Ctrl-C, which takes precedence over `1` and `3`. Ctrl-C during the run
+or during verification still writes the handoff, as a failed run with verification skipped, and
+any Ctrl-C before the Git step skips that step. Ctrl-C during the Git step stops Git at once and
+leaves the file at `git: pending`, because the host cannot tell whether a push reached the remote;
+the printed copy says whether a commit was made, and if none was, the new files staged for it are
+unstaged. Further presses do not cut that cleanup short. Once the Git step is over or skipped,
+Ctrl-C changes nothing. Before that, a third press outside the Git step forces an exit; the
+handoff may then be missing or still at `git: pending`.
 
 **Trust and threat model.** `.syndica.yaml` is code you run: `run --handoff` and `doctor --verify`
 execute `workspace.verify` on your machine without danger checks, so using them in a repository you

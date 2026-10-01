@@ -11,9 +11,11 @@ import json
 import os
 import random
 import shutil
+import signal
 import string
 import struct
 import subprocess
+import sys
 import termios
 import threading
 import time
@@ -32,6 +34,7 @@ from syndica.cli.git_finish import (
     ask,
     commit_message,
     integrity,
+    line_counts,
     offer,
     summary,
     verification_gaps,
@@ -39,6 +42,7 @@ from syndica.cli.git_finish import (
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.host_git import Change, HostGit
 from syndica.cli.main import CliIO, main
+from syndica.cli.redaction import Redactor
 from syndica.kernel import ContextBlock, ScriptedLLM, ScriptedTurn, ToolCall
 
 _SECRET = 'Zq9' + 'Lm4Xw7Pk2Rt8Vb5Nc3Jd6'
@@ -606,6 +610,632 @@ def test_the_summary_has_no_hook_line_when_only_push_time_hooks_exist():
     assert '提交时会运行钩子' not in text
 
 
+# ---- 增删行数 ----
+
+
+def _counts(root: Path, tmp_path: Path) -> dict[str, str]:
+    git = HostGit(root, _env(tmp_path))
+    return line_counts(git, git.changes())
+
+
+def test_the_summary_puts_each_count_in_a_column_before_its_path_in_the_order_given():
+    changes = [
+        Change('c.py', ' M', 'b' * 40),
+        Change('a.py', '??', 'b' * 40),
+        Change('b.bin', '??', 'b' * 40),
+        Change('d.txt', '??', 'b' * 40),
+        Change('e\x1b.txt', '??', 'b' * 40),
+    ]
+
+    text = summary(
+        before=_integrity(),
+        changes=changes,
+        written=lambda path: path != 'a.py',
+        host_verify='passed',
+        verdict='pass',
+        protected=(),
+        pre_existing=0,
+        title='t',
+        counts={'b.bin': '二进制', 'a.py': '+3 −0', 'c.py': '+2 −1', 'e\x1b.txt': '+1 −0'},
+    )
+
+    assert [line for line in text.splitlines() if line.startswith('- `')] == [
+        '- ` M` `+2 −1` c.py',
+        '- `??` `+3 −0` a.py（不是 Write / Edit 产生的）',
+        '- `??` `二进制` b.bin',
+        '- `??` `?` d.txt',
+        '- `??` `+1 −0` e\\x1b.txt',
+    ]
+
+
+def test_a_file_name_that_looks_like_a_count_cannot_take_the_count_column():
+    text = summary(
+        before=_integrity(),
+        changes=[Change('notes.md `+1 −0`', '??', 'b' * 40)],
+        written=lambda path: True,
+        host_verify='passed',
+        verdict='pass',
+        protected=(),
+        pre_existing=0,
+        title='t',
+        counts={'notes.md `+1 −0`': '+4000 −0'},
+    )
+
+    assert '- `??` `+4000 −0` notes.md `+1 −0`' in text
+
+
+def test_tracked_files_are_counted_by_git_and_new_files_by_their_lines(tmp_path: Path):
+    root = _with_tracked(
+        tmp_path, {'z.txt': 'a\nb\nc\n', 'm.txt': 'one\ntwo\n', 'gone.txt': 'x\ny\n'}
+    )
+    (root / 'z.txt').write_text('a\nB\nc\nd\n', encoding='utf-8')
+    (root / 'gone.txt').unlink()
+    (root / 'm.txt').write_text('one\ntwo\nthree', encoding='utf-8')
+    (root / 'b_new.txt').write_text('1\n2\n3', encoding='utf-8')
+
+    assert _counts(root, tmp_path) == {
+        'b_new.txt': '+3 −0',
+        'gone.txt': '+0 −2',
+        'm.txt': '+1 −0',
+        'z.txt': '+2 −1',
+    }
+
+
+def test_a_binary_file_is_counted_as_binary_whether_new_or_tracked(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / 'old.bin').write_bytes(b'\0\1\2')
+    _git(root, tmp_path, 'add', 'old.bin')
+    _git(root, tmp_path, 'commit', '-q', '-m', 'binary')
+    (root / 'old.bin').write_bytes(b'\0\1\3')
+    (root / 'new.bin').write_bytes(b'header\0' + b'x' * 100)
+
+    assert _counts(root, tmp_path) == {'new.bin': '二进制', 'old.bin': '二进制'}
+
+
+def test_a_new_file_is_binary_only_by_its_first_8000_bytes_as_git_decides(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / 'late.txt').write_bytes(b'a\n' * 5000 + b'\0')
+
+    assert _counts(root, tmp_path) == {'late.txt': '+5001 −0'}
+
+
+def test_a_new_file_over_the_size_limit_is_not_read_before_the_question(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    monkeypatch.setattr(git_finish, '_COUNT_LIMIT', 2 * 1024 * 1024)
+    (root / 'at_limit.txt').write_bytes(b'x\n' * (1024 * 1024))
+    with (root / 'over_limit.bin').open('wb') as stream:
+        stream.truncate(3 * 1024 * 1024 + 1)
+
+    assert _counts(root, tmp_path) == {
+        'at_limit.txt': '+1048576 −0',
+        'over_limit.bin': '大文件，3 MiB，没有数行',
+    }
+
+
+def test_a_new_symlink_counts_its_link_text_and_is_not_followed(tmp_path: Path):
+    root = _repository(tmp_path)
+    outside = tmp_path / 'outside.txt'
+    outside.write_text('line\n' * 50, encoding='utf-8')
+    (root / 'link').symlink_to(outside)
+
+    assert _counts(root, tmp_path) == {'link': '+1 −0'}
+
+
+def test_a_staged_rename_is_counted_against_the_old_content(tmp_path: Path):
+    root = _with_tracked(tmp_path, {'old.txt': 'a\nb\nc\nd\ne\n'})
+    _git(root, tmp_path, 'config', 'diff.renames', 'false')
+    _git(root, tmp_path, 'config', 'status.renames', 'true')
+    _git(root, tmp_path, 'mv', 'old.txt', 'new.txt')
+    (root / 'new.txt').write_text('a\nb\nc\nd\ne\nf\n', encoding='utf-8')
+    git = HostGit(root, _env(tmp_path))
+    changes = git.changes()
+
+    assert [(change.path, change.origin) for change in changes] == [('new.txt', 'old.txt')]
+    assert line_counts(git, changes) == {'new.txt': '+1 −0'}
+
+
+def test_counts_in_a_workspace_below_the_repository_top_use_workspace_paths(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / 'src' / 'keep.py').write_text('KEEP = 2\n', encoding='utf-8')
+    (root / 'src' / 'add.py').write_text('A = 1\n', encoding='utf-8')
+    git = HostGit(root / 'src', _env(tmp_path))
+
+    assert line_counts(git, git.changes()) == {'add.py': '+1 −0', 'keep.py': '+1 −1'}
+
+
+def test_a_special_file_has_no_count_and_never_blocks(tmp_path: Path):
+    root = _repository(tmp_path)
+    os.mkfifo(root / 'pipe')
+
+    counts = line_counts(HostGit(root, _env(tmp_path)), [Change('pipe', '??', None)])
+
+    assert counts == {}
+
+
+def test_a_regular_file_swapped_for_a_fifo_after_lstat_is_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    os.mkfifo(root / 'pipe')
+    (root / 'plain.txt').write_text('x\n', encoding='utf-8')
+    real_lstat = os.lstat
+
+    def regular(path: Any) -> os.stat_result:
+        if Path(path).name == 'pipe':
+            return real_lstat(root / 'plain.txt')
+        return real_lstat(path)
+
+    monkeypatch.setattr(git_finish.os, 'lstat', regular)
+
+    counts = line_counts(HostGit(root, _env(tmp_path)), [Change('pipe', '??', None)])
+
+    assert counts == {}
+
+
+def test_a_failing_git_diff_leaves_tracked_changes_without_a_count(tmp_path: Path):
+    root = tmp_path / 'fresh'
+    _git(tmp_path, tmp_path, 'init', '-q', '-b', 'main', str(root))
+    (root / 'staged.txt').write_text('x\n', encoding='utf-8')
+    (root / 'new.txt').write_text('y\n', encoding='utf-8')
+    _git(root, tmp_path, 'add', 'staged.txt')
+    changes = [Change('new.txt', '??', 'b' * 40), Change('staged.txt', 'A ', 'b' * 40)]
+
+    assert line_counts(HostGit(root, _env(tmp_path)), changes) == {'new.txt': '+1 −0'}
+
+
+def test_an_interrupted_hooked_commit_stops_its_whole_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    marker = tmp_path / 'hook.pid'
+    _hook(tmp_path, 'pre-commit', f'echo $$ > {marker}\nexec sleep 30')
+    (root / 'a.txt').write_text('x\n', encoding='utf-8')
+    _git(root, tmp_path, 'add', 'a.txt')
+    original = subprocess.Popen.communicate
+    interrupted: list[bool] = []
+
+    def communicate(self: subprocess.Popen[bytes], *args: Any, **kwargs: Any) -> Any:
+        if interrupted:
+            return original(self, *args, **kwargs)
+        interrupted.append(True)
+        deadline = time.monotonic() + _HOOK_STARTS_WITHIN
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(subprocess.Popen, 'communicate', communicate)
+
+    with pytest.raises(KeyboardInterrupt):
+        git_finish._hooked(  # pyright: ignore[reportPrivateUsage]
+            HostGit(root, _env(tmp_path)),
+            _env(tmp_path),
+            Redactor({}),
+            ['commit', '-q', '-F', '-'],
+            message='m',
+        )
+
+    pid = int(marker.read_text(encoding='utf-8'))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f'the hook process {pid} outlived the interrupted commit')
+
+
+def test_a_nul_inside_the_first_8000_bytes_makes_a_new_file_binary_and_one_after_does_not(
+    tmp_path: Path,
+):
+    root = _repository(tmp_path)
+    (root / 'early.bin').write_bytes(b'a' * 7999 + b'\0')
+    (root / 'late.txt').write_bytes(b'a' * 8000 + b'\0')
+
+    assert _counts(root, tmp_path) == {'early.bin': '二进制', 'late.txt': '+1 −0'}
+
+
+def test_a_new_file_bigger_than_one_read_is_counted_to_the_end(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / 'many.txt').write_bytes(b'x\n' * 100_000)
+
+    assert _counts(root, tmp_path) == {'many.txt': '+100000 −0'}
+
+
+def test_a_new_file_is_read_only_up_to_its_size_when_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    (root / 'growing.log').write_bytes(b'a\nb\nc\n')
+    real_fstat = os.fstat
+
+    def smaller(descriptor: int) -> os.stat_result:
+        info = real_fstat(descriptor)
+        fields = list(info[:10])
+        fields[6] = 2
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(git_finish.os, 'fstat', smaller)
+
+    assert line_counts(HostGit(root, _env(tmp_path)), [Change('growing.log', '??', None)]) == {
+        'growing.log': '+1 −0'
+    }
+
+
+def test_a_binary_new_file_is_read_no_further_than_it_takes_to_tell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    (root / 'image.bin').write_bytes(b'\0' + b'x' * (4 * 1024 * 1024))
+    reads: list[int] = []
+    real_read = os.read
+
+    def counted(descriptor: int, size: int) -> bytes:
+        reads.append(size)
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(git_finish.os, 'read', counted)
+
+    counts = line_counts(HostGit(root, _env(tmp_path)), [Change('image.bin', '??', None)])
+
+    assert counts == {'image.bin': '二进制'}
+    assert len(reads) == 1
+
+
+def test_a_symlink_swapped_in_after_lstat_is_not_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    target = tmp_path / 'outside.txt'
+    target.write_text('line\n' * 50, encoding='utf-8')
+    (root / 'swapped').symlink_to(target)
+    (root / 'plain.txt').write_text('x\n', encoding='utf-8')
+    real_lstat = os.lstat
+
+    def regular(path: Any) -> os.stat_result:
+        if Path(path).name == 'swapped':
+            return real_lstat(root / 'plain.txt')
+        return real_lstat(path)
+
+    monkeypatch.setattr(git_finish.os, 'lstat', regular)
+
+    counts = line_counts(HostGit(root, _env(tmp_path)), [Change('swapped', '??', None)])
+
+    assert counts == {}
+
+
+def test_a_symlink_that_goes_away_before_it_is_read_has_no_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    (root / 'link').symlink_to('target')
+
+    def gone(path: Any) -> str:
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(git_finish.os, 'readlink', gone)
+
+    assert line_counts(HostGit(root, _env(tmp_path)), [Change('link', '??', None)]) == {}
+
+
+def test_a_tracked_file_with_a_tab_in_its_name_is_counted(tmp_path: Path):
+    root = _with_tracked(tmp_path, {'a\tb.txt': 'one\n'})
+    (root / 'a\tb.txt').write_text('two\n', encoding='utf-8')
+
+    assert _counts(root, tmp_path) == {'a\tb.txt': '+1 −1'}
+
+
+def test_a_rename_git_cannot_pair_is_counted_as_the_new_lines_and_the_old_ones(tmp_path: Path):
+    root = _with_tracked(tmp_path, {'old.txt': ''.join(f'line {i}\n' for i in range(20))})
+    _git(root, tmp_path, 'config', 'status.renames', 'true')
+    _git(root, tmp_path, 'mv', 'old.txt', 'new.txt')
+    (root / 'new.txt').write_text(''.join(f'other {i}\n' for i in range(5)), encoding='utf-8')
+    git = HostGit(root, _env(tmp_path))
+    changes = git.changes()
+
+    assert [(change.path, change.origin) for change in changes] == [('new.txt', 'old.txt')]
+    assert line_counts(git, changes) == {'new.txt': '+5 −20'}
+
+
+_TEXT = b''.join(b'line %d\n' % number for number in range(20))
+_BINARY = b'\0' + b'z' * 200
+
+
+@pytest.mark.parametrize(
+    ('old', 'old_content', 'new', 'new_content'),
+    [('old.txt', _TEXT, 'new.bin', _BINARY), ('old.bin', _BINARY, 'new.txt', _TEXT)],
+    ids=['text_became_binary', 'binary_became_text'],
+)
+def test_a_rename_git_cannot_pair_with_a_binary_half_is_counted_as_binary(
+    tmp_path: Path, old: str, old_content: bytes, new: str, new_content: bytes
+):
+    root = _repository(tmp_path)
+    (root / old).write_bytes(old_content)
+    _git(root, tmp_path, 'add', old)
+    _git(root, tmp_path, 'commit', '-q', '-m', 'old')
+    _git(root, tmp_path, 'config', 'status.renames', 'true')
+    _git(root, tmp_path, 'mv', old, new)
+    (root / new).write_bytes(new_content)
+    git = HostGit(root, _env(tmp_path))
+    changes = git.changes()
+
+    assert [(change.path, change.origin) for change in changes] == [(new, old)]
+    assert line_counts(git, changes) == {new: '二进制'}
+
+
+def test_an_empty_new_file_adds_no_lines(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / 'empty.txt').write_bytes(b'')
+
+    assert _counts(root, tmp_path) == {'empty.txt': '+0 −0'}
+
+
+def _hooked_commit(tmp_path: Path, root: Path) -> Any:
+    return git_finish._hooked(  # pyright: ignore[reportPrivateUsage]
+        HostGit(root, _env(tmp_path)),
+        _env(tmp_path),
+        Redactor({}),
+        ['commit', '-q', '-F', '-'],
+        message='m',
+    )
+
+
+def _interrupted_communicate(monkeypatch: pytest.MonkeyPatch, marker: Path, times: int) -> None:
+    """前 `times` 次 `communicate` 等钩子写下 pid 之后抛 KeyboardInterrupt（人按 Ctrl-C），
+    之后照常。"""
+    original = subprocess.Popen.communicate
+    calls: list[bool] = []
+
+    def communicate(self: subprocess.Popen[bytes], *args: Any, **kwargs: Any) -> Any:
+        if len(calls) >= times:
+            return original(self, *args, **kwargs)
+        calls.append(True)
+        deadline = time.monotonic() + _HOOK_STARTS_WITHIN
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(subprocess.Popen, 'communicate', communicate)
+
+
+def _assert_process_gone(pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL)
+    pytest.fail(f'process {pid} outlived the interrupted commit')
+
+
+def test_a_second_ctrl_c_while_the_hook_is_stopped_still_kills_a_hook_ignoring_sigterm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    marker = tmp_path / 'hook.pid'
+    _hook(tmp_path, 'pre-commit', f"trap '' TERM\necho $$ > {marker}\nwhile :; do sleep 1; done")
+    (root / 'a.txt').write_text('x\n', encoding='utf-8')
+    _git(root, tmp_path, 'add', 'a.txt')
+    _interrupted_communicate(monkeypatch, marker, times=2)
+
+    with pytest.raises(KeyboardInterrupt):
+        _hooked_commit(tmp_path, root)
+
+    _assert_process_gone(int(marker.read_text(encoding='utf-8')))
+
+
+def test_a_group_left_with_only_zombies_does_not_turn_ctrl_c_into_another_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    marker = tmp_path / 'hook.pid'
+    _hook(tmp_path, 'pre-commit', f'echo $$ > {marker}\nexec sleep 30')
+    (root / 'a.txt').write_text('x\n', encoding='utf-8')
+    _git(root, tmp_path, 'add', 'a.txt')
+    _interrupted_communicate(monkeypatch, marker, times=1)
+    real_killpg = os.killpg
+
+    def eperm_then_kill(pgid: int, signum: int) -> None:
+        real_killpg(pgid, signal.SIGKILL)
+        raise PermissionError(1, 'Operation not permitted')
+
+    monkeypatch.setattr(git_finish.os, 'killpg', eperm_then_kill)
+
+    with pytest.raises(KeyboardInterrupt):
+        _hooked_commit(tmp_path, root)
+
+
+def test_ctrl_c_during_the_commit_unstages_the_new_files_it_staged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    (root / 'src' / 'new.py').write_text('NEW = 1\n', encoding='utf-8')
+    (root / 'README.md').write_text('# changed\n', encoding='utf-8')
+    git = HostGit(root, _env(tmp_path))
+    before = integrity(git)
+    changes = git.changes()
+    real_hooked = git_finish._hooked  # pyright: ignore[reportPrivateUsage]
+
+    def interrupted_commit(*args: Any, **kwargs: Any) -> Any:
+        if args[3][0] == 'commit':
+            raise KeyboardInterrupt
+        return real_hooked(*args, **kwargs)
+
+    monkeypatch.setattr(git_finish, '_hooked', interrupted_commit)
+
+    with pytest.raises(git_finish.GitInterrupted) as excinfo:
+        git_finish.execute(
+            git,
+            changes=changes,
+            message='m\n',
+            push=False,
+            before=before,
+            redactor=Redactor({}),
+            hook_env=_env(tmp_path),
+        )
+
+    status = _status(root, tmp_path)
+    assert '?? src/new.py' in status and ' M README.md' in status
+    assert excinfo.value.detail == '没有提交；改动还在工作区里；为提交暂存的新文件已经撤回。'
+
+
+def test_ctrl_c_when_head_cannot_be_read_leaves_the_index_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    (root / 'src' / 'new.py').write_text('NEW = 1\n', encoding='utf-8')
+    git = HostGit(root, _env(tmp_path))
+    before = integrity(git)
+    changes = git.changes()
+    real_hooked = git_finish._hooked  # pyright: ignore[reportPrivateUsage]
+    real_attempt = git_finish._attempt  # pyright: ignore[reportPrivateUsage]
+    broken: list[bool] = []
+
+    def interrupted_commit(*args: Any, **kwargs: Any) -> Any:
+        if args[3][0] == 'commit':
+            broken.append(True)
+            raise KeyboardInterrupt
+        return real_hooked(*args, **kwargs)
+
+    def head_unreadable(git: HostGit, *args: str) -> str | None:
+        if broken and args[:1] == ('rev-parse',):
+            return None
+        return real_attempt(git, *args)
+
+    monkeypatch.setattr(git_finish, '_hooked', interrupted_commit)
+    monkeypatch.setattr(git_finish, '_attempt', head_unreadable)
+
+    with pytest.raises(git_finish.GitInterrupted) as excinfo:
+        git_finish.execute(
+            git,
+            changes=changes,
+            message='m\n',
+            push=False,
+            before=before,
+            redactor=Redactor({}),
+            hook_env=_env(tmp_path),
+        )
+
+    assert excinfo.value.detail.startswith('确认不了有没有提交')
+    assert 'A  src/new.py' in _status(root, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ('push', 'said'),
+    [(True, '推送做到了哪一步不知道'), (False, '没有推送：先看这个提交')],
+    ids=['commit_and_push', 'commit_only'],
+)
+def test_ctrl_c_after_the_commit_was_made_leaves_the_index_alone_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, push: bool, said: str
+):
+    root = _repository(tmp_path)
+    (root / 'src' / 'new.py').write_text('NEW = 1\n', encoding='utf-8')
+    git = HostGit(root, _env(tmp_path))
+    before = integrity(git)
+    changes = git.changes()
+    real_hooked = git_finish._hooked  # pyright: ignore[reportPrivateUsage]
+
+    def committed_then_interrupted(*args: Any, **kwargs: Any) -> Any:
+        completed = real_hooked(*args, **kwargs)
+        if args[3][0] == 'commit':
+            raise KeyboardInterrupt
+        return completed
+
+    monkeypatch.setattr(git_finish, '_hooked', committed_then_interrupted)
+
+    with pytest.raises(git_finish.GitInterrupted) as excinfo:
+        git_finish.execute(
+            git,
+            changes=changes,
+            message='m\n',
+            push=push,
+            before=before,
+            redactor=Redactor({}),
+            hook_env=_env(tmp_path),
+        )
+
+    head = _head(root, tmp_path)
+    assert head != before.head
+    assert excinfo.value.detail.startswith(f'提交已经在本地（{head}），{said}')
+    assert 'src/new.py' not in _status(root, tmp_path)
+    assert _remote_head(tmp_path) == before.head
+
+
+def test_ctrl_c_that_leaves_an_index_lock_behind_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _repository(tmp_path)
+    (root / 'src' / 'new.py').write_text('NEW = 1\n', encoding='utf-8')
+    git = HostGit(root, _env(tmp_path))
+    before = integrity(git)
+    changes = git.changes()
+    real_hooked = git_finish._hooked  # pyright: ignore[reportPrivateUsage]
+
+    def killed_mid_commit(*args: Any, **kwargs: Any) -> Any:
+        if args[3][0] == 'commit':
+            (root / '.git' / 'index.lock').write_bytes(b'')
+            raise KeyboardInterrupt
+        return real_hooked(*args, **kwargs)
+
+    monkeypatch.setattr(git_finish, '_hooked', killed_mid_commit)
+
+    with pytest.raises(git_finish.GitInterrupted) as excinfo:
+        git_finish.execute(
+            git,
+            changes=changes,
+            message='m\n',
+            push=False,
+            before=before,
+            redactor=Redactor({}),
+            hook_env=_env(tmp_path),
+        )
+
+    detail = excinfo.value.detail
+    assert '这些新文件还在暂存区里：src/new.py' in detail
+    assert '仓库里留下了 ' in detail
+    assert '/.git/index.lock：确认没有别的 git 进程在跑之后删掉它' in detail
+
+
+def test_stopping_returns_even_if_a_process_that_left_the_group_holds_its_pipes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(git_finish, '_STOP_GRACE', 0.3)
+    pid_file = tmp_path / 'escaped.pid'
+    escaped = (
+        'import os, time\n'
+        f'open({str(pid_file)!r} + ".tmp", "w").write(str(os.getpid()))\n'
+        f'os.replace({str(pid_file)!r} + ".tmp", {str(pid_file)!r})\n'
+        'time.sleep(20)\n'
+    )
+    leader = (
+        'import subprocess, sys, time\n'
+        f'subprocess.Popen([sys.executable, "-c", {escaped!r}], start_new_session=True)\n'
+        'time.sleep(20)\n'
+    )
+    process = subprocess.Popen(
+        [sys.executable, '-c', leader],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + _HOOK_STARTS_WITHIN
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    escaped_pid = int(pid_file.read_text(encoding='utf-8'))
+    try:
+        started = time.monotonic()
+        git_finish._stop(process)  # pyright: ignore[reportPrivateUsage]
+        elapsed = time.monotonic() - started
+    finally:
+        os.kill(escaped_pid, signal.SIGKILL)
+    assert elapsed < 5
+
+
 def test_an_answer_that_is_not_utf8_means_3():
     stdin = TextIOWrapper(BytesIO(b'\xff\xfe1\n'), encoding='utf-8')
 
@@ -752,7 +1382,14 @@ def test_with_unpushed_local_commits_git_mode_push_exits_3(tmp_path: Path):
     assert _head(root, tmp_path) == head
 
 
-def test_a_buffered_answer_typed_before_the_question_does_not_count():
+@pytest.mark.parametrize(
+    'reader',
+    [lambda stream: stream, host_module._Lines],  # pyright: ignore[reportPrivateUsage]
+    ids=['the_stream', 'the_hosts_reader'],
+)
+def test_a_buffered_answer_typed_before_the_question_does_not_count(
+    reader: Callable[[TextIO], object],
+):
     master, slave = os.openpty()
     try:
         os.write(master, b'1\n')
@@ -773,7 +1410,7 @@ def test_a_buffered_answer_typed_before_the_question_does_not_count():
         typist = threading.Thread(target=answer_after_the_flush)
         typist.start()
         with open(slave, encoding='utf-8', closefd=False) as stdin:
-            answer = ask(stdin, StringIO(), 'summary', Offer((), None, ()))
+            answer = ask(cast(TextIO, reader(stdin)), StringIO(), 'summary', Offer((), None, ()))
         typist.join()
     finally:
         os.close(master)
@@ -1071,7 +1708,7 @@ def test_odd_file_names_are_committed_as_themselves_and_nothing_runs(tmp_path: P
     assert _committed_paths(root, tmp_path) == set(names)
     assert {'?? a.py', '?? b.py', '?? scratch.txt', '?? x'} <= set(_status(root, tmp_path))
     assert not any(path.name.startswith('pwned') for path in root.iterdir())
-    assert '- `??` line\\nbreak.txt' in run.stderr
+    assert '- `??` `+1 −0` line\\nbreak.txt' in run.stderr
 
 
 def test_a_protected_path_change_is_listed_and_left_to_the_human(tmp_path: Path):
@@ -1260,7 +1897,7 @@ def test_a_file_written_with_mixed_case_is_not_flagged_as_bash_made(tmp_path: Pa
 
     run = _run(tmp_path, _script(_write('src/New.py')), root=root)
 
-    assert '- `??` src/New.py\n' in run.stderr
+    assert '- `??` `+1 −0` src/New.py\n' in run.stderr
 
 
 def test_the_commit_body_lists_every_verify_command_in_order(tmp_path: Path):
@@ -1303,8 +1940,8 @@ def test_the_summary_marks_changes_not_made_by_write_or_edit(tmp_path: Path):
 
     run = _run(tmp_path, _script(*calls), root=root)
 
-    assert '- `??` src/new.py\n' in run.stderr
-    assert '- `??` via_bash.txt（不是 Write / Edit 产生的）' in run.stderr
+    assert '- `??` `+1 −0` src/new.py\n' in run.stderr
+    assert '- `??` `+1 −0` via_bash.txt（不是 Write / Edit 产生的）' in run.stderr
 
 
 # ---- 推送 ----
@@ -1807,7 +2444,7 @@ def test_the_question_never_prints_a_secret(tmp_path: Path):
     run = _run(tmp_path, _script(_write(f'cache-{_SECRET}.txt', 'x\n')), root=root, stdin='3\n')
 
     assert run.git == 'declined'
-    assert '- `??` cache-[REDACTED:secret.env_value].txt' in run.stderr
+    assert '- `??` `+1 −0` cache-[REDACTED:secret.env_value].txt' in run.stderr
     assert _SECRET not in run.stderr
 
 

@@ -387,6 +387,102 @@ def test_eof_aborts_a_pending_human_question(tmp_path: Path) -> None:
     assert excinfo.value.next_action
 
 
+def _break_the_pump_once_the_agent_is_done(monkeypatch: pytest.MonkeyPatch) -> None:
+    """读人的答复的那一侧在 Agent 结束之后、Runtime 关掉之前出错。"""
+    finished = asyncio.Event()
+    original = RuntimeCliHost._wait_with_pump  # pyright: ignore[reportPrivateUsage]
+
+    async def broken_pump(*args: object) -> None:
+        await finished.wait()
+        raise OSError('stdin went away')
+
+    async def wait_then_let_the_pump_break(
+        self: RuntimeCliHost, runtime: Any, agent_id: str, pump: asyncio.Task[None]
+    ) -> Context:
+        context = await original(self, runtime, agent_id, pump)
+        finished.set()
+        await asyncio.gather(pump, return_exceptions=True)
+        return context
+
+    monkeypatch.setattr(RuntimeCliHost, '_event_pump', broken_pump)
+    monkeypatch.setattr(RuntimeCliHost, '_wait_with_pump', wait_then_let_the_pump_break)
+
+
+def test_a_human_input_failure_after_the_agent_finished_still_fails_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llm = ScriptedLLM([ScriptedTurn(content='finished first')])
+    _break_the_pump_once_the_agent_is_done(monkeypatch)
+    host = RuntimeCliHost(
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
+        model_factory=lambda _: llm,
+        workspace_root=tmp_path,
+    )
+    try:
+        with pytest.raises(OSError, match='stdin went away'):
+            host.run_request(RunRequest(prompt='work', agent='Worker'))
+    finally:
+        host.close()
+
+
+def test_a_human_input_failure_while_the_agent_waits_is_reported_once(tmp_path: Path) -> None:
+    class Broken(StringIO):
+        def readline(self, size: int | None = -1) -> str:
+            raise OSError('stdin went away')
+
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        id='ask-1',
+                        name='AskUser',
+                        arguments='{"question":"Need input","timeout":30}',
+                    )
+                ]
+            )
+        ]
+    )
+    stderr = StringIO()
+    host = RuntimeCliHost(
+        io=CliIO(stdin=Broken(), stdout=StringIO(), stderr=stderr),
+        model_factory=lambda _: llm,
+        workspace_root=tmp_path,
+    )
+    try:
+        with pytest.raises(OSError, match='stdin went away'):
+            host.run_request(RunRequest(prompt='ask', agent='Worker'))
+    finally:
+        host.close()
+
+    assert '读人的答复时也出了错' not in stderr.getvalue()
+
+
+def test_a_human_input_failure_does_not_replace_the_runs_own_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llm = ScriptedLLM([ScriptedTurn(content='finished first')])
+    _break_the_pump_once_the_agent_is_done(monkeypatch)
+
+    async def failed(*args: object, **kwargs: object) -> str:
+        raise RuntimeError('the run itself failed')
+
+    monkeypatch.setattr(RuntimeCliHost, '_answer', failed)
+    stderr = StringIO()
+    host = RuntimeCliHost(
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
+        model_factory=lambda _: llm,
+        workspace_root=tmp_path,
+    )
+    try:
+        with pytest.raises(RuntimeError, match='the run itself failed'):
+            host.run_request(RunRequest(prompt='work', agent='Worker'))
+    finally:
+        host.close()
+
+    assert '读人的答复时也出了错：OSError: stdin went away' in stderr.getvalue()
+
+
 def test_eof_rejects_confirmation_without_executing_the_tool(tmp_path: Path) -> None:
     doomed = tmp_path / 'doomed.txt'
     doomed.write_text('keep me', encoding='utf-8')
