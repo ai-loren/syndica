@@ -273,8 +273,8 @@ class _LazyHost:
     def inspect(self, request: InspectRequest) -> str:
         return self._get().inspect(request)
 
-    def doctor(self, config: str) -> str:
-        return self._get().doctor(config)
+    def doctor(self, config: str, *, verify: bool = False) -> str | CliOutcome:
+        return self._get().doctor(config, verify=verify)
 
     def open_chat(self, config: str, max_turns: int | None = None) -> str:
         return self._get().open_chat(config, max_turns)

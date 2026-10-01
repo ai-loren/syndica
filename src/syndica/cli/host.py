@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
 import platform
+import re
 import secrets
-from collections.abc import Callable, Generator, Mapping
+import shlex
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
@@ -62,6 +65,7 @@ from syndica.kernel import (
     ConfigError,
     Context,
     ContractViolation,
+    ExecResult,
     ExitMode,
     FlagDeclaration,
     HookResult,
@@ -71,6 +75,7 @@ from syndica.kernel import (
     Junction,
     LocalWorkspace,
     MailboxConfirmationHandler,
+    Portal,
     Runtime,
     RuntimeModule,
     SafetyModule,
@@ -113,6 +118,11 @@ _READ_ONLY_NOTICE = (
 )
 # 宿主复核每条命令的上限（D13）：比 Agent 的 Bash 宽得多，全量测试要跑得完。
 _VERIFY_TIMEOUT = 900.0
+# doctor 跑 `command -v` 与 `<exe> --version` 的上限。
+_PROBE_TIMEOUT = 30.0
+_ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
+# 能不执行就找出来的程序名：普通名字或路径，外加 `[`；带 shell 语法或展开的词不在其中。
+_PROGRAM = re.compile(r'\[|[A-Za-z0-9_./+@%,:-]+')
 # 交接正文「Agent 跑过的检查」不列这一类：echo、ls 不是检查。
 _UNRECOGNISED_CHECK = 'other'
 
@@ -626,6 +636,100 @@ def _next_steps(
     return tuple(steps)
 
 
+def _git_line(git: HostGit) -> str:
+    """doctor 的 git 一行：只是情况说明，不让 doctor 失败。「不是仓库」只认 git 自己这么说；git
+    太旧、`safe.directory` 拒绝这类失败照实写出来——交接时会把这样的仓库当成不是仓库，只有这里
+    看得见。"""
+    try:
+        probe = git.attempt('rev-parse', '--is-inside-work-tree')
+    except GitUnavailable as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return 'git: 没有 git（宿主的 PATH 里找不到它）'
+        return f'git: 用不了（{one_line(str(exc))}）'
+    if probe.returncode != 0:
+        stderr = probe.stderr.decode('utf-8', 'replace').strip()
+        if 'not a git repository' in stderr:
+            return 'git: 非 git 仓库'
+        return (
+            f'git: 用不了（`git rev-parse` 退出 {probe.returncode}：{one_line(stderr)}）。下一步：'
+            '确认宿主的 git 是 2.40 以上，且这个仓库属于你（safe.directory）'
+        )
+    if probe.stdout.strip() != b'true':
+        return 'git: 非 git 仓库'
+    try:
+        changes = git.changes()
+    except GitUnavailable as exc:
+        return f'git: 列不出改动（{one_line(str(exc))}）'
+    return 'git: clean' if not changes else f'git: {len(changes)} 处改动'
+
+
+def _verify_executables(
+    commands: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...], tuple[str, ...]]:
+    """verify 用到的可执行文件（每条用 shlex 拆开、跳过开头的 `NAME=值`、取第一个词，按首次出现
+    去重）、拆不开的命令与原因，以及不单独检查的词：带 shell 语法或展开的（`(cd`、`$TOOL`）、
+    这条命令自己改了 PATH 的——它们指的是哪个程序，不执行就说不准。"""
+    found: dict[str, None] = {}
+    unchecked: dict[str, None] = {}
+    unparsed: list[tuple[str, str]] = []
+    for command in commands:
+        try:
+            words = shlex.split(command)
+        except ValueError as exc:
+            unparsed.append((command, str(exc)))
+            continue
+        assignments = list(itertools.takewhile(_ASSIGNMENT.match, words))
+        rest = words[len(assignments) :]
+        if not rest:
+            continue
+        sets_path = any(word.split('=', 1)[0] == 'PATH' for word in assignments)
+        if sets_path or not _PROGRAM.fullmatch(rest[0]):
+            unchecked.setdefault(rest[0])
+        else:
+            found.setdefault(rest[0])
+    return tuple(found), tuple(unparsed), tuple(name for name in unchecked if name not in found)
+
+
+async def _locate(portal: Portal, name: str) -> tuple[str | None, ExecResult]:
+    """`command -v` 在 Agent 的环境里找这个程序：交回它解析到的位置（内建命令是名字本身，找不到是
+    None）与那次结果。只查不跑。"""
+    found = await portal.run(f'command -v {shlex.quote(name)}', timeout=_PROBE_TIMEOUT, cwd='.')
+    lines = found.stdout.strip().splitlines() if _ran(found) else []
+    return (lines[0].strip() if lines else None), found
+
+
+def _why_not_found(found: ExecResult) -> str:
+    return f'：{_how_it_failed(found)}' if found.timed_out else ''
+
+
+def _inside_workspace(where: str, root: Path) -> bool:
+    """`command -v` 给的位置是不是在工作区里：相对路径（`./check.sh`）从工作区根算。"""
+    real_root = os.path.realpath(root)
+    full = os.path.realpath(where if os.path.isabs(where) else os.path.join(root, where))
+    return full == real_root or full.startswith(real_root + os.sep)
+
+
+def _ran(result: ExecResult) -> bool:
+    return result.exit_code == 0 and not result.timed_out
+
+
+def _first_line(result: ExecResult) -> str:
+    """版本号：stdout 或 stderr 的第一个非空行（有的程序把版本打在 stderr），转义、截到 80 个
+    字符。"""
+    text = next(
+        (line for line in (result.stdout + '\n' + result.stderr).splitlines() if line.strip()), ''
+    )
+    text = one_line(text.strip())
+    return text if len(text) <= 80 else text[:79] + '…'
+
+
+def _how_it_failed(result: ExecResult) -> str:
+    if result.timed_out:
+        return f'{_PROBE_TIMEOUT:g} 秒内没有结束'
+    detail = _first_line(ExecResult(None, '', result.stderr, False, False))
+    return f'退出 {result.exit_code}' + (f'：{detail}' if detail else '')
+
+
 _PENDING = 'git 收尾还没做：文件停在这里，说明 run 在收尾之前被打断了。'
 _NOT_WRITTEN = '交接文件没写成，宿主没有做 git 收尾：提交与推送由人来做。'
 
@@ -858,8 +962,8 @@ class RuntimeCliHost:
             indent=2,
         )
 
-    def doctor(self, config: str) -> str:
-        return self._runner.run(self._doctor(config))
+    def doctor(self, config: str, *, verify: bool = False) -> CliOutcome:
+        return self._runner.run(self._doctor(config, verify=verify))
 
     def open_chat(self, config: str, max_turns: int | None = None) -> str:
         return self._runner.run(self._open_chat(config, max_turns))
@@ -980,9 +1084,12 @@ class RuntimeCliHost:
             if not delivered.ok:
                 raise RuntimeError(delivered.reason or 'human response delivery failed')
 
-    async def _doctor(self, path: str) -> str:
+    async def _doctor(self, path: str, *, verify: bool) -> CliOutcome:
+        """D16：在 Agent 的环境里自检。git 与 python 两行只是情况说明；verify 用到的可执行文件跑不
+        起来、`--verify` 里有命令没过，退出 1。"""
         config = self._config(path)
         workspace, environment = self._open_workspace(config)
+        failed = False
         try:
             tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
             names = _model_names(config)
@@ -999,17 +1106,86 @@ class RuntimeCliHost:
                 danger_judge=judge,
                 danger_policy=policy,
             )
+            git = HostGit(self._workspace_root, self._environ)
+            lines = [
+                f'config: ok {one_line(config.source)}',
+                f'models: ok {", ".join(names)}',
+                f'workspace: ok {one_line(str(self._workspace_root))}',
+                f'env: {" ".join(environment.values)}',
+                _git_line(git),
+            ]
+            portal = workspace.portal()
+            where, found = await _locate(portal, 'python3')
+            if where is None:
+                lines.append(f'python: 没有（Agent 的环境里找不到 python3{_why_not_found(found)}）')
+            else:
+                lines.append(f'python: ok（{await self._describe(portal, where)}）')
+            executables, unparsed, unchecked = _verify_executables(config.workspace.verify)
+            for command, error in unparsed:
+                failed = True
+                lines.append(
+                    f'exe: failed（拆不开 verify 命令 `{one_line(command)}`：{error}）。下一步：'
+                    '修好 .syndica.yaml 里这条命令的引号'
+                )
+            for word in unchecked:
+                lines.append(
+                    f'exe: unchecked {one_line(word)}（不是单独的程序名，或这条命令自己改了 PATH：'
+                    'doctor 不展开它，`doctor --verify` 会真的跑它）'
+                )
+            for executable in executables:
+                where, found = await _locate(portal, executable)
+                if where is None:
+                    failed = True
+                    lines.append(
+                        f'exe: failed {one_line(executable)}（Agent 的环境里找不到它'
+                        f'{_why_not_found(found)}）。下一步：把它所在的目录加进 PATH（Agent 的环境'
+                        '透传宿主的 PATH），或把它需要的环境变量写进 .syndica.yaml 的 '
+                        'workspace.pass_env'
+                    )
+                else:
+                    lines.append(
+                        f'exe: ok {one_line(executable)}（{await self._describe(portal, where)}）'
+                    )
         finally:
             try:
                 await workspace.close()
             finally:
                 environment.remove()
-        return (
-            f'config: ok {config.source}\n'
-            f'models: ok {", ".join(names)}\n'
-            f'workspace: ok {self._workspace_root}\n'
-            f'env: {" ".join(environment.values)}'
+        if verify:
+            if not config.workspace.verify:
+                lines.append('verify: not_configured（.syndica.yaml 的 workspace.verify 是空的）')
+            before, _ = _changes(git)
+            for result in await self._verify(config):
+                failed = failed or not result.passed
+                lines.append(
+                    f'verify: {"passed" if result.passed else "failed"} {one_line(result.command)}'
+                    f'（{result.summary}）'
+                )
+            after, _ = _changes(git)
+            touched = _differences(before, after)
+            if touched:
+                failed = True
+                lines.append(
+                    f'verify: 改了工作区里的文件：{", ".join(map(one_line, touched))}'
+                    '（`run --handoff` 会因此判复核失败）。下一步：让这些命令只读地跑，或把它们'
+                    '生成的文件加进 .gitignore'
+                )
+        return CliOutcome(Redactor(self._environ).redact('\n'.join(lines)), 1 if failed else 0)
+
+    async def _describe(self, portal: Portal, where: str) -> str:
+        """找到了的程序怎么写进那一行：内建命令不跑；解析到工作区里的不跑（那是项目自己的代码，只有
+        `run --handoff` 与 `doctor --verify` 才执行项目代码）；其余跑 `--version`，跑不出来只算
+        版本未知，不算失败。"""
+        if '/' not in where:
+            return 'shell 内建命令'
+        if _inside_workspace(where, self._workspace_root):
+            return f'在工作区里：{one_line(where)}，doctor 不运行它'
+        version = await portal.run(
+            f'{shlex.quote(where)} --version', timeout=_PROBE_TIMEOUT, cwd='.'
         )
+        if _ran(version):
+            return _first_line(version) or one_line(where)
+        return f'版本未知：{_how_it_failed(version)}'
 
     async def _open_chat(self, path: str, max_turns: int | None) -> str:
         config = self._config(path)

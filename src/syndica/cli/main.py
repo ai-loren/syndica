@@ -73,7 +73,7 @@ class CliHost(Protocol):
 
     def inspect(self, request: InspectRequest) -> str: ...
 
-    def doctor(self, config: str) -> str | CliOutcome: ...
+    def doctor(self, config: str, *, verify: bool = False) -> str | CliOutcome: ...
 
     def open_chat(self, config: str, max_turns: int | None = None) -> str: ...
 
@@ -173,7 +173,12 @@ def _parser() -> _ArgumentParser:
     for action in ('show', 'resume', 'rm'):
         session_action = session_actions.add_parser(action)
         session_action.add_argument('name')
-    commands.add_parser('doctor')
+    doctor = commands.add_parser('doctor')
+    doctor.add_argument(
+        '--verify',
+        action='store_true',
+        help='自检之后在 Agent 的环境里逐条跑 workspace.verify，任一条失败退出 1',
+    )
     commands.add_parser('version')
     return parser
 
@@ -410,6 +415,9 @@ def main(
         )
         return _host_call(lambda: host.inspect(request), streams)
     if namespace.command == 'doctor':
+        # 只在给了 --verify 时才传这个参数：没有它的宿主实现照样能跑普通的 doctor。
+        if namespace.verify:
+            return _host_call(lambda: host.doctor(namespace.config, verify=True), streams)
         return _host_call(lambda: host.doctor(namespace.config), streams)
     if namespace.command == 'chat':
         return _chat(host, namespace.config, streams, namespace.max_turns)

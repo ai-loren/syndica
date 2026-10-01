@@ -3,7 +3,7 @@
 > **执行者须知：本文件是需求，不是参考。** 「公开契约」一节里的 CLI 参数、配置键、规则 ID、标记行、
 > front matter 字段与内核 API 一旦发布就是兼容承诺；执行中不得为了让测试变绿临时改名或缩小断言范围。
 
-**状态：已评审，执行中（T1–T11、T14 完成，阶段一已审计）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
+**状态：已评审，执行中（T1–T14 完成，阶段一已审计）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
 2026-10-01，见「决策日志」）。GitHub Actions 本月免费额度已用完，恢复之前按「验证」一节的本地验证协议执行。
 
 **Goal:** 让 Syndica 在一份仓库里完成一次受控修改：读约束、规划、改文件、跑检查、读失败、迭代修复，
@@ -446,8 +446,16 @@ commit-msg 钩子可能追加内容）写进 handoff。
 
 **D16 `doctor` 在 Agent 的环境里自检。** 输出行顺序固定：config、models、workspace（已有）、env（只列
 名字）、git（clean / N 处改动 / 非 git 仓库 / 没有 git）、python（Agent 环境里 `python3 --version`）、
-verify 命令用到的每个可执行文件（用 `shlex` 拆分、跳过开头的 `NAME=值`，在 Agent 环境里跑
-`<exe> --version`）；`doctor --verify` 再逐条跑 verify。
+verify 命令用到的每个可执行文件（用 `shlex` 拆分、跳过开头的 `NAME=值`，按首次出现去重）；
+`doctor --verify` 再逐条跑 verify（同样在 Agent 环境里），每条一行、带解析摘要。可执行文件在不在用
+`command -v` 判：内建命令（`cd`、`[`、`true`）算在；在的程序再跑 `--version` 取版本，跑不出来只写「版本
+未知」——`dash`、BSD 的 `uname` 这类不认 `--version` 的程序照样算在。解析到工作区里的程序（`./check.sh`、
+PATH 里指向工作区的目录）不跑：只有 `run --handoff` 与 `doctor --verify` 执行项目代码（D15）。带 shell
+语法或展开的词（`(cd`、`$TOOL`）与自己改了 PATH 的命令写成 unchecked，不执行就说不准它指哪个程序。git 一行
+只认 git 自己说「不是仓库」，git 太旧、`safe.directory` 拒绝这类失败照实写出来。git 与 python 两行只是情况
+说明，不让 doctor 失败；找不到可执行文件、verify 命令拆不开、`--verify` 有一条没过或改了工作区里的文件都退出
+1，失败行写明下一步（PATH 或 `workspace.pass_env`）；`--verify` 而没有配置 verify 时写明一行、不算失败。
+输出经 D12 脱敏（verify 命令里可能写着密钥）、逐段转义。
 
 **D17 `syndica-dev` 放在本仓的项目配置里。** 仓库根的 `.syndica.yaml` 加 `docs/agents/*.md` 提示词，纯声明式：
 
@@ -858,6 +866,15 @@ Critical 是宿主的提交会跑仓库的钩子，而钩子执行的往往是�
 
 #### T13 — `doctor` 扩展与 `doctor --verify`
 
+**状态：completed**（本地验证协议：定向用例与六道门禁全绿，定向用例在 `/bin/dash` 下同样通过。对抗评审没有
+Critical，找出 3 Medium / 4 Low 与 30 条存活变异：用 `--version` 判可执行文件在不在，内建命令、`dash`、BSD
+工具都被判成缺失、还指人去改 PATH；普通 doctor 会跑 `./check.sh --version` 这样的项目代码；git 的任何失败
+都被说成「非 git 仓库」；verify 命令里的密钥原样打出；`main` 总是传 `verify=`，没有这个参数的宿主实现连普通
+doctor 都跑不了；`--verify` 放过会改文件、交接时必然失败的命令；路径里的控制字符没转义。改为 `command -v`
+判在不在、版本只作说明、工作区里的程序不跑，其余逐条修掉；用例里补上能区分转义、顺序、超时、多个条目的固定
+装置。两轮变异共 60 条全部杀死；`command -v` 那一处的引号是按构造的等价变异（能走到那里的词已经排除了 shell
+元字符），没有计入。Linux 补跑待 CI 额度恢复）
+
 **Files:** `cli/host.py`、`cli/main.py`、对应用例。
 
 - 行为见 D16，返回 `CliOutcome`。用例：Agent 环境里找不到 uv 时退出 1，下一步指向 PATH 或
@@ -1159,6 +1176,16 @@ GitHub Free 每月 2000 分钟的 Actions 额度在 2026-10 已经用完，下�
   又找出一整类连写与缩写：`PGPASSWORD`、`MYSQL_PWD`、`NGROK_AUTHTOKEN`、`VOLC_SECRETKEY`、`BW_SESSION`、
   `QIANFAN_AK`、`AZURE_STORAGE_CONNECTION_STRING`。逐个补词追不完，改为另按词尾认，并补几个常见缩写；代价是
   `MONKEY_MODE` 这种以 KEY 结尾的普通名字也被拒收（报错说清原因，值只在像凭证时才打码）。
+- T12 评审：宿主的 `git commit` 会跑仓库的钩子与配置里的程序（`gpg.program`、filter），钩子执行的又往往
+  是工作区里 Agent 能改的代码——husky v9 的存根 source `.husky/<钩子>`，Agent 用 Write 改那个文件，完整性
+  快照（只看钩子目录里的文件）不变，宿主的提交就带着 ssh agent 与全部密钥执行它。D14 原先「快照、状态、
+  hash、提交、推送都在同一个宿主环境里跑」改为提交在 Agent 的环境里跑；同一次评审测出 include 进来的配置
+  文件里的 `pushInsteadOf`、`gpg.program` 绕过只 hash `.git/config` 的快照，改为 hash 全部有效配置。
+  AGENTS.md「安全」一节补了这条不变式。
+- T12 实测（git 2.50.1）：命令行 `-c trace2.eventtarget=` 盖不过全局配置里的 trace2 事件目标（git 读 trace2
+  配置时不看命令行），`GIT_TRACE2_EVENT=0` 才盖得过。宿主提交改用后者。agent-adk 仓库 AGENTS.md 里「只有
+  命令行 `-c` 有效」的说法与此不符，已告知用户；本机当前没有挂着改写提交消息的进程，没法实测那个进程认不认
+  `-c` 的写法。
 - T4，执行环境把同一条长命令执行了两遍、两遍时间上重叠：两个变异跑手同时改同一批文件，其中一个的
   `git add` 把另一个施加中的变异暂存了进去。基线自检（施加前先核对 sha256）当场报了漂移、没有带着残留
   继续跑。之后变异跑手加了进程锁、改在后台运行。

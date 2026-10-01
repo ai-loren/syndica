@@ -309,7 +309,7 @@ def test_doctor_validates_config_models_and_workspace(tmp_path: Path) -> None:
         workspace_root=tmp_path,
     )
     try:
-        result = host.doctor('.syndica.yaml')
+        result = host.doctor('.syndica.yaml').output
     finally:
         host.close()
 

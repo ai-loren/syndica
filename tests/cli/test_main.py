@@ -37,6 +37,7 @@ class _Host:
         self.requests: list[RunRequest] = []
         self.inspections: list[InspectRequest] = []
         self.doctor_configs: list[str] = []
+        self.doctor_verify: list[bool] = []
         self.chat_turn_limits: list[int | None] = []
 
     def run_request(self, request: RunRequest) -> str:
@@ -47,8 +48,9 @@ class _Host:
         self.inspections.append(request)
         return f'{request.resource}:{request.action}:{request.name or ""}'
 
-    def doctor(self, config: str) -> str:
+    def doctor(self, config: str, *, verify: bool = False) -> str:
         self.doctor_configs.append(config)
+        self.doctor_verify.append(verify)
         return 'healthy'
 
     def open_chat(self, config: str, max_turns: int | None = None) -> str:
@@ -282,7 +284,21 @@ def test_doctor_routes_with_the_selected_config() -> None:
 
     assert code == 0
     assert host.doctor_configs == ['custom.yml']
+    assert host.doctor_verify == [False]
     assert stdout.getvalue() == 'healthy\n'
+
+
+def test_doctor_verify_routes_the_flag() -> None:
+    host = _Host()
+
+    code = main(
+        ['doctor', '--verify'],
+        host=host,
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
+    )
+
+    assert code == 0
+    assert host.doctor_verify == [True]
 
 
 @pytest.mark.parametrize('verb', ['list', 'show', 'resume', 'rm'])

@@ -172,7 +172,7 @@ def test_run_chat_and_doctor_hand_the_agent_the_same_environment(tmp_path: Path)
         target = host.open_chat(config)
         assert host.run_request(RunRequest(prompt='probe', session=target, config=config))
         chat_names = _env_names(_tool_output(chat_llm))
-        doctor = host.doctor(config)
+        doctor = host.doctor(config).output
     finally:
         host.close()
     doctor_line = next(line for line in doctor.splitlines() if line.startswith('env: '))
