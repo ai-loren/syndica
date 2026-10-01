@@ -269,6 +269,10 @@ def _violations(source: str) -> list[str]:
             continue
         func = node.func
         banned = checker.banned_function(node)
+        if isinstance(func, ast.Attribute) and func.attr == 'communicate':
+            content = node.args[0] if node.args else _keyword(node, 'input')
+            if content is not None and not checker.safe_content(content):
+                found.append('communicate input')
         if checker.is_subprocess(func):
             found += checker.subprocess_violations(node)
             # `create_subprocess_exec` 的参数本身就是参数列表，不是一个列表字面量。
@@ -468,6 +472,8 @@ def test_a_violation_planted_in_a_cli_subpackage_is_reported(tmp_path: Path):
         ('import subprocess\nsubprocess.run(argv, stdout=handle)', 'subprocess stdout'),
         ('from subprocess import Popen\nPopen(argv, stderr=fd)', 'subprocess stderr'),
         ('import subprocess\nsubprocess.run(argv, **options)', 'subprocess **kwargs'),
+        ('process.communicate(message)', 'communicate input'),
+        ('process.communicate(input=message, timeout=5)', 'communicate input'),
     ],
 )
 def test_the_guard_flags_every_write_whose_content_it_cannot_see(source: str, expected: str):
@@ -512,6 +518,8 @@ def test_the_guard_flags_every_write_whose_content_it_cannot_see(source: str, ex
         'SUBJECT = "chore: sync"\nargv = ["git", "commit", "-m", SUBJECT]',
         'argv = ["git", "commit", f"-mchore", "--message=" "sync"]',
         'import os\nos.open(p, os.O_WRONLY | os.O_CREAT)',
+        'process.communicate(input=redactor.redact(message).encode("utf-8"), timeout=5)',
+        'process.communicate(timeout=5)',
     ],
 )
 def test_the_guard_allows_content_free_constant_and_redacted_writes(source: str):

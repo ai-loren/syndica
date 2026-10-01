@@ -21,12 +21,21 @@ from syndica.cli.checks import parse_check
 from syndica.cli.config import CliConfig, load_config
 from syndica.cli.dev_module import DevLog, DevLogSnapshot, DevModule, last_answer
 from syndica.cli.environment import AgentEnvironment, agent_environment
+from syndica.cli.git_finish import (
+    Finish,
+    Integrity,
+    finish,
+    hook_environment,
+    ignored_paths,
+    integrity,
+)
 from syndica.cli.handoff import (
     HandoffFacts,
     HandoffLocked,
     HandoffWriteError,
     RedactingWriter,
     VerifyResult,
+    commit_title,
     exit_code_of,
     front_matter,
     lock_workspace,
@@ -617,10 +626,8 @@ def _next_steps(
     return tuple(steps)
 
 
-_GIT_SECTIONS = {
-    'pending': 'git 收尾还没做：文件停在这里，说明 run 在收尾之前被打断了。',
-    'not_offered': '宿主这次没有提供 git 收尾：提交与推送由人来做。',
-}
+_PENDING = 'git 收尾还没做：文件停在这里，说明 run 在收尾之前被打断了。'
+_NOT_WRITTEN = '交接文件没写成，宿主没有做 git 收尾：提交与推送由人来做。'
 
 
 class _HandoffFailure(Exception):
@@ -1323,6 +1330,14 @@ class RuntimeCliHost:
         root = self._workspace_root
         git = HostGit(root, self._environ)
         in_repository = _in_repository(git)
+        start: Integrity | None = None
+        ignored_before: frozenset[str] | None = None
+        if in_repository and not request.no_write:
+            try:
+                start = integrity(git)
+                ignored_before = ignored_paths(git)
+            except (GitUnavailable, OSError):
+                pass
         before, before_error = _changes(git)
         logs: list[DevLog] = []
         stops: list[StopReason | None] = []
@@ -1423,7 +1438,7 @@ class RuntimeCliHost:
             ),
         )
 
-        def document(git_state: str, exit_code: int | None) -> str:
+        def document(git_state: str, exit_code: int | None, section: str) -> str:
             matter = front_matter(
                 status=status,
                 host_verify=host_verify,
@@ -1432,20 +1447,67 @@ class RuntimeCliHost:
                 protected_changed=protected_changed,
                 exit_code=exit_code,
             )
-            return render(matter, facts, git_section=_GIT_SECTIONS[git_state])
+            return render(matter, facts, git_section=section)
 
         name = f'{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}.md'
         try:
-            path = write_handoff(root, name, document('pending', None), redactor)
+            path = write_handoff(root, name, document('pending', None, _PENDING), redactor)
         except (HandoffWriteError, OSError) as exc:
-            # 结论不能跟着文件一起丢：照样打印到 stdout，退出 1 表示留档没做成。
+            # 结论不能跟着文件一起丢：照样打印到 stdout，退出 1 表示留档没做成。没有留档就不提交。
             self._warn(redactor.redact(f'交接文件没写成，内容照样打印在 stdout 上：\n{exc}'))
-            return CliOutcome(redactor.redact(document('not_offered', 1)), 1)
+            return CliOutcome(redactor.redact(document('not_offered', 1, _NOT_WRITTEN)), 1)
         self._warn(redactor.redact(f'交接文件：{path}'))
-        git_state = 'not_offered'
-        exit_code = exit_code_of(status, git_state)
-        final = document(git_state, exit_code)
-        rewrite_handoff(root, path, final, redactor)
+        if request.no_write:
+            result = Finish('not_offered', '只读 run 不改动工作区，不做 git 收尾。')
+        else:
+            stderr = RedactingWriter(self._io.stderr, redactor)
+            agent = agent_environment(self._environ, config.workspace.pass_env, workspace_root=root)
+            try:
+                result = finish(
+                    git,
+                    mode=request.git_mode,
+                    start=start,
+                    ignored_before=ignored_before,
+                    before_changes=before,
+                    status=status,
+                    host_verify=host_verify,
+                    verdict=verdict,
+                    run_changes=run_changes,
+                    touched_again=facts.touched_again,
+                    protected=protected_changed,
+                    written=lambda changed: path_key(changed) in facts.written,
+                    title=commit_title(answer),
+                    prompt=request.prompt,
+                    verify=[(item.command, item.summary) for item in results],
+                    stdin=self._io.stdin,
+                    stderr=cast(TextIO, stderr),
+                    redactor=redactor,
+                    hook_env=hook_environment(self._environ, agent.values),
+                )
+            finally:
+                agent.remove()
+                stderr.flush()
+        exit_code = exit_code_of(status, result.state)
+        if exit_code == 0 and result.refused:
+            exit_code = 3
+        final = document(result.state, exit_code, result.section)
+        try:
+            rewrite_handoff(root, path, final, redactor)
+        except (HandoffWriteError, OSError) as exc:
+            # git 收尾已经做了（可能已提交、已推送）：结论照样打印，不能让人以为什么都没发生而重跑。
+            self._warn(
+                redactor.redact(
+                    f'交接文件没能更新成最终版本（{path} 里停在 git: pending），最终内容照样打印在 '
+                    f'stdout 上：\n{exc}'
+                )
+            )
+            exit_code = 1
+            final = document(
+                result.state,
+                exit_code,
+                f'{result.section}\n\n交接文件没能更新成这一版：磁盘上的那份停在 `git: pending`，'
+                '以这里打印的为准；不要为此重跑。',
+            )
         return CliOutcome(redactor.redact(final), exit_code)
 
     async def _verify(self, config: CliConfig) -> tuple[VerifyResult, ...]:

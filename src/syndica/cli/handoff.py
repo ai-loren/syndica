@@ -37,6 +37,7 @@ __all__ = [
     'marker_verdict',
     'path_key',
     'protected_matcher',
+    'quoted',
     'render',
     'reviewer_verdict',
     'rewrite_handoff',
@@ -376,14 +377,14 @@ def _listed(items: Collection[str], limit: int = 30) -> list[str]:
     return shown
 
 
-def _quoted(text: str) -> list[str]:
+def quoted(text: str) -> list[str]:
     """来自模型的多行文字按引用块写：每一行都以 `> ` 开头，它伪造不出交接文件自己的节。"""
     return [f'> {line}' for line in terminal_safe(text).split('\n')]
 
 
 def render(matter: str, facts: HandoffFacts, *, git_section: str) -> str:
     """整份交接文件：front matter 加正文。正文里模型与文件系统给的字符串都已转义。"""
-    lines = [matter, '# 交接', '', '## 目标', '', *_quoted(facts.prompt), '', '## 改动', '']
+    lines = [matter, '# 交接', '', '## 目标', '', *quoted(facts.prompt), '', '## 改动', '']
     if facts.changes is None:
         lines.append(f'列不出改动：{one_line(facts.changes_error or "未知原因")}')
     elif not facts.changes:
@@ -422,11 +423,11 @@ def render(matter: str, facts: HandoffFacts, *, git_section: str) -> str:
     if facts.run_errors:
         lines += ['', '## 运行中的错误', '']
         for error in facts.run_errors:
-            lines += [*_quoted(error), '']
+            lines += [*quoted(error), '']
     lines += ['', '## Agent 的结论', '', '（模型给出的文字，不是宿主的结论。）', '']
     if facts.failure is not None:
-        lines += ['run 没有正常结束：', *_quoted(facts.failure), '']
-    lines += _quoted(facts.answer) if facts.answer else ['没有回答。']
+        lines += ['run 没有正常结束：', *quoted(facts.failure), '']
+    lines += quoted(facts.answer) if facts.answer else ['没有回答。']
     lines += ['', '## 下一步', '', *[f'- {step}' for step in facts.next_steps]]
     lines += ['', '## git 收尾', '', git_section, '']
     return '\n'.join(lines)

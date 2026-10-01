@@ -160,7 +160,7 @@ def test_a_verified_run_prints_the_handoff_once_and_writes_the_same_file(tmp_pat
         'status': 'verified',
         'host_verify': 'passed',
         'reviewer_verdict': 'pass',
-        'git': 'not_offered',
+        'git': 'declined',
         'protected_changed': '[]',
         'exit_code': '0',
     }

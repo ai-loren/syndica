@@ -1,0 +1,1771 @@
+"""git 收尾（spec D14）：经 CLI 宿主跑脚本化的 run，看询问、提交、推送、交接文件与退出码。
+
+git 全部隔离：`HOME` 与 `GIT_CONFIG_GLOBAL` 指向临时目录里的配置（本地身份、全局 hooksPath），
+`GIT_CONFIG_NOSYSTEM=1`；remote 是本地 bare 仓库。
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import random
+import shutil
+import string
+import struct
+import subprocess
+import termios
+import threading
+import time
+from collections.abc import Callable, Sequence
+from io import BytesIO, StringIO, TextIOWrapper
+from pathlib import Path
+from typing import Any, TextIO, cast
+
+import pytest
+
+import syndica.cli.git_finish as git_finish
+import syndica.cli.host as host_module
+from syndica.cli.git_finish import (
+    Integrity,
+    Offer,
+    ask,
+    commit_message,
+    integrity,
+    offer,
+    summary,
+    verification_gaps,
+)
+from syndica.cli.host import RuntimeCliHost
+from syndica.cli.host_git import Change, HostGit
+from syndica.cli.main import CliIO, main
+from syndica.kernel import ContextBlock, ScriptedLLM, ScriptedTurn, ToolCall
+
+_SECRET = 'Zq9' + 'Lm4Xw7Pk2Rt8Vb5Nc3Jd6'
+_MESSAGE = 'add new\n\n宿主复核：\n- 通过：true —— passed\n'
+
+
+def _call(call_id: str, name: str, **arguments: object) -> ToolCall:
+    return ToolCall(id=call_id, name=name, arguments=json.dumps(arguments))
+
+
+def _write(path: str, content: str = 'NEW = 1\n', call_id: str = 'w') -> ToolCall:
+    return _call(call_id, 'Write', path=path, content=content)
+
+
+def _env(tmp_path: Path) -> dict[str, str]:
+    home = tmp_path / 'home'
+    (home / 'hooks').mkdir(parents=True, exist_ok=True)
+    config = _global_config(tmp_path)
+    if not config.exists():
+        config.write_text(
+            '[user]\n\tname = Syndica Test\n\temail = test@example.com\n'
+            f'[core]\n\thooksPath = {home / "hooks"}\n[init]\n\tdefaultBranch = main\n',
+            encoding='utf-8',
+        )
+    environ = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    return {
+        **environ,
+        'HOME': str(home),
+        'GIT_CONFIG_GLOBAL': str(config),
+        'GIT_CONFIG_NOSYSTEM': '1',
+        'SERVICE_TOKEN': _SECRET,
+        'SSH_AUTH_SOCK': str(tmp_path / 'agent.sock'),
+    }
+
+
+def _global_config(tmp_path: Path) -> Path:
+    """不放在 `$HOME/.gitconfig`：那是 git 的默认位置，放在那里就看不出提交用的是不是宿主的配置。"""
+    return tmp_path / 'global.gitconfig'
+
+
+def _git(root: Path, tmp_path: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', *args], cwd=root, env=_env(tmp_path), check=True, capture_output=True, text=True
+    ).stdout
+
+
+def _repository(tmp_path: Path, *, upstream: bool = True) -> Path:
+    root = tmp_path / 'ws'
+    (root / 'src').mkdir(parents=True)
+    (root / 'README.md').write_text('# project\n', encoding='utf-8')
+    (root / 'src' / 'keep.py').write_text('KEEP = 1\n', encoding='utf-8')
+    (root / '.gitignore').write_text('.env\n', encoding='utf-8')
+    _git(tmp_path, tmp_path, 'init', '-q', '-b', 'main', str(root))
+    _git(root, tmp_path, 'add', '.')
+    _git(root, tmp_path, 'commit', '-q', '-m', 'init')
+    if upstream:
+        _git(tmp_path, tmp_path, 'init', '-q', '--bare', str(tmp_path / 'remote.git'))
+        _git(root, tmp_path, 'remote', 'add', 'origin', str(tmp_path / 'remote.git'))
+        _git(root, tmp_path, 'push', '-q', '-u', 'origin', 'main')
+    return root
+
+
+def _with_tracked(tmp_path: Path, files: dict[str, str]) -> Path:
+    root = _repository(tmp_path)
+    for name, content in files.items():
+        (root / name).write_text(content, encoding='utf-8')
+    _git(root, tmp_path, 'add', '.')
+    _git(root, tmp_path, 'commit', '-q', '-m', 'more')
+    _git(root, tmp_path, 'push', '-q')
+    return root
+
+
+def _hook(tmp_path: Path, name: str, body: str) -> Path:
+    path = tmp_path / 'home' / 'hooks' / name
+    path.write_text(f'#!/bin/sh\n{body}\n', encoding='utf-8')
+    path.chmod(0o755)
+    return path
+
+
+def _github_token() -> str:
+    rng = random.Random(1234)
+    return 'ghp_' + ''.join(rng.choice(string.ascii_letters + string.digits) for _ in range(36))
+
+
+def _config(tmp_path: Path, verify: Sequence[str] | None, protected: list[str] | None) -> Path:
+    (tmp_path / 'lead.md').write_text('You lead.\n', encoding='utf-8')
+    (tmp_path / 'reviewer.md').write_text('You review.\n', encoding='utf-8')
+    workspace: dict[str, object] = {}
+    if verify is not None:
+        workspace['verify'] = list(verify)
+    if protected is not None:
+        workspace['protected'] = protected
+    lines = [
+        'version: 1',
+        'agents:',
+        '  - name: Reviewer',
+        '    description: reviews',
+        '    system_prompt: reviewer.md',
+        '    tools: [Read, Bash]',
+        '  - name: Lead',
+        '    description: leads',
+        '    system_prompt: lead.md',
+        '    tools: [Write, Edit, Bash]',
+        '    subagents: [Reviewer]',
+    ]
+    if workspace:
+        lines.append(f'workspace: {json.dumps(workspace)}')
+    path = tmp_path / 'syndica.yaml'
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return path
+
+
+def _script(
+    *calls: ToolCall, verdict: str | None = 'pass', answer: str = 'done\ncommit_title: add new'
+) -> list[ScriptedTurn]:
+    """Lead 改文件、派 Reviewer；Reviewer 给出结论；Lead 收尾。"""
+    review = 'looks fine' + (f'\nverdict: {verdict}' if verdict is not None else '')
+    return [
+        ScriptedTurn(tool_calls=list(calls or (_write('src/new.py'),))),
+        ScriptedTurn(tool_calls=[_call('d', 'Delegate', agent='Reviewer', query='review')]),
+        ScriptedTurn(content=review),
+        ScriptedTurn(content=answer),
+    ]
+
+
+class _Meddling(ScriptedLLM):
+    """第 `at` 轮之前动一下宿主环境：模拟 run 期间有东西改了仓库配置、钩子或提交历史。"""
+
+    def __init__(self, script: list[ScriptedTurn], *, at: int, meddle: Callable[[], object]):
+        super().__init__(script)
+        self._at = at
+        self._meddle = meddle
+        self._count = 0
+
+    async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        if self._count == self._at:
+            self._meddle()
+        self._count += 1
+        return await super().create(messages, **kwargs)
+
+
+class _Answering(StringIO):
+    """读答复之前先做一件事：模拟人在问题挂着的时候改了文件。"""
+
+    def __init__(self, answer: str, before: Callable[[], None]) -> None:
+        super().__init__(answer)
+        self._before = before
+
+    def readline(self, size: int | None = -1) -> str:
+        self._before()
+        return super().readline(-1 if size is None else size)
+
+
+class _Run:
+    def __init__(self, code: int, stdout: str, stderr: str) -> None:
+        self.code = code
+        self.stdout = stdout
+        self.stderr = stderr
+
+    @property
+    def matter(self) -> dict[str, str]:
+        head = self.stdout.split('---\n')[1]
+        return dict(line.split(': ', 1) for line in head.splitlines())
+
+    @property
+    def git(self) -> str:
+        return self.matter['git']
+
+
+def _run(
+    tmp_path: Path,
+    llm: ScriptedLLM | list[ScriptedTurn],
+    *,
+    root: Path,
+    git_mode: str | None = None,
+    stdin: str | TextIO = '',
+    verify: Sequence[str] | None = ('true',),
+    protected: list[str] | None = None,
+    flags: Sequence[str] = (),
+    stderr: StringIO | None = None,
+) -> _Run:
+    model = llm if isinstance(llm, ScriptedLLM) else ScriptedLLM(llm)
+    config = _config(tmp_path, verify, protected)
+    stdout = StringIO()
+    stderr = StringIO() if stderr is None else stderr
+    io = CliIO(
+        stdin=StringIO(stdin) if isinstance(stdin, str) else stdin, stdout=stdout, stderr=stderr
+    )
+    host = RuntimeCliHost(
+        io=io, model_factory=lambda _: model, workspace_root=root, environ=_env(tmp_path)
+    )
+    extra = [*flags, *(['--git-mode', git_mode] if git_mode is not None else [])]
+    try:
+        code = main(
+            ['--config', str(config), 'run', '--handoff', *extra, '--agent', 'Lead', 'work on it'],
+            host=host,
+            io=io,
+        )
+    finally:
+        host.close()
+    return _Run(code, stdout.getvalue(), stderr.getvalue())
+
+
+def _head(root: Path, tmp_path: Path) -> str:
+    return _git(root, tmp_path, 'rev-parse', 'HEAD').strip()
+
+
+def _committed_paths(root: Path, tmp_path: Path, rev: str = 'HEAD') -> set[str]:
+    raw = _git(root, tmp_path, 'diff-tree', '-r', '-z', '--name-only', '--no-commit-id', rev)
+    return {name for name in raw.split('\0') if name}
+
+
+def _remote_head(tmp_path: Path) -> str:
+    return _git(tmp_path / 'remote.git', tmp_path, 'rev-parse', 'main').strip()
+
+
+def _message(root: Path, tmp_path: Path) -> str:
+    return _git(root, tmp_path, 'cat-file', 'commit', 'HEAD').split('\n\n', 1)[1]
+
+
+def _status(root: Path, tmp_path: Path) -> list[str]:
+    raw = _git(root, tmp_path, 'status', '--porcelain=v1', '-z', '--untracked-files=all')
+    return sorted(entry for entry in raw.split('\0') if entry)
+
+
+# ---- 纯函数 ----
+
+
+def _integrity(**overrides: object) -> Integrity:
+    values: dict[str, Any] = {
+        'toplevel': '/repo',
+        'head': 'a' * 40,
+        'branch': 'main',
+        'upstream': ('origin', 'refs/heads/main'),
+        'upstream_head': 'a' * 40,
+        'push_urls': ('git@example.com:o/r.git',),
+        'config': 'c' * 64,
+        'hooks': (),
+        'in_progress': (),
+    }
+    values.update(overrides)
+    return Integrity(**values)
+
+
+def _offer(**overrides: Any) -> Offer:
+    arguments: dict[str, Any] = {
+        'root': Path('/repo'),
+        'before': _integrity(),
+        'now': _integrity(),
+        'verification': (),
+        'run_changes': [Change('src/new.py', '??', 'b' * 40, mode='100644')],
+        'touched_again': (),
+        'before_changes': (),
+        'ignored_before': frozenset(),
+        'protected': (),
+        'ahead': 0,
+    }
+    arguments.update(overrides)
+    return offer(**arguments)
+
+
+def test_all_preconditions_met_offers_everything():
+    choices = _offer()
+
+    assert (choices.commit, choices.push, choices.reasons, choices.push_reason) == (
+        True,
+        True,
+        (),
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    ('overrides', 'reason'),
+    [
+        ({'before': None}, '取不到仓库的完整性快照'),
+        ({'now': None}, '取不到仓库的完整性快照'),
+        ({'now': _integrity(config='d' * 64)}, '完整性快照与 run 开始前不一致'),
+        ({'now': _integrity(hooks=(('pre-commit', 'e' * 40),))}, '钩子 pre-commit 变了'),
+        ({'now': _integrity(upstream_head='f' * 40)}, '上游分支在本地的位置'),
+        ({'now': _integrity(push_urls=('/elsewhere.git',))}, '推送地址'),
+        ({'before_changes': None}, '运行前的快照没取到'),
+        ({'ignored_before': None}, '列不出运行前被忽略的文件'),
+        ({'ignored_before': frozenset({'build/'})}, None),
+        ({'verification': ['宿主复核没有全过']}, '宿主复核没有全过'),
+        ({'now': _integrity(in_progress=('merge',))}, '有进行中的 merge'),
+        ({'run_changes': []}, '这次 run 没有改动'),
+        ({'touched_again': ('src/new.py',)}, '有运行前就改过、这次又被改的文件'),
+        ({'ignored_before': frozenset({'src/'})}, '运行前被忽略的文件出现在改动里：src/new.py'),
+        ({'root': Path('/repo/src')}, '工作区根不是 git 顶层目录'),
+    ],
+)
+def test_each_unmet_commit_precondition_is_named(overrides: dict[str, Any], reason: str | None):
+    choices = _offer(**overrides)
+
+    if reason is None:
+        assert choices.commit
+    else:
+        assert not choices.commit and not choices.push
+        assert any(reason in item for item in choices.reasons), choices.reasons
+
+
+def test_every_unmet_precondition_is_listed_not_just_the_first():
+    choices = _offer(verification=['宿主复核没有全过'], run_changes=[], before_changes=None)
+
+    assert len(choices.reasons) == 3
+
+
+def test_every_changed_part_of_the_snapshot_is_named():
+    now = _integrity(config='d' * 64, hooks=(('pre-commit', 'e' * 40),), head='b' * 40)
+
+    (reason,) = _offer(now=now).reasons
+
+    assert reason == (
+        '仓库的完整性快照与 run 开始前不一致（HEAD、git 配置（`git config --list` 的结果）、'
+        '钩子 pre-commit 变了）'
+    )
+
+
+def test_a_tampered_repository_gets_inspect_first_advice_not_commit_advice():
+    assert _offer(now=_integrity(config='d' * 64)).tampered
+    assert not _offer(verification=['宿主复核没有全过']).tampered
+
+
+@pytest.mark.parametrize(
+    ('status', 'host_verify', 'verdict', 'gaps'),
+    [
+        ('verified', 'passed', 'pass', []),
+        ('run_failed', 'skipped', 'unverified', ['run 没有正常结束']),
+        ('verification_failed', 'failed', 'pass', ['宿主复核没有全过']),
+        (
+            'unverified',
+            'not_configured',
+            'block',
+            ['没有配置 workspace.verify：宿主没有复核', 'Reviewer 结论是 block，不是 pass'],
+        ),
+        ('unverified', 'passed', 'partial', ['Reviewer 结论是 partial，不是 pass']),
+    ],
+)
+def test_each_reason_for_not_being_verified_is_named(
+    status: str, host_verify: str, verdict: str, gaps: list[str]
+):
+    assert verification_gaps(status=status, host_verify=host_verify, verdict=verdict) == gaps
+
+
+@pytest.mark.parametrize(
+    ('overrides', 'reason'),
+    [
+        ({'before': _integrity(upstream=None), 'now': _integrity(upstream=None)}, '没有上游'),
+        ({'ahead': None}, '算不出本地领先上游几个提交'),
+        ({'ahead': 2}, '本地已经领先上游 2 个提交'),
+        ({'ahead': 1}, '本地已经领先上游 1 个提交'),
+        (
+            {
+                'before': _integrity(hooks=(('pre-push', 'e' * 40),)),
+                'now': _integrity(hooks=(('pre-push', 'e' * 40),)),
+            },
+            '推送时会在本地运行的钩子（pre-push）',
+        ),
+        (
+            {
+                'before': _integrity(hooks=(('reference-transaction', 'e' * 40),)),
+                'now': _integrity(hooks=(('reference-transaction', 'e' * 40),)),
+            },
+            '（reference-transaction）',
+        ),
+        (
+            {'before_changes': [Change('notes.txt', '??', 'b' * 40)]},
+            '运行前工作区里就有 1 处改动',
+        ),
+    ],
+)
+def test_unmet_push_preconditions_still_offer_a_commit(overrides: dict[str, Any], reason: str):
+    choices = _offer(**overrides)
+
+    assert choices.commit and not choices.push
+    assert choices.push_reason is not None and reason in choices.push_reason
+
+
+def test_protected_changes_do_not_block_the_offer_itself():
+    choices = _offer(protected=['pyproject.toml', '.gitignore'])
+
+    assert choices.commit and choices.push
+    assert choices.protected == ('.gitignore', 'pyproject.toml')
+
+
+def test_the_summary_caps_the_list_at_30_and_escapes_paths():
+    changes = [Change(f'f{index:02}\x1b.txt', '??', 'b' * 40) for index in range(31)]
+
+    text = summary(
+        before=_integrity(),
+        changes=changes,
+        written=lambda path: True,
+        host_verify='passed',
+        verdict='pass',
+        protected=(),
+        pre_existing=0,
+    )
+
+    assert text.count('\n- `??` ') == 30
+    assert '- ……共 31 处' in text
+    assert '\x1b' not in text and 'f00\\x1b.txt' in text
+    assert 'f30' not in text
+
+
+def test_taking_the_integrity_snapshot_writes_nothing_into_the_object_store(tmp_path: Path):
+    root = _repository(tmp_path)
+    _hook(tmp_path, 'pre-commit', 'exit 0 # never stored')
+
+    def objects() -> list[Path]:
+        return sorted(p for p in (root / '.git' / 'objects').rglob('*') if p.is_file())
+
+    stored = objects()
+    snapshot = integrity(HostGit(root, _env(tmp_path)))
+
+    assert snapshot.hooks and objects() == stored
+
+
+@pytest.mark.parametrize(
+    ('marker', 'label', 'directory'),
+    [
+        ('MERGE_HEAD', 'merge', False),
+        ('rebase-merge', 'rebase', True),
+        ('rebase-apply', 'rebase 或 am', True),
+        ('CHERRY_PICK_HEAD', 'cherry-pick', False),
+        ('REVERT_HEAD', 'revert', False),
+        ('BISECT_LOG', 'bisect', False),
+    ],
+)
+def test_each_operation_in_progress_is_recognised(
+    tmp_path: Path, marker: str, label: str, directory: bool
+):
+    root = _repository(tmp_path)
+    path = root / '.git' / marker
+    if directory:
+        path.mkdir()
+    else:
+        path.write_text(_head(root, tmp_path) + '\n', encoding='utf-8')
+
+    assert integrity(HostGit(root, _env(tmp_path))).in_progress == (label,)
+
+
+def test_the_summary_lists_exactly_30_changes_without_a_total():
+    changes = [Change(f'f{index:02}.txt', '??', 'b' * 40) for index in range(30)]
+
+    text = summary(
+        before=_integrity(),
+        changes=changes,
+        written=lambda path: True,
+        host_verify='passed',
+        verdict='pass',
+        protected=(),
+        pre_existing=0,
+    )
+
+    assert text.count('\n- `??` ') == 30
+    assert '……共' not in text
+
+
+def test_the_summary_names_pre_existing_changes_and_the_hooks_that_will_run():
+    text = summary(
+        before=_integrity(hooks=(('commit-msg', 'e' * 40), ('pre-commit.sample', 'f' * 40))),
+        changes=[Change('src/new.py', '??', 'b' * 40)],
+        written=lambda path: True,
+        host_verify='passed',
+        verdict='pass',
+        protected=(),
+        pre_existing=2,
+    )
+
+    assert '运行前就有的 2 处改动不进提交' in text
+    assert '提交时会运行钩子（在 Agent 的环境里，拿不到 ssh agent 与密钥）：commit-msg' in text
+    assert 'pre-commit.sample' not in text
+
+
+def test_an_answer_that_is_not_utf8_means_3():
+    stdin = TextIOWrapper(BytesIO(b'\xff\xfe1\n'), encoding='utf-8')
+
+    assert ask(stdin, StringIO(), 'summary', Offer((), None, ())) == '3'
+
+
+def test_verify_commands_in_the_commit_body_are_escaped():
+    message = commit_message('t', 'goal', [('true\t#x', 'passed')])
+
+    assert message == 't\n\n宿主复核：\n- 通过：true\\t#x —— passed\n'
+
+
+def test_the_commit_title_is_escaped_and_cut_to_72_characters():
+    long = 'x' * 80
+
+    assert commit_message('y' * 72, 'goal', []).split('\n', 1)[0] == 'y' * 72
+    assert commit_message(long, 'goal', []).split('\n', 1)[0] == 'x' * 71 + '…'
+    assert commit_message('a\x1b[31mb', 'goal', []).startswith('a\\x1b[31mb\n')
+    assert commit_message(None, '\n  \nfirst line\nsecond', []).startswith('first line\n')
+
+
+# ---- 选项与答复 ----
+
+
+def test_answering_1_commits_this_runs_change_and_pushes_it(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, stdin='1\n')
+
+    assert (run.code, run.git) == (0, 'pushed')
+    assert _committed_paths(root, tmp_path) == {'src/new.py'}
+    assert _remote_head(tmp_path) == _head(root, tmp_path)
+    assert f'提交：`{_head(root, tmp_path)}`\n已推送。' in run.stdout
+    assert '选择：提交并推送。' in run.stdout
+
+
+def test_answering_2_commits_without_pushing(tmp_path: Path):
+    root = _repository(tmp_path)
+    pushed_before = _remote_head(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, stdin='2\n')
+
+    assert (run.code, run.git) == (0, 'committed')
+    assert _committed_paths(root, tmp_path) == {'src/new.py'}
+    assert _remote_head(tmp_path) == pushed_before != _head(root, tmp_path)
+
+
+@pytest.mark.parametrize('answer', ['3\n', '\n', '', 'yes\n', '12\n', 'push\n'])
+def test_3_an_empty_line_eof_and_anything_else_leave_the_change_uncommitted(
+    tmp_path: Path, answer: str
+):
+    root = _repository(tmp_path)
+    head = _head(root, tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, stdin=answer)
+
+    assert (run.code, run.git) == (0, 'declined')
+    assert _head(root, tmp_path) == head
+    assert '?? src/new.py' in _status(root, tmp_path)
+    assert '人选了「我来处理」' in run.stdout
+
+
+def test_the_question_is_visible_before_the_answer_is_read(tmp_path: Path):
+    root = _repository(tmp_path)
+    stderr = StringIO()
+    seen: list[str] = []
+
+    run = _run(
+        tmp_path,
+        _script(),
+        root=root,
+        stdin=_Answering('3\n', lambda: seen.append(stderr.getvalue())),
+        stderr=stderr,
+    )
+
+    assert run.git == 'declined'
+    assert seen and seen[0].rstrip().endswith('选哪个 [1/2/3]？>')
+
+
+def test_a_read_only_run_does_not_ask_or_offer_anything(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, [ScriptedTurn(content='done')], root=root, flags=['--no-write'])
+
+    assert (run.code, run.matter['status'], run.git) == (0, 'read_only', 'not_offered')
+    assert '只读 run 不改动工作区，不做 git 收尾。' in run.stdout
+    assert '选哪个' not in run.stderr
+
+
+def test_the_question_goes_to_stderr_with_all_three_options(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root)
+
+    assert '1. 提交并推送' in run.stderr
+    assert '2. 只提交' in run.stderr
+    assert '3. 我来处理' in run.stderr
+    assert run.stderr.rstrip().endswith('选哪个 [1/2/3]？>')
+    assert '选哪个' not in run.stdout
+    upstream = f'git 收尾：分支 main → 上游 origin/main（推送到 {tmp_path / "remote.git"}）'
+    assert upstream in run.stderr
+    assert '宿主复核：passed；Reviewer 结论（模型给出）：pass' in run.stderr
+
+
+def test_without_an_upstream_only_2_and_3_are_offered_and_1_is_refused(tmp_path: Path):
+    root = _repository(tmp_path, upstream=False)
+    head = _head(root, tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, stdin='1\n')
+
+    assert '1. 提交并推送' not in run.stderr
+    assert '（没有推送选项：当前分支没有上游）' in run.stderr
+    assert '选哪个 [2/3]？>' in run.stderr
+    assert (run.code, run.git) == (0, 'declined')
+    assert _head(root, tmp_path) == head
+
+
+def test_with_unpushed_local_commits_push_is_not_offered(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / 'local.txt').write_text('local\n', encoding='utf-8')
+    _git(root, tmp_path, 'add', 'local.txt')
+    _git(root, tmp_path, 'commit', '-q', '-m', 'local only')
+    pushed_before = _remote_head(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, stdin='2\n')
+
+    assert '1. 提交并推送' not in run.stderr
+    assert '本地已经领先上游 1 个提交' in run.stderr
+    assert (run.code, run.git) == (0, 'committed')
+    assert '只提交，没有推送（没有推送选项：本地已经领先上游 1 个提交' in run.stdout
+    assert _remote_head(tmp_path) == pushed_before
+
+
+def test_with_unpushed_local_commits_git_mode_push_exits_3(tmp_path: Path):
+    root = _repository(tmp_path)
+    _git(root, tmp_path, 'commit', '-q', '--allow-empty', '-m', 'local only')
+    head = _head(root, tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git, run.matter['exit_code']) == (3, 'not_offered', '3')
+    assert '`--git-mode push` 没有执行：没有推送选项：' in run.stdout
+    assert _head(root, tmp_path) == head
+
+
+def test_a_buffered_answer_typed_before_the_question_does_not_count():
+    master, slave = os.openpty()
+    try:
+        os.write(master, b'1\n')
+
+        def waiting() -> int:
+            return struct.unpack('i', fcntl.ioctl(slave, termios.FIONREAD, b'\0' * 4))[0]
+
+        deadline = time.monotonic() + 5
+        while waiting() != 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        def answer_after_the_flush() -> None:
+            deadline = time.monotonic() + 5
+            while waiting() != 0 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            os.write(master, b'2\n')
+
+        typist = threading.Thread(target=answer_after_the_flush)
+        typist.start()
+        with open(slave, encoding='utf-8', closefd=False) as stdin:
+            answer = ask(stdin, StringIO(), 'summary', Offer((), None, ()))
+        typist.join()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+    assert answer == '2'
+
+
+# ---- --git-mode ----
+
+
+def test_git_mode_push_does_not_ask_and_pushes(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git, run.matter['exit_code']) == (0, 'pushed', '0')
+    assert '选哪个' not in run.stderr
+    assert _remote_head(tmp_path) == _head(root, tmp_path)
+    assert '选择：`--git-mode push`。' in run.stdout
+
+
+def test_git_mode_commit_does_not_ask_and_does_not_push(tmp_path: Path):
+    root = _repository(tmp_path)
+    pushed_before = _remote_head(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (0, 'committed')
+    assert '选哪个' not in run.stderr
+    assert _remote_head(tmp_path) == pushed_before != _head(root, tmp_path)
+
+
+def test_git_mode_manual_declines_without_asking(tmp_path: Path):
+    root = _repository(tmp_path)
+    head = _head(root, tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='manual', stdin='1\n')
+
+    assert (run.code, run.git) == (0, 'declined')
+    assert '选哪个' not in run.stderr
+    assert _head(root, tmp_path) == head
+
+
+@pytest.mark.parametrize('mode', ['commit', 'push'])
+def test_git_mode_on_an_unverified_run_exits_3(tmp_path: Path, mode: str):
+    root = _repository(tmp_path)
+    head = _head(root, tmp_path)
+
+    run = _run(tmp_path, _script(verdict=None), root=root, git_mode=mode)
+
+    assert (run.matter['status'], run.matter['reviewer_verdict']) == ('unverified', 'unverified')
+    assert (run.code, run.git, run.matter['exit_code']) == (3, 'not_offered', '3')
+    assert f'`--git-mode {mode}` 没有执行：提交的前置条件不满足：' in run.stdout
+    assert '- Reviewer 结论是 unverified，不是 pass' in run.stdout
+    assert _head(root, tmp_path) == head
+
+
+def test_git_mode_manual_on_an_unverified_run_names_what_is_missing(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(verdict=None), root=root, git_mode='manual')
+
+    assert (run.code, run.git, run.matter['exit_code']) == (0, 'not_offered', '0')
+    assert '- Reviewer 结论是 unverified，不是 pass' in run.stdout
+
+
+def test_git_mode_push_with_a_failing_verify_exits_1_and_never_says_3(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push', verify=['true', 'false'])
+
+    assert run.matter['status'] == 'verification_failed'
+    assert (run.code, run.git, run.matter['exit_code']) == (1, 'not_offered', '1')
+    assert '退出 3' not in run.stdout
+    assert '- 宿主复核没有全过' in run.stdout
+
+
+def test_without_verify_a_reviewer_pass_is_not_enough(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, stdin='1\n', verify=None)
+
+    assert (run.matter['host_verify'], run.matter['reviewer_verdict']) == ('not_configured', 'pass')
+    assert (run.code, run.git) == (0, 'not_offered')
+    assert '- 没有配置 workspace.verify：宿主没有复核' in run.stdout
+
+
+@pytest.mark.parametrize('mode', ['commit', 'push', 'manual'])
+def test_git_mode_requires_handoff_and_refuses_no_write(tmp_path: Path, mode: str):
+    stderr = StringIO()
+    io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr)
+    host = RuntimeCliHost(io=io, model_factory=lambda _: ScriptedLLM([]), workspace_root=tmp_path)
+    try:
+        alone = main(['run', '--git-mode', mode, 'x'], host=host, io=io)
+        read_only = main(
+            ['run', '--handoff', '--no-write', '--git-mode', mode, 'x'], host=host, io=io
+        )
+    finally:
+        host.close()
+
+    assert (alone, read_only) == (2, 2)
+    assert '加上 --handoff' in stderr.getvalue()
+    assert '只读 run 没有改动，不做 git 收尾' in stderr.getvalue()
+
+
+# ---- 前置条件 ----
+
+
+def test_a_run_without_a_reviewer_pass_is_not_offered_anything(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(verdict=None), root=root, stdin='1\n')
+
+    assert (run.code, run.git) == (0, 'not_offered')
+    assert '选哪个' not in run.stderr
+    assert '- Reviewer 结论是 unverified，不是 pass' in run.stdout
+
+
+def test_a_run_without_changes_is_not_offered_anything(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(_call('b', 'Bash', command='true')), root=root, stdin='1\n')
+
+    assert run.matter['status'] == 'verified'
+    assert (run.code, run.git) == (0, 'not_offered')
+    assert '- 这次 run 没有改动' in run.stdout
+
+
+def test_a_detached_head_is_not_offered_anything(tmp_path: Path):
+    root = _repository(tmp_path)
+    _git(root, tmp_path, 'checkout', '-q', '--detach')
+
+    run = _run(tmp_path, _script(), root=root, stdin='2\n')
+
+    assert run.git == 'not_offered'
+    assert '- 不在分支上（游离 HEAD）' in run.stdout
+
+
+def test_a_merge_in_progress_is_not_offered_anything(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / '.git' / 'MERGE_HEAD').write_text(_head(root, tmp_path) + '\n', encoding='utf-8')
+
+    run = _run(tmp_path, _script(), root=root, stdin='2\n')
+
+    assert run.git == 'not_offered'
+    assert '- 有进行中的 merge' in run.stdout
+
+
+def test_a_workspace_below_the_top_level_is_not_offered_anything(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(_write('new.py')), root=root / 'src', stdin='2\n')
+
+    assert run.matter['status'] == 'verified'
+    assert run.git == 'not_offered'
+    assert '- 工作区根不是 git 顶层目录' in run.stdout
+
+
+def test_a_file_changed_before_the_run_and_again_is_not_offered_anything(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / 'src' / 'keep.py').write_text('KEEP = 2\n', encoding='utf-8')
+
+    run = _run(tmp_path, _script(_write('src/keep.py', 'KEEP = 3\n')), root=root, stdin='2\n')
+
+    assert run.git == 'not_offered'
+    assert '- 有运行前就改过、这次又被改的文件' in run.stdout
+
+
+def test_a_file_ignored_before_the_run_showing_up_is_not_offered_anything(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / '.env').write_text('LOCAL=1\n', encoding='utf-8')
+
+    run = _run(tmp_path, _script(_write('.gitignore', '# nothing\n')), root=root, stdin='2\n')
+
+    assert run.git == 'not_offered'
+    assert '- 运行前被忽略的文件出现在改动里：.env' in run.stdout
+    assert '?? .env' in _status(root, tmp_path)
+
+
+@pytest.mark.parametrize(
+    'meddle',
+    [
+        pytest.param(
+            lambda root, tmp: _git(root, tmp, 'config', 'core.fsmonitor', 'touch pwned'),
+            id='fsmonitor',
+        ),
+        pytest.param(
+            lambda root, tmp: _git(root, tmp, 'remote', 'set-url', 'origin', str(tmp / 'x.git')),
+            id='remote-url',
+        ),
+        pytest.param(
+            lambda root, tmp: (tmp / 'home' / 'hooks' / 'pre-commit').write_text('#!/bin/sh\n'),
+            id='global-hook',
+        ),
+        pytest.param(
+            lambda root, tmp: _git(root, tmp, 'commit', '-q', '--allow-empty', '-m', 'sneaky'),
+            id='head',
+        ),
+    ],
+)
+def test_a_repository_changed_during_the_run_is_not_offered_anything(
+    tmp_path: Path, meddle: Callable[[Path, Path], object]
+):
+    root = _repository(tmp_path)
+    llm = _Meddling(_script(), at=1, meddle=lambda: meddle(root, tmp_path))
+
+    run = _run(tmp_path, llm, root=root, git_mode='push')
+
+    assert run.matter['status'] == 'verified'
+    assert (run.code, run.git) == (3, 'not_offered')
+    assert '仓库的完整性快照与 run 开始前不一致' in run.stdout
+    assert not (root / 'pwned').exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root 不受文件权限约束')
+def test_a_failed_pre_run_snapshot_is_not_offered_anything(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / '.locked').write_text('x\n', encoding='utf-8')
+    (root / '.locked').chmod(0)
+    calls = (_call('b', 'Bash', command='rm -f .locked'), _write('src/new.py'))
+
+    run = _run(tmp_path, _script(*calls), root=root, git_mode='commit')
+
+    assert run.matter['status'] == 'verified'
+    assert (run.code, run.git) == (3, 'not_offered')
+    assert '- 运行前的快照没取到' in run.stdout
+
+
+def test_a_mode_change_while_the_question_is_pending_is_not_committed(tmp_path: Path):
+    root = _repository(tmp_path)
+    head = _head(root, tmp_path)
+
+    def chmod() -> None:
+        (root / 'src' / 'new.py').chmod(0o755)
+
+    run = _run(tmp_path, _script(), root=root, stdin=_Answering('2\n', chmod))
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert '复核之后这些文件又变了，没有提交：src/new.py' in run.stdout
+    assert _head(root, tmp_path) == head
+
+
+def test_a_file_changed_while_the_question_is_pending_is_not_committed(tmp_path: Path):
+    root = _repository(tmp_path)
+    head = _head(root, tmp_path)
+
+    def edit() -> None:
+        (root / 'src' / 'new.py').write_text('NEW = 2\n', encoding='utf-8')
+
+    run = _run(tmp_path, _script(), root=root, stdin=_Answering('2\n', edit))
+
+    assert (run.code, run.git, run.matter['exit_code']) == (1, 'failed', '1')
+    assert '复核之后这些文件又变了，没有提交：src/new.py' in run.stdout
+    assert _head(root, tmp_path) == head
+
+
+# ---- 提交什么 ----
+
+
+def test_only_this_runs_paths_are_committed(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / 'staged.txt').write_text('staged by the human\n', encoding='utf-8')
+    _git(root, tmp_path, 'add', 'staged.txt')
+    (root / 'scratch.txt').write_text('untracked\n', encoding='utf-8')
+    (root / '.env').write_text('LOCAL=1\n', encoding='utf-8')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    assert run.git == 'committed'
+    assert _committed_paths(root, tmp_path) == {'src/new.py'}
+    assert _status(root, tmp_path) == ['?? scratch.txt', 'A  staged.txt']
+
+
+def test_odd_file_names_are_committed_as_themselves_and_nothing_runs(tmp_path: Path):
+    root = _repository(tmp_path)
+    names = [
+        'a;touch pwned1',
+        '$(touch pwned2)',
+        '`touch pwned3`',
+        'line\nbreak.txt',
+        '-rf.txt',
+        '*',
+        '[ab].py',
+        ':(top)x',
+        ':!x',
+    ]
+    for decoy in ('a.py', 'b.py', 'x', 'scratch.txt'):
+        (root / decoy).write_text('decoy\n', encoding='utf-8')
+    calls = [_write(name, f'{index}\n', f'w{index}') for index, name in enumerate(names)]
+
+    run = _run(tmp_path, _script(*calls), root=root, stdin='2\n')
+
+    assert run.git == 'committed'
+    assert _committed_paths(root, tmp_path) == set(names)
+    assert {'?? a.py', '?? b.py', '?? scratch.txt', '?? x'} <= set(_status(root, tmp_path))
+    assert not any(path.name.startswith('pwned') for path in root.iterdir())
+    assert '- `??` line\\nbreak.txt' in run.stderr
+
+
+def test_a_protected_path_change_is_listed_and_left_to_the_human(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(_write('.gitignore', '.env\n*.log\n')), root=root, stdin='2\n')
+
+    assert run.matter['protected_changed'] == '[".gitignore"]'
+    assert '！！受保护路径有改动' in run.stderr
+    assert run.git == 'committed'
+    assert _committed_paths(root, tmp_path) == {'.gitignore'}
+    assert '受保护路径有改动，提交前已经在询问里逐个列出：' in run.stdout
+
+
+@pytest.mark.parametrize('mode', ['commit', 'push'])
+def test_a_protected_path_change_makes_git_mode_exit_3(tmp_path: Path, mode: str):
+    root = _repository(tmp_path)
+    head = _head(root, tmp_path)
+
+    run = _run(tmp_path, _script(_write('.gitignore', '.env\n*.log\n')), root=root, git_mode=mode)
+
+    assert (run.code, run.git) == (3, 'not_offered')
+    assert f'`--git-mode {mode}` 没有执行：受保护路径有改动' in run.stdout
+    assert '- .gitignore' in run.stdout
+    assert _head(root, tmp_path) == head
+
+
+def test_a_secret_in_the_change_refuses_the_commit_without_printing_it(tmp_path: Path):
+    root = _repository(tmp_path)
+    head = _head(root, tmp_path)
+    content = f'# config\nTOKEN = "{_SECRET}"\n'
+
+    run = _run(tmp_path, _script(_write('src/config.py', content)), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert 'src/config.py:2（secret.env_value）' in run.stdout
+    assert _SECRET not in run.stdout + run.stderr
+    assert _head(root, tmp_path) == head
+
+
+def test_a_secret_in_a_modified_file_is_reported_at_its_line(tmp_path: Path):
+    root = _repository(tmp_path)
+    content = f'KEEP = 1\n\nTOKEN = "{_SECRET}"\n'
+    edit = _call('e', 'Edit', path='src/keep.py', old_string='KEEP = 1\n', new_string=content)
+
+    run = _run(tmp_path, _script(edit), root=root, git_mode='commit')
+
+    assert run.git == 'failed'
+    assert 'src/keep.py:3（secret.env_value）' in run.stdout
+
+
+def test_a_new_symlink_whose_target_text_is_a_secret_is_refused(tmp_path: Path):
+    root = _repository(tmp_path)
+    link = _call('b', 'Bash', command=f'ln -s {_SECRET} leak')
+
+    run = _run(tmp_path, _script(_write('src/new.py'), link), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert 'leak:1（secret.env_value）' in run.stdout
+
+
+@pytest.mark.parametrize(
+    ('title', 'secret'),
+    [
+        ('rotate {secret}', _SECRET),
+        ('x' * 60 + '{secret}', _SECRET),
+        ('Rotate the deploy key; new value {secret}', _github_token()),
+    ],
+    ids=['env-value', 'env-value-cut-mid-secret', 'format-rule-cut-mid-secret'],
+)
+def test_a_secret_in_the_commit_title_never_reaches_the_commit(
+    tmp_path: Path, title: str, secret: str
+):
+    root = _repository(tmp_path)
+    answer = 'done\ncommit_title: ' + title.format(secret=secret)
+
+    run = _run(tmp_path, _script(answer=answer), root=root, git_mode='commit')
+
+    assert run.git == 'committed'
+    first = _message(root, tmp_path).split('\n', 1)[0]
+    assert '[REDACTED:' in first
+    assert secret[4:12] not in first
+
+
+def test_a_title_starting_with_a_hash_is_kept_verbatim(tmp_path: Path):
+    root = _repository(tmp_path)
+    with _global_config(tmp_path).open('a', encoding='utf-8') as config:
+        config.write('[commit]\n\tcleanup = strip\n')
+
+    run = _run(
+        tmp_path, _script(answer='done\ncommit_title: #42 fix it'), root=root, git_mode='commit'
+    )
+
+    assert run.git == 'committed'
+    assert _message(root, tmp_path) == _MESSAGE.replace('add new', '#42 fix it')
+
+
+def test_a_secret_in_a_verify_command_never_reaches_the_commit_message(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(
+        tmp_path, _script(), root=root, git_mode='commit', verify=[f'SERVICE_TOKEN={_SECRET} true']
+    )
+
+    assert run.git == 'committed'
+    message = _message(root, tmp_path)
+    assert '- 通过：SERVICE_TOKEN=[REDACTED:secret.env_value] true —— passed' in message
+    assert _SECRET not in message
+
+
+def test_the_commit_runs_with_trace2_switched_off(tmp_path: Path):
+    root = _repository(tmp_path)
+    trace = tmp_path / 'trace.json'
+    with _global_config(tmp_path).open('a', encoding='utf-8') as config:
+        config.write(f'[trace2]\n\teventTarget = {trace}\n')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    events = [json.loads(line) for line in trace.read_text(encoding='utf-8').splitlines()]
+    started = [event['argv'] for event in events if event.get('event') == 'start']
+    assert run.git == 'committed'
+    assert any('status' in argv for argv in started)
+    assert not any('commit' in argv for argv in started)
+
+
+@pytest.mark.parametrize(
+    'hook',
+    [
+        'echo extra > extra.txt && git add extra.txt',
+        "printf 'NEW = 9\\n' > src/new.py && git add src/new.py",
+    ],
+    ids=['adds-a-file', 'rewrites-the-file'],
+)
+def test_a_commit_hook_that_changes_the_commit_is_reported_and_not_pushed(
+    tmp_path: Path, hook: str
+):
+    root = _repository(tmp_path)
+    path = tmp_path / 'home' / 'hooks' / 'pre-commit'
+    path.write_text(f'#!/bin/sh\n{hook}\n', encoding='utf-8')
+    path.chmod(0o755)
+    pushed_before = _remote_head(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert '提交改到的路径或内容与复核时的不一致' in run.stdout
+    assert f'提交：`{_head(root, tmp_path)}`' in run.stdout
+    assert _remote_head(tmp_path) == pushed_before
+
+
+def test_the_commit_message_is_exactly_the_generated_one(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    assert run.git == 'committed'
+    assert _message(root, tmp_path) == _MESSAGE
+    author = _git(root, tmp_path, 'log', '-1', '--format=%an <%ae>').strip()
+    assert author == 'Syndica Test <test@example.com>'
+
+
+def test_the_handoff_records_the_message_a_commit_msg_hook_left(tmp_path: Path):
+    root = _repository(tmp_path)
+    hook = tmp_path / 'home' / 'hooks' / 'commit-msg'
+    hook.write_text('#!/bin/sh\nprintf "Hooked-by: test\\n" >> "$1"\n', encoding='utf-8')
+    hook.chmod(0o755)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    assert run.git == 'committed'
+    assert _message(root, tmp_path) == _MESSAGE + 'Hooked-by: test\n'
+    assert '> Hooked-by: test' in run.stdout
+
+
+def test_without_a_commit_title_the_goal_names_the_commit(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(answer='done'), root=root, git_mode='commit')
+
+    assert run.git == 'committed'
+    assert _message(root, tmp_path).split('\n', 1)[0] == 'work on it'
+
+
+def test_a_file_written_with_mixed_case_is_not_flagged_as_bash_made(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(_write('src/New.py')), root=root)
+
+    assert '- `??` src/New.py\n' in run.stderr
+
+
+def test_the_commit_body_lists_every_verify_command_in_order(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(
+        tmp_path, _script(), root=root, git_mode='commit', verify=['echo c', 'true', 'echo a']
+    )
+
+    assert run.git == 'committed'
+    assert _message(root, tmp_path).split('宿主复核：\n', 1)[1] == (
+        '- 通过：echo c —— passed\n- 通过：true —— passed\n- 通过：echo a —— passed\n'
+    )
+
+
+def test_the_cli_drops_typed_ahead_input_before_reading_the_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    flushed: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        git_finish.termios, 'tcflush', lambda fd, queue: flushed.append((fd, queue))
+    )
+    root = _repository(tmp_path)
+    master, slave = os.openpty()
+    try:
+        os.write(master, b'3\n')
+        with open(slave, encoding='utf-8', closefd=False) as stdin:
+            run = _run(tmp_path, _script(), root=root, stdin=stdin)
+    finally:
+        os.close(master)
+        os.close(slave)
+
+    assert run.git == 'declined'
+    assert flushed == [(slave, termios.TCIFLUSH)]
+
+
+def test_the_summary_marks_changes_not_made_by_write_or_edit(tmp_path: Path):
+    root = _repository(tmp_path)
+    calls = (_write('src/new.py'), _call('b', 'Bash', command='printf x > via_bash.txt'))
+
+    run = _run(tmp_path, _script(*calls), root=root)
+
+    assert '- `??` src/new.py\n' in run.stderr
+    assert '- `??` via_bash.txt（不是 Write / Edit 产生的）' in run.stderr
+
+
+# ---- 推送 ----
+
+
+def test_a_rejected_non_fast_forward_push_is_push_failed_and_never_forced(tmp_path: Path):
+    root = _repository(tmp_path)
+    other = tmp_path / 'other'
+    _git(tmp_path, tmp_path, 'clone', '-q', str(tmp_path / 'remote.git'), str(other))
+    _git(other, tmp_path, 'commit', '-q', '--allow-empty', '-m', 'someone else')
+    _git(other, tmp_path, 'push', '-q', 'origin', 'main')
+    theirs = _remote_head(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git, run.matter['exit_code']) == (1, 'push_failed', '1')
+    assert '期望推送是快进' in run.stdout
+    assert '`git pull --rebase`' in run.stdout
+    assert _remote_head(tmp_path) == theirs
+    assert _committed_paths(root, tmp_path) == {'src/new.py'}
+
+
+def test_push_goes_to_the_snapshots_remote_and_upstream_branch(tmp_path: Path):
+    root = _repository(tmp_path, upstream=False)
+    hub = tmp_path / 'hub.git'
+    _git(tmp_path, tmp_path, 'init', '-q', '--bare', str(hub))
+    _git(root, tmp_path, 'remote', 'add', 'hub', str(hub))
+    _git(root, tmp_path, 'push', '-q', 'hub', 'main:trunk')
+    _git(root, tmp_path, 'checkout', '-q', '-b', 'work', '--track', 'hub/trunk')
+
+    run = _run(tmp_path, _script(), root=root, stdin='1\n')
+
+    assert f'git 收尾：分支 work → 上游 hub/trunk（推送到 {hub}）' in run.stderr
+    assert run.git == 'pushed'
+    assert _git(hub, tmp_path, 'rev-parse', 'trunk').strip() == _head(root, tmp_path)
+    assert _git(hub, tmp_path, 'branch', '--list', 'work') == ''
+
+
+def test_an_ssh_authentication_failure_is_named(tmp_path: Path):
+    root = _repository(tmp_path, upstream=False)
+    stub = tmp_path / 'ssh-stub'
+    stub.write_text(
+        '#!/bin/sh\necho "git@example.invalid: Permission denied (publickey)." >&2\nexit 255\n',
+        encoding='utf-8',
+    )
+    stub.chmod(0o755)
+    _git(root, tmp_path, 'remote', 'add', 'origin', 'git@example.invalid:team/repo.git')
+    _git(root, tmp_path, 'config', 'branch.main.remote', 'origin')
+    _git(root, tmp_path, 'config', 'branch.main.merge', 'refs/heads/main')
+    _git(root, tmp_path, 'config', 'core.sshCommand', str(stub))
+    _git(root, tmp_path, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git) == (1, 'push_failed')
+    assert '期望推送通过远端认证，实际被拒' in run.stdout
+    assert 'Permission denied (publickey)' in run.stdout
+
+
+def test_a_non_fast_forward_after_a_fetch_is_named(tmp_path: Path):
+    root = _repository(tmp_path)
+    other = tmp_path / 'other'
+    _git(tmp_path, tmp_path, 'clone', '-q', str(tmp_path / 'remote.git'), str(other))
+    _git(other, tmp_path, 'commit', '-q', '--allow-empty', '-m', 'someone else')
+    _git(other, tmp_path, 'push', '-q', 'origin', 'main')
+    _git(root, tmp_path, 'fetch', '-q')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git) == (1, 'push_failed')
+    assert '(non-fast-forward)' in run.stdout
+    assert '期望推送是快进' in run.stdout
+
+
+def test_the_push_gets_its_own_longer_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    seen: list[float] = []
+    original = HostGit.attempt
+
+    def recording(
+        self: HostGit, *args: str, timeout: float = 60.0
+    ) -> subprocess.CompletedProcess[bytes]:
+        if 'push' in args:
+            seen.append(timeout)
+        return original(self, *args, timeout=timeout)
+
+    monkeypatch.setattr(HostGit, 'attempt', recording)
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert run.git == 'pushed'
+    assert seen == [120.0]
+
+
+def test_an_upstream_that_was_never_fetched_means_no_push(tmp_path: Path):
+    root = _repository(tmp_path)
+    _git(root, tmp_path, 'update-ref', '-d', 'refs/remotes/origin/main')
+
+    run = _run(tmp_path, _script(), root=root, stdin='1\n')
+
+    assert '（没有推送选项：算不出本地领先上游几个提交）' in run.stderr
+    assert run.git == 'declined'
+
+
+def test_a_push_to_a_missing_remote_repository_says_so(tmp_path: Path):
+    root = _repository(tmp_path)
+    shutil.rmtree(tmp_path / 'remote.git')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git) == (1, 'push_failed')
+    assert '期望推送到一个存在的远端仓库，实际找不到它' in run.stdout
+    assert '`git remote -v`' in run.stdout
+
+
+def test_a_push_declined_by_a_remote_hook_is_push_failed(tmp_path: Path):
+    root = _repository(tmp_path)
+    remote = tmp_path / 'remote.git'
+    hook = remote / 'hooks' / 'pre-receive'
+    hook.write_text('#!/bin/sh\necho "no pushes today" >&2\nexit 1\n', encoding='utf-8')
+    hook.chmod(0o755)
+    _git(remote, tmp_path, 'config', 'core.hooksPath', str(remote / 'hooks'))
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git) == (1, 'push_failed')
+    assert '期望远端接受推送，实际远端拒绝了' in run.stdout
+    assert 'no pushes today' in run.stdout
+
+
+# ---- 钩子与配置里的程序 ----
+
+
+def test_commit_hooks_run_without_the_hosts_secrets_or_ssh_agent(tmp_path: Path):
+    root = _repository(tmp_path)
+    seen = tmp_path / 'seen'
+    _hook(tmp_path, 'pre-commit', f'echo "token=$SERVICE_TOKEN ssh=$SSH_AUTH_SOCK" > {seen}')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    assert run.git == 'committed'
+    assert seen.read_text(encoding='utf-8') == 'token= ssh=\n'
+    author = _git(root, tmp_path, 'log', '-1', '--format=%an <%ae>').strip()
+    assert author == 'Syndica Test <test@example.com>'
+
+
+def test_a_husky_style_hook_that_runs_worktree_code_gets_no_host_secrets(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / '.husky' / '_').mkdir(parents=True)
+    stub = root / '.husky' / '_' / 'pre-commit'
+    stub.write_text('#!/bin/sh\n. "$(dirname "$0")/../pre-commit"\n', encoding='utf-8')
+    stub.chmod(0o755)
+    (root / '.husky' / 'pre-commit').write_text('true\n', encoding='utf-8')
+    _git(root, tmp_path, 'add', '.')
+    _git(root, tmp_path, 'commit', '-q', '-m', 'husky')
+    _git(root, tmp_path, 'push', '-q')
+    _git(root, tmp_path, 'config', 'core.hooksPath', '.husky/_')
+    leak = tmp_path / 'leak'
+    edit = _write('.husky/pre-commit', f'echo "token=$SERVICE_TOKEN" > {leak}\n')
+
+    run = _run(tmp_path, _script(edit), root=root, git_mode='commit')
+
+    assert run.git == 'committed'
+    assert leak.read_text(encoding='utf-8') == 'token=\n'
+
+
+def test_a_push_time_hook_means_no_push_option(tmp_path: Path):
+    root = _repository(tmp_path)
+    ran = tmp_path / 'ran'
+    _hook(tmp_path, 'pre-push', f'touch {ran}')
+
+    asked = _run(tmp_path, _script(), root=root, stdin='1\n')
+
+    assert '1. 提交并推送' not in asked.stderr
+    assert '推送时会在本地运行的钩子（pre-push）' in asked.stderr
+    assert asked.git == 'declined'
+    assert not ran.exists()
+
+
+def test_a_push_time_hook_makes_git_mode_push_exit_3(tmp_path: Path):
+    root = _repository(tmp_path)
+    _hook(tmp_path, 'pre-push', 'exit 0')
+    head = _head(root, tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git) == (3, 'not_offered')
+    assert _head(root, tmp_path) == head
+
+
+def test_an_included_config_file_changed_during_the_run_blocks_the_finish(tmp_path: Path):
+    root = _with_tracked(tmp_path, {'shared.gitconfig': '# team settings\n'})
+    _git(root, tmp_path, 'config', 'include.path', '../shared.gitconfig')
+    evil = tmp_path / 'evil.git'
+    _git(tmp_path, tmp_path, 'init', '-q', '--bare', str(evil))
+    content = f'[url "{evil}"]\n\tpushInsteadOf = {tmp_path / "remote.git"}\n'
+
+    run = _run(tmp_path, _script(_write('shared.gitconfig', content)), root=root, git_mode='push')
+
+    assert (run.code, run.git) == (3, 'not_offered')
+    assert 'git 配置（`git config --list` 的结果）' in run.stdout
+    assert _git(evil, tmp_path, 'branch', '--list') == ''
+    assert '先用编辑器或 `cat` 看 `.git/config`' in run.stdout
+
+
+def test_a_forged_upstream_ref_blocks_the_finish(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / 'local.txt').write_text('not ready to publish\n', encoding='utf-8')
+    _git(root, tmp_path, 'add', 'local.txt')
+    _git(root, tmp_path, 'commit', '-q', '-m', 'local only')
+    llm = _Meddling(
+        _script(),
+        at=1,
+        meddle=lambda: _git(root, tmp_path, 'update-ref', 'refs/remotes/origin/main', 'HEAD'),
+    )
+
+    run = _run(tmp_path, llm, root=root, git_mode='push')
+
+    assert (run.code, run.git) == (3, 'not_offered')
+    assert '上游分支在本地的位置' in run.stdout
+    log = _git(tmp_path / 'remote.git', tmp_path, 'log', '--format=%s', 'main')
+    assert 'local only' not in log
+
+
+def test_a_commit_made_while_the_question_is_pending_is_not_pushed(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    def sneak() -> None:
+        (root / 'backdoor.py').write_text('import os\n', encoding='utf-8')
+        _git(root, tmp_path, 'add', 'backdoor.py')
+        _git(root, tmp_path, 'commit', '-q', '-m', 'sneaky')
+
+    run = _run(tmp_path, _script(), root=root, stdin=_Answering('1\n', sneak))
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert '问过之后、提交之前，仓库变了（HEAD' in run.stdout
+    assert 'sneaky' not in _git(tmp_path / 'remote.git', tmp_path, 'log', '--format=%s', 'main')
+
+
+def test_a_hook_planted_while_the_question_is_pending_never_runs(tmp_path: Path):
+    root = _repository(tmp_path)
+    leak = tmp_path / 'leak'
+
+    def plant() -> None:
+        _hook(tmp_path, 'pre-commit', f'echo planted > {leak}')
+
+    run = _run(tmp_path, _script(), root=root, stdin=_Answering('2\n', plant))
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert '钩子 pre-commit' in run.stdout
+    assert not leak.exists()
+
+
+def test_a_post_commit_hook_that_redirects_the_push_stops_the_push(tmp_path: Path):
+    root = _repository(tmp_path)
+    evil = tmp_path / 'evil.git'
+    _git(tmp_path, tmp_path, 'init', '-q', '--bare', str(evil))
+    _hook(tmp_path, 'post-commit', f'git config remote.origin.pushurl {evil}')
+    pushed_before = _remote_head(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git) == (1, 'push_failed')
+    assert '提交之后、推送之前，仓库变了（推送地址' in run.stdout
+    assert f'提交：`{_head(root, tmp_path)}`' in run.stdout
+    assert _git(evil, tmp_path, 'branch', '--list') == ''
+    assert _remote_head(tmp_path) == pushed_before
+
+
+def test_a_slow_post_commit_hook_reports_the_commit_that_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(git_finish, 'LOCAL_TIMEOUT', 2.0)
+    monkeypatch.setattr(git_finish, '_STOP_GRACE', 0.5)
+    root = _repository(tmp_path)
+    pid = tmp_path / 'pid'
+    _hook(tmp_path, 'post-commit', f'echo $$ > {pid}\nsleep 30')
+    pushed_before = _remote_head(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert f'提交：`{_head(root, tmp_path)}`' in run.stdout
+    assert '提交已经在本地：没有推送' in run.stdout
+    assert _committed_paths(root, tmp_path) == {'src/new.py'}
+    assert _remote_head(tmp_path) == pushed_before
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid.read_text(encoding='utf-8')), 0)
+
+
+def test_a_slow_pre_commit_hook_leaves_no_lock_and_nothing_staged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(git_finish, 'LOCAL_TIMEOUT', 2.0)
+    monkeypatch.setattr(git_finish, '_STOP_GRACE', 0.5)
+    root = _repository(tmp_path)
+    head = _head(root, tmp_path)
+    _hook(tmp_path, 'pre-commit', 'sleep 30')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert '在 2 秒内没有结束' in run.stdout
+    assert _head(root, tmp_path) == head
+    assert not (root / '.git' / 'index.lock').exists()
+    assert '?? src/new.py' in _status(root, tmp_path)
+
+
+@pytest.mark.parametrize('change', ['rewrite', 'chmod'])
+def test_changing_an_existing_hook_during_the_run_blocks_the_finish(tmp_path: Path, change: str):
+    root = _repository(tmp_path)
+    hook = tmp_path / 'home' / 'hooks' / 'pre-commit'
+    hook.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+    hook.chmod(0o644 if change == 'chmod' else 0o755)
+
+    def meddle() -> None:
+        if change == 'chmod':
+            hook.chmod(0o755)
+        else:
+            hook.write_text('#!/bin/sh\nexit 0 # changed\n', encoding='utf-8')
+
+    run = _run(tmp_path, _Meddling(_script(), at=1, meddle=meddle), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (3, 'not_offered')
+    assert '钩子 pre-commit' in run.stdout
+
+
+def test_a_configured_fsmonitor_never_runs_during_the_finish(tmp_path: Path):
+    root = _repository(tmp_path)
+    pwned = tmp_path / 'pwned'
+    _git(root, tmp_path, 'config', 'core.fsmonitor', f'touch {pwned}; false')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    assert not pwned.exists()
+    assert run.git == 'committed'
+
+
+def test_a_filter_selected_by_the_agents_gitattributes_never_runs(tmp_path: Path):
+    root = _repository(tmp_path)
+    filtered = tmp_path / 'filtered'
+    _git(root, tmp_path, 'config', 'filter.evil.clean', f'touch {filtered}; cat')
+    calls = (_write('.gitattributes', '* filter=evil\n'), _write('src/new.py', 'NEW = 1\n', 'w2'))
+
+    run = _run(tmp_path, _script(*calls), root=root, stdin='2\n')
+
+    assert run.git == 'committed'
+    assert not filtered.exists()
+
+
+def test_a_hook_that_ignores_sigterm_is_killed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(git_finish, 'LOCAL_TIMEOUT', 2.0)
+    monkeypatch.setattr(git_finish, '_STOP_GRACE', 0.5)
+    root = _repository(tmp_path)
+    pid = tmp_path / 'pid'
+    _hook(tmp_path, 'pre-commit', f"trap '' TERM\necho $$ > {pid}\nsleep 120")
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (1, 'failed')
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid.read_text(encoding='utf-8')), 0)
+
+
+def test_a_timed_out_hook_gets_sigterm_before_it_is_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(git_finish, 'LOCAL_TIMEOUT', 2.0)
+    monkeypatch.setattr(git_finish, '_STOP_GRACE', 5.0)
+    root = _repository(tmp_path)
+    marker = tmp_path / 'marker'
+    _hook(
+        tmp_path,
+        'pre-commit',
+        f"trap 'echo term > {marker}; exit 1' TERM\nwhile :; do sleep 1; done",
+    )
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert marker.read_text(encoding='utf-8') == 'term\n'
+
+
+def test_a_rejecting_pre_commit_hook_unstages_the_new_files(tmp_path: Path):
+    root = _repository(tmp_path)
+    _hook(tmp_path, 'pre-commit', 'echo "lint failed" >&2\nexit 1')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert 'lint failed' in run.stdout
+    assert '为提交暂存的新文件已经撤回' in run.stdout
+    assert '?? src/new.py' in _status(root, tmp_path)
+
+
+# ---- 提交闸 ----
+
+
+def test_an_added_line_that_starts_with_plus_signs_is_still_scanned(tmp_path: Path):
+    root = _repository(tmp_path)
+    edit = _call(
+        'e',
+        'Edit',
+        path='README.md',
+        old_string='# project\n',
+        new_string=f'# project\n++ deploy token: {_SECRET}\n',
+    )
+
+    run = _run(tmp_path, _script(edit), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert 'README.md:2（secret.env_value）' in run.stdout
+
+
+@pytest.mark.parametrize('attribute', ['*.cfg -diff\n', '*.cfg binary\n'])
+def test_diff_attributes_do_not_hide_a_modified_file_from_the_scan(tmp_path: Path, attribute: str):
+    root = _with_tracked(tmp_path, {'app.cfg': 'A = 1\n', '.gitattributes': attribute})
+    edit = _call(
+        'e', 'Edit', path='app.cfg', old_string='A = 1\n', new_string=f'A = 1\nT = "{_SECRET}"\n'
+    )
+
+    run = _run(tmp_path, _script(edit), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert 'app.cfg:2（secret.env_value）' in run.stdout
+
+
+def test_a_nul_byte_does_not_exempt_a_new_file_from_the_scan(tmp_path: Path):
+    root = _repository(tmp_path)
+    content = f'TOKEN = "{_SECRET}"\n\x00\n'
+
+    run = _run(tmp_path, _script(_write('notes.txt', content)), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert 'notes.txt:1（secret.env_value）' in run.stdout
+
+
+def test_the_question_never_prints_a_secret(tmp_path: Path):
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(_write(f'cache-{_SECRET}.txt', 'x\n')), root=root, stdin='3\n')
+
+    assert run.git == 'declined'
+    assert '- `??` cache-[REDACTED:secret.env_value].txt' in run.stderr
+    assert _SECRET not in run.stderr
+
+
+def test_a_secret_in_a_file_name_refuses_the_commit_without_printing_it(tmp_path: Path):
+    root = _repository(tmp_path)
+    head = _head(root, tmp_path)
+
+    run = _run(
+        tmp_path, _script(_write(f'cache-{_SECRET}.txt', 'x\n')), root=root, git_mode='commit'
+    )
+
+    assert (run.code, run.git) == (1, 'failed')
+    assert '文件名 cache-[REDACTED:secret.env_value].txt（secret.env_value）' in run.stdout
+    assert _SECRET not in run.stdout + run.stderr
+    assert _head(root, tmp_path) == head
+
+
+# ---- 推送与提交的细节 ----
+
+
+def test_a_change_made_before_the_run_means_no_push(tmp_path: Path):
+    root = _repository(tmp_path)
+    (root / 'src' / 'keep.py').write_text('KEEP = 1\nVALUE = 2\n', encoding='utf-8')
+
+    asked = _run(tmp_path, _script(), root=root, stdin='1\n')
+
+    assert '运行前工作区里就有 1 处改动' in asked.stderr
+    assert '运行前就有的 1 处改动不进提交' in asked.stderr
+    assert asked.git == 'declined'
+
+
+def test_follow_tags_does_not_push_a_private_tag(tmp_path: Path):
+    root = _repository(tmp_path)
+    config = _global_config(tmp_path)
+    config.write_text(config.read_text(encoding='utf-8') + '[push]\n\tfollowTags = true\n')
+    _git(root, tmp_path, 'tag', '-a', 'v0-private', '-m', 'not for publishing')
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert run.git == 'pushed'
+    assert _git(tmp_path / 'remote.git', tmp_path, 'tag', '--list') == ''
+
+
+def test_the_summary_shows_where_the_push_really_goes(tmp_path: Path):
+    root = _repository(tmp_path)
+    other = tmp_path / 'other.git'
+    _git(tmp_path, tmp_path, 'init', '-q', '--bare', str(other))
+    _git(root, tmp_path, 'push', '-q', str(other), 'main')
+    _git(root, tmp_path, 'config', 'remote.origin.pushurl', str(other))
+
+    run = _run(tmp_path, _script(), root=root, stdin='1\n')
+
+    assert f'上游 origin/main（推送到 {other}）' in run.stderr
+    assert run.git == 'pushed'
+    assert _git(other, tmp_path, 'rev-parse', 'main').strip() == _head(root, tmp_path)
+
+
+def test_file_mode_false_does_not_turn_a_good_commit_into_a_failure(tmp_path: Path):
+    root = _repository(tmp_path)
+    _git(root, tmp_path, 'config', 'core.fileMode', 'false')
+    calls = (_write('run.sh', 'echo hi\n'), _call('b', 'Bash', command='chmod +x run.sh'))
+
+    run = _run(tmp_path, _script(*calls), root=root, git_mode='commit')
+
+    assert (run.code, run.git) == (0, 'committed')
+
+
+def test_a_closed_stdin_means_3(tmp_path: Path):
+    root = _repository(tmp_path)
+    head = _head(root, tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, stdin=cast(TextIO, None))
+
+    assert (run.code, run.git) == (0, 'declined')
+    assert _head(root, tmp_path) == head
+
+
+# ---- 收尾之后交接文件没写成 ----
+
+
+def test_a_handoff_directory_removed_during_the_question_still_prints_the_result(
+    tmp_path: Path,
+):
+    root = _repository(tmp_path)
+
+    def remove() -> None:
+        shutil.rmtree(root / '.syndica' / 'handoffs')
+
+    run = _run(tmp_path, _script(), root=root, stdin=_Answering('2\n', remove))
+
+    assert run.code == 1
+    assert (run.git, run.matter['exit_code']) == ('committed', '1')
+    assert f'提交：`{_head(root, tmp_path)}`' in run.stdout
+    assert '不要为此重跑' in run.stdout
+
+
+def test_a_failed_final_rewrite_after_a_push_still_prints_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def full(*args: object, **kwargs: object) -> None:
+        raise OSError('disk full')
+
+    monkeypatch.setattr(host_module, 'rewrite_handoff', full)
+    root = _repository(tmp_path)
+
+    run = _run(tmp_path, _script(), root=root, git_mode='push')
+
+    assert run.code == 1
+    assert (run.git, run.matter['exit_code']) == ('pushed', '1')
+    assert _remote_head(tmp_path) == _head(root, tmp_path)
+    assert 'disk full' in run.stderr
+    (path,) = (root / '.syndica' / 'handoffs').iterdir()
+    assert 'git: pending' in path.read_text(encoding='utf-8')

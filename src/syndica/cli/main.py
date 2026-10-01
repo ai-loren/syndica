@@ -36,6 +36,7 @@ class RunRequest:
     flags: tuple[str, ...] = ()
     no_write: bool = False
     handoff: bool = False
+    git_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +149,14 @@ def _parser() -> _ArgumentParser:
         help=(
             'run 结束后由宿主复核（workspace.verify），把交接文件写到 .syndica/handoffs/ 并打印到 '
             'stdout；交互提示改走 stderr；不能与 --session 同用'
+        ),
+    )
+    run.add_argument(
+        '--git-mode',
+        choices=('commit', 'push', 'manual'),
+        help=(
+            '--handoff 的 git 收尾不询问：commit 只提交、push 提交并推送（前置条件不满足时退出 '
+            '3）、manual 不提交；不能与 --no-write 同用'
         ),
     )
     chat = commands.add_parser('chat')
@@ -354,6 +363,21 @@ def main(
                 '下一步: 去掉 --session：交接要在 run 开始前取快照、在它结束后复核，会话里的 '
                 'Agent 早已开始',
             )
+        if namespace.command == 'run' and namespace.git_mode is not None:
+            if not namespace.handoff:
+                raise _ParserExit(
+                    2,
+                    '期望: --git-mode 与 --handoff 一起用\n'
+                    f'实际: 收到 --git-mode {namespace.git_mode}，没有 --handoff\n'
+                    '下一步: 加上 --handoff：git 收尾在交接之后、按复核结果做',
+                )
+            if namespace.no_write:
+                raise _ParserExit(
+                    2,
+                    '期望: --git-mode 用于会改动工作区的 run\n'
+                    f'实际: 同时收到 --no-write 与 --git-mode {namespace.git_mode}\n'
+                    '下一步: 去掉其中一个：只读 run 没有改动，不做 git 收尾',
+                )
     except _ParserExit as exc:
         if exc.message:
             _write(streams.stderr, exc.message)
@@ -402,5 +426,6 @@ def main(
         flags=flags,
         no_write=namespace.no_write,
         handoff=namespace.handoff,
+        git_mode=namespace.git_mode,
     )
     return _host_call(lambda: host.run_request(request), streams)

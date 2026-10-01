@@ -332,6 +332,9 @@ handoff 的状态是 `read_only`。依据路线图静态验收「写工具不可
 6. 执行 D14 的 git 收尾（摘要与询问都在 stderr）；
 7. 用最终的 `git` 与 `exit_code` 和 git 一节重写同一个文件（写临时文件再原子改名，仍是 0600），然后把这份
    最终 handoff 完整打印到 stdout，只打印这一次。在第 6 步被打断时，文件停在 `git: pending`，如实反映没做完。
+   重写失败时（这时可能已经提交、已经推送）最终 handoff 照样完整打印、退出 1，并写明磁盘上那份停在
+   `git: pending`、不要为此重跑；git 收尾里出了意外的异常同样写进 git 一节（含 HEAD 动没动），不转成
+   「修好之后重跑」的报错。
 
 **转义。** 所有来自模型、Agent 或文件系统的字符串（文件名、命令、结论、提交标题、确认参数、AskUser 的问题
 与选项）进终端与 handoff 之前都经 `terminal_safe()`：除换行与制表符外的 C0 控制字符、DEL、C1 控制字符、
@@ -346,19 +349,27 @@ handoff 的状态是 `read_only`。依据路线图静态验收「写工具不可
 
 **D14 git 收尾：人选择，宿主执行。** 只在 `run --handoff` 且不是 `--no-write` 时进行。
 
-**宿主 git 环境。** 快照、状态、hash、提交、推送都在同一个环境里跑：宿主自己的环境（含 ssh agent，去掉
-`GIT_DIR`、`GIT_WORK_TREE`、`GIT_INDEX_FILE`、`GIT_CONFIG_PARAMETERS` 这类会把 git 指到别的仓库或注入
-配置的变量）加 `GIT_TERMINAL_PROMPT=0`、`GIT_LITERAL_PATHSPECS=1`、`GIT_OPTIONAL_LOCKS=0`；每条都加
+**宿主 git 环境。** 快照、状态、hash、推送在宿主自己的环境里跑（含 ssh agent，去掉 `GIT_DIR`、
+`GIT_WORK_TREE`、`GIT_INDEX_FILE`、`GIT_CONFIG_PARAMETERS` 这类会把 git 指到别的仓库或注入配置的变量）
+加 `GIT_TERMINAL_PROMPT=0`、`GIT_LITERAL_PATHSPECS=1`、`GIT_OPTIONAL_LOCKS=0`；每条都加
 `-c core.fsmonitor=false` 与 `--attr-source=HEAD`（工作树里 Agent 写的 `.gitattributes` 选不中配置里的
 filter 驱动，需要 git 2.40 以上）；以参数数组直接调 git，不经 shell；stdin 接 `/dev/null`（提交消息除外）；
-本地操作超时 60 秒、推送 120 秒。工作区可以在仓库的子目录里：状态只看这个目录（`-- .`），路径相对工作区；
-改动里有嵌套仓库或子模块时取不到指纹（里面的改动看不见），按取不到处理。复核命令则在 Agent 环境里跑：
-复核验证的是 Agent 能跑出的东西。
+本地操作超时 60 秒、推送 120 秒。**提交（`git add`、`git commit` 与撤回暂存）在 Agent 的环境里跑**，只把
+git 配置的位置（`GIT_CONFIG_GLOBAL`、`GIT_CONFIG_NOSYSTEM`）换回宿主的，再加上面三个变量与
+`GIT_TRACE2_EVENT=0`：钩子与配置里的程序（`gpg.program` 之类）执行的往往是工作区里 Agent 能改的代码
+（husky、lint-staged、pre-commit 框架、`npm test`），在宿主环境里跑等于把 ssh agent 与全部密钥交给 Agent；
+在 Agent 的环境里跑，它们只拿到 Agent 本来就有的东西，身份、钩子目录与签名照旧来自宿主的配置。工作区可以在
+仓库的子目录里：状态只看这个目录（`-- .`），路径相对工作区；改动里有嵌套仓库或子模块时取不到指纹（里面的
+改动看不见），按取不到处理。复核命令则在 Agent 环境里跑：复核验证的是 Agent 能跑出的东西。
 
 **完整性快照（run 开始前取）：** `git rev-parse --show-toplevel`、HEAD、当前分支、上游（remote 与
-merge ref）、所有 remote 的 URL、`git rev-parse --git-path config` 指向的文件 hash、
-`git rev-parse --git-path hooks` 解析出的目录里每个钩子文件的 hash、有没有进行中的操作。hash 一律用不写
-对象库的 `git hash-object`（不带 `-w`），扫描之前不往 `.git/objects` 落任何内容。
+merge ref）、上游分支在本地的位置（`@{u}`）、推送地址（`git remote get-url --push --all`，含 `pushurl`
+与 `pushInsteadOf` 的改写）、`git config --list -z --show-origin --show-scope` 输出的 sha256（各层配置与
+include 进来的文件都在里面，值本身不留）、`git rev-parse --git-path hooks` 解析出的目录里每个钩子文件的
+hash 与可执行位（git 只跑可执行的钩子）、有没有进行中的操作。钩子文件的 hash 用不写对象库的 `git hash-object`（不带 `-w`）。快照在问人之前、
+提交之前、推送之前各比一次（推送前那次把 HEAD 换成这次的提交），任一次不一致就不往下走：handoff 写明变的是
+哪几项，并提醒人先用编辑器看配置与钩子、不要先跑 git 命令——被改过的 `core.fsmonitor` 在 `git status` 时
+就会执行。
 
 **Reviewer 结论。** 在满足下列全部条件的 Reviewer 运行里取**结束得最晚**的那一次的最后一段文字（并发的
 Reviewer、分叉出的子评审结束得早，开始的先后说明不了谁的结论在后）：结局是 `COMPLETED`；它开始与结束时的
@@ -376,30 +387,44 @@ Reviewer（包括从来没有派过 Reviewer）时结论是 `unverified`。hando
 - 本次有改动；没有「运行前已改动、本次又改」的文件；没有运行前被忽略的文件出现在改动里；受保护路径
   （D15）没有改动——这一条只挡 `--git-mode`，交互询问时醒目列出，由人决定。
 
-推送另要求：有上游，且提交前 `git rev-list @{u}..HEAD` 为空（不顺带推走人以前没推的提交）。只满足提交的
+推送另要求：有上游；钩子目录里没有推送时在本地运行的钩子（`pre-push`、`reference-transaction`：推送要用
+宿主的 ssh agent 与凭证，钩子会拿到它们）；运行前工作区里没有改动（复核时它们在场、提交里没有它们，这个
+提交没有被单独复核过）；提交前 `git rev-list @{u}..HEAD` 为空（不顺带推走人以前没推的提交）。只满足提交的
 前置条件时，只提供「只提交」与「我来处理」，并说明为什么没有推送选项。
 
-**询问。** 没给 `--git-mode` 时，在 stderr 打印宿主生成的摘要作为问题前的最后一段输出：分支 → 上游与
-remote URL；改动路径的列表（转义，最多 30 条再给总数），逐条标出它是否由 Agent 的 Write / Edit 产生（不是的
-可能来自 Bash，也可能是人在 run 期间改的）；复核结果；Reviewer 结论。然后问可用的选项：`1` 提交并推送、
-`2` 只提交、`3` 我来处理。stdin 是终端时，读答复之前先清掉已经缓冲的输入（`tcflush`），误敲的按键不会当成
-答复。读到 EOF、空行或其他输入都按 `3`，因此 `</dev/null` 的 run 永远不会自动提交。给了
-`--git-mode commit|push` 就不问；`--git-mode manual` 等同于选 `3`。
+**询问。** 没给 `--git-mode` 时，在 stderr 打印宿主生成的摘要作为问题前的最后一段输出：分支 → 上游与推送
+真正去的地址；改动路径的列表（转义，最多 30 条再给总数），逐条标出它是否由 Agent 的 Write / Edit 产生（不是的
+可能来自 Bash，也可能是人在 run 期间改的）；受保护路径；运行前就有、不进提交的改动；提交时会运行的钩子；
+复核结果；Reviewer 结论。然后问可用的选项：`1` 提交并推送、`2` 只提交、`3` 我来处理。stdin 是终端时，读答复
+之前先清掉已经缓冲的输入（`tcflush`），误敲的按键不会当成答复。读到 EOF、空行、其他输入或读不了 stdin（关掉
+了、不存在）都按 `3`，因此 `</dev/null` 的 run 永远不会自动提交。给了 `--git-mode commit|push` 就不问；
+`--git-mode manual` 等同于选 `3`（前置条件不满足时与交互一样是 `not_offered` 并列出原因）。不是 verified 时
+handoff 写明具体是哪一条：run 没有正常结束、没配 verify、复核没有全过、Reviewer 结论是什么。
 
 **执行。**
 
-1. 提交前再算一次改动文件的 blob hash，与快照 A 不同就不提交（复核之后文件又变了）；
-2. 用 D12 的逐字值与格式规则扫描将要提交的 diff，命中就不提交，报文件:行号与规则 ID，不打出命中内容；
+1. 提交前再比一次完整性快照、再算一次改动文件的 blob hash，与快照 A 不同就不提交（复核之后文件又变了）；
+2. 用 D12 的逐字值与格式规则扫描将要提交的新增行与文件名：新文件读全文（符号链接读链接文字，不跟着链接
+   读；FIFO 这类不是普通文件的不读），改动的文件用 `git diff --text -U0` 逐个块取 `+` 行（`-diff`、
+   `binary` 属性挡不住）；命中就不提交，报文件:行号与规则 ID（文件名命中报脱敏后的名字），不打出命中内容；
 3. 只提交本次改动的路径：新文件 `git add -- <路径…>`，然后 `git commit --only --cleanup=verbatim -F -
    -- <路径…>`，消息从 stdin 给；`GIT_LITERAL_PATHSPECS=1` 让 `*`、`[ab]`、`:!x` 这样的文件名只匹配它们
-   自己，人事先暂存的其他内容也不会被带上；
-4. 提交后用 `git diff-tree -r -z --name-only --no-commit-id --root HEAD` 核对这次提交改到的路径**集合**
-   恰好等于预期，且每个路径的 blob 与快照 A 一致；不一致就报告且不推送；
-5. 推送：`git push <快照里的 remote> HEAD:refs/heads/<快照里的上游分支>`，从不 `--force`；认证失败、钩子
-   拒绝、非快进各自给出三件套错误。
+   自己，人事先暂存的其他内容也不会被带上。提交在自己的进程组里跑，超时先 SIGTERM 整组（git 借此删掉锁
+   文件）再 SIGKILL，钩子起的进程不会比它活得久。提交没有正常结束时先看 HEAD：动了就是提交已经在了
+   （post-commit 钩子超时之类），报出这个提交、不推送，不让人照着「手动提交」再提交一次；没动就撤回为提交
+   暂存的新文件，并报出留下的锁文件；
+4. 提交后核对：父提交是 run 开始时的 HEAD；`git diff-tree -r -z --name-only --no-commit-id --root HEAD`
+   给出的路径**集合**恰好等于预期；每个路径的 blob 与 mode 与快照 A 一致（`core.fileMode=false` 时只比
+   内容与是不是符号链接）；不一致就报告且不推送；
+5. 推送前再比一次完整性快照，然后 `git push <快照里的 remote> <这次提交>:refs/heads/<快照里的上游分支>`：
+   推的是这个提交本身而不是 HEAD；关掉本地钩子（`core.hooksPath=/dev/null`、`--no-verify`），不顺带推标签
+   与子模块（`push.followTags=false`、`--recurse-submodules=no`），从不 `--force`；远端仓库不存在、认证
+   失败、远端拒绝、非快进各自给出三件套错误。
 
-提交标题取 Orchestrator 最终回答里的 `commit_title:` 行（缺失时用目标的第一行），转义、截到 72 字符、经
-D12 脱敏；正文列出复核结果。作者用本机 git 配置，宿主不加任何 trailer；提交后的实际消息（仓库自己的
+提交标题取 Orchestrator 最终回答里的 `commit_title:` 行（缺失时用目标的第一行），先经 D12 脱敏、再转义、
+截到 72 字符（先截断的话，截剩的半截密钥不一定还认得出来）；正文列出复核结果。作者用本机 git 配置，宿主
+不加任何 trailer；提交与它的钩子不发 trace2 事件（`GIT_TRACE2_EVENT=0`：本机可能挂着经 trace2 事件改写
+提交消息的进程，全局配置里的事件目标只有这个变量盖得过，命令行 `-c` 盖不过）；提交后的实际消息（仓库自己的
 commit-msg 钩子可能追加内容）写进 handoff。
 
 **D15 受保护路径与配置信任。** 受保护路径有改动时，`--git-mode commit|push` 拒绝执行（退出 3），交互询问时
@@ -792,6 +817,20 @@ Reviewer 每次运行都没改工作树、没启动后台命令；标记行按�
   `terminal_safe` 漏掉 C1；锁放在 `.syndica/` 下的文件上。
 
 #### T12 — git 收尾
+
+**状态：completed**（本地验证协议：定向用例与六道门禁全绿，定向用例在 `/bin/dash` 下同样通过。两次对抗
+评审：一路找出 1 Critical / 6 High / 5 Medium / 4 Low，另一路找出 3 Medium / 6 Low 的契约偏差与 33 条存活
+变异（多数与前者重合）；全部修掉或写进已知限制之后，三轮变异共 135 条杀死 134 条，剩下一条是等价变异——推
+这次提交的 sha 而不是 HEAD：推送前的复查已经保证二者相同，它只防复查与 `git push` 之间那一瞬间的竞争。
+Critical 是宿主的提交会跑仓库的钩子，而钩子执行的往往是工作区里 Agent 能改的代码（husky、lint-staged、
+`npm test`），在宿主环境里跑等于把 ssh agent 与全部密钥交给 Agent：提交改在 Agent 的环境里跑、git 配置仍用
+宿主的，有推送时运行的钩子就不提供推送，推送时关掉本地钩子。完整性快照扩到全部有效配置（含 include 进来的
+文件）、上游在本地的位置、推送地址与钩子的可执行位，在问人之前、提交之前、推送之前各比一次。提交闸按块取
+新增行并带 `--text`，新文件不因 NUL 跳过，文件名也扫；标题先脱敏再截断。提交超时先 SIGTERM 再 SIGKILL
+整组，HEAD 动了就报出已有的提交；失败时撤回为提交暂存的新文件；运行前就有改动时不提供推送（这个提交没有被
+单独复核过）。重写交接文件失败时最终内容照样打印、退出 1、写明不要重跑。变异跑手改为每个 worker 一份从索引
+取出的副本、三路并行。写进审计的已知限制：逃过进程组清理的进程在最后一次复查与提交 / 推送之间仍有一瞬间的
+窗口；钩子在 Agent 的环境里照样能读 Agent 能读的文件（D5）。Linux 补跑待 CI 额度恢复）
 
 **Files:** 新模块 `cli/git_finish.py`、`cli/host.py`、`cli/main.py`、对应用例。
 

@@ -150,6 +150,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'flags': (),
         'no_write': False,
         'handoff': False,
+        'git_mode': None,
     }
     assert asdict(host.requests[1]) == {
         'prompt': 'review this',
@@ -164,6 +165,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'flags': ('retry_enabled=true', 'attempts=3'),
         'no_write': True,
         'handoff': False,
+        'git_mode': None,
     }
 
 

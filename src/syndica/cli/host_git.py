@@ -20,6 +20,7 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 __all__ = ['LOCAL_TIMEOUT', 'Change', 'GitUnavailable', 'HostGit', 'host_environment']
 
@@ -104,15 +105,35 @@ class HostGit:
         self._object_format: str | None = None
         self._prefix: str | None = None
 
+    @property
+    def environment(self) -> Mapping[str, str]:
+        """宿主 git 环境本身：提交要从 stdin 给消息，在这一层之外起子进程时用同一份环境。"""
+        return MappingProxyType(self._env)
+
     def run(self, *args: str, timeout: float = LOCAL_TIMEOUT) -> bytes:
-        """跑一条 git，交回 stdout。"""
+        """跑一条 git，交回 stdout；退出码不是 0 也是 GitUnavailable。"""
+        completed = self.attempt(*args, timeout=timeout)
+        if completed.returncode != 0:
+            detail = completed.stderr.decode('utf-8', 'replace').strip() or '（没有输出）'
+            raise GitUnavailable(
+                f'期望 `git {args[0]}` 成功，实际退出 {completed.returncode}：{detail}。确认 '
+                f'{self.root} 在 git 仓库里、宿主的 git 是 2.40 以上、没有别的进程正在改动工作区，'
+                '再重试。'
+            )
+        return completed.stdout
+
+    def attempt(
+        self, *args: str, timeout: float = LOCAL_TIMEOUT
+    ) -> subprocess.CompletedProcess[bytes]:
+        """跑一条可以失败的 git，交回完整结果（退出码与两条流，推送要按 stderr 分辨失败原因）；
+        起不来（工作区不是目录、没有 git、超时、系统拒绝）仍是 GitUnavailable。"""
         if not self.root.is_dir():
             raise GitUnavailable(
                 f'期望工作区 {self.root} 是一个存在的目录，实际它不存在或不是目录。确认工作区路径'
                 '没写错、没被删掉。'
             )
         try:
-            completed = subprocess.run(
+            return subprocess.run(
                 ['git', '-c', 'core.fsmonitor=false', '--attr-source=HEAD', *args],
                 cwd=self.root,
                 env=self._env,
@@ -135,14 +156,6 @@ class HostGit:
                 f'期望能在 {self.root} 里运行 `git {args[0]}`，实际系统拒绝了：{exc}。按这个原因'
                 '修好之后重试。'
             ) from exc
-        if completed.returncode != 0:
-            detail = completed.stderr.decode('utf-8', 'replace').strip() or '（没有输出）'
-            raise GitUnavailable(
-                f'期望 `git {args[0]}` 成功，实际退出 {completed.returncode}：{detail}。确认 '
-                f'{self.root} 在 git 仓库里、宿主的 git 是 2.40 以上、没有别的进程正在改动工作区，'
-                '再重试。'
-            )
-        return completed.stdout
 
     def prefix(self) -> str:
         """工作区相对 git 顶层目录的前缀（`sub/dir/`），就在顶层时是空串。"""
