@@ -1083,3 +1083,33 @@ def test_handoff_and_session_together_are_refused(tmp_path: Path):
     assert code == 2
     assert '期望: --handoff 用于一次新的 run' in stderr.getvalue()
     assert '去掉 --session' in stderr.getvalue()
+
+
+def test_run_failed_without_changes_does_not_mention_uncommitted_work(tmp_path: Path):
+    root = _workspace(tmp_path)
+    run = _run(
+        tmp_path,
+        ScriptedLLM([ScriptedTurn(raises=RuntimeError('boom'))]),
+        config=_config(tmp_path),
+        root=root,
+    )
+
+    assert run.code == 1
+    assert run.matter['status'] == 'run_failed'
+    assert '修好之后重跑。' in run.stdout
+    assert '工作区里的改动还在' not in run.stdout
+
+
+def test_run_failed_with_changes_mentions_uncommitted_work(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('w', 'Write', path='src/new.py', content='NEW = 1\n')]),
+            ScriptedTurn(raises=RuntimeError('boom after write')),
+        ]
+    )
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root)
+
+    assert run.code == 1
+    assert run.matter['status'] == 'run_failed'
+    assert '工作区里的改动还在，没有提交。' in run.stdout

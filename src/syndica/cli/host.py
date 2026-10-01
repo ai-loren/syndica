@@ -634,6 +634,8 @@ def _next_steps(
 ) -> tuple[str, ...]:
     """「下一步」由宿主按状态生成，不取模型的文字。"""
     if status == 'run_failed':
+        if not changed:
+            return ('run 没有正常结束：原因写在「Agent 的结论」一节开头，修好之后重跑。',)
         return (
             'run 没有正常结束：原因写在「Agent 的结论」一节开头，修好之后重跑。工作区里的改动还在，'
             '没有提交。',
