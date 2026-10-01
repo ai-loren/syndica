@@ -225,9 +225,10 @@ class MailboxConfirmationHandler:
             },
         }
         # 这次请求的稳定键（`wait_for` 随后用同一个键登记它）：回放按键给出人的答复（M3 D10）。
+        # 字段名不能像密钥名（`key`、`*_key`）：落盘前的逐叶脱敏会把它下面的 agent id 换掉。
         key = peek_key('request')
         if key is not None:
-            payload['key'] = list(key)
+            payload['request_ref'] = list(key)
         await runtime.events.emit(
             Event(kind='tool_confirmation_requested', agent_id=request.agent_id, payload=payload)
         )

@@ -36,7 +36,9 @@ from syndica.kernel import (
     WaitState,
 )
 from syndica.kernel.danger import DangerRequest, Disposition
-from syndica.kernel.ids import ToolCallKey, current_tool_call
+from syndica.kernel.ids import RandomIds, ToolCallKey, current_tool_call
+from syndica.kernel.redaction import RuleRedactor, encode_redacted
+from syndica.kernel.stores import InMemoryAgentRegistry
 from syndica.kernel.tools import Delegate
 
 _TIMEOUT = 5.0
@@ -683,7 +685,7 @@ async def test_a_human_request_carries_its_key_and_the_answer_is_keyed_by_it():
         await runtime.shutdown()
 
     key = ['tool_call', agent_id, 1, 1, 0, 'request', 0]
-    assert request.payload['key'] == key
+    assert request.payload['request_ref'] == key
     assert (*key, 'reply') in ids.issued
     assert ('host', 'message', 0) in ids.issued
 
@@ -719,7 +721,7 @@ async def test_mailbox_confirmation_events_carry_the_key_of_the_current_tool_cal
     event = await _take(subscription, 'tool_confirmation_requested')
     subscription.close()
 
-    assert event.payload['key'] == ['tool_call', 'a1', 2, 3, 1, 'request', 0]
+    assert event.payload['request_ref'] == ['tool_call', 'a1', 2, 3, 1, 'request', 0]
 
 
 @pytest.mark.parametrize('ids', [object(), 'uuid', None.__class__], ids=['object', 'str', 'type'])
@@ -855,7 +857,7 @@ async def test_an_agents_own_numbering_carries_on_after_it_is_woken_again():
     assert [ids.issued[('agent', agent_id, 'spawn', n)] for n in (0, 1)] == spawned
 
 
-async def test_what_a_kill_tears_down_is_keyed_by_the_teardown_not_by_the_call_that_killed():
+async def test_what_a_kill_tears_down_is_keyed_by_the_despawn_not_by_the_call_that_killed():
     ids = _KeyedIds()
     runtime = Runtime(ids=ids)
     helpers: list[str] = []
@@ -886,7 +888,7 @@ async def test_what_a_kill_tears_down_is_keyed_by_the_teardown_not_by_the_call_t
         await runtime.shutdown()
 
     call = ('tool_call', killer, 1, 1, 0)
-    assert ids.issued[('reap', victim, 'spawn', 0)] == helpers[0]
+    assert ids.issued[('despawn', victim, 'spawn', 0)] == helpers[0]
     assert (*call, 'spawn', 0) in ids.issued
     assert (*call, 'spawn', 1) not in ids.issued
 
@@ -1229,6 +1231,552 @@ async def test_a_confirmation_is_answered_under_the_key_its_event_announced():
         await runtime.shutdown()
 
     key = ['tool_call', agent_id, 1, 1, 0, 'request', 0]
-    assert requested.payload['key'] == key
+    assert requested.payload['request_ref'] == key
     assert (*key, 'reply') in ids.issued
     assert seen == [ToolCallKey(agent_id, 1, 1, 0, 'c1')]
+    stored = json.loads(encode_redacted(requested.payload, RuleRedactor()))
+    assert stored['request_ref'] == key
+
+
+async def test_a_human_request_reference_survives_redaction_before_it_is_stored():
+    runtime = Runtime(ids=_KeyedIds(), modules=[HumanInteractionModule()])
+    events = runtime.events.subscribe()
+    llm = ScriptedLLM(
+        [ScriptedTurn(tool_calls=[_call('ask', 'AskUser', question='which?', timeout=0.05)])]
+        + [ScriptedTurn(content='done')]
+    )
+    try:
+        agent_id = await runtime.spawn(_factory('Root', llm), query='go')
+        request = await _take(events, 'user_input_requested')
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        events.close()
+        await runtime.shutdown()
+
+    stored = json.loads(encode_redacted(request.payload, RuleRedactor()))
+    assert stored['request_ref'] == ['tool_call', agent_id, 1, 1, 0, 'request', 0]
+
+
+# --- topology slots ---------------------------------------------------------------------------
+
+
+def _topology(*slots: Any) -> tuple[Any, Any]:
+    from syndica.kernel.catalog import AgentCatalog
+    from syndica.kernel.topology import Topology
+
+    catalog = AgentCatalog()
+    catalog.load_mapping({'name': 'Worker', 'description': 'Worker'})
+    return Topology(slots=slots), catalog
+
+
+async def test_a_lazy_singleton_gets_the_same_id_whoever_reaches_it_first():
+    """两个 Agent 的调用都往同一个 lazy singleton 发消息；记录时 B 先到，回放时 A 先到。先到者在
+    同一次调用里接着派的子 Agent 也不能因此换号。"""
+    from syndica.kernel.topology import AgentSlot
+
+    async def run(delays: dict[str, float], ids: _KeyedIds) -> tuple[str, dict[str, str]]:
+        topology, catalog = _topology(
+            AgentSlot(name='reviewer', agent='Worker', cardinality='singleton', boot='lazy')
+        )
+        runtime = Runtime(ids=ids)
+        children: dict[str, str] = {}
+
+        class _Ask(Tool):
+            __tool_name__ = 'Ask'
+            __tool_command_args__ = ()
+
+            def __init__(self, name: str) -> None:
+                self._name = name
+
+            async def execute(self) -> ToolResult:
+                """问 reviewer，再派一个子 Agent。"""
+                await asyncio.sleep(delays[self._name])
+                await runtime.send_to_slot('reviewer', f'from {self._name}')
+                children[self._name] = await runtime.spawn(_idle_child)
+                return ToolResult(output='asked')
+
+        await runtime.assemble(
+            topology,
+            catalog,
+            tools={},
+            models={'default': ScriptedLLM([ScriptedTurn(content='ok')] * 4)},
+        )
+        try:
+            askers = []
+            for name in ('A', 'B'):
+                llm = ScriptedLLM(
+                    [ScriptedTurn(tool_calls=[_call('a', 'Ask')]), ScriptedTurn(content='done')]
+                )
+                askers.append(
+                    await runtime.spawn(_factory(name, llm, {'Ask': _Ask(name)}), query='go')
+                )
+            await asyncio.wait_for(asyncio.gather(*map(runtime.wait, askers)), _TIMEOUT)
+            reviewer = await runtime.resolve('reviewer')
+        finally:
+            await runtime.shutdown()
+        assert reviewer is not None
+        return reviewer, children
+
+    recording = _KeyedIds()
+    recorded = await run({'A': 0.03, 'B': 0.0}, recording)
+    replayed = await run({'A': 0.0, 'B': 0.03}, _KeyedIds(recording.issued))
+
+    assert replayed == recorded
+    assert recording.issued[('slot', 'reviewer', '', 0)] == recorded[0]
+    askers = [recording.issued[('host', 'spawn', n)] for n in (0, 1)]
+    for name, asker in zip(('A', 'B'), askers, strict=True):
+        assert recording.issued[('tool_call', asker, 1, 1, 0, 'spawn', 0)] == recorded[1][name]
+
+
+async def test_each_key_of_a_keyed_slot_is_numbered_on_its_own():
+    from syndica.kernel.topology import AgentSlot
+
+    topology, catalog = _topology(
+        AgentSlot(
+            name='by-repo', agent='Worker', cardinality='keyed', key_field='repo', boot='lazy'
+        )
+    )
+    ids = _KeyedIds()
+    runtime = Runtime(ids=ids)
+    try:
+        await runtime.assemble(
+            topology,
+            catalog,
+            tools={},
+            models={'default': ScriptedLLM([ScriptedTurn(content='ok')])},
+        )
+        first = await runtime.resolve('by-repo', key='alpha', spawn=True)
+        second = await runtime.resolve('by-repo', key='beta', spawn=True)
+    finally:
+        await runtime.shutdown()
+
+    assert ids.issued == {
+        ('slot', 'by-repo', 'alpha', 0): first,
+        ('slot', 'by-repo', 'beta', 0): second,
+    }
+
+
+# --- waits ------------------------------------------------------------------------------------
+
+
+class _SlowRegistry(InMemoryAgentRegistry):
+    """每次 CAS 都要等一会儿：远端注册表的往返。"""
+
+    async def compare_and_set_status(self, agent_id: str, *, expected: Any, new: Any) -> bool:
+        await asyncio.sleep(0.005)
+        return await super().compare_and_set_status(agent_id, expected=expected, new=new)
+
+
+def test_an_answer_takes_the_newest_registration_and_leaves_the_older_one():
+    runtime = Runtime(ids=_KeyedIds())
+    older = ('tool_call', 'a1', 1, 1, 0, 'request', 0)
+    newer = ('tool_call', 'a1', 1, 1, 1, 'request', 0)
+    registry = runtime._request_keys  # pyright: ignore[reportPrivateUsage]
+    registry[('a1', 'c')] = [older, newer]
+
+    first = runtime._message_key('a1', 'c')  # pyright: ignore[reportPrivateUsage]
+    second = runtime._message_key('a1', 'c')  # pyright: ignore[reportPrivateUsage]
+
+    assert (first, second) == ((*newer, 'reply'), (*older, 'reply'))
+    assert registry == {}
+
+
+async def test_an_answer_given_the_moment_the_request_is_announced_is_keyed_as_its_reply():
+    ids = _KeyedIds()
+    runtime = Runtime(ids=ids, registry=_SlowRegistry(), modules=[HumanInteractionModule()])
+    events = runtime.events.subscribe()
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('ask', 'AskUser', question='which?', timeout=30)]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    async def answer_at_once() -> None:
+        request = await _take(events, 'user_input_requested')
+        await runtime.send(
+            request.agent_id,
+            'this one',
+            activate=False,
+            sender='human',
+            correlation_id=cast(str, request.payload['request_id']),
+        )
+
+    try:
+        answering = asyncio.create_task(answer_at_once())
+        agent_id = await runtime.spawn(_factory('Root', llm), query='go')
+        await asyncio.wait_for(answering, _TIMEOUT)
+        context = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        events.close()
+        await runtime.shutdown()
+
+    assert context.stop_reason is StopReason.COMPLETED
+    assert ('tool_call', agent_id, 1, 1, 0, 'request', 0, 'reply') in ids.issued
+    assert ('host', 'message', 0) not in ids.issued
+
+
+async def test_a_refused_wait_still_uses_up_its_request_number():
+    ids = _KeyedIds()
+    runtime = Runtime(ids=ids)
+    started = asyncio.Event()
+    idle: list[str] = []
+
+    class _TryTwice(Tool):
+        __tool_name__ = 'TryTwice'
+        __tool_command_args__ = ()
+
+        def __init__(self, agent_id: str) -> None:
+            self._agent_id = agent_id
+
+        async def execute(self) -> ToolResult:
+            """先在一个没在跑的 Agent 上等（被拒），再在自己身上等。"""
+            with pytest.raises(ContractViolation):
+                await runtime.wait_for(idle[0], Reply(correlation_id='nope', timeout=_TIMEOUT))
+            started.set()
+            result = await runtime.wait_for(
+                self._agent_id, Reply(correlation_id='mine', timeout=_TIMEOUT)
+            )
+            return ToolResult(output=result.state.value)
+
+    llm = ScriptedLLM(
+        [ScriptedTurn(tool_calls=[_call('t', 'TryTwice')]), ScriptedTurn(content='ok')]
+    )
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = _factory('Root', llm)(hooks, events)
+        agent.install_runtime_tools({'TryTwice': _TryTwice(agent.agent_id)})
+        return agent
+
+    try:
+        idle.append(await runtime.spawn(_idle_child))
+        agent_id = await runtime.spawn(build, query='go')
+        await asyncio.wait_for(started.wait(), _TIMEOUT)
+        await runtime.send(agent_id, 'answer', activate=False, correlation_id='mine')
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        await runtime.send(idle[0], 'to the refused wait', activate=False, correlation_id='nope')
+        leftover = dict(runtime._request_keys)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runtime.shutdown()
+
+    call = ('tool_call', agent_id, 1, 1, 0)
+    assert (*call, 'request', 1, 'reply') in ids.issued
+    assert (*call, 'request', 0, 'reply') not in ids.issued
+    assert ('host', 'message', 0) in ids.issued
+    assert leftover == {}
+
+
+async def test_a_wait_the_host_starts_registers_nothing():
+    runtime = Runtime(ids=_KeyedIds())
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _Hold(Tool):
+        __tool_name__ = 'Hold'
+        __tool_command_args__ = ()
+
+        async def execute(self) -> ToolResult:
+            """挂住，直到被放开。"""
+            entered.set()
+            await release.wait()
+            return ToolResult(output='released')
+
+    llm = ScriptedLLM([ScriptedTurn(tool_calls=[_call('h', 'Hold')]), ScriptedTurn(content='ok')])
+    try:
+        agent_id = await runtime.spawn(_factory('Root', llm, {'Hold': _Hold()}), query='go')
+        await asyncio.wait_for(entered.wait(), _TIMEOUT)
+        waiting = asyncio.create_task(
+            runtime.wait_for(agent_id, Reply(correlation_id='h1', timeout=_TIMEOUT))
+        )
+        await asyncio.sleep(0.01)
+        during = dict(runtime._request_keys)  # pyright: ignore[reportPrivateUsage]
+        await runtime.send(agent_id, 'answer', activate=False, correlation_id='h1')
+        await asyncio.wait_for(waiting, _TIMEOUT)
+        release.set()
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        after = dict(runtime._request_keys)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runtime.shutdown()
+
+    assert during == {} and after == {}
+
+
+async def test_a_correlation_id_that_is_not_a_string_is_not_looked_up():
+    runtime = Runtime(ids=_KeyedIds())
+    try:
+        agent_id = await runtime.spawn(_idle_child)
+        delivered = await runtime.send(
+            agent_id, 'odd', activate=False, correlation_id=cast(Any, ['not', 'hashable'])
+        )
+    finally:
+        await runtime.shutdown()
+
+    assert isinstance(delivered.ok, bool)
+
+
+# --- assignment, despawn, warnings ------------------------------------------------------------
+
+
+async def test_a_task_the_factory_starts_does_not_take_the_assigned_id_too():
+    ids = _KeyedIds()
+    runtime = Runtime(ids=ids)
+    late: list[BaseAgent] = []
+    tasks: list[asyncio.Task[None]] = []
+
+    def factory(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        async def build_later() -> None:
+            late.append(_idle_child(HooksCenter(), EventBus()))
+
+        tasks.append(asyncio.get_running_loop().create_task(build_later()))
+        return _idle_child(hooks, events)
+
+    try:
+        agent_id = await runtime.spawn(factory)
+        await asyncio.wait_for(asyncio.gather(*tasks), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+
+    assert agent_id == ids.issued[('host', 'spawn', 0)]
+    assert late[0].agent_id != agent_id
+
+
+async def test_a_task_the_factory_starts_cannot_take_an_id_the_factory_never_used():
+    ids = _KeyedIds()
+    runtime = Runtime(ids=ids)
+    late: list[BaseAgent] = []
+    tasks: list[asyncio.Task[None]] = []
+    prebuilt = _idle_child(HooksCenter(), EventBus())
+
+    def factory(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        async def build_later() -> None:
+            await asyncio.sleep(0)
+            late.append(_idle_child(HooksCenter(), EventBus()))
+
+        tasks.append(asyncio.get_running_loop().create_task(build_later()))
+        return prebuilt
+
+    try:
+        await runtime.spawn(factory)
+        await asyncio.wait_for(asyncio.gather(*tasks), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+
+    assert late[0].agent_id != ids.issued[('host', 'spawn', 0)]
+
+
+async def test_a_despawn_inside_a_call_hands_the_call_its_scope_back():
+    ids = _KeyedIds()
+    runtime = Runtime(ids=ids)
+    helpers: list[str] = []
+    after: list[str] = []
+    doomed = await runtime.spawn(_idle_child)
+
+    async def on_despawn(agent_id: str, **kwargs: Any) -> HookResult:
+        if agent_id == doomed:
+            helpers.append(await runtime.spawn(_idle_child))
+        return HookResult()
+
+    class _Remove(Tool):
+        __tool_name__ = 'Remove'
+        __tool_command_args__ = ()
+
+        async def execute(self) -> ToolResult:
+            """销毁那个 Agent，再派一个子 Agent。"""
+            await runtime.despawn(doomed)
+            after.append(await runtime.spawn(_idle_child))
+            return ToolResult(output=after[0])
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, on_despawn)
+    llm = ScriptedLLM([ScriptedTurn(tool_calls=[_call('r', 'Remove')]), ScriptedTurn(content='ok')])
+    try:
+        remover = await runtime.spawn(_factory('Remover', llm, {'Remove': _Remove()}), query='go')
+        await asyncio.wait_for(runtime.wait(remover), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+
+    assert ids.issued[('despawn', doomed, 'spawn', 0)] == helpers[0]
+    assert ids.issued[('tool_call', remover, 1, 1, 0, 'spawn', 0)] == after[0]
+
+
+async def test_what_a_despawn_hook_creates_is_keyed_by_the_despawn_and_refusals_use_numbers():
+    """级联拆除父时，子的拆除 hook 想给父再派一个子：父正在被拆，这次被拒，但它占掉序号。"""
+    ids = _KeyedIds()
+    runtime = Runtime(ids=ids)
+    created: list[str] = []
+    refused: list[str] = []
+    parents: list[str] = []
+
+    async def on_despawn(agent_id: str, **kwargs: Any) -> HookResult:
+        if not parents or agent_id == parents[0] or created:
+            return HookResult()
+        try:
+            await runtime.spawn(_idle_child, parent_id=parents[0])
+        except ConfigError as error:
+            refused.append(type(error).__name__)
+        except ContractViolation as error:
+            refused.append(type(error).__name__)
+        created.append(await runtime.spawn(_idle_child))
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, on_despawn)
+    try:
+        parents.append(await runtime.spawn(_idle_child))
+        child = await runtime.spawn(_idle_child, parent_id=parents[0])
+        await runtime.despawn(parents[0])
+    finally:
+        await runtime.shutdown()
+
+    assert len(refused) == 1
+    assert ('despawn', child, 'spawn', 0) not in ids.issued
+    assert ids.issued[('despawn', child, 'spawn', 1)] == created[0]
+
+
+async def test_a_source_that_subclasses_random_ids_still_hears_about_a_missed_assignment(
+    caplog: pytest.LogCaptureFixture,
+):
+    class _Recording(RandomIds):
+        pass
+
+    runtime = Runtime(ids=_Recording())
+
+    def factory(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        _idle_child(hooks, events)
+        return _idle_child(hooks, events)
+
+    try:
+        await runtime.spawn(factory)
+    finally:
+        await runtime.shutdown()
+
+    assert len(_missed_assignments(caplog)) == 1
+
+
+# --- the source's own contract ----------------------------------------------------------------
+
+
+def test_an_id_source_whose_methods_are_not_callable_is_refused_with_their_names():
+    class _Half:
+        agent_id = 'fixed'
+
+        def message_id(self, key: StableKey) -> str:
+            return 'm'
+
+    with pytest.raises(ConfigError) as caught:
+        Runtime(ids=cast(Any, _Half()))
+
+    assert 'agent_id' in caught.value.received and 'message_id' not in caught.value.received
+
+
+@pytest.mark.parametrize('missing', ['agent_id', 'message_id'])
+def test_an_object_missing_a_method_is_told_which_one(missing: str):
+    present = {'agent_id', 'message_id'} - {missing}
+    source = type('_Partial', (), {name: lambda self, key: 'x' for name in present})()
+
+    with pytest.raises(ConfigError) as caught:
+        Runtime(ids=cast(Any, source))
+
+    assert missing in caught.value.received
+    assert 'uuid4' in caught.value.next_action
+
+
+async def test_an_async_id_source_is_told_to_be_synchronous():
+    class _Async:
+        async def agent_id(self, key: StableKey) -> str:
+            return 'never'
+
+        async def message_id(self, key: StableKey) -> str:
+            return 'never'
+
+    runtime = Runtime(ids=cast(Any, _Async()))
+    try:
+        with pytest.raises(ContractViolation) as caught:
+            await runtime.spawn(_idle_child)
+    finally:
+        await runtime.shutdown()
+
+    assert 'agent_id(key)' in caught.value.expected
+    assert 'awaitable' in caught.value.received
+    assert 'def' in caught.value.next_action
+
+
+async def test_a_bad_message_id_names_the_message_method():
+    class _BadMessages:
+        def agent_id(self, key: StableKey) -> str:
+            return 'agent-1'
+
+        def message_id(self, key: StableKey) -> str:
+            return ''
+
+    runtime = Runtime(ids=_BadMessages())
+    try:
+        agent_id = await runtime.spawn(_idle_child)
+        with pytest.raises(ContractViolation) as caught:
+            await runtime.send(agent_id, 'hello', activate=False)
+    finally:
+        await runtime.shutdown()
+
+    assert 'message_id(key)' in caught.value.expected
+    assert '记录里的那个 id' in caught.value.next_action
+
+
+# --- the tool-call scope ----------------------------------------------------------------------
+
+
+async def test_post_tool_use_runs_inside_the_call_it_reports_on():
+    seen: list[ToolCallKey | None] = []
+
+    async def post(**kwargs: Any) -> HookResult:
+        seen.append(current_tool_call())
+        return HookResult()
+
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('a', 'Probe', delay=0.02), _call('b', 'Probe')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    probes: list[ToolCallKey | None] = []
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = _factory('Root', llm, {'Probe': _Probe(probes)})(hooks, events)
+        agent.register_hook(Junction.POST_TOOL_USE, post)
+        return agent
+
+    runtime = Runtime()
+    try:
+        agent_id = await runtime.spawn(build, query='go')
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+
+    assert seen == [ToolCallKey(agent_id, 1, 1, 1, 'b'), ToolCallKey(agent_id, 1, 1, 0, 'a')]
+
+
+async def test_an_agent_run_inline_inside_a_call_leaves_the_calls_scope_as_it_was():
+    after: list[ToolCallKey | None] = []
+
+    class _Inline(Tool):
+        __tool_name__ = 'Inline'
+        __tool_command_args__ = ()
+
+        async def execute(self) -> ToolResult:
+            """在这次调用里直接跑一个带工具的 Agent，再看当前工具调用。"""
+            helper_llm = ScriptedLLM(
+                [ScriptedTurn(tool_calls=[_call('h', 'Probe')]), ScriptedTurn(content='h')]
+            )
+            helper = _factory('Helper', helper_llm, {'Probe': _Probe([])})(
+                HooksCenter(), EventBus()
+            )
+            await helper.run('help')
+            after.append(current_tool_call())
+            return ToolResult(output='inline')
+
+    llm = ScriptedLLM([ScriptedTurn(tool_calls=[_call('i', 'Inline')]), ScriptedTurn(content='ok')])
+    runtime = Runtime()
+    try:
+        agent_id = await runtime.spawn(_factory('Root', llm, {'Inline': _Inline()}), query='go')
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+
+    assert after == [ToolCallKey(agent_id, 1, 1, 0, 'i')]

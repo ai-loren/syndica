@@ -4,10 +4,14 @@
 换上一个按稳定键交回记录的 id 的源。
 
 稳定键说的是「这个东西是怎么来的」，不是「它是第几个」：几个 Agent 并发时，创建的先后取决于调度。
-一个键由它的出处加上出处里的第几个组成。出处依次是：当前工具调用；否则是当前的属主——一个 Agent 自己
-的事件循环（它的 hook 派的活、发的消息）、一次收尾、一次关机，它们各自串行，序号因此与别的 Agent
-的快慢无关；都没有时才是宿主。经拓扑槽创建的 Agent 在出处前面再加上槽名与键；对一个请求的答复用那个
-请求的键。键只由字符串与整数组成，可以原样写进 JSON。
+一个键由它的出处加上出处里的第几个组成。出处依次是：当前工具调用；否则是当前的属主——一个 Agent
+自己的事件循环（它的 hook 派的活、发的消息）、一次拆除、一次收尾、一次关机，它们各自串行，序号因此
+与别的 Agent 的快慢无关；都没有时才是宿主。经拓扑槽创建的 Agent 在出处前面再加上槽名与键；对一个
+请求的答复用那个请求的键。键只由字符串与整数组成，可以原样写进 JSON。
+
+**一个出处里的序号按先后数**：工具调用里 `create_task` 出来的子任务继承这次调用、共用它的计数，几个
+子任务都在一次取决于时延的 await 之后才派活，序号就随到达的先后。要并发地派，先在调用里按确定的
+顺序派完（或取完 id）再等。
 """
 
 from __future__ import annotations
@@ -26,7 +30,9 @@ __all__ = [
     'assigning_agent_id',
     'becoming_owner',
     'current_tool_call',
+    'entering_owner',
     'entering_tool_call',
+    'leaving_owner',
     'leaving_tool_call',
     'next_key',
     'peek_key',
@@ -38,7 +44,11 @@ StableKey = tuple[str | int, ...]
 
 @runtime_checkable
 class IdSource(Protocol):
-    """按稳定键交出 id。交回的必须是非空字符串，同一个 Runtime 里各不相同。"""
+    """按稳定键交出 id。两个方法都是同步的，交回非空字符串，同一个 Runtime 里各不相同。
+
+    键只在一个 Runtime 之内唯一：宿主那一档（`('host', 'spawn', 0)`）与关机（`('shutdown', ...)`）
+    在每个 Runtime 里都从头数。一个源同时给几个 Runtime 用时，由源自己按 Runtime 分开。
+    """
 
     def agent_id(self, key: StableKey) -> str: ...
 
@@ -86,9 +96,17 @@ class _Owner:
     issued: dict[str, int]
 
 
+@dataclass
+class _Assignment:
+    """spawn 交给工厂的 id。可变的一格而不是值：工厂在构造 Agent 之前 `create_task` 出来的任务拿到的
+    是上下文的一份拷贝，取走值只改得了自己那份，拷贝里的照样能被再取一次，两个 Agent 就同名了。"""
+
+    agent_id: str | None
+
+
 _CURRENT: ContextVar[_Scope | None] = ContextVar('syndica_current_tool_call', default=None)
 _OWNER: ContextVar[_Owner | None] = ContextVar('syndica_key_owner', default=None)
-_ASSIGNED: ContextVar[str | None] = ContextVar('syndica_assigned_agent_id', default=None)
+_ASSIGNED: ContextVar[_Assignment | None] = ContextVar('syndica_assigned_agent_id', default=None)
 
 
 def current_tool_call() -> ToolCallKey | None:
@@ -109,9 +127,27 @@ def leaving_tool_call(token: Token[_Scope | None]) -> None:
 def becoming_owner(prefix: StableKey, issued: dict[str, int]) -> None:
     """在当前上下文里换成一个新的属主，并清掉「当前工具调用」：内核自己起的任务（驱动、收尾、关机）
     经 `create_task` 建在调用方的上下文里，不清就继承了调用方那次工具调用。`issued` 是属主自己的
-    计数，由调用方持有：同一个 Agent 的事件循环被唤醒好几次，序号要接着数。"""
+    计数，由调用方持有：同一个 Agent 的事件循环被唤醒好几次，序号要接着数。
+
+    不复位：只用在任务一开始，任务结束时它的上下文跟着丢掉。在别人的上下文里临时换属主用
+    `entering_owner`。"""
     _CURRENT.set(None)
     _OWNER.set(_Owner(prefix, issued))
+
+
+_OwnerTokens = tuple[Token[_Scope | None], Token[_Owner | None]]
+
+
+def entering_owner(prefix: StableKey, issued: dict[str, int]) -> _OwnerTokens:
+    """在当前上下文里临时换成一个属主，交回复位用的凭据：一段跑在调用方上下文里、但出处不该是调用方
+    的代码（同一次拆除可能由几个调用方之一收尾）。"""
+    return _CURRENT.set(None), _OWNER.set(_Owner(prefix, issued))
+
+
+def leaving_owner(tokens: _OwnerTokens) -> None:
+    current, owner = tokens
+    _OWNER.reset(owner)
+    _CURRENT.reset(current)
 
 
 def _counters() -> tuple[StableKey, dict[str, int]] | None:
@@ -143,19 +179,26 @@ def next_key(what: str) -> StableKey | None:
     return (*prefix, what, number)
 
 
-def assigning_agent_id(agent_id: str) -> Token[str | None]:
+def assigning_agent_id(agent_id: str) -> Token[_Assignment | None]:
     """`Runtime.spawn` 在调用工厂之前设下的 id：工厂里就已经有东西绑定 `agent.agent_id`（派活工具、
     选择器表），工厂返回之后再改就晚了。"""
-    return _ASSIGNED.set(agent_id)
+    return _ASSIGNED.set(_Assignment(agent_id))
 
 
-def releasing_agent_id(token: Token[str | None]) -> None:
+def releasing_agent_id(token: Token[_Assignment | None]) -> None:
+    """工厂返回之后收回没被取走的 id：工厂起的任务还攥着那一格，之后它们构造的 Agent 不能再拿到
+    它。"""
+    assignment = _ASSIGNED.get()
+    if assignment is not None:
+        assignment.agent_id = None
     _ASSIGNED.reset(token)
 
 
 def assigned_agent_id() -> str | None:
-    """取走 spawn 设下的 id：只有工厂里构造的第一个 Agent 拿到它，同一个工厂再构造的拿各自的。"""
-    agent_id = _ASSIGNED.get()
-    if agent_id is not None:
-        _ASSIGNED.set(None)
+    """取走 spawn 设下的 id：只有第一个构造的 Agent 拿到它，同一个工厂（以及它起的任务）再构造的拿
+    各自的。"""
+    assignment = _ASSIGNED.get()
+    if assignment is None:
+        return None
+    agent_id, assignment.agent_id = assignment.agent_id, None
     return agent_id

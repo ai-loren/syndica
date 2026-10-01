@@ -150,6 +150,8 @@ from syndica.kernel.ids import (
     StableKey,
     assigning_agent_id,
     becoming_owner,
+    entering_owner,
+    leaving_owner,
     next_key,
     releasing_agent_id,
 )
@@ -186,9 +188,24 @@ _StoreT = TypeVar('_StoreT')
 # 并由契约套件强制，见 protocols/broker.py。
 _ACTIVATION_ALLOWED: ContextVar[bool] = ContextVar('syndica_activation_allowed', default=True)
 _SHUTTING_DOWN: ContextVar[tuple[object, ...]] = ContextVar('syndica_shutting_down', default=())
-# 经拓扑槽的这一次 spawn 是哪个槽、哪个键（`_spawn_slot` 设下，`spawn` 取键时取走）：spawn 的签名
-# 计入公开面，槽的键不该从那里进来。取走而不是只读：spawn 里的 hook 再 spawn 的 Agent 不是这个槽的。
-_SLOT_SPAWN: ContextVar[tuple[str, str] | None] = ContextVar('syndica_slot_spawn', default=None)
+
+
+@dataclass(frozen=True)
+class _SlotSpawn:
+    """经拓扑槽的这一次 spawn（`_spawn_slot` 设下，`spawn` 取键时取走）。spawn 的签名计入公开面，
+    槽的键不该从那里进来；取走而不是只读：spawn 里的 hook 再 spawn 的 Agent 不是这个槽的。
+
+    `per_caller`：on-demand 槽每次要都新建一个，实例就是要它的那次调用的，键跟着调用方；singleton
+    与 keyed 的实例由槽与键确定，谁先来要都是同一个——键里带上先到者，回放时换一个先到者它就换了
+    id。
+    """
+
+    name: str
+    key: str
+    per_caller: bool
+
+
+_SLOT_SPAWN: ContextVar[_SlotSpawn | None] = ContextVar('syndica_slot_spawn', default=None)
 
 
 def _checked_ids(ids: object) -> IdSource:
@@ -200,18 +217,32 @@ def _checked_ids(ids: object) -> IdSource:
             received=f'收到类 {ids.__name__} 本身',
             next_action=f'传 {ids.__name__}(...) 构造出的实例，而不是类（漏了括号？）',
         )
-    if not isinstance(ids, IdSource):
+    unusable = [
+        name for name in ('agent_id', 'message_id') if not callable(getattr(ids, name, None))
+    ]
+    if unusable:
         raise ConfigError(
-            expected='ids 实现 IdSource：agent_id(key) 与 message_id(key) 都交回非空字符串',
-            received=f'收到 {type(ids).__name__}',
+            expected='ids 实现 IdSource：agent_id(key) 与 message_id(key) 都是方法，交回非空字符串',
+            received=f'收到 {type(ids).__name__}，{" 与 ".join(unusable)} 不存在或不可调用',
             next_action='不传就用 uuid4；回放时传一个按稳定键交回记录里那个 id 的对象',
         )
-    return ids
+    return cast(IdSource, ids)
 
 
 def _fresh_id(produce: Callable[[StableKey], str], key: StableKey, what: str) -> str:
     try:
         value = cast(object, produce(key))
+        if inspect.isawaitable(value):
+            # async def 的方法交回协程：内核不 await id 源，协程里的 id 永远取不出来。
+            if inspect.iscoroutine(value):
+                value.close()
+            raise ContractViolation(
+                expected=f'id 源的 {what}(key) 是同步方法，当场交回 id',
+                received=f'对键 {key!r} 交回了一个 awaitable',
+                next_action=f'把 {what} 改成普通的 def；要查的记录提前读进内存',
+            )
+    except ContractViolation:
+        raise
     except Exception as error:
         raise ContractViolation(
             expected=f'id 源的 {what}(key) 对每个键都交回一个 id',
@@ -584,11 +615,9 @@ class _Slot:
     # 与停在挂起门上的 PAUSED 是同一个取值，而只有后者收得到唤醒边沿。读它与改它都是同步的，
     # 因此控制面在一段不含 await 的代码里读到的答案与驱动任务此刻的位置严格一致。
     parked_on_mailbox: int = 0
-    # 这个 Agent 的事件循环与它的收尾在工具调用之外派的活、发的消息各自数到第几个了（M3 D10）。
-    # 放在这里而不是驱动任务里：zombie 被唤醒时换一个驱动任务，序号要接着数，否则两次唤醒的第一个
-    # 撞成同一个键。
+    # 这个 Agent 的事件循环在工具调用之外派的活、发的消息数到第几个了（M3 D10）。放在这里而不是驱动
+    # 任务里：zombie 被唤醒时换一个驱动任务，序号要接着数，否则两次唤醒的第一个撞成同一个键。
     issued: dict[str, int] = field(default_factory=dict[str, int])
-    reap_issued: dict[str, int] = field(default_factory=dict[str, int])
 
 
 @dataclass
@@ -820,9 +849,11 @@ class Runtime:
         self._host_spawns = 0
         self._host_messages = 0
         self._slot_spawns: dict[tuple[str, str], int] = {}
-        # 正在等的请求（等待方、关联 id）→ 它的稳定键：对它的答复用这个键取消息 id，而不是按到达的
-        # 先后。带上等待方：关联 id 只在一个 Agent 的等待里唯一，两个 Agent 可以等同一个。
-        self._request_keys: dict[tuple[str, str], StableKey] = {}
+        # 正在等的请求（等待方、关联 id）→ 登记过的稳定键，后登记的在后：对它的答复用最后一个取消息
+        # id，而不是按到达的先后。带上等待方：关联 id 只在一个 Agent 的等待里唯一，两个 Agent 可以等
+        # 同一个。一个栈而不是一格：同一个 Agent 的下一次等待在上一次还没收尾时就登记了，它被拒时
+        # 要露出的是上一次的登记，抢占成功时上一次收尾摘掉的是它自己那一个。
+        self._request_keys: dict[tuple[str, str], list[StableKey]] = {}
         module_assembly = _RuntimeModuleAssembly(modules, flags)
         self.registry: AgentRegistry = (
             InMemoryAgentRegistry()
@@ -974,13 +1005,15 @@ class Runtime:
 
         工厂收下本 Runtime 的 hooks 与事件总线：Agent 自己新建一份，宿主注册的切点与订阅就都落空了。
         """
+        # 键在两道取决于调度的拒绝之前占用（并发的关机、并发的拆除）：被拒的这一次也占掉它的序号，
+        # 后面的 spawn 才在两次运行里拿到同一个键（M3 D10）。
+        key = self._agent_key()
         if self._closed:
             raise _already_shut_down()
         if parent_id is not None and parent_id in self._doomed:
             raise _parent_being_destroyed(parent_id)
-        # 先取 id 再调工厂：工厂里就有东西绑定 `agent.agent_id`（M3 D10）。工厂返回一个不是在这次
-        # 调用里构造的 Agent 时，它留着自己的 id。
-        key = self._agent_key()
+        # 先取 id 再调工厂：工厂里就有东西绑定 `agent.agent_id`。工厂返回一个不是在这次调用里构造
+        # 的 Agent 时，它留着自己的 id。
         assigned = _fresh_id(self._ids.agent_id, key, 'agent_id')
         # cast 到 object 是因为要挡的正是违反 `AgentFactory` 标注的运行时取值；不擦掉静态类型，
         # 下面的 isinstance 就成了 pyright 眼里的死代码。
@@ -994,7 +1027,8 @@ class Runtime:
             raise _bad_factory_return(factory, produced)
         agent = produced
         agent_id = agent.agent_id
-        if agent_id != assigned and not isinstance(self._ids, RandomIds):
+        # 按类型比而不是 isinstance：记录用的源最自然的写法就是继承 RandomIds，它要这条警告。
+        if agent_id != assigned and type(self._ids) is not RandomIds:
             logger.warning(
                 '期望: 工厂交回的 Agent 用 spawn 交给它的 id %s（键 %r）。'
                 ' 实际: 它交回的 Agent 的 id 是 %s——它不是在这次工厂调用里构造的，'
@@ -1149,32 +1183,41 @@ class Runtime:
         return await handler.confirm(self, request)
 
     def _agent_key(self) -> StableKey:
-        """这次 spawn 的稳定键：当前出处（工具调用或属主）里的第几个，否则是宿主的第几次。经拓扑
-        槽的在前面加上槽名与键；不在任何出处里时按这个槽、这个键的第几个。"""
+        """这次 spawn 的稳定键：当前出处（工具调用或属主）里的第几个，否则是宿主的第几次。
+
+        经拓扑槽的在前面加上槽名与键。on-demand 槽的实例属于要它的那次调用，跟着调用方的出处取
+        （不在任何出处里时按这个槽的第几个）；singleton 与 keyed 的按这个槽、这个键的第几个，**不
+        占用调用方的计数**——它们由槽与键确定，谁先来寻址都是同一个。
+        """
         slot = _SLOT_SPAWN.get()
         if slot is not None:
             _SLOT_SPAWN.set(None)
+            if slot.per_caller:
+                origin = next_key('spawn')
+                if origin is not None:
+                    return ('slot', slot.name, slot.key, *origin)
+            count = self._slot_spawns.get((slot.name, slot.key), 0)
+            self._slot_spawns[(slot.name, slot.key)] = count + 1
+            return ('slot', slot.name, slot.key, count)
         origin = next_key('spawn')
-        if slot is not None:
-            if origin is not None:
-                return ('slot', *slot, *origin)
-            count = self._slot_spawns.get(slot, 0)
-            self._slot_spawns[slot] = count + 1
-            return ('slot', *slot, count)
         if origin is not None:
             return origin
         self._host_spawns += 1
         return ('host', 'spawn', self._host_spawns - 1)
 
-    def _message_key(self, receiver: str, correlation_id: str | None) -> StableKey:
+    def _message_key(self, receiver: str, correlation_id: object) -> StableKey:
         """这条消息的稳定键：答复收件人正在等的请求时用那个请求的键，否则是当前出处里的第几条，或
         宿主的第几条。"""
-        request = (
-            None
-            if correlation_id is None
-            else self._request_keys.pop((receiver, correlation_id), None)
+        # 只认字符串：关联 id 的类型由 broker 那一侧把关，这里一个不可哈希的值不该变成裸 TypeError。
+        waiting = (
+            self._request_keys.get((receiver, correlation_id))
+            if isinstance(correlation_id, str)
+            else None
         )
-        if request is not None:
+        if waiting:
+            request = waiting.pop()
+            if not waiting:
+                del self._request_keys[(receiver, cast(str, correlation_id))]
             return (*request, 'reply')
         key = next_key('message')
         if key is not None:
@@ -2041,7 +2084,14 @@ class Runtime:
             # 并复检过，所以这个切点报的仍是既成事实。
             if not teardown.reported:
                 teardown.reported = True
-                await self.hooks.trigger(Junction.AGENT_DESPAWN, agent_id=agent_id)
+                # 切点在拆除自己的出处里跑：取得到收据的可以是几条并发拆除中的任何一条（despawn、
+                # 级联、EXIT 收尾、kill 的收尾），hook 派的活按调用方取键就随谁先到而变（M3 D10）。
+                # 一个 Agent 至多消失一次，计数因此不必留着。
+                owner = entering_owner(('despawn', agent_id), {})
+                try:
+                    await self.hooks.trigger(Junction.AGENT_DESPAWN, agent_id=agent_id)
+                finally:
+                    leaving_owner(owner)
         finally:
             # 只摘自己那一份：清掉整张表会撤掉别的在飞拆除共享的那份收据，于是同一次消失会被
             # 第二条级联再报一次。
@@ -2073,9 +2123,9 @@ class Runtime:
         # 收尾刻意跑在事件循环之外，那个值在这里是假的：留着它，一次落在那个 Agent 身上的拆除会被
         # 误判成「等自己」而拒掉，被杀的 Agent 于是停在 aborting、再也复活不了。
         _DRIVING_AGENT.set(None)
-        # 同理它也继承了发起 kill 的那次工具调用：收尾里的 hook 派的活会与那次调用抢序号，而谁先谁后
-        # 取决于调度（M3 D10）。收尾自己是一个出处。
-        becoming_owner(('reap', agent_id), slot.reap_issued)
+        # 同理它也继承了发起 kill 的那次工具调用：不清掉，收尾里取的键会与那次调用抢序号，而谁先谁后
+        # 取决于调度（M3 D10）。收尾自己不派活：拆除的 hook 在 `_destroy` 里换到它自己的出处。
+        becoming_owner(('reap', agent_id), {})
         try:
             task = self._table.get_task(agent_id)
             if task is not None:
@@ -2327,11 +2377,26 @@ class Runtime:
 
         从工具调用里（或一个 Agent 自己的事件循环里）发起的等待登记它的稳定键（M3 D10）：等待期间
         发给这个 Agent、带着这个关联 ID 的第一条消息按它取消息 id。键在入口就占用，被拒的等待也
-        占掉它的序号。
+        占掉它的序号；登记在任何 await 之前——会挂起的注册表下，转 WAITING 的那次 CAS 期间就可能
+        有答复到达（回放按事件里的键当场作答）。发出请求事件与调用本方法之间不得有挂起点：那段
+        窗口里到达的答复认不出它答的是哪个请求。
         """
-        return await self._wait_for(agent_id, waiter, next_key('request'))
+        key = next_key('request')
+        if key is None:
+            return await self._wait_for(agent_id, waiter)
+        pending = (agent_id, correlation_of(waiter))
+        self._request_keys.setdefault(pending, []).append(key)
+        try:
+            return await self._wait_for(agent_id, waiter)
+        finally:
+            waiting = self._request_keys.get(pending)
+            # 只摘自己那一个：答复已经取走它时什么都不做，别的等待的登记原样留着。
+            if waiting is not None and key in waiting:
+                waiting.remove(key)
+                if not waiting:
+                    del self._request_keys[pending]
 
-    async def _wait_for(self, agent_id: str, waiter: Waiter, key: StableKey | None) -> WaitResult:
+    async def _wait_for(self, agent_id: str, waiter: Waiter) -> WaitResult:
         slot = self._slots.get(agent_id)
         if slot is None:
             raise _cannot_wait_for(agent_id, '本进程没有它的实例——它由别的进程持有，或它已被销毁')
@@ -2359,11 +2424,6 @@ class Runtime:
         slot.waiter = token
         if previous is not None:
             previous.interrupt(WaitState.PREEMPTED)
-        # 登记在成为这个 Agent 的等待者之后：被拒的等待不能盖掉正在等的那一个的登记。后来的覆盖
-        # 先来的，因为它刚刚抢占了先来的那一个，答复归它。
-        pending = (agent_id, correlation)
-        if key is not None:
-            self._request_keys[pending] = key
         if slot.control.abort_requested:
             # 上面那次 CAS 可以在**生效之后**才返回（远端注册表就是这样），而那段窗口里的一次 abort
             # 看不到还没装上的令牌，于是这次等待会一直挂到自己超时——中止的整个意义就没了。复检的是
@@ -2383,9 +2443,6 @@ class Runtime:
             cancelled = True
             raise
         finally:
-            # 只摘自己那一条：被抢占的等待走到这里时，同一个关联 ID 下登记的是抢占它的那一个。
-            if key is not None and self._request_keys.get(pending) == key:
-                del self._request_keys[pending]
             # `is token` 两处都要：被顶掉的那个等待先返回时，槽里装的是顶掉它的那个令牌，而那次
             # 等待还挂着——此刻恢复 RUNNING 会让注册表宣布一个正悬在等待里的 Agent 在跑。
             if slot.waiter is token:
@@ -2689,7 +2746,9 @@ class Runtime:
             existing = self._owned_alias(slot, alias)
             if existing is not None:
                 return existing
-        token = _SLOT_SPAWN.set((slot.name, key or ''))
+        token = _SLOT_SPAWN.set(
+            _SlotSpawn(slot.name, key or '', per_caller=slot.cardinality == 'on-demand')
+        )
         try:
             agent_id = await self.spawn(
                 self._enhanced_factory(base, slot),

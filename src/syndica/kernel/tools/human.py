@@ -140,10 +140,10 @@ class _HumanTool(Tool):
         if options:
             payload['options'] = list(options)
         # 这次请求的稳定键（`wait_for` 随后用同一个键登记它）：`request_id` 每次都不同，回放按键
-        # 给出人的答复（M3 D10）。
+        # 给出人的答复（M3 D10）。字段名不能像密钥名：落盘前的逐叶脱敏会把它下面的 agent id 换掉。
         key = peek_key('request')
         if key is not None:
-            payload['key'] = list(key)
+            payload['request_ref'] = list(key)
         await self._runtime.events.emit(Event(kind=kind, agent_id=self._agent_id, payload=payload))
         result = await self._runtime.wait_for(self._agent_id, waiter)
         if result.state is not WaitState.ANSWERED:
