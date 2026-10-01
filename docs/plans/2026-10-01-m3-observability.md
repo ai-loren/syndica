@@ -4,7 +4,8 @@
 > 规则 ID、回放文档的键、CLI 参数、配置键与环境变量一旦发布就是兼容承诺；执行中不得为了让测试变绿临时改名或
 > 缩小断言范围。
 
-**状态：草案，已经过一轮两路独立评审修订（2026-10-01），待用户确认。** 五项裁决由用户确认（见「决策日志」）。
+**状态：执行中。** 已经过两轮独立评审修订（2026-10-01；第二轮 5 High / 9 Medium / 7 Low 全部并入，见「决策日志」
+末条）。五项裁决由用户确认，用户确认按计划开工（见「决策日志」）。
 GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证」一节的本地验证协议执行。
 
 **Goal:** 一次多 Agent 的 run 结束后，人能回答「谁创建了谁、谁在等谁、时间花在哪、哪个工具最慢、从哪一步开始
@@ -97,7 +98,8 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
 - M2 遗留：危险规则认出 `sh -c` / `eval` / `xargs` / `find -exec` 里的命令与 `find <根> -delete`；git 收尾的摘要
   按文件给出增删行数；Ctrl-C 中断时照样留交接文件。
 - 内核统一 `Redactor`（规则 ID 不变，修掉不幂等，加用户规则与 `secret.named_assignment`）；逐叶脱敏的编码器与
-  `RedactedText` 类型闸；写入点与外发点守卫扩到全仓；宿主私有目录（`.syndica`）对文件工具关闭。
+  `RedactedText` 类型闸；写入点与外发点守卫扩到全仓；宿主私有目录（`.syndica/traces`、`.syndica/handoffs`）对文件
+  工具关闭。
 - 内核 trace 模型、同步的 `Tracer` 插桩、`TraceRecorder`、`TraceStore`（内存、文件）与契约套件。
 - LLM 侧：token 计数、作答平台与平台故障、`ModelRouter` 转发前缀单位。
 - B-19 收口；可复现的 id 与稳定键。
@@ -111,6 +113,7 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
 - 成本（价格表）与预算：价格表归 provider backend（spec 决策 #69），可感知预算归 M8。M3 只记 token 计数。
 - 会话、记忆、产物的持久化：M6、M7。M3 只把它们将来要过的脱敏闸与守卫准备好。
 - 回放时真跑触达外部世界的工具（用户裁决：按记录回放）。手写的 v2 场景不给 `tool_results` 时工具照 v1 真跑。
+- `chat` 会话的回放：随 M6 的会话持久化做，M3 的 chat 只记 `structure`（D15）。
 - 采样；OTel 的 metrics 与 logs；Web 可视化（M9）。
 - `module` 种类的 span：保留种类名不产出，归 M4。
 
@@ -154,11 +157,16 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
 
 - span 种类：`agent turn llm_call tool_call confirmation wait`；`module` 保留。消息的发送是发送方当前 span 上的一个
   事件。边：`spawn`、`message`（发送时的 span → 接收方消费这条消息的那一轮的 turn span，按 message id 连）；
-  `artifact`、`verification` 保留给 M7。等待 span 带被等的对象（`wait.target`）。
-- id：trace id 32 个十六进制字符（随机）；span id 16 个十六进制字符，取 `sha256` 于**长度前缀编码**的结构键：
-  agent =（agent id、周期序号），turn =（agent id、turn），llm_call =（agent id、turn、第几次调用：首次与每次重试
-  分开），tool_call 与 confirmation =（agent id、周期、turn、批内位置），wait =（agent id、该 Agent 的第几次等待）。
-  模型给的 `tool_call.id` 只作属性记录（脱敏后），不进键：它可以重复、可以是空串。
+  `artifact`、`verification` 保留给 M7。
+- `trace show` 要的东西都在 span 与边上，不靠事后推断：派生边带子 Agent 的 id（`child.agent_id`）——惰性启动的子
+  Agent 可能从没有自己的 agent span，而 span id 是单向的哈希；发送事件带接收方（`message.to`）；等待 span 带种类
+  （`wait.kind`：`agent human`）、被等的对象（`wait.target`：Agent 等的是它的 id，人等的是请求的稳定键）与结局
+  （`wait.outcome`，取 `WaitState` 的值）。
+- id：trace id 32 个十六进制字符（随机）；span id 16 个十六进制字符，取 `sha256` 于**长度前缀编码**的结构键，第一个
+  分量是 span 种类（agent、turn、wait 的其余分量形状相同，不带种类就撞）：agent =（agent id、周期序号），turn =
+  （agent id、turn），llm_call =（agent id、turn、第几次调用：首次与每次重试分开），tool_call 与 confirmation =
+  （agent id、周期、turn、批内位置），wait =（agent id、该 Agent 的第几次等待）。模型给的 `tool_call.id` 只作属性记录
+  （脱敏后），不进键：它可以重复、可以是空串。
 - 时间：`Tracer` 收可注入的时钟（纳秒，默认 `time.time_ns`）。状态：`ok`、`error`、`cancelled`。
 
 **D4 统一 `Redactor`：幂等、逐叶、带类型闸。**
@@ -167,7 +175,11 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
   `RuleRedactor(*, secrets=(), rules=())`。十条内置规则的 ID、顺序与占位符 `[REDACTED:<规则 ID>]` 与 M2 一致；
   新增 `secret.named_assignment`：形如 `NAME=value`、`"name": "value"` 的赋值里，名字按 M2 D6 的词表像密钥、值像
   凭证时替换值（`.env` 里的 `sk_live_…`、AWS secret key 这类没有固定格式的值此前一条都不命中）。名字的判定
-  （`looks_secret` 与它的词表）移进内核：它是对名字的纯函数，不读环境。
+  （`looks_secret` 与它的词表）移进内核：它是对名字的纯函数，不读环境。「值像凭证」同样是纯谓词（M2 查磁盘的
+  `_is_path` 留在 CLI）：按 M2 的词表加「8 个字符以上」在 `src/` 里就命中 69 处（`key='llm_retry_attempts'`），所以值要
+  按长度、字符集与熵收紧，并以「在 `src/` 与测试固定装置里零命中」为误报门槛——过不了就推迟这条规则并登记，不放宽
+  门槛。它**不进 `scan`**：`scan` 是 git 收尾的提交闸，一处误报就让 Agent 的每次提交都被拦。映射里的键值对
+  （`{"STRIPE_KEY": "sk_live_…"}`）由 `encode_redacted` 按映射判，逐叶脱敏看不见键与值的关系。
 - **占位符对所有后续规则不透明**：`redact` 先按已有的占位符切段，只在段内匹配，所以 `redact(redact(x)) == redact(x)`
   对所有规则成立；修掉 M2 `url_userinfo` 吃占位符的问题。用户规则 `RedactionRule(rule_id, pattern)` 的 ID 必须以
   `custom.` 开头且不与内置重名，加载时拒绝能匹配空串或能匹配任一占位符的模式。
@@ -184,15 +196,16 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
 
 **D5 守卫扩到全仓：写入点与外发点。**
 
-- 按根目录扫 `src/syndica/cli`、`src/syndica/runner`、`src/syndica/kernel`、`src/syndica/backends`，每个根一个
-  「必须扫到」的锚文件与一次独立的 `os.walk` 交叉核对。
+- 扫整个 `src/syndica`（`__main__.py` 在四个子包之外，它也装配写入与导出），`cli`、`runner`、`kernel`、`backends`
+  与包根各一个「必须扫到」的锚文件，再用一次独立的 `os.walk` 交叉核对。
 - 安全的内容只认：字面量、模块级绑定字面量的名字、直接调用从 `syndica.kernel.redaction` import 的 `redact` /
   `encode_redacted` 的结果、类型标注为 `RedactedText` 的参数。禁止在 `kernel/redaction.py` 之外 `def redact`、
   构造 `RedactedText(...)`、`cast(RedactedText, ...)`。
 - 外发点：`.post` / `.put` / `.request` / `.send` 带 `json=` / `content=` / `data=` 的调用按写入点同样检查。显式白名单
   两类并写明理由：Agent 自己的工具（`LocalWorkspace` 的写文件与子进程管道、`tools/local.py`）；LLM 客户端发给模型
   提供方的请求（M2 D5 的威胁模型：对话本来就要发给提供方，这是 run 的前提，不是观测数据）。`FileTraceStore` 与
-  OTLP 导出器不在白名单里。
+  OTLP 导出器不在白名单里：导出器收一个 `Redactor`，发出的正文是 `content=encode_redacted(...)`（从 store 读出的已经
+  脱敏，再过一遍是幂等的，守卫因此不必为它开例外）。
 
 **D6 `TraceStore` 是第五个 Store Protocol。**
 
@@ -210,7 +223,8 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
 
 - `.syndica/traces/<UTC 时间>-<trace id 前 8 位>/`：`trace.json`（头）、`spans.jsonl`、`edges.jsonl`、
   `payloads/<sha256>.txt`、`replay.json`（场景格式 v2 的同一份 schema，捕获写 JSON：内核不能依赖 PyYAML，PyYAML
-  读 JSON 也会把非 ASCII 字符弄坏）。目录 0700、文件 0600；`.syndica/.gitignore` 照旧。
+  读 JSON 也会把非 ASCII 字符弄坏）。目录 0700、文件 0600。记录 trace 时同样确保 `.syndica/.gitignore` 存在：M2 只在
+  写交接文件时建它，而记录默认开着，不建的话 `.syndica/` 在用户仓库里显示成未跟踪。
 - Agent 运行期间就在写，所以比交接文件更严：`begin` 时以 `O_DIRECTORY | O_NOFOLLOW` 打开 trace 目录，此后所有文件
   经 `dir_fd` 以 `O_NOFOLLOW` 创建；payload 以 `O_EXCL` 创建，`EEXIST` 与读取时都核对 sha256。
 - **宿主私有目录（D17）。**
@@ -231,39 +245,60 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
 
 **D9 B-19 收口：并发窗口里不许写轨迹。** 多调用的段在跑、以及**任何**可观察切点在分发（只有一个观察者也一样）时，
 `Context` 处于冻结状态，追加块报 `ContractViolation`（三件套：哪个切点 / 哪一段、为什么、改到串行的可拦截切点或
-Agent 自己的轮次里写）。冻结用计数而不是布尔（可以嵌套）。写进 hook 契约（`hooks/junctions.py` 的 docstring）；
-`tests/kernel/test_orchestration.py` 里那条从观察者追加的用例改写。
+Agent 自己的轮次里写）。冻结用计数而不是布尔（可以嵌套）。**冻结的只是触发切点的那个 Agent 的 `Context`**；Runtime
+级的切点不冻结任何 `Context`——`AGENT_SPAWN` 分发时子 Agent 的任务已经建好，冻住它，子 Agent 的第一次追加就会失败。
+写进 hook 契约（`hooks/junctions.py` 的 docstring）；`tests/kernel/test_orchestration.py` 里那条从观察者追加的用例改写。
 
 **D10 可复现的 id 与稳定键。**
 
-- 执行器在执行每个工具调用时设一个内核 contextvar「当前工具调用」（agent id、周期、turn、批内位置、模型给的 id）；
-  `spawn` 与 `send` 从它取键；人机请求的事件补上同样的键（现在只带 `request_id`）。
-- `Runtime(..., ids=None)` 收一个 id 源（默认 uuid4）。agent id 在工厂返回之后、任何东西绑定它之前由 id 源覆盖；
-  message id 同样从 id 源取。稳定键：Agent =（创建它的工具调用键）或（宿主，第几次 spawn）或（拓扑槽、键、第几次）；
-  message =（发送时的工具调用键或宿主，第几条）；人的答复 =（它答复的那个请求的键）。按键而不是按全局顺序：几个
-  Agent 并发时创建顺序取决于调度。
-- 后台命令的 handle 与 `request_id` 不需要复现：它们不进模型的上下文（`extra` 不发给提供方），工具按记录回放。
+- 内核 contextvar「当前工具调用」（agent id、周期、turn、批内位置、模型给的 id）。执行器自己不知道 agent、周期与
+  turn（turn 在 `agent.py`，周期只在 `runtime.py`），所以由 Agent 把（agent id、周期、turn）交给执行器，`_execute_one`
+  在 `PRE_TOOL_USE` 之前设、执行完复位；`_drive` 一开始就清掉它——驱动任务经 `create_task` 建在发送方的上下文里，
+  不清就继承了别人的「当前工具调用」。`spawn` 与 `send` 从它取键；人机请求的事件补上同样的键（现在只带
+  `request_id`）。
+- `Runtime(..., ids=None)` 收一个 id 源（默认 uuid4）。**`spawn` 在调用工厂之前**从 id 源取得 agent id，经内核私有的
+  contextvar 交给 `BaseAgent.__init__`（没设时照旧 uuid4）：工厂里就已经有东西绑定 `agent.agent_id`（Delegate / Fork
+  工具、scenario 的选择器表），工厂返回之后再改，`spawn(parent_id=<旧 id>)` 会被注册表拒掉。message id 同样从 id 源
+  取。稳定键：Agent =（创建它的工具调用键）或（宿主，第几次 spawn）或（拓扑槽、键、第几次）；message =（发送时的
+  工具调用键或宿主，第几条）；人的答复 =（它答复的那个请求的键）。按键而不是按全局顺序：几个 Agent 并发时创建顺序
+  取决于调度。
+- 后台命令的 handle 与 `request_id` 不需要复现：handle 原样在记录的工具输出里，工具按记录回放；`request_id` 不进
+  模型的上下文。
 
 **D11 回放：外部世界按记录给出，内核全真并逐项比对（用户裁决）。**
 
 - **模型：** `ReplayLLM` 按（Agent、turn、第几次调用）给出记录的回复——含首次调用与 `RetryModule` 的每次重试、`extra`、
-  原样的参数字节、带类型的错误；原始 run 在某次调用上被打断（kill、shutdown、Ctrl-C）的，回放在同一处阻塞，直到被
-  同样地取消。`RetryModule` 的等待在回放里注入成不等。
+  带类型的错误。工具调用的参数存规范编码（逐叶脱敏后的规范 JSON，解析不了的原串作为一个字符串叶子）：原样存字节
+  会把截断的私钥块漏进 trace，而规范编码改了键序，所以指纹与 T14 的比对都按解析后的参数。键从内核 contextvar
+  「当前 LLM 调用」（agent id、turn、第几次）取：`create(messages, **kwargs)` 不带这些，CLI 按模型名共用模型对象，
+  `RetryModule` 的备用模型跨 Agent 共用。Agent 在每次 `llm.create` 前设它，`RetryModule` 每次重试递增。原始 run 在某次
+  调用上被打断（kill、shutdown、Ctrl-C）的，回放在同一处阻塞，直到被同样地取消（见下面「宿主的动作」）。
+  `RetryModule` 的等待在回放里注入成不等。
 - **指纹：** 原始 run 对每次请求按单元（模型参数、系统提示词、工具定义、每条消息）取指纹：每个单元先逐叶脱敏（D4）
-  再规范编码再取 sha256；`extra` 与 `trust` 不进指纹（它们不发给提供方），提供方身份不进。回放用**记录下的规则集**
-  （内置规则与用户规则，不含宿主环境里的值）对自己的请求做同样的计算，第一个不一致的单元即失败并报出 Agent、轮次与
-  单元；`--allow-divergence` 时只记录。规则集的摘要也记进 trace，两边不一致时报出来。
+  再规范编码再取 sha256，消息里工具调用的参数先解析再规范编码。`trust` 不进指纹（不发给提供方）；`extra` 与提供方
+  身份也不进：`extra` 里有随提供方而变的部分（`llm_route`、`usage`，以及 OpenAI 兼容客户端回传给提供方的
+  `extra_content`），回放不发请求，只比中立的单元。指纹按单元原文的 sha256 缓存：每轮把整段上下文重新脱敏是轮数的
+  平方（实测一个 5 KB 的单元 0.69 ms，50 轮约 3.5 s，跑在事件循环上）。回放用**记录下的规则集**对自己的请求做同样的
+  计算，第一个不一致的单元即失败并报出 Agent、轮次与单元；`--allow-divergence` 时只记录。规则集 =（`RULES_VERSION`、
+  内置规则 ID 的顺序、用户规则的 (id, pattern)），不含宿主环境里的值；`trace.json` 记下用户规则的 (id, pattern) 与
+  摘要；`RULES_VERSION` 由一份黄金语料钉住（内置规则的行为一变就必须升版本）；摘要不一致单独报一种分叉。
 - **工具：** 触达外部世界的工具（`Read Write Edit Glob Grep Bash BashOutput KillBash`）与输出取决于时机的
   `QueryAgent` 按工具调用键返回记录的结局（`ToolResult` 的输出、`meta`、`trust`，或「工具抛了某个异常」），不碰磁盘、
   不起进程；`Delegate Fork SendMessage KillAgent` 与人机工具真跑——它们是内核。
 - **跳过：** 原始 run 里被 `PRE_TOOL_USE` 跳过的调用（CLI 的 git 守卫、`--no-write` 的只读守卫、第三方 hook）记成
   `skipped` 并带最终结果；回放装一个内核侧的 `PRE_TOOL_USE` hook，按调用键原样再跳过。否则这些调用在回放里会走到
   危险闸，被 `untrusted_high_risk` 拦下、给出不同的文字，下一次请求的指纹必然不同。
-- **危险判定与处置：** 回放从宿主档案按顺序重建规则（规则 ID 加参数，工作区根记字面值与解析后的值）、`RuleTablePolicy`
+- **危险判定与处置：** 回放从宿主档案按顺序重建规则（规则 ID 加参数，工作区根记字面值与解析后的值；
+  `path_outside_workspace_rule` 与 `workspace_root_removal_rule` 加仅限关键字的 `real=`，回放直接用记录的解析结果，
+  不在回放的机器上重新解析符号链接）、`RuleTablePolicy`
   的表与 Flag，**真跑** `disposition_of` 与策略；原始 run 记下每次闸门判定（命中的规则、风险等级、溯源、由 Flag 还是
   策略决定、处置），回放逐项比对，不一致、缺少或没被消费的都算分叉。只有人的答复按记录给出。这样丢掉 `UNTRUSTED`
   标记、改坏判定器的改动会在回放里现形（`trust` 不进请求字节，只比轨迹文本看不出来）。
-- **人：** 确认与 AskUser / AskUserQuestion 的答复按请求的键给出；超时、中止、被抢占直接给出结局，不真的等。
+- **人与宿主的动作：** 确认与 AskUser / AskUserQuestion 的答复按请求的键给出。宿主自己的动作单独记进 `host_actions`
+  并在原处重放：提示时读到 EOF 触发的 `runtime.abort` 按它所在的请求记——中止标记会活过那次等待、把下一轮也结束成
+  ABORTED，只给结局不给标记，Agent 就会去要一条从没记录过的回复；Ctrl-C 与关闭记在 run 安静下来的那一处。超时经
+  回放注入的时钟 / broker 钩子触发，不真的等，也不靠桩 broker（那会触发 `runtime.py` 里一条假的 ERROR）。`preempted`
+  由内核自己产生，回放比对而不注入。
 - **宿主档案：** Flag、危险规则与处置表、输出上限、HostFacts、`--max-turns`、`--no-write`、模块名单、拓扑与入口方式
   （含 `entry.trust`）、冻结后的角色（提示词正文、工具顺序、轮数、类式角色的 `impl` 只认内核内置类与白名单）。
 - 每一项记录都必须被消费：回放结束时还有没用上的回复、工具结局、人的答复、闸门判定，算分叉。
@@ -290,18 +325,20 @@ YAML 的标量把 `yes`、`0777` 变成别的类型）。捕获的 `expect` 填�
 - **端点只从用户自己的环境或命令行来**：`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` 设了就
   在每次 run 结束时导出，或用 `trace export <id> --otlp <url>` 手动导出。**项目配置不能设端点**：M2 D15 承认会在不
   信任的仓库里运行，仓库选的端点会收到 trace 的结构（命令、路径、工具名）与用户的鉴权头。`OTEL_EXPORTER_OTLP_HEADERS`
-  只随环境里给的端点发出；明文 HTTP 的非回环地址不带头；头里的值进脱敏器的 `secrets`。导出失败只告警，不影响退出码。
+  只随环境里给的端点发出；明文 HTTP 的非回环地址不带头；头里的值进脱敏器的 `secrets`。run 结束时的自动导出失败只
+  告警、不影响退出码；`trace export` 是用户点名要做的事，失败退出 1。
 
 **D15 CLI。**
 
 - `run` 与 `chat` 收 `--trace`；`trace.level` 与 `redaction.rules` 在 run 开始时快照（Agent 中途改 `.syndica.yaml`
   不影响）。结束时 stderr 打出 trace 目录（经脱敏与转义）；`--handoff` 的交接文件正文写上 trace 目录（front matter
-  不变）。`chat` 的一个会话是一个 trace，每条消息是根 Agent 的一个工作周期；回放文档的 `entry` 记下消息序列。
+  不变）。`chat` 的一个会话是一个 trace，M3 里最高只记 `structure`：`:use <id>` 能把消息发给任何 Agent，回放要按
+  消息记目标，这与会话恢复是同一件事，随 M6 的会话持久化做；要的级别更高时降到 `structure` 并在 stderr 说一句。
 - `trace list`、`trace show <id>`、`trace replay <id> [--allow-divergence]`、`trace export <id> --otlp <url>`、
   `trace prune [--keep N]`（默认 50）。`<id>` 接受完整 id、唯一前缀或目录名。
 - `trace replay` 本身也记一个 trace（`structure` 级，新的 trace id，`source.replay_of` 指向原 trace）。退出码：复现
-  原始结局且没有分叉 0；有分叉或结局不同 1；回放文档读不进来、版本不认识 2。回放引擎在 runner 里，由 `__main__.py`
-  注入 CLI。
+  原始结局且没有分叉 0；有分叉或结局不同 1；回放文档读不进来、版本不认识 2（与 M2 的「参数错误」同一类：交给它的
+  输入不能用）。回放引擎在 runner 里，由 `__main__.py` 注入 CLI。
 - **Ctrl-C：** 退出 130，优先于 1 与 3（中断本身就是没完成的原因）；stderr 没有 traceback。交接文件写出之前被中断：
   照样写交接文件，`status: run_failed`，原因「被中断」，复核标 `skipped`；交接文件写出之后（git 收尾时）被中断：
   照 M2 D13，文件停在 `git: pending`。trace 以 `cancelled` 收尾。
@@ -310,17 +347,21 @@ YAML 的标量把 `yes`、`0777` 变成别的类型）。捕获的 `expect` 填�
 
 - **危险规则（内核，T1）：** 共享分词把 shell 的 `-c` 参数（`sh bash dash zsh ksh`，包括 `-lc`、`-ec` 这类组合选项）
   与 `eval` 的参数当成一段命令递归判定；`xargs` 进 wrapper，带一张选项取值表（`-n -I -P -L -s -d -E -a` 等）；`find`
-  的 `-exec -execdir -ok -okdir` 到 `;` 或 `+` 之间是一条命令；`find <根或根下全部> -delete` 进
-  `shell.workspace_root_removal`。递归深度有上限，超过上限**按命中处理**（宁可多判）。与 HEAD 在 M2 那批 8253 条
-  命令上差分：新增命中逐条过目，少认的逐条给出理由。
+  的 `-exec -execdir -ok -okdir` 到 `;` 或 `+` 之间是一条命令；`find` **不加收窄地**删掉根或根下全部（`-delete`
+  或 `-exec rm {}` 之前没有 `-name`、`-type` 这类测试，或有 `!`、`-o` 把收窄翻成「其余全部」）进
+  `shell.workspace_root_removal`——`find . -name '*.pyc' -delete` 很常见，在开发期被无条件拦下就没有别的写法可走。
+  递归深度有上限，超过上限**按命中处理**（宁可多判）。与 HEAD 差分：新增命中逐条过目，少认的逐条给出理由。
 - **git 收尾的摘要（CLI，T2）：** 每个改动路径后面给出 `+N −M`（`git diff --numstat`，新文件数行数，二进制写「二进制」）。
 - **Ctrl-C（CLI，T2）：** 见 D15 末条。
 
-**D17 宿主私有目录。** `LocalWorkspace(..., private=())` 收一组相对根的目录（CLI 传 `('.syndica',)`）；文件工具
-（Read、Write、Edit，以及 Glob / Grep 的显式路径）拒绝这些目录下的路径，比较不分大小写、按目录身份（与 M2 的 `.git`
-保护同样做法），给模型的错误说明为什么。理由：trace 里存着此前标成不可信的工具输出，`Read` 读回来是可信的，等于
-绕过 spec §12.2 的溯源升级；Agent 改得到以前的交接文件（M2 遗留）也一并关掉。Bash 照样读得到（它的输出本来就是
-不可信的），这条挡的是失手与洗白，不是蓄意（真正的边界是 M5 的沙箱）。
+**D17 宿主私有目录。** `LocalWorkspace(..., private=())` 收一组相对根的目录（CLI 传
+`('.syndica/traces', '.syndica/handoffs')`）；文件工具（Read、Write、Edit，以及 Glob / Grep 的显式路径）拒绝这些目录下
+的路径，比较不分大小写、按目录身份（与 M2 的 `.git` 保护同样做法），给模型的错误说明为什么。理由：trace 里存着此前
+标成不可信的工具输出，`Read` 读回来是可信的，等于绕过 spec §12.2 的溯源升级；Agent 改得到以前的交接文件（M2 遗留）
+也一并关掉。不整个关 `.syndica`：本仓的 Worker 提示词让它把长输出存到 `.syndica/tmp/` 再读（`docs/agents/worker.md`，
+由 `tests/cli/test_repo_config.py` 钉住，T18 就跑这份提示词）。Bash 照样读写得到（它的输出本来就是不可信的）；
+Bash 写下的文件再经 `Read` 读回就成了可信内容，这条洗白的路 D17 不关。所以这条挡的是失手与读回 trace，不是蓄意
+（真正的边界是 M5 的沙箱）。
 
 ---
 
@@ -330,7 +371,7 @@ YAML 的标量把 `yes`、`0777` 变成别的类型）。捕获的 `expect` 填�
 
 | 用法 | 语义 |
 |---|---|
-| `run|chat --trace off\|structure\|replay\|full` | 记录级别，默认 `trace.level` 或 `replay` |
+| `run|chat --trace off\|structure\|replay\|full` | 记录级别，默认 `trace.level` 或 `replay`（`chat` 最高 `structure`） |
 | `trace list` | 列出 trace（UTC 时间、id、命令、状态、Agent 数、span 数、大小） |
 | `trace show <id>` | 时间线与三个回答：谁创建了谁、谁在等谁、最慢的工具调用 |
 | `trace replay <id> [--allow-divergence]` | 回放；0 复现、1 分叉或结局不同、2 回放文档不可用 |
@@ -355,7 +396,8 @@ redaction:
 ### trace schema `syndica.trace/1`
 
 - `trace.json`：`schema`、`trace_id`、`started_ns`、`ended_ns`、`status`（`ok error cancelled`）、`level`、
-  `redaction`（规则集的 sha256 与用户规则的 ID）、`source`（命令行参数、配置文件的 sha256、syndica 版本、git commit、
+  `redaction`（规则集的 sha256、`RULES_VERSION` 与用户规则的 (id, pattern)）、`source`（命令行参数、配置文件的 sha256、
+  syndica 版本、git commit、
   `replay_of`）。所有字符串经逐叶脱敏。
 - `spans.jsonl` 每行一个 span：`span_id`、`parent_span_id`、`kind`、`name`、`agent_id`、`start_ns`、`end_ns`、
   `status`、`attributes`、`events`（`[{name, time_ns, attributes}]`）。`edges.jsonl` 每行一条边：`kind`、
@@ -367,9 +409,14 @@ redaction:
   `llm.request_digest` str、`tool.name` str（未知工具为 `<unknown>`）、`tool.call_id` str、`tool.index` int、
   `tool.outcome` str、`tool.exit_code` int 或 null、`tool.timed_out` bool、`danger.rule_ids` list[str]、
   `danger.risk` str、`danger.provenance` str、`danger.decided_by` str（`flag policy`）、`danger.disposition` str、
-  `confirmation.outcome` str（`approved rejected timed_out aborted preempted`）、`wait.target` str、`message.id` str。
-- `tool.outcome` 取值：`ok error aborted judge_failed not_executed skipped blocked rejected preempted no_channel
-  unknown_tool bad_arguments`（与执行器追加结果块的位置一一对应）。
+  `confirmation.outcome` str（取内核 `ConfirmationOutcome` 的值：`approved rejected timeout preempted aborted`）、
+  `wait.kind` str（`agent human`）、`wait.target` str、`wait.outcome` str（取 `WaitState` 的值）、`message.id` str、
+  `message.to` str（发送事件上）、`child.agent_id` str（派生边上）。
+- `tool.outcome` 取值：`ok error aborted judge_failed not_executed skipped blocked rejected timeout preempted
+  confirmation_aborted no_channel unknown_tool bad_arguments interrupted`，与追加结果块的位置一一对应：`rejected
+  timeout preempted confirmation_aborted` 是确认的四种结局（`_confirmation_result`），与第 9 步中止补的 `aborted`
+  分开；`interrupted` 是恢复时修补被打断的批次（`agent.py` 的 `_repair_interrupted_batch`，在执行器之外，插桩点随之
+  扩到那里）。
 - 版本升级要有读旧版本的兼容测试；枚举的成员→取值表由一条整体断言钉住。
 
 ### 场景格式 v2（手写 YAML 与捕获 JSON 共用一份 schema）
@@ -377,15 +424,17 @@ redaction:
 在 v1 之上：`version: 2`；`host`（`flags`、`danger.rules`（有序，`{id, params}`）、`danger.table`、`output_limit`、
 `host_facts`、`max_turns`、`no_write`、`modules`）；`agents.<Role>` 可以用 `frozen`（`system_prompt` 正文、`tools`、
 `max_turns`、`impl`）代替 `manifest`；`instances` 带稳定键（`key: {tool_call: …}`、`{host: n}`、`{slot, key, n}`）；
-回合的 `content` 可以是列表、带 `extra`、`tool_calls[].arguments_raw`、带类型的 `raises`、`request_digests`；实例的
-`tool_results`（按调用键：`output`、`meta`、`trust`，或 `raised: {type, message}`）、`skipped`（按调用键的最终结果）、
-`gate`（按调用键的闸门判定）；`responses` 按请求的键，`kind` 加 `timeout abort preempted`；`ids`（稳定键 → 记录的 id）；
-`entry.mode`（`query send slot chat`）、`entry.trust`、`entry.messages`（`chat`）；拓扑槽不再受 v1 的限制；`source`。
+回合的 `content` 可以是列表、带 `extra`、`tool_calls[].arguments`（规范编码，见 D11）、带类型的 `raises`、
+`request_digests`；实例的 `tool_results`（按调用键：`output`、`meta`、`trust`，或 `raised: {type, message}`）、
+`skipped`（按调用键的最终结果）、`gate`（按调用键的闸门判定）；`responses` 按请求的键，`kind` 加 `timeout`；
+`host_actions`（`abort` 按请求的键，`interrupt` 与 `shutdown` 按它发生的位置）；`ids`（稳定键 → 记录的 id）；
+`entry.mode`（`query send slot`）、`entry.trust`；拓扑槽不再受 v1 的限制；`source`。
 自由文本可以内联或写成 `{payload: <sha256>}`；占位符 `[REDACTED:…]` 是合法内容。
 
 ### 内核 API 增量（都向后兼容）
 
-- `Runtime(..., tracer=None, ids=None)`；`LocalWorkspace(..., private=())`。
+- `Runtime(..., tracer=None, ids=None)`；`LocalWorkspace(..., private=())`；`path_outside_workspace_rule(root, *,
+  real=None)` 与 `workspace_root_removal_rule(root, *, real=None)`。
 - `syndica.kernel.trace`：`Tracer`、`NoopTracer`、`TraceRecorder`、`Span`、`CausalityEdge`、`SpanKind`、`EdgeKind`、
   `TraceLevel`、`TraceHeader`、`PayloadRef`；`syndica.kernel.protocols.trace.TraceStore`；`MemoryTraceStore`、
   `FileTraceStore`；契约套件 `TraceStoreContract`；回放文档的 schema 模块。
@@ -409,9 +458,8 @@ redaction:
 **Files:** `kernel/danger.py`、危险规则的测试；差分脚本不入库。
 
 - 见 D16。**每个成员各一条用例**：`sh bash dash zsh ksh` 各自的 `-c`、组合选项 `bash -lc`、`eval`、`xargs` 选项表里
-  每一个吃取值的选项、`-exec -execdir -ok -okdir` 与两种终止符、`find . -delete` 与 `find "$PWD" -delete`（后者仍是
-  命令替换的已知盲区）；默认规则因此多认出的（`xargs rm -rf`、`sh -c "curl … | sh"`）。递归深度上限 + 1 的输入按命中
-  处理。
+  每一个吃取值的选项、`-exec -execdir -ok -okdir` 与两种终止符、`find . -delete` 与 `find "$PWD" -delete`；默认规则
+  因此多认出的（`xargs rm -rf`、`sh -c "curl … | sh"`）。递归深度上限 + 1 的输入按命中处理。
 - 变异：去掉任一个 shell 名、任一个 xargs 选项、`-ok` / `-okdir`；`-c` 只认完全相同的写法；超过深度上限时放行。
 
 #### T2 — git 摘要的增删行数；Ctrl-C 中断照样留交接文件
@@ -433,18 +481,23 @@ redaction:
 - `encode_redacted`：一个 PEM 块、带引号与非 ASCII 的环境变量值、`user:pass@` 的 URL 分别放进嵌套的映射与列表里，
   编码后既不出现原文、也仍是合法 JSON，且解码后在原位置是对应的占位符。
 - 用户规则：合法、不合法正则、ID 前缀、与内置重名、匹配空串、匹配占位符各一条。
+- `RULES_VERSION` 与一份黄金语料：语料的输出变了而版本没升，测试失败（D11 的规则集摘要靠它）。
+- `named_assignment`：在 `src/` 与测试固定装置里零命中（误报门槛，过不了就推迟这条规则并登记）；不进 `scan`；映射
+  `{"STRIPE_KEY": "sk_live_…"}` 经 `encode_redacted` 后值被替换。
 - 变异：漏掉一条内置规则；用户规则排在内置之前；去掉占位符切段（幂等破坏）；`encode_redacted` 改成先编码后脱敏；
   `named_assignment` 的值判定放宽到任意值（误报）或收紧到只认固定格式（漏报）。
 
 #### T4 — 守卫扩到全仓；`RedactedText` 类型闸；宿主私有目录
 
 **Files:** `tests/test_write_points.py`（由 `tests/cli/test_write_points.py` 迁出并扩展）、`kernel/redaction.py`、
-`kernel/local_workspace.py`、`kernel/tools/local.py`、`cli/host.py`、测试。
+`kernel/local_workspace.py`、`kernel/tools/local.py`、`cli/host.py`、`tests/cli/test_handoff_run.py`（它用 Write 在
+`.syndica/handoffs` 建挡路的文件，改用 Bash）、测试。
 
 - 见 D5、D17。每个扫描根各有锚文件与 `os.walk` 交叉核对；在每个根里种一个违规样例证明被抓到：白名单之外写文件、
   `client.post(json=...)`、另起一个 `def redact(self, x): return x`、`cast(RedactedText, ...)`、白名单目录里的新文件。
-- 私有目录：Read / Write / Edit 拒 `.syndica/…`（含 `.SYNDICA/…` 与经符号链接的路径）；Glob / Grep 显式指向它时同样
-  拒；Bash 不受影响；错误说明写明为什么。
+- 私有目录：Read / Write / Edit 拒 `.syndica/traces/…` 与 `.syndica/handoffs/…`（含大小写变体与经符号链接的路径）；
+  Glob / Grep 显式指向它们时同样拒；`.syndica/tmp/…` 照常可读写（Worker 的提示词用它）；Bash 不受影响；错误说明写明
+  为什么。
 
 ### 阶段二：trace 模型与捕获
 
@@ -461,10 +514,12 @@ redaction:
 
 #### T6 — 可复现的 id 与「当前工具调用」
 
-**Files:** `kernel/runtime.py`、`kernel/tool_executor.py`、`kernel/tools/human.py`、测试。
+**Files:** `kernel/runtime.py`、`kernel/agent.py`、`kernel/tool_executor.py`、`kernel/tools/human.py`、测试。
 
-- 见 D10。默认 id 源与现状一致（uuid4，形式不变）；注入的 id 源对 agent 与 message 都生效且在任何东西绑定之前；
-  「当前工具调用」在工具执行期间可见、执行完复位、并发段里各调用互不串线；人机请求的事件带上键。
+- 见 D10。默认 id 源与现状一致（uuid4，形式不变）；注入的 id 源对 agent 与 message 都生效且在任何东西绑定之前——
+  一个在工厂里把 `agent.agent_id` 绑进 Delegate 工具的用例，注入 id 源之后派活照样被注册表接受；「当前工具调用」在
+  `PRE_TOOL_USE` 里就可见、执行完复位、并发段里各调用互不串线、不经 `_drive` 漏进被唤醒的 Agent；人机请求的事件
+  带上键。
 - 稳定键：三个子 Agent 以与记录相反、且非单调的顺序被创建时，各拿到自己记录的 id。
 
 #### T7 — 内核插桩：同步的 `Tracer` 与因果边
@@ -473,9 +528,12 @@ redaction:
 
 - 见 D2、D3。插桩前先列出 D2 列的每个「中间没有挂起点」的窗口，各写一条用例证明插桩没有在其中引入挂起点
   （tracer 在回调里断言自己处在同步调用中、计数事件循环的调度槽位不变）。
-- 每个插桩点一条用例；`tool.outcome` 的每个取值各一条（含钩子看不见的那些：未知工具、坏参数、跳过、阻断、拒绝、
-  抢占、没有确认通道、判定器出错、未执行、中止）；被取消的 Agent 的 agent span 以 `cancelled` 收尾；`RetryModule`
-  的每次重试是一个独立的 llm_call span（`llm.attempt`）。
+- 每个插桩点一条用例；`tool.outcome` 的每个取值各一条（含钩子看不见的那些：未知工具、坏参数、跳过、阻断、确认的
+  四种结局、没有确认通道、判定器出错、未执行、第 9 步中止、恢复时修补的批次）；被取消的 Agent 的 agent span 以
+  `cancelled` 收尾；`RetryModule` 的每次重试是一个独立的 llm_call span（`llm.attempt`），「当前 LLM 调用」在首次与
+  每次重试里各自正确（D11 的回放键靠它）。
+- `trace show` 要的属性：派生边的 `child.agent_id`（含一个惰性启动、从没跑过的子 Agent）、发送事件的 `message.to`、
+  等待的 `wait.kind` / `wait.target` / `wait.outcome`（Agent 等与人等各一条，四种结局各一条）。
 - 因果：Delegate 派出的三个子 Agent 各有一条从对应 Delegate 调用 span 出发的派生边；被 `SendMessage` 唤醒的 zombie
   只有消息边、没有派生边；三条消息各自连到接收方消费它的那一轮，互不串线。
 - span id：断言完整的「结构键 → id」映射（三轮以上、三个调用以上、含一个重复的 `tool_call.id` 与一个空串 id），且两两
@@ -495,7 +553,8 @@ redaction:
 **Files:** `kernel/trace.py`（或 `kernel/trace_recorder.py`）、测试。
 
 - `TraceRecorder(store, redactor, *, level, clock)` 实现 `Tracer`：同步缓冲、一个写入任务按序落盘、`finish` 排空；
-  按 D8 的级别决定记什么；所有字符串经 `encode_redacted`；请求按 D11 取逐单元指纹；宿主档案与人的答复由宿主报给它。
+  按 D8 的级别决定记什么；所有字符串经 `encode_redacted`；请求按 D11 取逐单元指纹（按单元原文的 sha256 缓存）；人的
+  答复由宿主报给它。宿主档案的 schema 到 T12 才有，T9 与 T11 不写它，从 T12 起写、T14 补进往返。
 - 脱敏用例：每个通道一个**不同的**假密钥（提示词、命令行参数、工具参数、工具输出、`meta`、模型回复、`extra`、
   提供方错误文本、未知工具名、模型给的调用 id、环境变量样例），每个规则族至少一个；断言 store 里解码后的每个字符串
   与每个 16 字符片段都不含任何原文，**且**每个通道的位置上确实是预期的占位符（防止「什么都没记」也通过）。
@@ -507,7 +566,8 @@ redaction:
 （契约 docstring）、`tests/kernel/test_orchestration.py`、测试。
 
 - 见 D9。三个声明可并发的工具、它们的 `POST_TOOL_USE` hook 写块 → `ContractViolation`；只有一个观察者的 `TURN_END`
-  写块 → 同上；嵌套分发里冻结计数正确复位；串行的单调用段写块照旧可以。
+  写块 → 同上；嵌套分发里冻结计数正确复位；串行的单调用段写块照旧可以；`AGENT_SPAWN` 的观察者分发期间子 Agent 的
+  第一次追加照常（Runtime 级切点不冻结任何 `Context`）。
 - 变异：计数不复位（之后所有写入都被拒）；只冻结工具段不冻结观察者分发；只在两个以上观察者时冻结。
 
 阶段二收口：阶段审计。
@@ -520,8 +580,9 @@ redaction:
 
 - 见 D6、D7、D8、D15。`FileTraceStore` 过契约套件；`O_NOFOLLOW` / `dir_fd`（在 run 中途把 `payloads` 换成符号链接，
   写入被拒、不写到链接指向的地方）、`O_EXCL` 与 sha256 核对各一条；写失败（目录只读）时 run 照常、stderr 一条说明。
-- CLI：`run` / `chat` 默认记录、四个级别、`trace.level` 快照、宿主档案（规则带参数、处置表、Flag、`--max-turns`、
-  `--no-write`、模块、拓扑与入口）与人的答复报给 recorder、交接文件写 trace 目录、Ctrl-C 时以 `cancelled` 收尾。
+- CLI：`run` / `chat` 默认记录（`chat` 最高 `structure`，D15）、四个级别、`trace.level` 快照、人的答复报给 recorder、
+  交接文件写 trace 目录、`.syndica/.gitignore` 照样建、Ctrl-C 时以 `cancelled` 收尾。宿主档案（规则带参数、处置表、
+  Flag、`--max-turns`、`--no-write`、模块、拓扑与入口）从 T12 起报。
 
 #### T12 — 场景格式 v2：内核的 schema 与 runner 的两种读法
 
@@ -534,9 +595,12 @@ redaction:
 
 #### T13 — 回放执行
 
-**Files:** `runner/replay.py`、`runner/scenario.py`、测试。
+**Files:** `runner/replay.py`、`runner/scenario.py`、`kernel/danger.py`（`real=`）、测试。
 
-- 见 D11。`ReplayLLM`：首次调用与重试各按键给出；被打断的调用处阻塞；逐单元指纹第一处不同即失败并报出单元。工具桩：
+- 见 D11。`ReplayLLM`：首次调用与重试各按「当前 LLM 调用」的键给出（两个 Agent 共用同一个模型对象时互不串线）；被
+  打断的调用处阻塞；逐单元指纹第一处不同即失败并报出单元。`host_actions`：EOF 触发的中止在原请求处重放、下一轮照样
+  结束成 ABORTED；超时经注入的时钟触发，零真实等待，日志里没有假的 ERROR；`preempted` 只比对。`real=`：工作区根是
+  符号链接、回放机器上解析结果不同，判定照样与记录一致。工具桩：
   测试期间禁止任何子进程与写模式的 `open`（打补丁断言零次），编排与人机工具真跑，`QueryAgent` 走桩。跳过 hook 原样
   再跳过。危险判定真跑并与记录逐项比对（改坏判定器、丢掉一个 `UNTRUSTED` 标记各一条用例证明报出分叉）。
 - 宿主档案重建：每个字段一条用例证明回放里生效。
@@ -548,10 +612,11 @@ redaction:
 **Files:** `kernel/trace.py`（recorder 写回放文档）、`tests/integration/test_capture_replay.py`。
 
 - recorder 在 `finish` 时写 `replay.json`，`expect` 填原始结局。
-- 往返：同一个脚本化 CLI run（含派活、消息、确认、AskUser、守卫跳过的 `git commit`——发生在一次不可信的 Bash 输出
-  之后——、被阻断的调用、失败的工具、`--no-write`、一个被 kill 的子 Agent）捕获后回放：两份轨迹逐块相同（比 `role`、
-  `content`、`tool_calls`、`trust`，不比 `extra`），闸门判定逐项相同，`expect` 全部成立；一个以错误结束的 run 回放出
-  同样的错误；一个 Ctrl-C 中断的 run 回放到同一处。
+- 往返：脚本化的 CLI run 捕获后回放。`--no-write` 会去掉 Bash，所以分两次 run：一次含派活、消息、确认、AskUser、
+  守卫跳过的 `git commit`（发生在一次不可信的 Bash 输出之后）、被阻断的调用、失败的工具、一个被 kill 的子 Agent；
+  另一次是 `--no-write`。两份轨迹逐块相同（比 `role`、`content`、`trust`，`tool_calls` 按解析后的参数比，不比
+  `extra`），闸门判定逐项相同，`expect` 全部成立；一个以错误结束的 run 回放出同样的错误；一个 Ctrl-C 中断的 run
+  回放到同一处。
 - 变异：recorder 漏记一种工具结局；工具桩按调用顺序而不是按调用键取；指纹在脱敏前算（固定装置里让一个可脱敏的值
   进入之后的请求，这条才杀得死）；跳过 hook 不装。
 
@@ -630,6 +695,18 @@ redaction:
   照绿（改为真跑判定并逐项比对）；项目配置选的 OTLP 端点会收到用户的鉴权头（端点只从环境或命令行来）；trace 经 `Read`
   读回成可信内容（宿主私有目录对文件工具关闭）；唤醒被误记成派生（派生边在 `spawn` 里发）；任务顺序里的隐藏依赖（id 与
   CLI 记录提前到用到它们的任务之前）；Ctrl-C 与 M2 退出码、`git: pending` 的关系；以及每个任务里最弱的那条断言。
+- 2026-10-01 用户确认按计划开工，先做 T1、T2，第二轮评审的结果回来后先修计划再进入 T3。
+- 2026-10-01 第二轮评审（5 High、9 Medium、7 Low）逐条修进本文。High：agent id 在工厂返回之后才覆盖太晚，工厂里已经
+  绑定了它（改为 `spawn` 先取 id、经内核私有的 contextvar 交给 `BaseAgent`）；整个关掉 `.syndica` 会弄坏本仓 Worker 的
+  `.syndica/tmp` 工作流（私有目录收窄到 `traces` 与 `handoffs`）；「原样的参数字节」与逐叶脱敏矛盾（参数存规范编码，
+  指纹与往返比对按解析后的参数）；宿主自己的动作（EOF 触发的中止、Ctrl-C、超时）没法回放（加 `host_actions` 与注入的
+  时钟）；`tool.outcome` 仍不是一一对应、拼写与内核枚举不一致（补三种结局、沿用内核拼写）。Medium：「当前工具调用」
+  要由 Agent 交出 (id、周期、turn) 并在 `_drive` 里清掉；回放模型的键改从「当前 LLM 调用」取；危险规则工厂加 `real=`；
+  规则集摘要的定义（`RULES_VERSION` 加黄金语料）；`named_assignment` 的误报门槛与不进提交闸；导出器经 `encode_redacted`
+  发出、守卫扫整个 `src/syndica`；冻结只作用于触发切点的 Agent；`trace show` 需要的属性；chat 的消息可以发给任何
+  Agent（chat 在 M3 只记 `structure`，回放随 M6 做）。Low：记录时建 `.syndica/.gitignore`；`trace export` 失败退出 1；
+  T14 分两次 run；指纹按单元缓存；「`extra` 不发给提供方」这条理由是错的（OpenAI 兼容客户端会回传 `extra_content`）；
+  宿主档案从 T12 起写。
 
 ## 风险与遗留（开工前登记）
 
@@ -639,4 +716,5 @@ redaction:
   「整段脱敏」不同，表现为一次误报的分叉；`--allow-divergence` 与报告里的单元定位让它可以被认出来。
 - **体量。** 「可回放」级别逐字存工具结果（`Read` 一次最多 2000 行）；按内容寻址去重之后，T18 记下真实 run 的大小。
 - **第三方并发工具的写法被冻结拦下**（T10）：有意的契约收紧，写进 hook 契约与发布说明。
-- **宿主私有目录只挡文件工具**（D17）：Bash 照样读写得到，真正的边界是 M5 的沙箱。
+- **宿主私有目录只挡文件工具**（D17）：Bash 照样读写得到，Bash 写下的文件经 `Read` 读回也照样成了可信内容；真正的
+  边界是 M5 的沙箱。
