@@ -43,6 +43,9 @@ from syndica.kernel import ContextBlock, ScriptedLLM, ScriptedTurn, ToolCall
 
 _SECRET = 'Zq9' + 'Lm4Xw7Pk2Rt8Vb5Nc3Jd6'
 _MESSAGE = 'add new\n\n宿主复核：\n- 通过：true —— passed\n'
+# 读钩子写下的 pid / 标记的用例里的提交超时：钩子得在超时之前跑到写文件那一行，否则断言读不到它。
+# 机器忙时提交本身就能用掉两秒。
+_HOOK_STARTS_WITHIN = 5.0
 
 
 def _call(call_id: str, name: str, **arguments: object) -> ToolCall:
@@ -1489,7 +1492,7 @@ def test_a_post_commit_hook_that_redirects_the_push_stops_the_push(tmp_path: Pat
 def test_a_slow_post_commit_hook_reports_the_commit_that_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    monkeypatch.setattr(git_finish, 'LOCAL_TIMEOUT', 2.0)
+    monkeypatch.setattr(git_finish, 'LOCAL_TIMEOUT', _HOOK_STARTS_WITHIN)
     monkeypatch.setattr(git_finish, '_STOP_GRACE', 0.5)
     root = _repository(tmp_path)
     pid = tmp_path / 'pid'
@@ -1568,7 +1571,7 @@ def test_a_filter_selected_by_the_agents_gitattributes_never_runs(tmp_path: Path
 
 
 def test_a_hook_that_ignores_sigterm_is_killed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(git_finish, 'LOCAL_TIMEOUT', 2.0)
+    monkeypatch.setattr(git_finish, 'LOCAL_TIMEOUT', _HOOK_STARTS_WITHIN)
     monkeypatch.setattr(git_finish, '_STOP_GRACE', 0.5)
     root = _repository(tmp_path)
     pid = tmp_path / 'pid'
@@ -1584,7 +1587,7 @@ def test_a_hook_that_ignores_sigterm_is_killed(tmp_path: Path, monkeypatch: pyte
 def test_a_timed_out_hook_gets_sigterm_before_it_is_killed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    monkeypatch.setattr(git_finish, 'LOCAL_TIMEOUT', 2.0)
+    monkeypatch.setattr(git_finish, 'LOCAL_TIMEOUT', _HOOK_STARTS_WITHIN)
     monkeypatch.setattr(git_finish, '_STOP_GRACE', 5.0)
     root = _repository(tmp_path)
     marker = tmp_path / 'marker'
