@@ -65,6 +65,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'HooksCenter',
     'HostFacts',
     'HumanInteractionModule',
+    'IdSource',
     'InMemoryAgentRegistry',
     'InMemoryMessageBroker',
     'Junction',
@@ -98,6 +99,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'SafetyModule',
     'ScriptedLLM',
     'ScriptedTurn',
+    'StableKey',
     'StopReason',
     'Subscription',
     'SyndicaError',
@@ -189,6 +191,7 @@ _RUNTIME_INIT: tuple[tuple[str, str, bool], ...] = (
     ('modules', 'KEYWORD_ONLY', True),
     ('flags', 'KEYWORD_ONLY', True),
     ('confirmation_handler', 'KEYWORD_ONLY', True),
+    ('ids', 'KEYWORD_ONLY', True),
 )
 _RUNTIME_SPAWN: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),
@@ -260,6 +263,9 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # - `looks_secret`：宿主从自己的环境里挑密钥值时用；内核的公开入口只收挑好的值。
 # - `write_all` / `write_redacted`：包内落盘只经它们（写入点守卫认得的写法）；宿主不需要它们就能
 #   用任何一个公开入口。
+# - `RandomIds`：`Runtime(ids=None)` 的默认值，宿主不传就是它。「当前工具调用」与它的那几个进出
+#   函数（`current_tool_call`、`ToolCallKey`、`entering_tool_call` 等）是内核插桩与回放的接缝，
+#   trace 的公开面定下来时再判。
 # - trace 的模型、`TraceStore` 协议、内存实现与它的契约套件：还没有公开入口收一个 TraceStore。第一个
 #   是 `TraceRecorder`，trace 的公开面到那时一起定，契约套件随协议一起进承诺面。
 _WITHHELD: tuple[str, ...] = (
@@ -289,6 +295,7 @@ _WITHHELD: tuple[str, ...] = (
     'QueryAgent',
     'RULES_VERSION',
     'RULE_IDS',
+    'RandomIds',
     'Read',
     'ReadOnlyKwarg',
     'RedactedText',
@@ -300,6 +307,7 @@ _WITHHELD: tuple[str, ...] = (
     'SpanKind',
     'SpanStatus',
     'TRACE_SCHEMA',
+    'ToolCallKey',
     'ToolExecutor',
     'TraceHeader',
     'TraceLevel',
@@ -310,15 +318,24 @@ _WITHHELD: tuple[str, ...] = (
     'TurnGate',
     'TurnGateDecision',
     'Write',
+    'assigned_agent_id',
+    'assigning_agent_id',
+    'becoming_owner',
     'correlation_of',
+    'current_tool_call',
     'disposition_of',
     'encode_redacted',
+    'entering_tool_call',
     'git_state_change_rule',
     'install_plugins',
+    'leaving_tool_call',
     'looks_secret',
+    'next_key',
     'parse_mapping',
     'path_outside_workspace_rule',
+    'peek_key',
     'register_tool',
+    'releasing_agent_id',
     'resolve_tool_names',
     'tool_name_disagreement',
     'validate_agent_factories',

@@ -135,6 +135,7 @@ from syndica.kernel.danger import (
 )
 from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction, ReadOnlyKwarg
+from syndica.kernel.ids import ToolCallKey, entering_tool_call, leaving_tool_call
 from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
 
 __all__ = ['DEFAULT_MAX_TOOL_CONCURRENCY', 'ToolExecutor', 'validate_max_concurrency']
@@ -646,7 +647,15 @@ class ToolExecutor:
         self._confirmation_agent_id = agent_id
         self._confirmation = callback
 
-    async def execute_tool_calls(self, ctx: Context, tool_calls: list[ToolCall]) -> None:
+    async def execute_tool_calls(
+        self,
+        ctx: Context,
+        tool_calls: list[ToolCall],
+        *,
+        origin: tuple[str, int, int] | None = None,
+    ) -> None:
+        """`origin` 是（agent id、工作周期、轮）：执行器自己不知道这三样，「当前工具调用」的键由
+        Agent 交进来（M3 D10）。不交时不设「当前工具调用」。"""
         provenance = provenance_of(ctx)
         safety = [self._concurrency_safe(call) for call in tool_calls]
         execution_gate = _ExecutionGate()
@@ -663,6 +672,12 @@ class ToolExecutor:
                     provenance,
                     execution_gate,
                     confirmation_lock,
+                    keys=[
+                        None
+                        if origin is None
+                        else ToolCallKey(*origin, index, tool_calls[index].id)
+                        for index in segment
+                    ],
                 )
             )
             for call, outcome in zip(calls, outcomes, strict=True):
@@ -691,6 +706,8 @@ class ToolExecutor:
         provenance: TrustLevel,
         execution_gate: _ExecutionGate,
         confirmation_lock: asyncio.Lock,
+        *,
+        keys: list[ToolCallKey | None],
     ) -> list[ToolResult | BaseException]:
         """跑一段：段内并发，交回与 `calls` 同序的结果或异常。
 
@@ -708,6 +725,7 @@ class ToolExecutor:
                         execution_gate,
                         confirmation_lock,
                         has_siblings=False,
+                        key=keys[0],
                     )
                 ]
             # 收进结果列表的只有 Exception，取消沿这条路直接上抛。并发那条路做不到这件事
@@ -724,8 +742,9 @@ class ToolExecutor:
                     execution_gate,
                     confirmation_lock,
                     has_siblings=True,
+                    key=key,
                 )
-                for call in calls
+                for call, key in zip(calls, keys, strict=True)
             ),
             return_exceptions=True,
         )
@@ -811,6 +830,33 @@ class ToolExecutor:
         )
 
     async def _execute_one(
+        self,
+        ctx: Context,
+        call: ToolCall,
+        provenance: TrustLevel,
+        execution_gate: _ExecutionGate,
+        confirmation_lock: asyncio.Lock,
+        *,
+        has_siblings: bool,
+        key: ToolCallKey | None,
+    ) -> ToolResult:
+        """在「当前工具调用」里跑一次调用：`PRE_TOOL_USE` 之前设、执行完复位（M3 D10）。单元素的段
+        跑在 Agent 自己的任务里，不复位就漏进下一批；并发段的每个调用在自己的任务里，互相看不见。"""
+        token = None if key is None else entering_tool_call(key)
+        try:
+            return await self._execute_in_scope(
+                ctx,
+                call,
+                provenance,
+                execution_gate,
+                confirmation_lock,
+                has_siblings=has_siblings,
+            )
+        finally:
+            if token is not None:
+                leaving_tool_call(token)
+
+    async def _execute_in_scope(
         self,
         ctx: Context,
         call: ToolCall,

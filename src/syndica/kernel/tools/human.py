@@ -13,6 +13,7 @@ from syndica.kernel.agent import BaseAgent
 from syndica.kernel.context import TrustLevel
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import Event, EventBus
+from syndica.kernel.ids import peek_key
 from syndica.kernel.modules import FlagValue, RuntimeModule
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.waiting import UserInput, WaitResult, WaitState
@@ -138,6 +139,11 @@ class _HumanTool(Tool):
         payload: dict[str, Any] = {'request_id': waiter.request_id, 'question': prompt}
         if options:
             payload['options'] = list(options)
+        # 这次请求的稳定键（`wait_for` 随后用同一个键登记它）：`request_id` 每次都不同，回放按键
+        # 给出人的答复（M3 D10）。
+        key = peek_key('request')
+        if key is not None:
+            payload['key'] = list(key)
         await self._runtime.events.emit(Event(kind=kind, agent_id=self._agent_id, payload=payload))
         result = await self._runtime.wait_for(self._agent_id, waiter)
         if result.state is not WaitState.ANSWERED:

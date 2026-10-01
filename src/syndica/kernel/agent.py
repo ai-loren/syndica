@@ -90,6 +90,7 @@ from syndica.kernel.danger import DangerJudge, DangerPolicy, Disposition, valida
 from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
 from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction, JunctionRef
+from syndica.kernel.ids import assigned_agent_id
 from syndica.kernel.llm import LLM, ContextOverflowError
 from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.tool import Tool, validate_tool_names
@@ -394,9 +395,10 @@ class BaseAgent:
         events: EventBus,
     ) -> None:
         self.options: AgentOptions = options
-        # 全量 uuid4 hex 而非截断：id 撞车不是软失败——AgentRegistry.register 拒绝重复 id，
-        # 撞上的那个 Agent 直接注册不进去。
-        self.agent_id: str = uuid.uuid4().hex
+        # `Runtime.spawn` 在调用工厂之前从 id 源取好的那个（M3 D10）；不经 spawn 构造时照旧 uuid4。
+        # 全量 hex 而非截断：id 撞车不是软失败——AgentRegistry.register 拒绝重复 id，撞上的那个 Agent
+        # 直接注册不进去。
+        self.agent_id: str = assigned_agent_id() or uuid.uuid4().hex
         # 本 Agent 自己的一层，外层是宿主交来的那个中心。两层合成一条链，本层在前（spec §5.3）。
         self._module_hooks = hooks
         self._hooks = HooksCenter(outer=hooks)
@@ -410,6 +412,8 @@ class BaseAgent:
         )
         self._context = Context()
         self._current_turn = 0
+        # 第几个工作周期（每次 `run` 一个）：工具调用的稳定键带着它（M3 D3 / D10）。
+        self._cycle = 0
         self._running = False
         # 默认开着，但什么都不拦；真正的门由 `Runtime.spawn` 经 `_attach_gate` 装上。构造器不接
         # `gate=`：那个参数的类型不在公开面，放在这里就等于给宿主一个写不出标注的入口。
@@ -626,6 +630,7 @@ class BaseAgent:
             self._running = False
 
     async def _run(self, query: str | None, trust: TrustLevel) -> Context:
+        self._cycle += 1
         ctx = self._context
         ctx.stop_reason = None
         _repair_interrupted_batch(ctx)
@@ -692,7 +697,9 @@ class BaseAgent:
                 await self._end_turn(ctx, turn, response)
                 return StopReason.COMPLETED
 
-            await self._executor.execute_tool_calls(ctx, response.tool_calls)
+            await self._executor.execute_tool_calls(
+                ctx, response.tool_calls, origin=(self.agent_id, self._cycle, turn)
+            )
             await self._end_turn(ctx, turn, response)
         ctx.stop_reason = StopReason.MAX_TURNS
         return StopReason.MAX_TURNS

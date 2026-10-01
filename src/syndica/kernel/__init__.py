@@ -60,6 +60,7 @@ from syndica.kernel.hooks import (
     JunctionKind,
     JunctionRef,
 )
+from syndica.kernel.ids import IdSource, StableKey
 from syndica.kernel.llm import (
     LLM,
     CachePrefixProvider,
@@ -142,6 +143,7 @@ __all__ = [
     'HooksCenter',
     'HostFacts',
     'HumanInteractionModule',
+    'IdSource',
     'InMemoryAgentRegistry',
     'InMemoryMessageBroker',
     'Junction',
@@ -175,6 +177,7 @@ __all__ = [
     'SafetyModule',
     'ScriptedLLM',
     'ScriptedTurn',
+    'StableKey',
     'StopReason',
     'Subscription',
     'SyndicaError',

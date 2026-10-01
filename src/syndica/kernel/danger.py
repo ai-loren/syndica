@@ -50,6 +50,7 @@ from typing import Any, Protocol, cast, runtime_checkable
 from syndica.kernel.context import ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import Event, EventBus
+from syndica.kernel.ids import peek_key
 from syndica.kernel.tool import Tool
 from syndica.kernel.waiting import Confirmation, WaitResult, WaitState
 
@@ -212,22 +213,23 @@ class MailboxConfirmationHandler:
         runtime: _ConfirmationRuntime,
         request: ConfirmationRequest,
     ) -> ConfirmationOutcome:
+        payload: dict[str, object] = {
+            'request_id': request.request_id,
+            'tool_call_id': request.tool_call_id,
+            'tool_name': request.tool_name,
+            'arguments': request.arguments,
+            'verdict': {
+                'rule_id': request.verdict.rule_id,
+                'level': request.verdict.level.value,
+                'reason': request.verdict.reason,
+            },
+        }
+        # 这次请求的稳定键（`wait_for` 随后用同一个键登记它）：回放按键给出人的答复（M3 D10）。
+        key = peek_key('request')
+        if key is not None:
+            payload['key'] = list(key)
         await runtime.events.emit(
-            Event(
-                kind='tool_confirmation_requested',
-                agent_id=request.agent_id,
-                payload={
-                    'request_id': request.request_id,
-                    'tool_call_id': request.tool_call_id,
-                    'tool_name': request.tool_name,
-                    'arguments': request.arguments,
-                    'verdict': {
-                        'rule_id': request.verdict.rule_id,
-                        'level': request.verdict.level.value,
-                        'reason': request.verdict.reason,
-                    },
-                },
-            )
+            Event(kind='tool_confirmation_requested', agent_id=request.agent_id, payload=payload)
         )
         waited = await runtime.wait_for(
             request.agent_id,
