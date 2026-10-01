@@ -1,0 +1,461 @@
+"""内核插桩：同步的 `Tracer` 与因果边（M3 D2 / D3）。
+
+**每一次调用都是同步的。** 内核里有几处正确性依赖「这两句之间没有挂起点」（spawn 的登记与建任务、
+停在邮箱上、装等待令牌之后复检中止、`run` 的检查与置位）；一个会 await 的 tracer 会在这些窗口里插进
+调度，而且只在会挂起的存储下才插，内存存储下的测试照绿。记录要落盘就由 tracer 自己缓冲、自己的任务
+去写。
+
+span id 由结构键确定（D3）：同一个结构键在两次运行里得到同一个 id，回放因此能逐个对上。键里只放与
+调度无关的事实（agent id、周期、轮、批内位置、出处里的第几个），模型给的 `tool_call.id` 不进键——它
+可以重复，可以是空串。
+
+tracer 坏掉不改变 run：内核经 `_Tracing` 调它。同步调用里不可能收到 asyncio 的取消（取消只在 await
+处进入协程），所以 tracer 抛出的任何东西都是它自己的缺陷，只有 `KeyboardInterrupt` 与 `SystemExit`
+照常上抛——与 asyncio 运行同步回调的规矩一致。其余的第一次记一条 ERROR，此后只计数，Runtime 关闭时
+报一次总数：插桩点坐在内核原本不会抛出的几段之间（建任务之前、拆除的收据之后、答复离开邮箱之后），
+一个漏出来的 `CancelledError` 会让 Agent 停在半路且一行日志都没有。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import inspect
+import logging
+from collections.abc import Callable, Collection, Mapping
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
+from types import TracebackType
+from typing import Protocol, cast, runtime_checkable
+
+from syndica.kernel.errors import ContractViolation
+from syndica.kernel.trace import AttributeValue, CausalityEdge, EdgeKind, SpanKind, SpanStatus
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    'NullTracer',
+    'Tracer',
+    'back_in_spans',
+    'current_llm_call',
+    'current_span_id',
+    'llm_attempt',
+    'outside_any_span',
+    'span_id_of',
+]
+
+
+@runtime_checkable
+class Tracer(Protocol):
+    """接收内核插桩的一方。
+
+    方法全是同步的，**不得 await、不得让出控制权**：内核在不允许挂起的窗口里调它们。时间由 tracer
+    自己取：内核不传时间戳，一个 tracer 用墙钟、另一个用注入的时钟都不需要内核知道。
+
+    `attributes` 是这次调用专属的一份，tracer 可以留着它。span 的开始与结束一一配对：结束时
+    `status` 说明它怎么结束（取消也是一种结束），结束时的属性补在开始时那一份之上。
+    """
+
+    def start_span(
+        self,
+        span_id: str,
+        parent_span_id: str | None,
+        kind: SpanKind,
+        name: str,
+        agent_id: str,
+        attributes: dict[str, AttributeValue],
+    ) -> None: ...
+
+    def end_span(
+        self, span_id: str, status: SpanStatus, attributes: dict[str, AttributeValue]
+    ) -> None: ...
+
+    def add_event(self, span_id: str, name: str, attributes: dict[str, AttributeValue]) -> None: ...
+
+    def add_edge(self, edge: CausalityEdge) -> None: ...
+
+
+class NullTracer:
+    """默认 tracer：什么都不记。"""
+
+    def start_span(
+        self,
+        span_id: str,
+        parent_span_id: str | None,
+        kind: SpanKind,
+        name: str,
+        agent_id: str,
+        attributes: dict[str, AttributeValue],
+    ) -> None:
+        return None
+
+    def end_span(
+        self, span_id: str, status: SpanStatus, attributes: dict[str, AttributeValue]
+    ) -> None:
+        return None
+
+    def add_event(self, span_id: str, name: str, attributes: dict[str, AttributeValue]) -> None:
+        return None
+
+    def add_edge(self, edge: CausalityEdge) -> None:
+        return None
+
+
+def span_id_of(kind: SpanKind, *key: str | int) -> str:
+    """结构键 → span id（16 个十六进制字符）。
+
+    第一个分量是 span 种类：agent、turn、wait 的其余分量形状可以相同。每个分量带类型标记与长度前缀：
+    不带长度，`('ab', 'c')` 与 `('a', 'bc')` 撞；不带类型，`'1'` 与 `1` 撞。
+    """
+    digest = hashlib.sha256()
+    for part in cast(tuple[object, ...], (kind.value, *key)):
+        if isinstance(part, bool) or not isinstance(part, str | int):
+            raise ContractViolation(
+                expected='span 的结构键只由字符串与整数组成',
+                received=f'{(kind.value, *key)!r} 里有 {type(part).__name__}',
+                next_action='把这个分量换成它的字符串或整数形式再取 span id',
+            )
+        tag, data = ('s', part.encode('utf-8')) if isinstance(part, str) else ('i', b'%d' % part)
+        digest.update(b'%s%d:' % (tag.encode('ascii'), len(data)) + data)
+    return digest.hexdigest()[:16]
+
+
+@dataclass
+class _OpenSpan:
+    """一个还开着的 span。`attributes` 是结束时补上的那些；没有接 tracer 时也照样可写。
+
+    `owner` 是开它的那一份 `_Tracing`：当前 span 是模块级的 contextvar，工具里嵌着跑的另一个
+    Runtime 会继承它，而那不是它的 span——认了，它的事件与边就记进别人的 trace。
+
+    `ended` 之后它仍可以当边的起点（边只引用 id），但不再收事件：span 收尾之后就交出去了。工具
+    里 `create_task` 出来、活得比这次调用长的任务继承着它，会在它结束之后才发消息。
+    """
+
+    span_id: str
+    owner: _Tracing
+    attributes: dict[str, AttributeValue] = field(default_factory=dict[str, AttributeValue])
+    ended: bool = False
+
+
+_CURRENT_SPAN: ContextVar[_OpenSpan | None] = ContextVar('syndica_current_span', default=None)
+
+
+def current_span_id() -> str | None:
+    """此刻所在的 span；不在任何 span 里时是 None。"""
+    span = _CURRENT_SPAN.get()
+    return None if span is None else span.span_id
+
+
+@dataclass
+class _LlmCall:
+    tracing: _Tracing
+    agent_id: str
+    turn: int
+    attempts: int = 0
+    in_flight: bool = False
+
+
+_LLM_CALL: ContextVar[_LlmCall | None] = ContextVar('syndica_current_llm_call', default=None)
+
+_Detached = tuple[Token[_OpenSpan | None], Token[_LlmCall | None]]
+
+
+def outside_any_span() -> _Detached:
+    """在当前上下文里清掉当前 span 与「当前 LLM 调用」，交回复位用的凭据。
+
+    内核自己起的任务（驱动、收尾、关机）经 `create_task` 建在调用方的上下文里：不清，它们的事件与边
+    就记在调用方的 span 上（那个 span 可能早已结束），在模型调用的 hook 里派出的子 Agent 还会读到
+    父的「当前 LLM 调用」——回放按它取回复。在任务一开始清的不必复位；在调用方的上下文里临时离开的
+    要用 `back_in_spans` 复位。
+    """
+    return _CURRENT_SPAN.set(None), _LLM_CALL.set(None)
+
+
+def back_in_spans(tokens: _Detached) -> None:
+    span, call = tokens
+    _LLM_CALL.reset(call)
+    _CURRENT_SPAN.reset(span)
+
+
+def current_llm_call() -> tuple[str, int, int] | None:
+    """此刻在飞的那次模型调用：（agent id、轮、第几次）。首次是 1，`RetryModule` 的每次重试与
+    备用模型各加 1。只在 `create` 在飞时有值：模型调用前后的 hook 里、工具里都是 None——它们自己
+    发起的模型调用不在这份计数里，回放模型按这个键取记录的回复（D11），给它一个属于别人的键只会
+    交回别人的那条回复。"""
+    call = _LLM_CALL.get()
+    if call is None or not call.in_flight:
+        return None
+    return (call.agent_id, call.turn, call.attempts)
+
+
+def _reset_quietly(var: ContextVar[object], token: Token[object]) -> None:
+    # 协程没被取消就被 GC 关掉时，finally 跑在另一份上下文里，reset 会抛 ValueError；那份上下文
+    # 随即丢弃，复位与否无所谓，但 span 的收尾不能因此丢掉。
+    try:
+        var.reset(token)
+    except ValueError:
+        pass
+
+
+class _Span:
+    """`with` 一个 span：进入时开始并成为当前 span，退出时按退出的方式收尾并复位。"""
+
+    def __init__(
+        self,
+        tracing: _Tracing,
+        kind: SpanKind,
+        key: tuple[str | int, ...],
+        *,
+        name: str,
+        agent_id: str,
+        parent: str | None,
+        attributes: dict[str, AttributeValue],
+    ) -> None:
+        self._tracing = tracing
+        self._kind = kind
+        self._name = name
+        self._agent_id = agent_id
+        self._parent = parent
+        self._attributes = attributes
+        self.span = _OpenSpan(span_id_of(kind, *key), tracing)
+        self._token: Token[_OpenSpan | None] | None = None
+
+    def __enter__(self) -> _OpenSpan:
+        span_id = self.span.span_id
+        self._tracing.call(
+            'start_span',
+            lambda tracer: tracer.start_span(
+                span_id, self._parent, self._kind, self._name, self._agent_id, self._attributes
+            ),
+        )
+        self._tracing.open_spans += 1
+        self._token = _CURRENT_SPAN.set(self.span)
+        return self.span
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self._token is not None:
+            _reset_quietly(
+                cast(ContextVar[object], _CURRENT_SPAN), cast(Token[object], self._token)
+            )
+        self.span.ended = True
+        self._tracing.open_spans -= 1
+        if exc_type is None:
+            status = SpanStatus.OK
+        elif issubclass(exc_type, Exception):
+            status = SpanStatus.ERROR
+        else:
+            status = SpanStatus.CANCELLED
+        span_id = self.span.span_id
+        attributes = dict(self.span.attributes)
+        self._tracing.call('end_span', lambda tracer: tracer.end_span(span_id, status, attributes))
+
+
+class _Tracing:
+    """内核与 tracer 之间的那一层：算 span id、维护当前 span、隔离 tracer 的失败、把消息边连上。
+
+    一个 Runtime 一份，交给它管的每个 Agent 与执行器；不经 Runtime 构造的 Agent 用自己的一份
+    （默认什么都不记）。
+    """
+
+    def __init__(self, tracer: Tracer | None = None) -> None:
+        self.tracer: Tracer = NullTracer() if tracer is None else tracer
+        # 当前这个 tracer 失败了几次。换 tracer 时由换的一方报掉并清零：总数报给谁、是谁的。
+        self.failures = 0
+        # 还开着的 span 数。不为零时换 tracer，开始与结束就落在两个 tracer 上。
+        self.open_spans = 0
+        # 消息 id → 发送时的 span 与收件人。消费时取走；投递失败、收件人被销毁、它的邮箱随一次收尾
+        # 被摘掉时丢掉，否则没人消费的消息会让这张表只增不减。
+        self._sent_from: dict[str, tuple[str, str]] = {}
+
+    def call(self, step: str, invoke: Callable[[Tracer], object]) -> None:
+        tracer = self.tracer
+        try:
+            returned = invoke(tracer)
+            if (
+                inspect.isawaitable(returned)
+                or inspect.isgenerator(returned)
+                or inspect.isasyncgen(returned)
+            ):
+                # 写成 async def 或生成器的方法交回一个对象就返回了，方法体一行都没跑：记录静默
+                # 丢失，只在 GC 时留下一行看不出主体的警告。关掉它，按一次失败报。
+                if inspect.iscoroutine(returned) or inspect.isgenerator(returned):
+                    returned.close()
+                raise TypeError(
+                    f'{step} 交回了一个 {type(returned).__name__}，而内核不 await、不迭代 tracer'
+                )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as error:
+            self.failures += 1
+            if self.failures == 1:
+                logger.error(
+                    '期望: tracer %s 收下内核的每一次插桩。'
+                    ' 实际: 它在 %s 里抛出 %s: %s；这一次的记录丢了，run 照常进行。'
+                    ' 下一步: 修好这个 tracer（它的方法必须同步返回、不抛异常、不是 async def '
+                    '或生成器）；此后它的失败只计数，Runtime 关闭时报一次总数。',
+                    type(tracer).__name__,
+                    step,
+                    type(error).__name__,
+                    error,
+                )
+
+    def _current(self) -> _OpenSpan | None:
+        span = _CURRENT_SPAN.get()
+        return span if span is not None and span.owner is self else None
+
+    def span(
+        self,
+        kind: SpanKind,
+        key: tuple[str | int, ...],
+        *,
+        name: str,
+        agent_id: str,
+        attributes: Mapping[str, AttributeValue] | None = None,
+        detached: bool = False,
+    ) -> _Span:
+        """开一个 span。父 span 是此刻的当前 span；`detached` 的没有父（agent span：Agent 之间的
+        关系只由边表达，驱动任务建在发送方的上下文里，继承来的当前 span 是唤醒它的人）。"""
+        current = None if detached else self._current()
+        return _Span(
+            self,
+            kind,
+            key,
+            name=name,
+            agent_id=agent_id,
+            parent=None if current is None else current.span_id,
+            attributes=dict(attributes or {}),
+        )
+
+    def event(self, name: str, attributes: Mapping[str, AttributeValue]) -> None:
+        """当前 span 上的一个事件；不在本 Runtime 任何开着的 span 里时不记。"""
+        span = self._current()
+        if span is None or span.ended:
+            return
+        span_id = span.span_id
+        owned = dict(attributes)
+        self.call('add_event', lambda tracer: tracer.add_event(span_id, name, owned))
+
+    def spawned(self, child_id: str, cycle: int) -> None:
+        """派生边：此刻的当前 span → 子 Agent 下一个工作周期（`cycle`）的 agent span。子 Agent 也许
+        从没跑过（惰性启动），边上因此带着它的 id。"""
+        source = self._current()
+        if source is None:
+            return
+        edge = CausalityEdge(
+            kind=EdgeKind.SPAWN,
+            source_span_id=source.span_id,
+            target_span_id=span_id_of(SpanKind.AGENT, child_id, cycle),
+            attributes={'child.agent_id': child_id},
+        )
+        self.call('add_edge', lambda tracer: tracer.add_edge(edge))
+
+    def sending(self, message_id: str, receiver: str) -> None:
+        """记下这条消息从哪个 span 发出。在投递之前记：会挂起的 broker 下，收件人可能在 publish
+        返回之前就已经消费了它。"""
+        span = self._current()
+        if span is not None:
+            self._sent_from[message_id] = (span.span_id, receiver)
+
+    def sent(self, message_id: str, receiver: str, *, delivered: bool) -> None:
+        """投递有了结局：投到了就在发出它的 span 上记一个事件；没投到，消费不会发生，来源丢掉。"""
+        if not delivered:
+            self._sent_from.pop(message_id, None)
+            return
+        self.event('message.sent', {'message.id': message_id, 'message.to': receiver})
+
+    def consumed(self, message_id: str) -> None:
+        """消息边：发送时的 span → 此刻消费它的 span（注入它的那一轮，或等到它的那次等待）。"""
+        sent = self._sent_from.pop(message_id, None)
+        target = self._current()
+        if sent is None or target is None:
+            return
+        edge = CausalityEdge(
+            kind=EdgeKind.MESSAGE,
+            source_span_id=sent[0],
+            target_span_id=target.span_id,
+            attributes={'message.id': message_id},
+        )
+        self.call('add_edge', lambda tracer: tracer.add_edge(edge))
+
+    def forget_receiver(self, agent_id: str, *, keep: Collection[str] = ()) -> None:
+        """发给它、还没被消费的消息再也不会被消费（它被销毁，或邮箱随一次收尾被摘掉）。`keep` 是
+        已经从邮箱取出、暂存在控制块里的那些：它们随唤醒注入，还会被消费。"""
+        stale = [
+            message_id
+            for message_id, (_, receiver) in self._sent_from.items()
+            if receiver == agent_id and message_id not in keep
+        ]
+        for message_id in stale:
+            del self._sent_from[message_id]
+
+    def llm_call(self, agent_id: str, turn: int) -> _LlmScope:
+        """一轮里的模型调用：首次与重试共用这一份计数（D3 / D11）。"""
+        return _LlmScope(_LlmCall(self, agent_id, turn))
+
+
+class _LlmScope:
+    def __init__(self, call: _LlmCall) -> None:
+        self._call = call
+        self._token: Token[_LlmCall | None] | None = None
+
+    def __enter__(self) -> None:
+        self._token = _LLM_CALL.set(self._call)
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self._token is not None:
+            _reset_quietly(cast(ContextVar[object], _LLM_CALL), cast(Token[object], self._token))
+
+
+class _Attempt:
+    """一次 `llm.create`：在当前模型调用里数一次、开一个 llm_call span，在飞期间「当前 LLM 调用」
+    有值。"""
+
+    def __init__(self, call: _LlmCall | None, model: object) -> None:
+        self._call = call
+        self._model = model
+        self._span: _Span | None = None
+
+    def __enter__(self) -> None:
+        call = self._call
+        if call is None:
+            return
+        call.attempts += 1
+        attributes: dict[str, AttributeValue] = {'llm.attempt': call.attempts}
+        if isinstance(self._model, str) and self._model:
+            attributes['llm.model'] = self._model
+        self._span = call.tracing.span(
+            SpanKind.LLM_CALL,
+            (call.agent_id, call.turn, call.attempts),
+            name='llm',
+            agent_id=call.agent_id,
+            attributes=attributes,
+        )
+        self._span.__enter__()
+        call.in_flight = True
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self._call is not None:
+            self._call.in_flight = False
+        if self._span is not None:
+            self._span.__exit__(exc_type, exc, tb)
+
+
+def llm_attempt(llm: object) -> _Attempt:
+    """包住一次 `llm.create`。不在 Agent 的模型调用里（没有 `llm_call` 作用域）时什么都不做。模型名
+    取 `llm.config.model`（`LLM` 协议给的是 config）。"""
+    config = getattr(llm, 'config', None)
+    return _Attempt(_LLM_CALL.get(), getattr(config, 'model', None))

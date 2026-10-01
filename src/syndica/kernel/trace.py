@@ -111,6 +111,7 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'message.id': 'str',
         'message.to': 'str',
         'child.agent_id': 'str',
+        'agent.id': 'str',
     }
 )
 

@@ -107,7 +107,7 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any, cast
@@ -121,6 +121,7 @@ from syndica.kernel.context import (
     strictest_trust,
 )
 from syndica.kernel.danger import (
+    NO_RULE_MATCHED,
     BlockHighRisk,
     ConfirmationOutcome,
     ConfirmationRequest,
@@ -130,6 +131,7 @@ from syndica.kernel.danger import (
     DangerVerdict,
     Disposition,
     RiskLevel,
+    _escalated,  # pyright: ignore[reportPrivateUsage]
     disposition_of,
     validate_danger_options,
 )
@@ -137,6 +139,12 @@ from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction, ReadOnlyKwarg
 from syndica.kernel.ids import ToolCallKey, entering_tool_call, leaving_tool_call
 from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
+from syndica.kernel.trace import AttributeValue, SpanKind
+from syndica.kernel.tracing import (
+    _OpenSpan,  # pyright: ignore[reportPrivateUsage]
+    _Span,  # pyright: ignore[reportPrivateUsage]
+    _Tracing,  # pyright: ignore[reportPrivateUsage]
+)
 
 __all__ = ['DEFAULT_MAX_TOOL_CONCURRENCY', 'ToolExecutor', 'validate_max_concurrency']
 
@@ -476,6 +484,39 @@ def _gated_result(call: ToolCall, verdict: DangerVerdict, disposition: Dispositi
     )
 
 
+def _answered_in_batch(ctx: Context) -> int:
+    """末尾那一批已经落了几块结果：最后一个 assistant 块之后的 tool 块数。"""
+    count = 0
+    for block in reversed(ctx.current_traj):
+        if block.role == 'assistant':
+            return count
+        if block.role == 'tool':
+            count += 1
+    return count
+
+
+def _recorded_exit(meta: Mapping[str, object]) -> dict[str, AttributeValue]:
+    """命令类工具在 `meta` 里报的退出码与是否超时（Bash）。类型不对的不记：trace 的属性是闭集。"""
+    recorded: dict[str, AttributeValue] = {}
+    exit_code = meta.get('exit_code')
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        recorded['tool.exit_code'] = exit_code
+    timed_out = meta.get('timed_out')
+    if isinstance(timed_out, bool):
+        recorded['tool.timed_out'] = timed_out
+    return recorded
+
+
+# 被确认拦下的结果块在 trace 里的结局（`tool.outcome`）。中止单列成 `confirmation_aborted`：
+# 工具没有跑，与整批被一个异常打断的 `aborted` 不是一回事。
+_CONFIRMATION_OUTCOMES: Mapping[ConfirmationOutcome, str] = {
+    ConfirmationOutcome.REJECTED: 'rejected',
+    ConfirmationOutcome.TIMEOUT: 'timeout',
+    ConfirmationOutcome.PREEMPTED: 'preempted',
+    ConfirmationOutcome.ABORTED: 'confirmation_aborted',
+}
+
+
 def _confirmation_result(
     call: ToolCall,
     verdict: DangerVerdict,
@@ -604,6 +645,33 @@ class ToolExecutor:
         self._untrusted_high_risk = Disposition.BLOCK
         self._confirmation_agent_id: str | None = None
         self._confirmation: ConfirmationCallback | None = None
+        self._tracing = _Tracing()
+
+    def _attach_tracing(self, tracing: _Tracing) -> None:
+        self._tracing = tracing
+
+    def _tool_span(self, key: ToolCallKey, call: ToolCall) -> _Span:
+        """一次调用的 span。每个追加结果块的地方各有一个（D2），包括没执行的、恢复时补上的。
+
+        没注册的名字记成 `<unknown>`：那是模型写的任意文本，只有这里知道它不是工具名；原文在
+        结果块与回复里。
+        """
+        name = call.name if call.name in self._tools else '<unknown>'
+        return self._tracing.span(
+            SpanKind.TOOL_CALL,
+            key.key[1:],
+            name=name,
+            agent_id=key.agent_id,
+            attributes={'tool.name': name, 'tool.call_id': call.id, 'tool.index': key.index},
+        )
+
+    def _trace_interrupted(
+        self, origin: tuple[str, int, int], repaired: Sequence[tuple[int, ToolCall]]
+    ) -> None:
+        """恢复时补上的那批：调用早已没有在跑，span 只是一个时刻，结局是 `interrupted`。"""
+        for index, call in repaired:
+            with self._tool_span(ToolCallKey(*origin, index, call.id), call) as span:
+                span.attributes['tool.outcome'] = 'interrupted'
 
     def _retarget(self, tools: dict[str, Tool]) -> None:
         """换掉查表用的那张表。
@@ -696,7 +764,9 @@ class ToolExecutor:
             if failure is not None:
                 break
         if failure is not None and failed_call is not None:
-            self._append_not_executed(ctx, tool_calls[handled:], failed_call, failure)
+            self._append_not_executed(
+                ctx, tool_calls[handled:], failed_call, failure, origin=origin, start=handled
+            )
             raise failure
 
     async def _run_segment(
@@ -792,20 +862,44 @@ class ToolExecutor:
             _report_unanswered_concurrency(tool, call, exc)
             return False
 
-    def append_unexecuted(self, ctx: Context, calls: Sequence[ToolCall], *, why: str) -> None:
-        """给尚未落过结果的调用各补一块「没有执行」的 tool block。
+    def append_unexecuted(
+        self,
+        ctx: Context,
+        calls: Sequence[ToolCall],
+        *,
+        why: str,
+        origin: tuple[str, int, int] | None,
+        start: int = 0,
+    ) -> None:
+        """给本批里还没有结果的调用各补一块「没有执行」的 tool block。
 
-        已经有结果的 id 跳过：同一条调用不得写两块。不带 `extra['interrupted']`——那是
-        `_repair_interrupted_batch` 给「跑过、副作用未知」用的，resume 扫到它会把真话改成未知。
+        `calls[0]` 在整批里的位置是 `start`。已经有结果的跳过：同一条调用不得写两块。认「有没有
+        结果」按位置不按 id：本批的结果块按批内顺序跟在 assistant 块后面，数一数就知道前几个答过了；
+        按 id 认，模型在更早的轮里用过同一个 id（`call_0`、空串）就会被当成答过，本批于是缺一块、
+        恢复时被说成「跑过、副作用未知」。不带 `extra['interrupted']`——那是
+        `_repair_interrupted_batch` 的。
+
+        `origin` 是（agent id、周期、轮），没有默认值：漏传就静默少记了这几次调用的 span。给 None
+        表示不记。
         """
-        answered = {block.tool_call_id for block in ctx.current_traj if block.role == 'tool'}
-        for call in calls:
-            if call.id in answered:
+        answered = _answered_in_batch(ctx)
+        for index, call in enumerate(calls, start):
+            if index < answered:
                 continue
             self._append(ctx, call, ToolResult(output=_unexecuted_output(call, why)))
+            if origin is not None:
+                with self._tool_span(ToolCallKey(*origin, index, call.id), call) as span:
+                    span.attributes['tool.outcome'] = 'not_executed'
 
     def _append_not_executed(
-        self, ctx: Context, pending: list[ToolCall], failed: ToolCall, exc: BaseException
+        self,
+        ctx: Context,
+        pending: list[ToolCall],
+        failed: ToolCall,
+        exc: BaseException,
+        *,
+        origin: tuple[str, int, int] | None,
+        start: int,
     ) -> None:
         self.append_unexecuted(
             ctx,
@@ -814,6 +908,8 @@ class ToolExecutor:
                 f'同批的 {failed.name}（id={failed.id}）'
                 f'中止于 {type(exc).__name__}，本批调用就此停下。'
             ),
+            origin=origin,
+            start=start,
         )
 
     def _append(self, ctx: Context, call: ToolCall, result: ToolResult) -> None:
@@ -840,21 +936,50 @@ class ToolExecutor:
         has_siblings: bool,
         key: ToolCallKey | None,
     ) -> ToolResult:
-        """在「当前工具调用」里跑一次调用：`PRE_TOOL_USE` 之前设、执行完复位（M3 D10）。单元素的段
-        跑在 Agent 自己的任务里，不复位就漏进下一批；并发段的每个调用在自己的任务里，互相看不见。"""
-        token = None if key is None else entering_tool_call(key)
-        try:
-            return await self._execute_in_scope(
+        """在「当前工具调用」与它的 span 里跑一次调用：`PRE_TOOL_USE` 之前设、执行完复位（M3 D10）。
+        单元素的段跑在 Agent 自己的任务里，不复位就漏进下一批；并发段的每个调用在自己的任务里，
+        互相看不见。
+
+        抛出的两种结局在这里记：判定抛出时结果块是 `judge_failed`，别的异常让整批停下、结果块是
+        `aborted`——两块都由调用方在 span 收尾之后才追加。
+
+        结局说的是这次执行，不是结果块：同段的兄弟被取消时整段的结果块都不落，已经跑完的这一次
+        仍记它自己的结局，恢复时补上的那块另有一个 `interrupted` 的 span。
+        """
+        if key is None:
+            result, _ = await self._execute_in_scope(
                 ctx,
                 call,
                 provenance,
                 execution_gate,
                 confirmation_lock,
                 has_siblings=has_siblings,
+                traced=None,
             )
+            return result
+        token = entering_tool_call(key)
+        try:
+            with self._tool_span(key, call) as span:
+                try:
+                    result, outcome = await self._execute_in_scope(
+                        ctx,
+                        call,
+                        provenance,
+                        execution_gate,
+                        confirmation_lock,
+                        has_siblings=has_siblings,
+                        traced=(key, span),
+                    )
+                except _JudgeFailure:
+                    span.attributes['tool.outcome'] = 'judge_failed'
+                    raise
+                except Exception:
+                    span.attributes['tool.outcome'] = 'aborted'
+                    raise
+                span.attributes['tool.outcome'] = outcome
+                return result
         finally:
-            if token is not None:
-                leaving_tool_call(token)
+            leaving_tool_call(token)
 
     async def _execute_in_scope(
         self,
@@ -865,8 +990,10 @@ class ToolExecutor:
         confirmation_lock: asyncio.Lock,
         *,
         has_siblings: bool,
-    ) -> ToolResult:
-        """跑一次调用。
+        traced: tuple[ToolCallKey, _OpenSpan] | None,
+    ) -> tuple[ToolResult, str]:
+        """跑一次调用，交回结果块与它的结局（trace 的 `tool.outcome`）。`traced` 是这次调用的键与
+        它的 span；不记 trace 时是 None。
 
         `has_siblings` 没有默认值：它决定 hook 改写参数之后这次调用按什么溯源结论过闸，漏传一处
         就是默认升级在那条路上静默失效，而默认值会把这件事变成静态检查看不见的疏漏。它由
@@ -877,18 +1004,18 @@ class ToolExecutor:
             misregistered = _misregistered(self._tools, call.name)
             if misregistered is not None:
                 raise misregistered
-            return _unknown_tool_result(call, sorted(self._tools))
+            return _unknown_tool_result(call, sorted(self._tools)), 'unknown_tool'
 
         args: dict[str, Any] = {}
         if call.arguments.strip():
             try:
                 decoded = json.loads(call.arguments)
             except json.JSONDecodeError as exc:
-                return _bad_arguments_result(call, tool, f'解析失败于 {exc.msg}（位置 {exc.pos}）')
+                detail = f'解析失败于 {exc.msg}（位置 {exc.pos}）'
+                return _bad_arguments_result(call, tool, detail), 'bad_arguments'
             if not isinstance(decoded, dict):
-                return _bad_arguments_result(
-                    call, tool, f'解析出的是 {type(decoded).__name__}，不是 JSON 对象'
-                )
+                detail = f'解析出的是 {type(decoded).__name__}，不是 JSON 对象'
+                return _bad_arguments_result(call, tool, detail), 'bad_arguments'
             args = cast(dict[str, Any], decoded)
 
         # 只读视图只活在这一次触发里：就地改一份没有声明的参数躲得过下面那个作者判据，而那正是
@@ -899,7 +1026,7 @@ class ToolExecutor:
             Junction.PRE_TOOL_USE, tool_call=call, tool=tool, args=handed
         )
         if pre.skip:
-            return _skipped_result(call, pre.result)
+            return _skipped_result(call, pre.result), 'skipped'
         rewritten_args = pre.get('args', handed)
         if not isinstance(rewritten_args, dict):
             raise _rewrite_rejected(Junction.PRE_TOOL_USE, 'args', dict, rewritten_args)
@@ -924,21 +1051,23 @@ class ToolExecutor:
         # 就地写会撞上一条指名 pre_tool_use 的错误——而那个切点根本不读 modified['args']。
         args = dict(cast(dict[str, Any], rewritten_args))
 
-        gated, exclusive, execution_args = await self._gated(
+        gated, gate_outcome, exclusive, execution_args = await self._gated(
             call,
             tool,
             args,
             provenance,
             confirmation_lock,
+            traced=traced,
         )
         if gated is not None:
-            return gated
+            return gated, gate_outcome
         args = execution_args
 
         async with execution_gate.hold(exclusive=exclusive):
             # 守卫必须坐在 POST_TOOL_USE 之前：让它去看 post.get('result', result) 就分不出坏值来自
             # 工具还是来自 hook。cast 到 object 是因为要挡的正是违反 execute 标注的运行时取值，不擦
             # 掉静态类型，下面的 isinstance 就成了 pyright 眼里的死代码。
+            outcome = 'ok'
             try:
                 returned = cast(object, await tool.execute(**args))
             except SyndicaError:
@@ -946,9 +1075,12 @@ class ToolExecutor:
                 raise
             except Exception as exc:
                 returned = _tool_raised_result(call, exc)
+                outcome = 'error'
             if not isinstance(returned, ToolResult):
                 raise _bad_tool_return(call, tool, returned)
             result = returned
+            if traced is not None:
+                traced[1].attributes.update(_recorded_exit(result.meta))
 
             post = await self._hooks.trigger(
                 Junction.POST_TOOL_USE, tool_call=call, tool=tool, args=args, result=result
@@ -958,7 +1090,7 @@ class ToolExecutor:
             rewritten = post.get('result', result)
             if not isinstance(rewritten, ToolResult):
                 raise _rewrite_rejected(Junction.POST_TOOL_USE, 'result', ToolResult, rewritten)
-            return _tightened(_strictest(result, post.rewrites('result')), rewritten)
+            return _tightened(_strictest(result, post.rewrites('result')), rewritten), outcome
 
     async def _gated(
         self,
@@ -967,8 +1099,10 @@ class ToolExecutor:
         args: dict[str, Any],
         provenance: TrustLevel,
         confirmation_lock: asyncio.Lock,
-    ) -> tuple[ToolResult | None, bool, dict[str, Any]]:
-        """闸：交回（拦截结果或 None，批准后是否独占执行，最终执行参数）。
+        *,
+        traced: tuple[ToolCallKey, _OpenSpan] | None,
+    ) -> tuple[ToolResult | None, str, bool, dict[str, Any]]:
+        """闸：交回（拦截结果或 None，拦截时的结局，批准后是否独占执行，最终执行参数）。
 
         处置经 `disposition_of` 取——它先按 `untrusted_high_risk` Flag 施加 spec §12.2 第 3 条
         的升级，再咨询宿主策略。直接调 `self._policy.decide` 会把升级整个绕过去，而 typing 与
@@ -978,15 +1112,29 @@ class ToolExecutor:
             verdict = self._judge.judge(tool, args)
         except Exception as exc:
             raise _JudgeFailure(exc) from exc
+        request_for_policy = DangerRequest(verdict=verdict, call=call, provenance=provenance)
         disposition = disposition_of(
             self._policy,
-            DangerRequest(verdict=verdict, call=call, provenance=provenance),
+            request_for_policy,
             untrusted_high_risk=self._untrusted_high_risk,
         )
+        if traced is not None:
+            traced[1].attributes.update(
+                {
+                    # 没有规则命中时是空表：`NO_RULE_MATCHED` 是哨兵，不是一条规则。
+                    'danger.rule_ids': (
+                        [] if verdict.rule_id == NO_RULE_MATCHED.rule_id else [verdict.rule_id]
+                    ),
+                    'danger.risk': verdict.level.value,
+                    'danger.provenance': provenance.value,
+                    'danger.decided_by': 'flag' if _escalated(request_for_policy) else 'policy',
+                    'danger.disposition': disposition.value,
+                }
+            )
         if disposition is Disposition.ALLOW:
             if verdict.level is RiskLevel.LOW and provenance is TrustLevel.UNTRUSTED:
                 _report_allowed_low_risk_from_untrusted(call, verdict)
-            return None, False, args
+            return None, 'ok', False, args
         if disposition is Disposition.CONFIRM:
             request = (
                 self._confirmation_request(call, args, verdict)
@@ -1004,22 +1152,59 @@ class ToolExecutor:
                 verdict=verdict,
             )
             if self._confirmation is not None and request is not None:
-                async with confirmation_lock:
-                    outcome = cast('object', await self._confirmation(request))
-                if not isinstance(outcome, ConfirmationOutcome):
-                    raise ContractViolation(
-                        expected='confirmation callback 交回 ConfirmationOutcome',
-                        received=f'收到 {outcome!r}，类型是 {type(outcome).__name__}',
-                        next_action=(
-                            '交回 ConfirmationOutcome.APPROVED / REJECTED / TIMEOUT / '
-                            'PREEMPTED / ABORTED 之一，不要用 bool 或字符串'
-                        ),
-                    )
+                outcome = await self._confirmed(
+                    self._confirmation,
+                    request,
+                    confirmation_lock,
+                    key=None if traced is None else traced[0],
+                )
                 if outcome is ConfirmationOutcome.APPROVED:
                     execution_args = cast('dict[str, Any]', json.loads(request.arguments))
-                    return None, True, execution_args
-                return _confirmation_result(call, verdict, request, outcome), False, args
-        return _gated_result(call, verdict, disposition), False, args
+                    return None, 'ok', True, execution_args
+                gated = _confirmation_result(call, verdict, request, outcome)
+                return gated, _CONFIRMATION_OUTCOMES[outcome], False, args
+            return _gated_result(call, verdict, disposition), 'no_channel', False, args
+        return _gated_result(call, verdict, disposition), 'blocked', False, args
+
+    async def _confirmed(
+        self,
+        confirmation: ConfirmationCallback,
+        request: ConfirmationRequest,
+        confirmation_lock: asyncio.Lock,
+        *,
+        key: ToolCallKey | None,
+    ) -> ConfirmationOutcome:
+        """问人，交回校验过的结局。给了这次调用的键就在 confirmation span 里问，从排队等锁算起。"""
+        if key is None:
+            return await self._asked(confirmation, request, confirmation_lock)
+        with self._tracing.span(
+            SpanKind.CONFIRMATION,
+            key.key[1:],
+            name='confirmation',
+            agent_id=key.agent_id,
+        ) as span:
+            outcome = await self._asked(confirmation, request, confirmation_lock)
+            span.attributes['confirmation.outcome'] = outcome.value
+            return outcome
+
+    @staticmethod
+    async def _asked(
+        confirmation: ConfirmationCallback,
+        request: ConfirmationRequest,
+        confirmation_lock: asyncio.Lock,
+    ) -> ConfirmationOutcome:
+        async with confirmation_lock:
+            outcome = cast('object', await confirmation(request))
+        if not isinstance(outcome, ConfirmationOutcome):
+            raise ContractViolation(
+                expected='confirmation callback 交回 ConfirmationOutcome',
+                received=f'收到 {outcome!r}，类型是 {type(outcome).__name__}',
+                next_action=(
+                    '交回 ConfirmationOutcome.APPROVED / REJECTED / TIMEOUT / '
+                    'PREEMPTED / ABORTED 之一，不要用 bool 或字符串'
+                ),
+            )
+        return outcome
 
     def _confirmation_request(
         self,

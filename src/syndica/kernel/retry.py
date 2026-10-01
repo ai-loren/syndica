@@ -13,6 +13,7 @@ from syndica.kernel.errors import ConfigError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import LLM
 from syndica.kernel.modules import FlagDeclaration, RuntimeModule
+from syndica.kernel.tracing import llm_attempt
 
 if TYPE_CHECKING:
     from syndica.kernel.agent import BaseAgent
@@ -140,7 +141,8 @@ class _RetryPlugin:
         for attempt in range(1, self._attempts + 1):
             await self._sleep(self._backoff_seconds)
             try:
-                response = await self._original.create(messages, **call_kwargs)
+                with llm_attempt(self._original):
+                    response = await self._original.create(messages, **call_kwargs)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -150,7 +152,8 @@ class _RetryPlugin:
         for name, candidate in self._fallbacks:
             await self._sleep(self._backoff_seconds)
             try:
-                response = await candidate.create(messages, **call_kwargs)
+                with llm_attempt(candidate):
+                    response = await candidate.create(messages, **call_kwargs)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

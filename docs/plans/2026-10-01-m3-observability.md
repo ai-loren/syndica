@@ -150,8 +150,11 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
   调用的 span），终点是子 Agent 第一个工作周期的 agent span（它的 id 可以事先算出，D3）。`ensure_active` 唤醒的
   周期只有消息边，没有派生边；agent span 不挂父 span，Agent 之间的关系只由边表达——驱动任务建在发送方的上下文里，
   靠 contextvar 继承会把「唤醒它的人」误记成「创建它的人」。
-- 内核经一个内部保护层调 tracer：只接 `Exception`（`CancelledError`、`KeyboardInterrupt` 照常上抛），第一次失败记
-  一条 ERROR（三件套），此后同一个 tracer 的失败只计数，Runtime 关闭时报一次总数；run 照常进行。
+- 内核经一个内部保护层调 tracer：同步调用里收不到 asyncio 的取消，tracer 抛出的任何东西都是它自己的缺陷，只有
+  `KeyboardInterrupt` 与 `SystemExit` 照常上抛（与 asyncio 运行同步回调的规矩一致）；`CancelledError`、`GeneratorExit`
+  与交回协程 / 生成器 / Future 的方法都按失败计。第一次失败记一条 ERROR（三件套），此后只计数，Runtime 关闭时报一次
+  总数；run 照常进行。插桩点坐在内核原本不会抛出的几段之间，漏出来的 `CancelledError` 会让 Agent 停在 running 且
+  不留日志（T7 评审）。
 
 **D3 span、边与确定的 id。**
 
@@ -165,8 +168,13 @@ GitHub Actions 本月免费额度已用完，恢复之前按 M2 计划「验证�
 - id：trace id 32 个十六进制字符（随机）；span id 16 个十六进制字符，取 `sha256` 于**长度前缀编码**的结构键，第一个
   分量是 span 种类（agent、turn、wait 的其余分量形状相同，不带种类就撞）：agent =（agent id、周期序号），turn =
   （agent id、turn），llm_call =（agent id、turn、第几次调用：首次与每次重试分开），tool_call 与 confirmation =
-  （agent id、周期、turn、批内位置），wait =（agent id、该 Agent 的第几次等待）。模型给的 `tool_call.id` 只作属性记录
-  （脱敏后），不进键：它可以重复、可以是空串。
+  （agent id、周期、turn、批内位置），wait = 它的出处键（D10：`wait_for` 用请求键，Delegate / Fork 的在轮等待用出处
+  里的第几次等待，都没有时是（宿主、agent id、第几次））——「该 Agent 的第几次等待」在同一个 Agent 的几次调用并发
+  等待时随调度换号（T7）。恢复时补上的那批调用按**恢复它的那个周期**取键，不与被取消的原调用撞号。模型给的
+  `tool_call.id` 只作属性记录（脱敏后），不进键：它可以重复、可以是空串。
+- 消息边的终点是消费它的那个 span：注入它的那一轮，或等到它的那次等待（T7）。宿主发出的消息与宿主发起的 spawn
+  没有起点 span，因此没有边。`despawn` 是发起它的那个 span 上的一个事件（`agent.despawned`，带 `agent.id`）。
+  已经结束的 span 不再收事件（工具里 `create_task` 出来的任务活得比调用长），但仍可以当边的起点。
 - 时间：`Tracer` 收可注入的时钟（纳秒，默认 `time.time_ns`）。墙钟可以回拨（`CLOCK_REALTIME`，NTP 校时），而模型拒收
   结束早于开始的 span：开始时间取墙钟，结束时间 = 开始时间 + 单调时钟（`time.monotonic_ns`）量出的时长，回拨既造不出
   倒着走的 span，也不会让 `finish` 失败（T5 评审）。状态：`ok`、`error`、`cancelled`。
@@ -454,12 +462,18 @@ redaction:
   `danger.risk` str、`danger.provenance` str、`danger.decided_by` str（`flag policy`）、`danger.disposition` str、
   `confirmation.outcome` str（取内核 `ConfirmationOutcome` 的值：`approved rejected timeout preempted aborted`）、
   `wait.kind` str（`agent human`）、`wait.target` str、`wait.outcome` str（取 `WaitState` 的值）、`message.id` str、
-  `message.to` str（发送事件上）、`child.agent_id` str（派生边上）。
+  `message.to` str（发送事件上）、`child.agent_id` str（派生边上）、`agent.id` str（拆除事件上）。`wait.target`：人等
+  的是请求键（JSON；宿主直接发起、没有请求键的是空串），Delegate / Fork 等的是子 Agent 的 id，等 `Reply` 的是关联
+  id。`danger.rule_ids` 没有规则命中时是空表。
+- 事件：`message.sent`（发送方的 span 上，投递成功才记，带 `message.id`、`message.to`）、`agent.despawned`（发起拆除
+  的 span 上，带 `agent.id`；宿主、EXIT 收尾、kill 的收尾、关机发起的拆除不在任何 span 里，不记）。
 - `tool.outcome` 取值：`ok error aborted judge_failed not_executed skipped blocked rejected timeout preempted
   confirmation_aborted no_channel unknown_tool bad_arguments interrupted`，与追加结果块的位置一一对应：`rejected
-  timeout preempted confirmation_aborted` 是确认的四种结局（`_confirmation_result`），与第 9 步中止补的 `aborted`
-  分开；`interrupted` 是恢复时修补被打断的批次（`agent.py` 的 `_repair_interrupted_batch`，在执行器之外，插桩点随之
-  扩到那里）。
+  timeout preempted confirmation_aborted` 是确认的四种结局（`_confirmation_result`）；`aborted` 是一次调用抛出、整批
+  停下的那一块，同批停下之后的与第 9 步中止补的都是 `not_executed`（工具都没开始跑）；`interrupted` 是恢复时修补
+  被打断的批次（`agent.py` 的 `_repair_interrupted_batch`，在执行器之外，插桩点随之扩到那里）。结局说的是这次
+  执行：同段的兄弟被取消时整段的结果块都不落，已经跑完的那一次仍记它自己的结局，恢复时补上的另有一个
+  `interrupted` 的 span（T7 评审）。
 - 版本升级要有读旧版本的兼容测试；枚举的成员→取值表由一条整体断言钉住。
 
 ### 场景格式 v2（手写 YAML 与捕获 JSON 共用一份 schema）
@@ -688,7 +702,7 @@ M2 的交接文件写入一直是单次调用。
   带上键。
 - 稳定键：三个子 Agent 以与记录相反、且非单调的顺序被创建时，各拿到自己记录的 id。
 
-**状态：完成。** 「当前工具调用」与稳定键在 `kernel/ids.py`：Agent 把（agent id、周期、turn）交给执行器，
+**状态：完成（4b8e4dc）。** 「当前工具调用」与稳定键在 `kernel/ids.py`：Agent 把（agent id、周期、turn）交给执行器，
 `_execute_one` 按批内位置（跨段计数）在 `PRE_TOOL_USE` 之前设、执行完复位；工具调用之外退到当前属主（Agent 自己的
 事件循环、kill 的收尾、关机），都没有时是宿主。`Runtime(ids=...)` 收 `IdSource`（默认 uuid4，形式不变）；spawn 在
 调工厂之前按键取 id，交给工厂里构造的第一个 `BaseAgent`；消息 id 同样按键取；AskUser 与邮箱确认的事件带上请求的
@@ -705,9 +719,9 @@ id）登记、键在注册表检查之前占用、拒收类、id 源的异常包
 被拒或当场返回的等待会盖掉、再摘掉正在等的那一个的登记；改成在成为等待者之后才登记。周期分量在 turn 跨周期累计时
 对唯一性是冗余的（`_cycle = 1` 因此存活），留着是因为 D3 的 agent span 键要它，用一条用例钉住取值。变异：33 条全杀
 （评审的 9 条存活与为修复写的 24 条）；用例在三路并行负载下重复 12 次、倒序跑一次全绿，排除假杀。零存活只对这组
-变异成立。全套 6047 条。提交 4b8e4dc。
+变异成立。全套 6047 条。
 
-复评（对 4b8e4dc）：1 High / 2 Medium / 一批 Low，另有 8 条存活变异，全部修掉，单独提交。High 是上一轮修复引入的：
+复评（对 4b8e4dc）：1 High / 2 Medium / 一批 Low，另有 8 条存活变异，全部修掉，单独提交（9406c34）。High 是上一轮修复引入的：
 「槽键带上出处」对 singleton 与 keyed 槽是错的——它们的实例由槽与键确定，谁先寻址都是同一个，键里带上先到者，回放
 时换一个先到者它就换了 id，先到者那次调用里此后的 spawn 也跟着错一位；改成只有 on-demand 跟着调用方取键，另两种按
 （槽名、键，第几个）且不占调用方的计数。Medium：请求在转 WAITING 的 CAS 之后才登记，会挂起的注册表下，当场作答
@@ -742,6 +756,31 @@ Runtime 之内唯一，写进 D10 与 `IdSource` 的文档。宿主自己写的 
 - 失败隔离：每次都抛 `Exception` 的 tracer 不影响 run 的结局，日志恰好一条 ERROR（断言 `record.args` 里的 tracer、
   步骤与级别），关闭时报出失败次数；抛 `CancelledError` 的照常上抛。
 
+**状态：完成。** `kernel/tracing.py`：同步的 `Tracer` 协议（`start_span` / `end_span` / `add_event` / `add_edge`，时间
+由 tracer 自己取）、`NullTracer`、长度前缀且带类型标记的 `span_id_of`、当前 span 与「当前 LLM 调用」两个 contextvar、
+`_Tracing`（每个 Runtime 一份，交给它的 Agent 与执行器）。插桩点：agent（每个周期，脱离父）、turn、llm_call（首次、
+重试与备用模型各一次，`llm.model` 取 `config.model`）、tool_call（每处追加结果块，含未执行与恢复时补的）、
+confirmation、wait（`wait_for` 与 Delegate / Fork 的在轮等待）；派生边在任务建好之后发出，终点是子 Agent 在这里的
+下一个周期；消息的来源在投递之前记，投递成功才在发送方 span 上记 `message.sent`，消费时（注入那一轮或等到它的
+等待）连边。内核自己起的任务（驱动、收尾、关机）与拆除的 hook 都在任何 span 之外跑。tracer 的公开面（`Runtime(
+tracer=)`）留给 T9：它要为回放级别加回复、工具结果与请求指纹的通道，此刻公开就是给第三方一个之后改不动的协议；
+测试经私有的 `Runtime._set_tracer`。
+
+验证：两路对抗评审。正确性一路 5 Medium / 9 Low：死在注入里的一轮下一个周期会重开同号的 turn span（计数挪到注入
+之前）；`llm.model` 读的是协议里没有的 `llm.model`；未知工具名原样记下（改 `<unknown>`）；子 Agent 继承父的「当前
+LLM 调用」（清掉，并且只在 `create` 在飞时有值——hook 与工具自己的模型调用不在计数里，给它一个别人的键回放只会交回
+别人的回复）；模型在更早的轮里用过同一个调用 id 时，补「未执行」的那块按 id 认成答过而漏掉（改按批内位置认；这条
+早于 T7）；以及派生边的终点写死第一个周期、`tool.exit_code` / `tool.timed_out` 从不产出、嵌在工具里的 Runtime 把
+事件记进外层 trace、换 tracer 拆开开始与结束、宿主 `wait_for(None)` 报错走样、`_sent_from` 在邮箱随收尾摘掉时只增
+不减。健壮性一路 1 High / 2 Medium / 5 Low：tracer 抛 `CancelledError` / `GeneratorExit` 会让 Agent 停在 running、
+半建子 Agent、销毁人的答复、吞掉 `AGENT_DESPAWN`（改为只放过 `KeyboardInterrupt` 与 `SystemExit`）；嵌套 Runtime
+（打开的 span 记下开它的 `_Tracing`，别人的当不在 span 里）；换 tracer（还有 span 开着时拒绝，旧的失败先报掉再清零）；
+生成器写的 tracer 方法静默丢记录；在轮等待的键在取决于调度的检查之后才取；GC 关掉协程时 reset 抛错吞掉 span 的
+收尾。外加 15 条存活变异（各状态的收尾、来源在投递前、备用模型的计数与名字、关机时的总数、轮边界被中止的那一轮、
+拆除事件只报一次、Future、单个收件人、等待的主体与结局、spawn 与在轮等待两个不许挂起的窗口）。全部修掉；两个窗口
+各有一条探针用例（`put` 时排一个回调，断言它跑的时候任务已经建好；在轮等待的 span 开始时排一个回调，断言令牌已经
+装上）。变异：最初 74 条里仍然适用的 56 条、失效 18 条的等价重写 15 条、评审 40 条，全杀；用例 104 条。
+
 #### T8 — LLM 侧：token、作答平台、平台故障、前缀单位
 
 **Files:** `backends/llm_openai/client.py`、`backends/llm_router/router.py`、测试。
@@ -761,6 +800,10 @@ Runtime 之内唯一，写进 D10 与 `IdSource` 的文档。宿主自己写的 
   提供方错误文本、未知工具名、模型给的调用 id、环境变量样例），每个规则族至少一个；断言 store 里解码后的每个字符串
   与每个 16 字符片段都不含任何原文，**且**每个通道的位置上确实是预期的占位符（防止「什么都没记」也通过）。
 - `structure` 没有 payload；`full` 有完整请求且已脱敏；store 抛错时 run 照常、恰好一条 ERROR。
+- T7 留下的：`Tracer` 协议要为回放级别加通道（模型的请求与回复、工具结果、人的答复），`llm_attempt` 的两处调用点
+  （`agent.py`、`retry.py`）随之改；结构性的 id（span id、agent id、消息 id）不是自由文本，不经逐叶脱敏——32 位十六
+  进制挂在像密钥名的键下会被换掉（T6 复评那条 `key` 字段就是这么丢的）。`Runtime(tracer=)` 在这里公开，`Tracer`
+  与它用到的模型类型一起进承诺面。
 
 #### T10 — B-19：并发窗口里不许写轨迹
 
@@ -812,6 +855,8 @@ Runtime 之内唯一，写进 D10 与 `IdSource` 的文档。宿主自己写的 
 - 人的答复按请求键给出，而宿主自己写的 `ConfirmationHandler`（CLI 的终端确认就是一个）拿不到请求键：`peek_key` 不在
   公开面。先定取法再写回放：`ConfirmationRequest` 带上它（尾部带默认值的字段，加名字不破坏兼容），或者在 handler 的
   调用里交给它（T6 复评）。
+- `current_llm_call()` 只在 `create` 在飞时有值：模型调用前后的 hook、工具与模块自己发起的模型调用拿到的是 None。
+  `ReplayLLM` 在 None 下要拒绝（三件套，指名这次调用不在内核的计数里）而不是猜一个键（T7 评审）。
 
 #### T14 — 捕获即回放
 

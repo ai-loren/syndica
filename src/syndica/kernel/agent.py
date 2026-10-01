@@ -100,6 +100,11 @@ from syndica.kernel.tool_executor import (
     ToolExecutor,
     validate_max_concurrency,
 )
+from syndica.kernel.trace import SpanKind
+from syndica.kernel.tracing import (
+    _Tracing,  # pyright: ignore[reportPrivateUsage]
+    llm_attempt,
+)
 
 __all__ = ['AgentOptions', 'BaseAgent']
 
@@ -359,8 +364,18 @@ def _interrupted_output(call: ToolCall) -> str:
     )
 
 
-def _repair_interrupted_batch(ctx: Context) -> None:
-    for call in _unpaired_calls(ctx.current_traj):
+def _repair_interrupted_batch(ctx: Context) -> list[tuple[int, ToolCall]]:
+    """补上被中断那一批里没有配对的调用，交回补上的那些（批内位置、调用）。"""
+    unpaired = _unpaired_calls(ctx.current_traj)
+    if not unpaired:
+        return []
+    batch = next(block for block in reversed(ctx.current_traj) if block.role == 'assistant')
+    repaired = [
+        (index, call)
+        for index, call in enumerate(batch.tool_calls)
+        if any(call is pending for pending in unpaired)
+    ]
+    for _, call in repaired:
         ctx.append(
             ContextBlock(
                 role='tool',
@@ -369,6 +384,7 @@ def _repair_interrupted_batch(ctx: Context) -> None:
                 extra={'interrupted': True},
             )
         )
+    return repaired
 
 
 def _skipped_response(result: object) -> ContextBlock:
@@ -412,8 +428,10 @@ class BaseAgent:
         )
         self._context = Context()
         self._current_turn = 0
-        # 第几个工作周期（每次 `run` 一个）：工具调用的稳定键带着它（M3 D3 / D10）。
+        # 第几个工作周期（每次 `run` 一个）：agent span 与工具调用的稳定键带着它（M3 D3 / D10）。
         self._cycle = 0
+        # 默认什么都不记；`Runtime.spawn` 经 `_attach_tracing` 换成 Runtime 的那一份。
+        self._tracing = _Tracing()
         self._running = False
         # 默认开着，但什么都不拦；真正的门由 `Runtime.spawn` 经 `_attach_gate` 装上。构造器不接
         # `gate=`：那个参数的类型不在公开面，放在这里就等于给宿主一个写不出标注的入口。
@@ -485,6 +503,7 @@ class BaseAgent:
         Disposition,
         str | None,
         ConfirmationCallback | None,
+        _Tracing,
     ]:
         """保存 Runtime 装配前本对象自己拥有的可变状态。"""
         return (
@@ -497,6 +516,7 @@ class BaseAgent:
             self._executor._untrusted_high_risk,  # pyright: ignore[reportPrivateUsage]
             self._executor._confirmation_agent_id,  # pyright: ignore[reportPrivateUsage]
             self._executor._confirmation,  # pyright: ignore[reportPrivateUsage]
+            self._tracing,
         )
 
     def _assembly_restore(
@@ -511,6 +531,7 @@ class BaseAgent:
             Disposition,
             str | None,
             ConfirmationCallback | None,
+            _Tracing,
         ],
     ) -> None:
         """恢复 `_assembly_snapshot`；被拒的 spawn 不留下半套 Agent。"""
@@ -524,7 +545,9 @@ class BaseAgent:
             disposition,
             confirmation_agent_id,
             confirmation,
+            tracing,
         ) = snapshot
+        self._attach_tracing(tracing)
         options.tools.clear()
         options.tools.update(tools)
         self.options = options
@@ -580,6 +603,11 @@ class BaseAgent:
             callback,
         )
 
+    def _attach_tracing(self, tracing: _Tracing) -> None:
+        """接上 Runtime 的插桩：Agent 与它的执行器记到同一份里。"""
+        self._tracing = tracing
+        self._executor._attach_tracing(tracing)  # pyright: ignore[reportPrivateUsage]
+
     def _attach_gate(self, gate: TurnGate) -> None:
         """装上控制面的门。
 
@@ -631,26 +659,39 @@ class BaseAgent:
 
     async def _run(self, query: str | None, trust: TrustLevel) -> Context:
         self._cycle += 1
-        ctx = self._context
-        ctx.stop_reason = None
-        _repair_interrupted_batch(ctx)
-        if query is not None:
-            ctx.append(ContextBlock(role='user', content=query, trust=trust))
-        await self._emit('agent_start', {})
-        await self._hooks.trigger(Junction.AGENT_START, ctx=ctx)
-        # Exception 而非 BaseException：取消既不是正常结束也不是失败，展开的路上不再触发切点、
-        # 不再发事件。
-        try:
-            stop_reason = await self._run_turns(ctx)
-        except Exception:
-            ctx.stop_reason = StopReason.ERROR
-            await self._hooks.trigger(Junction.AGENT_ERROR, ctx=ctx)
-            await self._emit('agent_error', {})
-            raise
-        await self._hooks.trigger(Junction.AGENT_END, ctx=ctx)
-        # 事件 payload 必须是纯数据：枚举成员走不出序列化的 SSE 出口。
-        await self._emit('agent_end', {'stop_reason': stop_reason.value})
-        return ctx
+        with self._tracing.span(
+            SpanKind.AGENT,
+            (self.agent_id, self._cycle),
+            name=self.options.name,
+            agent_id=self.agent_id,
+            attributes={'agent.role': self.options.name, 'agent.cycle': self._cycle},
+            detached=True,
+        ) as span:
+            ctx = self._context
+            ctx.stop_reason = None
+            repaired = _repair_interrupted_batch(ctx)
+            self._executor._trace_interrupted(  # pyright: ignore[reportPrivateUsage]
+                (self.agent_id, self._cycle, self._current_turn), repaired
+            )
+            if query is not None:
+                ctx.append(ContextBlock(role='user', content=query, trust=trust))
+            await self._emit('agent_start', {})
+            await self._hooks.trigger(Junction.AGENT_START, ctx=ctx)
+            # Exception 而非 BaseException：取消既不是正常结束也不是失败，展开的路上不再触发切点、
+            # 不再发事件。
+            try:
+                stop_reason = await self._run_turns(ctx)
+            except Exception:
+                ctx.stop_reason = StopReason.ERROR
+                span.attributes['stop_reason'] = StopReason.ERROR.value
+                await self._hooks.trigger(Junction.AGENT_ERROR, ctx=ctx)
+                await self._emit('agent_error', {})
+                raise
+            span.attributes['stop_reason'] = stop_reason.value
+            await self._hooks.trigger(Junction.AGENT_END, ctx=ctx)
+            # 事件 payload 必须是纯数据：枚举成员走不出序列化的 SSE 出口。
+            await self._emit('agent_end', {'stop_reason': stop_reason.value})
+            return ctx
 
     async def _run_turns(self, ctx: Context) -> StopReason:
         tool_defs = [tool.schema for tool in self.options.tools.values()]
@@ -667,42 +708,67 @@ class BaseAgent:
             if decision.abort:
                 ctx.stop_reason = StopReason.ABORTED
                 return StopReason.ABORTED
-            await self._inject(ctx, decision)
-
+            # 在这一轮的任何一步之前计数：死在注入里的一轮也消耗了预算，下一个周期从下一轮开始，
+            # 不会再开一个同号的 turn span。
             self._current_turn = turn
-            await self._emit('turn_start', {'turn': turn})
-            await self._hooks.trigger(Junction.TURN_START, ctx=ctx, turn=turn)
-
-            response = await self._one_llm_call(ctx, tool_defs)
-            if response is None:
-                await self._end_turn(ctx, turn, None)
-                continue
-
-            # spec §5.1 第 9 步：模型已经产出之后、工具执行之前再问一次。必须消费中止位——留下
-            # 的位会让下一周期的 `before_turn` 立刻再中止一次，而本轮已经结束。不得走
-            # `before_turn`：它会顺带 consume 邮箱。
-            if await self._gate.check_abort():
-                ctx.append(response)
-                if response.tool_calls:
-                    self._executor.append_unexecuted(
-                        ctx, response.tool_calls, why=_ABORT_AFTER_LLM_WHY
-                    )
-                ctx.stop_reason = StopReason.ABORTED
-                await self._end_turn(ctx, turn, response)
-                return StopReason.ABORTED
-
-            ctx.append(response)
-            if not response.tool_calls:
-                ctx.stop_reason = StopReason.COMPLETED
-                await self._end_turn(ctx, turn, response)
-                return StopReason.COMPLETED
-
-            await self._executor.execute_tool_calls(
-                ctx, response.tool_calls, origin=(self.agent_id, self._cycle, turn)
-            )
-            await self._end_turn(ctx, turn, response)
+            with self._tracing.span(
+                SpanKind.TURN,
+                (self.agent_id, turn),
+                name=f'turn {turn}',
+                agent_id=self.agent_id,
+                attributes={'turn': turn},
+            ):
+                stop_reason = await self._one_turn(ctx, turn, decision, tool_defs)
+            if stop_reason is not None:
+                return stop_reason
         ctx.stop_reason = StopReason.MAX_TURNS
         return StopReason.MAX_TURNS
+
+    async def _one_turn(
+        self,
+        ctx: Context,
+        turn: int,
+        decision: TurnGateDecision,
+        tool_defs: list[dict[str, Any]],
+    ) -> StopReason | None:
+        """一轮：注入、模型、第 9 步、工具。交回这个周期停下的原因；None 表示接着下一轮。"""
+        await self._inject(ctx, decision)
+
+        await self._emit('turn_start', {'turn': turn})
+        await self._hooks.trigger(Junction.TURN_START, ctx=ctx, turn=turn)
+
+        response = await self._one_llm_call(ctx, tool_defs)
+        if response is None:
+            await self._end_turn(ctx, turn, None)
+            return None
+
+        # spec §5.1 第 9 步：模型已经产出之后、工具执行之前再问一次。必须消费中止位——留下
+        # 的位会让下一周期的 `before_turn` 立刻再中止一次，而本轮已经结束。不得走
+        # `before_turn`：它会顺带 consume 邮箱。
+        if await self._gate.check_abort():
+            ctx.append(response)
+            if response.tool_calls:
+                self._executor.append_unexecuted(
+                    ctx,
+                    response.tool_calls,
+                    why=_ABORT_AFTER_LLM_WHY,
+                    origin=(self.agent_id, self._cycle, turn),
+                )
+            ctx.stop_reason = StopReason.ABORTED
+            await self._end_turn(ctx, turn, response)
+            return StopReason.ABORTED
+
+        ctx.append(response)
+        if not response.tool_calls:
+            ctx.stop_reason = StopReason.COMPLETED
+            await self._end_turn(ctx, turn, response)
+            return StopReason.COMPLETED
+
+        await self._executor.execute_tool_calls(
+            ctx, response.tool_calls, origin=(self.agent_id, self._cycle, turn)
+        )
+        await self._end_turn(ctx, turn, response)
+        return None
 
     async def _inject(self, ctx: Context, decision: TurnGateDecision) -> None:
         """把门交来的消息追加成 user block，逐条触发 MESSAGE_INJECTED。
@@ -724,6 +790,7 @@ class BaseAgent:
                     },
                 )
             )
+            self._tracing.consumed(message.id)
             await self._hooks.trigger(Junction.MESSAGE_INJECTED, ctx=ctx, message=message)
 
     async def _end_turn(self, ctx: Context, turn: int, message: ContextBlock | None) -> None:
@@ -734,7 +801,17 @@ class BaseAgent:
     async def _one_llm_call(
         self, ctx: Context, tool_defs: list[dict[str, Any]]
     ) -> ContextBlock | None:
-        """本轮的模型调用；返回 None 表示超窗已被插件处理，本轮不产出 assistant block。"""
+        """本轮的模型调用；返回 None 表示超窗已被插件处理，本轮不产出 assistant block。
+
+        首次调用与 `LLM_FAILURE` 里的每次重试共用一份计数（「当前 LLM 调用」，D11）：重试发生在
+        hook 里，计数放在调用之外它就看不见。
+        """
+        with self._tracing.llm_call(self.agent_id, self._current_turn):
+            return await self._one_llm_exchange(ctx, tool_defs)
+
+    async def _one_llm_exchange(
+        self, ctx: Context, tool_defs: list[dict[str, Any]]
+    ) -> ContextBlock | None:
         system_block = ContextBlock(role='system', content=self.get_system_prompt())
         request: dict[str, Any] = {
             'messages': [system_block, *(_isolated(block) for block in ctx.current_traj)],
@@ -772,7 +849,8 @@ class BaseAgent:
         messages = request['messages']
         kwargs = {key: value for key, value in request.items() if key != 'messages'}
         try:
-            return await self.options.llm.create(messages, **kwargs)
+            with llm_attempt(self.options.llm):
+                return await self.options.llm.create(messages, **kwargs)
         except ContextOverflowError as exc:
             outcome = await self._hooks.trigger(
                 Junction.CONTEXT_OVERFLOW, ctx=ctx, request=request, error=exc

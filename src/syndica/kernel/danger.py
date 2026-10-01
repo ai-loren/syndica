@@ -3116,6 +3116,12 @@ def validate_confirmation_handler(handler: object) -> None:
         )
 
 
+def _escalated(request: DangerRequest) -> bool:
+    """这次处置是不是由强制升级给出（不咨询 policy）。`disposition_of` 与 trace 的 `decided_by`
+    读同一个判据：各写一份，trace 就会在升级条件改动的那一天开始说谎。"""
+    return request.verdict.level is RiskLevel.HIGH and request.provenance is TrustLevel.UNTRUSTED
+
+
 def disposition_of(
     policy: DangerPolicy,
     request: DangerRequest,
@@ -3148,7 +3154,7 @@ def disposition_of(
                 'Runtime 宿主请改 SafetyModule 的 untrusted_high_risk Flag'
             ),
         )
-    if request.verdict.level is RiskLevel.HIGH and request.provenance is TrustLevel.UNTRUSTED:
+    if _escalated(request):
         return raw_disposition
     decided = cast('object', policy.decide(request))
     if not isinstance(decided, Disposition):

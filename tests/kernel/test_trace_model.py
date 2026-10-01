@@ -148,6 +148,7 @@ def test_the_attribute_set_is_exactly_the_schema():
         'message.id': 'str',
         'message.to': 'str',
         'child.agent_id': 'str',
+        'agent.id': 'str',
     }
 
 

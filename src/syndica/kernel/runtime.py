@@ -112,6 +112,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+import json
 import logging
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
@@ -167,7 +168,15 @@ from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tools import orchestration_tools
-from syndica.kernel.waiting import Waiter, WaitResult, WaitState, correlation_of
+from syndica.kernel.trace import SpanKind
+from syndica.kernel.tracing import (
+    Tracer,
+    _Span,  # pyright: ignore[reportPrivateUsage]
+    _Tracing,  # pyright: ignore[reportPrivateUsage]
+    back_in_spans,
+    outside_any_span,
+)
+from syndica.kernel.waiting import Reply, Waiter, WaitResult, WaitState, correlation_of
 
 if TYPE_CHECKING:
     from syndica.kernel.catalog import AgentCatalog
@@ -854,6 +863,10 @@ class Runtime:
         # 同一个。一个栈而不是一格：同一个 Agent 的下一次等待在上一次还没收尾时就登记了，它被拒时
         # 要露出的是上一次的登记，抢占成功时上一次收尾摘掉的是它自己那一个。
         self._request_keys: dict[tuple[str, str], list[StableKey]] = {}
+        # 插桩（M3 D2）：交给这里管的每个 Agent 与执行器。不在工具调用、也没有属主时发起的等待按
+        # 宿主的第几次取 span 的结构键。
+        self._tracing = _Tracing()
+        self._host_waits = 0
         module_assembly = _RuntimeModuleAssembly(modules, flags)
         self.registry: AgentRegistry = (
             InMemoryAgentRegistry()
@@ -1088,6 +1101,7 @@ class Runtime:
             if fork_from is not None and query is None:
                 self._carry_truncated_taint(agent, fork_from, source_trust)
             agent._attach_gate(gate)  # pyright: ignore[reportPrivateUsage]
+            agent._attach_tracing(self._tracing)  # pyright: ignore[reportPrivateUsage]
         except BaseException:
             agent._assembly_restore(assembly_snapshot)  # pyright: ignore[reportPrivateUsage]
             raise
@@ -1167,6 +1181,9 @@ class Runtime:
         seed = None if query is None else _Seed(text=query, trust=query_trust)
         task = asyncio.create_task(self._drive(agent_id, agent, seed), name=f'agent:{agent_id}')
         self._table.set_task(agent_id, task)
+        # 派生边在任务建好之后：put 与 create_task 之间一句别的都不放。终点是它在这里的第一个周期
+        # ——工厂交回的可能是一个已经跑过几个周期的 Agent。
+        self._tracing.spawned(agent_id, agent._cycle + 1)  # pyright: ignore[reportPrivateUsage]
         await self.hooks.trigger(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)
         return agent_id
 
@@ -1321,8 +1338,9 @@ class Runtime:
             return
         # 驱动任务建在发送方的上下文里（spawn、唤醒 zombie 的那次 send）：不换属主就继承了别人的
         # 「当前工具调用」或宿主的计数，它的 hook 派的活、发的消息就会按别人的键、按到达的先后
-        # 取 id。
+        # 取 id；同理也继承了别人的当前 span。
         becoming_owner(('agent', agent_id), slot.issued)
+        outside_any_span()
         if not await self.registry.compare_and_set_status(
             agent_id, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
         ):
@@ -1491,6 +1509,8 @@ class Runtime:
         """
         await self._report_abandoned_input(agent_id, slot)
         await self.broker.remove_queue(agent_id)
+        # 邮箱里那些随队列一起没了，不会再被消费；暂存在控制块里的随唤醒注入，留着它们的来源。
+        self._tracing.forget_receiver(agent_id, keep=slot.control.deferred_ids())
         if slot.exit_mode is ExitMode.EXIT:
             await self._destroy_tree(agent_id, operation='exit')
             return
@@ -1591,7 +1611,11 @@ class Runtime:
 
         **目标的两道守卫都在装令牌之前**：等自己是永久挂死，而目标不存在时这一轮悬在一次没有任何
         东西能解开的等待上。被拒的调用因此不在这个 Agent 的槽里留下任何痕迹。
+
+        span 的结构键按出处里的第几次等待（M3 D3），在入口就占用：「目标还在不在」取决于调度，
+        被拒的这一次也要占掉序号。
         """
+        wait_key = next_key('wait')
         slot = self._slots.get(agent_id)
         if slot is None:
             raise _cannot_wait_in_turn(
@@ -1608,6 +1632,12 @@ class Runtime:
             raise _cannot_wait_on_itself(agent_id)
         if target_id not in self._slots or self._table.get(target_id) is None:
             raise _unknown_in_turn_target(agent_id, target_id, sorted(self._slots))
+        with self._wait_span(agent_id, wait_key, 'agent', target_id) as span:
+            result = await self._waited_in_turn(slot, target_id)
+            span.attributes['wait.outcome'] = result.state.value
+            return result
+
+    async def _waited_in_turn(self, slot: _Slot, target_id: str) -> _InTurnWaitResult:
         token = _WaitToken()
         previous = slot.delegation
         slot.delegation = token
@@ -1709,11 +1739,17 @@ class Runtime:
             trust=trust,
             id=_fresh_id(self._ids.message_id, key, 'message_id'),
         )
+        self._tracing.sending(message.id, agent_id)
         token = _ACTIVATION_ALLOWED.set(activate)
+        delivered = None
         try:
-            return await self.broker.publish(agent_id, message)
+            delivered = await self.broker.publish(agent_id, message)
+            return delivered
         finally:
             _ACTIVATION_ALLOWED.reset(token)
+            self._tracing.sent(
+                message.id, agent_id, delivered=delivered is not None and delivered.ok
+            )
 
     async def ensure_active(self, agent_id: str) -> bool:
         """唯一的激活入口：复活 ZOMBIE、重开事件循环（spec §4.2）。
@@ -2080,17 +2116,22 @@ class Runtime:
                     agent_id,
                 )
                 return
+            self._tracing.forget_receiver(agent_id)
             # 收据是同步取的，因此两条并发的拆除里只有一个取得到；取到之前拆除的每一步都已经跑完
             # 并复检过，所以这个切点报的仍是既成事实。
             if not teardown.reported:
                 teardown.reported = True
-                # 切点在拆除自己的出处里跑：取得到收据的可以是几条并发拆除中的任何一条（despawn、
-                # 级联、EXIT 收尾、kill 的收尾），hook 派的活按调用方取键就随谁先到而变（M3 D10）。
-                # 一个 Agent 至多消失一次，计数因此不必留着。
+                self._tracing.event('agent.despawned', {'agent.id': agent_id})
+                # 切点在拆除自己的出处里、在任何 span 之外跑：取得到收据的可以是几条并发拆除中的
+                # 任何一条（despawn、级联、EXIT 收尾、kill 的收尾），hook 派的活按调用方取键、记在
+                # 调用方的 span 上，就随谁先到而变（M3 D10 / D3）。一个 Agent 至多消失一次，计数
+                # 因此不必留着。
                 owner = entering_owner(('despawn', agent_id), {})
+                spans = outside_any_span()
                 try:
                     await self.hooks.trigger(Junction.AGENT_DESPAWN, agent_id=agent_id)
                 finally:
+                    back_in_spans(spans)
                     leaving_owner(owner)
         finally:
             # 只摘自己那一份：清掉整张表会撤掉别的在飞拆除共享的那份收据，于是同一次消失会被
@@ -2123,9 +2164,11 @@ class Runtime:
         # 收尾刻意跑在事件循环之外，那个值在这里是假的：留着它，一次落在那个 Agent 身上的拆除会被
         # 误判成「等自己」而拒掉，被杀的 Agent 于是停在 aborting、再也复活不了。
         _DRIVING_AGENT.set(None)
-        # 同理它也继承了发起 kill 的那次工具调用：不清掉，收尾里取的键会与那次调用抢序号，而谁先谁后
-        # 取决于调度（M3 D10）。收尾自己不派活：拆除的 hook 在 `_destroy` 里换到它自己的出处。
+        # 同理它也继承了发起 kill 的那次工具调用与当前 span：不清掉，收尾里取的键会与那次调用抢序号
+        # （谁先谁后取决于调度，M3 D10），事件与边记到那次早已结束的调用上。收尾自己不派活：拆除的
+        # hook 在 `_destroy` 里换到它自己的出处。
         becoming_owner(('reap', agent_id), {})
+        outside_any_span()
         try:
             task = self._table.get_task(agent_id)
             if task is not None:
@@ -2140,6 +2183,42 @@ class Runtime:
             )
         finally:
             self._reaping.discard(agent_id)
+
+    def _set_tracer(self, tracer: Tracer) -> None:
+        """换上接收插桩的 tracer（内部入口：tracer 的公开面还没定）。已经在跑的 Agent 从下一次
+        插桩起记到它：它们持有的是同一份 `_Tracing`。
+
+        还有 span 开着时拒绝：开始已经交给了旧的，结束会落到新的上，两边都配不上对。旧 tracer 的
+        失败在换掉之前报掉，失败计数清零——总数报给谁就得是谁的。
+        """
+        given = cast(object, tracer)
+        if isinstance(given, type) or not isinstance(given, Tracer):
+            raise ConfigError(
+                expected='tracer 是一个实现了 Tracer 四个同步方法的实例',
+                received=f'收到 {tracer!r}（{type(tracer).__name__}）',
+                next_action='传 start_span / end_span / add_event / add_edge 都在的实例，不要传类',
+            )
+        if self._tracing.open_spans:
+            raise ConfigError(
+                expected='换 tracer 时没有开着的 span',
+                received=f'还有 {self._tracing.open_spans} 个 span 开着（有 Agent 正在跑）',
+                next_action='在 spawn 任何 Agent 之前换，或者等它们都停下（wait / shutdown）再换',
+            )
+        self._report_tracer_failures()
+        self._tracing.failures = 0
+        self._tracing.tracer = tracer
+
+    def _report_tracer_failures(self) -> None:
+        count = self._tracing.failures
+        if not count:
+            return
+        logger.error(
+            '期望: tracer %s 收下这个 Runtime 的每一次插桩。'
+            ' 实际: 它一共失败了 %d 次，这些记录都丢了（第一次的异常在当时那条日志里）。'
+            ' 下一步: 修好这个 tracer 再跑一次；这次运行的轨迹不完整，不要拿它回放或导出。',
+            type(self._tracing.tracer).__name__,
+            count,
+        )
 
     def _refuse_self(self, operation: str, agent_id: str) -> None:
         """拒绝一个要等目标停下、而目标就是调用者自己的操作。
@@ -2380,8 +2459,39 @@ class Runtime:
         占掉它的序号；登记在任何 await 之前——会挂起的注册表下，转 WAITING 的那次 CAS 期间就可能
         有答复到达（回放按事件里的键当场作答）。发出请求事件与调用本方法之间不得有挂起点：那段
         窗口里到达的答复认不出它答的是哪个请求。
+
+        每次等待一个 wait span（M3 D3），结构键就是这个请求键：它按出处编号，同一个 Agent 并发的
+        几次调用各等各的，编号不随调度变。人等的对象记成请求键，等 `Reply` 的记成关联 ID。
         """
         key = next_key('request')
+        if not isinstance(cast(object, agent_id), str):
+            # 不记 span：拒绝由 `_wait_for` 给出，它说得清期望什么。
+            return await self._registered_wait(agent_id, waiter, key)
+        if isinstance(waiter, Reply):
+            correlation = cast(object, waiter.correlation_id)
+            kind, target = 'agent', correlation if isinstance(correlation, str) else ''
+        else:
+            kind, target = 'human', '' if key is None else json.dumps(list(key))
+        with self._wait_span(agent_id, key, kind, target) as span:
+            result = await self._registered_wait(agent_id, waiter, key)
+            span.attributes['wait.outcome'] = result.state.value
+            return result
+
+    def _wait_span(self, agent_id: str, key: StableKey | None, kind: str, target: str) -> _Span:
+        if key is None:
+            self._host_waits += 1
+            key = ('host', 'wait', self._host_waits - 1)
+        return self._tracing.span(
+            SpanKind.WAIT,
+            key,
+            name=f'wait {kind}',
+            agent_id=agent_id,
+            attributes={'wait.kind': kind, 'wait.target': target},
+        )
+
+    async def _registered_wait(
+        self, agent_id: str, waiter: Waiter, key: StableKey | None
+    ) -> WaitResult:
         if key is None:
             return await self._wait_for(agent_id, waiter)
         pending = (agent_id, correlation_of(waiter))
@@ -2491,6 +2601,7 @@ class Runtime:
         answer = None if taking.cancelled() or failure is not None else taking.result()
         if answer is not None:
             # 答复优先于中断：消息已经离开邮箱了，此刻丢掉就是真的丢了。
+            self._tracing.consumed(answer.id)
             return WaitResult(state=WaitState.ANSWERED, message=answer)
         if token.raised.done():
             state = token.raised.result()
@@ -2872,9 +2983,10 @@ class Runtime:
 
     async def _shutdown_once(self) -> None:
         """完整关机只跑一次；每个公开 `shutdown` 调用等待本任务的同一结果。"""
-        # 本任务建在第一个调用方的上下文里；关机 hook 派的活不该按那个调用方的出处取 id——谁先叫
-        # shutdown 取决于调度（M3 D10）。
+        # 本任务建在第一个调用方的上下文里；关机 hook 派的活不该按那个调用方的出处取 id、记在它的
+        # span 上——谁先叫 shutdown 取决于调度（M3 D10）。
         becoming_owner(('shutdown',), {})
+        outside_any_span()
         token = _SHUTTING_DOWN.set((*_SHUTTING_DOWN.get(), self))
         try:
             await self._shutdown_body()
@@ -2907,7 +3019,12 @@ class Runtime:
         try:
             failures.extend(await self._module_assembly.shutdown(self))
         finally:
-            await self.events.close()
+            # 报在关掉总线之前与之后都不对：之前报不全（模块关闭里还有插桩），而关总线抛出时之后那句
+            # 根本走不到。
+            try:
+                await self.events.close()
+            finally:
+                self._report_tracer_failures()
         if not failures:
             return
         if all(isinstance(failure, Exception) for failure in failures):

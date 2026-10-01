@@ -80,6 +80,10 @@ class ControlBlock:
         """暂存的延迟消息条数。只交出条数不交出消息，避免又开一个活引用的口子。"""
         return len(self._deferred)
 
+    def deferred_ids(self) -> frozenset[str]:
+        """暂存的延迟消息的 id。只交出 id（字符串），理由同 `deferred_count`。"""
+        return frozenset(message.id for message in self._deferred)
+
     def enter_run(self) -> None:
         self._in_run = True
 
