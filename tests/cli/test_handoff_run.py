@@ -1,0 +1,984 @@
+"""`run --handoff` 端到端（spec D13）：经 CLI 宿主跑一次脚本化的 run，看交接文件、stdout、stderr
+与退出码。"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import subprocess
+from datetime import UTC, datetime
+from io import StringIO
+from pathlib import Path
+
+import pytest
+
+import syndica.cli.host as host_module
+from syndica.cli.handoff import lock_workspace
+from syndica.cli.host import RuntimeCliHost
+from syndica.cli.main import CliIO, RunRequest, main
+from syndica.kernel import ConfigError, ScriptedLLM, ScriptedTurn, ToolCall
+
+_SECRET = 'Zq9' + 'Lm4Xw7Pk2Rt8Vb5Nc3Jd6'
+
+
+def _call(call_id: str, name: str, **arguments: object) -> ToolCall:
+    return ToolCall(id=call_id, name=name, arguments=json.dumps(arguments))
+
+
+def _env(tmp_path: Path) -> dict[str, str]:
+    home = tmp_path / 'home'
+    home.mkdir(exist_ok=True)
+    return {
+        **os.environ,
+        'HOME': str(home),
+        'GIT_CONFIG_GLOBAL': os.devnull,
+        'GIT_CONFIG_NOSYSTEM': '1',
+        'SERVICE_TOKEN': _SECRET,
+    }
+
+
+def _git(root: Path, env: dict[str, str], *args: str) -> str:
+    return subprocess.run(
+        ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com', *args],
+        cwd=root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _workspace(tmp_path: Path, *, git: bool = True, name: str = 'ws') -> Path:
+    root = tmp_path / name
+    (root / 'src').mkdir(parents=True)
+    (root / 'README.md').write_text('# project\n', encoding='utf-8')
+    (root / 'src' / 'keep.py').write_text('KEEP = 1\n', encoding='utf-8')
+    if git:
+        env = _env(tmp_path)
+        _git(root, env, 'init', '-q')
+        _git(root, env, 'add', '.')
+        _git(root, env, 'commit', '-q', '-m', 'init')
+    return root
+
+
+def _config(
+    tmp_path: Path, verify: list[str] | None = None, protected: list[str] | None = None
+) -> Path:
+    (tmp_path / 'lead.md').write_text('You lead.\n', encoding='utf-8')
+    (tmp_path / 'reviewer.md').write_text('You review.\n', encoding='utf-8')
+    workspace = {}
+    if verify is not None:
+        workspace['verify'] = verify
+    if protected is not None:
+        workspace['protected'] = protected
+    lines = [
+        'version: 1',
+        'agents:',
+        '  - name: Reviewer',
+        '    description: reviews',
+        '    system_prompt: reviewer.md',
+        '    tools: [Read, Bash]',
+        '  - name: Lead',
+        '    description: leads',
+        '    system_prompt: lead.md',
+        '    tools: [Write, Edit, Bash]',
+        '    subagents: [Reviewer]',
+    ]
+    if workspace:
+        lines.append(f'workspace: {json.dumps(workspace)}')
+    path = tmp_path / 'syndica.yaml'
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return path
+
+
+def _reviewed(verdict: str = 'pass', *, answer: str = 'done\ncommit_title: add new') -> ScriptedLLM:
+    """Lead 写一个文件、派 Reviewer；Reviewer 给出结论；Lead 收尾。"""
+    return ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('w', 'Write', path='src/new.py', content='NEW = 1\n')]),
+            ScriptedTurn(tool_calls=[_call('d', 'Delegate', agent='Reviewer', query='review')]),
+            ScriptedTurn(content=f'looks fine\nverdict: {verdict}'),
+            ScriptedTurn(content=answer),
+        ]
+    )
+
+
+class _Run:
+    def __init__(self, code: int, stdout: str, stderr: str, root: Path) -> None:
+        self.code = code
+        self.stdout = stdout
+        self.stderr = stderr
+        self.root = root
+
+    @property
+    def files(self) -> list[Path]:
+        directory = self.root / '.syndica' / 'handoffs'
+        return sorted(directory.iterdir()) if directory.exists() else []
+
+    @property
+    def matter(self) -> dict[str, str]:
+        head = self.stdout.split('---\n')[1]
+        return dict(line.split(': ', 1) for line in head.splitlines())
+
+
+def _run(
+    tmp_path: Path,
+    llm: ScriptedLLM,
+    *,
+    config: Path,
+    root: Path,
+    agent: str = 'Lead',
+    stdin: str = '',
+    extra: tuple[str, ...] = ('--handoff',),
+) -> _Run:
+    stdout, stderr = StringIO(), StringIO()
+    io = CliIO(stdin=StringIO(stdin), stdout=stdout, stderr=stderr)
+    host = RuntimeCliHost(
+        io=io, model_factory=lambda _: llm, workspace_root=root, environ=_env(tmp_path)
+    )
+    try:
+        code = main(
+            ['--config', str(config), 'run', *extra, '--agent', agent, 'work on it'],
+            host=host,
+            io=io,
+        )
+    finally:
+        host.close()
+    return _Run(code, stdout.getvalue(), stderr.getvalue(), root)
+
+
+def test_a_verified_run_prints_the_handoff_once_and_writes_the_same_file(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    (path,) = run.files
+    assert run.code == 0
+    assert run.matter == {
+        'schema': 'syndica.handoff/1',
+        'status': 'verified',
+        'host_verify': 'passed',
+        'reviewer_verdict': 'pass',
+        'git': 'not_offered',
+        'protected_changed': '[]',
+        'exit_code': '0',
+    }
+    assert list(run.matter) == [
+        'schema',
+        'status',
+        'host_verify',
+        'reviewer_verdict',
+        'git',
+        'protected_changed',
+        'exit_code',
+    ]
+    assert path.read_text(encoding='utf-8') == run.stdout
+    assert run.stdout.count('schema: syndica.handoff/1') == 1
+    assert f'交接文件：{path}' in run.stderr
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert (root / '.syndica' / '.gitignore').read_text(encoding='utf-8') == '*\n'
+    assert '- `??` src/new.py\n' in run.stdout
+
+
+def test_a_failing_verify_command_fails_verification_and_exits_1(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true', 'false']), root=root)
+
+    assert run.code == 1
+    assert (run.matter['status'], run.matter['host_verify']) == ('verification_failed', 'failed')
+    assert '- 失败：`false`' in run.stdout
+    assert '修好复核命令 `false`' in run.stdout
+
+
+def test_without_verify_the_run_is_unverified_and_exits_0(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path), root=root)
+
+    assert run.code == 0
+    assert (run.matter['status'], run.matter['host_verify']) == ('unverified', 'not_configured')
+    assert 'workspace.verify 里配上' in run.stdout
+
+
+def test_a_passing_verify_with_a_blocking_reviewer_is_unverified(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, _reviewed('block'), config=_config(tmp_path, verify=['true']), root=root)
+
+    assert run.code == 0
+    assert (run.matter['status'], run.matter['reviewer_verdict']) == ('unverified', 'block')
+    assert '人工 review' in run.stdout
+
+
+def test_a_failed_run_skips_verification_and_exits_1(tmp_path: Path):
+    root = _workspace(tmp_path)
+    marker = tmp_path / 'verify-ran'
+
+    run = _run(
+        tmp_path,
+        ScriptedLLM([]),
+        config=_config(tmp_path, verify=[f'touch {marker}']),
+        root=root,
+    )
+
+    assert run.code == 1
+    assert (run.matter['status'], run.matter['host_verify']) == ('run_failed', 'skipped')
+    assert not marker.exists()
+    assert 'run 没有正常结束' in run.stdout
+
+
+def test_a_verify_command_that_changes_files_fails_verification_and_names_them(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(
+        tmp_path, _reviewed(), config=_config(tmp_path, verify=['touch generated.txt']), root=root
+    )
+
+    assert run.code == 1
+    assert run.matter['status'] == 'verification_failed'
+    assert '复核命令改了这些文件，复核按失败算：\n- generated.txt' in run.stdout
+
+
+def test_outside_git_the_handoff_says_why_it_cannot_list_changes(tmp_path: Path):
+    root = _workspace(tmp_path, git=False)
+    env = _env(tmp_path)
+    env['GIT_CEILING_DIRECTORIES'] = str(tmp_path)
+
+    stdout, stderr = StringIO(), StringIO()
+    io = CliIO(stdin=StringIO(), stdout=stdout, stderr=stderr)
+    llm = _reviewed()
+    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=root, environ=env)
+    try:
+        code = main(
+            [
+                '--config',
+                str(_config(tmp_path, verify=['true'])),
+                'run',
+                '--handoff',
+                '--agent',
+                'Lead',
+                'go',
+            ],
+            host=host,
+            io=io,
+        )
+    finally:
+        host.close()
+
+    assert code == 0
+    assert '列不出改动：' in stdout.getvalue()
+    assert 'reviewer_verdict: unverified' in stdout.getvalue()
+
+
+def test_a_file_changed_before_the_run_and_again_during_it_is_called_out(tmp_path: Path):
+    root = _workspace(tmp_path)
+    (root / 'src' / 'keep.py').write_text('KEEP = 2  # mine\n', encoding='utf-8')
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[_call('w', 'Write', path='src/keep.py', content='KEEP = 3\n')]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root)
+
+    assert '运行前已经改过、这次又被改的文件（提交前请人核对）：\n- src/keep.py' in run.stdout
+
+
+def test_an_interruption_before_the_final_rewrite_leaves_the_file_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+
+    def interrupted(*args: object) -> None:
+        raise RuntimeError('interrupted before the final rewrite')
+
+    monkeypatch.setattr(host_module, 'rewrite_handoff', interrupted)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    (path,) = run.files
+    text = path.read_text(encoding='utf-8')
+    assert run.code == 1
+    assert 'git: pending\n' in text
+    assert 'exit_code: null\n' in text
+    assert run.stdout == ''
+
+
+def test_a_failure_after_the_writers_are_removed_is_still_redacted_and_escaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+
+    def failing(*args: object) -> None:
+        raise RuntimeError(f'could not rename, token {_SECRET} \u202e')
+
+    monkeypatch.setattr(host_module, 'rewrite_handoff', failing)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path), root=root)
+
+    assert run.code == 1
+    assert _SECRET not in run.stderr
+    assert '\u202e' not in run.stderr
+    assert '[REDACTED:secret.env_value]' in run.stderr
+
+
+def _asking(question: str) -> ScriptedLLM:
+    return ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('q', 'AskUser', question=question)]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+
+def test_under_handoff_questions_go_to_stderr_and_stdout_has_only_the_handoff(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, _asking('Which option?'), config=_config(tmp_path), root=root, stdin='A\n')
+
+    assert 'Which option?' in run.stderr
+    assert 'Which option?' not in run.stdout
+    assert run.stdout.startswith('---\nschema: syndica.handoff/1\n')
+
+
+def test_questions_in_an_ordinary_run_are_escaped(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(
+        tmp_path,
+        _asking('Pick\x1b[2J\x9b1m\u202eevil'),
+        config=_config(tmp_path),
+        root=root,
+        stdin='A\n',
+        extra=(),
+    )
+
+    assert '\x1b' not in run.stdout
+    assert '\x9b' not in run.stdout
+    assert '\u202e' not in run.stdout
+    assert 'Pick\\x1b[2J\\x9b1m\\u202eevil' in run.stdout
+
+
+def test_a_secret_in_the_agents_words_never_reaches_the_file_or_either_stream(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('q', 'AskUser', question=f'use {_SECRET}?')]),
+            ScriptedTurn(content=f'done, the key is {_SECRET}'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root, stdin='yes\n')
+
+    (path,) = run.files
+    for text in (path.read_text(encoding='utf-8'), run.stdout, run.stderr):
+        assert _SECRET not in text
+        assert _SECRET[:16] not in text
+    assert '[REDACTED:secret.env_value]' in run.stdout
+    assert '[REDACTED:secret.env_value]' in run.stderr
+
+
+def test_a_second_handoff_run_on_a_locked_workspace_exits_1(tmp_path: Path):
+    root = _workspace(tmp_path)
+    held = lock_workspace(root)
+    try:
+        run = _run(tmp_path, _reviewed(), config=_config(tmp_path), root=root)
+    finally:
+        os.close(held)
+
+    assert run.code == 1
+    assert '另一个 run 锁着' in run.stderr
+    assert run.files == []
+
+
+def test_a_symlinked_syndica_directory_is_refused_and_the_handoff_still_printed(tmp_path: Path):
+    root = _workspace(tmp_path)
+    outside = tmp_path / 'elsewhere'
+    outside.mkdir()
+    (root / '.syndica').symlink_to(outside, target_is_directory=True)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path), root=root)
+
+    assert run.code == 1
+    assert '交接文件没写成' in run.stderr
+    assert '实际: 它是符号链接' in run.stderr
+    assert '下一步: 删掉它再跑' in run.stderr
+    assert run.stdout.startswith('---\nschema: syndica.handoff/1\n')
+    assert run.matter['exit_code'] == '1'
+    assert list(outside.iterdir()) == []
+
+
+def test_a_handoff_path_the_agent_blocked_with_a_file_still_prints_the_handoff(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('w', 'Write', path='.syndica/handoffs', content='x')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root)
+
+    assert run.code == 1
+    assert '实际: 它不是目录' in run.stderr
+    assert run.stdout.startswith('---\nschema: syndica.handoff/1\n')
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root 不受文件权限约束')
+def test_a_verify_that_breaks_the_after_snapshot_fails_verification(tmp_path: Path):
+    root = _workspace(tmp_path)
+    command = "sh -c 'echo tampered >> src/keep.py; : > .locked; chmod 000 .locked'"
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=[command]), root=root)
+
+    assert run.code == 1
+    assert (run.matter['status'], run.matter['host_verify']) == ('verification_failed', 'failed')
+    assert '列不出复核前后的改动' in run.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root 不受文件权限约束')
+def test_a_verification_whose_before_snapshot_failed_does_not_pass(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('b', 'Bash', command=': > .locked; chmod 000 .locked')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path, verify=['true']), root=root)
+
+    assert (run.code, run.matter['host_verify']) == (1, 'failed')
+    assert '列不出复核前后的改动' in run.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root 不受文件权限约束')
+def test_a_verification_that_only_has_an_after_snapshot_does_not_pass(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('b', 'Bash', command=': > .locked; chmod 000 .locked')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path, verify=['rm -f .locked']), root=root)
+
+    assert (run.code, run.matter['host_verify']) == (1, 'failed')
+    assert '列不出复核前后的改动' in run.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root 不受文件权限约束')
+def test_a_pre_run_snapshot_that_failed_is_stated(tmp_path: Path):
+    root = _workspace(tmp_path)
+    (root / '.locked').write_text('x\n', encoding='utf-8')
+    (root / '.locked').chmod(0)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('b', 'Bash', command='rm -f .locked')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root)
+
+    assert '运行前的快照没取到，确认不了这次有没有改到人在运行前就改过的文件' in run.stdout
+
+
+def test_a_verification_that_crashes_is_reported_as_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+
+    async def crashed(self: object, config: object) -> tuple[object, ...]:
+        raise RuntimeError('verify blew up')
+
+    monkeypatch.setattr(RuntimeCliHost, '_verify', crashed)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    assert run.code == 1
+    assert run.matter['status'] == 'verification_failed'
+    assert '复核命令没能跑完：RuntimeError: verify blew up' in run.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root 不受文件权限约束')
+def test_log_records_are_escaped_and_redacted_and_never_reach_the_real_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    root = _workspace(tmp_path)
+    locked = root / f'leak-{_SECRET}-\u202e.txt'
+    locked.write_text('x\n', encoding='utf-8')
+    locked.chmod(0)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['true']), root=root)
+
+    real = capsys.readouterr().err
+    assert _SECRET not in real
+    assert '\u202e' not in real
+    assert 'Reviewer' in run.stderr
+    assert _SECRET not in run.stderr
+    assert '\u202e' not in run.stderr
+
+
+def test_the_handoff_path_line_is_redacted_and_escaped(tmp_path: Path):
+    root = _workspace(tmp_path, name=f'ws-{_SECRET[:20]}-\u202e')
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path), root=root)
+
+    assert '交接文件：' in run.stderr
+    assert _SECRET[:20] not in run.stderr
+    assert '\u202e' not in run.stderr
+    assert '-\\u202e' in run.stderr
+
+
+def test_the_answer_of_an_ordinary_run_is_escaped(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM([ScriptedTurn(content='done\x1b]0;pwned\x07\u202e')])
+
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root, extra=())
+
+    assert run.code == 0
+    assert '\x1b' not in run.stdout
+    assert 'done\\x1b]0;pwned\\x07\\u202e' in run.stdout
+
+
+def test_a_failure_printed_by_the_cli_is_escaped():
+    class Failing:
+        def run_request(self, request: object) -> str:
+            raise RuntimeError('provider said \x1b[2J\u202egone')
+
+    stderr = StringIO()
+    io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr)
+
+    code = main(['run', 'go'], host=Failing(), io=io)  # type: ignore[arg-type]
+
+    assert code == 1
+    assert '\x1b' not in stderr.getvalue()
+    assert 'provider said \\x1b[2J\\u202egone' in stderr.getvalue()
+
+
+def test_protected_paths_the_run_changed_are_listed_in_the_front_matter(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    _call('g', 'Write', path='.gitignore', content='*.log\n'),
+                    _call('p', 'Write', path='pyproject.toml', content='[project]\n'),
+                    _call('n', 'Write', path='src/free.py', content='x = 1\n'),
+                ]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path, protected=['pyproject.toml']), root=root)
+
+    assert run.matter['protected_changed'] == '[".gitignore", "pyproject.toml"]'
+
+
+def test_a_reviewer_that_changes_files_with_bash_does_not_count(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('w', 'Write', path='src/new.py', content='NEW = 1\n')]),
+            ScriptedTurn(tool_calls=[_call('d', 'Delegate', agent='Reviewer', query='review')]),
+            ScriptedTurn(tool_calls=[_call('b', 'Bash', command='echo sneaky >> src/new.py')]),
+            ScriptedTurn(content='verdict: pass'),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path, verify=['true']), root=root)
+
+    assert (run.matter['status'], run.matter['reviewer_verdict']) == ('unverified', 'unverified')
+
+
+def test_a_read_only_handoff_is_read_only_and_skips_verification(tmp_path: Path):
+    root = _workspace(tmp_path)
+    marker = tmp_path / 'verify-ran'
+    llm = ScriptedLLM([ScriptedTurn(content='nothing to change')])
+
+    run = _run(
+        tmp_path,
+        llm,
+        config=_config(tmp_path, verify=[f'touch {marker}']),
+        root=root,
+        agent='Reviewer',
+        extra=('--handoff', '--no-write'),
+    )
+
+    assert run.code == 0
+    assert (run.matter['status'], run.matter['host_verify']) == ('read_only', 'skipped')
+    assert not marker.exists()
+
+
+def test_the_checks_the_agent_ran_are_listed(tmp_path: Path):
+    root = _workspace(tmp_path)
+    tool = tmp_path / 'bin'
+    tool.mkdir()
+    fake = tool / 'pytest'
+    fake.write_text('#!/bin/sh\necho "4 passed in 0.10s"\n', encoding='utf-8')
+    fake.chmod(0o755)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('t', 'Bash', command=f'{fake} -q')]),
+            ScriptedTurn(tool_calls=[_call('e', 'Bash', command='echo hello')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root)
+
+    assert f'`{fake} -q`：passed（passed=4）' in run.stdout
+    assert 'echo hello' not in run.stdout
+
+
+def test_a_verify_run_of_pytest_that_prints_no_summary_does_not_pass(tmp_path: Path):
+    root = _workspace(tmp_path)
+    tool = tmp_path / 'bin'
+    tool.mkdir()
+    fake = tool / 'pytest'
+    fake.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+    fake.chmod(0o755)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=[f'{fake} -q']), root=root)
+
+    assert run.code == 1
+    assert run.matter['host_verify'] == 'failed'
+
+
+def test_the_host_refuses_a_handoff_for_a_session_on_its_own(tmp_path: Path):
+    host = RuntimeCliHost(
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
+        model_factory=lambda _: ScriptedLLM([]),
+        workspace_root=_workspace(tmp_path),
+        environ=_env(tmp_path),
+    )
+    try:
+        with pytest.raises(ConfigError) as caught:
+            host.run_request(RunRequest(prompt='go', session='agent-1', handoff=True))
+    finally:
+        host.close()
+
+    assert caught.value.expected == '--handoff 用于一次新的 run'
+    assert '去掉 --session' in caught.value.next_action
+
+
+def _fake_pytest(tmp_path: Path, script: str) -> Path:
+    tool = tmp_path / 'fakebin'
+    tool.mkdir(exist_ok=True)
+    fake = tool / 'pytest'
+    fake.write_text(f'#!/bin/sh\n{script}\n', encoding='utf-8')
+    fake.chmod(0o755)
+    return fake
+
+
+def test_a_verify_run_of_pytest_that_collected_no_tests_does_not_pass(tmp_path: Path):
+    root = _workspace(tmp_path)
+    fake = _fake_pytest(tmp_path, 'echo "no tests ran in 0.01s"\nexit 5')
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=[f'{fake} -q']), root=root)
+
+    assert (run.code, run.matter['host_verify']) == (1, 'failed')
+
+
+def test_a_verify_command_that_times_out_does_not_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = _workspace(tmp_path)
+    monkeypatch.setattr(host_module, '_VERIFY_TIMEOUT', 0.5)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=['sleep 5']), root=root)
+
+    assert (run.code, run.matter['host_verify']) == (1, 'failed')
+
+
+def test_a_model_that_fails_outright_still_leaves_a_run_failed_handoff(tmp_path: Path):
+    root = _workspace(tmp_path)
+    stdout, stderr = StringIO(), StringIO()
+    io = CliIO(stdin=StringIO(), stdout=stdout, stderr=stderr)
+
+    def broken(name: str) -> ScriptedLLM:
+        raise RuntimeError('provider down \x1b]0;pwned\x07')
+
+    host = RuntimeCliHost(io=io, model_factory=broken, workspace_root=root, environ=_env(tmp_path))
+    try:
+        code = main(
+            ['--config', str(_config(tmp_path)), 'run', '--handoff', '--agent', 'Lead', 'go'],
+            host=host,
+            io=io,
+        )
+    finally:
+        host.close()
+
+    assert code == 1
+    assert 'status: run_failed' in stdout.getvalue()
+    assert '\x1b' not in stdout.getvalue()
+    assert '原因写在「Agent 的结论」一节开头' in stdout.getvalue()
+
+
+def test_the_config_loaded_at_the_start_is_the_one_used_for_verify_and_protected(tmp_path: Path):
+    root = _workspace(tmp_path)
+    (root / 'lead.md').write_text('You lead.\n', encoding='utf-8')
+    (root / 'reviewer.md').write_text('You review.\n', encoding='utf-8')
+    original = _config(tmp_path, verify=['false'], protected=['src/keep.py']).read_text(
+        encoding='utf-8'
+    )
+    config = root / '.syndica.yaml'
+    config.write_text(original, encoding='utf-8')
+    forged = original.replace('"verify": ["false"]', '"verify": ["true"]').replace(
+        '"protected": ["src/keep.py"]', '"protected": []'
+    )
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    _call('c', 'Write', path='.syndica.yaml', content=forged),
+                    _call('k', 'Write', path='src/keep.py', content='KEEP = 9\n'),
+                ]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=config, root=root)
+
+    assert run.matter['host_verify'] == 'failed'
+    assert 'src/keep.py' in run.matter['protected_changed']
+
+
+def test_a_human_edit_the_agent_reverted_is_called_out(tmp_path: Path):
+    root = _workspace(tmp_path)
+    (root / 'src' / 'keep.py').write_text('KEEP = 2  # mine\n', encoding='utf-8')
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[_call('w', 'Write', path='src/keep.py', content='KEEP = 1\n')]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root)
+
+    assert '运行前已经改过、这次又被改的文件（提交前请人核对）：\n- src/keep.py' in run.stdout
+
+
+@pytest.mark.parametrize(
+    'command', ['rm -f src/new.py', 'git add src/new.py', 'chmod +x src/new.py']
+)
+def test_a_verify_command_that_deletes_stages_or_chmods_a_file_fails(tmp_path: Path, command: str):
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path, verify=[command]), root=root)
+
+    assert (run.code, run.matter['host_verify']) == (1, 'failed')
+    assert f'- 通过：`{command}`' in run.stdout
+    assert '复核命令改了这些文件，复核按失败算：\n- src/new.py' in run.stdout
+
+
+def test_a_change_made_with_edit_is_marked_as_produced_by_write_or_edit(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    _call(
+                        'e',
+                        'Edit',
+                        path='src/keep.py',
+                        old_string='KEEP = 1',
+                        new_string='KEEP = 3',
+                    )
+                ]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root)
+
+    assert '- ` M` src/keep.py\n' in run.stdout
+
+
+def test_a_write_through_a_symlinked_directory_or_another_case_counts_as_written(tmp_path: Path):
+    root = _workspace(tmp_path)
+    (root / 'alias').symlink_to('src', target_is_directory=True)
+    env = _env(tmp_path)
+    _git(root, env, 'add', 'alias')
+    _git(root, env, 'commit', '-q', '-m', 'alias')
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    _call('w', 'Write', path='alias/viaLink.py', content='x\n'),
+                    _call('c', 'Write', path='SRC/Cafe\u0301.py', content='y\n'),
+                ]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root)
+
+    assert '- `??` src/viaLink.py\n' in run.stdout
+    assert '不是 Write / Edit 产生的' not in run.stdout
+
+
+def test_escape_sequences_in_checks_verify_commands_and_new_file_names_are_escaped(
+    tmp_path: Path,
+):
+    root = _workspace(tmp_path)
+    fake = _fake_pytest(tmp_path, 'echo "4 passed in 0.10s"')
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('t', 'Bash', command=f'{fake} -q "\x1b[31m"')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    verify = ['touch "$(printf \'evil\\033[31m.txt\')"  # \x1b[32m']
+
+    run = _run(tmp_path, llm, config=_config(tmp_path, verify=verify), root=root)
+
+    assert '\x1b' not in run.stdout
+    assert 'evil\\x1b[31m.txt' in run.stdout
+    assert '# \\x1b[32m' in run.stdout
+
+
+def test_the_handoff_file_name_carries_the_utc_time(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, _reviewed(), config=_config(tmp_path), root=root)
+
+    (path,) = run.files
+    stamp = datetime.strptime(path.name.split('-')[0], '%Y%m%dT%H%M%SZ').replace(tzinfo=UTC)
+    assert abs((datetime.now(UTC) - stamp).total_seconds()) < 120
+
+
+def test_a_failed_run_without_verify_is_skipped_not_not_configured(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, ScriptedLLM([]), config=_config(tmp_path), root=root)
+
+    assert (run.matter['status'], run.matter['host_verify']) == ('run_failed', 'skipped')
+
+
+def test_verification_runs_in_the_agents_environment_not_the_hosts(tmp_path: Path):
+    root = _workspace(tmp_path)
+    stdout, stderr = StringIO(), StringIO()
+    io = CliIO(stdin=StringIO(), stdout=stdout, stderr=stderr)
+    llm = _reviewed()
+    environ = {**_env(tmp_path), 'DEPLOY_REGION': 'host-only'}
+    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=root, environ=environ)
+    config = _config(tmp_path, verify=['test -n "$DEPLOY_REGION"'])
+    try:
+        code = main(
+            ['--config', str(config), 'run', '--handoff', '--agent', 'Lead', 'go'],
+            host=host,
+            io=io,
+        )
+    finally:
+        host.close()
+
+    assert code == 1
+    assert 'host_verify: failed' in stdout.getvalue()
+
+
+def test_a_root_that_runs_out_of_turns_is_a_failed_run_even_with_text(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                content='working on it',
+                tool_calls=[_call('w', 'Write', path='src/a.py', content='a\n')],
+            ),
+            ScriptedTurn(
+                content='still working',
+                tool_calls=[_call('x', 'Write', path='src/b.py', content='b\n')],
+            ),
+        ]
+    )
+
+    run = _run(
+        tmp_path,
+        llm,
+        config=_config(tmp_path, verify=['true']),
+        root=root,
+        extra=('--handoff', '--max-turns', '2'),
+    )
+
+    assert (run.code, run.matter['status']) == (1, 'run_failed')
+    assert '以 max_turns 结束' in run.stdout
+
+
+def test_a_root_aborted_by_end_of_input_is_a_failed_run(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, _asking('Go ahead?'), config=_config(tmp_path), root=root, stdin='')
+
+    assert (run.code, run.matter['status']) == (1, 'run_failed')
+
+
+def test_errors_of_child_agents_are_listed_in_the_handoff(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('d', 'Delegate', agent='Reviewer', query='review')]),
+            ScriptedTurn(raises=RuntimeError('reviewer model crashed')),
+            ScriptedTurn(content='done anyway'),
+        ]
+    )
+
+    run = _run(tmp_path, llm, config=_config(tmp_path), root=root)
+
+    assert '## 运行中的错误' in run.stdout
+    assert 'reviewer model crashed' in run.stdout
+
+
+def test_protected_paths_changed_by_a_human_before_the_run_are_not_reported(tmp_path: Path):
+    root = _workspace(tmp_path)
+    (root / 'pyproject.toml').write_text('[project]\n', encoding='utf-8')
+
+    run = _run(
+        tmp_path,
+        ScriptedLLM([ScriptedTurn(content='looked around')]),
+        config=_config(tmp_path, protected=['pyproject.toml']),
+        root=root,
+        agent='Reviewer',
+        extra=('--handoff', '--no-write'),
+    )
+
+    assert run.matter['protected_changed'] == '[]'
+
+
+def test_a_verified_run_without_changes_says_there_is_nothing_to_commit(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(
+        tmp_path,
+        ScriptedLLM([ScriptedTurn(content='verdict: pass')]),
+        config=_config(tmp_path, verify=['true']),
+        root=root,
+        agent='Reviewer',
+    )
+
+    assert run.matter['status'] == 'verified'
+    assert '不需要提交' in run.stdout
+
+
+def test_handoff_and_session_together_are_refused(tmp_path: Path):
+    stderr = StringIO()
+    io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr)
+
+    code = main(['run', '--handoff', '--session', 'agent-1', 'go'], host=None, io=io)
+
+    assert code == 2
+    assert '期望: --handoff 用于一次新的 run' in stderr.getvalue()
+    assert '去掉 --session' in stderr.getvalue()

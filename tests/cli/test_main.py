@@ -149,6 +149,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'max_wall_clock': None,
         'flags': (),
         'no_write': False,
+        'handoff': False,
     }
     assert asdict(host.requests[1]) == {
         'prompt': 'review this',
@@ -162,6 +163,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'max_wall_clock': 30.0,
         'flags': ('retry_enabled=true', 'attempts=3'),
         'no_write': True,
+        'handoff': False,
     }
 
 

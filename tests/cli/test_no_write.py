@@ -77,7 +77,7 @@ def _run(
         workspace_root=root,
     )
     try:
-        return host.run_request(
+        answer = host.run_request(
             RunRequest(
                 prompt='work',
                 agent=None if topology else agent,
@@ -87,6 +87,8 @@ def _run(
                 no_write=no_write,
             )
         )
+        assert isinstance(answer, str)
+        return answer
     finally:
         host.close()
 

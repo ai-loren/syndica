@@ -11,8 +11,9 @@ from dataclasses import dataclass
 from typing import Literal, NoReturn, Protocol, TextIO, cast
 
 from syndica import __version__
+from syndica.cli.terminal import terminal_safe
 
-__all__ = ['CliHost', 'CliIO', 'InspectRequest', 'RunRequest', 'main']
+__all__ = ['CliHost', 'CliIO', 'CliOutcome', 'InspectRequest', 'RunRequest', 'main']
 
 _COMMANDS = frozenset(
     {'run', 'chat', 'agents', 'topology', 'sessions', 'flags', 'doctor', 'version'}
@@ -34,6 +35,15 @@ class RunRequest:
     max_wall_clock: float | None = None
     flags: tuple[str, ...] = ()
     no_write: bool = False
+    handoff: bool = False
+
+
+@dataclass(frozen=True)
+class CliOutcome:
+    """一条命令的结果与退出码。host 交回 `str` 等同于 `CliOutcome(str, 0)`。"""
+
+    output: str
+    exit_code: int
 
 
 @dataclass(frozen=True)
@@ -58,11 +68,11 @@ class CliIO:
 class CliHost(Protocol):
     """Runtime behavior injected behind the dependency-light router."""
 
-    def run_request(self, request: RunRequest) -> str: ...
+    def run_request(self, request: RunRequest) -> str | CliOutcome: ...
 
     def inspect(self, request: InspectRequest) -> str: ...
 
-    def doctor(self, config: str) -> str: ...
+    def doctor(self, config: str) -> str | CliOutcome: ...
 
     def open_chat(self, config: str, max_turns: int | None = None) -> str: ...
 
@@ -130,6 +140,14 @@ def _parser() -> _ArgumentParser:
         help=(
             '只读 run：Agent 只能用 Read、Grep、Glob 与派活、问人的工具，不会改动工作区；'
             '不能与 --session 同用'
+        ),
+    )
+    run.add_argument(
+        '--handoff',
+        action='store_true',
+        help=(
+            'run 结束后由宿主复核（workspace.verify），把交接文件写到 .syndica/handoffs/ 并打印到 '
+            'stdout；交互提示改走 stderr；不能与 --session 同用'
         ),
     )
     chat = commands.add_parser('chat')
@@ -217,13 +235,14 @@ def _write(stream: TextIO, text: str) -> None:
     stream.flush()
 
 
-def _host_call(action: Callable[[], str], streams: CliIO) -> int:
+def _host_call(action: Callable[[], str | CliOutcome], streams: CliIO) -> int:
     try:
-        output = action()
+        result = action()
     except Exception as exc:
         return _host_failure(exc, streams)
-    _write(streams.stdout, output)
-    return 0
+    outcome = result if isinstance(result, CliOutcome) else CliOutcome(result, 0)
+    _write(streams.stdout, outcome.output)
+    return outcome.exit_code
 
 
 def _host_failure(exc: Exception, streams: CliIO) -> int:
@@ -238,9 +257,10 @@ def _host_failure(exc: Exception, streams: CliIO) -> int:
         expected = 'CLI host 完成当前命令'
         received = f'{type(exc).__name__}: {exc}'
         next_action = '检查 Runtime host 配置和错误日志后重试'
+    # 异常文字可能带着模型或提供方回来的内容：转义之后才进终端。
     _write(
         streams.stderr,
-        f'期望: {expected}\n实际: {received}\n下一步: {next_action}',
+        terminal_safe(f'期望: {expected}\n实际: {received}\n下一步: {next_action}'),
     )
     return 1
 
@@ -289,10 +309,10 @@ def _chat(host: CliHost, config: str, streams: CliIO, max_turns: int | None) -> 
             return 2
         request = RunRequest(prompt=message, config=config, session=target)
         try:
-            output = host.run_request(request)
+            result = host.run_request(request)
         except Exception as exc:
             return _host_failure(exc, streams)
-        _write(streams.stdout, output)
+        _write(streams.stdout, result.output if isinstance(result, CliOutcome) else result)
 
 
 def main(
@@ -325,6 +345,14 @@ def main(
                 f'实际: 同时收到 --session {namespace.session}\n'
                 '下一步: 去掉 --session 开一次只读的新 run；会话里的 Agent 建好时已经带着写工具，'
                 '中途收不回来',
+            )
+        if namespace.command == 'run' and namespace.handoff and namespace.session is not None:
+            raise _ParserExit(
+                2,
+                '期望: --handoff 用于一次新的 run\n'
+                f'实际: 同时收到 --session {namespace.session}\n'
+                '下一步: 去掉 --session：交接要在 run 开始前取快照、在它结束后复核，会话里的 '
+                'Agent 早已开始',
             )
     except _ParserExit as exc:
         if exc.message:
@@ -373,5 +401,6 @@ def main(
         max_wall_clock=namespace.max_wall_clock,
         flags=flags,
         no_write=namespace.no_write,
+        handoff=namespace.handoff,
     )
     return _host_call(lambda: host.run_request(request), streams)

@@ -3,7 +3,7 @@
 > **执行者须知：本文件是需求，不是参考。** 「公开契约」一节里的 CLI 参数、配置键、规则 ID、标记行、
 > front matter 字段与内核 API 一旦发布就是兼容承诺；执行中不得为了让测试变绿临时改名或缩小断言范围。
 
-**状态：已评审，执行中（T1–T10、T14 完成，阶段一已审计）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
+**状态：已评审，执行中（T1–T11、T14 完成，阶段一已审计）。** 五项裁决由用户确认；计划经作者自审与两轮独立评审修订（2026-09-30、
 2026-10-01，见「决策日志」）。GitHub Actions 本月免费额度已用完，恢复之前按「验证」一节的本地验证协议执行。
 
 **Goal:** 让 Syndica 在一份仓库里完成一次受控修改：读约束、规划、改文件、跑检查、读失败、迭代修复，
@@ -319,21 +319,27 @@ handoff 的状态是 `read_only`。依据路线图静态验收「写工具不可
    hash。`verify`、`protected`、`pass_env` 都从开始时加载的配置里取，Agent 中途改 `.syndica.yaml` 不影响；
 3. Agent 结束后关闭 Agent 的工作区（D9：杀掉它留下的全部进程组）；复核用新的工作区（Agent 环境），git 用
    宿主 git 环境；
-4. run 失败时不跑复核（`host_verify: skipped`）；否则取快照 A（改动与 blob hash）→ 逐条跑 verify（每条上限
-   900 秒）→ 取快照 B。B 与 A 不同说明复核命令改了文件，复核按失败算，handoff 列出被改的文件；
+4. run 失败时不跑复核（`host_verify: skipped`）。「run 失败」包括根 Agent 没有以 completed 结束（轮数用完、
+   被中止：它留下的文字可能只做了一半）。否则取快照 A（改动与 blob hash）→ 逐条跑 verify（每条上限
+   900 秒）→ 取快照 B。B 与 A 不同说明复核命令改了文件，复核按失败算，handoff 列出被改的文件；在 git 仓库里
+   而 A 或 B 取不到（复核命令留下读不了的文件、弄坏了仓库），复核同样按失败算并写明原因——确认不了就是没
+   通过；复核命令崩了也一样。运行前的快照取不到时 handoff 写明「确认不了有没有改到人在运行前改过的文件」；
 5. 组装 handoff，经 D12 脱敏，以 0600 写到 `.syndica/handoffs/<UTC 时间戳>-<短 id>.md`：这时 git 收尾
-   还没发生，front matter 里 `git: pending`、`exit_code: null`。文件路径打到 stderr。写之前 `lstat` 检查
-   `.syndica` 与 `handoffs` 不是符号链接、解析后仍在工作区内；第一次创建 `.syndica/` 时写一个内容为 `*` 的
-   `.gitignore`；
+   还没发生，front matter 里 `git: pending`、`exit_code: null`。文件路径（同样经脱敏）打到 stderr。写之前
+   `lstat` 检查 `.syndica` 与 `handoffs` 不是符号链接、不是别的类型的文件、解析后仍在工作区内；`.syndica/`
+   里没有 `.gitignore` 时补一个内容为 `*` 的（`O_EXCL`，已有的不动——Agent 先建出 `.syndica/` 时第一次创建的
+   那一刻已经过去）。文件写不成时交接内容照样打印到 stdout、退出 1；
 6. 执行 D14 的 git 收尾（摘要与询问都在 stderr）；
 7. 用最终的 `git` 与 `exit_code` 和 git 一节重写同一个文件（写临时文件再原子改名，仍是 0600），然后把这份
    最终 handoff 完整打印到 stdout，只打印这一次。在第 6 步被打断时，文件停在 `git: pending`，如实反映没做完。
 
 **转义。** 所有来自模型、Agent 或文件系统的字符串（文件名、命令、结论、提交标题、确认参数、AskUser 的问题
 与选项）进终端与 handoff 之前都经 `terminal_safe()`：除换行与制表符外的 C0 控制字符、DEL、C1 控制字符、
-双向文字控制字符（U+061C、U+200E、U+200F、U+202A–U+202E、U+2066–U+2069）与 U+2028 / U+2029 转义成可见的
-`\x..` / `\u....`。这对**所有** run 的交互提示都生效，不只 `--handoff`；`--handoff` 下提示另外改走 stderr，
-stdout 只有 handoff。
+双向文字控制字符（U+061C、U+200E、U+200F、U+202A–U+202E、U+2066–U+2069）、U+2028 / U+2029 与落单的代理
+字符转义成可见的 `\x..` / `\u....`。这对**所有** run 生效，不只 `--handoff`：交互提示、回答、stderr 上的
+告警与错误、run 期间的日志（日志不装处理器时经 `logging.lastResort` 直接写进进程的 stderr，绕过转义与脱敏）。
+`--handoff` 下提示另外改走 stderr，stdout 只有 handoff。handoff 正文里来自模型的多行文字按引用块写，文件名
+与命令里的换行也转义，伪造不出交接文件自己的节。
 
 「改动」按 `git status --porcelain=v1 -z --untracked-files=all` 解析，排除 `.syndica/`；不是 git 仓库或
 没有 git 时写明原因。「下一步」由宿主按状态生成（修哪条失败、怎么手动提交），不取模型文字。
@@ -354,11 +360,13 @@ merge ref）、所有 remote 的 URL、`git rev-parse --git-path config` 指向�
 `git rev-parse --git-path hooks` 解析出的目录里每个钩子文件的 hash、有没有进行中的操作。hash 一律用不写
 对象库的 `git hash-object`（不带 `-w`），扫描之前不往 `.git/objects` 落任何内容。
 
-**Reviewer 结论。** 取最后一个满足下列全部条件的 Reviewer Agent 的最后一段文字：结局是 `COMPLETED`；自己
-没有 Write / Edit；它开始与结束时的工作树指纹（D11）都等于快照 A——这同时挡住了「Reviewer 之后又有人改」
-「Reviewer 自己用 Bash 改了」「后台进程在 review 期间改了」三种情况；文字里恰有一行符合标记语法（公开
-契约）。找不到这样的 Reviewer（包括从来没有派过 Reviewer）时结论是 `unverified`。handoff 标明这是模型
-给出的结论。
+**Reviewer 结论。** 在满足下列全部条件的 Reviewer 运行里取**结束得最晚**的那一次的最后一段文字（并发的
+Reviewer、分叉出的子评审结束得早，开始的先后说明不了谁的结论在后）：结局是 `COMPLETED`；它开始与结束时的
+工作树指纹（D11）都等于快照 A——这同时挡住了「Reviewer 之后又有人改」「Reviewer 自己用 Bash 改了」「后台
+进程在 review 期间改了」三种情况；文字里恰有一行符合标记语法（公开契约）；这个 Agent 自己没有 Write /
+Edit、没启动过后台命令，而且它的**每一次**运行都取到了指纹、开始与结束时相同（挡住被唤醒两次、第一次用
+Bash 改了文件的 Reviewer；正常的「评审 → 修 → 再评审」每一次运行都没改文件，照样算数）。找不到这样的
+Reviewer（包括从来没有派过 Reviewer）时结论是 `unverified`。handoff 标明这是模型给出的结论。
 
 **前置条件。** 提交的前置条件，任一不满足就不提供任何自动选项，handoff 写明是哪一条：
 
@@ -502,7 +510,8 @@ topologies: {}
   大小写）。
 - Orchestrator 最终回答里：匹配 `^\s*commit_title\s*[:：]\s*(\S.*?)\s*$` 的一行。
 
-键是小写 ASCII；各自恰好一行才算数，零行或多行都按缺失处理。
+键是小写 ASCII，值按 ASCII 不分大小写（`paſſ` 不算）；按 `str.splitlines()` 切行、每行整行匹配（`\s` 含
+`\r`、NBSP 与全角空格，CRLF 结尾的行照样算数）；各自恰好一行才算数，零行或多行都按缺失处理。
 
 ### `meta` 与服务
 
@@ -758,6 +767,15 @@ Linux 补跑待 CI 额度恢复）
 - 变异：逐条删规则；短的先换；片段匹配套用到路径值；提交闸做片段匹配；长度下限差一。
 
 #### T11 — `CliOutcome` 与 `run --handoff`
+
+**状态：completed**（本地验证协议：定向用例与六道门禁全绿；两次对抗评审共找出 1 Critical / 8 High /
+11 Medium / 6 Low 与 23 条存活变异，修掉之后变异 86 条杀死 85 条，剩下一条是等价变异（快照 A 取不到时的提前
+返回：指纹取不到的 Reviewer 本来就不算数）。确认不了就是没通过：在 git 仓库里快照 A 或 B 取不到、复核命令
+崩了都按复核失败算，根 Agent 没以 completed 结束是 run 失败。Reviewer 结论取结束得最晚的那一次，且这个
+Reviewer 每次运行都没改工作树、没启动后台命令；标记行按契约的 `\s` 逐行整行匹配、值只认 ASCII。受保护路径
+不分大小写、只算这次 run 的改动。日志、告警、回答与失败消息都转义，`--handoff` 下日志也经脱敏写入器，正文里
+模型的文字按引用块写。交接文件写不成时内容照样打印、退出 1，`.syndica/` 里缺 `.gitignore` 就补。写进审计
+的已知限制：Agent 能改 `.syndica/` 里以前的交接文件。Linux 补跑待 CI 额度恢复）
 
 **Files:** `cli/main.py`（`CliOutcome`、`--handoff`）、`cli/host.py`、新模块 `cli/handoff.py`、对应用例。
 

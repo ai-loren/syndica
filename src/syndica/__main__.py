@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from syndica.cli.main import CliIO, InspectRequest, RunRequest, main
+from syndica.cli.main import CliIO, CliOutcome, InspectRequest, RunRequest, main
 
 if TYPE_CHECKING:
     from syndica.cli.host import RuntimeCliHost
@@ -267,7 +267,7 @@ class _LazyHost:
             )
         return self._host
 
-    def run_request(self, request: RunRequest) -> str:
+    def run_request(self, request: RunRequest) -> str | CliOutcome:
         return self._get().run_request(request)
 
     def inspect(self, request: InspectRequest) -> str:

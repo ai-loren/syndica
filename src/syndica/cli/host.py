@@ -7,18 +7,42 @@ import json
 import logging
 import os
 import platform
-from collections.abc import Callable, Mapping
+import secrets
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from textwrap import indent
 from types import MappingProxyType
-from typing import cast
+from typing import TextIO, cast
 
+from syndica.cli.checks import parse_check
 from syndica.cli.config import CliConfig, load_config
-from syndica.cli.dev_module import DevModule
+from syndica.cli.dev_module import DevLog, DevLogSnapshot, DevModule, last_answer
 from syndica.cli.environment import AgentEnvironment, agent_environment
-from syndica.cli.main import CliIO, InspectRequest, RunRequest
+from syndica.cli.handoff import (
+    HandoffFacts,
+    HandoffLocked,
+    HandoffWriteError,
+    RedactingWriter,
+    VerifyResult,
+    exit_code_of,
+    front_matter,
+    lock_workspace,
+    path_key,
+    protected_matcher,
+    render,
+    reviewer_verdict,
+    rewrite_handoff,
+    status_of,
+    write_handoff,
+)
+from syndica.cli.host_git import Change, GitUnavailable, HostGit
+from syndica.cli.main import CliIO, CliOutcome, InspectRequest, RunRequest
 from syndica.cli.policy import dev_danger_options
+from syndica.cli.redaction import Redactor
+from syndica.cli.terminal import one_line, terminal_safe
 from syndica.kernel import (
     LLM,
     AgentCatalog,
@@ -78,6 +102,10 @@ _READ_ONLY_NOTICE = (
     '（这次 run 是只读的（--no-write）：只有 Read、Grep、Glob 与派活、问人的工具，改文件、跑命令的'
     '工具都用不了。需要改动时，把要改什么、怎么改写进最终回答。）\n\n'
 )
+# 宿主复核每条命令的上限（D13）：比 Agent 的 Bash 宽得多，全量测试要跑得完。
+_VERIFY_TIMEOUT = 900.0
+# 交接正文「Agent 跑过的检查」不列这一类：echo、ls 不是检查。
+_UNRECOGNISED_CHECK = 'other'
 
 
 class _RuntimeErrorCapture(logging.Handler):
@@ -310,13 +338,6 @@ def _no_answer(reason: StopReason | None) -> ContractViolation:
     )
 
 
-def _final_text(context: Context, start: int) -> str | None:
-    for block in reversed(context.current_traj[start:]):
-        if block.role == 'assistant' and isinstance(block.content, str) and block.content:
-            return block.content
-    return None
-
-
 def _after_message(context: Context, message_id: str | None) -> int:
     """这条消息注入之后的位置；它没被注入（Agent 没读到它）时是轨迹末尾。
 
@@ -479,6 +500,176 @@ def _read_only_topology(topology: Topology) -> Topology:
     )
 
 
+def _changes(git: HostGit) -> tuple[tuple[Change, ...] | None, str | None]:
+    """(改动, 取不到时的原因)。不是 git 仓库、没有 git 都不让交接失败，只让它写明原因。"""
+    try:
+        return git.changes(), None
+    except GitUnavailable as exc:
+        return None, str(exc)
+
+
+def _differences(
+    before: tuple[Change, ...] | None, after: tuple[Change, ...] | None
+) -> tuple[str, ...]:
+    """两份快照之间内容或状态不同的路径（多出来的、少了的都算）。"""
+    if before is None or after is None:
+        return ()
+    old = {change.path: change for change in before}
+    new = {change.path: change for change in after}
+    return tuple(sorted(path for path in old.keys() | new.keys() if old.get(path) != new.get(path)))
+
+
+def _touched_again(
+    before: tuple[Change, ...] | None, after: tuple[Change, ...] | None
+) -> tuple[str, ...]:
+    """运行前就改过、这次又被改（或被改回去）的文件：提交会把人自己的改动一起带走。"""
+    if before is None or after is None:
+        return ()
+    new = {change.path: change for change in after}
+    return tuple(sorted(change.path for change in before if new.get(change.path) != change))
+
+
+def _written(log: DevLogSnapshot, root: Path) -> frozenset[str]:
+    """Write / Edit 写成了的路径，按工作区的解析方式落到真实位置（符号链接目录、`/tmp` 与
+    `/private/tmp` 这样的两种写法都归一），再换成相对工作区根的比较键，好与 git 的改动逐条对上。"""
+    real_root = os.path.realpath(root)
+    keys: set[str] = set()
+    for entry in log.tools:
+        if entry.tool in {'Write', 'Edit'} and entry.target:
+            target = Path(entry.target)
+            full = os.path.realpath(target if target.is_absolute() else root / target)
+            keys.add(path_key(Path(os.path.relpath(full, real_root)).as_posix()))
+    return frozenset(keys)
+
+
+def _run_changes(
+    before: tuple[Change, ...] | None, after: tuple[Change, ...] | None
+) -> tuple[Change, ...]:
+    """这次 run 改出来的：快照里与运行前那一份不同的条目。运行前那份没取到时只能当全是这次的。"""
+    if after is None:
+        return ()
+    if before is None:
+        return after
+    old = {change.path: change for change in before}
+    return tuple(change for change in after if old.get(change.path) != change)
+
+
+def _in_repository(git: HostGit) -> bool:
+    try:
+        return git.run('rev-parse', '--is-inside-work-tree').strip() == b'true'
+    except GitUnavailable:
+        return False
+
+
+def _checks(log: DevLogSnapshot) -> tuple[str, ...]:
+    return tuple(
+        f'`{entry.target}`：{entry.check.status}'
+        + (f'（{entry.check.summary}）' if entry.check.summary else '')
+        for entry in log.tools
+        if entry.check is not None and entry.check.tool != _UNRECOGNISED_CHECK
+    )
+
+
+def _next_steps(
+    status: str,
+    host_verify: str,
+    verdict: str,
+    results: tuple[VerifyResult, ...],
+    changed_by_verify: tuple[str, ...],
+    verify_error: str | None,
+    *,
+    changed: bool,
+) -> tuple[str, ...]:
+    """「下一步」由宿主按状态生成，不取模型的文字。"""
+    if status == 'run_failed':
+        return (
+            'run 没有正常结束：原因写在「Agent 的结论」一节开头，修好之后重跑。工作区里的改动还在，'
+            '没有提交。',
+        )
+    if status == 'read_only':
+        return ('只读 run 不改动工作区，也不做宿主复核与 git 收尾。',)
+    if status == 'verified' and not changed:
+        return ('宿主复核全过、Reviewer 结论为 pass，但这次没有改动：不需要提交。',)
+    if status == 'verified':
+        return ('宿主复核全过、Reviewer 结论为 pass：可以提交，见「git 收尾」。',)
+    steps: list[str] = []
+    for result in results:
+        if not result.passed:
+            steps.append(
+                f'修好复核命令 `{one_line(result.command)}`（{result.summary}）：在工作区里'
+                '手动跑它，修到通过之后重跑 `syndica run --handoff`。'
+            )
+    if verify_error is not None:
+        steps.append(
+            '复核没法下结论（见「宿主复核」）：修好那个原因之后重跑 `syndica run --handoff`。'
+        )
+    if changed_by_verify:
+        steps.append(
+            '复核命令改了工作区里的文件：让它们只读地跑，或把它们生成的文件加进 .gitignore。'
+        )
+    if host_verify == 'not_configured':
+        steps.append('在 .syndica.yaml 的 workspace.verify 里配上本仓的检查命令，宿主才会复核。')
+    if status == 'unverified' and verdict != 'pass':
+        steps.append(
+            '没有可用的 Reviewer pass 结论（没派 Reviewer、它之后又有改动、它自己改了文件，或结论'
+            '不是 pass）：人工 review 改动之后再提交。'
+        )
+    return tuple(steps)
+
+
+_GIT_SECTIONS = {
+    'pending': 'git 收尾还没做：文件停在这里，说明 run 在收尾之前被打断了。',
+    'not_offered': '宿主这次没有提供 git 收尾：提交与推送由人来做。',
+}
+
+
+class _HandoffFailure(Exception):
+    """`run --handoff` 没能交出交接文件时给 CLI 的三件套：原错误里的文字经过转义与脱敏——这时两条
+    流上的脱敏写入器已经摘掉了。"""
+
+    def __init__(self, *, expected: str, received: str, next_action: str) -> None:
+        self.expected = expected
+        self.received = received
+        self.next_action = next_action
+        super().__init__(f'期望: {expected}\n实际: {received}\n下一步: {next_action}')
+
+
+def _handoff_failure(exc: Exception, redactor: Redactor) -> _HandoffFailure:
+    def clean(text: str) -> str:
+        return redactor.redact(terminal_safe(text))
+
+    parts = [getattr(exc, name, None) for name in ('expected', 'received', 'next_action')]
+    if all(isinstance(part, str) and part.strip() for part in parts):
+        expected, received, next_action = cast(list[str], parts)
+        return _HandoffFailure(
+            expected=clean(expected), received=clean(received), next_action=clean(next_action)
+        )
+    return _HandoffFailure(
+        expected='`run --handoff` 交出交接文件',
+        received=clean(f'{type(exc).__name__}: {exc}'),
+        next_action='按上面的原因修好之后重跑',
+    )
+
+
+class _TerminalLogHandler(logging.Handler):
+    """run 期间 WARNING 以上的日志：转义之后写到宿主当前的 stderr（`--handoff` 下就是脱敏写入器）。
+    不装它，日志经 `logging.lastResort` 直接写进进程的 stderr，绕过转义与脱敏，而 Reviewer 指纹的
+    告警会带着 Agent 起的文件名。"""
+
+    def __init__(self, stream: Callable[[], TextIO]) -> None:
+        super().__init__(logging.WARNING)
+        self._stream = stream
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            text = terminal_safe(self.format(record))
+            stream = self._stream()
+            stream.write(f'{text}\n')
+            stream.flush()
+        except Exception:
+            self.handleError(record)
+
+
 @dataclass
 class _ChatSession:
     config: str
@@ -512,10 +703,19 @@ class RuntimeCliHost:
         self._runner = asyncio.Runner()
         self._closed = False
         self._sessions: dict[str, _ChatSession] = {}
+        # `--handoff` 下 stdout 只有交接文件，问人的提示改走 stderr。
+        self._prompts_to_stderr = False
 
-    def run_request(self, request: RunRequest) -> str:
+    def run_request(self, request: RunRequest) -> str | CliOutcome:
         flags = _validated_request(request)
         if request.session is not None:
+            if request.handoff:
+                raise _config_error(
+                    '--handoff 用于一次新的 run',
+                    f'同时收到 session={request.session!r}',
+                    '去掉 --session：交接要在 run 开始前取快照、在它结束后复核，会话里的 Agent '
+                    '早已开始',
+                )
             if request.no_write:
                 raise _config_error(
                     '--no-write 用于一次新的 run',
@@ -539,8 +739,22 @@ class RuntimeCliHost:
                     f'这些参数会被忽略：{overrides!r}',
                     '删除这些参数；要改变装配请退出 chat，再创建一个新会话',
                 )
-            return self._runner.run(self._run_chat_request(request))
-        return self._runner.run(self._run_request(request, flags))
+            with self._logging_to_stderr():
+                return self._runner.run(self._run_chat_request(request))
+        with self._logging_to_stderr():
+            if request.handoff:
+                return self._runner.run(self._run_handoff(request, flags))
+            return self._runner.run(self._run_request(request, flags))
+
+    @contextmanager
+    def _logging_to_stderr(self) -> Generator[None, None, None]:
+        handler = _TerminalLogHandler(lambda: self._io.stderr)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        try:
+            yield
+        finally:
+            root.removeHandler(handler)
 
     def inspect(self, request: InspectRequest) -> str:
         if request.resource == 'flags':
@@ -674,11 +888,15 @@ class RuntimeCliHost:
         return workspace, environment
 
     def _prompt(self, text: str) -> None:
-        self._io.stdout.write(text)
-        self._io.stdout.flush()
+        """问人的提示。问题、选项与确认参数来自模型：转义之后才进终端。"""
+        stream = self._io.stderr if self._prompts_to_stderr else self._io.stdout
+        stream.write(terminal_safe(text))
+        stream.flush()
 
     def _warn(self, text: str) -> None:
-        self._io.stderr.write(f'{text}\n')
+        """写到 stderr 的告警与运行时错误报告：里面有异常文字与 Agent 起的名字，转义之后才进
+        终端。"""
+        self._io.stderr.write(f'{terminal_safe(text)}\n')
         self._io.stderr.flush()
 
     async def _answer(
@@ -689,8 +907,10 @@ class RuntimeCliHost:
         *,
         start: int,
         fail_without_text: bool,
+        reports: list[str] | None = None,
     ) -> str:
-        """把目标 Agent 的终局交给用户：Runtime 错误写进 stderr，回答作为返回值。
+        """把目标 Agent 的终局交给用户：Runtime 错误写进 stderr，回答作为返回值。`reports` 另外
+        收下这些错误报告（交接文件里要列出来）。
 
         这些错误记录被 `_CaptureRuntimeErrors` 截下、不会冒到 logging；子 Agent 失败时根 Agent 照样
         可能给出回答，不在这里写出去，失败就只剩一个看起来正常的结论。被最终错误引用的那一条不重复写。
@@ -699,10 +919,13 @@ class RuntimeCliHost:
         failed = context.stop_reason is StopReason.ERROR
         listed = records[:-1] if failed else records
         for position, record in enumerate(listed, start=1):
-            self._warn(_runtime_error_report(record, names, f'{position}/{len(listed)}'))
+            report = _runtime_error_report(record, names, f'{position}/{len(listed)}')
+            self._warn(report)
+            if reports is not None:
+                reports.append(report)
         if failed:
             raise _error_failure(records)
-        text = _final_text(context, start)
+        text = last_answer(context, start)
         if text is None:
             missing = _no_answer(context.stop_reason)
             if fail_without_text:
@@ -712,7 +935,7 @@ class RuntimeCliHost:
         notice = _CUT_SHORT.get(context.stop_reason)
         if notice is not None:
             self._warn(notice)
-        return text
+        return terminal_safe(text)
 
     async def _event_pump(self, runtime: Runtime, subscription: Subscription) -> None:
         async for event in subscription:
@@ -938,8 +1161,15 @@ class RuntimeCliHost:
         self,
         request: RunRequest,
         flags: Mapping[str, bool | int | str],
+        *,
+        config: CliConfig | None = None,
+        logs: list[DevLog] | None = None,
+        stops: list[StopReason | None] | None = None,
+        reports: list[str] | None = None,
     ) -> str:
-        config = self._config(request.config)
+        """一次 run 的回答。`logs` 收下这个 Runtime 的 `dev_log`（run 结束、Runtime 关掉之后照样
+        能读），`stops` 收下根 Agent 的结局，`reports` 收下运行中的错误报告。"""
+        config = config or self._config(request.config)
         catalog = _turn_capped(config.catalog, request.max_turns)
         prompt = _READ_ONLY_NOTICE + request.prompt if request.no_write else request.prompt
         workspace, environment = self._open_workspace(config)
@@ -975,6 +1205,9 @@ class RuntimeCliHost:
                     flags=flags,
                     confirmation_handler=MailboxConfirmationHandler(timeout=300),
                 )
+                if logs is not None:
+                    # 服务是装配时 setattr 上去的，Runtime 的静态类型里没有这个属性。
+                    logs.append(cast(DevLog, getattr(runtime, 'dev_log')))  # noqa: B009
                 subscription = runtime.events.subscribe()
                 pump = asyncio.create_task(
                     self._event_pump(runtime, subscription),
@@ -1037,12 +1270,15 @@ class RuntimeCliHost:
                             exit_mode=ExitMode.ZOMBIE,
                         )
                     context = await self._wait_with_pump(runtime, agent_id, pump)
+                    if stops is not None:
+                        stops.append(context.stop_reason)
                     return await self._answer(
                         runtime,
                         context,
                         runtime_errors,
                         start=0,
                         fail_without_text=True,
+                        reports=reports,
                     )
                 finally:
                     await runtime.shutdown()
@@ -1053,3 +1289,183 @@ class RuntimeCliHost:
                 await workspace.close()
             finally:
                 environment.remove()
+
+    async def _run_handoff(
+        self, request: RunRequest, flags: Mapping[str, bool | int | str]
+    ) -> CliOutcome:
+        """D13：锁住工作区 → 运行前快照 → run → 复核 → 写交接文件 → git 收尾 → 重写并打印。
+        `verify`、`protected`、`pass_env` 都取开始时加载的配置：Agent 中途改 `.syndica.yaml`
+        不影响。"""
+        config = self._config(request.config)
+        redactor = Redactor(self._environ)
+        try:
+            lock = lock_workspace(self._workspace_root)
+        except HandoffLocked as exc:
+            raise _config_error(
+                '同一工作区同时只跑一个 `run --handoff`',
+                f'{self._workspace_root} 正被另一个 run 锁着',
+                '等那个 run 结束（它退出时会把交接文件路径打到 stderr），或者到别的工作区里跑',
+            ) from exc
+        try:
+            return await self._handoff(request, flags, config, redactor)
+        except Exception as exc:
+            raise _handoff_failure(exc, redactor) from exc
+        finally:
+            os.close(lock)
+
+    async def _handoff(
+        self,
+        request: RunRequest,
+        flags: Mapping[str, bool | int | str],
+        config: CliConfig,
+        redactor: Redactor,
+    ) -> CliOutcome:
+        root = self._workspace_root
+        git = HostGit(root, self._environ)
+        in_repository = _in_repository(git)
+        before, before_error = _changes(git)
+        logs: list[DevLog] = []
+        stops: list[StopReason | None] = []
+        reports: list[str] = []
+        answer: str | None = None
+        failure: str | None = None
+        results: tuple[VerifyResult, ...] = ()
+        verify_error: str | None = None
+        changed_by_verify: tuple[str, ...] = ()
+        original = self._io
+        writers = (
+            RedactingWriter(original.stdout, redactor),
+            RedactingWriter(original.stderr, redactor),
+        )
+        self._io = CliIO(
+            stdin=original.stdin,
+            stdout=cast(TextIO, writers[0]),
+            stderr=cast(TextIO, writers[1]),
+        )
+        self._prompts_to_stderr = True
+        try:
+            try:
+                answer = await self._run_request(
+                    request, flags, config=config, logs=logs, stops=stops, reports=reports
+                )
+            except Exception as exc:
+                failure = str(exc)
+            # 「run 正常结束」（D14）指根 Agent 以 completed 结束：轮数用完、被中止时它留下的文字
+            # 可能只做了一半。
+            if failure is None and stops and stops[0] is not StopReason.COMPLETED:
+                reason = stops[0].value if stops[0] is not None else 'unknown'
+                failure = f'根 Agent 以 {reason} 结束，不是正常完成：它的回答可能只做了一半。'
+            snapshot_a, changes_error = _changes(git)
+            if failure is not None or request.no_write:
+                host_verify = 'skipped'
+            elif not config.workspace.verify:
+                host_verify = 'not_configured'
+            else:
+                try:
+                    results = await self._verify(config)
+                except Exception as exc:
+                    verify_error = f'复核命令没能跑完：{type(exc).__name__}: {exc}'
+                snapshot_b, error_b = _changes(git)
+                # 在 git 仓库里而快照 A 或 B 没取到（复核命令弄坏了仓库、留下读不了的文件），就不
+                # 知道复核改了什么：按失败算。不在 git 仓库里是本来就比不了，交接文件写明了原因。
+                if (
+                    verify_error is None
+                    and in_repository
+                    and (snapshot_a is None or snapshot_b is None)
+                ):
+                    error = changes_error if snapshot_a is None else error_b
+                    verify_error = f'列不出复核前后的改动，确认不了复核命令有没有改文件：{error}'
+                changed_by_verify = _differences(snapshot_a, snapshot_b)
+                passed = (
+                    verify_error is None
+                    and all(result.passed for result in results)
+                    and not changed_by_verify
+                )
+                host_verify = 'passed' if passed else 'failed'
+        finally:
+            for writer in writers:
+                writer.flush()
+            self._io = original
+            self._prompts_to_stderr = False
+        log = logs[0].snapshot() if logs else DevLogSnapshot((), (), ())
+        verdict = reviewer_verdict(log, snapshot_a)
+        status = status_of(
+            run_failed=failure is not None,
+            read_only=request.no_write,
+            host_verify=host_verify,
+            verdict=verdict,
+        )
+        protected = protected_matcher(config.workspace.protected)
+        run_changes = _run_changes(before, snapshot_a)
+        protected_changed = sorted(change.path for change in run_changes if protected(change.path))
+        facts = HandoffFacts(
+            prompt=request.prompt,
+            answer=answer,
+            failure=failure,
+            changes=snapshot_a,
+            changes_error=changes_error,
+            before_error=before_error if in_repository and before is None else None,
+            touched_again=_touched_again(before, snapshot_a),
+            written=_written(log, root),
+            checks=_checks(log),
+            verify=results,
+            verify_error=verify_error,
+            changed_by_verify=changed_by_verify,
+            run_errors=tuple(reports),
+            next_steps=_next_steps(
+                status,
+                host_verify,
+                verdict,
+                results,
+                changed_by_verify,
+                verify_error,
+                changed=bool(run_changes),
+            ),
+        )
+
+        def document(git_state: str, exit_code: int | None) -> str:
+            matter = front_matter(
+                status=status,
+                host_verify=host_verify,
+                verdict=verdict,
+                git=git_state,
+                protected_changed=protected_changed,
+                exit_code=exit_code,
+            )
+            return render(matter, facts, git_section=_GIT_SECTIONS[git_state])
+
+        name = f'{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}.md'
+        try:
+            path = write_handoff(root, name, document('pending', None), redactor)
+        except (HandoffWriteError, OSError) as exc:
+            # 结论不能跟着文件一起丢：照样打印到 stdout，退出 1 表示留档没做成。
+            self._warn(redactor.redact(f'交接文件没写成，内容照样打印在 stdout 上：\n{exc}'))
+            return CliOutcome(redactor.redact(document('not_offered', 1)), 1)
+        self._warn(redactor.redact(f'交接文件：{path}'))
+        git_state = 'not_offered'
+        exit_code = exit_code_of(status, git_state)
+        final = document(git_state, exit_code)
+        rewrite_handoff(root, path, final, redactor)
+        return CliOutcome(redactor.redact(final), exit_code)
+
+    async def _verify(self, config: CliConfig) -> tuple[VerifyResult, ...]:
+        """在新的工作区（Agent 的环境）里逐条跑 verify：复核验证的是 Agent 能跑出的东西。"""
+        workspace, environment = self._open_workspace(config)
+        results: list[VerifyResult] = []
+        try:
+            for command in config.workspace.verify:
+                result = await workspace.portal().run(command, timeout=_VERIFY_TIMEOUT, cwd='.')
+                check = parse_check(
+                    command=command,
+                    exit_code=result.exit_code,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    timed_out=result.timed_out,
+                )
+                results.append(VerifyResult(command, check.status == 'passed', check.summary))
+        finally:
+            try:
+                await workspace.close()
+            finally:
+                environment.remove()
+        return tuple(results)
