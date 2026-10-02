@@ -8,13 +8,13 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from io import StringIO
 from pathlib import Path
 
 import pytest
 
-from syndica.cli.main import CliIO, InspectRequest, RunRequest, main
+from syndica.cli.main import PRUNE_KEEP, CliIO, InspectRequest, RunRequest, TraceRequest, main
 
 REPO_ROOT = Path(__file__).parents[2]
 _MODEL_ENV = {
@@ -41,6 +41,7 @@ class _Host:
         self.doctor_verify: list[bool] = []
         self.chat_turn_limits: list[int | None] = []
         self.chat_traces: list[tuple[str | None, tuple[str, ...]]] = []
+        self.traces: list[TraceRequest] = []
 
     def run_request(self, request: RunRequest) -> str:
         self.requests.append(request)
@@ -70,6 +71,10 @@ class _Host:
 
     def active_agents(self) -> str:
         return 'root-agent-id Orchestrator zombie\nworker-agent-id Worker zombie'
+
+    def trace(self, request: TraceRequest) -> str:
+        self.traces.append(request)
+        return 'traced'
 
 
 def test_module_version_command_does_not_import_product_packages() -> None:
@@ -460,6 +465,64 @@ def test_host_configuration_errors_reach_stderr_with_a_nonzero_exit() -> None:
         '实际: the requested agent is missing\n'
         '下一步: run syndica agents list\n'
     )
+
+
+@pytest.mark.parametrize(
+    ('argv', 'expected'),
+    [
+        (['trace', 'list'], TraceRequest('list')),
+        (['trace', 'show', 'ab12'], TraceRequest('show', trace_id='ab12')),
+        (['trace', 'replay', 'ab12'], TraceRequest('replay', trace_id='ab12')),
+        (
+            ['trace', 'replay', 'ab12', '--allow-divergence'],
+            TraceRequest('replay', trace_id='ab12', allow_divergence=True),
+        ),
+        (['trace', 'prune'], TraceRequest('prune', keep=PRUNE_KEEP)),
+        (['trace', 'prune', '--keep', '0'], TraceRequest('prune', keep=0)),
+        (['trace', 'prune', 'ab', 'cd'], TraceRequest('prune', names=('ab', 'cd'))),
+        (['--config', 'other.yml', 'trace', 'list'], TraceRequest('list', config='other.yml')),
+    ],
+)
+def test_a_trace_command_reaches_the_host_as_one_request(
+    argv: list[str], expected: TraceRequest
+) -> None:
+    host = _Host()
+    stdout = StringIO()
+
+    code = main(argv, host=host, io=CliIO(stdin=StringIO(), stdout=stdout, stderr=StringIO()))
+
+    assert code == 0
+    assert host.traces == [replace(expected, argv=tuple(argv))]
+    assert stdout.getvalue() == 'traced\n'
+
+
+@pytest.mark.parametrize(
+    ('exit_code', 'expected'), [(2, 2), (1, 1), (3, 1), (0, 1), (-1, 1), (True, 1), ('2', 1)]
+)
+def test_a_host_error_chooses_its_exit_code_only_among_1_and_2(
+    exit_code: object, expected: int
+) -> None:
+    class Unusable(Exception):
+        expected = 'a usable trace'
+        received = 'it is not there'
+        next_action = 'run syndica trace list'
+
+    Unusable.exit_code = exit_code  # pyright: ignore[reportAttributeAccessIssue]
+
+    class FailingHost(_Host):
+        def trace(self, request: TraceRequest) -> str:
+            raise Unusable
+
+    stderr = StringIO()
+
+    code = main(
+        ['trace', 'list'],
+        host=FailingHost(),
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
+    )
+
+    assert (type(code), code) == (int, expected)
+    assert stderr.getvalue().endswith('下一步: run syndica trace list\n')
 
 
 def test_unexpected_host_errors_are_wrapped_without_a_traceback() -> None:

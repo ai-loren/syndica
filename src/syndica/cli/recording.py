@@ -26,7 +26,16 @@ from syndica.kernel import (
     TraceSource,
 )
 
-__all__ = ['LEVELS', 'Finished', 'Recording', 'run_status', 'start_recording', 'trace_level']
+__all__ = [
+    'LEVELS',
+    'Finished',
+    'Recording',
+    'described',
+    'run_status',
+    'start_recording',
+    'trace_level',
+    'trace_source',
+]
 
 LEVELS: dict[str, TraceLevel] = {level.value: level for level in TraceLevel}
 
@@ -99,17 +108,23 @@ class Recording:
         return Finished(directory, complete=header is not None and header.status is not None)
 
 
-def _source(argv: Sequence[str], config: Path | None) -> TraceSource:
+def trace_source(
+    argv: Sequence[str], config: Path | None, *, replay_of: str | None = None
+) -> TraceSource:
+    """trace 头里的来源：命令行、配置文件的 sha256（读不到是 None）、版本，回放时加原 trace。"""
     digest = None
     if config is not None:
         try:
             digest = hashlib.sha256(config.read_bytes()).hexdigest()
         except OSError:
             digest = None
-    return TraceSource(argv=tuple(argv), config_sha256=digest, version=__version__)
+    return TraceSource(
+        argv=tuple(argv), config_sha256=digest, version=__version__, replay_of=replay_of
+    )
 
 
-def _described(error: BaseException) -> str:
+def described(error: BaseException) -> str:
+    """一个异常的一行说明：带三件套的写成三件套，别的写类型与文字。"""
     parts = [getattr(error, name, None) for name in ('expected', 'received', 'next_action')]
     if all(isinstance(part, str) and part for part in parts):
         expected, received, next_action = parts
@@ -131,12 +146,12 @@ async def start_recording(
         return Recording(None, None)
     try:
         store = FileTraceStore(trace_directory(root))
-        recorder = TraceRecorder(store, redactor, level=level, source=_source(argv, config))
+        recorder = TraceRecorder(store, redactor, level=level, source=trace_source(argv, config))
         await recorder.begin()
     except Exception as error:
         warn(
             redactor.redact(
-                f'这次 run 不记录 trace：{_described(error)}。run 照常进行；要关掉这条提示就加 '
+                f'这次 run 不记录 trace：{described(error)}。run 照常进行；要关掉这条提示就加 '
                 '--trace off，或在 .syndica.yaml 写 trace: {level: off}。'
             )
         )

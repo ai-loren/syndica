@@ -41,6 +41,7 @@ from syndica.kernel.redaction import (
     RedactedText,
     Redactor,
     RuleRedactor,
+    _placeholder,  # pyright: ignore[reportPrivateUsage]
     encode_digests,
     encode_prepared,
     encode_redacted,
@@ -781,6 +782,20 @@ class TraceRecorder:
                 if isinstance(said, str) and isinstance(where, str)
                 else f'{type(error).__name__}: {error}'
             )
+            rewriting = [
+                rule.rule_id
+                for rule in self._redactor.rules
+                if _placeholder(rule.rule_id) in detail
+            ]
+            if rewriting:
+                logger.warning(
+                    '期望: 用户脱敏规则只换掉内容，不改写回放文档的结构（字段名与内核的标识）。'
+                    ' 实际: %s 改写了其中一项：%s；这个 trace 不写回放文档，其余照常。'
+                    ' 下一步: 收窄这条规则的 pattern，让它认不出上面那个值。',
+                    ', '.join(rewriting),
+                    detail,
+                )
+                return
             logger.error(
                 '期望: trace %s 写出的回放文档按场景格式读得回来。'
                 ' 实际: %s；这个 trace 不写回放文档，其余照常。'

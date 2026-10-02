@@ -39,6 +39,7 @@ import asyncio
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 import selectors
 import sys
@@ -57,6 +58,7 @@ from syndica.kernel import (
     AgentOptions,
     AgentStatus,
     BaseAgent,
+    CausalityEdge,
     ConfigError,
     ContextBlock,
     DangerJudge,
@@ -71,6 +73,7 @@ from syndica.kernel import (
     LocalWorkspace,
     MailboxConfirmationHandler,
     ManifestSource,
+    Message,
     Orchestrator,
     RetryModule,
     Runtime,
@@ -84,6 +87,8 @@ from syndica.kernel import (
     Tool,
     ToolCall,
     ToolResult,
+    Tracer,
+    TraceRecorder,
     TrustLevel,
     local_tools,
     register_builtins,
@@ -119,6 +124,8 @@ from syndica.kernel.tracing import NullTracer, current_llm_call, span_id_of
 from syndica.runner.scenario import ScenarioEvent, ScenarioResult
 
 __all__ = ['Divergence', 'ReplayResult', 'ReplayRunner']
+
+logger = logging.getLogger(__name__)
 
 # `host.no_write` 下放行的工具：只读的三件、派活与消息、问人。
 _READ_ONLY_TOOLS = frozenset(
@@ -230,15 +237,19 @@ class _VirtualClockLoop(asyncio.SelectorEventLoop):
 
 class _ReplayTracer(NullTracer):
     """闸门判定（tool_call span 结束时带着的 `danger.*` 与 `tool.outcome`）按 span id 记下，各 Agent
-    停下的原因按 agent span 记下；人的等待结束时告诉回放：它不再在等，或者记录里的那次超时到了。"""
+    停下的原因按 agent span 记下；人的等待结束时告诉回放：它不再在等，或者记录里的那次超时到了。
+    给了 `inner` 就把每一条插桩原样转给它（回放自己也记成一个 trace），回放自己的账先记。"""
 
-    def __init__(self, ended: Callable[[str, str | None], None]) -> None:
+    def __init__(
+        self, ended: Callable[[str, str | None], None], inner: Tracer | None = None
+    ) -> None:
         self.gates: dict[str, tuple[str, list[int], dict[str, AttributeValue]]] = {}
         self.stop_reasons: dict[str, str | None] = {}
         self._calls: dict[str, tuple[str, list[int]]] = {}
         self._agents: dict[str, str] = {}
         self._waits: dict[str, str] = {}
         self._ended = ended
+        self._inner = inner
 
     def start_span(
         self,
@@ -258,6 +269,8 @@ class _ReplayTracer(NullTracer):
         elif kind is SpanKind.WAIT and attributes.get('wait.kind') == 'human':
             target = attributes.get('wait.target')
             self._waits[span_id] = target if isinstance(target, str) else ''
+        if self._inner is not None:
+            self._inner.start_span(span_id, parent_span_id, kind, name, agent_id, attributes)
 
     def end_span(
         self, span_id: str, status: SpanStatus, attributes: dict[str, AttributeValue]
@@ -274,6 +287,41 @@ class _ReplayTracer(NullTracer):
         if target is not None:
             outcome = attributes.get('wait.outcome')
             self._ended(target, outcome if isinstance(outcome, str) else None)
+        if self._inner is not None:
+            self._inner.end_span(span_id, status, attributes)
+
+    def add_event(self, span_id: str, name: str, attributes: dict[str, AttributeValue]) -> None:
+        if self._inner is not None:
+            self._inner.add_event(span_id, name, attributes)
+
+    def add_edge(self, edge: CausalityEdge) -> None:
+        if self._inner is not None:
+            self._inner.add_edge(edge)
+
+    def llm_exchange(
+        self,
+        span_id: str,
+        request: Mapping[str, Any],
+        reply: ContextBlock | None,
+        error: BaseException | None,
+    ) -> None:
+        if self._inner is not None:
+            self._inner.llm_exchange(span_id, request, reply, error)
+
+    def tool_result(
+        self,
+        span_id: str,
+        result: ToolResult | None,
+        error: BaseException | None,
+        *,
+        arguments: Mapping[str, Any] | None = None,
+    ) -> None:
+        if self._inner is not None:
+            self._inner.tool_result(span_id, result, error, arguments=arguments)
+
+    def wait_answer(self, span_id: str, message: Message) -> None:
+        if self._inner is not None:
+            self._inner.wait_answer(span_id, message)
 
 
 @dataclass
@@ -334,9 +382,15 @@ class ReplayRunner:
         self._real_tools = real_tools
 
     def run(
-        self, document: ScenarioDocument, *, workspace_root: str | Path | None = None
+        self,
+        document: ScenarioDocument,
+        *,
+        workspace_root: str | Path | None = None,
+        recorder: TraceRecorder | None = None,
     ) -> ReplayResult:
-        """同步跑完（回放自己建事件循环）。v1 文档交给 `ScenarioRunner`。"""
+        """同步跑完（回放自己建事件循环）。v1 文档交给 `ScenarioRunner`。给了 `recorder`（还没
+        `begin` 的）就把这次回放本身也记下来：在回放的事件循环里 `begin` 与 `finish`，插桩照样转给
+        它；它开不了头时记一条 WARNING，回放照常。"""
         if document.version != 2:
             raise ConfigError(
                 expected='ReplayRunner 跑 version: 2 的场景文档',
@@ -365,7 +419,7 @@ class ReplayRunner:
         replay = _Replay(self, document, stubbed=stubbed, virtual=not real, resolved=resolved)
         with asyncio.Runner(loop_factory=None if real else _VirtualClockLoop) as runner:
             try:
-                return runner.run(replay.run(workspace_root))
+                return runner.run(replay.run(workspace_root, recorder))
             except asyncio.CancelledError:
                 if not replay.hung:
                     raise
@@ -418,7 +472,11 @@ class ReplayRunner:
                 raise ConfigError(
                     expected=f'回放文档引用的 payload {digest} 读得到',
                     received='没有给 payloads，或它交回 None',
-                    next_action='从记录它的那个 trace 回放（trace replay 会接上它的 payload 文件）',
+                    next_action=(
+                        '构造时给 ReplayRunner(payloads=...)：按 sha256 交回 payload 的正文'
+                        '（trace 目录 payloads/<sha256>.txt 的文本）。'
+                        '捕获写下的文档把正文内联，不引用 payload'
+                    ),
                 )
             given = cast(object, text)
             if not isinstance(given, str):
@@ -1235,20 +1293,33 @@ class _Replay:
 
     # --- the run ----------------------------------------------------------------------------
 
-    async def run(self, workspace_root: str | Path | None) -> ReplayResult:
+    async def run(
+        self, workspace_root: str | Path | None, recorder: TraceRecorder | None = None
+    ) -> ReplayResult:
         loop = asyncio.get_running_loop()
         self._task = asyncio.current_task()
         if isinstance(loop, _VirtualClockLoop):
             loop.on_idle = self.on_idle
             loop.on_stall = self.on_stall
+        recording = await _begun(recorder)
+        status = SpanStatus.ERROR
         try:
-            return await self._run(workspace_root)
+            result = await self._run(workspace_root, recording)
+            status = SpanStatus.OK
+            return result
+        except asyncio.CancelledError:
+            status = SpanStatus.CANCELLED
+            raise
         finally:
+            if recording is not None:
+                await recording.finish(status)
             if isinstance(loop, _VirtualClockLoop):
                 loop.on_idle = None
                 loop.on_stall = None
 
-    async def _run(self, workspace_root: str | Path | None) -> ReplayResult:
+    async def _run(
+        self, workspace_root: str | Path | None, recording: TraceRecorder | None = None
+    ) -> ReplayResult:
         temporary: tempfile.TemporaryDirectory[str] | None = None
         if workspace_root is None:
             temporary = tempfile.TemporaryDirectory(prefix='syndica-replay-')
@@ -1258,7 +1329,7 @@ class _Replay:
             root.mkdir(parents=True, exist_ok=True)
         workspace = LocalWorkspace(str(root), shell='/bin/sh', env={})
         llm = _ReplayLLM(self)
-        tracer = _ReplayTracer(self.wait_ended)
+        tracer = _ReplayTracer(self.wait_ended, recording)
         unrebuilt: tuple[str, ...] = ()
         events: list[ScenarioEvent] = []
         try:
@@ -1619,6 +1690,23 @@ def _rule(spec: DangerRuleSpec) -> DangerRule:
         else workspace_root_removal_rule
     )
     return factory(spec.params['root'], real=spec.params.get('real'))
+
+
+async def _begun(recorder: TraceRecorder | None) -> TraceRecorder | None:
+    """开始记录回放本身；开不了头（store 写不进去）只少这一份记录。"""
+    if recorder is None:
+        return None
+    try:
+        await recorder.begin()
+    except Exception as error:
+        logger.warning(
+            '期望: 回放本身记成一个 trace。 实际: 开头时抛出 %s: %s；这次回放不记录，照常回放。'
+            ' 下一步: 检查 trace 目录（磁盘空间、权限）。',
+            type(error).__name__,
+            error,
+        )
+        return None
+    return recorder
 
 
 def _known_error(qualified: str) -> type[Exception]:

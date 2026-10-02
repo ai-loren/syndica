@@ -44,6 +44,7 @@ __all__ = [
     'status_of',
     'terminal_safe',
     'trace_directory',
+    'trace_root',
     'write_handoff',
 ]
 
@@ -333,6 +334,13 @@ def _handoff_directory(root: Path) -> Path:
 def trace_directory(root: Path) -> Path:
     """`.syndica/traces`：trace 的根目录，与交接文件同样核对，`.gitignore` 同样补。"""
     return _own_directory(root, _TRACES)
+
+
+def trace_root(root: Path) -> Path:
+    """`.syndica/traces` 该在的位置，缺了不建：只读的命令（`trace list`）不往工作区里写东西。
+    `.syndica` 已有时照样核对；`traces` 这一级由 store 自己以 `O_NOFOLLOW` 打开，管不到上一级。"""
+    _checked_directory(root, root / _OWN)
+    return root / _OWN / _TRACES
 
 
 def write_handoff(root: Path, name: str, text: str, redactor: Redactor) -> Path:

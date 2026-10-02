@@ -426,7 +426,9 @@ class FileTraceStore:
                 return None
             name, trace, _ = found
             try:
-                return _read_text(trace, _REPLAY, f'{self._root / name}/{_REPLAY}', _FILE_LIMIT)
+                return _read_text(
+                    trace, _REPLAY, f'{self._root / name}/{_REPLAY}', _FILE_LIMIT, growing=True
+                )
             except FileNotFoundError:
                 return None
 
@@ -440,13 +442,23 @@ class FileTraceStore:
                 name = None if found is None else found[0]
         return None if name is None else self._root / name
 
+    async def size(self, trace_id: str) -> int | None:
+        """这个 trace 占的字节数（目录里的文件与 payload 目录里的文件），`trace list` 报给人看；没有
+        这个 trace 时 None。不跟符号链接、不进别的目录。不在 `TraceStore` 协议里：别的 store 不一定
+        量得出来。"""
+        with self._trace_fd(trace_id) as found:
+            if found is None:
+                return None
+            _, trace, _ = found
+            return _bytes_in(trace)
+
     async def delete(self, trace_id: str) -> None:
         with self._root_fd() as root:
             if root is None:
                 return
             with self._located(root, trace_id) as found:
                 if found is not None:
-                    shutil.rmtree(found[0], dir_fd=root)
+                    _remove(root, found[0], found[1])
             self._names.pop(trace_id, None)
 
     # --- internals ------------------------------------------------------------------------
@@ -512,6 +524,18 @@ class FileTraceStore:
                     error,
                 )
                 continue
+            # 按 id 找、按 id 删都只认名字对得上的目录（`_candidates`）：列出别的，就会有查不到、
+            # 删不掉、却照样报「删掉了」的 trace。
+            if not name.endswith(_suffixes(header.trace_id)):
+                logger.warning(
+                    '期望: %s 的名字以它的头里的 trace id（前 8 位或完整的）结尾。'
+                    ' 实际: 头是 trace %s。'
+                    ' 下一步: 它是被改名或复制出来的，不会出现在 trace 列表里；'
+                    '不要了就删掉这个目录。',
+                    self._root / name,
+                    header.trace_id,
+                )
+                continue
             yield name, header
 
     @contextmanager
@@ -557,8 +581,7 @@ class FileTraceStore:
                 os.close(trace)
 
     def _candidates(self, root: int, trace_id: str) -> list[str]:
-        suffixes = (f'-{trace_id[:8]}', f'-{trace_id}')
-        return [name for name in sorted(os.listdir(root)) if name.endswith(suffixes)]
+        return [name for name in sorted(os.listdir(root)) if name.endswith(_suffixes(trace_id))]
 
     def _opened_trace(self, root: int, name: str) -> tuple[int, TraceHeader]:
         """打开 `name` 这个目录并读出它的头，交回描述符（调用方关）与头。它不是目录、读不出头时报
@@ -631,18 +654,23 @@ class FileTraceStore:
             name, trace, _ = found
             where = f'{self._root / name}/{file}'
             try:
-                text = _read_text(trace, file, where, _FILE_LIMIT)
+                data = _read_bytes(trace, file, where, _FILE_LIMIT, growing=True)
             except FileNotFoundError:
                 return []
-        lines = text.split('\n')
+        # 先切行再逐行解码：写到一半的最后一行可能断在一个多字节字符中间，整份解码会把它报成篡改。
+        lines = data.split(b'\n')
         complete, tail = lines[:-1], lines[-1]
         values: list[tuple[Mapping[str, Any], str]] = []
         for number, line in enumerate(complete, 1):
             try:
+                text = line.decode('utf-8')
+            except UnicodeDecodeError as error:
+                raise _corrupt(where, f'第 {number} 行不是 UTF-8：{error}') from None
+            try:
                 values.append(
-                    (cast(Mapping[str, Any], json.loads(line)), f'{where} 第 {number} 行')
+                    (cast(Mapping[str, Any], json.loads(text)), f'{where} 第 {number} 行')
                 )
-            except ValueError:
+            except (ValueError, RecursionError):
                 raise _corrupt(where, f'第 {number} 行不是 JSON') from None
         if tail:
             logger.warning(
@@ -746,26 +774,51 @@ def _append_line(directory: int, name: str, text: RedactedText) -> None:
         os.close(descriptor)
 
 
-def _read_text(directory: int, name: str, where: str, limit: int) -> str:
-    """整个文件按 UTF-8 读回；比 `limit` 大的不读（打开时看大小，读的时候它变大了也停下）。"""
+def _read_bytes(
+    directory: int, name: str, where: str, limit: int, *, growing: bool = False
+) -> bytes:
+    """整个文件读回；比 `limit` 大的不读（打开时看大小，读的时候它变大了也停下）。`growing` 的
+    文件随 run 变长（span、边、回放文档），超过上限不说明它被改过。"""
     descriptor, size = _open_file(name, os.O_RDONLY, directory, write=False)
     chunks: list[bytes] = []
     try:
         if size > limit:
-            raise _corrupt(where, f'有 {size} 字节，超过这种文件的上限 {limit}')
+            raise (_too_large if growing else _over)(where, f'有 {size} 字节', limit)
         total = 0
         while chunk := os.read(descriptor, 1 << 16):
             total += len(chunk)
             if total > limit:
-                raise _corrupt(where, f'读到超过上限 {limit} 字节（文件在读的时候变大了）')
+                raise (_too_large if growing else _over)(
+                    where, f'读的时候它变大了，读到超过 {limit} 字节', limit
+                )
             chunks.append(chunk)
     finally:
         os.close(descriptor)
-    data = b''.join(chunks)
+    return b''.join(chunks)
+
+
+def _read_text(directory: int, name: str, where: str, limit: int, *, growing: bool = False) -> str:
+    """整个文件按 UTF-8 读回，上限同 `_read_bytes`。"""
     try:
-        return data.decode('utf-8')
+        return _read_bytes(directory, name, where, limit, growing=growing).decode('utf-8')
     except UnicodeDecodeError as error:
         raise _corrupt(where, f'不是 UTF-8：{error}') from None
+
+
+def _over(where: str, received: str, limit: int) -> ContractViolation:
+    return _corrupt(where, f'{received}，超过这种文件的上限 {limit}')
+
+
+def _too_large(where: str, received: str, limit: int) -> ContractViolation:
+    """写入不设上限，长跑的 trace 可以真的长到这么大：这不是「被改过」。"""
+    return ContractViolation(
+        expected=f'{where} 不超过读回的上限 {limit} 字节',
+        received=received,
+        next_action=(
+            '这个 trace 大到读不回来：被人灌大的就删掉它所在的目录；'
+            '真的是一次长跑，文件还在，直接看'
+        ),
+    )
 
 
 def _read_header(directory: int, where: str) -> TraceHeader:
@@ -787,3 +840,54 @@ def _read_payload(payloads: int, digest: str, where: str, *, limit: int) -> str 
     if hashlib.sha256(text.encode('utf-8')).hexdigest() != digest:
         raise _corrupt(where, '内容的 sha256 与文件名对不上')
     return text
+
+
+def _suffixes(trace_id: str) -> tuple[str, str]:
+    """`_new_directory` 起的名字以这两者之一结尾。"""
+    return (f'-{trace_id[:8]}', f'-{trace_id}')
+
+
+def _remove(root: int, name: str, trace: int) -> None:
+    """删掉一个 trace 目录，头最后删：中途失败时它仍列得出来、能再删一次。先删了头，剩下的目录
+    谁也认不出、也删不掉。"""
+    for entry in os.listdir(trace):
+        if entry == _HEADER:
+            continue
+        try:
+            mode = os.stat(entry, dir_fd=trace, follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(mode):
+            shutil.rmtree(entry, dir_fd=trace)
+        else:
+            os.unlink(entry, dir_fd=trace)
+    os.unlink(_HEADER, dir_fd=trace)
+    shutil.rmtree(name, dir_fd=root)
+
+
+def _bytes_in(trace: int) -> int:
+    """trace 目录里普通文件的字节数，加 payload 目录里的。不跟符号链接（`payloads` 是链接或打不开
+    时不算它）。"""
+    total = _file_bytes(trace)
+    try:
+        payloads = os.open(_PAYLOADS, _DIRECTORY, dir_fd=trace)
+    except OSError:
+        return total
+    try:
+        return total + _file_bytes(payloads)
+    finally:
+        os.close(payloads)
+
+
+def _file_bytes(directory: int) -> int:
+    """`directory` 里普通文件的字节数之和。列出与量之间消失的项不算：还在写的 trace 换头时临时
+    文件转瞬即逝。"""
+    total = 0
+    for name in os.listdir(directory):
+        try:
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            total += info.st_size
+    return total

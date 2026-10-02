@@ -16,12 +16,15 @@ from syndica.cli.main import (
     CliOutcome,
     InspectRequest,
     RunRequest,
+    TraceRequest,
     main,
 )
 
 if TYPE_CHECKING:
     from syndica.cli.host import RuntimeCliHost
-    from syndica.kernel import LLM
+    from syndica.cli.trace_commands import Replayed
+    from syndica.kernel import LLM, ScenarioDocument, TraceRecorder
+    from syndica.kernel.redaction import Redactor
 
 _OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1'
 _OPENROUTER_DEFAULT_MODEL = 'openrouter/free'
@@ -260,6 +263,21 @@ def _openai_model(name: str) -> LLM:
     )
 
 
+def _replay_document(
+    document: ScenarioDocument,
+    *,
+    redactor: Redactor,
+    allow_divergence: bool,
+    recorder: TraceRecorder | None,
+) -> Replayed:
+    """`trace replay` 的回放：CLI 与 runner 互不依赖，由组合根把两边接上。"""
+    from syndica.runner.replay import ReplayRunner
+
+    return ReplayRunner(redactor=redactor, allow_divergence=allow_divergence).run(
+        document, recorder=recorder
+    )
+
+
 class _LazyHost:
     def __init__(self, io: CliIO) -> None:
         self._io = io
@@ -273,6 +291,7 @@ class _LazyHost:
                 io=self._io,
                 model_factory=_configured_model,
                 workspace_root=Path.cwd(),
+                replayer=_replay_document,
             )
         return self._host
 
@@ -297,6 +316,9 @@ class _LazyHost:
 
     def active_agents(self) -> str:
         return self._get().active_agents()
+
+    def trace(self, request: TraceRequest) -> str | CliOutcome:
+        return self._get().trace(request)
 
     def close(self, *, interrupted: bool = False) -> None:
         if self._host is not None:

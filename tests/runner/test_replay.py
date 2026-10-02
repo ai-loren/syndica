@@ -20,11 +20,19 @@ import pytest
 from syndica.kernel import (
     ConfigError,
     ContractViolation,
+    EdgeKind,
     HookResult,
+    InMemoryTraceStore,
     Junction,
     RedactionRule,
     RuleRedactor,
+    SpanKind,
+    SpanStatus,
     Subscription,
+    TraceHeader,
+    TraceLevel,
+    TraceRecorder,
+    TraceSource,
     parse_scenario_document,
 )
 from syndica.kernel.tools.orchestration import QueryAgent
@@ -725,7 +733,7 @@ def test_a_payload_the_replay_cannot_read_makes_the_document_unusable():
         _replay(document)
 
     assert 'a' * 64 in caught.value.expected
-    assert 'trace replay' in caught.value.next_action
+    assert 'payloads=' in caught.value.next_action
 
 
 def test_payloads_are_read_through_the_given_lookup():
@@ -1829,3 +1837,141 @@ def test_a_child_woken_again_and_cut_keeps_no_stop_reason_from_its_earlier_cycle
     assert result.reproduced, result.divergences
     helper = [(b.role, b.content) for b in result.trajectories['Helper[0]']]
     assert helper == [('user', 'help'), ('assistant', 'helper done'), ('user', 'more')]
+
+
+_ORIGINAL = 'ab' * 16
+
+
+def _recorded(
+    document: dict[str, Any], store: InMemoryTraceStore
+) -> tuple[ReplayResult, TraceRecorder]:
+    recorder = TraceRecorder(
+        store, RuleRedactor(), level=TraceLevel.FULL, source=TraceSource(replay_of=_ORIGINAL)
+    )
+    result = ReplayRunner().run(
+        parse_scenario_document(document, source='captured.json'), recorder=recorder
+    )
+    return result, recorder
+
+
+def _header(store: InMemoryTraceStore, trace_id: str) -> TraceHeader:
+    header = asyncio.run(store.get(trace_id))
+    assert header is not None
+    return header
+
+
+def test_a_recorder_given_to_the_replay_records_the_replay_itself():
+    store = InMemoryTraceStore()
+
+    result, recorder = _recorded(_peers(), store)
+
+    assert result.reproduced, result.divergences
+    header = _header(store, recorder.trace_id)
+    assert (header.status, header.source.replay_of) == (SpanStatus.OK, _ORIGINAL)
+    spans = asyncio.run(store.spans(recorder.trace_id))
+    assert {span.status for span in spans} == {SpanStatus.OK}
+    agents = {span.agent_id: span for span in spans if span.kind is SpanKind.AGENT}
+    assert set(agents) == {_LEAD, _HELPER}
+    assert [span.attributes.get('stop_reason') for span in agents.values()] == ['completed'] * 2
+    [send] = [span for span in spans if span.name == 'SendMessage']
+    assert 'tool.result' in send.attributes
+    assert [event.name for event in send.events] == ['message.sent']
+    calls = [span for span in spans if span.kind is SpanKind.LLM_CALL]
+    assert len(calls) == 3
+    assert all({'llm.request', 'llm.response'} <= set(span.attributes) for span in calls)
+    edges = asyncio.run(store.edges(recorder.trace_id))
+    assert [edge.kind for edge in edges] == [EdgeKind.MESSAGE]
+
+
+def test_a_human_answer_in_the_replay_is_recorded_on_its_wait():
+    store = InMemoryTraceStore()
+    document, _ = _asked({'kind': 'user_input', 'answer': 'blue'})
+
+    result, recorder = _recorded(document, store)
+
+    assert result.reproduced, result.divergences
+    spans = asyncio.run(store.spans(recorder.trace_id))
+    [wait] = [span for span in spans if span.attributes.get('wait.kind') == 'human']
+    assert 'wait.answer' in wait.attributes
+
+
+class _Unwritable(InMemoryTraceStore):
+    def __init__(self, refusal: Exception) -> None:
+        super().__init__()
+        self._refusal = refusal
+
+    async def begin(self, header: TraceHeader) -> None:
+        raise self._refusal
+
+
+@pytest.mark.parametrize(
+    'refusal',
+    [OSError('disk full'), ContractViolation(expected='e', received='disk full', next_action='n')],
+)
+def test_a_recorder_that_cannot_begin_leaves_the_replay_as_it_was(
+    caplog: pytest.LogCaptureFixture, refusal: Exception
+):
+    store = _Unwritable(refusal)
+
+    with caplog.at_level(logging.WARNING, logger='syndica.runner.replay'):
+        result, _ = _recorded(_bash_run(), store)
+
+    assert result.reproduced, result.divergences
+    assert asyncio.run(store.traces()) == []
+    [record] = [r for r in caplog.records if r.name == 'syndica.runner.replay']
+    assert record.levelno == logging.WARNING
+    assert isinstance(record.args, tuple)
+    assert record.args[0] == type(refusal).__name__
+    assert 'disk full' in str(record.args[1])
+    assert '下一步' in record.getMessage()
+
+
+class _BrokenAtTheEnd(TraceRecorder):
+    """转过来的 `end_span` 一律抛；收尾时自己关掉开着的 span 照常。"""
+
+    closing = False
+
+    def end_span(self, span_id: str, status: SpanStatus, attributes: dict[str, Any]) -> None:
+        if not self.closing:
+            raise RuntimeError('recorder broke')
+        super().end_span(span_id, status, attributes)
+
+    async def finish(self, status: SpanStatus = SpanStatus.OK) -> None:
+        self.closing = True
+        await super().finish(status)
+
+
+def test_a_recorder_that_breaks_does_not_disturb_what_the_replay_compares(
+    caplog: pytest.LogCaptureFixture,
+):
+    recorder = _BrokenAtTheEnd(InMemoryTraceStore(), RuleRedactor(), level=TraceLevel.FULL)
+
+    with caplog.at_level(logging.ERROR):
+        result = ReplayRunner().run(
+            parse_scenario_document(_bash_run(), source='captured.json'), recorder=recorder
+        )
+
+    assert result.reproduced, result.divergences
+
+
+@pytest.mark.parametrize(
+    ('raised', 'status'),
+    [
+        (ConfigError(expected='e', received='r', next_action='n'), SpanStatus.ERROR),
+        (asyncio.CancelledError(), SpanStatus.CANCELLED),
+    ],
+)
+def test_a_replay_that_does_not_finish_ends_its_recording_with_how_it_ended(
+    monkeypatch: pytest.MonkeyPatch, raised: BaseException, status: SpanStatus
+):
+    async def broken(*args: Any, **kwargs: Any) -> ReplayResult:
+        raise raised
+
+    monkeypatch.setattr(replay_module._Replay, '_run', broken)
+    store = InMemoryTraceStore()
+
+    with pytest.raises(type(raised)):
+        _recorded(_bash_run(), store)
+
+    [header] = asyncio.run(store.traces())
+    assert header.status is status

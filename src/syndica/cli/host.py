@@ -55,14 +55,39 @@ from syndica.cli.handoff import (
     reviewer_verdict,
     rewrite_handoff,
     status_of,
+    trace_directory,
+    trace_root,
     write_handoff,
 )
 from syndica.cli.host_git import Change, GitUnavailable, HostGit
-from syndica.cli.main import EXIT_INTERRUPTED, CliIO, CliOutcome, InspectRequest, RunRequest
+from syndica.cli.main import (
+    EXIT_INTERRUPTED,
+    CliIO,
+    CliOutcome,
+    InspectRequest,
+    RunRequest,
+    TraceRequest,
+)
 from syndica.cli.policy import dev_danger_options
-from syndica.cli.recording import Recording, run_status, start_recording, trace_level
+from syndica.cli.recording import (
+    Recording,
+    described,
+    run_status,
+    start_recording,
+    trace_level,
+    trace_source,
+)
 from syndica.cli.redaction import host_redactor
 from syndica.cli.terminal import one_line, terminal_safe
+from syndica.cli.trace_commands import (
+    Replayer,
+    TraceUnusable,
+    trace_list,
+    trace_prune,
+    trace_replay,
+    trace_show,
+    unusable_replay,
+)
 from syndica.kernel import (
     LLM,
     AgentCatalog,
@@ -76,6 +101,7 @@ from syndica.kernel import (
     ContractViolation,
     ExecResult,
     ExitMode,
+    FileTraceStore,
     FlagDeclaration,
     HookResult,
     HooksCenter,
@@ -1091,8 +1117,10 @@ class RuntimeCliHost:
         model_factory: ModelFactory,
         workspace_root: str | Path,
         environ: Mapping[str, str] | None = None,
+        replayer: Replayer | None = None,
     ) -> None:
         self._io = io
+        self._replayer = replayer
         self._lines = _Lines(io.stdin)
         self._model_factory = model_factory
         self._workspace_root = Path(workspace_root)
@@ -1102,6 +1130,85 @@ class RuntimeCliHost:
         self._sessions: dict[str, _ChatSession] = {}
         # `--handoff` 下 stdout 只有交接文件，问人的提示改走 stderr。
         self._prompts_to_stderr = False
+
+    def trace(self, request: TraceRequest) -> str | CliOutcome:
+        """`syndica trace ...`：读 `.syndica/traces`（与记录同样核对；还没有时当作空的，不建）。
+        trace 目录是 Agent 改得到的，store 的告警会带着里面的名字：日志一律转义后进 stderr。"""
+        with self._logging_to_stderr():
+            try:
+                store = FileTraceStore(trace_root(self._workspace_root))
+            except HandoffWriteError as error:
+                raise TraceUnusable(
+                    expected=error.expected, received=error.received, next_action=error.next_action
+                ) from error
+            if request.action == 'list':
+                return self._runner.run(trace_list(store))
+            if request.action == 'show':
+                return self._runner.run(trace_show(store, request.trace_id))
+            if request.action == 'prune':
+                return self._runner.run(trace_prune(store, request.keep, request.names))
+            return self._trace_replay(request, store)
+
+    def _trace_replay(self, request: TraceRequest, store: FileTraceStore) -> CliOutcome:
+        """回放一个 trace，回放本身按 structure 记成一个指向原 trace 的新 trace（配置关掉记录时
+        不记）。回放自己建事件循环（记录器的写入任务跟着它），所以不在宿主的 runner 里跑。"""
+        if self._replayer is None:
+            raise TraceUnusable(
+                expected='这个入口接上了回放（syndica 的命令行入口会接上）',
+                received='宿主建出来时没有给 replayer',
+                next_action='从 `syndica` 命令行运行 trace replay',
+            )
+        header, text = self._runner.run(unusable_replay(store, request.trace_id))
+        config = self._config(request.config)
+        redactor = host_redactor(self._environ, config.redaction_rules)
+        recorder = None
+        if trace_level(None, config.trace_level, chat=False, warn=self._warn) is not TraceLevel.OFF:
+            try:
+                trace_directory(self._workspace_root)
+            except (HandoffWriteError, OSError) as error:
+                self._warn(
+                    redactor.redact(f'这次回放不记录 trace：{described(error)}。回放照常进行。')
+                )
+            else:
+                recorder = TraceRecorder(
+                    store,
+                    redactor,
+                    level=TraceLevel.STRUCTURE,
+                    source=trace_source(
+                        request.argv, self._config_file(request.config), replay_of=header.trace_id
+                    ),
+                )
+        try:
+            # 回放出原始 run 的失败是预期之内的：Runtime 为它记的 ERROR（带 traceback）不打出来，
+            # 结论里的分叉已经说清楚了两边一不一样。
+            with _CaptureRuntimeErrors():
+                return trace_replay(
+                    header,
+                    text,
+                    replayer=self._replayer,
+                    allow_divergence=request.allow_divergence,
+                    recorder=recorder,
+                )
+        finally:
+            if recorder is not None:
+                self._runner.run(self._show_trace(store, recorder.trace_id, redactor))
+
+    async def _show_trace(self, store: FileTraceStore, trace_id: str, redactor: Redactor) -> None:
+        """在 stderr 打出一个记完的 trace 的目录与它完不完整；目录不在（没开始记）时不说。"""
+        directory = await store.directory(trace_id)
+        if directory is None:
+            return
+        header = await store.get(trace_id)
+        label = 'trace' if header is not None and header.status is not None else _INCOMPLETE_TRACE
+        self._warn(redactor.redact(f'{label}：{self._shown(directory)}'))
+
+    def _shown(self, directory: Path) -> str:
+        """trace 目录相对工作区根；不在工作区里时给绝对路径。"""
+        return (
+            str(directory.relative_to(self._workspace_root))
+            if directory.is_relative_to(self._workspace_root)
+            else str(directory)
+        )
 
     def run_request(self, request: RunRequest) -> str | CliOutcome:
         flags = _validated_request(request)
@@ -1322,12 +1429,7 @@ class RuntimeCliHost:
             return
         if finished is None:
             return
-        directory = finished.directory
-        shown = (
-            str(directory.relative_to(self._workspace_root))
-            if directory.is_relative_to(self._workspace_root)
-            else str(directory)
-        )
+        shown = self._shown(finished.directory)
         label = 'trace' if finished.complete else _INCOMPLETE_TRACE
         self._warn(redactor.redact(f'{label}：{shown}'))
         if traces is not None:

@@ -20,14 +20,17 @@ __all__ = [
     'CliOutcome',
     'InspectRequest',
     'RunRequest',
+    'TraceRequest',
     'main',
 ]
 
 # 被 Ctrl-C 中断：优先于 1（没通过）与 3（被拒绝），中断本身就是没做完的原因。
 EXIT_INTERRUPTED = 130
 _COMMANDS = frozenset(
-    {'run', 'chat', 'agents', 'topology', 'sessions', 'flags', 'doctor', 'version'}
+    {'run', 'chat', 'agents', 'topology', 'sessions', 'flags', 'doctor', 'version', 'trace'}
 )
+# `trace prune` 不点名时留下的、有结局的 trace 个数。
+PRUNE_KEEP = 50
 _TRACE_LEVELS = ('off', 'structure', 'replay', 'full')
 
 
@@ -71,6 +74,20 @@ class InspectRequest:
 
 
 @dataclass(frozen=True)
+class TraceRequest:
+    """`syndica trace ...` 的一次请求：`list`、`show <id>`、`replay <id>`、`prune`。`trace_id` 是
+    id 或它的前缀；`names` 是 `prune` 点名要删的那几个（点了名就只删它们）。"""
+
+    action: Literal['list', 'show', 'replay', 'prune']
+    trace_id: str | None = None
+    allow_divergence: bool = False
+    keep: int = PRUNE_KEEP
+    names: tuple[str, ...] = ()
+    config: str = '.syndica.yaml'
+    argv: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class CliIO:
     """Text streams owned by the embedding console process."""
 
@@ -98,6 +115,8 @@ class CliHost(Protocol):
     ) -> str: ...
 
     def active_agents(self) -> str: ...
+
+    def trace(self, request: TraceRequest) -> str | CliOutcome: ...
 
 
 class _ParserExit(Exception):
@@ -127,6 +146,16 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError('must be a positive integer') from exc
     if parsed <= 0:
         raise argparse.ArgumentTypeError('must be a positive integer')
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('must be a non-negative integer') from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError('must be a non-negative integer')
     return parsed
 
 
@@ -209,6 +238,29 @@ def _parser() -> _ArgumentParser:
         help='自检之后在 Agent 的环境里逐条跑 workspace.verify，任一条失败退出 1',
     )
     commands.add_parser('version')
+    trace = commands.add_parser('trace')
+    trace_actions = trace.add_subparsers(dest='action', required=True)
+    trace_actions.add_parser(
+        'list', help='列出 trace：开始时间（UTC）、id、状态、Agent 数、span 数、大小'
+    )
+    show = trace_actions.add_parser('show', help='时间线，以及谁创建了谁、谁在等谁、最慢的工具调用')
+    show.add_argument('trace_id')
+    replay = trace_actions.add_parser(
+        'replay', help='离线回放：0 复现，1 分叉或结局不同，2 回放文档用不了'
+    )
+    replay.add_argument('trace_id')
+    replay.add_argument(
+        '--allow-divergence',
+        action='store_true',
+        help='分叉之后接着回放、把每一处分叉都报出来（仍以 1 退出）',
+    )
+    prune = trace_actions.add_parser(
+        'prune', help='删掉旧 trace：只留最近 --keep 个有结局的；点名的只删点名的'
+    )
+    prune.add_argument('trace_ids', nargs='*')
+    prune.add_argument(
+        '--keep', type=_non_negative_int, help=f'留下最近几个有结局的（默认 {PRUNE_KEEP}）'
+    )
     return parser
 
 
@@ -307,7 +359,9 @@ def _host_failure(exc: Exception, streams: CliIO) -> int:
         text = f'{headline}\n{text}'
     # 异常文字可能带着模型或提供方回来的内容：转义之后才进终端。
     _write(streams.stderr, terminal_safe(text))
-    return 1
+    # 宿主可以说这是哪一类失败：2 是「给的东西用不了」（trace 不存在、回放文档读不进来）。
+    code = getattr(exc, 'exit_code', 1)
+    return code if type(code) is int and code in (1, 2) else 1
 
 
 def _chat(
@@ -435,6 +489,14 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
                     f'实际: 同时收到 --no-write 与 --git-mode {namespace.git_mode}\n'
                     '下一步: 去掉其中一个：只读 run 没有改动，不做 git 收尾',
                 )
+        if namespace.command == 'trace' and getattr(namespace, 'trace_ids', None):
+            if namespace.keep is not None:
+                raise _ParserExit(
+                    2,
+                    '期望: trace prune 要么点名删、要么按 --keep 留\n'
+                    f'实际: 同时收到 {len(namespace.trace_ids)} 个 id 与 --keep {namespace.keep}\n'
+                    '下一步: 去掉其中一个：点了名就只删点名的那几个，不再按个数留',
+                )
     except _ParserExit as exc:
         if exc.message:
             _write(streams.stderr, exc.message)
@@ -466,6 +528,18 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
             config=namespace.config,
         )
         return _host_call(lambda: host.inspect(request), streams)
+    if namespace.command == 'trace':
+        keep: int | None = getattr(namespace, 'keep', None)
+        trace_request = TraceRequest(
+            action=namespace.action,
+            trace_id=getattr(namespace, 'trace_id', None),
+            allow_divergence=getattr(namespace, 'allow_divergence', False),
+            keep=PRUNE_KEEP if keep is None else keep,
+            names=tuple(getattr(namespace, 'trace_ids', ())),
+            config=namespace.config,
+            argv=tuple(received),
+        )
+        return _host_call(lambda: host.trace(trace_request), streams)
     if namespace.command == 'doctor':
         # 只在给了 --verify 时才传这个参数：没有它的宿主实现照样能跑普通的 doctor。
         if namespace.verify:

@@ -493,6 +493,43 @@ async def test_a_description_that_does_not_fit_the_format_writes_no_document(
     assert header is not None and header.status is SpanStatus.OK
 
 
+async def test_a_user_rule_that_rewrites_part_of_the_document_is_named_in_a_warning(
+    caplog: pytest.LogCaptureFixture,
+):
+    with caplog.at_level(logging.WARNING, logger='syndica.kernel.trace_recorder'):
+        store, recorder, document = await _captured(
+            [ScriptedTurn('done')],
+            host={'danger': {'rules': [{'id': 'shell.privilege_escalation'}]}},
+            redactor=RuleRedactor(rules=[RedactionRule('custom.word', 'shell')]),
+        )
+
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
+    header = await store.get(recorder.trace_id)
+    assert document is None
+    assert record.levelno == logging.WARNING
+    rules, detail = cast(tuple[str, str], record.args)
+    assert rules == 'custom.word'
+    assert '[REDACTED:custom.word].privilege_escalation' in detail
+    assert '收窄这条规则的 pattern' in record.getMessage()
+    assert header is not None and header.status is SpanStatus.OK
+
+
+async def test_a_description_that_does_not_fit_stays_an_error_beside_an_unrelated_rule(
+    caplog: pytest.LogCaptureFixture,
+):
+    with caplog.at_level(logging.WARNING, logger='syndica.kernel.trace_recorder'):
+        _, _, document = await _captured(
+            [ScriptedTurn('done')],
+            host={'danger': {'rules': [{'id': 'shell.no_such_rule'}]}},
+            redactor=RuleRedactor(rules=[RedactionRule('custom.word', 'zebra')]),
+        )
+
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
+    assert document is None
+    assert record.levelno == logging.ERROR
+    assert 'describe_run' in record.getMessage()
+
+
 async def test_a_store_that_refuses_the_replay_document_leaves_the_trace_without_an_outcome():
     class _Refusing(InMemoryTraceStore):
         async def put_replay(self, trace_id: str, document: Any) -> None:

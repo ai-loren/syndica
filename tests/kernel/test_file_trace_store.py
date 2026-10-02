@@ -673,3 +673,148 @@ async def test_a_file_that_grows_while_it_is_read_stops_at_the_limit(
         await store.payload(ref)
 
     assert '变大了' in caught.value.received
+
+
+def _on_disk(directory: Path) -> int:
+    total = 0
+    for parent, _, files in os.walk(directory):
+        total += sum(os.lstat(Path(parent, name)).st_size for name in files)
+    return total
+
+
+async def test_the_size_counts_every_file_of_the_trace_including_its_payloads(tmp_path: Path):
+    store, directory = await _begun(tmp_path)
+    await store.append(_TRACE, [_span(1), _span(2)], [])
+    await store.put_payload(_TRACE, encode_redacted('x' * 5000, RuleRedactor()))
+    await store.put_replay(_TRACE, encode_redacted({'version': 2}, RuleRedactor()))
+
+    size = await store.size(_TRACE)
+
+    assert size == _on_disk(directory)
+    assert size is not None and size > 5000
+
+
+async def test_the_size_follows_no_symlink_and_enters_no_other_directory(tmp_path: Path):
+    store, directory = await _begun(tmp_path)
+    before = await store.size(_TRACE)
+    elsewhere = tmp_path / 'elsewhere'
+    elsewhere.mkdir()
+    (elsewhere / 'big.bin').write_bytes(b'x' * 10_000)
+    (directory / 'linked.bin').symlink_to(elsewhere / 'big.bin')
+    (directory / 'payloads').rmdir()
+    (directory / 'payloads').symlink_to(elsewhere, target_is_directory=True)
+    (directory / 'nested').mkdir()
+    (directory / 'nested' / 'inner.bin').write_bytes(b'x' * 10_000)
+
+    assert await store.size(_TRACE) == before
+
+
+async def test_the_payload_directory_is_counted_but_nothing_below_it(tmp_path: Path):
+    store, directory = await _begun(tmp_path)
+    await store.put_payload(_TRACE, encode_redacted('x' * 5000, RuleRedactor()))
+    before = await store.size(_TRACE)
+    (directory / 'payloads' / 'deeper').mkdir()
+    (directory / 'payloads' / 'deeper' / 'inner.bin').write_bytes(b'x' * 10_000)
+
+    assert await store.size(_TRACE) == before
+
+
+async def test_a_file_that_vanishes_while_the_size_is_taken_is_not_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store, directory = await _begun(tmp_path)
+    real_listdir = os.listdir
+
+    def with_a_vanished_entry(path: Any) -> list[str]:
+        return [*real_listdir(path), '.trace.json.vanished']
+
+    monkeypatch.setattr(file_trace.os, 'listdir', with_a_vanished_entry)
+
+    assert await store.size(_TRACE) == _on_disk(directory)
+
+
+async def test_the_size_of_a_trace_that_is_not_there_is_none(tmp_path: Path):
+    store, _ = await _begun(tmp_path)
+
+    assert await store.size('cd' * 16) is None
+
+
+async def test_a_tail_cut_inside_a_multibyte_character_is_dropped_like_any_cut_off_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    store, directory = await _begun(tmp_path)
+    await store.append(_TRACE, [_span(1)])
+    whole = ('{"name": "中文"' + '}').encode()
+    with (directory / 'spans.jsonl').open('ab') as file:
+        file.write(whole[: whole.index('中'.encode()) + 1])
+
+    spans = await store.spans(_TRACE)
+
+    assert [span.span_id for span in spans] == [f'{1:016x}']
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.stores.file_trace']
+    assert record.levelno == logging.WARNING and record.args == (_TRACE, 'spans.jsonl')
+
+
+async def test_a_line_nested_too_deep_to_parse_is_reported_as_changed(tmp_path: Path):
+    store, directory = await _begun(tmp_path)
+    with (directory / 'spans.jsonl').open('a') as file:
+        file.write('[' * 100_000 + ']' * 100_000 + '\n')
+
+    with pytest.raises(ContractViolation) as caught:
+        await store.spans(_TRACE)
+
+    assert '第 1 行不是 JSON' in caught.value.received
+
+
+@pytest.mark.parametrize('name', ['backup', 'renamed-by-hand'])
+async def test_a_directory_whose_name_does_not_carry_its_trace_id_is_not_listed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, name: str
+):
+    store, directory = await _begun(tmp_path)
+    shutil.copytree(directory, directory.parent / name)
+
+    headers = await FileTraceStore(tmp_path / 'traces').traces()
+
+    assert [header.trace_id for header in headers] == [_TRACE]
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.stores.file_trace']
+    assert record.levelno == logging.WARNING
+    assert record.args == (tmp_path / 'traces' / name, _TRACE)
+
+
+async def test_a_delete_that_fails_partway_leaves_the_trace_listed_for_another_try(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store, directory = await _begun(tmp_path)
+    await store.append(_TRACE, [_span(1)])
+    await store.put_payload(_TRACE, encode_redacted('output', RuleRedactor()))
+    real_unlink = os.unlink
+
+    def refusing(path: Any, *args: Any, **kwargs: Any) -> None:
+        if path == 'spans.jsonl':
+            raise PermissionError('not now')
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(file_trace.os, 'unlink', refusing)
+    with pytest.raises(PermissionError):
+        await store.delete(_TRACE)
+    monkeypatch.setattr(file_trace.os, 'unlink', real_unlink)
+    fresh = FileTraceStore(tmp_path / 'traces')
+
+    assert [header.trace_id for header in await fresh.traces()] == [_TRACE]
+    await fresh.delete(_TRACE)
+    assert await fresh.traces() == []
+    assert not directory.exists()
+
+
+async def test_a_span_file_over_the_read_limit_is_too_large_rather_than_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store, _ = await _begun(tmp_path)
+    await store.append(_TRACE, [_span(number) for number in range(1, 20)])
+    monkeypatch.setattr(file_trace, '_FILE_LIMIT', 512)
+
+    with pytest.raises(ContractViolation) as caught:
+        await store.spans(_TRACE)
+
+    assert '读回的上限 512' in caught.value.expected
+    assert '长跑' in caught.value.next_action
