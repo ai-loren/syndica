@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
@@ -17,8 +18,10 @@ import pytest
 from syndica.kernel import (
     AgentOptions,
     BaseAgent,
+    CausalityEdge,
     ConfigError,
     ContractViolation,
+    EdgeKind,
     EventBus,
     HooksCenter,
     Runtime,
@@ -854,3 +857,101 @@ async def test_unreadable_names_each_directory_traces_skips_with_why_and_logs_no
     assert '被改名或复制出来的' in reasons['copy'][0]
     assert quiet == []
     assert len([record for record in caplog.records if record.levelno == logging.WARNING]) == 3
+
+
+async def test_a_finished_trace_whose_last_line_was_torn_is_refused_as_changed_after_it_finished(
+    tmp_path: Path,
+):
+    store, directory = await _begun(tmp_path)
+    await store.append(_TRACE, [_span(1), _span(2)])
+    await store.finish(_TRACE, SpanStatus.OK, 1_700_000_000_000_000_001)
+    spans = directory / 'spans.jsonl'
+    spans.write_bytes(spans.read_bytes()[:-5])
+
+    with pytest.raises(ContractViolation) as caught:
+        await store.spans(_TRACE)
+
+    assert '已经写下了结局' in caught.value.received
+
+
+async def test_finishing_puts_the_records_on_disk_before_the_header_that_vouches_for_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store, directory = await _begun(tmp_path)
+    await store.append(
+        _TRACE,
+        [_span(1)],
+        [CausalityEdge(EdgeKind.SPAWN, '1' * 16, '2' * 16, {'child.agent_id': 'a2'})],
+    )
+    await store.put_payload(_TRACE, encode_redacted('a payload', RuleRedactor()))
+    events: list[tuple[str, int]] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(descriptor: int) -> None:
+        events.append(('fsync', os.fstat(descriptor).st_ino))
+        real_fsync(descriptor)
+
+    def replace(*args: Any, **kwargs: Any) -> None:
+        real_replace(*args, **kwargs)
+        events.append(('replace', 0))
+
+    monkeypatch.setattr(os, 'fsync', fsync)
+    monkeypatch.setattr(os, 'replace', replace)
+
+    await store.finish(_TRACE, SpanStatus.OK, 1_700_000_000_000_000_001)
+
+    inode = {name: (directory / name).stat().st_ino for name in ('spans.jsonl', 'edges.jsonl')}
+    inode['payloads'] = (directory / 'payloads').stat().st_ino
+    inode['trace'] = directory.stat().st_ino
+    inode['header'] = (directory / 'trace.json').stat().st_ino
+    replaced = events.index(('replace', 0))
+    before = {number for kind, number in events[:replaced] if kind == 'fsync'}
+    after = {number for kind, number in events[replaced:] if kind == 'fsync'}
+    assert set(inode.values()) <= before
+    assert inode['trace'] in after
+
+
+async def test_a_payload_is_on_disk_before_put_payload_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store, directory = await _begun(tmp_path)
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def fsync(descriptor: int) -> None:
+        synced.append(os.fstat(descriptor).st_ino)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, 'fsync', fsync)
+
+    ref = await store.put_payload(_TRACE, encode_redacted('a payload', RuleRedactor()))
+
+    assert (directory / 'payloads' / f'{ref.digest}.txt').stat().st_ino in synced
+
+
+@pytest.mark.parametrize(('code', 'finishes'), [(errno.EINVAL, True), (errno.EIO, False)])
+async def test_a_directory_that_cannot_be_synced_is_tolerated_only_where_syncing_it_is_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int, finishes: bool
+):
+    store, directory = await _begun(tmp_path)
+    await store.append(_TRACE, [_span(1)])
+    real_fsync = os.fsync
+
+    def fsync(descriptor: int) -> None:
+        if os.path.isdir(f'/dev/fd/{descriptor}') or os.fstat(descriptor).st_ino == (
+            directory.stat().st_ino
+        ):
+            raise OSError(code, os.strerror(code))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, 'fsync', fsync)
+
+    if finishes:
+        await store.finish(_TRACE, SpanStatus.OK, 1_700_000_000_000_000_001)
+        header = await store.get(_TRACE)
+        assert header is not None and header.status is SpanStatus.OK
+    else:
+        with pytest.raises(OSError):
+            await store.finish(_TRACE, SpanStatus.OK, 1_700_000_000_000_000_001)
+        header = await store.get(_TRACE)
+        assert header is not None and header.status is None

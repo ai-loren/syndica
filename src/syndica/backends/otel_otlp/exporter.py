@@ -64,6 +64,12 @@ class _Incomplete(OtlpExportError):
     resendable = False
 
 
+class _PartlySent(OtlpExportError):
+    """前面的批次 collector 已经收下：整个重发会重复它们。"""
+
+    resendable = False
+
+
 # 这次调用自己没成：工具抛了、判定器抛了、没有这个工具、参数解析不了、整批因它停下、要确认却没有
 # 通道。阻断、拒绝、跳过这些是处置的结论，不是失败：照样发 `tool.outcome`，状态不改。
 _FAILED_OUTCOMES = frozenset(
@@ -157,15 +163,24 @@ class OtlpHttpExporter:
         client = self._client or httpx.AsyncClient(
             timeout=self._timeout, trust_env=urlsplit(self._url).scheme == 'https'
         )
+        sent = 0
         try:
             async with asyncio.timeout(self._deadline):
                 for document in documents:
-                    await self._send(client, document)
+                    try:
+                        await self._send(client, document)
+                    except OtlpExportError as error:
+                        raise _partly_sent(error, sent, len(spans)) from error
+                    sent += _spans_in(document)
         except TimeoutError as error:
-            raise OtlpExportError(
-                expected=f'OTLP collector {_shown(self._url)} 在 {self._deadline:g} 秒里收完',
-                received='没有收完',
-                next_action='确认 collector 没有过载、网络通畅',
+            raise _partly_sent(
+                OtlpExportError(
+                    expected=f'OTLP collector {_shown(self._url)} 在 {self._deadline:g} 秒里收完',
+                    received='没有收完',
+                    next_action='确认 collector 没有过载、网络通畅',
+                ),
+                sent,
+                len(spans),
             ) from error
         finally:
             if self._client is None:
@@ -188,7 +203,14 @@ class OtlpHttpExporter:
                     '确认 collector 在跑、地址与端口对（OTLP/HTTP 默认 4318，路径 /v1/traces）'
                 ),
             ) from error
-        if response.status_code >= 300:
+        if 300 <= response.status_code < 400:
+            location = response.headers.get('location', '')
+            raise OtlpExportError(
+                expected=f'OTLP collector {shown} 以 2xx 收下 trace',
+                received=f'HTTP {response.status_code}：它要改去 {location or "（没说去哪）"}',
+                next_action='导出不跟着重定向走（鉴权头不该发给另一个地址）：确认那个地址可信，把端点换成它',
+            )
+        if response.status_code >= 400:
             raise OtlpExportError(
                 expected=f'OTLP collector {shown} 以 2xx 收下 trace',
                 received=f'HTTP {response.status_code}：{response.text[:300]}',
@@ -354,6 +376,25 @@ def _status(span: Span) -> dict[str, Any]:
     if span.status is SpanStatus.OK:
         return {'code': _STATUS_OK}
     return {'code': _STATUS_ERROR, 'message': span.status.value}
+
+
+def _partly_sent(error: OtlpExportError, sent: int, total: int) -> OtlpExportError:
+    """一批没发成。前面一个 span 都没收下时原样交出；收下过就不能整个重发了，说清收下了多少。"""
+    if not sent:
+        return error
+    return _PartlySent(
+        expected=error.expected,
+        received=f'{error.received}；在这之前 collector 已经收下了 {sent} 个 span（共 {total} 个）',
+        next_action=('不要整个重发：收下的那些会重复。' + error.next_action),
+    )
+
+
+def _spans_in(document: dict[str, Any]) -> int:
+    return sum(
+        len(scope['spans'])
+        for resource in document['resourceSpans']
+        for scope in resource['scopeSpans']
+    )
 
 
 def _rejected(response: httpx.Response) -> tuple[int, str]:

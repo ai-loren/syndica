@@ -357,6 +357,9 @@ class FileTraceStore:
                 status=status,
                 schema=header.schema,
             )
+            # 结局说「记录都在这里了」：写下它之前先把记录落到盘上，否则崩溃之后读到的是一个有结局、
+            # 记录却缺了或成了一片零的 trace。
+            _synced(trace)
             temporary = f'.{_HEADER}.{uuid.uuid4().hex}.tmp'
             _write_new(trace, temporary, encode_redacted(_header_value(finished), _ENCODER))
             try:
@@ -364,6 +367,7 @@ class FileTraceStore:
             except BaseException:
                 os.unlink(temporary, dir_fd=trace)
                 raise
+            _sync_directory(trace)
 
     # --- reads ----------------------------------------------------------------------------
 
@@ -692,7 +696,7 @@ class FileTraceStore:
         with self._trace_fd(trace_id) as found:
             if found is None:
                 return []
-            name, trace, _ = found
+            name, trace, header = found
             where = f'{self._root / name}/{file}'
             try:
                 data = _read_bytes(trace, file, where, _FILE_LIMIT, growing=True)
@@ -713,6 +717,9 @@ class FileTraceStore:
                 )
             except (ValueError, RecursionError):
                 raise _corrupt(where, f'第 {number} 行不是 JSON') from None
+        if tail and header.status is not None:
+            # 写下结局之前记录都已落盘：有结局的 trace 里出现写了一半的行，是之后有人改过它。
+            raise _corrupt(where, '最后一行只写了一半，而这个 trace 已经写下了结局')
         if tail:
             logger.warning(
                 '期望: trace %s 的 %s 以换行结尾。实际: 最后一行只写了一半（写它的进程中途退出）。'
@@ -800,11 +807,42 @@ def _write_new(directory: int, name: str, text: RedactedText) -> None:
     try:
         try:
             write_redacted(descriptor, text)
+            os.fsync(descriptor)
         finally:
             os.close(descriptor)
     except BaseException:
         os.unlink(name, dir_fd=directory)
         raise
+
+
+def _synced(trace: int) -> None:
+    """把追加写的两个文件、payload 目录与 trace 目录落到盘上（payload 与回放文档建的时候已经落
+    过）。"""
+    for name in (_SPANS, _EDGES):
+        try:
+            descriptor, _ = _open_file(name, os.O_RDONLY, trace, write=False)
+        except FileNotFoundError:
+            continue
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    try:
+        with _opened(_PAYLOADS, trace) as payloads:
+            _sync_directory(payloads)
+    except FileNotFoundError:
+        pass
+    _sync_directory(trace)
+
+
+def _sync_directory(descriptor: int) -> None:
+    """目录里新建与改名的条目落到盘上。有的文件系统不收对目录的 fsync（EINVAL）：那里做不到，
+    照常往下。"""
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        if error.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF):
+            raise
 
 
 def _append_line(directory: int, name: str, text: RedactedText) -> None:

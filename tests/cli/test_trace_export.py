@@ -48,6 +48,8 @@ from syndica.kernel.redaction import Redactor, encode_redacted
 from syndica.kernel.stores import file_trace
 
 _NOT_GIVEN: Any = object()
+# 解析器挂住的时长：比导出的时限长得多，关宿主要是等它就看得出来。
+_RESOLVER_HANGS = 15.0
 _WITHIN = 30.0
 
 
@@ -1159,3 +1161,59 @@ def test_an_export_refuses_with_2_when_the_config_it_redacts_with_cannot_be_read
 
     assert (code, out, spy.calls) == (2, '', [])
     assert '修好配置再导出' in err
+
+
+def test_a_collector_name_that_takes_forever_to_resolve_cannot_keep_the_host_from_closing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    release = threading.Event()
+
+    def unresolvable(*args: object, **kwargs: object) -> object:
+        release.wait(_RESOLVER_HANGS)
+        raise OSError('resolver gave up')
+
+    monkeypatch.setattr('socket.getaddrinfo', unresolvable)
+    monkeypatch.setattr(host_module, '_EXPORT_DEADLINE', 0.3)
+    stdout, stderr = StringIO(), StringIO()
+    io = CliIO(stdin=StringIO(''), stdout=stdout, stderr=stderr)
+    host = RuntimeCliHost(
+        io=io,
+        model_factory=lambda _: _llm(),
+        workspace_root=tmp_path,
+        environ={'OTEL_EXPORTER_OTLP_ENDPOINT': 'http://collector.never-resolves.test:4318'},
+        exporter=entry._export_trace,  # pyright: ignore[reportPrivateUsage]
+    )
+    try:
+        code = main(['run', 'go', '--agent', 'Worker'], host=host, io=io)
+        started = time.monotonic()
+        host.close(interrupted=False)
+        closing = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert code == 0 and stdout.getvalue().rstrip().endswith('done')
+    assert closing < _RESOLVER_HANGS / 3
+    assert 'trace 没有导出完' in stderr.getvalue()
+
+
+def test_a_finished_trace_whose_spans_were_zeroed_is_refused_with_2_and_nothing_is_sent(
+    tmp_path: Path,
+):
+    spy = _Spy()
+    _run(tmp_path, {}, exporter=spy)
+    store = FileTraceStore(trace_directory(tmp_path))
+    [header] = asyncio.run(store.traces())
+    directory = asyncio.run(store.directory(header.trace_id))
+    assert directory is not None
+    spans = directory / 'spans.jsonl'
+    spans.write_bytes(b'\0' * spans.stat().st_size)
+
+    code, out, err = _cli(
+        tmp_path,
+        ['trace', 'export', header.trace_id[:8], '--otlp', 'http://localhost:9'],
+        environ={},
+        exporter=spy,
+    )
+
+    assert (code, out, spy.calls) == (2, '', [])
+    assert '已经写下了结局' in err

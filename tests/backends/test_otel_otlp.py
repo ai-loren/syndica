@@ -312,9 +312,7 @@ async def test_a_trace_without_spans_sends_nothing():
     assert (count, requests) == (0, [])
 
 
-@pytest.mark.parametrize(
-    ('status', 'said'), [(307, 'moved'), (400, 'unknown path'), (503, 'overloaded')]
-)
+@pytest.mark.parametrize(('status', 'said'), [(400, 'unknown path'), (503, 'overloaded')])
 async def test_a_collector_that_does_not_take_the_trace_says_what_it_answered(
     status: int, said: str
 ):
@@ -843,3 +841,58 @@ async def test_a_tool_call_that_failed_by_itself_is_an_error_and_a_refused_one_i
     assert span['status'] == (
         {'code': 2, 'message': f'tool.outcome={outcome}'} if code == 2 else {'code': 1}
     )
+
+
+async def test_a_failure_after_the_collector_took_earlier_batches_is_not_offered_for_a_resend():
+    store = await _stored([_span(number, number) for number in (1, 2, 3, 4)])
+    answers = iter([httpx.Response(200), httpx.Response(503, text='busy')])
+
+    with pytest.raises(OtlpExportError) as caught:
+        await _export(store, lambda request: next(answers), batch=2)
+
+    assert caught.value.resendable is False
+    assert '已经收下了 2 个 span（共 4 个）' in caught.value.received
+    assert caught.value.next_action.startswith('不要整个重发')
+
+
+async def test_a_failure_of_the_first_batch_can_still_be_resent_whole():
+    store = await _stored([_span(number, number) for number in (1, 2, 3, 4)])
+
+    with pytest.raises(OtlpExportError) as caught:
+        await _export(store, lambda request: httpx.Response(503, text='busy'), batch=2)
+
+    assert caught.value.resendable is True
+    assert '已经收下' not in caught.value.received
+
+
+async def test_a_redirect_says_where_the_collector_wants_the_trace_and_is_not_followed():
+    store = await _stored(_spans())
+    elsewhere = 'http://elsewhere.test/v1/traces'
+
+    with pytest.raises(OtlpExportError) as caught:
+        await _export(store, lambda request: httpx.Response(307, headers={'location': elsewhere}))
+
+    assert elsewhere in caught.value.received
+    assert '不跟着重定向走' in caught.value.next_action
+
+
+async def test_running_out_of_time_after_the_collector_took_earlier_batches_is_not_resendable():
+    store = await _stored([_span(number, number) for number in (1, 2, 3, 4)])
+    answered = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal answered
+        answered += 1
+        if answered > 1:
+            await asyncio.sleep(10)
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        exporter = OtlpHttpExporter(
+            _URL, client=client, redactor=RuleRedactor(), batch=2, deadline=0.2
+        )
+        with pytest.raises(OtlpExportError) as caught:
+            await exporter.export(store, _TRACE)
+
+    assert caught.value.resendable is False
+    assert '没有收完' in caught.value.received and '已经收下了 2 个 span' in caught.value.received

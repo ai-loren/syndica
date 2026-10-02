@@ -30,6 +30,7 @@ from syndica.cli.checks import parse_check
 from syndica.cli.config import CliConfig, load_config
 from syndica.cli.dev_module import DevLog, DevLogSnapshot, DevModule, last_answer
 from syndica.cli.environment import AgentEnvironment, agent_environment
+from syndica.cli.executor import DaemonExecutor
 from syndica.cli.export import (
     TraceExporter,
     command_line_target,
@@ -826,6 +827,9 @@ _PENDING = 'git 收尾还没做：文件停在这里，说明 run 在收尾之�
 _NOT_WRITTEN = '交接文件没写成，宿主没有做 git 收尾：提交与推送由人来做。'
 _T = TypeVar('_T')
 _INTERRUPTED_RUN = '被中断（Ctrl-C）：run 没有跑完，Agent 的回答可能只做了一半。'
+_INTERRUPTED_AFTER_RUN = (
+    '被中断（Ctrl-C）：run 已经做完、回答完整，按键落在之后，复核与 git 收尾没有做。'
+)
 _INTERRUPTED_VERIFY = '被中断（Ctrl-C）：宿主复核没有跑完。'
 _INTERRUPTED_NO_GIT = '被中断（Ctrl-C），不做 git 收尾：工作区里的改动还在，没有提交。'
 _INTERRUPTED_GIT = (
@@ -1023,24 +1027,36 @@ class _CtrlC:
         self._settled = True
 
 
-async def _despite_cancellation(work: Coroutine[Any, Any, _T]) -> _T:
-    """跑完 `work` 再理会取消，取消在它跑完之后照样抛出。trace 的收尾等着写入任务排空，`run
+def _host_loop() -> asyncio.AbstractEventLoop:
+    loop = asyncio.new_event_loop()
+    loop.set_default_executor(DaemonExecutor())
+    return loop
+
+
+async def _despite_cancellation(work: Coroutine[Any, Any, _T], *, absorb: bool) -> tuple[_T, bool]:
+    """跑完 `work` 再理会取消，交回结果与期间有没有被取消。trace 的收尾等着写入任务排空，`run
     --handoff` 期间的第二次 Ctrl-C 只取消、不强制退出：收尾被它打断，trace 就没有结局，交接文件里也
-    没有它的目录。"""
+    没有它的目录。`absorb` 时取消到此为止：run 已经做完，收尾时按的键不该把一次做完的 run 换成被中断
+    的、把结论与 trace 目录丢掉；不 `absorb` 时跑完之后照样抛出。"""
     task = asyncio.ensure_future(work)
-    interrupted = False
+    cancelled = 0
     while not task.done():
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            interrupted = True
+            cancelled += 1
         except BaseException:
             break
-    if interrupted:
+    if cancelled and not absorb:
         if not task.cancelled():
             task.exception()
         raise asyncio.CancelledError
-    return task.result()
+    current = asyncio.current_task()
+    if current is not None:
+        # 吞下的取消要还回去：不还，这个任务之后的 `asyncio.timeout` 会把自己的到期当成外面的取消。
+        for _ in range(cancelled):
+            current.uncancel()
+    return task.result(), cancelled > 0
 
 
 async def _interruptible(ctrl_c: _CtrlC, work: Coroutine[Any, Any, _T]) -> _T:
@@ -1153,7 +1169,7 @@ class RuntimeCliHost:
         self._model_factory = model_factory
         self._workspace_root = Path(workspace_root)
         self._environ: Mapping[str, str] = os.environ if environ is None else environ
-        self._runner = asyncio.Runner()
+        self._runner = asyncio.Runner(loop_factory=_host_loop)
         self._closed = False
         self._sessions: dict[str, _ChatSession] = {}
         # `--handoff` 下 stdout 只有交接文件，问人的提示改走 stderr。
@@ -1578,7 +1594,9 @@ class RuntimeCliHost:
         """收尾并在 stderr 打出 trace 目录（相对工作区根）与它完不完整；`traces` 收下这两样。收尾
         自己出错只告警：它不能顶替 run 的结论。"""
         try:
-            finished = await _despite_cancellation(recording.finish(run_status(error)))
+            finished, pressed = await _despite_cancellation(
+                recording.finish(run_status(error)), absorb=error is None
+            )
         except Exception as exc:
             self._warn(
                 redactor.redact(
@@ -1587,6 +1605,8 @@ class RuntimeCliHost:
                 )
             )
             return
+        if pressed:
+            self._warn('收尾 trace 时按了 Ctrl-C：run 已经做完，结论照常给出。')
         if finished is None:
             return
         shown = self._shown(finished.directory)
@@ -2416,9 +2436,9 @@ class RuntimeCliHost:
                 interrupted = _INTERRUPTED_RUN
             except Exception as exc:
                 failure = _failure_text(exc)
-            # 取消在 run 里面被转成了别的错误：同样是被中断。
+            # 取消在 run 里面被转成了别的错误：同样是被中断。run 交回了回答，按键就落在它做完之后。
             if interrupted is None and ctrl_c.pressed:
-                interrupted = _INTERRUPTED_RUN
+                interrupted = _INTERRUPTED_AFTER_RUN if answer is not None else _INTERRUPTED_RUN
             # 「run 正常结束」（D14）指根 Agent 以 completed 结束：轮数用完、被中止时它留下的文字
             # 可能只做了一半。
             if failure is None and stops and stops[0] is not StopReason.COMPLETED:

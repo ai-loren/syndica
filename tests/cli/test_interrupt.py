@@ -53,6 +53,19 @@ llm = ScriptedLLM(
     ]
 )
 entry._configured_model = lambda name: llm
+if spec.get('slow_finish'):
+    import asyncio
+
+    from syndica.cli import recording
+
+    original = recording.Recording.finish
+
+    async def finish(self, status):
+        Path(spec['slow_finish']).write_text('finishing', encoding='utf-8')
+        await asyncio.sleep(1.5)
+        return await original(self, status)
+
+    recording.Recording.finish = finish
 sys.argv = ['syndica', *spec['argv']]
 entry.entrypoint()
 """
@@ -123,11 +136,22 @@ def _waiting(name: str) -> str:
 
 
 class _Child:
-    def __init__(self, tmp_path: Path, root: Path, argv: list[str], turns: list[dict[str, Any]]):
+    def __init__(
+        self,
+        tmp_path: Path,
+        root: Path,
+        argv: list[str],
+        turns: list[dict[str, Any]],
+        *,
+        slow_finish: Path | None = None,
+    ):
         driver = tmp_path / 'driver.py'
         driver.write_text(_DRIVER, encoding='utf-8')
         spec = tmp_path / 'spec.json'
-        spec.write_text(json.dumps({'argv': argv, 'turns': turns}), encoding='utf-8')
+        values: dict[str, Any] = {'argv': argv, 'turns': turns}
+        if slow_finish is not None:
+            values['slow_finish'] = str(slow_finish)
+        spec.write_text(json.dumps(values), encoding='utf-8')
         self.root = root
         self.process = subprocess.Popen(
             [sys.executable, str(driver), str(spec)],
@@ -422,6 +446,52 @@ def test_ctrl_c_in_an_ordinary_run_exits_130_and_ends_its_trace_cancelled(tmp_pa
     assert '被中断（Ctrl-C）：命令可能没有做完。' in child.stderr
     assert '没有的话重跑这条命令' in child.stderr
     _assert_gone(pid)
+
+
+def test_ctrl_c_while_a_finished_run_finishes_its_trace_keeps_the_answer_and_the_trace(
+    tmp_path: Path,
+):
+    root = _workspace(tmp_path)
+    argv = ['--config', str(tmp_path / 'syndica.yaml'), 'run', '--agent', 'Lead', 'go']
+    finishing = root / 'finishing'
+    child = _Child(tmp_path, root, argv, [{'content': 'the whole answer'}], slow_finish=finishing)
+
+    child.wait_for(finishing.exists, 'the trace started to finish')
+    code = child.interrupt()
+
+    [trace] = _traces(root)
+    assert code == 0, child.stderr
+    assert child.stdout.rstrip().endswith('the whole answer')
+    assert '收尾 trace 时按了 Ctrl-C：run 已经做完，结论照常给出。' in child.stderr
+    assert 'trace：.syndica/traces/' in child.stderr
+    assert trace.status is SpanStatus.OK
+    assert 'Traceback' not in child.stderr
+
+
+def test_ctrl_c_while_a_finished_handoff_run_finishes_its_trace_keeps_answer_and_trace(
+    tmp_path: Path,
+):
+    root = _workspace(tmp_path)
+    finishing = root / 'finishing'
+    child = _Child(
+        tmp_path,
+        root,
+        _handoff_argv(tmp_path),
+        [{'content': 'the whole answer'}],
+        slow_finish=finishing,
+    )
+
+    child.wait_for(finishing.exists, 'the trace started to finish')
+    code = child.interrupt()
+
+    [handoff] = child.handoffs()
+    document = handoff.read_text(encoding='utf-8')
+    [trace] = _traces(root)
+    assert code == 130, child.stderr
+    assert 'the whole answer' in document
+    assert '按键落在之后，复核与 git 收尾没有做' in document
+    assert '## trace' in document and trace.trace_id[:8] in document
+    assert trace.status is SpanStatus.OK
 
 
 def test_ctrl_c_while_a_chat_agent_asks_the_human_ends_the_session_and_its_trace(tmp_path: Path):

@@ -575,7 +575,7 @@ async def test_finishing_a_trace_outlasts_cancellation_and_then_reports_it():
         finished.append('done')
         return 'value'
 
-    task = asyncio.ensure_future(_despite_cancellation(finish()))
+    task = asyncio.ensure_future(_despite_cancellation(finish(), absorb=False))
     await asyncio.sleep(0)
     task.cancel()
     await asyncio.sleep(0)
@@ -586,7 +586,34 @@ async def test_finishing_a_trace_outlasts_cancellation_and_then_reports_it():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert finished == ['done']
-    assert await _despite_cancellation(asyncio.sleep(0, 'plain')) == 'plain'
+    assert await _despite_cancellation(asyncio.sleep(0, 'plain'), absorb=False) == (
+        'plain',
+        False,
+    )
+
+
+async def test_absorbing_keeps_the_result_and_gives_the_task_its_cancellations_back():
+    release = asyncio.Event()
+
+    async def finish() -> str:
+        await release.wait()
+        return 'value'
+
+    async def finishing() -> tuple[tuple[str, bool], int]:
+        result = await _despite_cancellation(finish(), absorb=True)
+        current = asyncio.current_task()
+        assert current is not None
+        return result, current.cancelling()
+
+    task = asyncio.ensure_future(finishing())
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await task == (('value', True), 0)
 
 
 async def test_a_failure_while_finishing_still_surfaces_when_nothing_cancelled():
@@ -594,7 +621,7 @@ async def test_a_failure_while_finishing_still_surfaces_when_nothing_cancelled()
         raise OSError('disk full')
 
     with pytest.raises(OSError, match='disk full'):
-        await _despite_cancellation(broken())
+        await _despite_cancellation(broken(), absorb=False)
 
 
 class _SlowFinish:
