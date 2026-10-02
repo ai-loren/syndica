@@ -136,13 +136,15 @@ class DangerRule:
     """一条规则。`matches` 是纯函数：同样的文本必然同样的结论。
 
     `matches` 收一整条命令文本而不是解析结果：解析形态是本模块的内部约定，交给第三方规则就成了
-    永久兼容承诺。
+    永久兼容承诺。`params` 是构造它的参数（名字、取值）：工作区根的两条规则记下字面的根与解析之后
+    的根，回放按它们重建同一条规则（`matches` 是函数，记不下来）。
     """
 
     rule_id: str
     level: RiskLevel
     reason: str
     matches: Callable[[str], bool]
+    params: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2669,6 +2671,7 @@ def path_outside_workspace_rule(root: object, *, real: object = None) -> DangerR
             '或离开工作区的 cd），超出了这次任务的范围'
         ),
         matches=workspace.reaches_outside,
+        params=(('root', workspace.lexical), ('real', workspace.real)),
     )
 
 
@@ -2702,6 +2705,7 @@ def workspace_root_removal_rule(root: object, *, real: object = None) -> DangerR
         level=RiskLevel.HIGH,
         reason='这次调用删除工作区根目录本身或根下的全部内容，删掉的东西没有回收站',
         matches=workspace.removes_root,
+        params=(('root', workspace.lexical), ('real', workspace.real)),
     )
 
 
@@ -2951,6 +2955,11 @@ class DangerJudge:
             DEFAULT_RULES if rules is None else rules
         )
 
+    @property
+    def rules(self) -> tuple[DangerRule, ...]:
+        """按声明顺序的规则（结论取第一个命中的）：宿主把它记进回放文档。"""
+        return self._rules
+
     def judge(self, tool: Tool, args: Mapping[str, Any]) -> DangerVerdict:
         """取第一个命中的规则。
 
@@ -3043,6 +3052,11 @@ class RuleTablePolicy:
 
     def __init__(self, table: object) -> None:
         self._table = _validated_table(table)
+
+    @property
+    def table(self) -> Mapping[str, Disposition]:
+        """规则 ID → 处置，只读：宿主把它记进回放文档。"""
+        return MappingProxyType(self._table)
 
     def decide(self, request: DangerRequest) -> Disposition:
         listed = self._table.get(request.verdict.rule_id)

@@ -1235,3 +1235,30 @@ def test_an_empty_recorded_root_is_refused_rather_than_resolved_here(factory: An
 def test_the_recorded_root_is_keyword_only(factory: Any):
     with pytest.raises(TypeError):
         factory(_ELSEWHERE, _RECORDED)
+
+
+@pytest.mark.parametrize('factory', [path_outside_workspace_rule, workspace_root_removal_rule])
+def test_a_workspace_root_rule_carries_the_roots_it_was_built_with(factory: Any):
+    resolved = factory(_ELSEWHERE)
+    recorded = factory(_ELSEWHERE, real=_RECORDED)
+
+    assert dict(recorded.params) == {'root': _ELSEWHERE, 'real': _RECORDED}
+    assert dict(resolved.params)['root'] == _ELSEWHERE
+    assert dict(resolved.params)['real'] == os.path.realpath(_ELSEWHERE)
+    assert hash(recorded) == hash(recorded)
+
+
+def test_a_judge_hands_back_its_rules_in_order_and_a_policy_its_table_read_only():
+    from syndica.kernel import DEFAULT_RULES, DangerJudge, Disposition
+    from syndica.kernel.danger import RuleTablePolicy, git_state_change_rule
+
+    rules = (git_state_change_rule(), *DEFAULT_RULES)
+    table = {'shell.git_state_change': Disposition.CONFIRM}
+    policy = RuleTablePolicy(table)
+    table['shell.git_state_change'] = Disposition.ALLOW
+
+    assert DangerJudge(rules).rules == rules
+    assert dict(policy.table) == {'shell.git_state_change': Disposition.CONFIRM}
+    with pytest.raises(TypeError):
+        policy.table['x'] = Disposition.ALLOW  # type: ignore[index]
+    assert all(rule.params == () for rule in DEFAULT_RULES)

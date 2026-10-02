@@ -25,6 +25,7 @@ from textwrap import indent
 from types import MappingProxyType
 from typing import Any, TextIO, TypeVar, cast
 
+from syndica.cli.capture import frozen_roles, host_profile
 from syndica.cli.checks import parse_check
 from syndica.cli.config import CliConfig, load_config
 from syndica.cli.dev_module import DevLog, DevLogSnapshot, DevModule, last_answer
@@ -65,6 +66,7 @@ from syndica.cli.terminal import one_line, terminal_safe
 from syndica.kernel import (
     LLM,
     AgentCatalog,
+    AgentFactory,
     AgentOptions,
     AgentSlot,
     AskUser,
@@ -93,12 +95,14 @@ from syndica.kernel import (
     ToolCall,
     ToolResult,
     Topology,
+    TraceLevel,
     TraceRecorder,
     TrustLevel,
     local_tools,
     register_builtins,
 )
 from syndica.kernel.redaction import Redactor
+from syndica.kernel.scenario_schema import FROZEN_IMPLS
 from syndica.kernel.tools import Delegate, Fork, KillAgent, QueryAgent, SendMessage
 
 __all__ = ['RuntimeCliHost']
@@ -1725,6 +1729,55 @@ class RuntimeCliHost:
                     session.redactor,
                 )
 
+    def _describe_run(
+        self,
+        tracer: TraceRecorder,
+        request: RunRequest,
+        config: CliConfig,
+        catalog: AgentCatalog,
+        factories: Mapping[str, AgentFactory],
+        host: Mapping[str, object],
+        prompt: str,
+    ) -> None:
+        """把回放文档里只有宿主知道的部分交给 recorder。回放造不出来的 run 不交（trace 照常记录），
+        只在人点名要了 replay / full 时说一句：默认级别下每次 run 都说同一句是噪音。"""
+        explicit = request.trace is not None or config.trace_level is not None
+        reason: str | None = None
+        roles: dict[str, dict[str, object]] = {}
+        if request.topology is not None:
+            reason = '--topology 的 run 还不能捕获（拓扑槽给角色附加的工具与预算，回放重建不出来）'
+        else:
+            try:
+                roles = frozen_roles(catalog, factories)
+            except Exception as error:
+                # 建不出角色只少回放文档：这次 run 要不要用到那个角色，要等它跑起来才知道。
+                reason = f'读冻结之后的角色时出错：{type(error).__name__}: {error}'
+                explicit = True
+            else:
+                custom = sorted(
+                    name
+                    for name, role in roles.items()
+                    if role['impl'] is not None and role['impl'] not in FROZEN_IMPLS
+                )
+                if custom:
+                    reason = (
+                        f'角色 {", ".join(custom)} 是自定义的类式角色，回放只重建内核内置的那几个'
+                    )
+        if reason is not None:
+            if explicit:
+                self._warn(f'trace 里不写回放文档：{reason}；trace replay 回放不了这次 run。')
+            return
+        tracer.describe_run(
+            host=host,
+            roles=roles,
+            entry={
+                'mode': 'query',
+                'agent': request.agent or 'Orchestrator',
+                'prompt': prompt,
+                'trust': 'trusted',
+            },
+        )
+
     async def _wait_with_pump(
         self,
         runtime: Runtime,
@@ -1813,16 +1866,37 @@ class RuntimeCliHost:
                     factories = catalog.freeze(
                         tools, models, facts, danger_judge=judge, danger_policy=policy
                     )
+                modules = _agent_modules(
+                    self._workspace_root, self._environ, tools if request.no_write else None
+                )
                 runtime = Runtime(
                     agents={} if request.topology is not None else factories,
                     orchestration=True,
-                    modules=_agent_modules(
-                        self._workspace_root, self._environ, tools if request.no_write else None
-                    ),
+                    modules=modules,
                     flags=flags,
                     confirmation_handler=MailboxConfirmationHandler(timeout=300),
                     tracer=tracer,
+                    ids=None if tracer is None else tracer.ids,
                 )
+                if tracer is not None and tracer.level is not TraceLevel.STRUCTURE:
+                    self._describe_run(
+                        tracer,
+                        request,
+                        config,
+                        catalog,
+                        factories,
+                        host_profile(
+                            flags=flags,
+                            judge=judge,
+                            policy=policy,
+                            output_limit=_OUTPUT_LIMIT,
+                            facts=facts,
+                            max_turns=request.max_turns,
+                            no_write=request.no_write,
+                            modules=modules,
+                        ),
+                        prompt,
+                    )
                 if logs is not None:
                     # 服务是装配时 setattr 上去的，Runtime 的静态类型里没有这个属性。
                     logs.append(cast(DevLog, getattr(runtime, 'dev_log')))  # noqa: B009
@@ -1902,6 +1976,10 @@ class RuntimeCliHost:
                     )
                 except BaseException as exc:
                     failure = exc
+                    if tracer is not None and isinstance(exc, asyncio.CancelledError):
+                        # 拆 Runtime 之前记下此刻在等外部世界的调用：拆的时候它们都会被取消，
+                        # 之后就分不出哪些是被这次打断切断的。
+                        tracer.interrupted()
                     raise
                 finally:
                     await runtime.shutdown()

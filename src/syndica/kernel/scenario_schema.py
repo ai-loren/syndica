@@ -44,6 +44,7 @@ from syndica.kernel.trace import ATTRIBUTE_DOMAINS
 
 __all__ = [
     'FROZEN_IMPLS',
+    'REPLAYED_TOOLS',
     'RULE_PARAMETERS',
     'SCENARIO_VERSIONS',
     'DangerRuleSpec',
@@ -71,6 +72,11 @@ __all__ = [
 SCENARIO_VERSIONS = (1, 2)
 # 冻结角色的 `impl` 只认内核内置的类式角色：回放文档可能来自别人的仓库，任意 import 路径等于执行它。
 FROZEN_IMPLS = frozenset({'syndica.kernel.agents.orchestrator:Orchestrator'})
+# 触达外部世界、回放时按记录给出结局的工具；其余（派活、消息、人机）是内核，回放时真跑。捕获只记
+# 它们的结局，回放只替换它们：两边认的是同一份名单。
+REPLAYED_TOOLS = frozenset(
+    {'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillBash', 'QueryAgent'}
+)
 # 回放重建得出的危险规则与它们的参数：只有工作区根的两条带参数，`root` 是字面值、`real` 是记录时
 # 解析出的路径（回放不在自己的机器上重新解析符号链接）。
 RULE_PARAMETERS: Mapping[str, frozenset[str]] = MappingProxyType(
@@ -712,7 +718,9 @@ def _roles(value: object, version: int) -> dict[str, ScenarioRole]:
         else:
             frozen = _frozen(data['frozen'], f'{field}.frozen')
         raw_instances = _sequence(data['instances'], f'{field}.instances')
-        if not raw_instances:
+        # v2 的角色可以一个实例都没有：捕获的文档列出宿主目录里的每个角色（回放要建得出它们，
+        # 交给模型的工具定义里会点它们的名），没跑过的那些就没有实例。
+        if not raw_instances and version == 1:
             raise _error(
                 f'{field}.instances 至少有一份脚本',
                 '收到空列表',

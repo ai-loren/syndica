@@ -28,7 +28,7 @@ import math
 import os
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, cast, final, runtime_checkable
 
@@ -43,6 +43,7 @@ __all__ = [
     'Redactor',
     'RuleRedactor',
     'encode_digests',
+    'encode_prepared',
     'encode_redacted',
     'looks_secret',
     'redact_argv',
@@ -754,14 +755,21 @@ def _validated_rules(rules: Sequence[RedactionRule]) -> tuple[RedactionRule, ...
     return tuple(rules)
 
 
-def encode_redacted(value: object, redactor: Redactor) -> RedactedText:
+def encode_redacted(
+    value: object, redactor: Redactor, *, identifiers: Collection[str] = ()
+) -> RedactedText:
     """先对每个字符串叶子（含映射的键）分别脱敏，再做规范 JSON 编码（`ensure_ascii=False`、键排序、
     无多余空白）。逐叶脱敏看不见键与值的关系，所以映射另按键判：名字像密钥的键下面（任意层，含列表
     与嵌套的映射），脱敏之后仍像凭证的字符串叶子换成 `secret.named_assignment` 的占位符；
     `Authorization` 这类键的值按 `Authorization:` 头脱敏；`{"name": <像密钥的名字>, "value": …}`
     这种环境变量表按名字判值；两项的字符串列表当成一对键值。两个键脱敏之后撞成同一个时，按原键排序
     后来的那个加 `#2`、`#3`，不丢任何一项。只收 JSON 能表达的值：dict（键是字符串）、list、tuple、
-    str、int、float（有限）、bool、None。"""
+    str、int、float（有限）、bool、None。
+
+    `identifiers` 是内核生成的 id 与摘要（32 或 64 个小写十六进制字符）：恰好等于其中一项的字符串
+    值原样保留，在名字像密钥的键下面也一样——用户规则可能认得一段十六进制，`key` 下面的 agent id
+    又像凭证，换掉之后引用就断了。每一项都必须是这个形状：这道校验是它们不经脱敏的前提。"""
+    keep = _identifiers(identifiers, 'encode_redacted')
     if not isinstance(cast(object, redactor), Redactor):
         raise ContractViolation(
             expected='encode_redacted 的第二个参数是脱敏器（有 redact 与 scan 方法）',
@@ -769,7 +777,7 @@ def encode_redacted(value: object, redactor: Redactor) -> RedactedText:
             next_action='传一个 RuleRedactor，例如 RuleRedactor(secrets=[...])',
         )
     try:
-        tree = _redacted(value, redactor, '$', secret=False)
+        tree = _redacted(value, redactor, '$', secret=False, keep=keep)
     except RecursionError as exc:
         raise ContractViolation(
             expected='encode_redacted 的值嵌套层数在 Python 的递归上限之内',
@@ -791,6 +799,106 @@ def encode_redacted(value: object, redactor: Redactor) -> RedactedText:
 
 
 _SHA256 = re.compile(r'[0-9a-f]{64}')
+_IDENTIFIER = re.compile(r'[0-9a-f]{32}|[0-9a-f]{64}')
+
+
+def _identifiers(identifiers: Collection[str], caller: str) -> frozenset[str]:
+    """校验过的内核标识。被拒的那一项不回显：它可能是误放进来的自由文本，而错误会进日志。"""
+    keep = frozenset(cast(Collection[object], identifiers))
+    for item in keep:
+        if not isinstance(item, str) or _IDENTIFIER.fullmatch(item) is None:
+            shape = f'长度 {len(item)} 的字符串' if isinstance(item, str) else type(item).__name__
+            raise ContractViolation(
+                expected=(
+                    f'{caller} 的 identifiers 每一项是 32 或 64 个小写十六进制字符'
+                    '（内核生成的 id 或摘要）'
+                ),
+                received=f'其中一项是{shape}，不是这个形状',
+                next_action='自由文本不进 identifiers：它要经过脱敏',
+            )
+    return cast(frozenset[str], keep)
+
+
+def encode_prepared(
+    value: object, redactor: Redactor, *, identifiers: Collection[str] = ()
+) -> RedactedText:
+    """把一份由已经脱过敏的各项拼成的结构做规范 JSON 编码（与 `encode_redacted` 同一种编码）。每个
+    字符串（含映射的键）要么恰好是 `identifiers` 里的一项，要么已经是脱敏器的不动点——再脱一次不变；
+    哪一个都不是就报错：那一处没有经过脱敏。
+
+    键名在这里不再给它下面的值定性：每一项在它自己的上下文里经 `encode_redacted` 脱敏时已经按它
+    自己的键判过；在拼装出来的结构里再按外层的键判，一个碰巧像密钥的名字（角色名 `second-pass`、
+    字段名 `key`）下面的每个 id 都会被换成占位符，而指纹是按各项自己的上下文算的，两边就对不上
+    了。"""
+    keep = _identifiers(identifiers, 'encode_prepared')
+    if not isinstance(cast(object, redactor), Redactor):
+        raise ContractViolation(
+            expected='encode_prepared 的第二个参数是脱敏器（有 redact 与 scan 方法）',
+            received=f'收到 {type(redactor).__name__}',
+            next_action='传拼装这份结构时用的那个 RuleRedactor',
+        )
+    try:
+        _prepared(value, redactor, '$', keep)
+    except RecursionError as exc:
+        raise ContractViolation(
+            expected='encode_prepared 的值嵌套层数在 Python 的递归上限之内',
+            received='嵌套太深，逐层检查时超过了递归上限',
+            next_action='把它拍平或截断之后再编码',
+        ) from exc
+    try:
+        text = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False
+        )
+    except (TypeError, ValueError) as exc:
+        raise ContractViolation(
+            expected='encode_prepared 的值能编码成 JSON',
+            received=f'编码失败：{exc}',
+            next_action='只放 JSON 能表达的值；过大的整数先转成字符串',
+        ) from exc
+    escaped = _RAW_IN_JSON.sub(lambda match: f'\\u{ord(match.group()):04x}', text)
+    return RedactedText(escaped, _mint=_MINT)
+
+
+def _prepared(value: object, redactor: Redactor, path: str, keep: frozenset[str]) -> None:
+    if isinstance(value, str):
+        if value not in keep and str(redactor.redact(value)) != value:
+            raise ContractViolation(
+                expected='encode_prepared 收到的每个字符串都已经脱过敏（再脱一次不变）',
+                received=f'{path} 再脱一次会变（长度 {len(value)}）：它没有经过脱敏',
+                next_action='先对这一项做 encode_redacted（在它自己的上下文里），再拼进结构',
+            )
+        return
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ContractViolation(
+            expected='encode_prepared 的数值是有限数',
+            received=f'{path} 是 {value!r}',
+            next_action='把它换成 None 或字符串之后再编码：JSON 表达不了 NaN 与无穷大',
+        )
+    if value is None or isinstance(value, bool | int | float):
+        return
+    if isinstance(value, Mapping):
+        for key, item in cast(Mapping[object, object], value).items():
+            if not isinstance(key, str):
+                raise ContractViolation(
+                    expected='encode_prepared 的映射键都是字符串',
+                    received=f'{path} 里有 {type(key).__name__} 类型的键',
+                    next_action='把键转成字符串之后再编码：JSON 的键只能是字符串',
+                )
+            # 键先过检查：过了就是不动点，可以放进之后报错用的路径。
+            _prepared(key, redactor, f'{path} 的键', keep)
+            _prepared(item, redactor, f'{path}.{key}', keep)
+        return
+    if isinstance(value, list | tuple):
+        for index, item in enumerate(cast(Sequence[object], value)):
+            _prepared(item, redactor, f'{path}[{index}]', keep)
+        return
+    raise ContractViolation(
+        expected=(
+            'encode_prepared 只收 JSON 能表达的值：dict、list、tuple、str、int、float、bool、None'
+        ),
+        received=f'{path} 是 {type(value).__name__}',
+        next_action='先把它转成上面这些类型',
+    )
 
 
 def encode_digests(digests: Sequence[str]) -> RedactedText:
@@ -861,9 +969,19 @@ def write_redacted(fd: int, text: RedactedText, *, newline: bool = False) -> Non
     write_all(fd, text.encode('utf-8') + (b'\n' if newline else b''))
 
 
-def _redacted(value: object, redactor: Redactor, path: str, *, secret: bool) -> object:
-    """`secret`：这个值在一个名字像密钥的键下面。`path` 只进错误信息，里面的键已经脱敏。"""
+def _redacted(
+    value: object,
+    redactor: Redactor,
+    path: str,
+    *,
+    secret: bool,
+    keep: frozenset[str] = frozenset(),
+) -> object:
+    """`secret`：这个值在一个名字像密钥的键下面。`path` 只进错误信息，里面的键已经脱敏。`keep` 见
+    `encode_redacted` 的 `identifiers`。"""
     if isinstance(value, str):
+        if value in keep:
+            return value
         text = redactor.redact(value)
         if secret and _credential_value(text, quoted=True):
             return _placeholder('secret.named_assignment')
@@ -877,16 +995,16 @@ def _redacted(value: object, redactor: Redactor, path: str, *, secret: bool) -> 
     if value is None or isinstance(value, bool | int | float):
         return value
     if isinstance(value, Mapping):
-        return _redacted_mapping(cast(Mapping[object, object], value), redactor, path, secret)
+        return _redacted_mapping(cast(Mapping[object, object], value), redactor, path, secret, keep)
     if isinstance(value, list | tuple):
         items = cast(Sequence[object], value)
         if len(items) == 2 and isinstance(items[0], str) and isinstance(items[1], str):
             return [
-                _redacted(items[0], redactor, f'{path}[0]', secret=secret),
-                _entry(items[0], items[1], redactor, f'{path}[1]', secret=secret),
+                _redacted(items[0], redactor, f'{path}[0]', secret=secret, keep=keep),
+                _entry(items[0], items[1], redactor, f'{path}[1]', secret=secret, keep=keep),
             ]
         return [
-            _redacted(item, redactor, f'{path}[{index}]', secret=secret)
+            _redacted(item, redactor, f'{path}[{index}]', secret=secret, keep=keep)
             for index, item in enumerate(items)
         ]
     raise ContractViolation(
@@ -898,7 +1016,11 @@ def _redacted(value: object, redactor: Redactor, path: str, *, secret: bool) -> 
 
 
 def _redacted_mapping(
-    value: Mapping[object, object], redactor: Redactor, path: str, secret: bool
+    value: Mapping[object, object],
+    redactor: Redactor,
+    path: str,
+    secret: bool,
+    keep: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     for key in value:
         if not isinstance(key, str):
@@ -914,7 +1036,7 @@ def _redacted_mapping(
     for key, item in entries:
         name = redactor.redact(key)
         inherited = secret or (key == 'value' and secret_pair)
-        redacted = _entry(key, item, redactor, f'{path}.{name}', secret=inherited)
+        redacted = _entry(key, item, redactor, f'{path}.{name}', secret=inherited, keep=keep)
         unique = name
         suffix = 2
         while unique in result:
@@ -924,7 +1046,15 @@ def _redacted_mapping(
     return result
 
 
-def _entry(key: str, item: object, redactor: Redactor, path: str, *, secret: bool) -> object:
+def _entry(
+    key: str,
+    item: object,
+    redactor: Redactor,
+    path: str,
+    *,
+    secret: bool,
+    keep: frozenset[str] = frozenset(),
+) -> object:
     """映射里一项（或一对键值）的值：`Authorization` 这类键按头脱敏；名字像密钥的键让它下面的值
     都按 `secret` 判。"""
     if isinstance(item, str) and _AUTHORIZATION_KEY.fullmatch(key):
@@ -932,4 +1062,4 @@ def _entry(key: str, item: object, redactor: Redactor, path: str, *, secret: boo
         if framed.startswith(_FRAMED):
             return framed[len(_FRAMED) :]
         return redactor.redact(item)
-    return _redacted(item, redactor, path, secret=secret or looks_secret(key))
+    return _redacted(item, redactor, path, secret=secret or looks_secret(key), keep=keep)

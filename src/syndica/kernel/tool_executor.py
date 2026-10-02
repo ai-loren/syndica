@@ -1088,16 +1088,16 @@ class ToolExecutor:
             except SyndicaError as exc:
                 # 三件套写给程序员或运维，模型执行不了它的 next_action。
                 if traced is not None:
-                    self._tracing.tool_result(traced[1], None, exc)
+                    self._tracing.tool_result(traced[1], None, exc, arguments=args)
                 raise
             except Exception as exc:
                 if traced is not None:
-                    self._tracing.tool_result(traced[1], None, exc)
+                    self._tracing.tool_result(traced[1], None, exc, arguments=args)
                 returned = _tool_raised_result(call, exc)
                 outcome = 'error'
             else:
                 if traced is not None and isinstance(returned, ToolResult):
-                    self._tracing.tool_result(traced[1], returned, None)
+                    self._tracing.tool_result(traced[1], returned, None, arguments=args)
             if not isinstance(returned, ToolResult):
                 raise _bad_tool_return(call, tool, returned)
             result = returned

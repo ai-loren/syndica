@@ -100,6 +100,7 @@ from syndica.kernel.errors import ContractViolation
 from syndica.kernel.ids import StableKey, current_tool_call
 from syndica.kernel.redaction import Redactor, RuleRedactor
 from syndica.kernel.scenario_schema import (
+    REPLAYED_TOOLS,
     DangerRuleSpec,
     HostAction,
     HostProfile,
@@ -119,10 +120,6 @@ from syndica.runner.scenario import ScenarioEvent, ScenarioResult
 
 __all__ = ['Divergence', 'ReplayResult', 'ReplayRunner']
 
-# 触达外部世界、按记录回放的工具；其余（派活、消息、人机）是内核，真跑。
-EXTERNAL_TOOLS = frozenset(
-    {'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillBash', 'QueryAgent'}
-)
 # `host.no_write` 下放行的工具：只读的三件、派活与消息、问人。
 _READ_ONLY_TOOLS = frozenset(
     {
@@ -232,12 +229,14 @@ class _VirtualClockLoop(asyncio.SelectorEventLoop):
 
 
 class _ReplayTracer(NullTracer):
-    """闸门判定（tool_call span 结束时带着的 `danger.*` 与 `tool.outcome`）按 span id 记下；人的
-    等待结束时告诉回放：它不再在等，或者记录里的那次超时到了。"""
+    """闸门判定（tool_call span 结束时带着的 `danger.*` 与 `tool.outcome`）按 span id 记下，各 Agent
+    停下的原因按 agent span 记下；人的等待结束时告诉回放：它不再在等，或者记录里的那次超时到了。"""
 
     def __init__(self, ended: Callable[[str, str | None], None]) -> None:
         self.gates: dict[str, tuple[str, list[int], dict[str, AttributeValue]]] = {}
+        self.stop_reasons: dict[str, str | None] = {}
         self._calls: dict[str, tuple[str, list[int]]] = {}
+        self._agents: dict[str, str] = {}
         self._waits: dict[str, str] = {}
         self._ended = ended
 
@@ -254,6 +253,8 @@ class _ReplayTracer(NullTracer):
             call = current_tool_call()
             position = [] if call is None else [call.cycle, call.turn, call.index]
             self._calls[span_id] = (agent_id, position)
+        elif kind is SpanKind.AGENT:
+            self._agents[span_id] = agent_id
         elif kind is SpanKind.WAIT and attributes.get('wait.kind') == 'human':
             target = attributes.get('wait.target')
             self._waits[span_id] = target if isinstance(target, str) else ''
@@ -264,6 +265,11 @@ class _ReplayTracer(NullTracer):
         call = self._calls.pop(span_id, None)
         if call is not None and 'danger.disposition' in attributes:
             self.gates[span_id] = (*call, dict(attributes))
+        agent_id = self._agents.pop(span_id, None)
+        if agent_id is not None:
+            # 与捕获同一个判据：最后一个工作周期的原因，被取消的周期没有原因。
+            reason = attributes.get('stop_reason')
+            self.stop_reasons[agent_id] = reason if isinstance(reason, str) else None
         target = self._waits.pop(span_id, None)
         if target is not None:
             outcome = attributes.get('wait.outcome')
@@ -349,7 +355,7 @@ class ReplayRunner:
                 for instance in instances
                 for reply in instance.replies
                 for call in reply.tool_calls
-                if call.name in EXTERNAL_TOOLS
+                if call.name in REPLAYED_TOOLS
             }
         )
         real = not stubbed and bool(external)
@@ -740,6 +746,15 @@ class _Replay:
                     )
                     if self._stopped:
                         return await self._parked()
+            if any(call.key in (action.waiting or ()) for action in self._pending):
+                # 原始 run 在这次调用交回之后、结果落进轨迹之前被打断（宿主的 hook 还在跑）：停在
+                # 这里，等那个打断同样地取消它。
+                cut = Divergence(
+                    'tool',
+                    where,
+                    '原始 run 在这次调用的结果落进轨迹之前被打断，回放没有在这里被打断',
+                )
+                return await self._missing(call.key, cut)
             result: ToolResult | Exception = (
                 self._exception(found.raised) if found.raised is not None else self._result(found)
             )
@@ -1272,7 +1287,7 @@ class _Replay:
                         raise
                 await runtime.shutdown()
                 events = await answering
-                result = await self._observed(runtime, events, root, subscription)
+                result = await self._observed(runtime, events, root, subscription, tracer)
             finally:
                 if not answering.done():
                     await runtime.shutdown()
@@ -1334,7 +1349,12 @@ class _Replay:
         return agent_id
 
     async def _observed(
-        self, runtime: Runtime, events: list[ScenarioEvent], root: Path, subscription: Subscription
+        self,
+        runtime: Runtime,
+        events: list[ScenarioEvent],
+        root: Path,
+        subscription: Subscription,
+        tracer: _ReplayTracer,
     ) -> ScenarioResult:
         statuses: dict[str, str] = {}
         final_output: dict[str, str] = {}
@@ -1366,8 +1386,9 @@ class _Replay:
                 if block.role == 'assistant'
                 for call in block.tool_calls
             )
-            if context.stop_reason is not None:
-                stop_reasons[selector] = context.stop_reason.value
+        for agent_id, reason in tracer.stop_reasons.items():
+            if agent_id in self._bound and reason is not None:
+                stop_reasons[self._selector(agent_id)] = reason
         if subscription.dropped:
             self.divergences.append(
                 Divergence('outcome', 'events', f'事件订阅丢了 {subscription.dropped} 个事件')
@@ -1570,7 +1591,7 @@ class _RecordedTool(Tool):
 
 
 def _stub(tool: Tool, replay: _Replay) -> Tool:
-    if tool.name not in EXTERNAL_TOOLS:
+    if tool.name not in REPLAYED_TOOLS:
         return tool
     # 类名与要执行的参数照真的那个：危险判定的说明文字里有类名，它会进轨迹与之后的请求。
     real_type = type(tool)

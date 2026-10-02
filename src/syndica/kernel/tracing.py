@@ -90,12 +90,18 @@ class Tracer(Protocol):
         ...
 
     def tool_result(
-        self, span_id: str, result: ToolResult | None, error: BaseException | None
+        self,
+        span_id: str,
+        result: ToolResult | None,
+        error: BaseException | None,
+        *,
+        arguments: Mapping[str, Any] | None = None,
     ) -> None:
         """一次工具执行（`span_id` 那个 tool_call span）交回的结果，或它抛出的异常——工具自己的
         结局，`POST_TOOL_USE` 改写之前；被 `PRE_TOOL_USE` 跳过的调用交的是跳过它的那个结果。在 span
         收尾之前到达。内核自己写的结局（未知工具、坏参数、阻断、确认的结局）不经这里：回放时内核
-        照样写得出来。"""
+        照样写得出来。`arguments` 是真正交给工具执行的参数（hook 与确认改写之后）；跳过的调用没有
+        执行，是 None。"""
         ...
 
     def wait_answer(self, span_id: str, message: Message) -> None:
@@ -139,7 +145,12 @@ class NullTracer:
         return None
 
     def tool_result(
-        self, span_id: str, result: ToolResult | None, error: BaseException | None
+        self,
+        span_id: str,
+        result: ToolResult | None,
+        error: BaseException | None,
+        *,
+        arguments: Mapping[str, Any] | None = None,
     ) -> None:
         return None
 
@@ -444,10 +455,18 @@ class _Tracing:
         return _LlmScope(_LlmCall(self, agent_id, turn))
 
     def tool_result(
-        self, span: _OpenSpan, result: ToolResult | None, error: BaseException | None
+        self,
+        span: _OpenSpan,
+        result: ToolResult | None,
+        error: BaseException | None,
+        *,
+        arguments: Mapping[str, Any] | None = None,
     ) -> None:
         span_id = span.span_id
-        self.call('tool_result', lambda tracer: tracer.tool_result(span_id, result, error))
+        self.call(
+            'tool_result',
+            lambda tracer: tracer.tool_result(span_id, result, error, arguments=arguments),
+        )
 
     def wait_answer(self, span: _OpenSpan, message: Message) -> None:
         span_id = span.span_id

@@ -33,6 +33,7 @@ from typing import Any, cast
 
 from syndica.kernel.context import ContextBlock, ToolCall
 from syndica.kernel.errors import ConfigError, ContractViolation
+from syndica.kernel.ids import IdSource
 from syndica.kernel.message import Message
 from syndica.kernel.protocols.trace import TraceStore
 from syndica.kernel.redaction import (
@@ -41,9 +42,12 @@ from syndica.kernel.redaction import (
     Redactor,
     RuleRedactor,
     encode_digests,
+    encode_prepared,
     encode_redacted,
     redact_argv,
 )
+from syndica.kernel.replay_capture import ReplayCapture, Unreplayable
+from syndica.kernel.scenario_schema import parse_scenario_document
 from syndica.kernel.tool import ToolResult
 from syndica.kernel.trace import (
     ATTRIBUTE_DOMAINS,
@@ -323,6 +327,12 @@ class TraceRecorder:
     请求指纹的「模型参数」单元是内核交给 `create` 的关键字参数（不含消息与工具定义）；后端自己的
     配置不在其中——模型名记在 `llm.model` 上。人的答复由内核在等待等到它时交过来（`wait_answer`），
     挂在那次等待上。
+
+    `replay` 与 `full` 级还写一份回放文档（`replay.json`，M3 D12）：宿主在 run 开始之前把只有它知道
+    的部分交给 `describe_run`、把 `ids` 交给 `Runtime(ids=...)`，`finish` 时与插桩攒下的部分合成
+    一份、逐叶脱敏（内核生成的 id 与摘要原样）、按场景格式读一遍确认读得回来，再交给 store。写不出
+    （Agent 的 id 不是 `ids` 交出的、宿主漏交了角色）只少这一份文档，记一条三件套的 WARNING；trace
+    照常。
     """
 
     def __init__(
@@ -391,6 +401,8 @@ class TraceRecorder:
         self._writer: asyncio.Task[None] | None = None
         # 单元原文的 sha256 → 脱敏后的指纹：每轮把整段上下文重新脱敏是轮数的平方（D11）。
         self._fingerprints = RequestFingerprints(redactor)
+        self._capture = ReplayCapture(_jsonable, redactor)
+        self._capture_failed = False
         self._began_ns = 0
         self._began_mono = 0
         self._last_ns = 0
@@ -407,6 +419,54 @@ class TraceRecorder:
     @property
     def level(self) -> TraceLevel:
         return self._level
+
+    @property
+    def ids(self) -> IdSource:
+        """交给 `Runtime(ids=...)` 的 id 源：交出 uuid4，并记下每个稳定键交出了什么（回放文档的
+        `ids`）。不交给 Runtime 就写不出回放文档。"""
+        return self._capture.ids
+
+    def describe_run(
+        self,
+        *,
+        host: Mapping[str, object],
+        roles: Mapping[str, Mapping[str, object]],
+        entry: Mapping[str, object],
+    ) -> None:
+        """回放文档里只有宿主知道的部分，写法同场景格式 v2：`host`（宿主档案）、`roles`（角色名
+        → 冻结后的角色：`system_prompt` 正文、`tools` 按顺序、`max_turns`、`impl` 等）、`entry`
+        （入口）。run 开始之前调；不调就不写回放文档。值在这里取走一份，此后宿主改它们不影响
+        文档。"""
+        for name, value in (('host', host), ('roles', roles), ('entry', entry)):
+            if not isinstance(cast(object, value), Mapping):
+                raise ConfigError(
+                    expected=f'describe_run 的 {name} 是一个映射（写法同场景格式 v2）',
+                    received=f'收到 {type(value).__name__}',
+                    next_action=(
+                        '传 dict，例如 entry={"mode": "query", "agent": "Lead", "prompt": "…"}'
+                    ),
+                )
+        for role, value in roles.items():
+            if not isinstance(cast(object, role), str) or not isinstance(
+                cast(object, value), Mapping
+            ):
+                raise ConfigError(
+                    expected='describe_run 的 roles 是角色名（str）→ 冻结后的角色（映射）',
+                    received=f'其中一项是 {type(role).__name__} → {type(value).__name__}',
+                    next_action='每个角色写成 {"system_prompt": …, "tools": […], …}',
+                )
+        if self._capture_failed:
+            return
+        try:
+            self._capture.describe(host, roles, entry)
+        except Exception as error:
+            self._capture_broken(error)
+
+    def interrupted(self) -> None:
+        """宿主因为人打断（Ctrl-C）要拆掉这次 run：在拆之前调。此刻还在等外部世界的调用记成回放
+        文档里那条 `interrupt` 的位置，回放恰好停在这些调用上时才发出它。不调时，以 `cancelled`
+        结束的 trace 记一条不带位置的 `interrupt`。"""
+        self._capturing(self._capture.interrupted)
 
     @property
     def dropped(self) -> int:
@@ -490,6 +550,9 @@ class TraceRecorder:
                 await asyncio.shield(self._writer)
         if self._failure is not None or self._incomplete:
             return
+        await self._write_replay(status)
+        if self._failure is not None:
+            return
         try:
             await self._store.finish(self._trace_id, status, self._now())
         except Exception as error:
@@ -528,6 +591,16 @@ class TraceRecorder:
             start_ns=self._now(),
             attributes=dict(attributes),
         )
+        if self._level is not TraceLevel.STRUCTURE:
+            parent = None if parent_span_id is None else self._open.get(parent_span_id)
+            located = (
+                None
+                if parent is None or parent_span_id is None
+                else (parent.kind, parent.attributes, parent_span_id)
+            )
+            self._capturing(
+                lambda: self._capture.started(span_id, kind, agent_id, attributes, located)
+            )
 
     def end_span(
         self, span_id: str, status: SpanStatus, attributes: dict[str, AttributeValue]
@@ -536,6 +609,12 @@ class TraceRecorder:
         if span is None:
             return
         span.attributes.update(attributes)
+        if self._level is not TraceLevel.STRUCTURE:
+            self._capturing(
+                lambda: self._capture.ended(
+                    span_id, span.kind, span.agent_id, status, span.attributes
+                )
+            )
         try:
             record = Span(
                 span_id=span_id,
@@ -588,6 +667,7 @@ class TraceRecorder:
         span = self._open.get(span_id)
         if span is None or self._level is TraceLevel.STRUCTURE:
             return
+        units: list[str] | None = None
         try:
             messages, params = _request_parts(request)
             units = self._fingerprints.of_parts(messages, params)
@@ -604,9 +684,15 @@ class TraceRecorder:
             self._attach(span, 'llm.response', lambda: _error_value(error))
         elif reply is not None:
             self._attach(span, 'llm.response', lambda: _reply_value(reply))
+        self._capturing(lambda: self._capture.exchanged(span_id, units, reply, error))
 
     def tool_result(
-        self, span_id: str, result: ToolResult | None, error: BaseException | None
+        self,
+        span_id: str,
+        result: ToolResult | None,
+        error: BaseException | None,
+        *,
+        arguments: Mapping[str, Any] | None = None,
     ) -> None:
         span = self._open.get(span_id)
         if span is None or self._level is TraceLevel.STRUCTURE:
@@ -616,6 +702,12 @@ class TraceRecorder:
         elif result is not None:
             self._attach(span, 'tool.result', lambda: _result_value(result))
 
+        def capture() -> None:
+            digest = None if arguments is None else arguments_digest(arguments, self._redactor)
+            self._capture.returned(span_id, result, error, digest)
+
+        self._capturing(capture)
+
     def wait_answer(self, span_id: str, message: Message) -> None:
         """只记人的答复：等 Agent 的答复在回放里由那个 Agent 真跑出来（D11），记下来没人用；宿主
         直接发来的消息是宿主的动作，另记（D11 `host_actions`）。"""
@@ -624,8 +716,84 @@ class TraceRecorder:
             return
         if span.attributes.get('wait.kind') == 'human':
             self._attach(span, 'wait.answer', lambda: _answer_value(message))
+            self._capturing(lambda: self._capture.answered(span_id, message))
 
     # --- internals ------------------------------------------------------------------------
+
+    def _capturing(self, action: Callable[[], None]) -> None:
+        """回放文档的账本出错只少这一份文档：trace 与 run 都不受影响，ERROR 恰好一条。宿主没有调
+        `describe_run` 时不记：不会写的文档，攒下来只占内存。"""
+        if self._capture_failed or not self._capture.wanted:
+            return
+        try:
+            action()
+        except Exception as error:
+            self._capture_broken(error)
+
+    def _capture_broken(self, error: Exception) -> None:
+        if not self._capture_failed:
+            self._capture_failed = True
+            logger.error(
+                '期望: 回放文档要的每一项都记得下来。'
+                ' 实际: 记录时抛出 %s: %s；trace %s 不写回放文档，其余照常记录。'
+                ' 下一步: 这是 TraceRecorder 的缺陷，带上这条日志报告。',
+                type(error).__name__,
+                error,
+                self._trace_id,
+            )
+
+    async def _write_replay(self, status: SpanStatus) -> None:
+        if self._level is TraceLevel.STRUCTURE or not self._capture.wanted or self._capture_failed:
+            return
+        try:
+            source = dataclasses.replace(
+                self._source, argv=redact_argv(self._source.argv, self._redactor)
+            )
+            document, identifiers = self._capture.document(self._trace_id, source, status)
+        except Unreplayable as reason:
+            logger.warning(
+                '期望: %s。 实际: %s。 下一步: %s。',
+                reason.expected,
+                reason.received,
+                reason.next_action,
+            )
+            return
+        except Exception as error:
+            self._capture_failed = True
+            logger.error(
+                '期望: trace %s 的回放文档合得成一份。'
+                ' 实际: 合成时抛出 %s: %s；这个 trace 不写回放文档，其余照常。'
+                ' 下一步: 这是 TraceRecorder 的缺陷，带上这条日志报告。',
+                self._trace_id,
+                type(error).__name__,
+                error,
+            )
+            return
+        try:
+            text = encode_prepared(document, self._redactor, identifiers=identifiers)
+            parse_scenario_document(json.loads(text), source=f'trace {self._trace_id} 的回放文档')
+        except Exception as error:
+            # 里面那条错误的「下一步」写给的是手写文档的人，这里只取它说了什么。
+            said = getattr(error, 'received', None)
+            where = getattr(error, 'expected', None)
+            detail = (
+                f'{where}；{said}'
+                if isinstance(said, str) and isinstance(where, str)
+                else f'{type(error).__name__}: {error}'
+            )
+            logger.error(
+                '期望: trace %s 写出的回放文档按场景格式读得回来。'
+                ' 实际: %s；这个 trace 不写回放文档，其余照常。'
+                ' 下一步: 对照上面说的那一项检查宿主交给 describe_run 的值；它们都合格时这是'
+                ' TraceRecorder 的缺陷，带上这条日志报告。',
+                self._trace_id,
+                detail,
+            )
+            return
+        try:
+            await self._store.put_replay(self._trace_id, text)
+        except Exception as error:
+            self._fail('写回放文档', error)
 
     def _now(self) -> int:
         """`begin` 时的墙钟加上单调时钟走过的间隔，且不回退（从 `begin` 那一刻起取最大值）。"""

@@ -209,9 +209,12 @@ _TRACE_RECORDER_SURFACE: tuple[str, ...] = (
     'add_edge',
     'add_event',
     'begin',
+    'describe_run',
     'dropped',
     'end_span',
     'finish',
+    'ids',
+    'interrupted',
     'level',
     'llm_exchange',
     'start_span',
@@ -315,6 +318,10 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 #   `PayloadText`）先进承诺面，各部分到捕获写出的文档定稿时再判。
 # - `RequestFingerprints` 与 `arguments_digest`：回放（runner）用它们对自己的请求与执行的参数取与
 #   记录时同样的指纹；宿主不需要它们就能记录与回放。
+# - `encode_prepared`：recorder 写回放文档用的编码（各项已在自己的上下文里脱敏）；宿主写自己的
+#   持久化内容用 `encode_redacted`。
+# - 回放文档的账本（`ReplayCapture`、`RecordingIds`、`Unreplayable`）：宿主经 `TraceRecorder.ids` 与
+#   `describe_run` 用它们，不直接碰；`REPLAYED_TOOLS` 是捕获与回放共用的名单，宿主不读它。
 _WITHHELD: tuple[str, ...] = (
     'ATTRIBUTE_DOMAINS',
     'ATTRIBUTE_KINDS',
@@ -341,14 +348,17 @@ _WITHHELD: tuple[str, ...] = (
     'NullTurnGate',
     'OBSERVABLE',
     'QueryAgent',
+    'REPLAYED_TOOLS',
     'RULES_VERSION',
     'RULE_IDS',
     'RULE_PARAMETERS',
     'RandomIds',
     'Read',
     'ReadOnlyKwarg',
+    'RecordingIds',
     'RedactedText',
     'Redactor',
+    'ReplayCapture',
     'RequestFingerprints',
     'RuleTablePolicy',
     'SCENARIO_VERSIONS',
@@ -370,6 +380,7 @@ _WITHHELD: tuple[str, ...] = (
     'ToolOutcome',
     'TurnGate',
     'TurnGateDecision',
+    'Unreplayable',
     'Write',
     'arguments_digest',
     'assigned_agent_id',
@@ -382,6 +393,7 @@ _WITHHELD: tuple[str, ...] = (
     'current_tool_call',
     'disposition_of',
     'encode_digests',
+    'encode_prepared',
     'encode_redacted',
     'entering_owner',
     'entering_tool_call',

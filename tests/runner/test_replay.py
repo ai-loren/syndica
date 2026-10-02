@@ -1094,13 +1094,22 @@ def test_an_interrupt_recorded_with_its_waits_fires_exactly_there():
 
 
 def test_an_interrupt_whose_waits_the_replay_never_reaches_is_a_stall():
-    document = _interrupted([{'kind': 'interrupt', 'waiting': [['tool_call', _LEAD, 1, 1, 0]]}])
+    document = _interrupted([{'kind': 'interrupt', 'waiting': [['llm_call', _LEAD, 3, 1]]}])
 
     [divergence] = _replay(document).divergences
 
     assert (divergence.kind, divergence.where) == ('stall', 'host_actions interrupt')
-    assert "['tool_call', 'a1a1" in divergence.detail
-    assert "['llm_call', 'a1a1" in divergence.detail
+    assert f"['llm_call', '{_LEAD}', 3, 1]" in divergence.detail
+    assert f"['llm_call', '{_LEAD}', 2, 1]" in divergence.detail
+
+
+def test_a_call_cut_after_it_returned_parks_on_its_record_until_the_interrupt():
+    document = _interrupted([{'kind': 'interrupt', 'waiting': [['tool_call', _LEAD, 1, 1, 0]]}])
+
+    result = _replay(document)
+
+    assert result.reproduced, result.divergences
+    assert [block.role for block in result.trajectories['Lead[0]']] == ['user', 'assistant']
 
 
 def _hanging_after_tools(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1758,3 +1767,65 @@ def test_an_interrupt_the_replay_reaches_without_creating_a_recorded_agent_is_a_
 
     assert (divergence.kind, divergence.where) == ('stall', 'host_actions interrupt')
     assert 'Lead[1]' in divergence.detail
+
+
+def test_with_divergence_allowed_a_call_that_did_not_run_does_not_shift_the_others_records():
+    document = _doc(
+        _lead(
+            _turn(1, tool_calls=[_call('c1', 'Bash', command='rm -rf /')]),
+            _turn(2, tool_calls=[_call('c2', 'Bash', command='ls')]),
+            _turn(3, content='done'),
+            tool_results=[
+                {'call': [1, 1, 0], 'output': 'first'},
+                {'call': [1, 2, 0], 'output': 'second'},
+            ],
+            gate=[
+                {**_BLOCKED, 'call': [1, 1, 0], 'disposition': 'allow'},
+                _allowed(1, 2, 0),
+            ],
+        ),
+        host={
+            'danger': {
+                'rules': [{'id': 'shell.recursive_force_remove'}],
+                'table': {'shell.recursive_force_remove': 'block'},
+            }
+        },
+    )
+
+    result = _replay(document, allow_divergence=True)
+
+    outputs = [str(b.content) for b in result.trajectories['Lead[0]'] if b.role == 'tool']
+    assert 'first' not in outputs[0]
+    assert outputs[1] == 'second'
+
+
+def test_a_child_woken_again_and_cut_keeps_no_stop_reason_from_its_earlier_cycle():
+    child = ['tool_call', _LEAD, 1, 1, 0, 'spawn', 0]
+    document = _doc(
+        _lead(
+            _turn(1, tool_calls=[_call('d1', 'Delegate', agent='Helper', query='help')]),
+            _turn(
+                2,
+                tool_calls=[
+                    _call('s1', 'SendMessage', agent_id=_HELPER, content='more', trigger='pending')
+                ],
+            ),
+            _turn(3, content='lead done'),
+            gate=[_allowed(1, 1, 0), _allowed(1, 2, 0)],
+        ),
+        expect={'stop_reasons': {'Lead[0]': 'completed'}},
+    )
+    document['agents']['Helper'] = {
+        'frozen': {'system_prompt': 'You help.', 'tools': ['Read']},
+        'instances': [{'key': child, 'turns': [_turn(1, content='helper done')]}],
+    }
+    document['ids'] += [
+        {'key': child, 'id': _HELPER},
+        {'key': ['tool_call', _LEAD, 1, 2, 0, 'message', 0], 'id': 'e9' * 16},
+    ]
+
+    result = _replay(document)
+
+    assert result.reproduced, result.divergences
+    helper = [(b.role, b.content) for b in result.trajectories['Helper[0]']]
+    assert helper == [('user', 'help'), ('assistant', 'helper done'), ('user', 'more')]

@@ -26,6 +26,7 @@ from syndica.kernel.redaction import (
     RedactedText,
     _entropy,  # pyright: ignore[reportPrivateUsage]
     encode_digests,
+    encode_prepared,
     encode_redacted,
     looks_secret,
     write_all,
@@ -1820,3 +1821,74 @@ def test_anything_but_a_digest_is_refused_by_the_unredacted_encoder(bad: list[An
     assert '第 1 项' in caught.value.received
     assert 'encode_redacted' in caught.value.next_action
     assert 'api_key' not in caught.value.received
+
+
+def test_kernel_identifiers_are_kept_verbatim_even_under_a_key_named_like_a_secret():
+    agent_id = 'c0ffee' + '0' * 26
+    digest = 'ab' * 32
+    redactor = RuleRedactor(rules=[RedactionRule('custom.hex', '[0-9a-f]{32}')])
+    value = {'key': ['tool_call', agent_id, 1], 'note': f'id {agent_id}', 'digest': digest}
+
+    kept = json.loads(encode_redacted(value, redactor, identifiers={agent_id, digest}))
+    plain = json.loads(encode_redacted(value, redactor))
+
+    assert kept == {
+        'digest': digest,
+        'key': ['tool_call', agent_id, 1],
+        'note': 'id [REDACTED:custom.hex]',
+    }
+    assert plain['key'][1] != agent_id and plain['digest'] != digest
+
+
+@pytest.mark.parametrize(
+    'identifier', ['not-hex', 'AB' * 16, 'ab' * 15, 'ab' * 40, 'g' * 32, 'z9' * 32]
+)
+def test_only_kernel_shaped_identifiers_may_skip_redaction(identifier: str):
+    with pytest.raises(ContractViolation) as caught:
+        encode_redacted({'x': identifier}, RuleRedactor(), identifiers={identifier})
+
+    assert '32 或 64 个小写十六进制' in caught.value.expected
+    assert identifier not in str(caught.value)
+    assert f'长度 {len(identifier)}' in caught.value.received
+
+
+@pytest.mark.parametrize('identifier', ['0f' * 16, '0f' * 32])
+def test_ids_and_digests_are_both_kernel_shaped(identifier: str):
+    text = encode_redacted({'key': identifier}, RuleRedactor(), identifiers={identifier})
+
+    assert json.loads(text) == {'key': identifier}
+
+
+def test_a_prepared_structure_is_encoded_without_judging_its_leaves_by_outer_keys():
+    looks_like_a_credential = 'aB3dE5fG7hJ9kL1mN2pQ4rS6'
+    value = {'second-pass': {'id': looks_like_a_credential}, 'password': looks_like_a_credential}
+
+    prepared = json.loads(encode_prepared(value, RuleRedactor()))
+    judged = json.loads(encode_redacted(value, RuleRedactor()))
+
+    assert prepared == value
+    assert judged['password'] != looks_like_a_credential
+
+
+@pytest.mark.parametrize('where', ['leaf', 'key'], ids=['leaf', 'key'])
+def test_a_prepared_structure_refuses_a_string_that_was_never_redacted(where: str):
+    token = 'ghp_' + ''.join('aB3dE5fG7hJ9kL1mN2pQ4rS6tU8vW0xYz1234'[:36])
+    value = {'notes': [token]} if where == 'leaf' else {token: 1}
+
+    with pytest.raises(ContractViolation) as caught:
+        encode_prepared(value, RuleRedactor())
+
+    assert '已经脱过敏' in caught.value.expected
+    assert token not in str(caught.value)
+    assert 'encode_redacted' in caught.value.next_action
+
+
+def test_a_prepared_structure_keeps_kernel_identifiers_a_user_rule_would_change():
+    agent_id = 'ab' * 16
+    redactor = RuleRedactor(rules=[RedactionRule('custom.hex', '[0-9a-f]{32}')])
+
+    text = encode_prepared({'key': ['tool_call', agent_id]}, redactor, identifiers={agent_id})
+
+    assert json.loads(text) == {'key': ['tool_call', agent_id]}
+    with pytest.raises(ContractViolation):
+        encode_prepared({'key': ['tool_call', agent_id]}, redactor)

@@ -1003,7 +1003,7 @@ trace 开不了头（`.syndica` 是普通文件、`traces` 是符号链接、记
 - `current_llm_call()` 只在 `create` 在飞时有值：模型调用前后的 hook、工具与模块自己发起的模型调用拿到的是 None。
   `ReplayLLM` 在 None 下要拒绝（三件套，指名这次调用不在内核的计数里）而不是猜一个键（T7 评审）。
 
-**状态：完成。** `runner/replay.py`：`ReplayRunner(payloads=, redactor=, allow_divergence=, perturb=, real_tools=)
+**状态：完成（dcc8155）。** `runner/replay.py`：`ReplayRunner(payloads=, redactor=, allow_divergence=, perturb=, real_tools=)
 .run(document, workspace_root=)` 交回 `ReplayResult`（分叉列表、结局、没能重建的模块名与它们的 Flag、每个 Agent 回放出的轨迹；
 `reproduced` 是「没有分叉」）。模型按「当前 LLM 调用」的键给出记录的回复（`extra`、`trust`、带类型的错误照原样：抛出的是与记录
 同名、同模块、同文字的类，记录的是内核错误时保留它的身份），记了逐单元指纹的回复先比请求、第一处不同报出单元。外部工具
@@ -1055,6 +1055,48 @@ trace 开不了头（`.syndica` 是普通文件、`traces` 是符号链接、记
 - 捕获时，id 不是 id 源按它的键交出的那个的 Agent（工厂交回了别处构造的 Agent，或先构造了别的 Agent）回放不出
   记录的 id：recorder 在捕获时就指出它（三件套，指名工厂），而不是等回放发散。内核的 WARNING 只在注入的 id 源下
   发出，记录时默认的 uuid4 源看不出这件事（T6 评审）。
+
+**状态：完成。** `kernel/replay_capture.py`：recorder 在插桩到达时把回放要的东西记进一个账本——按（轮、第几次）的模型回复与
+逐单元指纹或带类型的错误、外部工具（`REPLAYED_TOOLS`，与回放共用一份名单）按调用位置的结局与执行参数的指纹、跳过、每次
+闸门判定连同这次调用的结局、按请求键的人的答复（确认、AskUser、AskUserQuestion、超时）、宿主在请求处的中止、各 Agent 最后
+一个工作周期的停下原因；`finish` 时与宿主交给 `TraceRecorder.describe_run` 的部分（宿主档案、冻结后的角色、入口）合成一份
+v2 文档，逐叶脱敏、按场景格式读一遍确认读得回来，再经 `put_replay` 写下。宿主把 `TraceRecorder.ids`（交出 uuid4 并记下每个
+稳定键交出了什么）交给 `Runtime(ids=...)`；宿主没调 `describe_run` 时账本什么都不攒。账本任何一处出错只少这份文档（一条
+ERROR）；回放造不出来的 run（Agent 的 id 不是 id 源交出的——工厂交回了别处构造的或先构造了别的、宿主漏交了角色、一个键交出
+两个 id、模型调用不在任何一轮里、人的等待没有请求键、宿主在 run 中途自己发了消息或在请求之外中止了某个 Agent、脱敏规则认得
+某个工具名、有内核之外的类式角色、两个角色名脱敏之后撞成一个）记一条三件套的 WARNING；store 拒收这份文档时 trace 不写结局。
+被 Ctrl-C 打断的 run 记一条 `interrupt`：宿主在拆 Runtime 之前调 `TraceRecorder.interrupted()`，此刻还在等外部世界的调用记成
+`waiting`——在飞的模型调用、开着的外部工具调用（在执行，或已经交回、结果还没落进轨迹：宿主的 hook 还在跑）、还挂着的人的
+请求；底下开着一个确认的工具调用不算（在飞的是那个请求）。回放里结果已经记下、却在 `waiting` 里的那次调用停在它的替身上，
+等打断同样地取消它。宿主没调 `interrupted()` 的 cancelled trace 记一条不带位置的 `interrupt`。CLI：`_run_traced` 交出 `ids`、
+调 `describe_run`（`cli/capture.py` 从这次 run 真正用的判定器、策略与冻结出的 Agent 上读，不另写一份），被打断时先调
+`interrupted()` 再关 Runtime；`--topology` 的 run 与带自定义类式角色的目录不交（建角色出错同样只少这份文档），只在人点名要了
+replay / full 时说一句。
+
+内核接缝：`Tracer.tool_result` 多一个仅限关键字的 `arguments`（真正交给工具执行的参数；`Tracer` 是本计划新加的公开面，
+发布之前一并定下）；`encode_redacted` 多一个 `identifiers`（只收 32 / 64 位小写十六进制：内核生成的 id 与摘要原样保留，
+名字像密钥的键 `key` 下面也一样，否则 agent id 会被当成凭证换掉、引用就断了；被拒的那一项不回显）；`encode_prepared`
+（回放文档的每一项先在自己的上下文里经 `encode_redacted` 脱敏，拼起来之后只确认每个字符串都已经是脱敏器的不动点、
+不再按外层的键给下面定性：整份一起脱敏时，一个像密钥的角色名 `second-pass` 下面的每个提供方工具调用 id 都被换掉，而指纹
+是按各项自己的上下文算的）；`DangerRule.params`（工作区根的两条规则记下字面与解析之后的根），`DangerJudge.rules`、
+`RuleTablePolicy.table` 只读；场景格式 v2 的角色可以没有实例（捕获列出宿主目录里的每个角色：交给模型的工具定义会点它们的名）。
+
+与计划不同之处：(1) 回放文档里的自由文本内联、不引用 payload：D12 要求引用是为了躲开 YAML 标量的类型转换，而捕获写的是
+JSON；内联让文档自成一份、`trace replay` 不必再读一批 payload，体积与引用相同（payload 的 JSON 里本来就有同一段文字）。(2) 捕获
+的 `expect` 只有 `stop_reasons`，取自 agent span（回放按同一个判据取，所以被 despawn 的子 Agent 也比得到）：最终回答与错误只是
+记录的回声，状态取决于注册表的生命周期（结束即 despawn 的子 Agent 在回放里查不到）。(3) `--topology` 的 run 不写回放文档、CLI
+说明原因：拓扑槽给角色附加的工具与预算回放重建不出来。(4) 回放像 CLI 一样开着编排工具重建 Runtime，宿主档案没有记 Module 名单
+时装安全与人机交互两个；别的宿主照样记下它们，否则第一次请求的「工具定义」就对不上。(5) 变异「工具桩按调用顺序取」在回放与
+原始 run 一致时是等价的（本地工具都不声明可并发，一个 Agent 的调用按位置的先后执行）；它只在某次记录过的调用回放里没有执行时
+才错位，那条由允许分叉的用例钉住。(6) `expect.stop_reasons` 取每个 Agent 最后一个工作周期的原因，被取消的周期没有原因（回放
+同一个判据）：沿用前一个周期的原因会把一个被切断的 Agent 报成「做完了」。(7) 执行参数的指纹在脱敏之后算，一段脱敏认不出的
+低熵秘密（hook 塞进参数的短口令）仍可能从指纹上被猜出：与请求指纹同一个前提，靠脱敏认得出真正的凭证。
+
+两路对抗评审（捕获的保真度；鲁棒性、安全与内核接缝）都在写报告之前撞上了模型用量上限，发现取自它们的工作记录：中断位置
+累计了整个 run 里被取消的调用（先被 kill 切断的子 Agent 的调用也在里面，真 SIGINT 复现回放卡住）、整份一起脱敏让像密钥的
+角色名下的 id 被换掉、宿主在请求之外的动作被静默丢掉、规则认得工具名、没写文档的 run 也攒账本、默认级别下每次 `--topology`
+都说一句、自定义类式角色让每次 run 记一条误导的 ERROR、建角色不隔离、读回失败的报错有两个「下一步」、文档的顺序随调度、
+被切断的周期沿用旧的停下原因、标识校验回显被拒的值，以及 2 条存活变异。全部按上面的设计修掉；修后一轮 32 条变异没有存活。
 
 ### 阶段四：surface 与导出
 

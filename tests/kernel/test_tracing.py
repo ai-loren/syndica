@@ -109,6 +109,9 @@ class _Recorder:
     tool_results: list[tuple[str, ToolResult | None, BaseException | None]] = field(
         default_factory=list[tuple[str, ToolResult | None, BaseException | None]]
     )
+    arguments: list[tuple[str, dict[str, Any] | None]] = field(
+        default_factory=list[tuple[str, dict[str, Any] | None]]
+    )
     answers: list[tuple[str, Message]] = field(default_factory=list[tuple[str, Message]])
     problems: list[str] = field(default_factory=list[str])
 
@@ -154,10 +157,16 @@ class _Recorder:
         self.exchanges.append((span_id, request, reply, error))
 
     def tool_result(
-        self, span_id: str, result: ToolResult | None, error: BaseException | None
+        self,
+        span_id: str,
+        result: ToolResult | None,
+        error: BaseException | None,
+        *,
+        arguments: Mapping[str, Any] | None = None,
     ) -> None:
         self._before_end(span_id, SpanKind.TOOL_CALL, 'tool result', result, error)
         self.tool_results.append((span_id, result, error))
+        self.arguments.append((span_id, None if arguments is None else dict(arguments)))
 
     def wait_answer(self, span_id: str, message: Message) -> None:
         self._before_end(span_id, SpanKind.WAIT, 'wait answer', message, None)
@@ -599,6 +608,35 @@ async def test_a_call_a_hook_skips_is_skipped():
 
     attributes = recorder.attributes(span_id_of(SpanKind.TOOL_CALL, agent_id, 1, 1, 0))
     assert attributes['tool.outcome'] == 'skipped'
+    assert recorder.arguments == [(span_id_of(SpanKind.TOOL_CALL, agent_id, 1, 1, 0), None)]
+
+
+async def test_the_tracer_gets_the_arguments_the_tool_really_ran_with():
+    runtime, recorder = _traced()
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall(id='c', name='Echo', arguments='{"text": "from model"}')]
+            ),
+            ScriptedTurn(content='ok'),
+        ]
+    )
+
+    async def rewrite(**kwargs: Any) -> HookResult:
+        return HookResult(modified={'args': {'text': 'from hook'}})
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = _factory('Root', llm, {'Echo': _Echo()})(hooks, events)
+        agent.register_hook(Junction.PRE_TOOL_USE, rewrite)
+        return agent
+
+    try:
+        agent_id = await _run_one(runtime, build)
+    finally:
+        await runtime.shutdown()
+
+    span = span_id_of(SpanKind.TOOL_CALL, agent_id, 1, 1, 0)
+    assert recorder.arguments == [(span, {'text': 'from hook'})]
 
 
 async def test_a_high_risk_call_traced_to_untrusted_content_is_decided_by_the_flag():
@@ -1469,7 +1507,7 @@ class _Broken:
         self.error = error
         self.calls = 0
 
-    def _fail(self, *args: Any) -> None:
+    def _fail(self, *args: Any, **kwargs: Any) -> None:
         self.calls += 1
         raise self.error
 
