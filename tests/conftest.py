@@ -37,3 +37,15 @@ def shell_path() -> str:
 @pytest.fixture(autouse=True)
 def cli_agent_shell(monkeypatch: pytest.MonkeyPatch, shell_path: str) -> None:
     monkeypatch.setattr('syndica.cli.host._SHELL', shell_path)
+
+
+def drop_opentelemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """开发者自己 shell 里的 `OTEL_*` 不进任何用例：经公开 CLI 的用例照抄 `os.environ` 当宿主的
+    环境，漏进来的端点会让测试把 trace 发到开发者真正的 collector 上。要端点的用例自己给。"""
+    for name in [name for name in os.environ if name.startswith('OTEL_')]:
+        monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
+def without_opentelemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+    drop_opentelemetry(monkeypatch)

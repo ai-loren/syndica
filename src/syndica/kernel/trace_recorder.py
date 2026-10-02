@@ -66,6 +66,9 @@ from syndica.kernel.trace import (
 
 logger = logging.getLogger(__name__)
 
+# 宿主交给脱敏器逐字换掉的那些值（`RuleRedactor(secrets=...)`）的占位符用的规则 id。
+_ENVIRONMENT_RULE = 'secret.env_value'
+
 __all__ = ['RequestFingerprints', 'TraceRecorder', 'arguments_digest']
 
 _LEVELS = (TraceLevel.STRUCTURE, TraceLevel.REPLAY, TraceLevel.FULL)
@@ -782,6 +785,17 @@ class TraceRecorder:
                     ' 实际: %s 改写了其中一项：%s；这个 trace 不写回放文档，其余照常。'
                     ' 下一步: 收窄这条规则的 pattern，让它认不出上面那个值。',
                     ', '.join(rewriting),
+                    detail,
+                )
+                return
+            if _placeholder(_ENVIRONMENT_RULE) in detail:
+                logger.warning(
+                    '期望: 宿主环境里的密钥值只换掉内容，不改写回放文档的结构'
+                    '（字段名与内核的标识）。'
+                    ' 实际: 一个名字像密钥的环境变量，它的值恰好是结构里的一段，被逐字换掉了：%s；'
+                    '这个 trace 不写回放文档，其余照常。'
+                    ' 下一步: 那个变量的值太像一个普通的词：换成真的凭证，'
+                    '或者别把它放进运行的环境。',
                     detail,
                 )
                 return

@@ -1453,10 +1453,38 @@ class RuntimeCliHost:
         if self._closed:
             return
         self._closed = True
-        with self._logging_to_stderr():
-            self._runner.run(self._close_sessions(interrupted=interrupted))
-            self._flush_exports()
-        self._runner.close()
+        try:
+            with self._logging_to_stderr():
+                self._runner.run(self._close_sessions(interrupted=interrupted))
+                self._flush_exports()
+        finally:
+            self._close_loop()
+
+    def _close_loop(self) -> None:
+        """关掉事件循环。这时按的 Ctrl-C 会把循环停在关线程池的半路上，asyncio 交出的是
+        「Event loop stopped before Future completed」这个 RuntimeError 而不是 KeyboardInterrupt；
+        循环照样关掉了，结论早已打出去，按过键时两者都不再往外抛。没按过键的 RuntimeError 照抛。"""
+        pressed = False
+
+        def press(signum: int, frame: object) -> None:
+            nonlocal pressed
+            pressed = True
+            raise KeyboardInterrupt
+
+        previous = None
+        if (
+            threading.current_thread() is threading.main_thread()
+            and signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        ):
+            previous = signal.signal(signal.SIGINT, press)
+        try:
+            self._runner.close()
+        except (KeyboardInterrupt, RuntimeError):
+            if not pressed:
+                raise
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGINT, previous)
 
     def _flush_exports(self) -> None:
         """run 结束时的导出放在结论打出去之后：导出可能要等，这时按的 Ctrl-C 不该把一次做完的 run

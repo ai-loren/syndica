@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -51,3 +53,28 @@ def test_the_agent_bash_behind_the_cli_follows_the_selected_shell_too() -> None:
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert '1 passed' in completed.stdout
+
+
+def _conftest() -> Any:
+    spec = importlib.util.spec_from_file_location('tests_conftest', _REPO / 'tests' / 'conftest.py')
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_opentelemetry_settings_from_the_developers_shell_are_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://collector.invalid:4318')
+    monkeypatch.setenv('OTEL_EXPORTER_OTLP_HEADERS', 'x-token=abc')
+    monkeypatch.setenv('NOT_OTEL_SETTING', 'kept')
+
+    _conftest().drop_opentelemetry(monkeypatch)
+
+    assert [name for name in os.environ if name.startswith('OTEL_')] == []
+    assert os.environ['NOT_OTEL_SETTING'] == 'kept'
+
+
+def test_no_test_sees_an_opentelemetry_setting() -> None:
+    assert [name for name in os.environ if name.startswith('OTEL_')] == []

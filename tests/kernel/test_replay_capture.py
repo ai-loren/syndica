@@ -514,6 +514,23 @@ async def test_a_user_rule_that_rewrites_part_of_the_document_is_named_in_a_warn
     assert header is not None and header.status is SpanStatus.OK
 
 
+async def test_an_environment_secret_that_rewrites_part_of_the_document_is_explained(
+    caplog: pytest.LogCaptureFixture,
+):
+    with caplog.at_level(logging.WARNING, logger='syndica.kernel.trace_recorder'):
+        _, _, document = await _captured(
+            [ScriptedTurn('done')],
+            host={'danger': {'rules': [{'id': 'shell.workspace_root_removal', 'params': {}}]}},
+            redactor=RuleRedactor(secrets=('workspace',)),
+        )
+
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
+    assert document is None
+    assert record.levelno == logging.WARNING
+    assert '[REDACTED:secret.env_value]' in str(record.args)
+    assert '名字像密钥的环境变量' in record.getMessage()
+
+
 async def test_a_description_that_does_not_fit_stays_an_error_beside_an_unrelated_rule(
     caplog: pytest.LogCaptureFixture,
 ):

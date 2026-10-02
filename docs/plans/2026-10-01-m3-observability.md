@@ -1164,7 +1164,7 @@ run 时整段 traceback 原样进终端）、`show` 里 Agent id 不转义、循
   明文 HTTP 的非回环地址不带头。
 - 依赖方向：内核不 import 这个 backend（`check_deps` 与一条字符串守卫）。
 
-**状态：完成。** `backends/otel_otlp/`：`OtlpHttpExporter(url, *, redactor, headers=None, resource=None,
+**状态：完成（a5606ce）。** `backends/otel_otlp/`：`OtlpHttpExporter(url, *, redactor, headers=None, resource=None,
 client=None, batch=512, timeout=10, deadline=120)` 只从 `TraceStore` 读，组装 OTLP/HTTP JSON：十六进制 id、Unix 纳秒的
 十进制字符串、带类型的属性（`bool` 先于 `int` 判，值是 None 的不发）、整数枚举、`kind` INTERNAL、事件；因果边转成
 links，挂在结果那一端指向起因，结果那一端不在 trace 里时挂在起因上（`syndica.edge.points_at` 说指向哪一端）；每批
@@ -1216,6 +1216,38 @@ run 结束时的导出不受此影响。导出不重试：429 / 503 只告警，
 - 失败的 run 捕获后 `trace replay` 复现同样的失败；在测试里给内核打一个改变行为的补丁后，回放报出分叉并指对单元。
 - 导出到本地 mock collector 成功；trace 写入失败时 run 照常结束、stderr 恰好一条说明。
 - Agent 用 Read 读 `.syndica/traces/…` 被拒。
+
+**状态：完成。** `tests/integration/test_trace_e2e.py` 经公开 CLI 与按 Agent 分发的脚本化模型，在夹具项目
+（`tests/fixtures/trace/project/`，`.fixture` 后缀，用例前后核对夹具没变）的 tmp 副本里跑七条：派活的 run（子 Agent
+读文件、给根发消息）——`trace show` 的树、等待链与最慢的工具调用逐行对，派生边与消息边都在；Agent 的 Read 与 Write
+碰 `.syndica/traces/…` 被拒（拒绝以三件套作为工具结果返回），trace 文件不变；以模型失败结束的 run 回放出同样的结局；
+给内核打补丁（工具结果多一段文字）之后回放报出 `request Worker[0] 第 2 轮第 1 次调用：请求的「第 2 条历史」与记录
+不同`；导出到本机的 collector，发出的 span 与 `spans.jsonl` 逐个对上；trace 写不进去时 run 照常结束，stderr 恰好一条
+ERROR，trace 标成不完整且不导出；十二个通道（提示词与命令行、工具参数、文件内容、私钥块、模型回复、模型发起的工具
+参数、提供方错误、命令输出、问人的问题、人的答复、环境里的密钥值、用户规则）各一个不同的假凭证、各命中一族规则：
+trace 目录里每个文件解码之后的每个字符串都不含原文，也不含原文任何 16 个字符的片段，十二个占位符都在。
+
+偏差：(1) 测试的 conftest 去掉每条用例环境里的 `OTEL_*`：经公开 CLI 的用例照抄 `os.environ` 当宿主环境，开发者 shell
+里的端点会让测试把 trace 发到真正的 collector 上。(2) 全量跑出一处偶发：`run --handoff` 结束后按在关事件循环那一刻的
+Ctrl-C，把循环停在关线程池的半路上，asyncio 交出 `RuntimeError` 而不是 `KeyboardInterrupt`，`entrypoint` 只接后者，于是
+打出 traceback、以 1 退出（本机约十二次一次）。宿主关循环时记下按键，按过就两者都不再往外抛（循环照样关掉了，结论早已
+打出），没按过的 `RuntimeError` 照抛；关会话被打断时循环也照样关。修后同一复现跑 24 次无失败，另有三条确定性的用例。
+
+(3) 宿主环境里名字像密钥、值却是普通词（`workspace`）的变量会把回放文档里内核的标识逐字换掉，读回校验拦下了文档，
+却报成 TraceRecorder 的缺陷；现在与用户规则一样按 WARNING 说清是环境里的值。
+
+变异：31 条，无存活：8 条打在这些端到端用例要守的生产代码上（私有目录不拒、AWS 规则失明、payload 只用内置规则脱敏、
+不记派生边、不记消息边、回放不比请求、不完整不标、写入失败每次都记），关循环的 4 条，评审给的 19 条。
+
+一路对抗评审（这些用例自己证明了什么）：Bash 那一路被 git 守卫跳过、命令输出从没进过 trace；三个通道其实是同一个
+（模型发起的工具参数）；没有一个秘密走 span 属性与头——store 自己的编码只认内置规则的形状，内置形状的秘密让记录器
+漏掉时也被它兜住；只在默认级别跑；回放的用例分不出结局检查坏没坏、「同样的失败」没比失败的文字；边只看种类不看两端；
+最慢的工具调用恰好也是最先开始的；collector 什么都收；私有目录只试了一种大小写、没试交接文件目录；环境照抄开发者
+的（一个名字像密钥、值是 `workspace` 的变量就让回放测试失败）；脚本化模型多要一次回复时与一次模型失败分不出来，以及
+18 条存活变异。改成：通道各走各的路且都真的执行（确认放在读不可信内容之前、只有宿主认得的环境值进调用 id 与命令行）、
+两个级别都跑并回放同一个 trace、补了改结局的内核补丁与失败文字的比对、边按两端核对、加一次慢的 Bash、collector 记
+路径与内容类型、Agent 自己的 Bash 往 trace 里塞的 span 不导出、多试大小写与交接文件、宿主环境只给跑命令要的几项与
+一个空的 HOME、脚本之外多要的回复单独记下；另补一条「晚些时候导出的 trace 按那时认得的密钥脱敏」。
 
 #### T18 — 真实模型 E2E、文档与收口
 

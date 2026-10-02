@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from io import StringIO
 from pathlib import Path
 from typing import Any, TextIO, cast
 
@@ -22,11 +23,13 @@ import pytest
 
 import syndica.__main__ as entry
 from syndica.cli.host import (
+    RuntimeCliHost,
     _CtrlC,  # pyright: ignore[reportPrivateUsage]
     _interruptible,  # pyright: ignore[reportPrivateUsage]
     _Lines,  # pyright: ignore[reportPrivateUsage]
 )
-from syndica.kernel import FileTraceStore, SpanStatus, TraceHeader
+from syndica.cli.main import CliIO
+from syndica.kernel import FileTraceStore, ScriptedLLM, SpanStatus, TraceHeader
 
 _DRIVER = """
 import json
@@ -905,3 +908,68 @@ def test_a_second_ctrl_c_while_main_reports_the_first_still_exits_130(
     monkeypatch.setattr(entry._LazyHost, 'close', lambda self, **_: None)  # pyright: ignore[reportPrivateUsage]
 
     assert _exit_code_of_entrypoint() == 130
+
+
+def _closing_host(tmp_path: Path) -> RuntimeCliHost:
+    io = CliIO(stdin=StringIO(''), stdout=StringIO(), stderr=StringIO())
+    return RuntimeCliHost(
+        io=io, model_factory=lambda _: ScriptedLLM([]), workspace_root=tmp_path, environ={}
+    )
+
+
+@pytest.mark.parametrize('surfaced_as', ['KeyboardInterrupt', 'RuntimeError'])
+def test_a_ctrl_c_while_the_host_closes_its_loop_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surfaced_as: str
+):
+    host = _closing_host(tmp_path)
+    runner = host._runner  # pyright: ignore[reportPrivateUsage]
+    real_close = runner.close
+
+    def interrupted() -> None:
+        real_close()
+        try:
+            signal.raise_signal(signal.SIGINT)
+        except KeyboardInterrupt:
+            if surfaced_as == 'KeyboardInterrupt':
+                raise
+            raise RuntimeError('Event loop stopped before Future completed.') from None
+
+    monkeypatch.setattr(runner, 'close', interrupted)
+
+    host.close()
+
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+def test_a_loop_that_fails_to_close_without_a_press_still_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    host = _closing_host(tmp_path)
+    runner = host._runner  # pyright: ignore[reportPrivateUsage]
+    real_close = runner.close
+
+    def broken() -> None:
+        real_close()
+        raise RuntimeError('a bug in closing')
+
+    monkeypatch.setattr(runner, 'close', broken)
+
+    with pytest.raises(RuntimeError, match='a bug in closing'):
+        host.close()
+
+
+def test_the_loop_is_closed_even_when_closing_the_sessions_is_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    host = _closing_host(tmp_path)
+
+    async def interrupted(*, interrupted: bool = False) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(host, '_close_sessions', interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        host.close()
+
+    with pytest.raises(RuntimeError, match='closed'):
+        host._runner.get_loop()  # pyright: ignore[reportPrivateUsage]
