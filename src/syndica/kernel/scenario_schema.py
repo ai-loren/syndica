@@ -102,14 +102,15 @@ _V2_ERROR = frozenset({'type', 'message', 'status_code', 'retry_after'})
 _ERROR_KINDS: Mapping[str, str] = MappingProxyType(
     {
         'runtime_error': 'builtins.RuntimeError',
-        'context_overflow': 'syndica.kernel.errors.ContextOverflowError',
+        'context_overflow': 'syndica.kernel.llm.base.ContextOverflowError',
         'llm_response_error': 'syndica.kernel.errors.LLMResponseError',
     }
 )
 _FROZEN = frozenset({'system_prompt', 'tools', 'max_turns', 'impl', 'model', 'description'})
-_OUTCOME = frozenset({'call', 'output', 'meta', 'trust', 'artifacts', 'raised'})
+_OUTCOME = frozenset({'call', 'output', 'meta', 'trust', 'artifacts', 'raised', 'arguments_digest'})
 _SKIPPED = frozenset({'call', 'output', 'meta', 'trust', 'artifacts'})
 _GATE = frozenset({'call', 'rule_ids', 'risk', 'provenance', 'decided_by', 'disposition'})
+_GATE_OPTIONAL = frozenset({'outcome'})
 _ARTIFACT = frozenset({'id', 'path', 'kind', 'mime', 'version', 'producer', 'is_deliverable'})
 _TOPOLOGY = frozenset({'slots'})
 _SLOT = frozenset(
@@ -133,7 +134,7 @@ _V1_RESPONSE = frozenset({'kind', 'agent', 'answer', 'tool_call_id'})
 _KEYED_RESPONSE = frozenset({'key', 'kind', 'answer', 'trust'})
 _V1_RESPONSE_KINDS = ('user_input', 'user_question', 'confirmation')
 _V2_RESPONSE_KINDS = (*_V1_RESPONSE_KINDS, 'timeout')
-_HOST_ACTION = frozenset({'kind', 'key'})
+_HOST_ACTION = frozenset({'kind', 'key', 'waiting'})
 _HOST_ACTION_KINDS = ('abort', 'interrupt', 'shutdown')
 _ID = frozenset({'key', 'id'})
 _HOST = frozenset(
@@ -211,7 +212,9 @@ class ScenarioReply:
 @dataclass(frozen=True)
 class ToolOutcome:
     """一次工具调用自己交回的结局（`POST_TOOL_USE` 改写之前）：结果，或它抛出的异常。`call` 是
-    （周期、轮、批内位置），Agent 由所在的实例给出。"""
+    （周期、轮、批内位置），Agent 由所在的实例给出。`arguments_digest` 是这次真正执行的参数（hook
+    与确认改写之后）逐叶脱敏、规范编码后的 sha256：模型那一侧比的是发出的请求，工具这一侧比的是
+    执行的参数。"""
 
     call: tuple[int, int, int]
     output: Text | tuple[object, ...] | None = None
@@ -219,6 +222,7 @@ class ToolOutcome:
     trust: str = 'trusted'
     artifacts: tuple[Mapping[str, object], ...] = ()
     raised: ScenarioError | None = None
+    arguments_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -234,7 +238,8 @@ class SkippedCall:
 
 @dataclass(frozen=True)
 class GateRecord:
-    """一次闸门判定：命中的规则（没有时是空表）、风险、溯源、由谁决定、处置。"""
+    """一次闸门判定：命中的规则（没有时是空表）、风险、溯源、由谁决定、处置；`outcome` 是这次调用
+    的结局（trace 的 `tool.outcome`：确认被拒、超时、被抢占都在这里分得开）。"""
 
     call: tuple[int, int, int]
     rule_ids: tuple[str, ...]
@@ -242,6 +247,7 @@ class GateRecord:
     provenance: str
     decided_by: str
     disposition: str
+    outcome: str | None = None
 
 
 @dataclass(frozen=True)
@@ -305,10 +311,12 @@ class ScenarioResponse:
 @dataclass(frozen=True)
 class HostAction:
     """宿主自己的动作：`abort` 在 `key` 那个请求处，`interrupt` / `shutdown` 在 run 安静下来的
-    那一处。"""
+    那一处。`waiting` 是它发生时还在等外部世界的那些调用（模型调用 `('llm_call', agent id, 轮,
+    第几次)`、工具调用的键、人的请求键）：给了它，回放只在恰好停在这些调用上时发出这个动作。"""
 
     kind: str
     key: tuple[str | int, ...] | None = None
+    waiting: tuple[tuple[str | int, ...], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -344,7 +352,8 @@ class ScenarioSource:
 
 @dataclass(frozen=True)
 class ScenarioExpectation:
-    """`expect`：只比写出来的那几项（`specified`），各项逐字比较。"""
+    """`expect`：只比写出来的那几项（`specified`），各项逐字比较。v2 的 `events` 也可以按 Agent
+    选择器分开写（`events_by_agent`）：几个 Agent 的事件交错的先后取决于调度。"""
 
     final_output: Mapping[str, str]
     tool_order: Mapping[str, tuple[str, ...]]
@@ -354,6 +363,7 @@ class ScenarioExpectation:
     events: tuple[str, ...]
     workspace: Mapping[str, str]
     specified: frozenset[str]
+    events_by_agent: Mapping[str, tuple[str, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -662,7 +672,7 @@ def _document(raw: object, source: str) -> ScenarioDocument:
         topology=topology,
         entry=entry,
         responses=responses,
-        expect=_expectation(root['expect']),
+        expect=_expectation(root['expect'], version),
         source=source,
         host=host,
         host_actions=host_actions,
@@ -1102,14 +1112,18 @@ def _outcome(field: str, value: object) -> ToolOutcome:
     data = _mapping(value, field, allowed=_OUTCOME, required=frozenset({'call'}))
     call = _call_position(data['call'], f'{field}.call')
     if 'raised' in data:
-        extra = sorted(key for key in data if key not in {'call', 'raised'})
+        extra = sorted(key for key in data if key not in {'call', 'raised', 'arguments_digest'})
         if extra:
             raise _error(
                 f'{field} 是工具交回的结果，或它抛出的异常（raised），不是两者都有',
                 f'raised 旁边还有 {extra!r}',
                 '工具抛了就只写 call 与 raised',
             )
-        return ToolOutcome(call=call, raised=_raised(data['raised'], f'{field}.raised', 2))
+        return ToolOutcome(
+            call=call,
+            raised=_raised(data['raised'], f'{field}.raised', 2),
+            arguments_digest=_arguments_digest(data, field),
+        )
     if 'output' not in data:
         raise _error(
             f'{field} 有 output（工具交回的结果）或 raised（它抛出的异常）',
@@ -1122,7 +1136,13 @@ def _outcome(field: str, value: object) -> ToolOutcome:
         meta=_json_object(data.get('meta', {}), f'{field}.meta'),
         trust=_choice(data.get('trust', 'trusted'), f'{field}.trust', _TRUST),
         artifacts=_artifacts(data.get('artifacts', ()), f'{field}.artifacts'),
+        arguments_digest=_arguments_digest(data, field),
     )
+
+
+def _arguments_digest(data: Mapping[str, object], field: str) -> str | None:
+    raw = data.get('arguments_digest')
+    return None if raw is None else _digest(raw, f'{field}.arguments_digest')
 
 
 def _skipped(field: str, value: object) -> SkippedCall:
@@ -1137,7 +1157,7 @@ def _skipped(field: str, value: object) -> SkippedCall:
 
 
 def _gate(field: str, value: object) -> GateRecord:
-    data = _mapping(value, field, allowed=_GATE, required=_GATE)
+    data = _mapping(value, field, allowed=_GATE | _GATE_OPTIONAL, required=_GATE)
     rule_ids = tuple(
         _nonblank(item, f'{field}.rule_ids[{index}]')
         for index, item in enumerate(_sequence(data['rule_ids'], f'{field}.rule_ids'))
@@ -1160,6 +1180,13 @@ def _gate(field: str, value: object) -> GateRecord:
             data['disposition'],
             f'{field}.disposition',
             sorted(ATTRIBUTE_DOMAINS['danger.disposition']),
+        ),
+        outcome=(
+            None
+            if 'outcome' not in data
+            else _choice(
+                data['outcome'], f'{field}.outcome', sorted(ATTRIBUTE_DOMAINS['tool.outcome'])
+            )
         ),
     )
 
@@ -1368,6 +1395,7 @@ def _host_actions(value: object) -> tuple[HostAction, ...]:
                 'interrupt 与 shutdown 发生在 run 安静下来的那一处，不需要位置',
             )
         key = _stable_key(data['key'], f'{field}.key') if kind == 'abort' else None
+        waiting = _waiting(data, field, kind)
         if key is not None:
             if key in aborted:
                 raise _error(
@@ -1382,8 +1410,32 @@ def _host_actions(value: object) -> tuple[HostAction, ...]:
                 f'{field} 是第二条',
                 '一次 run 只会被中断或关闭一次：删掉多余的那一条',
             )
-        actions.append(HostAction(kind, key))
+        actions.append(HostAction(kind, key, waiting))
     return tuple(actions)
+
+
+def _waiting(
+    data: Mapping[str, object], field: str, kind: str
+) -> tuple[tuple[str | int, ...], ...] | None:
+    if 'waiting' not in data:
+        return None
+    if kind == 'abort':
+        raise _error(
+            f'{field}：waiting 只属于 interrupt / shutdown',
+            'abort 带了 waiting',
+            'abort 的位置就是它的 key（所在的请求），删掉 waiting',
+        )
+    keys: list[tuple[str | int, ...]] = []
+    for index, raw in enumerate(_sequence(data['waiting'], f'{field}.waiting')):
+        key = _stable_key(raw, f'{field}.waiting[{index}]')
+        if key in keys:
+            raise _error(
+                f'{field}.waiting 里的键各不相同',
+                f'{field}.waiting[{index}]={list(key)!r} 重复',
+                '删掉重复的那一项',
+            )
+        keys.append(key)
+    return tuple(keys)
 
 
 def _ids(value: object) -> tuple[tuple[tuple[str | int, ...], str], ...]:
@@ -1546,12 +1598,17 @@ def _tool_order(value: object) -> Mapping[str, tuple[str, ...]]:
     return MappingProxyType(result)
 
 
-def _expectation(value: object) -> ScenarioExpectation:
+def _expectation(value: object, version: int) -> ScenarioExpectation:
     data = _mapping(value, 'expect', allowed=_EXPECT)
-    events = tuple(
-        _nonblank(item, f'expect.events[{index}]')
-        for index, item in enumerate(_sequence(data.get('events', ()), 'expect.events'))
-    )
+    raw_events = data.get('events', ())
+    by_agent: dict[str, tuple[str, ...]] | None = None
+    if version >= 2 and isinstance(raw_events, Mapping):
+        by_agent = {}
+        for selector, sequence in cast(Mapping[object, object], raw_events).items():
+            name = _nonblank(selector, 'expect.events 的键')
+            by_agent[name] = _event_kinds(sequence, f'expect.events.{name}')
+        raw_events = ()
+    events = _event_kinds(raw_events, 'expect.events')
     return ScenarioExpectation(
         final_output=_string_map(data.get('final_output', {}), 'expect.final_output'),
         tool_order=_tool_order(data.get('tool_order', {})),
@@ -1561,4 +1618,11 @@ def _expectation(value: object) -> ScenarioExpectation:
         events=events,
         workspace=_string_map(data.get('workspace', {}), 'expect.workspace'),
         specified=frozenset(data),
+        events_by_agent=None if by_agent is None else MappingProxyType(by_agent),
+    )
+
+
+def _event_kinds(value: object, field: str) -> tuple[str, ...]:
+    return tuple(
+        _nonblank(item, f'{field}[{index}]') for index, item in enumerate(_sequence(value, field))
     )

@@ -287,6 +287,22 @@ def test_a_v1_document_reads_as_before_with_slot_entry_and_ordered_responses():
         (('host', 'flags'), {}),
         (('host_actions',), [{'kind': 'shutdown'}, {'kind': 'interrupt'}]),
         ((*_TURN, 'tool_calls', 0, 'id'), ''),
+        ((*_INSTANCE, 'tool_results', 0, 'arguments_digest'), 'f' * 64),
+        (
+            (*_INSTANCE, 'tool_results', 0),
+            {
+                'call': [1, 1, 0],
+                'raised': {'type': 'a.B', 'message': 'x'},
+                'arguments_digest': 'e' * 64,
+            },
+        ),
+        ((*_INSTANCE, 'gate', 0, 'outcome'), 'confirmation_aborted'),
+        (
+            ('host_actions',),
+            [{'kind': 'interrupt', 'waiting': [['llm_call', _LEAD, 2, 1], _REQUEST]}],
+        ),
+        (('host_actions',), [{'kind': 'shutdown', 'waiting': []}]),
+        (('expect', 'events'), {'Lead[0]': ['agent_start'], 'Helper[0]': []}),
     ],
     ids=[
         'unrestricted-topology',
@@ -299,6 +315,12 @@ def test_a_v1_document_reads_as_before_with_slot_entry_and_ordered_responses():
         'no-flags',
         'shutdown-and-interrupt',
         'empty-call-id',
+        'executed-arguments',
+        'raised-with-executed-arguments',
+        'gate-outcome',
+        'interrupt-at-its-waits',
+        'shutdown-with-nothing-in-flight',
+        'events-by-agent',
     ],
 )
 def test_each_v2_form_is_accepted(path: tuple[Any, ...], value: object):
@@ -804,6 +826,54 @@ _INVALID: list[tuple[str, tuple[Any, ...], object, str, str, str]] = [
         "['message', 'typ']",
         '写 type',
     ),
+    (
+        'arguments-digest',
+        (*_INSTANCE, 'tool_results', 0, 'arguments_digest'),
+        'ABC',
+        'arguments_digest 是 64 个小写十六进制',
+        'ABC',
+        '不要截断',
+    ),
+    (
+        'gate-outcome',
+        (*_INSTANCE, 'gate', 0, 'outcome'),
+        'done',
+        'outcome 是',
+        "'done'",
+        '逐字匹配',
+    ),
+    (
+        'abort-waiting',
+        ('host_actions', 0, 'waiting'),
+        [['llm_call', _LEAD, 1, 1]],
+        'waiting 只属于 interrupt / shutdown',
+        'abort 带了 waiting',
+        '删掉 waiting',
+    ),
+    (
+        'waiting-twice',
+        ('host_actions', 1, 'waiting'),
+        [_REQUEST, _REQUEST],
+        'waiting 里的键各不相同',
+        '重复',
+        '删掉重复',
+    ),
+    (
+        'waiting-not-a-key',
+        ('host_actions', 1, 'waiting'),
+        [[1, 2]],
+        '内核的稳定键',
+        '[1, 2]',
+        '原样抄写',
+    ),
+    (
+        'events-by-agent',
+        ('expect', 'events'),
+        {'Lead[0]': 'agent_start'},
+        'expect.events.Lead[0]',
+        'agent_start',
+        '',
+    ),
 ]
 
 
@@ -1147,3 +1217,59 @@ def test_the_version_hint_appears_only_when_every_unknown_key_is_a_v2_key():
 
     assert '删除未知键' in mixed.value.next_action
     assert '把 version 改成 2' in keyed.value.next_action
+
+
+def test_the_v2_additions_read_into_their_fields():
+    document = _with(_v2(), (*_INSTANCE, 'tool_results', 0, 'arguments_digest'), 'f' * 64)
+    document = _with(document, (*_INSTANCE, 'gate', 0, 'outcome'), 'rejected')
+    document = _with(
+        document, ('host_actions', 1), {'kind': 'interrupt', 'waiting': [_REQUEST, ['b', 1]]}
+    )
+    document = _with(document, ('expect', 'events'), {'Lead[0]': ['agent_start', 'turn_start']})
+
+    parsed = parse_scenario_document(document, source='captured.json')
+
+    [instance] = parsed.roles['Lead'].instances
+    assert instance.tool_results[0].arguments_digest == 'f' * 64
+    assert instance.gate[0].outcome == 'rejected'
+    assert parsed.host_actions[1] == HostAction('interrupt', None, (tuple(_REQUEST), ('b', 1)))
+    assert parsed.expect.events_by_agent == {'Lead[0]': ('agent_start', 'turn_start')}
+    assert parsed.expect.events == () and 'events' in parsed.expect.specified
+
+
+def test_events_by_agent_are_a_v2_form():
+    document = _with(_v1(), ('expect',), {'events': {'Root[0]': ['agent_start']}})
+
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(document, source='scenario.yaml')
+
+    assert 'expect.events' in caught.value.expected
+
+
+def test_v1_error_kinds_name_the_classes_the_kernel_actually_raises():
+    from syndica.kernel import ContextOverflowError, LLMResponseError
+
+    named = {
+        kind: scenario_schema.parse_scenario_document(
+            _with(
+                _v1(),
+                ('agents', 'Root', 'instances', 0, 'turns', 0),
+                {'raises': {'kind': kind, 'message': 'x'}},
+            ),
+            source='scenario.yaml',
+        )
+        .roles['Root']
+        .instances[0]
+        .replies[0]
+        .raises
+        for kind in ('context_overflow', 'llm_response_error', 'runtime_error')
+    }
+
+    assert {kind: None if error is None else error.type for kind, error in named.items()} == {
+        kind: f'{cls.__module__}.{cls.__qualname__}'
+        for kind, cls in (
+            ('context_overflow', ContextOverflowError),
+            ('llm_response_error', LLMResponseError),
+            ('runtime_error', RuntimeError),
+        )
+    }

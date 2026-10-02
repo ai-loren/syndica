@@ -313,6 +313,8 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # - 场景文档各部分的类型（`ScenarioRole`、`ToolOutcome`、`HostProfile` 等）与 schema 的常量：
 #   回放（T13）与捕获（T14）还会动它们的形状。入口（`parse_scenario_document`、`ScenarioDocument`、
 #   `PayloadText`）先进承诺面，各部分到捕获写出的文档定稿时再判。
+# - `RequestFingerprints` 与 `arguments_digest`：回放（runner）用它们对自己的请求与执行的参数取与
+#   记录时同样的指纹；宿主不需要它们就能记录与回放。
 _WITHHELD: tuple[str, ...] = (
     'ATTRIBUTE_DOMAINS',
     'ATTRIBUTE_KINDS',
@@ -347,6 +349,7 @@ _WITHHELD: tuple[str, ...] = (
     'ReadOnlyKwarg',
     'RedactedText',
     'Redactor',
+    'RequestFingerprints',
     'RuleTablePolicy',
     'SCENARIO_VERSIONS',
     'ScenarioCall',
@@ -368,6 +371,7 @@ _WITHHELD: tuple[str, ...] = (
     'TurnGate',
     'TurnGateDecision',
     'Write',
+    'arguments_digest',
     'assigned_agent_id',
     'assigning_agent_id',
     'back_in_spans',

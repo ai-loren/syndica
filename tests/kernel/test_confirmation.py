@@ -98,6 +98,7 @@ def test_confirmation_public_values_and_field_order_are_exact() -> None:
         'tool_name',
         'arguments',
         'verdict',
+        'request_ref',
     ]
 
 
@@ -620,6 +621,54 @@ async def test_mailbox_confirmation_uses_a_nonce_and_a_trusted_human_reply() -> 
         await runtime.shutdown()
 
 
+async def test_a_host_handler_gets_the_stable_key_the_wait_and_the_event_use() -> None:
+    tool = _Recorder()
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(id='c', name='Recorder', arguments='{"value":"x"}'),
+                    ToolCall(id='c', name='Confirmable', arguments='{"value":"y"}'),
+                ]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    seen: list[ConfirmationRequest] = []
+
+    class _Keyed:
+        async def confirm(
+            self, runtime: object, request: ConfirmationRequest
+        ) -> ConfirmationOutcome:
+            seen.append(request)
+            return ConfirmationOutcome.APPROVED
+
+    other = _Recorder()
+    other.__class__ = type('Recorder', (_Recorder,), {'__tool_name__': 'Recorder'})
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(
+                name='Root',
+                llm=llm,
+                tools={'Recorder': other, 'Confirmable': tool},
+                danger_policy=_ConfirmNamed(),
+            ),
+            hooks=hooks,
+            events=events,
+        )
+
+    runtime = Runtime(confirmation_handler=_Keyed())
+    try:
+        agent_id = await runtime.spawn(build, query='start')
+        await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+    finally:
+        await runtime.shutdown()
+
+    [request] = seen
+    assert request.request_ref == ('tool_call', agent_id, 1, 1, 1, 'request', 0)
+
+
 @pytest.mark.parametrize(
     ('sender', 'trust'),
     [
@@ -672,3 +721,65 @@ async def test_mailbox_confirmation_rejects_forged_or_untrusted_replies(
     finally:
         events.close()
         await runtime.shutdown()
+
+
+async def test_the_request_key_a_host_handler_gets_is_the_one_its_event_and_wait_use() -> None:
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall(id='c', name='Confirmable', arguments='{"value":"y"}')]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    seen: list[ConfirmationRequest] = []
+    mailbox = MailboxConfirmationHandler(timeout=_TIMEOUT)
+
+    class _Watching:
+        async def confirm(self, runtime: Any, request: ConfirmationRequest) -> ConfirmationOutcome:
+            seen.append(request)
+            return await mailbox.confirm(runtime, request)
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(
+                name='Root',
+                llm=llm,
+                tools={'Confirmable': _Recorder()},
+                danger_policy=_ConfirmNamed(),
+            ),
+            hooks=hooks,
+            events=events,
+        )
+
+    runtime = Runtime(confirmation_handler=_Watching())
+    subscription = runtime.events.subscribe()
+    announced: list[tuple[object, ...]] = []
+    outcomes: list[bool] = []
+
+    async def answer() -> None:
+        async for event in subscription:
+            if event.kind == 'tool_confirmation_requested':
+                announced.append(tuple(event.payload['request_ref']))
+                delivered = await runtime.send(
+                    event.agent_id,
+                    'approve',
+                    activate=False,
+                    sender='human',
+                    correlation_id=event.payload['request_id'],
+                )
+                outcomes.append(delivered.ok)
+
+    answering = asyncio.create_task(answer())
+    try:
+        agent_id = await runtime.spawn(build, query='start')
+        context = await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+    finally:
+        await runtime.shutdown()
+        subscription.close()
+        await asyncio.gather(answering, return_exceptions=True)
+
+    [request] = seen
+    assert announced == [request.request_ref]
+    assert outcomes == [True]
+    assert context.current_traj[-1].content == 'done'

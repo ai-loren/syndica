@@ -173,6 +173,9 @@ class ConfirmationRequest:
     `request_id` is a fresh nonce and is intentionally distinct from the
     model-provided `tool_call_id`. A late answer can therefore never approve a
     later call that happens to reuse the same model id.
+
+    `request_ref` 是这次请求的稳定键（M3 D10，`wait_for` 随后用同一个键登记它；不在任何工具调用里
+    时是 None）：宿主自己写的 handler 按它对上记录下来的答复——回放就是这样给出人的答复的。
     """
 
     request_id: str
@@ -181,6 +184,7 @@ class ConfirmationRequest:
     tool_name: str
     arguments: str
     verdict: DangerVerdict
+    request_ref: tuple[str | int, ...] | None = None
 
 
 class _ConfirmationRuntime(Protocol):
@@ -2484,21 +2488,12 @@ class _WorkspaceRoot:
     real: str
 
     @classmethod
-    def of(cls, root: object, factory: str) -> _WorkspaceRoot:
-        shown, kind = repr(root), type(root).__name__
-        text: object = None
-        if isinstance(root, str | os.PathLike):
-            text = os.fspath(cast('str | os.PathLike[str]', root))
-        if not isinstance(text, str) or not text.startswith('/') or '\0' in text:
-            raise ConfigError(
-                expected=f'{factory} 的 root 是工作区根的绝对路径（str 或 os.PathLike）',
-                received=f'收到 {shown}，类型是 {kind}',
-                next_action=(
-                    f'宿主先把工作区根解析成绝对路径再交给 {factory}（例如 Path(root).resolve()）；'
-                    '规则不读 cwd，相对路径没有可以相对的地方'
-                ),
-            )
-        lexical = posixpath.normpath(text)
+    def of(cls, root: object, factory: str, real: object = None) -> _WorkspaceRoot:
+        """`real` 给出时就用它当解析之后的根，不在这台机器上解析：回放的机器上同一个路径可能解析成
+        别处，判定就与记录的对不上（M3 D11）。"""
+        lexical = cls._absolute(root, factory, 'root')
+        if real is not None:
+            return cls(lexical=lexical, real=cls._absolute(real, factory, 'real'))
         try:
             real = str(Path(lexical).resolve())
         except (OSError, RuntimeError) as exc:
@@ -2508,6 +2503,26 @@ class _WorkspaceRoot:
                 next_action='检查工作区根路径上的符号链接（是否成环、是否有权限读），修好后再构造规则',
             ) from exc
         return cls(lexical=lexical, real=real)
+
+    @staticmethod
+    def _absolute(value: object, factory: str, name: str) -> str:
+        shown, kind = repr(value), type(value).__name__
+        text: object = None
+        if isinstance(value, str | os.PathLike):
+            text = os.fspath(cast('str | os.PathLike[str]', value))
+        if not isinstance(text, str) or not text.startswith('/') or '\0' in text:
+            raise ConfigError(
+                expected=f'{factory} 的 {name} 是工作区根的绝对路径（str 或 os.PathLike）',
+                received=f'收到 {shown}，类型是 {kind}',
+                next_action=(
+                    '传记录下的、原始机器上解析出的工作区根（trace 的宿主档案里有）；'
+                    '不要在这台机器上重新解析，real= 就是为了不解析才有的'
+                    if name == 'real'
+                    else f'宿主先把工作区根解析成绝对路径再交给 {factory}'
+                    '（例如 Path(root).resolve()）；规则不读 cwd，相对路径没有可以相对的地方'
+                ),
+            )
+        return posixpath.normpath(text)
 
     def points_outside(self, word: str) -> bool:
         word = _without_pwd(word)
@@ -2620,10 +2635,11 @@ def git_state_change_rule() -> DangerRule:
     )
 
 
-def path_outside_workspace_rule(root: object) -> DangerRule:
+def path_outside_workspace_rule(root: object, *, real: object = None) -> DangerRule:
     """`shell.path_outside_workspace`：实参或重定向目标指向工作区之外。
 
-    `root` 是工作区根的绝对路径，构造时解析一次。命中：工作区外的绝对路径（`_PSEUDO_DEVICES`
+    `root` 是工作区根的绝对路径，构造时解析一次；`real` 给出时用它当解析之后的根、不再解析（回放用
+    记录下来的那一份）。命中：工作区外的绝对路径（`_PSEUDO_DEVICES`
     与 `/dev/fd/N` 除外）、`~` 开头、`$HOME` / `${HOME}` 开头、会逃出去的 `..`（`$PWD` 当 `.`）；
     `--选项=值` 按值判；不带目录的 `cd`、`cd -`、`pushd`、`popd`（`builtin cd`、`{ cd; }` 也算）。
     包含关系按规范化后的路径段比，兄弟目录 `<根>-other` 在外面。相对路径按 Bash 的 `cwd` 在根下
@@ -2644,7 +2660,7 @@ def path_outside_workspace_rule(root: object) -> DangerRule:
     文件、`echo $HOME`、`cd src && … && cd ..`（命令内的 `cd` 不跟踪）、结束标记不带引号的 heredoc
     正文里的路径。
     """
-    workspace = _WorkspaceRoot.of(root, 'path_outside_workspace_rule')
+    workspace = _WorkspaceRoot.of(root, 'path_outside_workspace_rule', real)
     return DangerRule(
         rule_id='shell.path_outside_workspace',
         level=RiskLevel.HIGH,
@@ -2656,10 +2672,10 @@ def path_outside_workspace_rule(root: object) -> DangerRule:
     )
 
 
-def workspace_root_removal_rule(root: object) -> DangerRule:
+def workspace_root_removal_rule(root: object, *, real: object = None) -> DangerRule:
     """`shell.workspace_root_removal`：`rm` 或 `find` 删掉工作区根本身、根下的全部内容，或根的祖先。
 
-    `root` 同 `path_outside_workspace_rule`。命中的目标规范化之后是根（`.`、`./`、`.//`、
+    `root` 与 `real` 同 `path_outside_workspace_rule`。命中的目标规范化之后是根（`.`、`./`、`.//`、
     `src/..`、`$PWD`、根的绝对路径、`../<根目录名>`）、根的祖先（`..`、`/`）、逐段通配能匹配到
     根或其祖先（`/srv/*/proj`、`../*`），或根下的「全部」（`*`、`./*`、`?*`、`[!.]*`）。相对目标
     按 Bash 的 `cwd` 在根下任意一层都试（cwd 在 `src` 时 `../../proj` 就是根），接在字面与解析掉
@@ -2680,7 +2696,7 @@ def workspace_root_removal_rule(root: object) -> DangerRule:
     「全部」的写法，别的都算收窄；花括号展开（`{*,.*}`）；`git clean`（它归
     `shell.git_state_change`）。
     """
-    workspace = _WorkspaceRoot.of(root, 'workspace_root_removal_rule')
+    workspace = _WorkspaceRoot.of(root, 'workspace_root_removal_rule', real)
     return DangerRule(
         rule_id='shell.workspace_root_removal',
         level=RiskLevel.HIGH,

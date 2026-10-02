@@ -968,7 +968,7 @@ trace 开不了头（`.syndica` 是普通文件、`traces` 是符号链接、记
 - 有序字段（`danger.rules`、`frozen.tools`）对照手写的固定装置逐项比顺序；同一份 v2 文档写成 YAML 与 JSON，读出的
   结果相同。
 
-**状态：完成。** `kernel/scenario_schema.py`：`parse_scenario_document(raw, *, source)` 把一份已经读出来的映射校验成不可变的
+**状态：完成（788d958）。** `kernel/scenario_schema.py`：`parse_scenario_document(raw, *, source)` 把一份已经读出来的映射校验成不可变的
 `ScenarioDocument`（v1 与 v2，纯映射、不依赖 PyYAML）；`ScenarioDocument`、`PayloadText` 与入口进承诺面，各部分的类型等捕获
 写出的文档定稿时再判。v2 在 v1 之上多出公开契约里的那些键，另有几条结构约束：同一份文档里实例的稳定键都给或都不给；回复的
 `(turn, attempt)` 严格递增、每一轮的 attempt 从 1 起逐个加 1、拿到回复之后不再有下一次调用、`raises` 不与回复的内容并存；
@@ -1002,6 +1002,43 @@ trace 开不了头（`.syndica` 是普通文件、`traces` 是符号链接、记
   调用里交给它（T6 复评）。
 - `current_llm_call()` 只在 `create` 在飞时有值：模型调用前后的 hook、工具与模块自己发起的模型调用拿到的是 None。
   `ReplayLLM` 在 None 下要拒绝（三件套，指名这次调用不在内核的计数里）而不是猜一个键（T7 评审）。
+
+**状态：完成。** `runner/replay.py`：`ReplayRunner(payloads=, redactor=, allow_divergence=, perturb=, real_tools=)
+.run(document, workspace_root=)` 交回 `ReplayResult`（分叉列表、结局、没能重建的模块名与它们的 Flag、每个 Agent 回放出的轨迹；
+`reproduced` 是「没有分叉」）。模型按「当前 LLM 调用」的键给出记录的回复（`extra`、`trust`、带类型的错误照原样：抛出的是与记录
+同名、同模块、同文字的类，记录的是内核错误时保留它的身份），记了逐单元指纹的回复先比请求、第一处不同报出单元。外部工具
+（`Read Write Edit Glob Grep Bash BashOutput KillBash`，以及 Runtime 自己装的 `QueryAgent`）换成同名的替身，按「当前工具调用」的
+位置交回记录的结局，记录带执行参数的指纹（`arguments_digest`，hook 与确认之后真正交给工具的那一份）时先比参数；内核工具与人机
+工具真跑。跳过的调用由一个 `PRE_TOOL_USE` hook 原样再跳过，`no_write` 另装只读守卫。危险规则按宿主档案重建（`real=` 用记录的
+解析结果）、判定真跑，每次闸门判定按 span id 逐项比对，记录带 `outcome` 时连这次调用的结局一起比（确认被拒、超时、被抢占分得
+开）；捕获的文档一条闸门记录都没有也照样比。人的答复按请求事件里的键给出。
+
+记录里没有的那一次（原始 run 在模型调用、工具调用或人的请求上被 Ctrl-C、关闭、kill 或根结束后的关机打断）先停在那里，run
+安静下来时还停着、又没有什么会去取消它，才算分叉。宿主的 interrupt / shutdown 在 run 安静下来、记录都用完之后发出；记录了它
+发生时在等哪些调用（`waiting`）的，只在回放恰好停在那些调用上时发出，停在别处报 `stall`。还有记录没用上时先让定时器走完。
+根结束之后别的 Agent 接着跑到安静下来，再像原始 run 那样关掉。每一项记录都要被消费，剩下的算分叉；分叉之后停下
+（`allow_divergence` 时只记下、尽量往下跑：缺结局的工具调用拿一个说明接着跑），停下之后的结局比对与未消费检查不再报。payload
+在回放开始之前全部读出并按 sha256 校验，读不到、不是文本、对不上，以及回放自己在替身里出错，都由 `run` 抛出（文档不可用），
+不变成一个分叉或一个看起来正常的 Agent 失败。
+
+与计划不同之处：(1) 回放跑在一个虚拟时钟的事件循环上：`time()` 只在循环空闲时直接跳到最早的定时器（浮点精度用尽的量级上跳过
+它一个最小单位，否则定时器永远不就绪），`RetryModule` 的退避与人的超时零真实等待，超时由内核自己的 `wait_for` 触发；没有定时器、
+没有停在记录之外的调用也没有能发出的动作时空转 40 次判为卡住，停下之后关机仍不结束则放弃并报出。(2) 真跑工具只给调用方
+明确允许的手写文档（`real_tools=True`）：文档决定不了这件事——来路不明的文档按它自己的危险规则真跑，就是在执行它写的命令；
+真时钟下判不出安静，所以那种回放不收 `allow_divergence` 与 interrupt / shutdown，没有记录的调用当场算分叉。(3) 宿主的
+`ConfirmationHandler` 拿请求键的取法：`ConfirmationRequest` 带上尾部带默认值的 `request_ref`（`peek_key('request')`，与等待、
+事件用的同一个）。(4) 逐单元指纹从 `TraceRecorder` 拆成 `RequestFingerprints`，执行参数的指纹是 `arguments_digest`（都不进
+`kernel.__all__`），回放用记录的规则集算同一个。(5) 结果带上每个 Agent 回放出的轨迹（被打断的停在打断处）：人的答复交给了哪个
+请求、超时有没有先到，只有轨迹能独立证明（拿被测代码自己算的指纹当期望值是恒等式）。(6) 模块按名字重建（安全、人机交互、重试），
+其余名字与只有它们声明的 Flag 报进 `unrebuilt`、不交给 Runtime。(7) schema 补了四处（都可选）：`tool_results[].arguments_digest`、
+`gate[].outcome`、interrupt / shutdown 的 `waiting`、v2 的 `expect.events` 可按 Agent 选择器分开写（几个 Agent 的事件交错取决于
+调度）。v1 的 `context_overflow` 原来指向一个不存在的路径，改成内核真正抛出的 `syndica.kernel.llm.base.ContextOverflowError`。
+(8) 变异 `position-ignores-cycle`（工具结局的位置不看周期）是等价变异：一个 Agent 的 turn 跨周期全局递增，（turn，批内位置）
+已经唯一。
+
+两路对抗评审（保真度；鲁棒性与内核接缝）报了 5 High（`QueryAgent` 没走桩、只有模型调用会等宿主的动作、分叉发生在进入阶段时
+永远挂住、真跑工具的回放没有安静判定而挂住、手写文档能让回放按它自己的规则真跑命令）、8 Medium、4 Low 与 55 条存活变异，全部
+按上面的设计修掉；修后一轮 71 条变异（含内核的 `request_ref`、`real=` 与 schema 的新键）没有存活。
 
 #### T14 — 捕获即回放
 

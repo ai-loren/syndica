@@ -1,5 +1,6 @@
 """Scenario replay surface."""
 
+from syndica.runner.replay import Divergence, ReplayResult, ReplayRunner
 from syndica.runner.scenario import (
     Scenario,
     ScenarioAgent,
@@ -14,6 +15,9 @@ from syndica.runner.scenario import (
 )
 
 __all__ = [
+    'Divergence',
+    'ReplayResult',
+    'ReplayRunner',
     'Scenario',
     'ScenarioAgent',
     'ScenarioEvent',

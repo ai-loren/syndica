@@ -38,6 +38,7 @@ from syndica.kernel.protocols.trace import TraceStore
 from syndica.kernel.redaction import (
     RULES_VERSION,
     RedactedText,
+    Redactor,
     RuleRedactor,
     encode_digests,
     encode_redacted,
@@ -61,7 +62,7 @@ from syndica.kernel.trace import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['TraceRecorder']
+__all__ = ['RequestFingerprints', 'TraceRecorder', 'arguments_digest']
 
 _LEVELS = (TraceLevel.STRUCTURE, TraceLevel.REPLAY, TraceLevel.FULL)
 _TRACE_ID = re.compile(r'[0-9a-f]{32}')
@@ -230,6 +231,64 @@ def _answer_value(message: Message) -> dict[str, object]:
     }
 
 
+def _request_parts(request: Mapping[str, Any]) -> tuple[Sequence[object], dict[str, object]]:
+    """一次模型请求拆成历史与模型参数：`create(messages, **kwargs)` 的那两部分。"""
+    raw = cast(object, request.get('messages', ()))
+    messages = cast(Sequence[object], raw) if isinstance(raw, list | tuple) else (raw,)
+    params = {
+        _text_of(key): _jsonable(value) for key, value in request.items() if key != 'messages'
+    }
+    return messages, params
+
+
+def arguments_digest(arguments: Mapping[str, object], redactor: Redactor) -> str:
+    """一次工具调用真正执行的参数的指纹：逐叶脱敏、规范编码，再取 sha256（回放文档的
+    `tool_results[].arguments_digest`）。脱敏在取摘要之前：低熵的密钥经 sha256 照样猜得出。"""
+    text = encode_redacted(_jsonable(dict(arguments)), redactor)
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+class RequestFingerprints:
+    """一次模型请求的逐单元指纹（D11）：模型参数、system、工具定义、每条历史。每个单元先逐叶脱敏、
+    再规范编码、再取 sha256；按单元原文的 sha256 缓存（原文按 ASCII 编码：落单的代理字符照样有键），
+    每轮把整段上下文重新脱敏是轮数的平方。记录与回放用同一份：回放拿记录下的规则集对自己发出的请求
+    算一遍，第一个对不上的单元就是分叉的地方。"""
+
+    def __init__(self, redactor: Redactor) -> None:
+        self._redactor = redactor
+        self._units: dict[str, str] = {}
+
+    def of(self, request: Mapping[str, Any]) -> list[str]:
+        """`request` 是交给 `create` 的那一份：`messages` 加上其余关键字参数。"""
+        return self.of_parts(*_request_parts(request))
+
+    def of_parts(self, messages: Sequence[object], params: Mapping[str, object]) -> list[str]:
+        system: object = None
+        history: Sequence[object] = messages
+        first = messages[0] if messages else None
+        if isinstance(first, ContextBlock) and first.role == 'system':
+            system = _block_value(first)
+            history = messages[1:]
+        model_params = {key: value for key, value in params.items() if key != 'tools'}
+        units: list[object] = [
+            model_params,
+            system,
+            params.get('tools', []),
+            *(_unit_value(block) for block in history),
+        ]
+        digests: list[str] = []
+        for unit in units:
+            raw = json.dumps(unit, sort_keys=True)
+            key = hashlib.sha256(raw.encode('ascii')).hexdigest()
+            digest = self._units.get(key)
+            if digest is None:
+                redacted = encode_redacted(unit, self._redactor)
+                digest = hashlib.sha256(redacted.encode('utf-8')).hexdigest()
+                self._units[key] = digest
+            digests.append(digest)
+        return digests
+
+
 @dataclass(frozen=True)
 class _Payload:
     digest: str
@@ -331,7 +390,7 @@ class TraceRecorder:
         self._queue: asyncio.Queue[object] | None = None
         self._writer: asyncio.Task[None] | None = None
         # 单元原文的 sha256 → 脱敏后的指纹：每轮把整段上下文重新脱敏是轮数的平方（D11）。
-        self._units: dict[str, str] = {}
+        self._fingerprints = RequestFingerprints(redactor)
         self._began_ns = 0
         self._began_mono = 0
         self._last_ns = 0
@@ -530,14 +589,8 @@ class TraceRecorder:
         if span is None or self._level is TraceLevel.STRUCTURE:
             return
         try:
-            raw = cast(object, request.get('messages', ()))
-            messages = cast(Sequence[object], raw) if isinstance(raw, list | tuple) else (raw,)
-            params = {
-                _text_of(key): _jsonable(value)
-                for key, value in request.items()
-                if key != 'messages'
-            }
-            units = self._unit_digests(messages, params)
+            messages, params = _request_parts(request)
+            units = self._fingerprints.of_parts(messages, params)
             span.attributes['llm.request_digest'] = hashlib.sha256(
                 ''.join(units).encode()
             ).hexdigest()
@@ -612,34 +665,6 @@ class TraceRecorder:
         digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
         self._put(_Payload(digest, text))
         return digest
-
-    def _unit_digests(self, messages: Sequence[object], params: Mapping[str, object]) -> list[str]:
-        """逐单元的指纹（D11）：模型参数、system、工具定义、每条历史。每个单元先逐叶脱敏再规范
-        编码再取 sha256；按单元原文的 sha256 缓存（原文按 ASCII 编码：落单的代理字符照样有键）。"""
-        system: object = None
-        history: Sequence[object] = messages
-        first = messages[0] if messages else None
-        if isinstance(first, ContextBlock) and first.role == 'system':
-            system = _block_value(first)
-            history = messages[1:]
-        model_params = {key: value for key, value in params.items() if key != 'tools'}
-        units: list[object] = [
-            model_params,
-            system,
-            params.get('tools', []),
-            *(_unit_value(block) for block in history),
-        ]
-        digests: list[str] = []
-        for unit in units:
-            raw = json.dumps(unit, sort_keys=True)
-            key = hashlib.sha256(raw.encode('ascii')).hexdigest()
-            digest = self._units.get(key)
-            if digest is None:
-                redacted = encode_redacted(unit, self._redactor)
-                digest = hashlib.sha256(redacted.encode('utf-8')).hexdigest()
-                self._units[key] = digest
-            digests.append(digest)
-        return digests
 
     def _put(self, item: _Payload | Span | CausalityEdge) -> None:
         if self._queue is None:

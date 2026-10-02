@@ -1190,3 +1190,48 @@ def test_the_default_rules_still_come_first_when_the_families_are_appended():
 
     assert _rule_id(judge, 'rm -rf .') == 'shell.recursive_force_remove'
     assert _rule_id(judge, 'rm -r .') == 'shell.workspace_root_removal'
+
+
+_ELSEWHERE = '/syndica-nonexistent-root'
+_RECORDED = '/private/syndica-nonexistent-root'
+
+
+def test_a_recorded_resolution_is_used_instead_of_resolving_the_root_on_this_machine():
+    recorded = path_outside_workspace_rule(_ELSEWHERE, real=_RECORDED)
+    resolved_here = path_outside_workspace_rule(_ELSEWHERE)
+
+    assert recorded.matches(f'cat {_RECORDED}/notes.txt') is False
+    assert recorded.matches(f'cat {_ELSEWHERE}/notes.txt') is False
+    assert resolved_here.matches(f'cat {_RECORDED}/notes.txt') is True
+
+
+def test_root_removal_recognises_the_recorded_resolution_of_the_root():
+    recorded = workspace_root_removal_rule(_ELSEWHERE, real=_RECORDED)
+
+    assert recorded.matches(f'rm -rf {_RECORDED}') is True
+    assert workspace_root_removal_rule(_ELSEWHERE).matches(f'rm -rf {_RECORDED}') is False
+
+
+@pytest.mark.parametrize('factory', [path_outside_workspace_rule, workspace_root_removal_rule])
+def test_a_recorded_resolution_must_be_an_absolute_path(factory: Any):
+    with pytest.raises(ConfigError) as caught:
+        factory(_ELSEWHERE, real='relative/root')
+
+    assert '的 real 是工作区根的绝对路径' in caught.value.expected
+    assert 'relative/root' in caught.value.received
+
+
+@pytest.mark.parametrize('factory', [path_outside_workspace_rule, workspace_root_removal_rule])
+def test_an_empty_recorded_root_is_refused_rather_than_resolved_here(factory: Any):
+    with pytest.raises(ConfigError) as caught:
+        factory(_ELSEWHERE, real='')
+
+    assert 'real' in caught.value.expected
+    assert 'trace' in caught.value.next_action
+    assert 'resolve()' not in caught.value.next_action
+
+
+@pytest.mark.parametrize('factory', [path_outside_workspace_rule, workspace_root_removal_rule])
+def test_the_recorded_root_is_keyword_only(factory: Any):
+    with pytest.raises(TypeError):
+        factory(_ELSEWHERE, _RECORDED)

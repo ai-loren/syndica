@@ -198,7 +198,7 @@ def _scripted(reply: ScenarioReply) -> ScriptedTurn:
 
 def _v1_exception(error: ScenarioError) -> BaseException:
     message = cast(str, error.message)
-    if error.type == 'syndica.kernel.errors.ContextOverflowError':
+    if error.type == 'syndica.kernel.llm.base.ContextOverflowError':
         return ContextOverflowError(
             expected='场景脚本指定一次 context overflow',
             received=message,

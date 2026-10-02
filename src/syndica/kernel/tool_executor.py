@@ -138,7 +138,7 @@ from syndica.kernel.danger import (
 )
 from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction, ReadOnlyKwarg
-from syndica.kernel.ids import ToolCallKey, entering_tool_call, leaving_tool_call
+from syndica.kernel.ids import ToolCallKey, entering_tool_call, leaving_tool_call, peek_key
 from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
 from syndica.kernel.trace import AttributeValue, SpanKind
 from syndica.kernel.tracing import (
@@ -1263,4 +1263,5 @@ class ToolExecutor:
             tool_name=call.name,
             arguments=arguments,
             verdict=verdict,
+            request_ref=peek_key('request'),
         )
