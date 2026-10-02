@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, cast
 
-from syndica.kernel.context import ContextBlock
+from syndica.kernel.context import ContextBlock, ToolCall
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.message import Message
 from syndica.kernel.protocols.trace import TraceStore
@@ -156,13 +156,15 @@ def _text_of(value: object) -> str:
         return name
 
 
-def _arguments(text: str) -> object:
-    """工具调用的参数按解析后的值记（规范编码改了键序，指纹与比对都按值）；解析不了的原串作为一个
-    字符串叶子。"""
+def _call_value(call: ToolCall) -> dict[str, object]:
+    """一次工具调用。参数按解析后的值记在 `arguments`（规范编码改了键序，指纹与比对都按值）；解析
+    不了的原串记在 `arguments_raw`：都记成一个字符串叶子的话，原串 `ls` 与解析出来恰好是字符串的
+    `"ls"` 就分不开，回放交回的字节也就不同。"""
     try:
-        return _jsonable(json.loads(text))
+        parsed = json.loads(call.arguments)
     except ValueError:
-        return text
+        return {'id': call.id, 'name': call.name, 'arguments_raw': call.arguments}
+    return {'id': call.id, 'name': call.name, 'arguments': _jsonable(parsed)}
 
 
 def _block_value(block: ContextBlock) -> dict[str, object]:
@@ -170,10 +172,7 @@ def _block_value(block: ContextBlock) -> dict[str, object]:
     return {
         'role': block.role,
         'content': _jsonable(block.content),
-        'tool_calls': [
-            {'id': call.id, 'name': call.name, 'arguments': _arguments(call.arguments)}
-            for call in block.tool_calls
-        ],
+        'tool_calls': [_call_value(call) for call in block.tool_calls],
         'tool_call_id': block.tool_call_id,
     }
 

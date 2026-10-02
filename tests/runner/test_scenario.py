@@ -58,7 +58,7 @@ def test_scenario_loader_preserves_tool_call_and_mapping_order() -> None:
     [
         ('', 'Mapping'),
         ('version: true\nname: bad\n', 'version'),
-        ('version: 2\nname: bad\n', 'version'),
+        ('version: 3\nname: bad\n', 'version'),
         ('version: 1\nname: bad\nextra: value\n', 'extra'),
         ('version: 1\nname: bad\nagents: []\n', 'agents'),
         (

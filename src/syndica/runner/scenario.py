@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -14,13 +13,11 @@ from typing import Any, cast
 from syndica.kernel import (
     AgentCatalog,
     AgentFactory,
-    AgentSlot,
     AgentStatus,
     BaseAgent,
     ConfigError,
     ContextOverflowError,
     EventBus,
-    ExitMode,
     HooksCenter,
     HostFacts,
     HumanInteractionModule,
@@ -44,7 +41,15 @@ from syndica.kernel import (
 from syndica.kernel.danger import DangerRequest, Disposition
 from syndica.kernel.errors import ContractViolation
 from syndica.kernel.manifest import AgentManifest
-from syndica.runner.yaml import load_yaml_mapping
+from syndica.kernel.scenario_schema import (
+    ScenarioDocument,
+    ScenarioError,
+    ScenarioExpectation,
+    ScenarioReply,
+    ScenarioRole,
+    parse_scenario_document,
+)
+from syndica.runner.yaml import load_document_mapping
 
 __all__ = [
     'Scenario',
@@ -55,45 +60,9 @@ __all__ = [
     'ScenarioResponse',
     'ScenarioResult',
     'ScenarioRunner',
+    'load_document',
     'load_scenario',
 ]
-
-_ROOT_KEYS = frozenset({'version', 'name', 'agents', 'topology', 'entry', 'responses', 'expect'})
-_AGENT_KEYS = frozenset({'manifest', 'instances'})
-_INSTANCE_KEYS = frozenset({'turns'})
-_TURN_KEYS = frozenset({'content', 'tool_calls', 'raises'})
-_CALL_KEYS = frozenset({'id', 'name', 'arguments'})
-_ERROR_KEYS = frozenset({'kind', 'message'})
-_ERROR_KINDS = frozenset({'runtime_error', 'context_overflow', 'llm_response_error'})
-_TOPOLOGY_KEYS = frozenset({'slots'})
-_SLOT_KEYS = frozenset(
-    {
-        'name',
-        'agent',
-        'is_root',
-        'cardinality',
-        'key_field',
-        'boot',
-        'exit_mode',
-        'extra_tools',
-        'budget',
-        'metadata',
-    }
-)
-_ENTRY_KEYS = frozenset({'slot', 'prompt'})
-_RESPONSE_KEYS = frozenset({'kind', 'agent', 'answer', 'tool_call_id'})
-_RESPONSE_KINDS = frozenset({'user_input', 'user_question', 'confirmation'})
-_EXPECT_KEYS = frozenset(
-    {
-        'final_output',
-        'tool_order',
-        'stop_reasons',
-        'errors',
-        'statuses',
-        'events',
-        'workspace',
-    }
-)
 
 
 class ScenarioMismatch(ContractViolation):
@@ -112,18 +81,6 @@ class ScenarioResponse:
     agent: str
     answer: str
     tool_call_id: str | None = None
-
-
-@dataclass(frozen=True)
-class ScenarioExpectation:
-    final_output: Mapping[str, str]
-    tool_order: Mapping[str, tuple[str, ...]]
-    stop_reasons: Mapping[str, str]
-    errors: Mapping[str, str]
-    statuses: Mapping[str, str]
-    events: tuple[str, ...]
-    workspace: Mapping[str, str]
-    specified: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -164,424 +121,96 @@ def _error(expected: str, received: str, next_action: str) -> ConfigError:
     return ConfigError(expected=expected, received=received, next_action=next_action)
 
 
-def _mapping(
-    value: object,
-    field: str,
-    *,
-    allowed: frozenset[str] | None = None,
-    required: frozenset[str] = frozenset(),
-) -> Mapping[str, object]:
-    if not isinstance(value, Mapping):
-        raise _error(
-            f'{field} 是 Mapping',
-            f'收到 {type(value).__name__} 类型的 {value!r}',
-            f'把 {field} 写成 YAML 对象',
-        )
-    raw = cast(Mapping[object, object], value)
-    bad_keys = [key for key in raw if not isinstance(key, str)]
-    if bad_keys:
-        raise _error(
-            f'{field} 的键都是字符串',
-            f'非字符串键为 {bad_keys!r}',
-            '把这些键改成场景格式声明的字段名',
-        )
-    typed = cast(Mapping[str, object], raw)
-    if allowed is not None:
-        unknown = sorted(key for key in typed if key not in allowed)
-        if unknown:
-            raise _error(
-                f'{field} 只含 {sorted(allowed)!r}',
-                f'未知键 {unknown!r}',
-                '删除未知键；场景字段写错时不能静默忽略',
-            )
-    missing = sorted(required - set(typed))
-    if missing:
-        raise _error(
-            f'{field} 含必填键 {sorted(required)!r}',
-            f'缺少 {missing!r}',
-            '补齐缺失字段后重试',
-        )
-    return typed
-
-
-def _sequence(value: object, field: str) -> Sequence[object]:
-    if isinstance(value, str | bytes | bytearray) or not isinstance(value, Sequence):
-        raise _error(
-            f'{field} 是 YAML 列表',
-            f'收到 {type(value).__name__} 类型的 {value!r}',
-            f'把 {field} 写成 `- ...` 列表',
-        )
-    return cast(Sequence[object], value)
-
-
-def _nonblank(value: object, field: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise _error(
-            f'{field} 是非空白字符串',
-            f'收到 {value!r}，类型是 {type(value).__name__}',
-            f'给 {field} 填写可逐字匹配的字符串',
-        )
-    return value
+def load_document(path: object) -> ScenarioDocument:
+    """读一份场景文档并交给内核的校验（`syndica.kernel.scenario_schema`）：`.yaml` / `.yml` 是手写的
+    （PyYAML 的 safe 读法，重复键报错），`.json` 是捕获的（标准库 `json`，重复键与 NaN 报错）。两种
+    读法交出同样的 Mapping，读出同样的文档。"""
+    raw, file = load_document_mapping(path)
+    return parse_scenario_document(raw, source=str(file))
 
 
 def load_scenario(path: object) -> Scenario:
-    """Parse one v1 YAML scenario without importing any backend."""
-    root, file = load_yaml_mapping(path)
-    root = _mapping(
-        root,
-        'scenario',
-        allowed=_ROOT_KEYS,
-        required=_ROOT_KEYS,
-    )
-    version = root['version']
-    if type(version) is not int or version != 1:
+    """Parse one v1 scenario without importing any backend."""
+    document = load_document(path)
+    if document.version != 1:
         raise _error(
-            'scenario.version 是整数 1',
-            f'收到 version={version!r}，类型是 {type(version).__name__}',
-            '写成 `version: 1`；不要写 true、字符串或其他版本',
+            'load_scenario 读的是 v1 手写脚本（version: 1）',
+            f'{document.source!r} 是 version: {document.version} 的回放文档',
+            '用 syndica.runner.load_document 读它',
         )
-    name = _nonblank(root['name'], 'scenario.name')
+    file = Path(document.source)
     catalog = AgentCatalog()
     register_builtins(catalog)
-    agents = _agents(root['agents'], catalog, file)
-    topology = _topology(root['topology'])
+    agents = {role.name: _agent(role, catalog, file) for role in document.roles.values()}
+    topology = cast(Topology, document.topology)
     topology.validate(catalog)
-    missing_scripts = sorted({slot.agent for slot in topology.slots} - set(agents))
-    if missing_scripts:
-        raise _error(
-            'topology 引用的每个角色都在 scenario.agents 中提供 instances 脚本',
-            f'缺少脚本的角色为 {missing_scripts!r}',
-            '给每个角色添加 manifest 与至少一个 instances[].turns',
-        )
-    entry = _mapping(
-        root['entry'],
-        'entry',
-        allowed=_ENTRY_KEYS,
-        required=_ENTRY_KEYS,
-    )
-    entry_slot = _nonblank(entry['slot'], 'entry.slot')
-    if entry_slot not in {slot.name for slot in topology.slots}:
-        raise _error(
-            'entry.slot 是 topology.slots 中的槽名',
-            f'收到 {entry_slot!r}；现有槽为 {[slot.name for slot in topology.slots]!r}',
-            '把 entry.slot 改成现有槽名',
-        )
-    prompt = _nonblank(entry['prompt'], 'entry.prompt')
-    responses = _responses(root['responses'])
     return Scenario(
         version=1,
-        name=name,
+        name=document.name,
         catalog=catalog,
         agents=MappingProxyType(agents),
         topology=topology,
-        entry_slot=entry_slot,
-        prompt=prompt,
-        responses=responses,
-        expect=_expectation(root['expect']),
-        source=str(file),
+        entry_slot=cast(str, document.entry.slot),
+        prompt=cast(str, document.entry.prompt),
+        responses=tuple(
+            ScenarioResponse(
+                kind=response.kind,
+                agent=cast(str, response.agent),
+                answer=cast(str, response.answer),
+                tool_call_id=response.tool_call_id,
+            )
+            for response in document.responses
+        ),
+        expect=document.expect,
+        source=document.source,
     )
 
 
-def _agents(
-    value: object,
-    catalog: AgentCatalog,
-    file: Path,
-) -> dict[str, ScenarioAgent]:
-    mapping = _mapping(value, 'agents')
-    if not mapping:
+def _agent(role: ScenarioRole, catalog: AgentCatalog, file: Path) -> ScenarioAgent:
+    manifest = catalog.load_mapping(
+        role.manifest,
+        source=ManifestSource(
+            kind='yaml_file',
+            location=f'{str(file)}#agents.{role.name}.manifest',
+            origin=str(file.parent.resolve()),
+        ),
+    )
+    if manifest.name != role.name:
         raise _error(
-            'agents 至少声明一个角色',
-            '收到空 Mapping',
-            '添加根角色及其 manifest / instances',
+            f'agents 键与 manifest.name 都是 {role.name!r}',
+            f'manifest.name={manifest.name!r}',
+            '让两处名字逐字相同；稳定 Agent selector 使用外层角色名',
         )
-    agents: dict[str, ScenarioAgent] = {}
-    all_call_ids: set[str] = set()
-    for role, raw_agent in mapping.items():
-        role = _nonblank(role, 'agents 的角色名')
-        data = _mapping(
-            raw_agent,
-            f'agents.{role}',
-            allowed=_AGENT_KEYS,
-            required=_AGENT_KEYS,
-        )
-        manifest_data = _mapping(data['manifest'], f'agents.{role}.manifest')
-        if manifest_data.get('impl') is not None:
-            raise _error(
-                'L2 场景 Agent 使用声明式 manifest，不加载任意 Python 类',
-                f'agents.{role}.manifest.impl={manifest_data.get("impl")!r}',
-                '删除 impl；需要的行为用真实工具与 ScriptedLLM turns 表达',
-            )
-        manifest = catalog.load_mapping(
-            manifest_data,
-            source=ManifestSource(
-                kind='yaml_file',
-                location=f'{str(file)}#agents.{role}.manifest',
-                origin=str(file.parent.resolve()),
-            ),
-        )
-        if manifest.name != role:
-            raise _error(
-                f'agents 键与 manifest.name 都是 {role!r}',
-                f'manifest.name={manifest.name!r}',
-                '让两处名字逐字相同；稳定 Agent selector 使用外层角色名',
-            )
-        raw_instances = _sequence(data['instances'], f'agents.{role}.instances')
-        if not raw_instances:
-            raise _error(
-                f'agents.{role}.instances 至少有一份脚本',
-                '收到空列表',
-                '添加 `{turns: [...]}`；每个运行时实例消费一份独立脚本',
-            )
-        instances = tuple(
-            _instance(role, index, item, all_call_ids) for index, item in enumerate(raw_instances)
-        )
-        agents[role] = ScenarioAgent(manifest=manifest, instances=instances)
-    return agents
-
-
-def _instance(
-    role: str,
-    index: int,
-    value: object,
-    all_call_ids: set[str],
-) -> tuple[ScriptedTurn, ...]:
-    field = f'agents.{role}.instances[{index}]'
-    data = _mapping(
-        value,
-        field,
-        allowed=_INSTANCE_KEYS,
-        required=_INSTANCE_KEYS,
+    instances = tuple(
+        tuple(_scripted(reply) for reply in instance.replies) for instance in role.instances
     )
-    return tuple(
-        _turn(role, index, turn_index, item, all_call_ids)
-        for turn_index, item in enumerate(_sequence(data['turns'], f'{field}.turns'))
-    )
+    return ScenarioAgent(manifest=manifest, instances=instances)
 
 
-def _turn(
-    role: str,
-    instance: int,
-    index: int,
-    value: object,
-    all_call_ids: set[str],
-) -> ScriptedTurn:
-    field = f'agents.{role}.instances[{instance}].turns[{index}]'
-    data = _mapping(value, field, allowed=_TURN_KEYS)
+def _scripted(reply: ScenarioReply) -> ScriptedTurn:
+    """v1 的一次回复：正文是内联的字符串（v1 没有 payload 引用），失败按三种 kind 之一重建。"""
     calls = [
-        _tool_call(field, call_index, item, all_call_ids)
-        for call_index, item in enumerate(
-            _sequence(data.get('tool_calls', ()), f'{field}.tool_calls')
-        )
+        ToolCall(id=call.id, name=call.name, arguments=call.arguments) for call in reply.tool_calls
     ]
-    content = data.get('content')
-    if content is not None and not isinstance(content, str):
-        raise _error(
-            f'{field}.content 是字符串或 null',
-            f'收到 {content!r}，类型是 {type(content).__name__}',
-            '改成模型会返回的文本，或省略',
-        )
-    raised = _raised(data['raises'], field) if 'raises' in data else None
-    return ScriptedTurn(content=content, tool_calls=calls, raises=raised)
+    raised = None if reply.raises is None else _v1_exception(reply.raises)
+    return ScriptedTurn(content=cast(str | None, reply.content), tool_calls=calls, raises=raised)
 
 
-def _tool_call(
-    turn_field: str,
-    index: int,
-    value: object,
-    all_call_ids: set[str],
-) -> ToolCall:
-    field = f'{turn_field}.tool_calls[{index}]'
-    data = _mapping(
-        value,
-        field,
-        allowed=_CALL_KEYS,
-        required=_CALL_KEYS,
-    )
-    call_id = _nonblank(data['id'], f'{field}.id')
-    if call_id in all_call_ids:
-        raise _error(
-            '一个场景内每个 tool call id 只出现一次',
-            f'{field}.id={call_id!r} 重复',
-            '给每次调用一个稳定且唯一的 id；重复会让结果配对与确认答复指向错误调用',
-        )
-    all_call_ids.add(call_id)
-    name = _nonblank(data['name'], f'{field}.name')
-    arguments = _mapping(data['arguments'], f'{field}.arguments')
-    try:
-        encoded = json.dumps(arguments, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
-    except (TypeError, ValueError) as exc:
-        raise _error(
-            f'{field}.arguments 只含 JSON 值',
-            f'编码失败：{type(exc).__name__}: {exc}',
-            '把值改成字符串、数字、布尔值、null、列表或 Mapping',
-        ) from exc
-    return ToolCall(id=call_id, name=name, arguments=encoded)
-
-
-def _raised(value: object, field: str) -> BaseException:
-    data = _mapping(
-        value,
-        f'{field}.raises',
-        allowed=_ERROR_KEYS,
-        required=_ERROR_KEYS,
-    )
-    kind = _nonblank(data['kind'], f'{field}.raises.kind')
-    message = _nonblank(data['message'], f'{field}.raises.message')
-    if kind == 'runtime_error':
-        return RuntimeError(message)
-    if kind == 'context_overflow':
+def _v1_exception(error: ScenarioError) -> BaseException:
+    message = cast(str, error.message)
+    if error.type == 'syndica.kernel.errors.ContextOverflowError':
         return ContextOverflowError(
             expected='场景脚本指定一次 context overflow',
             received=message,
             next_action='由被测 overflow hook 处理，或把 expect.stop_reasons 设为 error',
         )
-    if kind == 'llm_response_error':
+    if error.type == 'syndica.kernel.errors.LLMResponseError':
         return LLMResponseError(
             expected='场景脚本指定一次 LLM response error',
             received=message,
             next_action='由被测 llm_failure hook 处理，或把 expect.stop_reasons 设为 error',
         )
-    raise _error(
-        f'{field}.raises.kind 是 {sorted(_ERROR_KINDS)!r} 之一',
-        f'收到 {kind!r}',
-        '改成 runtime_error / context_overflow / llm_response_error；不接受 import path',
-    )
-
-
-def _topology(value: object) -> Topology:
-    data = _mapping(
-        value,
-        'topology',
-        allowed=_TOPOLOGY_KEYS,
-        required=_TOPOLOGY_KEYS,
-    )
-    slots: list[AgentSlot] = []
-    for index, raw_slot in enumerate(_sequence(data['slots'], 'topology.slots')):
-        field = f'topology.slots[{index}]'
-        slot = dict(_mapping(raw_slot, field, allowed=_SLOT_KEYS))
-        raw_exit = slot.get('exit_mode')
-        if raw_exit is not None:
-            try:
-                slot['exit_mode'] = ExitMode(raw_exit)
-            except (TypeError, ValueError) as exc:
-                raise _error(
-                    f'{field}.exit_mode 是 idle / zombie / exit 之一',
-                    f'收到 {raw_exit!r}',
-                    '改成小写字符串 idle、zombie 或 exit',
-                ) from exc
-        try:
-            parsed = AgentSlot(**cast(Any, slot))
-        except TypeError as exc:
-            raise _error(
-                f'{field} 至少含 name 与 agent',
-                f'构造失败：{exc}',
-                '补齐必填字段并删除未知字段',
-            ) from exc
-        if (
-            parsed.cardinality != 'singleton'
-            or parsed.exit_mode is not ExitMode.ZOMBIE
-            or parsed.extra_tools
-            or parsed.budget is not None
-        ):
-            raise _error(
-                'L2 v1 的 slot 使用 singleton + zombie，且不带 extra_tools / budget',
-                (
-                    f'{field} 为 cardinality={parsed.cardinality!r}、'
-                    f'exit_mode={parsed.exit_mode.value!r}、'
-                    f'extra_tools={parsed.extra_tools!r}、budget={parsed.budget!r}'
-                ),
-                (
-                    '把场景槽收窄到最小回放形态；完整 topology 装配已有独立集成测试，'
-                    'L2 v1 不静默忽略实例键或槽级增强'
-                ),
-            )
-        slots.append(parsed)
-    return Topology(slots=tuple(slots))
-
-
-def _responses(value: object) -> tuple[ScenarioResponse, ...]:
-    responses: list[ScenarioResponse] = []
-    for index, raw in enumerate(_sequence(value, 'responses')):
-        field = f'responses[{index}]'
-        data = _mapping(
-            raw,
-            field,
-            allowed=_RESPONSE_KEYS,
-            required=frozenset({'kind', 'agent', 'answer'}),
-        )
-        kind = _nonblank(data['kind'], f'{field}.kind')
-        if kind not in _RESPONSE_KINDS:
-            raise _error(
-                f'{field}.kind 是 {sorted(_RESPONSE_KINDS)!r} 之一',
-                f'收到 {kind!r}',
-                '改成 user_input / user_question / confirmation',
-            )
-        tool_call_id = data.get('tool_call_id')
-        if tool_call_id is not None:
-            tool_call_id = _nonblank(tool_call_id, f'{field}.tool_call_id')
-        if kind != 'confirmation' and tool_call_id is not None:
-            raise _error(
-                f'{field}.tool_call_id 只用于 confirmation',
-                f'kind={kind!r} 同时给了 tool_call_id={tool_call_id!r}',
-                '删除 tool_call_id；普通人类问题按请求顺序匹配',
-            )
-        if kind == 'confirmation' and tool_call_id is None:
-            raise _error(
-                f'{field}.tool_call_id 是 confirmation 的必填原始工具调用 ID',
-                f'kind={kind!r} 但没有 tool_call_id',
-                '填写触发本次确认的 scripted tool_call_id；动态 request_id 不写进 YAML',
-            )
-        responses.append(
-            ScenarioResponse(
-                kind=kind,
-                agent=_nonblank(data['agent'], f'{field}.agent'),
-                answer=_nonblank(data['answer'], f'{field}.answer'),
-                tool_call_id=tool_call_id,
-            )
-        )
-    return tuple(responses)
-
-
-def _string_map(value: object, field: str) -> Mapping[str, str]:
-    mapping = _mapping(value, field)
-    bad = [(key, item) for key, item in mapping.items() if not isinstance(item, str)]
-    if bad:
-        raise _error(
-            f'{field} 的值都是字符串',
-            f'不合格项为 {bad!r}',
-            '把期望值写成逐字比较的字符串',
-        )
-    return MappingProxyType(dict(cast(Mapping[str, str], mapping)))
-
-
-def _tool_order(value: object) -> Mapping[str, tuple[str, ...]]:
-    mapping = _mapping(value, 'expect.tool_order')
-    result: dict[str, tuple[str, ...]] = {}
-    for agent, raw_names in mapping.items():
-        names = _sequence(raw_names, f'expect.tool_order.{agent}')
-        result[agent] = tuple(
-            _nonblank(name, f'expect.tool_order.{agent}[{index}]')
-            for index, name in enumerate(names)
-        )
-    return MappingProxyType(result)
-
-
-def _expectation(value: object) -> ScenarioExpectation:
-    data = _mapping(value, 'expect', allowed=_EXPECT_KEYS)
-    events = tuple(
-        _nonblank(item, f'expect.events[{index}]')
-        for index, item in enumerate(_sequence(data.get('events', ()), 'expect.events'))
-    )
-    return ScenarioExpectation(
-        final_output=_string_map(data.get('final_output', {}), 'expect.final_output'),
-        tool_order=_tool_order(data.get('tool_order', {})),
-        stop_reasons=_string_map(data.get('stop_reasons', {}), 'expect.stop_reasons'),
-        errors=_string_map(data.get('errors', {}), 'expect.errors'),
-        statuses=_string_map(data.get('statuses', {}), 'expect.statuses'),
-        events=events,
-        workspace=_string_map(data.get('workspace', {}), 'expect.workspace'),
-        specified=frozenset(data),
-    )
+    return RuntimeError(message)
 
 
 class _ScenarioPolicy:

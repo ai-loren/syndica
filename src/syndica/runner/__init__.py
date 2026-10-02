@@ -9,6 +9,7 @@ from syndica.runner.scenario import (
     ScenarioResponse,
     ScenarioResult,
     ScenarioRunner,
+    load_document,
     load_scenario,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     'ScenarioResponse',
     'ScenarioResult',
     'ScenarioRunner',
+    'load_document',
     'load_scenario',
 ]

@@ -79,6 +79,11 @@ from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueC
 from syndica.kernel.redaction import Finding, RedactionRule, RuleRedactor
 from syndica.kernel.retry import RetryModule
 from syndica.kernel.runtime import AgentFactory, Runtime
+from syndica.kernel.scenario_schema import (
+    PayloadText,
+    ScenarioDocument,
+    parse_scenario_document,
+)
 from syndica.kernel.stores import (
     FileTraceStore,
     InMemoryAgentRegistry,
@@ -189,6 +194,7 @@ __all__ = [
     'Orchestrator',
     'OverrideRecord',
     'PayloadRef',
+    'PayloadText',
     'Plugin',
     'Portal',
     'PrefixDriftModule',
@@ -203,6 +209,7 @@ __all__ = [
     'Runtime',
     'RuntimeModule',
     'SafetyModule',
+    'ScenarioDocument',
     'ScriptedLLM',
     'ScriptedTurn',
     'Span',
@@ -234,6 +241,7 @@ __all__ = [
     'Workspace',
     'local_tools',
     'orchestration_tools',
+    'parse_scenario_document',
     'provenance_of',
     'register_builtins',
     'strictest_trust',

@@ -479,8 +479,8 @@ redaction:
   id。`danger.rule_ids` 没有规则命中时是空表。
 - payload 引用（种类 `payload`：同一个 trace 里一份 payload 的 sha256，64 个小写十六进制；`replay` 级起才有）：
   `llm.request_units`（逐单元指纹的列表）、`llm.request`（`full` 才有：`{messages, params}`）、`llm.response`
-  （`{kind: reply, role, content, tool_calls: [{id, name, arguments}], tool_call_id, extra, trust}`，参数是解析后的
-  值、解析  不了的是原串；或 `{kind: error, type, message, status_code?, retry_after?}`，`type` 是 `模块.限定名`）、`tool.result`
+  （`{kind: reply, role, content, tool_calls: [{id, name, arguments | arguments_raw}], tool_call_id, extra, trust}`，
+  `arguments` 是解析后的值，解析不了的原串记成 `arguments_raw`（原串 `ls` 与解析出来的字符串 `"ls"` 由此分得开）；或 `{kind: error, type, message, status_code?, retry_after?}`，`type` 是 `模块.限定名`）、`tool.result`
   （工具自己交回的、`POST_TOOL_USE` 改写之前的 `{kind: result, output, meta, trust, artifacts}`，或它抛出的
   `{kind: error, …}`；被 `PRE_TOOL_USE` 跳过的调用是跳过它的那个结果；内核自己写的结局——未知工具、坏参数、
   阻断、确认的结局——没有，回放时内核照样写得出来）、`wait.answer`（只在人等的 span 上：`{kind: answer, sender,
@@ -512,7 +512,8 @@ redaction:
 在 v1 之上：`version: 2`；`host`（`flags`、`danger.rules`（有序，`{id, params}`）、`danger.table`、`output_limit`、
 `host_facts`、`max_turns`、`no_write`、`modules`）；`agents.<Role>` 可以用 `frozen`（`system_prompt` 正文、`tools`、
 `max_turns`、`impl`）代替 `manifest`；`instances` 带稳定键（`key: {tool_call: …}`、`{host: n}`、`{slot, key, n}`）；
-回合的 `content` 可以是列表、带 `extra`、`tool_calls[].arguments`（规范编码，见 D11）、带类型的 `raises`、
+回合的 `content` 可以是列表、带 `extra`、`tool_calls[].arguments`（解析后的任何 JSON 值，按 D11 编码；解析不了的原串写
+`arguments_raw`）、带类型的 `raises`、
 `request_digests`；实例的 `tool_results`（按调用键：`output`、`meta`、`trust`，或 `raised: {type, message}`）、
 `skipped`（按调用键的最终结果）、`gate`（按调用键的闸门判定）；`responses` 按请求的键，`kind` 加 `timeout`；
 `host_actions`（`abort` 按请求的键，`interrupt` 与 `shutdown` 按它发生的位置）；`ids`（稳定键 → 记录的 id）；
@@ -933,7 +934,7 @@ Agent 自己的追加，模型的回复与结果块都会被拒；窗口里取�
   收尾、`begin` 失败（store 写不进去）时 stderr 一条说明且照常跑。人的答复不用宿主报：内核在等待等到它时交给 recorder。宿主档案（规则带参数、处置表、
   Flag、`--max-turns`、`--no-write`、模块、拓扑与入口）从 T12 起报。
 
-**状态：完成。** `kernel/stores/file_trace.py`：`FileTraceStore(root)` 过契约套件。每一级按名字以 `O_NOFOLLOW`（目录另加
+**状态：完成（dea6cfd）。** `kernel/stores/file_trace.py`：`FileTraceStore(root)` 过契约套件。每一级按名字以 `O_NOFOLLOW`（目录另加
 `O_DIRECTORY`）经 `dir_fd` 重开；文件另加 `O_NONBLOCK`、打开之后核对是普通文件，要写的只许有一个硬链接，读之前按大小设上限
 （头 4 MiB、别的 256 MiB，撞上已有的 payload 时按它应有的大小）；`root` 记下第一次打开时的身份，换成别的目录就拒绝；`begin`
 记下自己建的目录名，此后按名字直接打开、核对头里的 id，没记下的（别的 store 实例读）按目录名里的 id 前缀找，两个目录都自称是
@@ -956,7 +957,7 @@ trace 开不了头（`.syndica` 是普通文件、`traces` 是符号链接、记
 与上级目录的符号链接把写入带出 trace 目录；一个读不成的头让列表与查找都失败；`run --handoff` 的第二次 Ctrl-C 打断收尾、trace
 没有结局；每一次写都列一遍历史上所有的 trace，复制出的同名前缀目录能接走写入；chat 以失败的一轮结束时 trace 记成 ok；两个 run
 同时建 `.syndica` 时一个报错；未知级别是裸 `KeyError`），外加 14 条存活变异（其中 4 条已被评审导出之后补的用例杀掉）。全部修掉并
-各补用例；修复后的变异见提交说明。
+各补用例；修复与评审存活变异的同型改写 35 条，全杀（两条起初靠超时「杀掉」的另补了断言）。
 
 #### T12 — 场景格式 v2：内核的 schema 与 runner 的两种读法
 
@@ -966,6 +967,22 @@ trace 开不了头（`.syndica` 是普通文件、`traces` 是符号链接、记
   `impl` 只认内核内置类与白名单。
 - 有序字段（`danger.rules`、`frozen.tools`）对照手写的固定装置逐项比顺序；同一份 v2 文档写成 YAML 与 JSON，读出的
   结果相同。
+
+**状态：完成。** `kernel/scenario_schema.py`：`parse_scenario_document(raw, *, source)` 把一份已经读出来的映射校验成不可变的
+`ScenarioDocument`（v1 与 v2，纯映射、不依赖 PyYAML）；`ScenarioDocument`、`PayloadText` 与入口进承诺面，各部分的类型等捕获
+写出的文档定稿时再判。v2 在 v1 之上多出公开契约里的那些键，另有几条结构约束：同一份文档里实例的稳定键都给或都不给；回复的
+`(turn, attempt)` 严格递增、每一轮的 attempt 从 1 起逐个加 1、拿到回复之后不再有下一次调用、`raises` 不与回复的内容并存；
+`tool_results` / `skipped` / `gate` 的调用位置必须落在那一轮最后一次调用的回复里真有的工具调用上（于是这样的实例的回复必须
+按键给）。JSON 值有深度（64）与整份文档节点数（一百万）的上限，清单整份冻结、与调用方的输入脱钩。runner：`load_document`
+读 `.yaml` / `.yml`（safe YAML，重复键报错，不收别名，`0777`、`1:30` 读成字符串而不是八进制与六十进制）或 `.json`（重复键报
+出所在行列，NaN、无穷大与溢出的字面量报错，嵌套过深报错而不是 `RecursionError`），交给同一个校验；`load_scenario` 读 v1，由
+文档建出原来的 `Scenario`，遇到 v2 指向 `load_document`。
+
+与计划不同之处：(1) `instances[].key` 是内核稳定键的原样数组（`['host', 'spawn', 0]`），不另造带标签的写法：一种写法，捕获时
+原样写出。(2) `host_actions` 的 `interrupt` / `shutdown` 不带位置，发生在 run 安静下来的那一处（D11 的原意）。(3) 工具调用的
+参数：解析后的任何 JSON 值写 `arguments`，解析不了的原串写 `arguments_raw`；recorder 的 `llm.response` 同样拆开（原来两者都记成
+一个字符串，原串 `ls` 与 JSON 字符串 `"ls"` 分不开，回放交回的字节就不同）。(4) v1 的工具参数也按 JSON 值校验：嵌套对象里的
+数字键原来会被编码成与同名字符串键重复的两个键、后一个静默顶掉前一个，现在报错。
 
 #### T13 — 回放执行
 

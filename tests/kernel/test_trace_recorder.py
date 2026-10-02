@@ -778,6 +778,8 @@ async def test_a_reply_is_recorded_with_parsed_arguments_and_its_extra():
         tool_calls=[
             ToolCall(id='c1', name='Echo', arguments='{"b": 2, "a": [1, true, null]}'),
             ToolCall(id='c2', name='Echo', arguments='{not json'),
+            ToolCall(id='c3', name='Echo', arguments='"ls"'),
+            ToolCall(id='c4', name='Echo', arguments='ls'),
         ],
         extra={'llm_route': 'main', 'usage': {'input_tokens': 3}},
         trust=TrustLevel.UNTRUSTED,
@@ -793,7 +795,9 @@ async def test_a_reply_is_recorded_with_parsed_arguments_and_its_extra():
         'content': 'calling',
         'tool_calls': [
             {'id': 'c1', 'name': 'Echo', 'arguments': {'a': [1, True, None], 'b': 2}},
-            {'id': 'c2', 'name': 'Echo', 'arguments': '{not json'},
+            {'id': 'c2', 'name': 'Echo', 'arguments_raw': '{not json'},
+            {'id': 'c3', 'name': 'Echo', 'arguments': 'ls'},
+            {'id': 'c4', 'name': 'Echo', 'arguments_raw': 'ls'},
         ],
         'tool_call_id': None,
         'extra': {'llm_route': 'main', 'usage': {'input_tokens': 3}},
