@@ -47,6 +47,7 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 # 服务端连接留在那里。签名由 spec §4.4 固定，因此按文件豁免而不是全局关掉这条规则。
 "src/syndica/kernel/protocols/broker.py" = ["ASYNC109"]
 "src/syndica/kernel/stores/memory_broker.py" = ["ASYNC109"]
+"src/syndica/runner/replay_broker.py" = ["ASYNC109"]
 # Portal.run 的 timeout 要下推给子进程；调用方套 asyncio.timeout 杀不掉已经拉起的进程组。
 "src/syndica/kernel/workspace.py" = ["ASYNC109"]
 "src/syndica/kernel/local_workspace.py" = ["ASYNC109"]

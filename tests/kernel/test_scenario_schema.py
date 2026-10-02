@@ -920,10 +920,13 @@ def test_an_instance_key_is_unique_across_roles():
         (('host',), {}, "['host']"),
         (('agents', 'Root', 'frozen'), {}, "['frozen']"),
         (('agents', 'Root', 'instances', 0, 'key'), ['host', 'spawn', 0], "['key']"),
+        (('agents', 'Root', 'instances', 0, 'messages'), [], "['messages']"),
+        (('agents', 'Root', 'instances', 0, 'continued'), [], "['continued']"),
+        (('agents', 'Root', 'instances', 0, 'cut'), [], "['cut']"),
         (('agents', 'Root', 'instances', 0, 'turns', 0, 'turn'), 1, "['turn']"),
         (('entry', 'mode'), 'slot', "['mode']"),
     ],
-    ids=['root', 'agent', 'instance', 'turn', 'entry'],
+    ids=['root', 'agent', 'instance', 'messages', 'continued', 'cut', 'turn', 'entry'],
 )
 def test_a_v2_key_in_a_v1_document_points_at_version_two(
     path: tuple[Any, ...], value: object, newer: str
@@ -933,6 +936,163 @@ def test_a_v2_key_in_a_v1_document_points_at_version_two(
 
     assert newer in caught.value.received
     assert '把 version 改成 2' in caught.value.next_action
+
+
+_FIRST = 'ab' * 16
+_SECOND = 'cd' * 16
+_THIRD = 'ef' * 16
+
+
+def _injecting(messages: object) -> dict[str, Any]:
+    document = _with(_v2(), (*_INSTANCE, 'messages'), messages)
+    document['ids'] += [
+        {'key': ['host', 'message', 0], 'id': _FIRST},
+        {'key': ['tool_call', _LEAD, 1, 1, 0, 'message', 0], 'id': _SECOND},
+        {'key': ['tool_call', _LEAD, 1, 1, 0, 'message', 1], 'id': _THIRD},
+    ]
+    return document
+
+
+def test_messages_read_into_injections_per_turn_sorted_by_turn_in_the_order_written():
+    document = parse_scenario_document(
+        _injecting([{'turn': 4, 'ids': [_THIRD]}, {'turn': 2, 'ids': [_SECOND, _FIRST]}]),
+        source='captured.json',
+    )
+
+    [instance] = document.roles['Lead'].instances
+    assert instance.messages == {2: (_SECOND, _FIRST), 4: (_THIRD,)}
+    assert list(instance.messages or {}) == [2, 4]
+
+
+def test_an_instance_without_messages_has_no_record_and_an_empty_list_records_none():
+    absent = parse_scenario_document(_v2(), source='x.json').roles['Lead'].instances[0]
+    empty = parse_scenario_document(_injecting([]), source='x.json').roles['Lead'].instances[0]
+
+    assert absent.messages is None
+    assert empty.messages == {}
+
+
+@pytest.mark.parametrize(
+    ('messages', 'received', 'next_action'),
+    [
+        ([{'turn': 0, 'ids': [_FIRST]}], '0', '1 或更大'),
+        ([{'turn': True, 'ids': [_FIRST]}], 'True', 'yes / on / true'),
+        ([{'turn': 1, 'ids': []}], '空列表', '删掉这一项'),
+        ([{'turn': 1, 'ids': [_FIRST]}, {'turn': 1, 'ids': [_SECOND]}], '第 1 轮', '合进一项'),
+        ([{'turn': 1, 'ids': [_FIRST]}, {'turn': 2, 'ids': [_FIRST]}], _FIRST, '只在一轮'),
+        ([{'turn': 1, 'ids': ['f' * 32]}], 'f' * 32, '原样抄写 ids 与 messages'),
+        ([{'turn': 1, 'ids': [_FIRST], 'when': 3}], "['when']", 'messages[0]'),
+    ],
+    ids=['turn-zero', 'turn-bool', 'no-ids', 'turn-twice', 'id-twice', 'unknown-id', 'extra-key'],
+)
+def test_malformed_messages_are_refused_with_what_to_change(
+    messages: object, received: str, next_action: str
+):
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(_injecting(messages), source='captured.json')
+
+    assert received in caught.value.received
+    assert next_action in caught.value.next_action + caught.value.expected
+
+
+def _continuing(continued: object, messages: object = None) -> dict[str, Any]:
+    if messages is None:
+        messages = [{'turn': 2, 'ids': [_FIRST]}, {'turn': 4, 'ids': [_SECOND, _THIRD]}]
+    document = _injecting(messages)
+    document['agents']['Lead']['instances'][0]['continued'] = continued
+    return document
+
+
+def test_continued_turns_read_into_a_set_of_turns_that_opened_a_cycle_without_a_pause():
+    document = parse_scenario_document(_continuing([4, 2]), source='captured.json')
+
+    [instance] = document.roles['Lead'].instances
+    assert instance.continued == {2, 4}
+
+
+@pytest.mark.parametrize(
+    ('continued', 'messages', 'received', 'next_action'),
+    [
+        ([1], None, '1', '2 或更大'),
+        ([True], None, 'True', 'yes / on / true'),
+        ([2, 2], None, '第 2 轮出现了不止一次', '删掉重复的那一项'),
+        ([3], None, '第 3 轮在 messages 里没有', '原样抄写 messages 与 continued'),
+        ([2], [], '第 2 轮在 messages 里没有', '原样抄写 messages 与 continued'),
+    ],
+    ids=['first-cycle', 'bool', 'twice', 'no-injection', 'nothing-injected'],
+)
+def test_malformed_continued_turns_are_refused_with_what_to_change(
+    continued: object, messages: object, received: str, next_action: str
+):
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(_continuing(continued, messages), source='captured.json')
+
+    assert received in caught.value.received
+    assert next_action in caught.value.next_action + caught.value.expected
+
+
+def test_continued_turns_without_any_messages_record_are_refused():
+    document = _v2()
+    document['agents']['Lead']['instances'][0]['continued'] = [2]
+
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(document, source='captured.json')
+
+    assert '原样抄写 messages 与 continued' in caught.value.next_action
+
+
+def _cutting(cut: object, **instance: object) -> dict[str, Any]:
+    document = _v2()
+    [lead] = document['agents']['Lead']['instances']
+    turn = {
+        'turn': 1,
+        'attempt': 1,
+        'tool_calls': [
+            {'id': 'c1', 'name': 'Bash', 'arguments': {'command': 'sleep 9'}},
+            {'id': 'c2', 'name': 'Bash', 'arguments': {'command': 'sleep 9'}},
+        ],
+    }
+    document['agents']['Lead']['instances'] = [
+        {'key': lead['key'], 'turns': [turn], 'cut': cut, **instance}
+    ]
+    return document
+
+
+def test_cut_calls_read_into_positions_in_the_order_written():
+    document = parse_scenario_document(_cutting([[1, 1, 1], [1, 1, 0]]), source='captured.json')
+
+    [instance] = document.roles['Lead'].instances
+    assert instance.cut == ((1, 1, 1), (1, 1, 0))
+
+
+@pytest.mark.parametrize(
+    ('cut', 'instance', 'received', 'next_action'),
+    [
+        ([[1, 1, 0], [1, 1, 0]], {}, '[1, 1, 0] 重复', '删掉重复的那一项'),
+        ([[1, 1, 2]], {}, '[1, 1, 2]', '照捕获的文档'),
+        (
+            [[1, 1, 0]],
+            {'tool_results': [{'call': [1, 1, 0], 'output': 'done'}]},
+            'cut[0]=[1, 1, 0] 也有结局',
+            '什么也没有交回',
+        ),
+        (
+            [[1, 1, 1]],
+            {'skipped': [{'call': [1, 1, 1], 'output': 'refused'}]},
+            'cut[0]=[1, 1, 1] 也有结局',
+            '什么也没有交回',
+        ),
+    ],
+    ids=['twice', 'no-such-call', 'with-an-outcome', 'also-skipped'],
+)
+def test_malformed_cut_calls_are_refused_with_what_to_change(
+    cut: object, instance: dict[str, object], received: str, next_action: str
+):
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(_cutting(cut, **instance), source='captured.json')
+
+    assert received in caught.value.received
+    assert next_action in caught.value.next_action + caught.value.expected
 
 
 _ROOT_TURN = ('agents', 'Root', 'instances', 0, 'turns', 0)

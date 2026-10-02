@@ -1,7 +1,9 @@
 """捕获即回放（M3 T14）：recorder 在记录的同时攒下回放文档要的东西，`finish` 时写成 `replay.json`。
 
 回放文档的大部分来自插桩本身：模型的回复与逐单元指纹、外部工具的结局与执行参数的指纹、跳过、
-闸门判定、人的答复、被宿主中止的请求、run 被打断时还在等外部世界的那些调用、各 Agent 停下的原因。
+闸门判定、每一轮开始前注入的消息、哪些周期是紧接着上一个开的（Agent 没有停下来等）、哪些调用开了头
+却没有返回（被打断）、人的答复、被宿主中止的请求、run 被打断时还在等外部世界的那些调用、各 Agent
+停下的原因。
 另一部分只有宿主知道——宿主档案、冻结后的角色、入口——由宿主在 run 开始之前交给
 `TraceRecorder.describe_run`。
 
@@ -70,6 +72,9 @@ class _Instance:
     tool_results: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
     skipped: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
     gate: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
+    messages: dict[int, list[str]] = field(default_factory=dict[int, list[str]])
+    continued: set[int] = field(default_factory=set[int])
+    cut: list[list[int]] = field(default_factory=list[list[int]])
     stop_reason: str | None = None
 
 
@@ -102,6 +107,13 @@ class ReplayCapture:
         self._llm: dict[str, tuple[str, int | None, int]] = {}
         self._exchanged: set[str] = set()
         self._calls: dict[str, _Call] = {}
+        # turn span → (Agent、第几轮、它开了一个工作周期时的周期号)。
+        self._turns: dict[str, tuple[str, int, int | None]] = {}
+        self._cycles_seen: set[tuple[str, int]] = set()
+        # 插桩到达的先后：消息发出、工作周期结束各占一个序号。
+        self._order = 0
+        self._sent: dict[str, int] = {}
+        self._cycle_ended: dict[str, int] = {}
         self._confirmations: dict[str, str] = {}
         self._waits: dict[str, _Wait] = {}
         self._responses: list[dict[str, object]] = []
@@ -157,6 +169,20 @@ class ReplayCapture:
             role = attributes.get('agent.role')
             if agent_id not in self._instances:
                 self._instances[agent_id] = _Instance(role if isinstance(role, str) else '')
+        elif kind is SpanKind.TURN:
+            turn = attributes.get('turn')
+            if isinstance(turn, int) and not isinstance(turn, bool):
+                cycle = None if parent is None else parent[1].get('agent.cycle')
+                opens = (
+                    parent is not None
+                    and parent[0] is SpanKind.AGENT
+                    and isinstance(cycle, int)
+                    and not isinstance(cycle, bool)
+                    and (agent_id, cycle) not in self._cycles_seen
+                )
+                if opens:
+                    self._cycles_seen.add((agent_id, cast(int, cycle)))
+                self._turns[span_id] = (agent_id, turn, cast(int, cycle) if opens else None)
         elif kind is SpanKind.LLM_CALL:
             turn = None
             if parent is not None and parent[0] is SpanKind.TURN:
@@ -231,6 +257,33 @@ class ReplayCapture:
             self._digests.add(digest)
         call.returned = value
 
+    def sent(self, message_id: str) -> None:
+        """一条消息投递成功了（发送方 span 上的 `message.sent`）。"""
+        self._order += 1
+        self._sent[message_id] = self._order
+
+    def consumed(self, target_span_id: str, message_id: str) -> None:
+        """一条消息被消费了。消费它的是一轮（门在这一轮开始前注入它）时记下：回放的门在同一轮取走
+        同一批，消息早到晚到都一样。被一次等待取走的不记：等待的一方本来就停在那里等它。
+
+        这一轮开了一个新的工作周期（第二个起），且这条消息在上一个周期结束之前就发出了：上一个周期
+        结束时它已经在邮箱里，Agent 没有停下来等，紧接着开了这个周期——记下这一轮。否则 Agent 先停了
+        下来（进了 zombie 或停在邮箱上），是后来的消息把它叫醒的。两者别人看得见：派活的一方要等子
+        Agent 停下才拿到它的结果。"""
+        located = self._turns.get(target_span_id)
+        if located is None:
+            return
+        agent_id, turn, cycle = located
+        instance = self._instances.get(agent_id)
+        if instance is None:
+            return
+        instance.messages.setdefault(turn, []).append(message_id)
+        ended = self._cycle_ended.get(agent_id)
+        sent = self._sent.get(message_id)
+        if cycle is not None and cycle >= 2 and ended is not None and sent is not None:
+            if sent < ended:
+                instance.continued.add(turn)
+
     def answered(self, span_id: str, message: Message) -> None:
         wait = self._waits.get(span_id)
         if wait is not None:
@@ -248,18 +301,22 @@ class ReplayCapture:
         attributes: Mapping[str, AttributeValue],
     ) -> None:
         if kind is SpanKind.AGENT:
+            self._order += 1
+            self._cycle_ended[agent_id] = self._order
             reason = attributes.get('stop_reason')
             instance = self._instances.get(agent_id)
             if instance is not None:
                 # 最后一个工作周期的原因：被取消的周期没有原因，前一个周期的那个已经不是它的结局。
                 instance.stop_reason = reason if isinstance(reason, str) else None
+        elif kind is SpanKind.TURN:
+            self._turns.pop(span_id, None)
         elif kind is SpanKind.LLM_CALL:
             self._llm.pop(span_id, None)
             self._exchanged.discard(span_id)
         elif kind is SpanKind.TOOL_CALL:
             call = self._calls.pop(span_id, None)
             if call is not None:
-                self._tool_ended(call, attributes)
+                self._tool_ended(call, status, attributes)
         elif kind is SpanKind.CONFIRMATION:
             self._confirmations.pop(span_id, None)
         elif kind is SpanKind.WAIT:
@@ -267,12 +324,20 @@ class ReplayCapture:
             if wait is not None:
                 self._wait_ended(wait, attributes.get('wait.outcome'))
 
-    def _tool_ended(self, call: _Call, attributes: Mapping[str, AttributeValue]) -> None:
+    def _tool_ended(
+        self, call: _Call, status: SpanStatus, attributes: Mapping[str, AttributeValue]
+    ) -> None:
         instance = self._instances.get(call.agent_id)
         if instance is None:
             return
         position = list(call.position)
         outcome = attributes.get('tool.outcome')
+        recorded = call.tool in REPLAYED_TOOLS and call.returned is not None
+        if status is SpanStatus.CANCELLED and not isinstance(outcome, str) and not recorded:
+            # 开了头、被取消在半路上，结果没有落进轨迹。回放里真跑的内核工具（派活、发消息）在这里
+            # 不能交回，否则 Agent 就走到了原始 run 没走到的地方；记录了结局的外部工具由宿主动作的
+            # 等待名单停在原处。
+            instance.cut.append(position)
         disposition = attributes.get('danger.disposition')
         if disposition is not None:
             gate: dict[str, object] = {
@@ -377,6 +442,12 @@ class ReplayCapture:
                         'tool_results': instance.tool_results,
                         'skipped': instance.skipped,
                         'gate': instance.gate,
+                        'messages': [
+                            {'turn': turn, 'ids': ids}
+                            for turn, ids in sorted(instance.messages.items())
+                        ],
+                        **({'continued': sorted(instance.continued)} if instance.continued else {}),
+                        **({'cut': instance.cut} if instance.cut else {}),
                     }
                 )
             )

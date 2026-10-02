@@ -10,6 +10,11 @@
   时机的 `QueryAgent`）换成同名的替身，按调用位置交回记录的结局，不碰磁盘、不起进程；记录带着执行
   参数的指纹时先比参数。派活、消息、人机工具真跑。被 `PRE_TOOL_USE` 跳过的调用由一个回放装上的
   hook 原样再跳过。
+- **消息、kill 与没交回的调用：** 外部世界不花时间，Agent 之间的先后就与原始 run 不同。消息照常
+  投递，但收件人在每个决定点上看到的是原始 run 那一刻看到的（见 `replay_broker`）。会落下的
+  `KillAgent` 等 run 安静下来、目标走到原始 run 里 kill 落下的地方再发出；kill 只停目标自己的事件
+  循环，不连带它的后代，所以只看目标。原始 run 里没交回的内核工具调用，回放里也不交回，等同样的
+  打断。
 - **危险判定：** 规则、处置表与 Flag 从宿主档案重建（工作区根用记录下的解析结果，`real=`），
   判定真跑；每一次闸门判定（含这次调用的结局）与记录逐项比对。
 - **人与宿主：** 人的答复按请求的稳定键给出（手写文档也可以按先后与选择器给）；`timeout` 不答，
@@ -121,6 +126,7 @@ from syndica.kernel.scenario_schema import (
 from syndica.kernel.trace import AttributeValue
 from syndica.kernel.trace_recorder import RequestFingerprints, arguments_digest
 from syndica.kernel.tracing import NullTracer, current_llm_call, span_id_of
+from syndica.runner.replay_broker import GIVE_UP, Plan, ScheduledBroker
 from syndica.runner.scenario import ScenarioEvent, ScenarioResult
 
 __all__ = ['Divergence', 'ReplayResult', 'ReplayRunner']
@@ -160,8 +166,8 @@ _UNITS = ('模型参数', 'system', '工具定义')
 
 @dataclass(frozen=True)
 class Divergence:
-    """一处分叉：哪一类（`request` `reply` `tool` `skip` `gate` `id` `response` `unconsumed`
-    `outcome` `stall`）、在哪（Agent 选择器、轮次、调用位置或键）、怎么不一样。"""
+    """一处分叉：哪一类（`request` `reply` `tool` `skip` `gate` `id` `response` `message`
+    `unconsumed` `outcome` `stall`）、在哪（Agent 选择器、轮次、调用位置或键）、怎么不一样。"""
 
     kind: str
     where: str
@@ -238,6 +244,7 @@ class _VirtualClockLoop(asyncio.SelectorEventLoop):
 class _ReplayTracer(NullTracer):
     """闸门判定（tool_call span 结束时带着的 `danger.*` 与 `tool.outcome`）按 span id 记下，各 Agent
     停下的原因按 agent span 记下；人的等待结束时告诉回放：它不再在等，或者记录里的那次超时到了。
+    另记每个 Agent 开到了第几轮（门按它取那一轮的消息）。
     给了 `inner` 就把每一条插桩原样转给它（回放自己也记成一个 trace），回放自己的账先记。"""
 
     def __init__(
@@ -245,11 +252,27 @@ class _ReplayTracer(NullTracer):
     ) -> None:
         self.gates: dict[str, tuple[str, list[int], dict[str, AttributeValue]]] = {}
         self.stop_reasons: dict[str, str | None] = {}
+        self.turns: dict[str, int] = {}
         self._calls: dict[str, tuple[str, list[int]]] = {}
         self._agents: dict[str, str] = {}
         self._waits: dict[str, str] = {}
         self._ended = ended
         self._inner = inner
+
+    def next_turn(self, agent_id: str) -> int:
+        return self.turns.get(agent_id, 0) + 1
+
+    def running(self, agent_id: str) -> bool:
+        """它此刻在一个工作周期里（agent span 开着）。"""
+        return agent_id in self._agents.values()
+
+    def open_calls(self, agent_id: str) -> list[tuple[int, int, int]]:
+        """它此刻还没结束的工具调用的位置。"""
+        return [
+            (position[0], position[1], position[2])
+            for owner, position in self._calls.values()
+            if owner == agent_id and len(position) == 3
+        ]
 
     def start_span(
         self,
@@ -264,6 +287,10 @@ class _ReplayTracer(NullTracer):
             call = current_tool_call()
             position = [] if call is None else [call.cycle, call.turn, call.index]
             self._calls[span_id] = (agent_id, position)
+        elif kind is SpanKind.TURN:
+            turn = attributes.get('turn')
+            if isinstance(turn, int) and not isinstance(turn, bool):
+                self.turns[agent_id] = turn
         elif kind is SpanKind.AGENT:
             self._agents[span_id] = agent_id
         elif kind is SpanKind.WAIT and attributes.get('wait.kind') == 'human':
@@ -544,6 +571,9 @@ class _Replay:
         self._task: asyncio.Task[Any] | None = None
         self._draining: asyncio.Future[None] | None = None
         self._runtime: Runtime | None = None
+        self._kills: list[tuple[str, asyncio.Future[None]]] = []
+        self._held: set[StableKey] = set()
+        self._tracer: _ReplayTracer | None = None
         self._errors: dict[str, str] = {}
         self._trajectories: dict[str, tuple[ContextBlock, ...]] = {}
 
@@ -759,6 +789,145 @@ class _Replay:
                 setattr(exception, attribute, value)
         return exception
 
+    # --- messages, kills and calls the original never returned from ---------------------------
+
+    def plan(self, agent_id: str) -> Plan | None:
+        """这个收件人的记录；没有记录（手写的文档、记录里没有它、真时钟）时是 None。"""
+        bound = self._bound.get(agent_id)
+        if not self._virtual or bound is None or bound.instance.messages is None:
+            return None
+        return Plan(bound.instance.messages, bound.instance.continued)
+
+    def from_host(self, message: Message) -> bool:
+        """宿主发的消息（入口、人的答复）：发送方不是回放里的哪个 Agent。"""
+        return message.sender not in self._bound
+
+    async def asleep(self, agent_id: str) -> bool:
+        runtime = self._runtime
+        if runtime is None:
+            return False
+        info = await runtime.find(agent_id)
+        return info is not None and info.status is AgentStatus.ZOMBIE
+
+    def hold(
+        self, agent_id: str, turn: int, missing: tuple[str, ...], waiter: asyncio.Future[object]
+    ) -> Callable[[], None]:
+        """记录里这一轮开始前注入的消息还没到：登记成一次停着的等待，run 安静下来时还在等就是
+        分叉。"""
+        key: StableKey = ('messages', agent_id, turn)
+        entry = _Missing(
+            Divergence(
+                'message',
+                f'{self._selector(agent_id)} 第 {turn} 轮',
+                f'记录里这一轮开始前注入了 {list(missing)!r}，回放安静下来时它们还不在它的邮箱里',
+            ),
+            waiter,
+            GIVE_UP,
+        )
+        self._waiting[key] = entry
+
+        def release() -> None:
+            if self._waiting.get(key) is entry:
+                del self._waiting[key]
+
+        return release
+
+    async def settled(self, killer: str, target: str) -> None:
+        """`KillAgent` 真的会落下（目标是发起方派出去的、还在的 Agent）时，发出之前等到 run 安静下
+        来、目标走到了原始 run 里 kill 落下的地方（见 `_at_kill_point`）。安静下来时还没走到也发出
+        去：它没走到的那些记录随后报成没用上。"""
+        if not self._virtual or self._stopped or not await self._lands(killer, target):
+            return
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        entry = (target, future)
+        self._kills.append(entry)
+        try:
+            await future
+        finally:
+            self._kills.remove(entry)
+
+    async def _lands(self, killer: str, target: str) -> bool:
+        runtime = self._runtime
+        if runtime is None or target == killer:
+            return False
+        info = await runtime.find(target)
+        seen: set[str] = set()
+        while info is not None and info.parent_id is not None and info.agent_id not in seen:
+            if info.parent_id == killer:
+                return True
+            seen.add(info.agent_id)
+            info = await runtime.find(info.parent_id)
+        return False
+
+    def _at_kill_point(self, target: str) -> bool:
+        """原始 run 里 kill 落下的那一刻目标停在哪里，回放里它就停在了那里：周期之间；记录里没有的
+        一步上（一次没有结局的模型或工具调用、一次没有答复的请求）；或者一次原始 run 里没交回的内核
+        工具调用里。周期里等着的消息不算：原始 run 里它在这个周期收到了它们，kill 在那之后。"""
+        tracer = self._tracer
+        if tracer is None or not tracer.running(target):
+            return True
+        waits = {key[0] for key in self._waiting if key[1:2] == (target,)}
+        if 'messages' in waits:
+            return False
+        if waits:
+            return True
+        bound = self._bound.get(target)
+        if bound is None:
+            return True
+        return any(position in bound.instance.cut for position in tracer.open_calls(target))
+
+    def _release_kill(self, *, anyway: bool) -> bool:
+        for target, future in self._kills:
+            if not future.done() and (anyway or self._at_kill_point(target)):
+                future.set_result(None)
+                return True
+        return False
+
+    async def returned(self, name: str, result: ToolResult) -> ToolResult:
+        """一次真跑的内核工具交回了。原始 run 里它没有交回（被取消在半路上）：停在这里，等同样的打断
+        （kill、关机、宿主的中断）取消它——交回去，Agent 就走到了原始 run 没走到的地方。安静下来时
+        还停着才算分叉；允许分叉时交回它接着跑。"""
+        call = current_tool_call()
+        bound = None if call is None else self._bound.get(call.agent_id)
+        if call is None or bound is None:
+            return result
+        position = (call.cycle, call.turn, call.index)
+        if position not in bound.instance.cut:
+            return result
+        key = call.key
+        self._held.add(key)
+        try:
+            cut = Divergence(
+                'tool',
+                f'{self._selector(call.agent_id)} {name} {list(position)!r}',
+                '原始 run 里这次调用没有交回（被取消在半路上），回放里它交回了',
+            )
+            return await self._missing(key, cut, result)
+        finally:
+            self._held.discard(key)
+
+    def _report_message_waits(self) -> bool:
+        """还在等记录里注入过的消息：原始 run 在这一刻已经收到了它们，回放却等不来。在 kill 被强行放
+        出去、根结束后关机之前报出来——它们会把这些等待取消掉，分叉就看不见了。"""
+        fresh = [
+            missing
+            for key, missing in self._waiting.items()
+            if key[:1] == ('messages',) and not missing.reported
+        ]
+        if not fresh:
+            return False
+        for missing in fresh:
+            missing.reported = True
+            self.divergences.append(missing.divergence)
+        if self._allow:
+            for missing in fresh:
+                if missing.future is not None and not missing.future.done():
+                    missing.future.set_result(missing.fallback)
+        else:
+            self._halted = True
+            self._stop()
+        return True
+
     # --- tools ------------------------------------------------------------------------------
 
     async def outcome(self, name: str, arguments: Mapping[str, Any]) -> ToolResult:
@@ -832,6 +1001,13 @@ class _Replay:
             ],
             trust=TrustLevel(recorded.trust),
         )
+
+    def _runtime_tool(self, tool: Tool, owner: str) -> Tool:
+        if self._stubbed and tool.name in REPLAYED_TOOLS:
+            return _stub(tool, self)
+        if self._virtual and tool.name not in REPLAYED_TOOLS:
+            return _stand_in(_KernelTool, tool, self, owner)
+        return tool
 
     def _tools(self, workspace: LocalWorkspace) -> dict[str, Tool]:
         real = local_tools(workspace.portal(), output_limit=self._host.output_limit)
@@ -996,15 +1172,18 @@ class _Replay:
         agent.register_hook(Junction.PRE_TOOL_USE, self.skip_recorded)
         if self._host.no_write:
             agent.register_hook(Junction.PRE_TOOL_USE, self.refuse_writes)
-        if self._stubbed:
-            # `QueryAgent` 由 Runtime 自己装（编排五件套），不经工厂交进来的工具表：它装进来的那一
-            # 刻换成替身。
+        if self._stubbed or self._virtual:
+            # 编排五件套由 Runtime 自己装，不经工厂交进来的工具表：`QueryAgent` 装进来的那一刻换成
+            # 替身，别的换成回放版（kill 等目标走到原始 run 里它落下的地方、原始 run 里没交回的调用
+            # 不交回）。
             install = agent.install_runtime_tools
 
-            def install_stubbed(tools: Mapping[str, Tool]) -> None:
-                install({name: _stub(tool, self) for name, tool in tools.items()})
+            def install_replayed(tools: Mapping[str, Tool]) -> None:
+                install(
+                    {name: self._runtime_tool(tool, agent.agent_id) for name, tool in tools.items()}
+                )
 
-            cast(Any, agent).install_runtime_tools = install_stubbed
+            cast(Any, agent).install_runtime_tools = install_replayed
         selector = self._selector(agent.agent_id)
 
         async def capture_failure(**kwargs: object) -> None:
@@ -1205,10 +1384,16 @@ class _Replay:
         时间推到下一个定时器（`timers`），或者没有定时器时开始数空转。"""
         if self._runtime is None or self._stopped:
             return False
+        if self._release_kill(anyway=False):
+            return True
         leftovers = self._leftovers()
         left = bool(leftovers)
         if timers and left:
             return False
+        if self._report_message_waits():
+            return True
+        if self._release_kill(anyway=True):
+            return True
         if self._draining is not None:
             if self._draining.done():
                 return False
@@ -1226,7 +1411,7 @@ class _Replay:
     def _ready_for(self, action: HostAction) -> bool:
         if action.waiting is None:
             return True
-        return set(action.waiting) == set(self._waiting)
+        return set(action.waiting) == set(self._waiting) - self._held
 
     def _quiet(self, leftovers: Sequence[Divergence]) -> bool:
         """没有定时器、也没有能发出的宿主动作：run 停在这里了。交回 True 表示做了处置。"""
@@ -1241,7 +1426,7 @@ class _Replay:
                 )
             else:
                 recorded = sorted(list(key) for key in action.waiting or ())
-                current = sorted(list(key) for key in self._waiting)
+                current = sorted(list(key) for key in self._waiting if key not in self._held)
                 detail = (
                     f'原始 run 发生 {action.kind} 时在等 {recorded!r}；'
                     f'回放安静下来时在等 {current!r}'
@@ -1330,6 +1515,7 @@ class _Replay:
         workspace = LocalWorkspace(str(root), shell='/bin/sh', env={})
         llm = _ReplayLLM(self)
         tracer = _ReplayTracer(self.wait_ended, recording)
+        self._tracer = tracer
         unrebuilt: tuple[str, ...] = ()
         events: list[ScenarioEvent] = []
         try:
@@ -1338,6 +1524,13 @@ class _Replay:
             unrebuilt = unrebuilt_modules + tuple(f'flags.{key}' for key in dropped)
             factories = self._factories(self._tools(workspace), llm)
             runtime = Runtime(
+                broker=ScheduledBroker(
+                    self.plan,
+                    tracer.next_turn,
+                    self.hold,
+                    from_host=self.from_host,
+                    asleep=self.asleep,
+                ),
                 agents=factories,
                 orchestration=True,
                 modules=modules,
@@ -1661,21 +1854,56 @@ class _RecordedTool(Tool):
         return await self._replay.outcome(self.name, kwargs)
 
 
+class _KernelTool(Tool):
+    """真跑的内核工具（派活、分叉、发消息、kill）的回放版：kill 先等目标走到原始 run 里它落下的地方
+    （见 `_Replay.settled`）；原始 run 里没有交回的那次调用，回放里也不交回（见
+    `_Replay.returned`）。名字、schema 与并发性照真的那个。"""
+
+    def __init__(self, real: Tool, replay: _Replay, owner: str) -> None:
+        self._real = real
+        self._replay = replay
+        self._owner = owner
+
+    @property
+    def name(self) -> str:
+        return self._real.name
+
+    @property
+    def schema(self) -> dict[str, Any]:
+        return self._real.schema
+
+    def is_concurrency_safe(self, args: dict[str, Any]) -> bool:
+        return self._real.is_concurrency_safe(args)
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        target = kwargs.get('agent_id')
+        if self._real.name == 'KillAgent' and isinstance(target, str):
+            await self._replay.settled(self._owner, target)
+        result = await self._real.execute(**kwargs)
+        return await self._replay.returned(self.name, result)
+
+
 def _stub(tool: Tool, replay: _Replay) -> Tool:
     if tool.name not in REPLAYED_TOOLS:
         return tool
-    # 类名与要执行的参数照真的那个：危险判定的说明文字里有类名，它会进轨迹与之后的请求。
+    return _stand_in(_RecordedTool, tool, replay)
+
+
+def _stand_in(
+    base: type[_RecordedTool | _KernelTool], tool: Tool, replay: _Replay, *more: str
+) -> Tool:
+    """替身的类名与要执行的参数照真的那个：危险判定的说明文字里有类名，它会进轨迹与之后的请求。"""
     real_type = type(tool)
     stand_in = type(
         real_type.__name__,
-        (_RecordedTool,),
+        (base,),
         {
             '__module__': real_type.__module__,
             '__qualname__': real_type.__qualname__,
             '__tool_command_args__': real_type.__tool_command_args__,
         },
     )
-    return cast(Tool, stand_in(tool, replay))
+    return cast(Tool, stand_in(tool, replay, *more))
 
 
 def _rule(spec: DangerRuleSpec) -> DangerRule:

@@ -14,7 +14,8 @@ v1 是手写脚本：只存回复的一侧，工具真跑，人的答复按请�
 - `instances[].key`：创建这个实例的稳定键（内核 `ids` 的原样数组）；`turns[]` 多出 `turn` /
   `attempt`（「当前 LLM 调用」的键）、`extra`、`trust`、`request_digests`、带类型的 `raises`，
   `content` 可以是列表，`tool_calls[].arguments` 可以是解析不了的原串；`tool_results` /
-  `skipped` / `gate` 按调用位置（`[周期, 轮, 批内位置]`）；
+  `skipped` / `gate` 按调用位置（`[周期, 轮, 批内位置]`）；`messages` 是每一轮开始前注入的消息，
+  `continued` 是哪些周期紧接着上一个开（Agent 没有停下来等），`cut` 是开了头却没有返回的调用；
 - `responses` 可以按请求的稳定键给（`kind` 多一个 `timeout`）；`host_actions`（`abort` 按请求的
   键，`interrupt` / `shutdown` 在 run 安静下来的那一处）；`ids`（稳定键 → 记录的 id）；
   `entry.mode`（`slot` / `query` / `send`）与 `entry.trust`；拓扑槽不再受 v1 的限制；
@@ -98,7 +99,10 @@ _V2_REQUIRED_ROOT = frozenset({'version', 'name', 'agents', 'entry', 'expect'})
 _V1_AGENT = frozenset({'manifest', 'instances'})
 _V2_AGENT = _V1_AGENT | frozenset({'frozen'})
 _V1_INSTANCE = frozenset({'turns'})
-_V2_INSTANCE = _V1_INSTANCE | frozenset({'key', 'tool_results', 'skipped', 'gate'})
+_V2_INSTANCE = _V1_INSTANCE | frozenset(
+    {'key', 'tool_results', 'skipped', 'gate', 'messages', 'continued', 'cut'}
+)
+_INJECTED = frozenset({'turn', 'ids'})
 _V1_TURN = frozenset({'content', 'tool_calls', 'raises'})
 _V2_TURN = _V1_TURN | frozenset({'turn', 'attempt', 'extra', 'trust', 'request_digests'})
 _V1_CALL = frozenset({'id', 'name', 'arguments'})
@@ -258,13 +262,21 @@ class GateRecord:
 
 @dataclass(frozen=True)
 class ScenarioInstance:
-    """一个角色的一个运行时实例。`key` 是创建它的稳定键（v2，可选）。"""
+    """一个角色的一个运行时实例。`key` 是创建它的稳定键（v2，可选）。
+
+    `messages` 是每一轮开始前门注入的消息 id（轮 → 按注入的先后）：回放的门在那一轮取走的恰好是
+    它们。None 是没有记录（手写的文档），回放照常投递；空表是记录了、一条也没注入。`continued` 是
+    哪些轮开了一个紧接着上一个周期的新周期（上一个周期结束时消息已经在邮箱里，Agent 没有停下来
+    等）；没列出的那些周期是 Agent 停下之后被叫醒的。`cut` 是开了头却被取消在半路上的调用位置。"""
 
     replies: tuple[ScenarioReply, ...]
     key: tuple[str | int, ...] | None = None
     tool_results: tuple[ToolOutcome, ...] = ()
     skipped: tuple[SkippedCall, ...] = ()
     gate: tuple[GateRecord, ...] = ()
+    messages: Mapping[int, tuple[str, ...]] | None = None
+    continued: frozenset[int] = frozenset()
+    cut: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -670,6 +682,7 @@ def _document(raw: object, source: str) -> ScenarioDocument:
     host = _host(root['host']) if 'host' in root else None
     host_actions = _host_actions(root.get('host_actions', ()))
     ids = _ids(root.get('ids', ()))
+    _check_injected(roles, ids)
     origin = _origin(root['source']) if 'source' in root else None
     return ScenarioDocument(
         version=version,
@@ -836,9 +849,90 @@ def _instance(
         field, 'skipped', [item.call for item in skipped], [item.call for item in outcomes]
     )
     _unique_calls(field, 'gate', [item.call for item in gate], [])
-    if outcomes or skipped or gate:
-        _check_positions(field, replies, outcomes, skipped, gate)
-    return ScenarioInstance(replies, key=key, tool_results=outcomes, skipped=skipped, gate=gate)
+    cut = tuple(
+        _call_position(item, f'{field}.cut[{index}]')
+        for index, item in enumerate(_sequence(data.get('cut', ()), f'{field}.cut'))
+    )
+    _unique_calls(field, 'cut', list(cut), [])
+    finished = {item.call for item in outcomes} | {item.call for item in skipped}
+    for index, call in enumerate(cut):
+        if call in finished:
+            raise _error(
+                f'{field}.cut 里的调用没有交回：它不会同时有结局（tool_results）'
+                '或被跳过（skipped）',
+                f'{field}.cut[{index}]={list(call)!r} 也有结局',
+                '删掉不对的那一边：被取消在半路上的调用什么也没有交回',
+            )
+    if outcomes or skipped or gate or cut:
+        _check_positions(field, replies, outcomes, skipped, gate, cut)
+    messages = _injected(f'{field}.messages', data['messages']) if 'messages' in data else None
+    continued = _continued(f'{field}.continued', data.get('continued', ()), messages)
+    return ScenarioInstance(
+        replies,
+        key=key,
+        tool_results=outcomes,
+        skipped=skipped,
+        gate=gate,
+        messages=messages,
+        continued=continued,
+        cut=cut,
+    )
+
+
+def _continued(
+    field: str, value: object, messages: Mapping[int, tuple[str, ...]] | None
+) -> frozenset[int]:
+    turns: set[int] = set()
+    for index, item in enumerate(_sequence(value, field)):
+        turn = _integer(item, f'{field}[{index}]', minimum=2)
+        if turn in turns:
+            raise _error(
+                f'{field} 里每一轮只出现一次',
+                f'第 {turn} 轮出现了不止一次（{field}[{index}]）',
+                '删掉重复的那一项',
+            )
+        if messages is None or turn not in messages:
+            raise _error(
+                f'{field} 里的每一轮在 messages 里有注入（紧接着开的周期，第一轮注入了等着的消息）',
+                f'第 {turn} 轮在 messages 里没有',
+                '照捕获的文档原样抄写 messages 与 continued',
+            )
+        turns.add(turn)
+    return frozenset(turns)
+
+
+def _injected(field: str, value: object) -> Mapping[int, tuple[str, ...]]:
+    by_turn: dict[int, tuple[str, ...]] = {}
+    seen: dict[str, str] = {}
+    for index, raw in enumerate(_sequence(value, field)):
+        where = f'{field}[{index}]'
+        data = _mapping(raw, where, allowed=_INJECTED, required=_INJECTED)
+        turn = _integer(data['turn'], f'{where}.turn', minimum=1)
+        if turn in by_turn:
+            raise _error(
+                f'{field} 里每一轮只出现一次',
+                f'第 {turn} 轮出现了不止一次（{where}）',
+                '把同一轮注入的 id 合进一项，按注入的先后排',
+            )
+        ids: list[str] = []
+        for position, item in enumerate(_sequence(data['ids'], f'{where}.ids')):
+            message_id = _nonblank(item, f'{where}.ids[{position}]')
+            if message_id in seen:
+                raise _error(
+                    f'{field} 里每条消息只注入一次',
+                    f'{message_id!r} 在 {seen[message_id]} 与 {where} 都出现了',
+                    '一条消息只在一轮开始前被注入：照捕获的文档原样抄写',
+                )
+            seen[message_id] = where
+            ids.append(message_id)
+        if not ids:
+            raise _error(
+                f'{where}.ids 至少有一个 id',
+                '收到空列表',
+                '那一轮没有注入就删掉这一项',
+            )
+        by_turn[turn] = tuple(ids)
+    return MappingProxyType(dict(sorted(by_turn.items())))
 
 
 def _check_positions(
@@ -847,31 +941,33 @@ def _check_positions(
     outcomes: tuple[ToolOutcome, ...],
     skipped: tuple[SkippedCall, ...],
     gate: tuple[GateRecord, ...],
+    cut: tuple[tuple[int, int, int], ...] = (),
 ) -> None:
     """按调用位置给的每一项都落在一次真有的调用上：那一轮最后一次模型调用交回的回复里第 `index`
     个工具调用。对不上的记录回放时永远消费不掉，到那时只剩一句「没用上」，指不回这里。"""
     if any(reply.turn is None for reply in replies):
         raise _error(
-            f'{field} 有 tool_results / skipped / gate 时，turns 每一项都给 turn 与 attempt',
+            f'{field} 有 tool_results / skipped / gate / cut 时，turns 每一项都给 turn 与 attempt',
             'turns 没有按键给',
             '调用位置里的轮次要对得上回复：照捕获的文档给每一项写 turn 与 attempt',
         )
     calls: dict[int, int] = {}
     for reply in replies:
         calls[cast(int, reply.turn)] = len(reply.tool_calls)
-    sections: tuple[tuple[str, tuple[ToolOutcome | SkippedCall | GateRecord, ...]], ...] = (
-        ('tool_results', outcomes),
-        ('skipped', skipped),
-        ('gate', gate),
+    positions: tuple[tuple[str, tuple[tuple[int, int, int], ...]], ...] = (
+        ('tool_results', tuple(item.call for item in outcomes)),
+        ('skipped', tuple(item.call for item in skipped)),
+        ('gate', tuple(item.call for item in gate)),
+        ('cut', cut),
     )
-    for section, items in sections:
-        for index, item in enumerate(items):
-            _, turn, position = item.call
+    for section, calls_at in positions:
+        for index, call in enumerate(calls_at):
+            _, turn, position = call
             if position >= calls.get(turn, 0):
                 raise _error(
                     f'{field}.{section} 的调用位置落在第 {turn} 轮回复里的工具调用上',
                     (
-                        f'{field}.{section}[{index}].call={list(item.call)!r}，而第 {turn} 轮'
+                        f'{field}.{section}[{index}].call={list(call)!r}，而第 {turn} 轮'
                         + (f'只有 {calls[turn]} 个工具调用' if turn in calls else '没有回复')
                     ),
                     '批内位置从 0 数起，按那一轮最后一次调用的回复数；照捕获的文档原样抄写',
@@ -1444,6 +1540,27 @@ def _waiting(
             )
         keys.append(key)
     return tuple(keys)
+
+
+def _check_injected(
+    roles: Mapping[str, ScenarioRole], ids: tuple[tuple[tuple[str | int, ...], str], ...]
+) -> None:
+    """`messages` 里的每个 id 都是 `ids` 交出的：回放按稳定键重发同一批 id，认得出的才是同一条
+    消息；认不出的那一条回放时永远等不到。"""
+    issued = {given for _, given in ids}
+    for role in roles.values():
+        for index, instance in enumerate(role.instances):
+            for turn, injected in (instance.messages or {}).items():
+                unknown = [message_id for message_id in injected if message_id not in issued]
+                if unknown:
+                    raise _error(
+                        'messages 里的每个 id 都在 ids 里（回放按稳定键重发同一个 id）',
+                        (
+                            f'agents.{role.name}.instances[{index}].messages 第 {turn} 轮的'
+                            f' {unknown[0]!r} 不在 ids 里'
+                        ),
+                        '照捕获的文档原样抄写 ids 与 messages；手写的文档不写 messages',
+                    )
 
 
 def _ids(value: object) -> tuple[tuple[tuple[str | int, ...], str], ...]:

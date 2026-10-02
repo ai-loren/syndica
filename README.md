@@ -434,9 +434,14 @@ the replay cannot rebuild what topology slots attach to their roles.
   and host actions come from the record, while the kernel, its danger judgement and the modules the
   replay can rebuild (safety, human interaction, retry) run for real and are compared item by item.
   Host modules it cannot rebuild, such as the development guard, are named in the output; their
-  effects (the calls they skipped) are already in the record. Exit 0 means it reproduced, 1 that it
-  diverged (each divergence names the agent, turn and unit), 2 that the trace cannot be replayed.
-  The replay records itself as a new trace that points back to the original.
+  effects (the calls they skipped) are already in the record. Every agent sees its messages when the
+  record says it did (injected into the same turn; a cycle stops or carries straight on as it did),
+  a kill lands where it landed, and a call the original never got back stays pending until the
+  same interruption cuts it, so agents that ran concurrently replay the same way. Messages the host
+  sends (the entry, a person's answers) are not in the record and arrive when they are sent. Exit 0
+  means it reproduced, 1 that it diverged (each divergence names the agent, turn and unit), 2 that
+  the trace cannot be replayed. The replay records itself as a new trace that points back to the
+  original.
 - `syndica trace export <id> [--otlp <url>]` sends the trace to an OTLP/HTTP collector. Exports
   also happen at the end of every run when your environment names an endpoint
   (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`), honouring

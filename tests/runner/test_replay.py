@@ -1027,21 +1027,296 @@ def test_an_interrupt_in_the_middle_of_a_call_replays_at_that_call(
     assert result.reproduced, result.divergences
 
 
+_CHILD = 'c7' * 16
+_CHILD_KEY = ['tool_call', _LEAD, 1, 1, 0, 'spawn', 0]
+_RETRYING = {
+    'modules': ['safety', 'human-interaction', 'retry'],
+    'flags': {'llm_retry_attempts': 1, 'llm_retry_backoff_ms': 2000},
+}
+_FAILED = {'type': 'syndica.kernel.errors.LLMResponseError', 'message': 'HTTP 503'}
+
+
+def _woken_then_killed(*woken: dict[str, Any], **root: Any) -> dict[str, Any]:
+    """根派出一个子 Agent，等它做完，再发消息叫醒它，然后 kill 它；`woken` 是子 Agent 被叫醒之后的
+    那个周期在原始 run 里被 kill 之前留下的回复。"""
+    lead = _lead(
+        _turn(1, tool_calls=[_call('d1', 'Delegate', agent='Child', query='say hi')]),
+        _turn(2, tool_calls=[_call('s1', 'SendMessage', agent_id=_CHILD, content='go on')]),
+        _turn(3, tool_calls=[_call('k1', 'KillAgent', agent_id=_CHILD)]),
+        _turn(4, content='lead done'),
+        tools=('Read',),
+        gate=[_allowed(1, 1, 0), _allowed(1, 2, 0), _allowed(1, 3, 0)],
+    )
+    document = _doc(lead, **root)
+    document['agents']['Child'] = {
+        'frozen': {'system_prompt': 'You help.', 'tools': ['Bash']},
+        'instances': [{'key': _CHILD_KEY, 'turns': [_turn(1, content='hi'), *woken]}],
+    }
+    document['ids'] += [
+        {'key': _CHILD_KEY, 'id': _CHILD},
+        {'key': ['tool_call', _LEAD, 1, 2, 0, 'message', 0], 'id': 'e9' * 16},
+    ]
+    return document
+
+
 def _killed() -> dict[str, Any]:
-    send = _call('s1', 'SendMessage', agent_id=_HELPER, content='start', trigger='pending')
-    kill = _call('k1', 'KillAgent', agent_id=_HELPER)
+    """子 Agent 被叫醒之后的第一次模型调用还在飞时就被 kill 了：那一次没有回复。"""
+    return _woken_then_killed()
+
+
+def _expecting_a_message_never_sent() -> dict[str, Any]:
+    document = _doc(
+        _lead(
+            _turn(1, tool_calls=[_call('r1', 'Read', path='notes.txt')]),
+            _turn(2, content='done'),
+            tool_results=[{'call': [1, 1, 0], 'output': 'notes', 'trust': 'untrusted'}],
+            gate=[_allowed(1, 1, 0)],
+            messages=[{'turn': 2, 'ids': ['d4' * 16]}],
+        ),
+        expect={'final_output': {'Lead[0]': 'done'}},
+    )
+    document['ids'].append({'key': ['host', 'message', 7], 'id': 'd4' * 16})
+    return document
+
+
+def test_a_message_the_record_injected_that_the_replay_never_sends_diverges_where_it_was_due():
+    stopped = _replay(_expecting_a_message_never_sent())
+    carried_on = _replay(_expecting_a_message_never_sent(), allow_divergence=True)
+
+    assert _kinds(stopped) == ['message']
+    assert stopped.divergences[0].where == 'Lead[0] 第 2 轮'
+    assert 'd4' * 16 in stopped.divergences[0].detail
+    assert _kinds(carried_on) == ['message', 'unconsumed']
+    assert carried_on.result.final_output == {'Lead[0]': 'done'}
+
+
+def test_a_kill_waits_for_its_target_to_use_up_records_that_only_come_after_a_backoff():
+    document = _woken_then_killed(
+        _turn(2, 1, raises=_FAILED), _turn(2, 2, content='child done'), host=_RETRYING
+    )
+
+    result = _replay(document)
+
+    assert result.reproduced, result.divergences
+    assert result.result.final_output == {'Lead[0]': 'lead done', 'Child[0]': 'child done'}
+
+
+def test_a_kill_whose_target_can_never_use_up_its_records_lands_anyway_and_reports_them():
+    document = _woken_then_killed(_turn(2, content='child done'), _turn(3, content='never reached'))
+
+    result = _replay(document)
+
+    assert _kinds(result) == ['unconsumed']
+    assert result.divergences[0].where == 'Child[0]'
+
+
+@pytest.mark.parametrize('second', ['ran', 'skipped'])
+def test_a_kill_waits_through_a_backoff_for_what_its_target_did_after_its_delegate_returned(
+    second: str,
+):
+    grandchild_key = ['tool_call', _CHILD, 2, 2, 0, 'spawn', 0]
+    document = _woken_then_killed(
+        _turn(
+            2,
+            tool_calls=[
+                _call('d2', 'Delegate', agent='Child', query='retry once'),
+                _call('b2', 'Bash', command='echo after'),
+            ],
+        ),
+        host=_RETRYING,
+    )
+    child = document['agents']['Child']['instances'][0]
+    child['gate'] = [_allowed(2, 2, 0)]
+    if second == 'ran':
+        child['gate'].append(_allowed(2, 2, 1))
+        child['tool_results'] = [{'call': [2, 2, 1], 'output': 'after'}]
+    else:
+        child['skipped'] = [{'call': [2, 2, 1], 'output': 'the host refused it'}]
+    document['agents']['Child']['instances'].append(
+        {
+            'key': grandchild_key,
+            'turns': [_turn(1, 1, raises=_FAILED), _turn(1, 2, content='gc done')],
+        }
+    )
+    document['ids'].append({'key': grandchild_key, 'id': '9d' * 16})
+
+    result = _replay(document)
+
+    assert result.reproduced, result.divergences
+
+
+def test_a_message_the_record_injected_before_a_kill_that_never_comes_is_not_cut_off_by_it():
+    document = _woken_then_killed(_turn(2, tool_calls=[_call('b2', 'Bash', command='echo step')]))
+    child = document['agents']['Child']['instances'][0]
+    child.update(
+        tool_results=[{'call': [2, 2, 0], 'output': 'step'}],
+        gate=[_allowed(2, 2, 0)],
+        messages=[{'turn': 2, 'ids': ['e9' * 16]}, {'turn': 3, 'ids': ['d5' * 16]}],
+    )
+    document['ids'].append({'key': ['host', 'message', 7], 'id': 'd5' * 16})
+
+    result = _replay(document)
+
+    assert _kinds(result) == ['message']
+    assert result.divergences[0].where == 'Child[0] 第 3 轮'
+
+
+def test_a_kill_lands_where_its_target_was_cut_off_even_with_records_left_for_after_it_wakes():
+    document = _peers()
+    document['agents']['Lead']['instances'][0].update(
+        turns=[
+            _turn(1, tool_calls=[_call('d1', 'Delegate', agent='Child', query='say hi')]),
+            _turn(2, tool_calls=[_call('s1', 'SendMessage', agent_id=_CHILD, content='go on')]),
+            _turn(3, tool_calls=[_call('k1', 'KillAgent', agent_id=_CHILD)]),
+            _turn(4, tool_calls=[_call('s2', 'SendMessage', agent_id=_HELPER, content='after')]),
+            _turn(5, tool_calls=[_call('s3', 'SendMessage', agent_id=_CHILD, content='resume')]),
+            _turn(6, content='lead done'),
+        ],
+        gate=[_allowed(1, turn, 0) for turn in range(1, 6)],
+    )
+    document['agents']['Helper']['instances'][0]['messages'] = [{'turn': 1, 'ids': ['e6' * 16]}]
+    document['agents']['Child'] = {
+        'frozen': {'system_prompt': 'You help.', 'tools': ['Bash']},
+        'instances': [
+            {
+                'key': _CHILD_KEY,
+                'turns': [_turn(1, content='hi'), _turn(3, content='child resumed')],
+                'messages': [{'turn': 2, 'ids': ['e9' * 16]}, {'turn': 3, 'ids': ['e5' * 16]}],
+            }
+        ],
+    }
+    document['ids'] = [item for item in document['ids'] if item['key'][0] != 'tool_call'] + [
+        {'key': _CHILD_KEY, 'id': _CHILD},
+        {'key': ['tool_call', _LEAD, 1, 2, 0, 'message', 0], 'id': 'e9' * 16},
+        {'key': ['tool_call', _LEAD, 1, 4, 0, 'message', 0], 'id': 'e6' * 16},
+        {'key': ['tool_call', _LEAD, 1, 5, 0, 'message', 0], 'id': 'e5' * 16},
+    ]
+    document['expect'] = {}
+
+    result = _replay(document)
+
+    assert result.reproduced, result.divergences
+
+
+def test_a_kill_of_a_child_that_had_already_stopped_goes_out_before_anyone_waits_on_it():
+    document = _peers()
+    document['agents']['Lead']['instances'][0].update(
+        turns=[
+            _turn(1, tool_calls=[_call('d1', 'Delegate', agent='Child', query='say hi')]),
+            _turn(2, tool_calls=[_call('k1', 'KillAgent', agent_id=_CHILD)]),
+            _turn(3, tool_calls=[_call('s1', 'SendMessage', agent_id=_HELPER, content='after')]),
+            _turn(4, content='lead done'),
+        ],
+        gate=[_allowed(1, turn, 0) for turn in range(1, 4)],
+    )
+    document['agents']['Helper']['instances'][0]['messages'] = [{'turn': 1, 'ids': ['e6' * 16]}]
+    document['agents']['Child'] = {
+        'frozen': {'system_prompt': 'You help.', 'tools': ['Bash']},
+        'instances': [{'key': _CHILD_KEY, 'turns': [_turn(1, content='hi')], 'messages': []}],
+    }
+    document['ids'] = [item for item in document['ids'] if item['key'][0] != 'tool_call'] + [
+        {'key': _CHILD_KEY, 'id': _CHILD},
+        {'key': ['tool_call', _LEAD, 1, 3, 0, 'message', 0], 'id': 'e6' * 16},
+    ]
+    document['expect'] = {}
+
+    result = _replay(document)
+
+    assert result.reproduced, result.divergences
+
+
+def test_a_kill_lands_while_its_target_waits_in_a_delegate_the_original_never_got_back():
+    grandchild_key = ['tool_call', _CHILD, 2, 2, 0, 'spawn', 0]
+    document = _woken_then_killed(
+        _turn(2, tool_calls=[_call('d2', 'Delegate', agent='Child', query='wait for word')])
+    )
+    document['agents']['Lead']['instances'][0].update(
+        turns=[
+            _turn(1, tool_calls=[_call('d1', 'Delegate', agent='Child', query='say hi')]),
+            _turn(2, tool_calls=[_call('s1', 'SendMessage', agent_id=_CHILD, content='go on')]),
+            _turn(3, tool_calls=[_call('k1', 'KillAgent', agent_id=_CHILD)]),
+            _turn(4, tool_calls=[_call('s2', 'SendMessage', agent_id='9d' * 16, content='word')]),
+            _turn(5, content='lead done'),
+        ],
+        gate=[_allowed(1, turn, 0) for turn in range(1, 5)],
+    )
+    child = document['agents']['Child']['instances'][0]
+    child.update(
+        gate=[_allowed(2, 2, 0)],
+        cut=[[2, 2, 0]],
+        messages=[{'turn': 2, 'ids': ['e9' * 16]}],
+    )
+    document['agents']['Child']['instances'].append(
+        {
+            'key': grandchild_key,
+            'turns': [
+                _turn(1, tool_calls=[_call('b1', 'Bash', command='sleep 1')]),
+                _turn(2, content='gc done'),
+            ],
+            'tool_results': [{'call': [1, 1, 0], 'output': ''}],
+            'gate': [_allowed(1, 1, 0)],
+            'messages': [{'turn': 2, 'ids': ['e3' * 16]}],
+        }
+    )
+    document['ids'] += [
+        {'key': grandchild_key, 'id': '9d' * 16},
+        {'key': ['tool_call', _LEAD, 1, 4, 0, 'message', 0], 'id': 'e3' * 16},
+    ]
+
+    result = _replay(document)
+
+    assert result.reproduced, result.divergences
+
+
+def test_a_kill_whose_target_never_gets_to_where_it_landed_goes_out_once_the_run_is_quiet():
+    grandchild_key = ['tool_call', _CHILD, 2, 2, 0, 'spawn', 0]
+    document = _woken_then_killed(
+        _turn(2, tool_calls=[_call('d2', 'Delegate', agent='Child', query='never answers')]),
+        _turn(3, content='after'),
+    )
+    child = document['agents']['Child']['instances'][0]
+    child['gate'] = [_allowed(2, 2, 0)]
+    document['agents']['Child']['instances'].append(
+        {
+            'key': grandchild_key,
+            'turns': [_turn(1, tool_calls=[_call('b1', 'Bash', command='sleep 9')])],
+            'gate': [_allowed(1, 1, 0)],
+        }
+    )
+    document['ids'].append({'key': grandchild_key, 'id': '9d' * 16})
+
+    result = _replay(document, allow_divergence=True)
+
+    assert result.result.final_output['Lead[0]'] == 'lead done'
+    assert ('unconsumed', 'Child[0]') in [(d.kind, d.where) for d in result.divergences]
+
+
+def test_a_kill_that_cannot_land_does_not_wait_for_its_target():
     document = _peers()
     lead = document['agents']['Lead']['instances'][0]
     lead['turns'] = [
-        _turn(1, tool_calls=[send]),
-        _turn(2, tool_calls=[kill]),
-        _turn(3, content='lead done'),
+        _turn(1, tool_calls=[_call('s1', 'SendMessage', agent_id=_HELPER, content='start')]),
+        _turn(2, tool_calls=[_call('k1', 'KillAgent', agent_id=_HELPER)]),
+        _turn(3, tool_calls=[_call('s2', 'SendMessage', agent_id=_HELPER, content='more')]),
+        _turn(4, content='lead done'),
     ]
-    lead['gate'] = [_allowed(1, 1, 0), _allowed(1, 2, 0)]
-    # 原始 run 里 Helper 的第一次模型调用还在飞时就被 kill 了：没有它的回复。
-    document['agents']['Helper']['instances'][0]['turns'] = []
-    document['expect'] = {'final_output': {'Lead[0]': 'lead done'}}
-    return document
+    lead['gate'] = [_allowed(1, 1, 0), _allowed(1, 2, 0), _allowed(1, 3, 0)]
+    document['agents']['Helper']['frozen']['tools'] = ['Bash']
+    [helper] = document['agents']['Helper']['instances']
+    helper.update(
+        turns=[
+            _turn(1, tool_calls=[_call('b1', 'Bash', command='sleep 1')]),
+            _turn(2, content='helper done'),
+        ],
+        tool_results=[{'call': [1, 1, 0], 'output': ''}],
+        gate=[_allowed(1, 1, 0)],
+        messages=[{'turn': 1, 'ids': ['e8' * 16]}, {'turn': 2, 'ids': ['e7' * 16]}],
+    )
+    document['ids'].append({'key': ['tool_call', _LEAD, 1, 3, 0, 'message', 0], 'id': 'e7' * 16})
+
+    result = _replay(document)
+
+    assert result.reproduced, result.divergences
 
 
 @pytest.mark.parametrize('seed', range(1, 41))

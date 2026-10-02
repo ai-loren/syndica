@@ -53,6 +53,7 @@ from syndica.kernel.tool import ToolResult
 from syndica.kernel.trace import (
     AttributeValue,
     CausalityEdge,
+    EdgeKind,
     Span,
     SpanEvent,
     SpanKind,
@@ -627,6 +628,13 @@ class TraceRecorder:
         self._put(record)
 
     def add_event(self, span_id: str, name: str, attributes: dict[str, AttributeValue]) -> None:
+        message_id = attributes.get('message.id')
+        if (
+            name == 'message.sent'
+            and isinstance(message_id, str)
+            and self._level is not TraceLevel.STRUCTURE
+        ):
+            self._capturing(lambda: self._capture.sent(message_id))
         span = self._open.get(span_id)
         if span is None:
             return
@@ -643,6 +651,14 @@ class TraceRecorder:
         if self._finished:
             self._dropped += 1
             return
+        message_id = edge.attributes.get('message.id')
+        if (
+            edge.kind is EdgeKind.MESSAGE
+            and isinstance(message_id, str)
+            and self._level is not TraceLevel.STRUCTURE
+        ):
+            target = edge.target_span_id
+            self._capturing(lambda: self._capture.consumed(target, message_id))
         try:
             record = dataclasses.replace(edge, attributes=self._attributes(edge.attributes))
         except Exception as error:
