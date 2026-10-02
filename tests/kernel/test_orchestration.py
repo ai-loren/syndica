@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections.abc import Callable
 
 import pytest
 
@@ -1732,6 +1733,87 @@ async def test_delegate_creates_its_child_as_a_zombie_so_the_returned_id_is_not_
 
     slot = runtime._slots[result.meta['agent_id']]
     assert slot.exit_mode is ExitMode.ZOMBIE
+    await runtime.shutdown()
+
+
+class _WakesOnZombie(InMemoryAgentRegistry):
+    """一个 Agent 进 zombie 的那一刻（它的驱动任务还没结束）就有人给它发一条消息：复活的那个周期
+    排在等它的那一方醒来之前。只叫一次。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.wake: Callable[[str], object] | None = None
+
+    async def compare_and_set_status(
+        self, agent_id: str, *, expected: AgentStatus, new: AgentStatus
+    ) -> bool:
+        changed = await super().compare_and_set_status(agent_id, expected=expected, new=new)
+        if changed and new is AgentStatus.ZOMBIE and self.wake is not None:
+            wake, self.wake = self.wake, None
+            wake(agent_id)
+        return changed
+
+
+async def test_delegate_hands_back_the_cycle_it_waited_for_when_a_message_revives_the_child_first():
+    registry = _WakesOnZombie()
+    runtime = Runtime(
+        agents={'Worker': _worker([ScriptedTurn(content='first'), ScriptedTurn(content='second')])},
+        registry=registry,
+    )
+    parent = await _idle_parent(runtime)
+    sends: list[asyncio.Task[object]] = []
+
+    def wake(agent_id: str) -> None:
+        sends.append(asyncio.get_running_loop().create_task(runtime.send(agent_id, 'more')))
+
+    registry.wake = wake
+    result = await asyncio.wait_for(
+        Delegate(runtime, parent).execute(agent='Worker', query='x'), timeout=_TIMEOUT
+    )
+    child = result.meta['agent_id']
+    await asyncio.wait_for(asyncio.gather(*sends), timeout=_TIMEOUT)
+    await asyncio.wait_for(runtime.wait(child), timeout=_TIMEOUT)
+
+    assert 'first' in str(result.output) and 'second' not in str(result.output)
+    assert result.meta['stop_reason'] == 'completed'
+    assert _final_text(_context(runtime, child)) == 'second'
+    await runtime.shutdown()
+
+
+async def _zombie(runtime: Runtime, agent_id: str) -> None:
+    async with asyncio.timeout(_TIMEOUT):
+        while True:
+            info = await runtime.find(agent_id)
+            if info is not None and info.status is AgentStatus.ZOMBIE:
+                return
+            await asyncio.sleep(0.001)
+
+
+async def test_the_cycle_a_kill_stopped_is_what_its_driver_left_even_after_a_message_revives_it():
+    blocker = _Block()
+    runtime = Runtime()
+    child = await runtime.spawn(
+        _worker(
+            [
+                ScriptedTurn(content='working', tool_calls=[ToolCall('b1', 'Block', '{}')]),
+                ScriptedTurn(content='revived'),
+            ],
+            {'Block': blocker},
+        ),
+        query='go',
+    )
+    await asyncio.wait_for(blocker.entered.wait(), timeout=_TIMEOUT)
+    driver = runtime._table.get_task(child)
+    assert driver is not None
+    await runtime.kill(child)
+    await _zombie(runtime, child)
+    assert (await runtime.send(child, 'more')).ok
+    await asyncio.wait_for(runtime.wait(child), timeout=_TIMEOUT)
+
+    ended = runtime._finished_context(child, driver)
+
+    assert _final_text(ended) == 'working'
+    assert _final_text(_context(runtime, child)) == 'revived'
     await runtime.shutdown()
 
 

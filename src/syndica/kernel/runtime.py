@@ -114,6 +114,7 @@ import copy
 import inspect
 import json
 import logging
+import weakref
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -367,6 +368,16 @@ def _forkable_prefix(blocks: list[ContextBlock]) -> list[ContextBlock]:
     if not head.content:
         return blocks[:index]
     return [*blocks[:index], replace(head, tool_calls=[])]
+
+
+def _frozen(context: Context) -> Context:
+    """这一刻的轨迹与停下的原因。列表是新的、块与原件共用（同 `current_traj`）：此后追加的块不进
+    这一份，对已有块的就地改写（失败标记）照样看得见。"""
+    frozen = Context()
+    for block in context.current_traj:
+        frozen.append(block)
+    frozen.stop_reason = context.stop_reason
+    return frozen
 
 
 def _not_a_role_table(agents: object) -> ConfigError:
@@ -910,6 +921,13 @@ class Runtime:
         self._confirmation_handler = confirmation_handler
         self._table: LocalAgentTable[BaseAgent] = LocalAgentTable()
         self._slots: dict[str, _Slot] = {}
+        # 驱动任务 → 它那次事件循环停下时的轨迹（`_finish` 一开头取，早于进 zombie）。在轮等待读
+        # 这一份而不是活的 Context：被等的那一方进了 zombie 就叫得醒，复活的周期可能排在等待者
+        # 醒来之前，活的那份那时已经是下一个周期的了。按任务存，复活之后的周期也跑完了，等前一个
+        # 的那一方读到的仍是前一个；弱引用，没人再握着那个任务时条目跟着消失。
+        self._ended: weakref.WeakKeyDictionary[asyncio.Task[Any], Context] = (
+            weakref.WeakKeyDictionary()
+        )
         # 收尾在事件循环之外做，因此它自己是一个任务；不在实例表里，`shutdown` 的取消名单看不见
         # 它们，只能另等一次。
         self._reapers: set[asyncio.Task[None]] = set()
@@ -1381,7 +1399,7 @@ class Runtime:
             )
         finally:
             if not cancelled:
-                await self._finish(agent_id, slot)
+                await self._finish(agent_id, slot, asyncio.current_task())
 
     async def _report_lost_takeover(self, agent_id: str) -> None:
         """IDLE -> RUNNING 被拒的两种情形，下一步不是同一件事。
@@ -1519,12 +1537,15 @@ class Runtime:
                 return True
         return False
 
-    async def _finish(self, agent_id: str, slot: _Slot) -> None:
-        """事件循环退出后的归宿（spec §4.1 的 ExitMode）。
+    async def _finish(self, agent_id: str, slot: _Slot, driver: asyncio.Task[Any] | None) -> None:
+        """事件循环退出后的归宿（spec §4.1 的 ExitMode）。`driver` 是刚停下的那个驱动任务。
 
         **状态与资源的拆除是幂等的**：`kill` 的收割任务与驱动任务自己的 finally 都可能走到这里，
-        而两者谁先谁后取决于取消是否赶上。
+        而两者谁先谁后取决于取消是否赶上。轨迹的快照因此只取第一次：第二次可能落在复活之后。
         """
+        agent = self._table.get(agent_id)
+        if driver is not None and agent is not None and driver not in self._ended:
+            self._ended[driver] = _frozen(agent.context)
         await self._report_abandoned_input(agent_id, slot)
         await self.broker.remove_queue(agent_id)
         # 邮箱里那些随队列一起没了，不会再被消费；暂存在控制块里的随唤醒注入，留着它们的来源。
@@ -1583,11 +1604,14 @@ class Runtime:
             await asyncio.wait({task})
         return self._finished_context(agent_id)
 
-    def _finished_context(self, agent_id: str) -> Context:
+    def _finished_context(self, agent_id: str, driver: asyncio.Task[Any] | None = None) -> Context:
         """一个事件循环已经停下的 Agent 的轨迹。`wait` 与 `_wait_in_turn` 的共同出口。
 
         两条路各写一份，迟早会在「接管失败算不算等到了」这种地方分叉，而分叉出来的差异只在
         接管真的失败时才现身。
+
+        给了 `driver` 就交回那个驱动任务停下时的快照（见 `_ended`）。还没有快照说明 `_finish`
+        还没开始，它就还进不了 zombie、没有被复活过，活的那份就是停下时的那份。
         """
         slot = self._slots.get(agent_id)
         agent = self._table.get(agent_id)
@@ -1602,6 +1626,10 @@ class Runtime:
                 ),
                 next_action='用 find() 读它当前的 status 与 owner；确认它空闲后重新 spawn 一个',
             )
+        if driver is not None:
+            ended = self._ended.get(driver)
+            if ended is not None:
+                return ended
         return agent.context
 
     async def _wait_in_turn(self, agent_id: str, target_id: str) -> _InTurnWaitResult:
@@ -1683,7 +1711,7 @@ class Runtime:
             # 轨迹在中断也到达时被丢掉。
             if target is None or target.done():
                 return _InTurnWaitResult(
-                    state=WaitState.ANSWERED, context=self._finished_context(target_id)
+                    state=WaitState.ANSWERED, context=self._finished_context(target_id, target)
                 )
             if token.raised.done():
                 return _InTurnWaitResult(state=token.raised.result())
@@ -2191,7 +2219,7 @@ class Runtime:
             task = self._table.get_task(agent_id)
             if task is not None:
                 await asyncio.wait({task})
-            await self._finish(agent_id, slot)
+            await self._finish(agent_id, slot, task)
         except Exception:
             logger.exception(
                 '期望: agent %s 被取消之后的收尾走完，它落到 exit_mode 说的那个归宿上。'
