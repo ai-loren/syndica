@@ -28,10 +28,15 @@ Runtime 级钩子看到的入参，局部钩子的 `skip` 会连 Runtime 级的�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from syndica.kernel.context import (
+    Context,
+    _frozen,  # pyright: ignore[reportPrivateUsage]
+)
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.hooks.junctions import (
     INTERCEPTABLE,
@@ -54,6 +59,17 @@ _KERNEL_JUNCTIONS_BY_VALUE: dict[str, Junction] = {j.value: j for j in Junction}
 
 def _label(junction: JunctionRef) -> str:
     return junction.value if isinstance(junction, Junction) else junction
+
+
+def _window(
+    junction: JunctionRef, kwargs: dict[str, Any]
+) -> contextlib.AbstractContextManager[None]:
+    """分发期间冻结 `ctx` 参数那一份轨迹，可拦截与可观察都一样（见 `junctions` 模块文档）；不带
+    `ctx` 的切点不冻结任何轨迹。"""
+    ctx = kwargs.get('ctx')
+    if isinstance(ctx, Context):
+        return _frozen(ctx, f'切点 {_label(junction)} 分发')
+    return contextlib.nullcontext()
 
 
 def _orphan_result(
@@ -333,8 +349,10 @@ class HooksCenter:
         if not hooks:
             return HookResult()
         if kind is JunctionKind.INTERCEPTABLE:
-            return await self._trigger_serial(resolved, hooks, **kwargs)
-        await self._trigger_parallel(resolved, hooks, **kwargs)
+            with _window(resolved, kwargs):
+                return await self._trigger_serial(resolved, hooks, **kwargs)
+        with _window(resolved, kwargs):
+            await self._trigger_parallel(resolved, hooks, **kwargs)
         return HookResult()
 
     def _assembly_snapshot(

@@ -76,9 +76,8 @@ _TRIGGERS: str = ' / '.join(trigger.value for trigger in Trigger)
 def _final_text(ctx: Context) -> str | None:
     """子 Agent 最后一次留下的文字。
 
-    从后往前找而不是取最后一块：`COMPLETED` 那一块 assistant 之后，`AGENT_END` / `TURN_END` 上
-    的 hook 还能往这份轨迹里追加任何东西（切点收到的 `ctx` 就是这一份），取最后一块于是会把一个
-    观察者写下的块当成子 Agent 的结论。
+    从后往前找而不是取最后一块：轨迹的末尾可以是 assistant 之外的块（恢复时补上的、被打断的那批
+    调用的结果块；宿主在两次运行之间追加的），取最后一块就会把它们当成子 Agent 的结论。
     """
     for block in reversed(ctx.current_traj):
         if block.role == 'assistant' and isinstance(block.content, str) and block.content:

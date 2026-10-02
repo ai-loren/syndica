@@ -8,10 +8,14 @@ Registry（spec §4.3）。理由是 Agent 阻塞或崩溃时无法自报状态�
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
+
+from syndica.kernel.errors import ContractViolation
 
 __all__ = [
     'ArtifactRef',
@@ -84,7 +88,52 @@ class Context:
         return list(self._blocks)
 
     def append(self, block: ContextBlock) -> None:
+        """追加一块。轨迹只由内核自己的循环写：在这份轨迹的窗口里（这个 Agent 的切点分发、工具段，
+        以及从它们里面起的任务）报 `ContractViolation`，见 `hooks.junctions` 模块文档。"""
+        window = next((name for owner, name in reversed(_WINDOWS.get()) if owner is self), None)
+        if window is not None:
+            raise ContractViolation(
+                expected=(
+                    '轨迹只由内核写，hook、工具与它们起的任务不往里追加：几方并发时谁先写取决于调度，'
+                    '写在一次调用与它的结果之间提供方会拒掉下一次请求'
+                ),
+                received=f'{window}期间收到一次追加（role={block.role}）',
+                next_action=(
+                    "要改一次调用的产出，在 POST_TOOL_USE 交回 modified['result']（或由工具"
+                    '自己交回 ToolResult）；要告诉模型一件事，用 Runtime.send 发一条消息，'
+                    'Agent 下一轮按顺序注入。在这次分发里、以及它起的任务里，怎么等都写不进'
+                ),
+            )
         self._blocks.append(block)
+
+
+# 此刻所在的窗口：（哪份轨迹，哪个窗口）。窗口里跑的代码与它起的任务（任务建在窗口里，继承这份值）
+# 不许往那份轨迹里追加。放在 contextvar 里而不是 Context 上：别的任务开的窗口不该冻结 Agent 自己的
+# 循环，轨迹的拷贝也不该带着一个早已结束的窗口。
+_WINDOWS: ContextVar[tuple[tuple[Context, str], ...]] = ContextVar(
+    'syndica_trajectory_windows', default=()
+)
+
+
+@contextmanager
+def _frozen(ctx: Context, window: str) -> Generator[None, None, None]:  # pyright: ignore[reportUnusedFunction]
+    """`window` 期间（在这段代码与它起的任务里）不许往 `ctx` 追加。`window` 写成接上「期间」读得通
+    的一句话。"""
+    token = _WINDOWS.set((*_WINDOWS.get(), (ctx, window)))
+    try:
+        yield
+    finally:
+        try:
+            _WINDOWS.reset(token)
+        except ValueError:
+            # 协程没被取消就被 GC 关掉时，finally 跑在另一份上下文里；那份上下文随即丢弃。
+            pass
+
+
+def _no_windows() -> None:  # pyright: ignore[reportUnusedFunction]
+    """内核自己的循环在任务开头调：它不继承建它的那段代码所在的窗口（一个在自己的观察者里被叫醒的
+    Agent，否则从此写不进自己的轨迹）。"""
+    _WINDOWS.set(())
 
 
 def _trailing_unpaired_batch(  # pyright: ignore[reportUnusedFunction]

@@ -32,7 +32,12 @@ from syndica.kernel.tools import (
     SendMessage,
     orchestration_tools,
 )
-from syndica.kernel.tools.orchestration import _INTERRUPTED, _UNFINISHED, _AgentTool
+from syndica.kernel.tools.orchestration import (
+    _INTERRUPTED,
+    _UNFINISHED,
+    _AgentTool,
+    _final_text,  # pyright: ignore[reportPrivateUsage]
+)
 from syndica.kernel.waiting import WaitState
 
 # 每个等待都设上限：回归应当让用例变红，而不是把 CI 挂住。
@@ -1730,23 +1735,22 @@ async def test_delegate_creates_its_child_as_a_zombie_so_the_returned_id_is_not_
     await runtime.shutdown()
 
 
-async def test_the_conclusion_is_found_even_when_a_hook_appended_after_the_final_assistant_block():
-    """`AGENT_END` 收到的 `ctx` 就是子 Agent 那一份，切点之后它的末尾可以是任何东西。
-
-    取最后一块就会把一个观察者写下的块当成子 Agent 的结论交给模型。
-    """
+async def test_an_end_of_run_observer_cannot_append_to_the_childs_trajectory():
+    """`AGENT_END` 收到的 `ctx` 就是子 Agent 那一份；观察者往里追加被拒（B-19），交给模型的结论
+    仍是子 Agent 自己的那句话。"""
     runtime = Runtime(agents={'Worker': _worker([ScriptedTurn(content='the child answer')])})
     parent = await _idle_parent(runtime)
+    refusals: list[str] = []
 
     async def append_a_trailing_block(**kwargs: object) -> HookResult:
         ctx = kwargs['ctx']
         assert isinstance(ctx, Context)
-        if [block.content for block in ctx.current_traj if block.role == 'assistant'] == [
-            'the child answer'
-        ]:
+        try:
             ctx.append(
                 ContextBlock(role='tool', content='an observer wrote this', tool_call_id='z')
             )
+        except ContractViolation as error:
+            refusals.append(error.received)
         return HookResult()
 
     runtime.hooks.register(Junction.AGENT_END, append_a_trailing_block)
@@ -1754,9 +1758,23 @@ async def test_the_conclusion_is_found_even_when_a_hook_appended_after_the_final
         Delegate(runtime, parent).execute(agent='Worker', query='x'), timeout=_TIMEOUT
     )
 
+    assert refusals == ['切点 agent_end 分发期间收到一次追加（role=tool）']
     assert 'the child answer' in str(result.output)
     assert 'an observer wrote this' not in str(result.output)
     await runtime.shutdown()
+
+
+def test_the_conclusion_is_the_last_assistant_text_even_when_other_blocks_follow_it():
+    ctx = Context()
+    for block in (
+        ContextBlock(role='assistant', content='earlier'),
+        ContextBlock(role='assistant', content='the child answer'),
+        ContextBlock(role='assistant', content=None, tool_calls=[ToolCall('c', 'Nope', '{}')]),
+        ContextBlock(role='tool', content='interrupted', tool_call_id='c'),
+    ):
+        ctx.append(block)
+
+    assert _final_text(ctx) == 'the child answer'
 
 
 def test_the_unfinished_table_answers_for_every_stop_reason_and_for_having_none():

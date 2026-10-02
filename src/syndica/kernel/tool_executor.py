@@ -117,6 +117,7 @@ from syndica.kernel.context import (
     ContextBlock,
     ToolCall,
     TrustLevel,
+    _frozen,  # pyright: ignore[reportPrivateUsage]
     provenance_of,
     strictest_trust,
 )
@@ -781,43 +782,54 @@ class ToolExecutor:
     ) -> list[ToolResult | BaseException]:
         """跑一段：段内并发，交回与 `calls` 同序的结果或异常。
 
+        整段在这份轨迹的窗口里跑，单个调用也一样：段里跑的是第三方的 hook 与工具，它们往轨迹里
+        写，要么先后取决于调度，要么插进一次调用与它的结果之间（见 `hooks.junctions`）。结果块等
+        整段跑完、由调用方按调用顺序落，不在窗口里。
+
         单元素的段**不进 `asyncio.gather`**：那会把协程包成 Task，于是这次调用换了取消域、也拿到
         一份 contextvars 的副本。默认工具都不可并发（`Tool.is_concurrency_safe` 交回 False），单
         元素段是最常见的形态，不该因为引入分段就改掉它的执行环境。
         """
-        if len(calls) == 1:
-            try:
-                return [
-                    await self._execute_one(
+        names = ', '.join(call.name for call in calls)
+        window = (
+            f'工具调用 {names} 执行'
+            if len(calls) == 1
+            else f'同一段里 {len(calls)} 个调用（{names}）并发执行'
+        )
+        with _frozen(ctx, window):
+            if len(calls) == 1:
+                try:
+                    return [
+                        await self._execute_one(
+                            ctx,
+                            calls[0],
+                            provenance,
+                            execution_gate,
+                            confirmation_lock,
+                            has_siblings=False,
+                            key=keys[0],
+                        )
+                    ]
+                # 收进结果列表的只有 Exception，取消沿这条路直接上抛。并发那条路做不到这件事
+                # （gather 把子协程的取消一并收进列表），所以两条路都还要过 `_without_cancellation`
+                # ——「取消不写 block」这条只由它保证。
+                except Exception as exc:
+                    return [exc]
+            return await asyncio.gather(
+                *(
+                    self._execute_one(
                         ctx,
-                        calls[0],
+                        call,
                         provenance,
                         execution_gate,
                         confirmation_lock,
-                        has_siblings=False,
-                        key=keys[0],
+                        has_siblings=True,
+                        key=key,
                     )
-                ]
-            # 收进结果列表的只有 Exception，取消沿这条路直接上抛。并发那条路做不到这件事
-            # （gather 把子协程的取消一并收进列表），所以两条路都还要过 `_without_cancellation`
-            # ——「取消不写 block」这条只由它保证。
-            except Exception as exc:
-                return [exc]
-        return await asyncio.gather(
-            *(
-                self._execute_one(
-                    ctx,
-                    call,
-                    provenance,
-                    execution_gate,
-                    confirmation_lock,
-                    has_siblings=True,
-                    key=key,
-                )
-                for call, key in zip(calls, keys, strict=True)
-            ),
-            return_exceptions=True,
-        )
+                    for call, key in zip(calls, keys, strict=True)
+                ),
+                return_exceptions=True,
+            )
 
     def _concurrency_safe(self, call: ToolCall) -> bool:
         """这次调用能不能与同一批里相邻的调用一起跑。

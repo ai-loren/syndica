@@ -278,6 +278,16 @@ Agent 自己的轮次里写）。冻结用计数而不是布尔（可以嵌套�
 级的切点不冻结任何 `Context`——`AGENT_SPAWN` 分发时子 Agent 的任务已经建好，冻住它，子 Agent 的第一次追加就会失败。
 写进 hook 契约（`hooks/junctions.py` 的 docstring）；`tests/kernel/test_orchestration.py` 里那条从观察者追加的用例改写。
 
+**D9 修订（T10 评审）：轨迹只由内核写。** 上面「串行的可拦截切点里照旧可以写」是错的：写在 `PRE_TOOL_USE` /
+`POST_TOOL_USE` 里的块落在一次调用与它的结果之间，提供方会拒掉下一次请求，hook 也无从知道自己是不是一段里唯一的
+调用；写在 `PRE_LLM_REQUEST` / `POST_LLM_RESPONSE` 里的块不在这一次请求里、却排在回复之前，轨迹会说模型看过它
+其实没看过的东西。改为：带 `ctx` 参数的切点分发（可拦截与可观察都算）与每一个工具段（单个调用也算）都是窗口；
+窗口记在 contextvar 里、跟着代码走——窗口里跑的代码与它起的任务不许追加；别的任务开的窗口不冻结 Agent 自己的
+循环（扩展切点由声明它的能力在任意任务里触发）；轨迹的拷贝不带窗口（观察者在轮末做的快照不会永远冻住）；Agent
+的驱动任务从没有窗口开始（否则一个在自己的观察者里被叫醒的 Agent 写不进自己的轨迹）。正确的写法：改一次调用的
+产出用 `POST_TOOL_USE` 的 `modified['result']`，告诉模型一件事用 `Runtime.send`，改这一次请求用
+`PRE_LLM_REQUEST` 的 `modified['request']`。
+
 **D10 可复现的 id 与稳定键。**
 
 - 内核 contextvar「当前工具调用」（agent id、周期、turn、批内位置、模型给的 id）。执行器自己不知道 agent、周期与
@@ -513,12 +523,15 @@ redaction:
 
 - `Runtime(..., tracer=None, ids=None)`；`LocalWorkspace(..., private=())`；`path_outside_workspace_rule(root, *,
   real=None)` 与 `workspace_root_removal_rule(root, *, real=None)`。
-- `syndica.kernel.trace`：`Tracer`、`NoopTracer`、`TraceRecorder`、`Span`、`SpanEvent`、`CausalityEdge`、`SpanKind`、
-  `EdgeKind`、`SpanStatus`、`TraceLevel`、`TraceHeader`、`TraceRedaction`、`TraceSource`、`PayloadRef`、
-  `ATTRIBUTE_KINDS`、`ATTRIBUTE_DOMAINS`；`syndica.kernel.protocols.trace.TraceStore`；`InMemoryTraceStore`、
-  `FileTraceStore`；契约套件 `TraceStoreContract`；回放文档的 schema 模块。
+- `syndica.kernel.tracing`：`Tracer`、`NullTracer`；`syndica.kernel.trace_recorder`：`TraceRecorder`；
+  `syndica.kernel.trace`：`Span`、`SpanEvent`、`CausalityEdge`、`SpanKind`、`EdgeKind`、`SpanStatus`、`TraceLevel`、
+  `TraceHeader`、`TraceRedaction`、`TraceSource`、`PayloadRef`、`AttributeValue`、`ATTRIBUTE_KINDS`、
+  `ATTRIBUTE_DOMAINS`；`syndica.kernel.protocols.trace.TraceStore`；`InMemoryTraceStore`、`FileTraceStore`；契约套件
+  `TraceStoreContract`；回放文档的 schema 模块。除 `ATTRIBUTE_KINDS` / `ATTRIBUTE_DOMAINS` 外都从 `syndica.kernel`
+  导出。
 - `syndica.kernel.redaction`：`Redactor`、`RuleRedactor`、`RedactionRule`、`RedactedText`、`encode_redacted`、
-  `write_redacted`、`write_all`、`Finding`、`RULE_IDS`、`RULES_VERSION`、`looks_secret`。
+  `write_redacted`、`write_all`、`Finding`、`RULE_IDS`、`RULES_VERSION`、`looks_secret`；不进 `kernel.__all__` 的
+  `redact_argv`（命令行参数，`--api-key <值>` 两项一对）与 `encode_digests`（只收 sha256 的不脱敏编码）。
 - 哪些进 `kernel.__all__`、哪些进 `_WITHHELD`，在各自任务里按「宿主不用它就做不成某件事」判定并写进
   `tests/kernel/test_public_api.py`。
 
@@ -845,7 +858,7 @@ None，猜一个数比没有更糟）与 `extra['finish_reason']`，它们不随
   进制挂在像密钥名的键下会被换掉（T6 复评那条 `key` 字段就是这么丢的）。`Runtime(tracer=)` 在这里公开，`Tracer`
   与它用到的模型类型一起进承诺面。
 
-**状态：完成。** `kernel/trace_recorder.py`：`TraceRecorder` 实现 `Tracer`——同步方法只往内存记、往队列放，一个
+**状态：完成（edf5d32）。** `kernel/trace_recorder.py`：`TraceRecorder` 实现 `Tracer`——同步方法只往内存记、往队列放，一个
 写入任务按收到的先后成批落盘（一批里 payload 先于引用它的 span），`finish` 把还开着的 span 以 `cancelled` 收尾、
 等写入任务排空（被取消也排空）、写下结局。时间只在 `begin` 读一次墙钟，此后按单调时钟往后推、不回退，span 不会
 落在 trace 之外。级别按 D8；指纹按 D11（模型参数是内核交给 `create` 的关键字参数，后端的配置不在其中，模型名记在
@@ -888,7 +901,23 @@ recorder 脱敏（`redact_argv`，`--api-key <值>` 分成两项时也认），`
   第一次追加照常（Runtime 级切点不冻结任何 `Context`）。
 - 变异：计数不复位（之后所有写入都被拒）；只冻结工具段不冻结观察者分发；只在两个以上观察者时冻结。
 
-阶段二收口：阶段审计。
+**状态：完成。** 按 D9 修订实现。`Context.append` 在这份轨迹的窗口里报三件套 `ContractViolation`、点名最近的
+那个窗口；窗口由 `context._frozen(ctx, window)` 开、记在 contextvar 里（可以嵌套、可以同名，异常与取消时照样关），
+`Runtime._drive` 开头调 `_no_windows()`。两类窗口：`HooksCenter.trigger` 的每一次带 `ctx` 的分发（可拦截与可观察
+都算），与 `ToolExecutor._run_segment` 的每一段（单个调用也算——`PRE_TOOL_USE`、`POST_TOOL_USE`、
+`TOOL_CONFIRMATION_REQUIRED` 与工具本身都在段里；结果块在窗口外按调用顺序落）。契约写进 `junctions` 模块文档；
+`test_orchestration.py` 那条从观察者追加的用例改写成断言追加被拒、结论照旧；`_final_text` 从后往前找的理由改成
+「恢复时补的结果块、宿主在两次运行之间追加的」。B-19 移到遗留项登记的已关闭一节。
+
+验证：最初的实现（只冻结多调用的段与可观察分发、窗口记在对象上）8 条变异全杀。对抗评审一路：1 High（契约推荐的
+写法本身是错的——单调用段里的 `PRE_TOOL_USE` / `POST_TOOL_USE` 破坏调用与结果的配对，`PRE_LLM_REQUEST` /
+`POST_LLM_RESPONSE` 让轨迹说谎，hook 也无从知道自己是不是一段里唯一的调用）、3 Medium（别的任务开的窗口冻住
+Agent 自己的追加，模型的回复与结果块都会被拒；窗口里取的拷贝永远冻着；审计写的「取消时照样关上」没有用例）、
+4 Low（就地改块、观察者起的任务一轮之后又能写、点错窗口、文字），外加 14 条存活变异。改成 D9 修订的设计；评审的
+复现各成一条用例（另一个任务里的分发、轮末快照、在自己的观察者里被叫醒），14 条存活变异的同型改写全杀；就地改块
+写进契约，不在冻结之内。
+
+阶段二收口：阶段审计，见 [M3 阶段二审计](../audits/2026-10-02-m3-phase2-audit.md)。
 
 ### 阶段三：文件存储、CLI 记录与回放
 

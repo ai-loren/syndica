@@ -126,6 +126,7 @@ from syndica.kernel.context import (
     ContextBlock,
     StopReason,
     TrustLevel,
+    _no_windows,  # pyright: ignore[reportPrivateUsage]
     _trailing_unpaired_batch,  # pyright: ignore[reportPrivateUsage]
     provenance_of,
     strictest_trust,
@@ -1354,9 +1355,10 @@ class Runtime:
             return
         # 驱动任务建在发送方的上下文里（spawn、唤醒 zombie 的那次 send）：不换属主就继承了别人的
         # 「当前工具调用」或宿主的计数，它的 hook 派的活、发的消息就会按别人的键、按到达的先后
-        # 取 id；同理也继承了别人的当前 span。
+        # 取 id；同理也继承了别人的当前 span，以及别人所在的轨迹窗口。
         becoming_owner(('agent', agent_id), slot.issued)
         outside_any_span()
+        _no_windows()
         if not await self.registry.compare_and_set_status(
             agent_id, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
         ):
