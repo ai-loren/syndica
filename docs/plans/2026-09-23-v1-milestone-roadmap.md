@@ -14,6 +14,12 @@ OpenRouter 兜底，每个平台各自指数退避，spec 决策 #89）。
 推送，那个提交原样进了本仓。GitHub Actions 本月额度用完，M2 的提交都只按本地验证协议验证过，额度恢复后
 在 Linux 上补跑。
 
+里程碑 3 已完成（2026-10-02），审计记录见 [`docs/audits/2026-10-02-m3-final-audit.md`](../audits/2026-10-02-m3-final-audit.md)：
+每次 run 记成一个 trace（span、派生边与消息边），默认级别可离线回放，`syndica trace` 读、回放、导出、清理它；
+落盘与导出的一切都先过内核的统一 `Redactor`。真实免费模型的 `syndica-dev` 运行留下的 trace 由 `trace show` 回答了
+三个问题，并导出到了本地 collector；一次单 Agent 的真实运行在没有任何 API key 的环境里离线回放复现。M3 的提交同样
+只按本地验证协议验证过。
+
 当前主线约束：
 
 - 不重做 M1，不补 `Runtime.start` / `Junction.RUNTIME_START`。
@@ -52,8 +58,8 @@ uv run pytest -q
 |---|---|---|---|
 | 1 | 内核骨架 | 已完成 | 只维护回归门禁 |
 | 2 | 自举 | 已完成 | 只维护回归门禁；额度恢复后在 Linux 上补跑 CI |
-| 3 | 可观测性 + 脱敏收口 | 未开始 | 下一个：写实现计划；最小脱敏器（M2 D12）并进统一 `Redactor` |
-| 4 | 扩展点完备 | 未开始 | 补齐第三方能力装配闭环 |
+| 3 | 可观测性 + 脱敏收口 | 已完成 | 只维护回归门禁；额度恢复后在 Linux 上补跑 CI |
+| 4 | 扩展点完备 | 未开始 | 下一个：写实现计划；补齐第三方能力装配闭环 |
 | 5 | 执行面完整化 + 不可信内容 | 未开始 | 完成 Workspace/Portal 与真实溯源链 |
 | 6 | 状态 | 未开始 | 会话、压缩、记忆持久化 |
 | 7 | 产物与验收 | 未开始 | Artifact、Rubric、Verifier |
@@ -89,7 +95,7 @@ deferred items」。
 | B-15 | 溯源是「出现过」的上界，不是因果链 | M5 | 真实溯源链 |
 | B-17 | 并发段里的 `KeyboardInterrupt` / `SystemExit` 逃进事件循环 | 接受 | CPython Task 机制，配对不变式仍成立 |
 | B-18 | hook 改写参数且有兄弟时一律按不可信算 | M5 | 真实溯源链 |
-| B-19 | 段内 hook 写轨迹的顺序取决于调度 | M3 | 捕获与回放同源时复核 |
+| B-19 | 段内 hook 写轨迹的顺序取决于调度 | 已修 | M3 D9 修订：轨迹只由内核写，并发窗口与可观察切点分发期间冻结 |
 | B-20 | 连续两个未配对批次留下孤儿 | 接受 | 不可达，且当前症状是响亮失败 |
 | B-21 | `SendMessage` 不限后代，唤醒会烧掉对方不可恢复的轮数 | M8 | 预算树决定这次唤醒记在谁账上 |
 | B-22 | `KillAgent` 的后代遍历是 O(子树) | M6 | Store 契约给「后代」一个单一定义 |
@@ -100,7 +106,7 @@ deferred items」。
 | D-46 | 派活 / 分叉树没有上限也没有回收 | M8 | 预算树与回收策略 |
 | 验收后续 | Agent 看不到自己还剩几轮，紧预算下一直调工具不收尾 | M8 | `GetBudget` 与预算注入历史 |
 | 验收后续 | `--max-turns` 是每个 Agent 各自的上限，总请求数没有严格上界 | M8 | 父子预算树 |
-| 轮换后续 | `ModelRouter` 不实现 `CachePrefixProvider`：经它的漂移检测只做逻辑比对，换平台记成一次 `identity` 漂移 | M3 | LLM span 记下作答平台，并转发成员的精确前缀单位 |
+| 轮换后续 | `ModelRouter` 不实现 `CachePrefixProvider`：经它的漂移检测只做逻辑比对，换平台记成一次 `identity` 漂移 | 已修 | M3 T8：LLM span 记下作答平台，`ModelRouter` 转发作答成员的前缀单位 |
 | 轮换后续 | 清单显式写的模型名只走 OpenRouter / `OPENAI_*`，一次 run 只能用一个 Gemini 型号 | M4 | 第三方 backend 装配定型时，给清单的 `model` 一个「平台 + 型号」的写法 |
 | D-61 | `Delegate` 对用完轮数的子 Agent 仍建议 SendMessage 继续 | 已修 | 登记表已关闭 |
 | M-3 | `provenance_of` / `strictest_trust` 不满足「公开签名需要它」 | M12 | API 冻结时决定是否扣留 |
@@ -266,6 +272,14 @@ syndica-dev topology
 建立统一 trace/span 模型、跨 Agent 因果链、可回放捕获格式，并在任何持久化写入之前执行脱敏。
 
 M3 必须排在早期：后续长跑、产物、HTTP、训练都依赖 trace 来调试和验收。
+
+### 当前状态
+
+已完成并审计通过（2026-10-02）。实现计划见 [`2026-10-01-m3-observability.md`](./2026-10-01-m3-observability.md)，
+收口审计见 [`docs/audits/2026-10-02-m3-final-audit.md`](../audits/2026-10-02-m3-final-audit.md)。与下面原始 TODO 的
+差别：记录是内核同步插桩而不是订阅事件流的 RuntimeModule（D2：钩子与事件拼出来的 trace 恰好在被拦、被取消、
+并发的地方缺口最多）；回放文档写进 `TraceStore`，没有单独的 `ReplayStore`；默认级别是「可回放」而不是「失败才留
+payload」（D8，用户裁决）；artifact / verification 边等 M7 的产物与验收落地再加；`--topology` 的 run 不写回放文档。
 
 ### 依赖
 

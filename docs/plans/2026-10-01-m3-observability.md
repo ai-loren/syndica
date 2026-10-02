@@ -1217,7 +1217,7 @@ run 结束时的导出不受此影响。导出不重试：429 / 503 只告警，
 - 导出到本地 mock collector 成功；trace 写入失败时 run 照常结束、stderr 恰好一条说明。
 - Agent 用 Read 读 `.syndica/traces/…` 被拒。
 
-**状态：完成。** `tests/integration/test_trace_e2e.py` 经公开 CLI 与按 Agent 分发的脚本化模型，在夹具项目
+**状态：完成（8bde5f9）。** `tests/integration/test_trace_e2e.py` 经公开 CLI 与按 Agent 分发的脚本化模型，在夹具项目
 （`tests/fixtures/trace/project/`，`.fixture` 后缀，用例前后核对夹具没变）的 tmp 副本里跑七条：派活的 run（子 Agent
 读文件、给根发消息）——`trace show` 的树、等待链与最慢的工具调用逐行对，派生边与消息边都在；Agent 的 Read 与 Write
 碰 `.syndica/traces/…` 被拒（拒绝以三件套作为工具结果返回），trace 文件不变；以模型失败结束的 run 回放出同样的结局；
@@ -1259,6 +1259,17 @@ Ctrl-C，把循环停在关线程池的半路上，asyncio 交出 `RuntimeError`
   交接文档与 next-todos；`AGENTS.md` 硬约束第 8 条改成「写进 trace 与导出给第三方的数据都先过内核的 `Redactor`；
   发给模型提供方的请求是唯一的例外」。
 - 写 M3 收口审计（`docs/audits/`），遗留项登记。
+
+**状态：完成。** 两次真实运行，都在仓库副本里、只用免费模型。`syndica-dev` 拓扑做一处真实小改动（`trace list` 的大小
+加 GB 一档并补一条用例）：40 次请求（Gemini 31、OpenRouter 9），Gemini 两次 429 记成平台故障事件，trace 256.6 KB、
+130 个 span、4 条派生边；`trace show` 回答了三个问题；run 结束时导出到本机的 mock collector。单 Agent 的只读运行写下
+回放文档，在没有 API key、代理不通的环境里 `trace replay` 复现；宿主环境里的假凭证写进提示词，trace 与导出里只有
+占位符。`prune` 的默认值保持 50（一个 trace 0.3–0.6 MB）。
+
+偏差：(1) 回放用第二次、单 Agent 的运行证明：`--topology` 的 run 不写回放文档（T14）。(2) 拓扑 run 的宿主复核撞上
+M3 自己的一条偶发失败的用例（负断言 `'caf' not in err` 与 trace 目录名里的随机十六进制相撞），没有提供提交；探针值
+换成 `quiz`，教训进 `AGENTS.md`。Agent 的改动原样带进本仓，另补四个单位各自起点的用例。详见
+[M3 收口审计](../audits/2026-10-02-m3-final-audit.md)。
 
 ---
 

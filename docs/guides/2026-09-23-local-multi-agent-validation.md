@@ -385,7 +385,39 @@ uv run python -m syndica run --handoff --topology syndica-dev "……（点名�
 
 ---
 
-## 11. 当前已知限制
+## 11. 看 trace、回放与导出（里程碑 3）
+
+目的：验证每次 run 都留下一个可读、可回放、可导出的 trace，且里面没有密钥。在仓库副本里跑：
+
+```bash
+uv sync --locked --extra openai --extra dev --extra otel
+uv run python -m syndica run "读取 README.md 的 Observability 一节，用两句话总结。不要修改文件。" --agent Worker --max-turns 4
+uv run python -m syndica trace list
+uv run python -m syndica trace show <上面那一行的 id>
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY uv run python -m syndica trace replay <id>
+uv run python -m syndica trace export <id> --otlp http://127.0.0.1:4318
+uv run python -m syndica trace prune --keep 50
+```
+
+符合预期：
+
+- run 结束时 stderr 打出 `trace：.syndica/traces/<UTC 时间>-<id>`。
+- `trace show`：谁创建了谁、谁在等谁、最慢的三个工具调用与时间线。
+- `trace replay` 在没有任何 API key 的环境里以 0 退出、打出「复现」：回放不发模型请求。它自己记一个新的 trace，
+  `trace list` 里那一行写着「回放自 <原 id>」。
+- `trace export`：本机的 collector（任何 OTLP/HTTP 接收端）收到 `/v1/traces`；以 1 退出说明 collector 没收下，
+  三件套说为什么。环境里设了 `OTEL_EXPORTER_OTLP_ENDPOINT` 时，每次 run 结束都会自动导出。
+- 在 trace 目录里搜你环境里的密钥值：一处也没有，只有 `[REDACTED:…]`。
+
+不符合预期 / 常见情况：
+
+- `trace replay` 以 2 退出、说没有回放文档：这个 trace 是 `--trace structure` 或 `--topology` 的 run 记的。
+- 回放以 1 退出：分叉那一行说是哪个 Agent、第几轮、哪个单元；你刚改过内核或宿主配置时这正是它该报的。
+- `trace list` 里一行写着「span 读不进来」：那个 trace 被改过（多半是 Agent 的 Bash），`trace show` 说是哪一行。
+
+---
+
+## 12. 当前已知限制
 
 - OpenRouter 免费模型每天有额度限制。`free-models-per-day` 429 是外部额度耗尽，不是 Syndica 逻辑
   错误。Gemini 免费档同样按型号限额。

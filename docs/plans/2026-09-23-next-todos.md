@@ -27,11 +27,15 @@
   `run --handoff` 的宿主复核与交接文件、人选择宿主执行的 git 收尾、`doctor --verify`、本仓的
   `syndica-dev` 配置；真实免费模型在仓库副本里完成了一次 `verified` 的自改动并推到本地 bare remote，
   那个提交原样进了本仓。收口审计见 [`docs/audits/2026-10-01-m2-final-audit.md`](../audits/2026-10-01-m2-final-audit.md)。
+- 2026-10-02 M3 可观测性 + 脱敏收口完成：内核统一 `Redactor` 与全仓写入点 / 外发点守卫、trace 模型与第五个
+  Store Protocol `TraceStore`、内核同步插桩（span 与派生 / 消息因果边）、默认「可回放」级别的捕获与离线
+  `trace replay`、`syndica trace list/show/replay/export/prune`、OTLP/HTTP JSON 导出。收口审计见
+  [`docs/audits/2026-10-02-m3-final-audit.md`](../audits/2026-10-02-m3-final-audit.md)。
 
 未完成：
 
-- M3-M12 共 10 个里程碑尚未实现。
-- GitHub Actions 本月额度用完：M2 的提交都只按本地验证协议验证过，额度恢复后在 Linux 上补跑 CI。
+- M4-M12 共 9 个里程碑尚未实现。
+- GitHub Actions 本月额度用完：M2、M3 的提交都只按本地验证协议验证过，额度恢复后在 Linux 上补跑 CI。
 - 其余遗留项已逐条归入 M2-M12 或标为接受的限制，见路线图「遗留项归属（2026-09-29）」。
 
 ---

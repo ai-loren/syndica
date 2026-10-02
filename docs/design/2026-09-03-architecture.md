@@ -190,9 +190,10 @@ heartbeat_at: float # 最近一次心跳
 - 孤儿可被回收（转为 `ZOMBIE`，保留可寻址性与已落盘的会话）或被其他进程接管
 - **单进程内存实现下租约恒有效，零额外开销** —— 这个机制只在需要它的部署形态下产生成本
 
-### 4.4 四个 Store Protocol
+### 4.4 五个 Store Protocol
 
-内核只依赖 Protocol，默认提供零依赖的内存 / 文件实现；生产部署可换 Redis / Postgres 实现而内核不改一行。
+内核只依赖 Protocol，默认提供零依赖的内存 / 文件实现；生产部署可换 Redis / Postgres 实现而内核不改一行。第五个是
+里程碑 3 加的 `TraceStore`，见本节末尾。
 
 #### AgentRegistry
 
@@ -212,6 +213,30 @@ class AgentRegistry(Protocol):
 **状态转换必须是 CAS 而不是直接赋值。** 单进程下直接赋值可行；多进程下两个执行体同时改同一个 Agent 的状态会丢失转换（例如挂起与中止相撞）。CAS 保证状态机在分布式实现下仍然是状态机。
 
 `update()` 是无条件写，因此**只允许用于单一写者拥有的字段**（例如该 Agent 自己的 metadata）。**多方可写的集合类字段（如子 Agent 列表）必须提供专用的原子操作**，不能让调用方"读出来、改一改、写回去"——那在多进程下必然丢更新。
+
+#### TraceStore（里程碑 3）
+
+```python
+class TraceStore(Protocol):
+    async def begin(self, header: TraceHeader) -> None: ...
+    async def append(self, trace_id: str, spans: Sequence[Span] = (), edges: Sequence[CausalityEdge] = ()) -> None: ...
+    async def put_payload(self, trace_id: str, payload: RedactedText) -> PayloadRef: ...
+    async def put_replay(self, trace_id: str, document: RedactedText) -> None: ...
+    async def finish(self, trace_id: str, status: SpanStatus, ended_ns: int) -> None: ...
+    async def traces(self) -> list[TraceHeader]: ...
+    async def find(self, prefix: str) -> TraceHeader | None: ...
+    async def get(self, trace_id: str) -> TraceHeader | None: ...
+    async def spans(self, trace_id: str) -> list[Span]: ...
+    async def edges(self, trace_id: str) -> list[CausalityEdge]: ...
+    async def payload(self, ref: PayloadRef) -> str | None: ...
+    async def replay(self, trace_id: str) -> str | None: ...
+    async def delete(self, trace_id: str) -> None: ...
+```
+
+**写入面只收 `RedactedText`**：脱敏器的输出是唯一能进 store 的东西（§12.3）。payload 按内容的 sha256 引用；没有
+结局（`status` 为空）的 trace 是记录到一半就断了的，回放与导出都拒绝它。内核带一份内存实现与随发行版分发的契约套件；
+CLI 用文件实现 `FileTraceStore`（`<工作区>/.syndica/traces/<UTC 时间>-<id 前 8 位>/`，目录 0700、文件 0600，每一级按
+名字以 `O_NOFOLLOW` 打开）。
 
 #### MessageBroker
 
@@ -1186,6 +1211,11 @@ trace                一次任务
 
 统一模型用 **OpenTelemetry** 语义导出。LLM 应用的可观测性已有成熟工具链，自建后端是纯负担且没人会用。内核只负责产出规范的 trace，接哪个后端由用户决定。
 
+**里程碑 3 的落地：** backend `syndica.backends.otel_otlp`（httpx，extra `otel`）只从 `TraceStore` 读，按 OTLP/HTTP
+JSON 发出；因果边转成 span links。端点只从用户自己的环境（`OTEL_EXPORTER_OTLP_ENDPOINT` 等 OpenTelemetry 约定的变量）
+或命令行（`syndica trace export <id> --otlp <url>`）来，**项目配置不能设端点**：仓库可能来自不受信任的人，它选的端点
+会收到 trace 的结构与用户的鉴权头。
+
 ### 11.3 生产运行可捕获为可回放形式（关键复用）
 
 **运行时记录所有 LLM 请求/响应与工具输入/输出，其格式与 §13.1 的场景回放格式相同。**
@@ -1194,17 +1224,20 @@ trace                一次任务
 
 因此捕获格式与回放格式**必须是同一个**。这是设计约束，不是可选优化——两者一旦分叉，这个能力就没了。
 
-#### 保留策略：分级，全量 payload 显式开启
+#### 保留策略：分级，全量请求显式开启
 
-可回放需要完整的请求与响应正文，而那恰好是体量最大的部分；长跑数百轮乘以数十个 Agent，全量保留会失控。这两个要求直接冲突，解法是分级：
+可回放需要完整的请求与响应正文，而那恰好是体量最大的部分；长跑数百轮乘以数十个 Agent，全量保留会失控。这两个要求直接冲突，解法是分级。里程碑 3 按用户裁决把默认定在「可回放」——回放只需要回复一侧（每轮几 KB），完整请求每轮都带着整段上下文、体量随轮数平方增长：
 
-| 数据 | 默认 | 理由 |
-| --- | --- | --- |
-| span 结构（时序、因果、token 计数、成本） | **永久保留** | 体量小，且它是"谁在等谁、钱花在哪"的全部依据 |
-| 失败与异常轮次的完整 payload | 保留 | 出问题的那几轮最需要细节 |
-| 全量 payload（完整可回放） | **显式开启** | 调试特定长跑任务时才开 |
+| 级别（`--trace` / `trace.level`） | span 与边 | 回放文档（回复、工具结果、人的答复、宿主档案、危险判定） | 完整请求 |
+| --- | --- | --- | --- |
+| `off` | — | — | — |
+| `structure` | 记 | — | — |
+| `replay`（默认） | 记 | 记 | 只记逐单元指纹 |
+| `full` | 记 | 记 | 记（逐叶脱敏后） |
 
-与本文档其他地方一致的原则：**贵的能力按需启用，不默认收费。** 需要注意的是分级不等于采样——采样会恰好丢掉关键那一轮，而按"是否失败"分级保证了最需要细节的地方一定有细节。
+与本文档其他地方一致的原则：**贵的能力按需启用，不默认收费。** 分级不等于采样——采样会恰好丢掉关键那一轮。trace 只在用户执行 `syndica trace prune` 时删除，不自动删（结构永久保留）。
+
+**捕获与回放是同一个格式：** 捕获写下的回放文档就是场景格式 v2（§13.1），`syndica trace replay <id>` 离线跑它——外部世界（模型回复、工具结局、人的答复、宿主的动作）按记录给出，内核全真并逐项比对（请求的逐单元指纹、工具真正执行的参数、每次闸门判定、每个 Agent 怎么停下的）；复现以 0 退出、分叉以 1、文档用不了以 2。
 
 ### 11.4 成本与进度可观测
 
@@ -1288,6 +1321,13 @@ Skill 是运行时按需加载的指令文本（§6.6），而第三方 Skill �
 - **脱敏在唯一收口执行**：trace 与会话的写入路径必须共用同一个脱敏器。否则每新增一个持久化点就漏一个。
 - 已知模式（常见密钥格式、认证头、私钥块）默认脱敏；用户可追加模式。
 - **脱敏有损且不可逆，这与可回放（§11.3）直接冲突。** 脱敏后的 trace 回放时缺少真实凭证，需要凭证的步骤会失败。**这是刻意的取舍：回放能力不值得用凭证泄漏风险来换。** 回放使用占位符，相关步骤失败是正确行为，不是缺陷。
+
+**里程碑 3 的落地：统一 `Redactor`。** `syndica.kernel.redaction` 是唯一的收口：规则（内置规则族加用户在
+`.syndica.yaml` 追加的 `custom.*`）有稳定 ID，命中处换成 `[REDACTED:<规则 ID>]`；脱敏幂等，结构化的数据逐叶脱敏
+（键名像密钥的值另按键判）；写入面只收它的输出 `RedactedText`（只有这个模块造得出来）。一条 AST 守卫扫整个包的
+写入点与外发点：落盘与发出的正文要么不带内容、要么是脱敏器的输出，例外逐个文件写明理由（Agent 自己的工具；发给
+模型提供方的请求）。trace、交接文件、提交消息、OTLP 导出都经它；规则集（版本、内置规则 ID 的顺序、用户规则）的
+摘要记进 trace 头，回放用记录下的规则集对自己的请求取同样的指纹。
 
 **里程碑 3 之前的收口：CLI 的最小脱敏器。** 里程碑 2 带来框架最早的两条落盘路径——`run --handoff` 写的交接文件与宿主执行的提交——它们不能等到 M3 的统一 `Redactor`。`syndica/cli/redaction.py` 先做最小的一份：宿主环境里名字像密钥、值像凭证的变量按值替换（被截断的 key 也认得出），加私钥块、`Authorization` 头、URL 里的 `user:pass@` 与几种公开的令牌格式；每条规则有稳定 ID，替换成 `[REDACTED:<规则 ID>]`。交接文件、`--handoff` 下的 stdout 与 stderr、提交消息都经它；先脱敏再截断，截剩的半截密钥不一定还认得出。提交前另扫一遍将要提交的新增行与文件名，只用逐字值、格式规则与完整的私钥块，命中就不提交——片段匹配允许误报，拦提交不允许。一条 AST 守卫保证 `syndica/cli` 里写文件、子进程参数与 stdin 要么不带内容，要么是脱敏器的输出。M3 建统一 `Redactor` 时把它并进去，规则 ID 保持不变。
 
@@ -1404,8 +1444,10 @@ CI 检查项：
 | 11 | 训练出口 | 中立轨迹 + SFT / 偏好 / RL 导出器 + 至少一个训练框架对接 |
 | 12 | 发布准备 | 英文文档、文档站、CI 矩阵、许可与贡献流程 |
 
-**状态（2026-10-01）：** 里程碑 1、2 已完成，审计见 [M1 收口审计](../audits/2026-09-23-m1-final-audit.md) 与
-[M2 收口审计](../audits/2026-10-01-m2-final-audit.md)。M2 的完成判据由一次真实运行证明：免费模型按本仓的
+**状态（2026-10-02）：** 里程碑 1、2、3 已完成，审计见 [M1 收口审计](../audits/2026-09-23-m1-final-audit.md)、
+[M2 收口审计](../audits/2026-10-01-m2-final-audit.md) 与 [M3 收口审计](../audits/2026-10-02-m3-final-audit.md)。
+M3 的完成判据（统一 trace / span、跨 Agent 因果链、运行捕获为可回放格式、脱敏收口）由一次真实运行与一套端到端
+用例证明，见 M3 收口审计。M2 的完成判据由一次真实运行证明：免费模型按本仓的
 `syndica-dev` 拓扑在仓库副本里改了 CLI 的一处交接文字并补了两条用例，宿主复核全过、Reviewer 给出 pass，人选择
 之后由宿主提交，这个提交原样进了本仓。
 
@@ -1547,3 +1589,21 @@ CI 检查项：
 | 103 | 本仓的开发配置 | `syndica-dev` 是纯声明式的项目配置与提示词，不进内核；角色轮数与提示词按真实运行调（D17） |
 | 104 | 转手执行的命令 | shell `-c`、`eval`、`xargs`、`find -exec` 交出的命令当命令再拆一遍，四族规则都看得见；超过 8 层按命中；`find` 只在不加收窄地删掉起点时算删根（M3 D16） |
 | 105 | wrapper 之后的候选命令词 | 照旧每个词都算候选；只有选项全认得出的 wrapper 启动确定不执行实参的程序时，它的实参不算（M3 T1） |
+
+#106 起来自[里程碑 3 计划](../plans/2026-10-01-m3-observability.md)的设计裁决（括号里是计划中的编号）。
+
+| # | 决策 | 结论 |
+| --- | --- | --- |
+| 106 | 记录的方式 | **内核插桩，同步，不靠钩子拼**：钩子拼出来的 trace 恰好在被拦的调用、被取消的 Agent、并发的段上缺口最多（D2） |
+| 107 | span 与 id | span、两类因果边（派生、消息）；span id 由稳定键确定地导出，回放按稳定键重发同一批 id（D3、D10） |
+| 108 | 统一 `Redactor` | 幂等、逐叶、带类型闸；写入面只收 `RedactedText`；规则 ID 沿用 M2（D4） |
+| 109 | 守卫的范围 | 写入点与外发点扫整个包，例外逐个文件写明理由（D5） |
+| 110 | 第五个 Store | `TraceStore`，内存实现与契约套件随内核发布，文件实现给 CLI（D6、D7） |
+| 111 | 默认记录级别 | **可回放**（用户裁决）：回复一侧记全，完整请求只记逐单元指纹；`full` 显式开启（D8） |
+| 112 | 轨迹的写者 | **轨迹只由内核写**：并发窗口与可观察切点分发期间冻结，hook 往里追加报错（D9 修订） |
+| 113 | 回放 | 外部世界按记录给出，内核全真并逐项比对；第一处分叉即停，`--allow-divergence` 时接着比（D11，用户裁决） |
+| 114 | 场景格式 | v2 一份 schema，手写与捕获共用；捕获的文档自成一份（正文内联）（D12） |
+| 115 | LLM 侧 | 记作答平台、token、平台故障；`ModelRouter` 转发前缀单位（D13） |
+| 116 | 导出 | OTLP/HTTP JSON，httpx backend；端点只从用户环境或命令行来，项目配置不能设；导出的是记录器自己写的（D14） |
+| 117 | CLI | `trace list / show / replay / export / prune`；`<id>` 收完整 id、唯一前缀或目录名；`trace replay` 自己记一个指向原 trace 的 trace（D15） |
+| 118 | 宿主私有目录 | `.syndica/traces` 与 `.syndica/handoffs` 只归宿主读写，Agent 的文件工具碰不到（Bash 碰得到，真边界在 M5）（D17） |

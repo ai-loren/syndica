@@ -765,7 +765,7 @@ def test_the_credential_after_an_auth_scheme_is_redacted_on_its_own(tmp_path: Pa
         (
             {
                 'OTEL_EXPORTER_OTLP_ENDPOINT': 'http://localhost:9',
-                'OTEL_EXPORTER_OTLP_HEADERS': 'x-token=caf%C3%A9',
+                'OTEL_EXPORTER_OTLP_HEADERS': 'x-token=quiz%C3%A9',
             },
             'ASCII 之外的字符',
         ),
@@ -796,7 +796,7 @@ def test_an_environment_the_export_cannot_use_warns_and_sends_nothing(
 
     assert (code, spy.calls) == (0, [])
     assert said in err and '下一步: ' in err
-    assert 'pw@' not in err and 'caf' not in err
+    assert 'pw@' not in err and 'quiz' not in err
 
 
 @pytest.mark.parametrize(

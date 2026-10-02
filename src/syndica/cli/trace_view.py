@@ -325,4 +325,6 @@ def _size(size: int) -> str:
         return f'{size} B'
     if size < 1024 * 1024:
         return f'{size / 1024:.1f} KB'
-    return f'{size / (1024 * 1024):.1f} MB'
+    if size < 1024 * 1024 * 1024:
+        return f'{size / (1024 * 1024):.1f} MB'
+    return f'{size / (1024 * 1024 * 1024):.1f} GB'

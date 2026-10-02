@@ -60,6 +60,19 @@ Milestone 2 makes Syndica able to change its own repository under a host that ch
 
 Milestone 2 audit: [`docs/audits/2026-10-01-m2-final-audit.md`](docs/audits/2026-10-01-m2-final-audit.md).
 
+Milestone 3 records every run as a trace and makes it replayable (see [Observability](#observability)):
+
+- One trace per `run` and per `chat` session under `.syndica/traces/`: spans for agents, turns, model
+  calls, tool calls, confirmations and waits, plus spawn and message edges between agents.
+- `syndica trace show` answers who created whom, who waits on whom, and which tool calls were slowest.
+- At the default `replay` level a captured run replays offline with `syndica trace replay`: the
+  outside world comes from the record, the kernel runs for real and is compared item by item.
+- OTLP/HTTP JSON export to a collector named in your own environment or on the command line.
+- One kernel `Redactor` for everything persisted or exported, with an AST guard over every write and
+  outbound point in the package.
+
+Milestone 3 audit: [`docs/audits/2026-10-02-m3-final-audit.md`](docs/audits/2026-10-02-m3-final-audit.md).
+
 ## Install From Source
 
 The package is not published yet. Use an editable checkout:
@@ -393,6 +406,52 @@ credential files under `HOME` (`~/.netrc`, `~/.npmrc`). Processes that call `set
 group cleanup. The real boundary is the sandbox planned for Milestone 5; until then, use development
 mode only on trusted input such as your own repository and prompts.
 
+## Observability
+
+Every `run` and every `chat` session is recorded as a trace in `.syndica/traces/<UTC time>-<id>/`
+(directories 0700, files 0600). The directory path is printed on stderr when the run ends, and
+`--handoff` files name it too. A trace that lost records says so (`trace（不完整…）`) and is neither
+replayed nor exported.
+
+| Level | Spans and edges | Replay document | Full requests |
+| --- | --- | --- | --- |
+| `off` | — | — | — |
+| `structure` | yes | — | — |
+| `replay` (default) | yes | yes | per-unit fingerprints only |
+| `full` | yes | yes | yes, redacted leaf by leaf |
+
+Set the level per run with `--trace` or for the project with `trace: {level: ...}` in
+`.syndica.yaml`; `chat` records at most `structure`. `--topology` runs write no replay document:
+the replay cannot rebuild what topology slots attach to their roles.
+
+- `syndica trace list` lists traces newest first (UTC time, id, status, agents, spans, size,
+  command; a replay's own trace says which trace it replayed).
+  An id may be the full id, a unique prefix, or the directory name printed after a run.
+- `syndica trace show <id>` prints who created whom, who waits on whom (a wait cycle is marked),
+  the three slowest tool calls, and a timeline.
+- `syndica trace replay <id>` replays the trace offline: model replies, tool results, human answers
+  and host actions come from the record, while the kernel, its danger judgement and every hook run
+  for real and are compared item by item. Exit 0 means it reproduced, 1 that it diverged (each
+  divergence names the agent, turn and unit), 2 that the trace cannot be replayed. The replay
+  records itself as a new trace that points back to the original.
+- `syndica trace export <id> [--otlp <url>]` sends the trace to an OTLP/HTTP collector. Exports
+  also happen at the end of every run when your environment names an endpoint
+  (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`), honouring
+  `OTEL_SDK_DISABLED`, `OTEL_TRACES_EXPORTER`, `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`.
+  `OTEL_EXPORTER_OTLP_HEADERS` go only with the environment's endpoint, never over plaintext HTTP to
+  another machine. A project's `.syndica.yaml` cannot choose the endpoint: a repository you do not
+  trust would otherwise receive your traces and your collector credentials. Install the extra with
+  `pip install 'syndica[otel]'`.
+- `syndica trace prune [--keep <n>]` keeps the newest `n` finished traces (default 50) and never
+  deletes an unfinished one; `syndica trace prune <id>...` deletes exactly the named traces.
+
+Everything written into a trace, a handoff file, a commit message or an export goes through the
+kernel `Redactor` first: secret-looking values from the host environment, built-in credential
+formats (private keys, `Authorization` headers, URL user info, common token formats, secret-named
+assignments), and your own `redaction.rules`. Each match becomes `[REDACTED:<rule id>]`. The
+agent's file tools cannot read or write `.syndica/traces` or `.syndica/handoffs`; its shell can,
+until the sandbox of milestone 5.
+
 ## CLI Reference
 
 ```text
@@ -403,6 +462,8 @@ syndica topology list | show <name>
 syndica flags list | show <key>
 syndica sessions list | show <id> | resume <id> | rm <id>   # reserved for M6
 syndica doctor [--verify]
+syndica trace list | show <id> | replay <id> [--allow-divergence]
+syndica trace export <id> [--otlp <url>] | prune [<id>...] [--keep <n>]
 syndica version
 ```
 
@@ -420,6 +481,7 @@ syndica version
 --no-write                read-only tools only
 --handoff                 host verification, a redacted handoff file, and the Git question
 --git-mode <mode>         commit | push | manual, answered in advance; requires --handoff
+--trace <level>           off | structure | replay | full (default: trace.level, then replay)
 ```
 
 `--agent`, `--topology`, and `--session` are mutually exclusive, and `--no-write` excludes
@@ -521,7 +583,7 @@ The v1.0 roadmap has 12 internal milestones:
 |---|---|---|
 | 1 | Kernel skeleton | Done |
 | 2 | Self-bootstrapping | Done |
-| 3 | Observability + redaction | Planned |
+| 3 | Observability + redaction | Done |
 | 4 | Complete extension system | Planned |
 | 5 | Complete execution layer + provenance | Planned |
 | 6 | State: sessions, compression, memory | Planned |

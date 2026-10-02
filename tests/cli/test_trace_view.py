@@ -429,3 +429,19 @@ def test_agents_nobody_spawned_are_roots_in_the_order_they_started():
     tree = _section(render_show(_header(), spans, []), '谁创建了谁：')
 
     assert tree == [f'  Explorer {_EARLY[:8]}', f'  Lead {_LEAD[:8]}']
+
+
+def test_sizes_of_a_gibibyte_or_more_are_shown_in_gb():
+    row = TraceRow(_header(), agents=1, spans=1, size=int(1.5 * 1024**3))
+    text = render_list([row])
+    assert '1.5 GB' in text
+
+
+@pytest.mark.parametrize(
+    ('size', 'shown'),
+    [(1023, '1023 B'), (1024, '1.0 KB'), (1024**2, '1.0 MB'), (1024**3, '1.0 GB')],
+)
+def test_each_size_unit_starts_at_its_power_of_1024(size: int, shown: str):
+    [line] = render_list([TraceRow(_header(), agents=1, spans=1, size=size)]).splitlines()
+
+    assert f'  {shown}  ' in line
