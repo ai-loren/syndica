@@ -435,9 +435,10 @@ the replay cannot rebuild what topology slots attach to their roles.
   replay can rebuild (safety, human interaction, retry) run for real and are compared item by item.
   Host modules it cannot rebuild, such as the development guard, are named in the output; their
   effects (the calls they skipped) are already in the record. Every agent sees its messages when the
-  record says it did (injected into the same turn; a cycle stops or carries straight on as it did),
-  a kill lands where it landed, and a call the original never got back stays pending until the
-  same interruption cuts it, so agents that ran concurrently replay the same way. Messages the host
+  record says it did (injected into the same turn, a deferred message put aside in the same turn; a
+  cycle stops or carries straight on as it did), a kill lands where it landed, and a call the
+  original never got back, or got back without its result landing, stays pending until the same
+  interruption cuts it, so agents that ran concurrently replay the same way. Messages the host
   sends (the entry, a person's answers) are not in the record and arrive when they are sent. Exit 0
   means it reproduced, 1 that it diverged (each divergence names the agent, turn and unit), 2 that
   the trace cannot be replayed. The replay records itself as a new trace that points back to the

@@ -1147,13 +1147,13 @@ def test_cut_calls_read_into_positions_in_the_order_written():
         (
             [[1, 1, 0]],
             {'tool_results': [{'call': [1, 1, 0], 'output': 'done'}]},
-            'cut[0]=[1, 1, 0] 也有结局',
+            'cut[0]=[1, 1, 0] 也有结局（tool_results）',
             '什么也没有交回',
         ),
         (
             [[1, 1, 1]],
             {'skipped': [{'call': [1, 1, 1], 'output': 'refused'}]},
-            'cut[0]=[1, 1, 1] 也有结局',
+            'cut[0]=[1, 1, 1] 也被跳过了（skipped）',
             '什么也没有交回',
         ),
     ],
@@ -1167,6 +1167,149 @@ def test_malformed_cut_calls_are_refused_with_what_to_change(
 
     assert received in caught.value.received
     assert next_action in caught.value.next_action + caught.value.expected
+
+
+def test_calls_that_returned_but_never_landed_read_into_positions_in_the_order_written():
+    document = parse_scenario_document(
+        _cutting(
+            [],
+            unlanded=[[1, 1, 1], [1, 1, 0]],
+            tool_results=[
+                {'call': [1, 1, 0], 'output': 'done'},
+                {'call': [1, 1, 1], 'output': 'done'},
+            ],
+        ),
+        source='captured.json',
+    )
+
+    [instance] = document.roles['Lead'].instances
+    assert instance.unlanded == ((1, 1, 1), (1, 1, 0))
+
+
+@pytest.mark.parametrize(
+    ('instance', 'received'),
+    [
+        ({'unlanded': [[1, 1, 0]]}, 'unlanded[0]=[1, 1, 0] 在 tool_results 里没有'),
+        (
+            {
+                'unlanded': [[1, 1, 0]],
+                'skipped': [{'call': [1, 1, 0], 'output': 'refused'}],
+            },
+            'unlanded[0]=[1, 1, 0] 在 tool_results 里没有',
+        ),
+        (
+            {
+                'unlanded': [[1, 1, 0], [1, 1, 0]],
+                'tool_results': [{'call': [1, 1, 0], 'output': 'done'}],
+            },
+            '[1, 1, 0] 重复',
+        ),
+    ],
+    ids=['no-outcome', 'skipped', 'twice'],
+)
+def test_malformed_unlanded_calls_are_refused_with_what_to_change(
+    instance: dict[str, object], received: str
+):
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(_cutting([], **instance), source='captured.json')
+
+    assert received in caught.value.received
+
+
+def test_a_call_both_cut_and_unlanded_is_refused_as_one_or_the_other():
+    document = _cutting(
+        [[1, 1, 1]],
+        unlanded=[[1, 1, 1]],
+        tool_results=[{'call': [1, 1, 0], 'output': 'done'}],
+    )
+
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(document, source='captured.json')
+
+    assert 'unlanded[0]=[1, 1, 1] 也在 cut 里' in caught.value.received
+    assert '没交回的在 cut 里' in caught.value.next_action
+
+
+def _stashing(deferred: object, messages: object = None, **instance: object) -> dict[str, Any]:
+    if messages is None:
+        messages = [{'turn': 2, 'ids': [_FIRST]}, {'turn': 4, 'ids': [_SECOND, _THIRD]}]
+    document = _injecting(messages)
+    document['agents']['Lead']['instances'][0].update(deferred=deferred, **instance)
+    return document
+
+
+def test_stashed_messages_read_into_turns_in_the_order_they_were_taken():
+    document = parse_scenario_document(
+        _stashing([{'turn': 3, 'ids': [_THIRD, _SECOND]}]), source='captured.json'
+    )
+
+    [instance] = document.roles['Lead'].instances
+    assert dict(instance.deferred) == {3: (_THIRD, _SECOND)}
+
+
+@pytest.mark.parametrize(
+    ('deferred', 'received', 'next_action'),
+    [
+        (
+            [{'turn': 4, 'ids': [_SECOND]}],
+            f'{_SECOND!r} 在第 4 轮暂存，messages 里却在第 4 轮注入',
+            '原样抄写 messages 与 deferred',
+        ),
+        (
+            [{'turn': 5, 'ids': [_SECOND]}],
+            f'{_SECOND!r} 在第 5 轮暂存，messages 里却在第 4 轮注入',
+            '原样抄写 messages 与 deferred',
+        ),
+        (
+            [{'turn': 3, 'ids': [_SECOND]}, {'turn': 2, 'ids': [_SECOND]}],
+            f'{_SECOND!r} 在',
+            '被暂存一次',
+        ),
+        ([{'turn': 3, 'ids': []}], '收到空列表', '没有暂存就删掉这一项'),
+    ],
+    ids=['same-turn', 'after-injection', 'twice', 'empty'],
+)
+def test_malformed_stashed_messages_are_refused_with_what_to_change(
+    deferred: object, received: str, next_action: str
+):
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(_stashing(deferred), source='captured.json')
+
+    assert received in caught.value.received
+    assert next_action in caught.value.next_action
+
+
+def test_stashed_messages_without_a_messages_record_are_refused():
+    document = _v2()
+    document['agents']['Lead']['instances'][0]['deferred'] = [{'turn': 3, 'ids': [_FIRST]}]
+
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(document, source='captured.json')
+
+    assert '只有 deferred' in caught.value.received
+    assert '原样抄写 messages 与 deferred' in caught.value.next_action
+
+
+def test_a_continued_turn_that_injected_only_stashed_messages_is_refused():
+    document = _stashing(
+        [{'turn': 3, 'ids': [_SECOND, _THIRD]}],
+        continued=[4],
+    )
+
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(document, source='captured.json')
+
+    assert '第 4 轮注入的都在 deferred 里' in caught.value.received
+    assert '原样抄写 messages、deferred 与 continued' in caught.value.next_action
+
+
+def test_a_continued_turn_with_a_message_from_the_mailbox_besides_stashed_ones_is_accepted():
+    document = parse_scenario_document(
+        _stashing([{'turn': 3, 'ids': [_SECOND]}], continued=[4]), source='captured.json'
+    )
+
+    [instance] = document.roles['Lead'].instances
+    assert instance.continued == {4}
 
 
 def _prefixed(**turns: dict[str, object]) -> dict[str, Any]:

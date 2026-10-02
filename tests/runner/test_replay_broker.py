@@ -19,7 +19,11 @@ _T = TypeVar('_T')
 
 
 def _no_hold(
-    agent_id: str, turn: int, missing: tuple[str, ...], waiter: asyncio.Future[object]
+    agent_id: str,
+    turn: int,
+    missing: tuple[str, ...],
+    waiter: asyncio.Future[object],
+    boundary: bool,
 ) -> Callable[[], None]:
     raise AssertionError(f'没有记录的邮箱不该登记等待：{agent_id} 第 {turn} 轮 {missing}')
 
@@ -31,8 +35,8 @@ class TestUnscheduledReplayBroker(MessageBrokerContract):
 
 
 class _Plan:
-    """收件人 `a1` 的记录与它此刻要开的那一轮；`holds` 是 broker 登记过的等待；发送方是 `host` 的
-    消息算宿主发的；`asleep` 是它进没进 zombie。"""
+    """收件人 `a1` 的记录与它此刻要开的那一轮；`holds` 是 broker 登记过的等待（最后一项是不是周期
+    边界）；发送方是 `host` 的消息算宿主发的；`asleep` 是它进没进 zombie。"""
 
     def __init__(
         self,
@@ -40,18 +44,22 @@ class _Plan:
         *,
         turn: int = 1,
         continued: Collection[int] = (),
+        deferred: dict[int, tuple[str, ...]] | None = None,
     ) -> None:
         self.messages = messages
         self.continued = frozenset(continued)
+        self.deferred = deferred or {}
         self.turn = turn
         self.asleep = False
-        self.holds: list[tuple[str, int, tuple[str, ...]]] = []
+        self.holds: list[tuple[str, int, tuple[str, ...], bool]] = []
         self.waiters: list[asyncio.Future[object]] = []
         self.released = 0
 
     def broker(self) -> ScheduledBroker:
         return ScheduledBroker(
-            lambda agent_id: Plan(self.messages, self.continued) if agent_id == 'a1' else None,
+            lambda agent_id: (
+                Plan(self.messages, self.continued, self.deferred) if agent_id == 'a1' else None
+            ),
             lambda _: self.turn,
             self.hold,
             from_host=lambda message: message.sender == 'host',
@@ -59,9 +67,14 @@ class _Plan:
         )
 
     def hold(
-        self, agent_id: str, turn: int, missing: tuple[str, ...], waiter: asyncio.Future[object]
+        self,
+        agent_id: str,
+        turn: int,
+        missing: tuple[str, ...],
+        waiter: asyncio.Future[object],
+        boundary: bool,
     ) -> Callable[[], None]:
-        self.holds.append((agent_id, turn, missing))
+        self.holds.append((agent_id, turn, missing, boundary))
         self.waiters.append(waiter)
 
         def release() -> None:
@@ -121,7 +134,7 @@ async def test_a_message_recorded_for_this_turn_that_was_not_sent_yet_holds_the_
 
     gate = asyncio.create_task(broker.consume('a1'))
     await _parked(gate)
-    assert plan.holds == [('a1', 1, ('m2',))]
+    assert plan.holds == [('a1', 1, ('m2',), False)]
     await broker.publish('a1', _message('m2'))
 
     assert [message.id for message in await _done(gate)] == ['m1', 'm2']
@@ -150,6 +163,47 @@ async def test_a_host_message_is_handed_over_on_arrival_ahead_of_the_recorded_on
     assert await _ids(broker) == ['h1', 'm1']
 
 
+async def test_the_gate_takes_what_was_stashed_that_turn_and_leaves_it_out_when_it_is_injected():
+    plan = _Plan({2: ('m1',), 4: ('d1', 'm3')}, deferred={3: ('d2', 'd1')}, turn=2)
+    broker = plan.broker()
+    await _ready(broker, 'm3', 'd1', 'm1', 'd2')
+
+    second = await _ids(broker)
+    plan.turn = 3
+    third = await _ids(broker)
+    plan.turn = 4
+    fourth = await _ids(broker)
+
+    assert (second, third, fourth) == (['m1'], ['d2', 'd1'], ['m3'])
+    assert plan.holds == []
+
+
+async def test_a_message_recorded_as_stashed_that_turn_holds_the_gate_until_it_is_sent():
+    plan = _Plan({}, deferred={3: ('d1',)}, turn=3)
+    broker = plan.broker()
+    await _ready(broker)
+
+    gate = asyncio.create_task(broker.consume('a1'))
+    await _parked(gate)
+    assert plan.holds == [('a1', 3, ('d1',), False)]
+    await broker.publish('a1', _message('d1'))
+
+    assert [message.id for message in await _done(gate)] == ['d1']
+
+
+async def test_a_parked_agent_does_not_wait_in_its_mailbox_for_what_it_stashed():
+    plan = _Plan({4: ('d1', 'm4')}, deferred={3: ('d1',)}, turn=4)
+    broker = plan.broker()
+    await _ready(broker)
+
+    parked = asyncio.create_task(broker.wait_for_messages('a1', None))
+    await _parked(parked)
+    assert plan.holds == [('a1', 4, ('m4',), False)]
+    await broker.publish('a1', _message('m4'))
+
+    assert await _done(parked) is True
+
+
 async def test_right_after_a_cycle_the_record_says_it_stopped_even_with_its_next_message_there():
     plan = _Plan({2: ('m2',)})
     broker = plan.broker()
@@ -169,7 +223,7 @@ async def test_right_after_a_cycle_the_record_says_it_went_on_so_the_poll_waits_
 
     poll = asyncio.create_task(broker.wait_for_messages('a1', 0))
     await _parked(poll)
-    assert plan.holds == [('a1', 2, ('m2', 'm3'))]
+    assert plan.holds == [('a1', 2, ('m2', 'm3'), True)]
     await broker.publish('a1', _message('m3'))
 
     assert await _done(poll) is True
@@ -194,7 +248,7 @@ async def test_once_parked_the_poll_before_its_next_cycle_answers_by_what_is_in_
 
     parked = asyncio.create_task(broker.wait_for_messages('a1', None))
     await _parked(parked)
-    assert plan.holds == [('a1', 2, ('m2',))]
+    assert plan.holds == [('a1', 2, ('m2',), False)]
     await broker.publish('a1', _message('m2'))
 
     assert await _done(parked) is True
@@ -309,6 +363,37 @@ async def test_messages_recorded_for_later_turns_outlive_the_mailbox_and_come_ba
 
     assert (third, fourth) == (['m3'], ['m4'])
     assert await broker.wait_for_messages('a1', 0) is False
+
+
+async def test_a_message_recorded_as_stashed_at_a_later_turn_outlives_the_mailbox():
+    plan = _Plan({1: ('m1',)}, deferred={3: ('d1',)}, turn=2)
+    broker = plan.broker()
+    await _ready(broker, 'd1', 'm9')
+
+    await broker.remove_queue('a1')
+    await broker.ensure_queue('a1')
+    plan.turn = 3
+
+    assert await _ids(broker) == ['d1']
+
+
+async def test_a_message_recorded_as_stashed_at_a_later_turn_does_not_wake_the_zombie():
+    plan = _Plan({}, deferred={3: ('d1',)}, turn=2)
+    broker = plan.broker()
+    revived: list[str] = []
+
+    async def revive(agent_id: str) -> bool:
+        revived.append(agent_id)
+        return True
+
+    broker.on_missing_queue(revive)
+    plan.asleep = True
+    await _ready(broker, 'd1')
+    await broker.remove_queue('a1')
+    for _ in range(60):
+        await asyncio.sleep(0)
+
+    assert revived == []
 
 
 async def test_a_message_due_next_turn_that_came_before_the_mailbox_went_wakes_the_zombie():

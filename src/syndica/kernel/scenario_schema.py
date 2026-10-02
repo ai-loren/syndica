@@ -101,7 +101,17 @@ _V1_AGENT = frozenset({'manifest', 'instances'})
 _V2_AGENT = _V1_AGENT | frozenset({'frozen'})
 _V1_INSTANCE = frozenset({'turns'})
 _V2_INSTANCE = _V1_INSTANCE | frozenset(
-    {'key', 'tool_results', 'skipped', 'gate', 'messages', 'continued', 'cut'}
+    {
+        'key',
+        'tool_results',
+        'skipped',
+        'gate',
+        'messages',
+        'deferred',
+        'continued',
+        'cut',
+        'unlanded',
+    }
 )
 _INJECTED = frozenset({'turn', 'ids'})
 _V1_TURN = frozenset({'content', 'tool_calls', 'raises'})
@@ -281,10 +291,14 @@ class GateRecord:
 class ScenarioInstance:
     """一个角色的一个运行时实例。`key` 是创建它的稳定键（v2，可选）。
 
-    `messages` 是每一轮开始前门注入的消息 id（轮 → 按注入的先后）：回放的门在那一轮取走的恰好是
-    它们。None 是没有记录（手写的文档），回放照常投递；空表是记录了、一条也没注入。`continued` 是
-    哪些轮开了一个紧接着上一个周期的新周期（上一个周期结束时消息已经在邮箱里，Agent 没有停下来
-    等）；没列出的那些周期是 Agent 停下之后被叫醒的。`cut` 是开了头却被取消在半路上的调用位置。"""
+    `messages` 是每一轮开始前门注入的消息 id（轮 → 按注入的先后）。None 是没有记录（手写的文档），
+    回放照常投递；空表是记录了、一条也没注入。`deferred` 是门在哪一轮从邮箱取走、暂存到下一个周期
+    的延迟消息（轮 → 按取走的先后）；它们在 `messages` 里出现在之后的某一轮。回放的门在每一轮从
+    邮箱取走的恰好是那一轮注入的（去掉早先暂存的）加上那一轮暂存的。`continued` 是哪些轮开了一个
+    新周期、且上一个周期结束时邮箱里已经有这一轮要注入的消息（Agent 没有停下来等）；没列出的那些
+    周期是 Agent 停下之后被后来的消息叫醒的。`cut` 是开了头却被取消在半路上、没有交回的调用位置；
+    `unlanded` 是外部工具交回了（结局在 `tool_results` 里）、结果却在落进轨迹之前被打断的调用
+    位置。"""
 
     replies: tuple[ScenarioReply, ...]
     key: tuple[str | int, ...] | None = None
@@ -292,8 +306,12 @@ class ScenarioInstance:
     skipped: tuple[SkippedCall, ...] = ()
     gate: tuple[GateRecord, ...] = ()
     messages: Mapping[int, tuple[str, ...]] | None = None
+    deferred: Mapping[int, tuple[str, ...]] = dataclasses.field(
+        default_factory=lambda: MappingProxyType[int, tuple[str, ...]]({})
+    )
     continued: frozenset[int] = frozenset()
     cut: tuple[tuple[int, int, int], ...] = ()
+    unlanded: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -882,19 +900,35 @@ def _instance(
         for index, item in enumerate(_sequence(data.get('cut', ()), f'{field}.cut'))
     )
     _unique_calls(field, 'cut', list(cut), [])
-    finished = {item.call for item in outcomes} | {item.call for item in skipped}
+    returned = {item.call for item in outcomes}
+    jumped = {item.call for item in skipped}
     for index, call in enumerate(cut):
-        if call in finished:
+        if call in returned or call in jumped:
             raise _error(
                 f'{field}.cut 里的调用没有交回：它不会同时有结局（tool_results）'
                 '或被跳过（skipped）',
-                f'{field}.cut[{index}]={list(call)!r} 也有结局',
+                f'{field}.cut[{index}]={list(call)!r} 也'
+                + ('有结局（tool_results）' if call in returned else '被跳过了（skipped）'),
                 '删掉不对的那一边：被取消在半路上的调用什么也没有交回',
+            )
+    unlanded = tuple(
+        _call_position(item, f'{field}.unlanded[{index}]')
+        for index, item in enumerate(_sequence(data.get('unlanded', ()), f'{field}.unlanded'))
+    )
+    _unique_calls(field, 'unlanded', list(unlanded), [])
+    for index, call in enumerate(unlanded):
+        if call not in returned or call in cut:
+            raise _error(
+                f'{field}.unlanded 里的调用交回了：它有结局（tool_results），也不在 cut 里',
+                f'{field}.unlanded[{index}]={list(call)!r} '
+                + ('也在 cut 里' if call in cut else '在 tool_results 里没有'),
+                '照捕获的文档原样抄写：交回了才有结局，没交回的在 cut 里',
             )
     if outcomes or skipped or gate or cut:
         _check_positions(field, replies, outcomes, skipped, gate, cut)
     messages = _injected(f'{field}.messages', data['messages']) if 'messages' in data else None
-    continued = _continued(f'{field}.continued', data.get('continued', ()), messages)
+    deferred = _stashed(field, data, messages)
+    continued = _continued(f'{field}.continued', data.get('continued', ()), messages, deferred)
     return ScenarioInstance(
         replies,
         key=key,
@@ -902,8 +936,10 @@ def _instance(
         skipped=skipped,
         gate=gate,
         messages=messages,
+        deferred=deferred,
         continued=continued,
         cut=cut,
+        unlanded=unlanded,
     )
 
 
@@ -941,8 +977,12 @@ def _expanded(
 
 
 def _continued(
-    field: str, value: object, messages: Mapping[int, tuple[str, ...]] | None
+    field: str,
+    value: object,
+    messages: Mapping[int, tuple[str, ...]] | None,
+    deferred: Mapping[int, tuple[str, ...]],
 ) -> frozenset[int]:
+    stashed = {message_id for ids in deferred.values() for message_id in ids}
     turns: set[int] = set()
     for index, item in enumerate(_sequence(value, field)):
         turn = _integer(item, f'{field}[{index}]', minimum=2)
@@ -958,11 +998,43 @@ def _continued(
                 f'第 {turn} 轮在 messages 里没有',
                 '照捕获的文档原样抄写 messages 与 continued',
             )
+        if all(message_id in stashed for message_id in messages[turn]):
+            raise _error(
+                f'{field} 里的每一轮注入了从邮箱取的消息（暂存的不经邮箱，周期结束时内核不为它们'
+                '问邮箱）',
+                f'第 {turn} 轮注入的都在 deferred 里',
+                '照捕获的文档原样抄写 messages、deferred 与 continued',
+            )
         turns.add(turn)
     return frozenset(turns)
 
 
-def _injected(field: str, value: object) -> Mapping[int, tuple[str, ...]]:
+def _stashed(
+    field: str, data: Mapping[str, object], messages: Mapping[int, tuple[str, ...]] | None
+) -> Mapping[int, tuple[str, ...]]:
+    if 'deferred' not in data:
+        return MappingProxyType({})
+    if messages is None:
+        raise _error(
+            f'{field} 有 deferred 时也有 messages（暂存的消息在之后的一轮注入，两者一起记录）',
+            '只有 deferred',
+            '照捕获的文档原样抄写 messages 与 deferred',
+        )
+    deferred = _injected(f'{field}.deferred', data['deferred'], verb='暂存')
+    injected_at = {message_id: turn for turn, ids in messages.items() for message_id in ids}
+    for turn, ids in deferred.items():
+        for message_id in ids:
+            later = injected_at.get(message_id)
+            if later is not None and later <= turn:
+                raise _error(
+                    f'{field}.deferred 里的消息在暂存之后的某一轮才被注入',
+                    f'{message_id!r} 在第 {turn} 轮暂存，messages 里却在第 {later} 轮注入',
+                    '照捕获的文档原样抄写 messages 与 deferred',
+                )
+    return deferred
+
+
+def _injected(field: str, value: object, *, verb: str = '注入') -> Mapping[int, tuple[str, ...]]:
     by_turn: dict[int, tuple[str, ...]] = {}
     seen: dict[str, str] = {}
     for index, raw in enumerate(_sequence(value, field)):
@@ -973,16 +1045,16 @@ def _injected(field: str, value: object) -> Mapping[int, tuple[str, ...]]:
             raise _error(
                 f'{field} 里每一轮只出现一次',
                 f'第 {turn} 轮出现了不止一次（{where}）',
-                '把同一轮注入的 id 合进一项，按注入的先后排',
+                f'把同一轮{verb}的 id 合进一项，按{verb}的先后排',
             )
         ids: list[str] = []
         for position, item in enumerate(_sequence(data['ids'], f'{where}.ids')):
             message_id = _nonblank(item, f'{where}.ids[{position}]')
             if message_id in seen:
                 raise _error(
-                    f'{field} 里每条消息只注入一次',
+                    f'{field} 里每条消息只{verb}一次',
                     f'{message_id!r} 在 {seen[message_id]} 与 {where} 都出现了',
-                    '一条消息只在一轮开始前被注入：照捕获的文档原样抄写',
+                    f'一条消息只在一轮开始前被{verb}一次：照捕获的文档原样抄写',
                 )
             seen[message_id] = where
             ids.append(message_id)
@@ -990,7 +1062,7 @@ def _injected(field: str, value: object) -> Mapping[int, tuple[str, ...]]:
             raise _error(
                 f'{where}.ids 至少有一个 id',
                 '收到空列表',
-                '那一轮没有注入就删掉这一项',
+                f'那一轮没有{verb}就删掉这一项',
             )
         by_turn[turn] = tuple(ids)
     return MappingProxyType(dict(sorted(by_turn.items())))

@@ -4,20 +4,24 @@
 时间，同一条消息可能早到也可能晚到——请求与记录对不上，派活的一方拿到的结果也可能不同，而内核
 什么都没改。所以收件人有记录时（`plan` 交回非 None），按记录在三个决定点上答：
 
-- **门在第 N 轮开始前 `consume`：** 交回记录里第 N 轮注入的那几条，按注入的先后；还没到的等它到，
+- **门在第 N 轮开始前 `consume`：** 交回记录里第 N 轮从邮箱取走的那几条——注入的（按注入的先后；
+  早先暂存的从控制块里出来，不在其中）与暂存的（内核照样把它们暂存到下一个周期）。还没到的等它到，
   记录里属于以后的留在邮箱里。
 - **一个周期刚结束时问「还有没有没处理的输入」：** 答记录里的那个答案。紧接着开了下一个周期的
   （`continued`），等它第一轮要注入的消息有一条到了，答有；别的答没有，Agent 照常停下来——原始
-  run 里它停了，派活的一方此刻拿到了它的结果。
+  run 里它停了，派活的一方此刻拿到了它的结果。手上有暂存的消息时内核不问，直接开下一个周期。
 - **停下来之后（停在邮箱上、或进了 zombie 又被叫醒）：** 它第一轮要注入的消息有一条到了就醒。
 
 邮箱随 Agent 停下被摘掉时，记录里属于以后几轮的消息留着，邮箱重建时放回去；下一轮要注入的那些
-已经到了时，等 Agent 进了 zombie 替它们把它叫醒：原始 run 里它们是之后才到的，到的那一刻叫醒了它。
+已经到了时，等 Agent 进了 zombie 替它们把它叫醒：原始 run 里它们是之后才到的（之前到的要么在那一
+轮被注入，要么被门暂存、不在邮箱里），到的那一刻叫醒了它。
 
 宿主发的消息（入口、人的答复）不在记录里（它们没有发送方的 span，消费时没有因果边），到了就照常
 投递。
 
-等一条还没到的消息时，这次等待交给回放登记（`hold`）：run 安静下来时还在等，就是一处分叉。
+等一条还没到的消息时，这次等待交给回放登记（`hold`），连同它是不是周期刚结束、记录说紧接着开了
+下一个周期的那一次（原始 run 里 Agent 没有停在那里，kill 落不到那里）：run 安静下来时还在等，就是
+一处分叉。
 
 没有记录的邮箱就是一个普通的内存 broker，契约与 `InMemoryMessageBroker` 相同。
 """
@@ -36,8 +40,9 @@ __all__ = ['GIVE_UP', 'Hold', 'Plan', 'ScheduledBroker']
 # 回放不再等了（允许分叉、run 已经安静下来）时交给等待者的值：拿邮箱里有的接着跑。
 GIVE_UP = object()
 
-# 登记一次等待：（收件人、第几轮、还没到的 id、等待者）→ 撤销这次登记。
-Hold = Callable[[str, int, tuple[str, ...], 'asyncio.Future[object]'], Callable[[], None]]
+# 登记一次等待：（收件人、第几轮、还没到的 id、等待者、是不是记录说紧接着开下一个周期的那次周期
+# 边界）→ 撤销这次登记。
+Hold = Callable[[str, int, tuple[str, ...], 'asyncio.Future[object]', bool], Callable[[], None]]
 
 # Agent 进 zombie 要走完它的收尾；替它叫醒之前最多等这么多轮事件循环。
 _REVIVE_TRIES = 50
@@ -45,11 +50,21 @@ _REVIVE_TRIES = 50
 
 @dataclass(frozen=True)
 class Plan:
-    """一个收件人的记录：每一轮开始前注入的消息（轮 → id，按注入的先后），以及哪些轮开了一个紧接着
-    上一个周期的新周期。"""
+    """一个收件人的记录：每一轮开始前注入的消息（轮 → id，按注入的先后）、哪些轮开了一个紧接着
+    上一个周期的新周期，以及门在哪一轮暂存了哪些延迟消息（轮 → id，按取走的先后）。"""
 
     messages: Mapping[int, tuple[str, ...]]
     continued: Collection[int] = frozenset()
+    deferred: Mapping[int, tuple[str, ...]] = field(default_factory=dict[int, tuple[str, ...]])
+
+    def taken(self, turn: int) -> tuple[str, ...]:
+        """门在第 `turn` 轮开始前从邮箱取走的：那一轮注入的（去掉早先暂存的，它们从控制块里出来），
+        加上那一轮暂存的。"""
+        stashed = {message_id for ids in self.deferred.values() for message_id in ids}
+        injected = tuple(
+            message_id for message_id in self.messages.get(turn, ()) if message_id not in stashed
+        )
+        return injected + self.deferred.get(turn, ())
 
 
 @dataclass
@@ -130,7 +145,7 @@ class ScheduledBroker:
         if plan is None:
             return _taken(box, box.messages, max_n)
         turn = self._next_turn(agent_id)
-        wanted = plan.messages.get(turn, ())
+        wanted = plan.taken(turn)
         await self._until(agent_id, box, turn, wanted, every=True)
         if self._boxes.get(agent_id) is not box:
             return []
@@ -150,7 +165,7 @@ class ScheduledBroker:
                 await self._woken_until(agent_id, box, timeout, lambda: bool(box.messages))
             return self._boxes.get(agent_id) is box and bool(box.messages)
         turn = self._next_turn(agent_id)
-        recorded = plan.messages.get(turn, ())
+        recorded = plan.taken(turn)
         wanted = frozenset(recorded)
 
         def present() -> bool:
@@ -172,7 +187,7 @@ class ScheduledBroker:
             return True
         if turn not in plan.continued:
             return False
-        await self._until(agent_id, box, turn, recorded, every=False)
+        await self._until(agent_id, box, turn, recorded, every=False, boundary=True)
         return self._boxes.get(agent_id) is box and present()
 
     async def take_by_correlation(
@@ -205,9 +220,9 @@ class ScheduledBroker:
             turn = self._next_turn(agent_id)
             later = {
                 message_id
-                for at, injected in plan.messages.items()
+                for at, ids in (*plan.messages.items(), *plan.deferred.items())
                 if at >= turn
-                for message_id in injected
+                for message_id in ids
             }
             kept = [
                 message
@@ -216,7 +231,7 @@ class ScheduledBroker:
             ]
             if kept:
                 self._kept[agent_id] = [*self._kept.get(agent_id, []), *kept]
-                due = set(plan.messages.get(turn, ()))
+                due = set(plan.taken(turn))
                 if self._asleep is not None and any(message.id in due for message in kept):
                     task = asyncio.get_running_loop().create_task(self._revive(agent_id))
                     self._reviving.add(task)
@@ -252,10 +267,11 @@ class ScheduledBroker:
         wanted: tuple[str, ...],
         *,
         every: bool,
+        boundary: bool = False,
     ) -> None:
-        """等记录里第 `turn` 轮要注入的消息到（`every` 时全部到，否则到一条——宿主的消息也算），或
-        邮箱被摘掉，或回放放弃。不看超时：原始 run 在这一刻已经收到了它们，它们到不到只取决于别的
-        Agent。"""
+        """等记录里第 `turn` 轮要从邮箱取走的消息到（`every` 时全部到，否则到一条——宿主的消息也
+        算），或邮箱被摘掉，或回放放弃。不看超时：原始 run 在这一刻已经收到了它们，它们到不到只取决
+        于别的 Agent。`boundary`：这是周期刚结束、记录说紧接着开了下一个周期的那次等待。"""
         loop = asyncio.get_running_loop()
         while self._boxes.get(agent_id) is box:
             present = {message.id for message in box.messages}
@@ -269,7 +285,7 @@ class ScheduledBroker:
                 return
             waiter: asyncio.Future[object] = loop.create_future()
             box.waiters.append(waiter)
-            release = self._hold(agent_id, turn, missing, waiter)
+            release = self._hold(agent_id, turn, missing, waiter, boundary)
             try:
                 if await waiter is GIVE_UP:
                     return

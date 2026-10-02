@@ -792,6 +792,8 @@ class BaseAgent:
             )
             self._tracing.consumed(message.id)
             await self._hooks.trigger(Junction.MESSAGE_INJECTED, ctx=ctx, message=message)
+        for message_id in decision.deferred:
+            self._tracing.deferred(message_id)
 
     async def _end_turn(self, ctx: Context, turn: int, message: ContextBlock | None) -> None:
         """turn 的可观测数据在 turn_end 切点之后才冻结，切点自身的耗时也计入（spec §5.1）。"""

@@ -181,10 +181,15 @@ class TurnGateDecision:
 
     `messages` 是**元组**而不是列表：它跨越了控制面与 turn 循环的边界，交出可变列表等于让接收方
     能改到发送方还在用的东西。
+
+    `deferred` 是这一次从邮箱取走、暂存到下一个周期再注入的那些消息的 id（只交 id，理由同
+    `ControlBlock.deferred_ids`）。只给插桩用：回放要在同一轮把它们交给门，否则邮箱里的那份在
+    一次 kill 之后的去向与原始 run 不同（暂存的留在控制块里，邮箱里的随队列一起没了）。
     """
 
     abort: bool = False
     messages: tuple[Message, ...] = ()
+    deferred: tuple[str, ...] = ()
 
 
 @runtime_checkable
@@ -252,12 +257,14 @@ class BrokerTurnGate:
         at_cycle_start = self._at_cycle_start
         self._at_cycle_start = False
         injected: list[Message] = self._control.take_deferred() if at_cycle_start else []
+        deferred: list[str] = []
         for message in await self._broker.consume(self._agent_id):
             if message.trigger is Trigger.DEFERRED and not at_cycle_start:
                 self._control.defer(message)
+                deferred.append(message.id)
             else:
                 injected.append(message)
-        return TurnGateDecision(messages=tuple(injected))
+        return TurnGateDecision(messages=tuple(injected), deferred=tuple(deferred))
 
     async def check_abort(self) -> bool:
         return self._control.take_abort()

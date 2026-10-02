@@ -1,9 +1,9 @@
 """捕获即回放：recorder 在记录的同时攒下回放文档要的东西，`finish` 时写成 `replay.json`。
 
 回放文档的大部分来自插桩本身：模型的回复与逐单元指纹、外部工具的结局与执行参数的指纹、跳过、
-闸门判定、每一轮开始前注入的消息、哪些周期是紧接着上一个开的（Agent 没有停下来等）、哪些调用开了头
-却没有返回（被打断）、人的答复、被宿主中止的请求、run 被打断时还在等外部世界的那些调用、各 Agent
-停下的原因。
+闸门判定、每一轮开始前注入的消息与门暂存的延迟消息、哪些周期是紧接着上一个开的（上一个周期结束时
+邮箱里已经有它要注入的消息）、哪些调用开了头却没有返回、哪些外部调用交回了结果却没落进轨迹（都是被
+打断的）、人的答复、被宿主中止的请求、run 被打断时还在等外部世界的那些调用、各 Agent 停下的原因。
 另一部分只有宿主知道——宿主档案、冻结后的角色、入口——由宿主在 run 开始之前交给
 `TraceRecorder.describe_run`。
 
@@ -75,8 +75,10 @@ class _Instance:
     skipped: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
     gate: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
     messages: dict[int, list[str]] = field(default_factory=dict[int, list[str]])
+    deferred: dict[int, list[str]] = field(default_factory=dict[int, list[str]])
     continued: set[int] = field(default_factory=set[int])
     cut: list[list[int]] = field(default_factory=list[list[int]])
+    unlanded: list[list[int]] = field(default_factory=list[list[int]])
     stop_reason: str | None = None
 
 
@@ -290,10 +292,13 @@ class ReplayCapture:
         """一条消息被消费了。消费它的是一轮（门在这一轮开始前注入它）时记下：回放的门在同一轮取走
         同一批，消息早到晚到都一样。被一次等待取走的不记：等待的一方本来就停在那里等它。
 
-        这一轮开了一个新的工作周期（第二个起），且这条消息在上一个周期结束之前就发出了：上一个周期
-        结束时它已经在邮箱里，Agent 没有停下来等，紧接着开了这个周期——记下这一轮。否则 Agent 先停了
-        下来（进了 zombie 或停在邮箱上），是后来的消息把它叫醒的。两者别人看得见：派活的一方要等子
-        Agent 停下才拿到它的结果。"""
+        这一轮开了一个新的工作周期（第二个起），且这条消息是从邮箱取的、在上一个周期结束之前就发出
+        了：上一个周期结束时它已经在邮箱里，Agent 没有停下来等，紧接着开了这个周期——记下这一轮。
+        早先被门暂存的不算：暂存的熬过 kill、不经邮箱注入，手上有暂存时内核也不问邮箱。没记下的，是
+        Agent 先停了下来（进了 zombie 或停在邮箱上），后来的消息把它叫醒的。两者别人看得见：派活的
+        一方要等子 Agent 停下才拿到它的结果。
+
+        被 kill、预算耗尽或抛了异常的周期之后不会有这样的一轮：那一刻邮箱里的随队列一起没了。"""
         located = self._turns.get(target_span_id)
         if located is None:
             return
@@ -304,9 +309,21 @@ class ReplayCapture:
         instance.messages.setdefault(turn, []).append(message_id)
         ended = self._cycle_ended.get(agent_id)
         sent = self._sent.get(message_id)
+        stashed = any(message_id in ids for ids in instance.deferred.values())
         if cycle is not None and cycle >= 2 and ended is not None and sent is not None:
-            if sent < ended:
+            if sent < ended and not stashed:
                 instance.continued.add(turn)
+
+    def deferred(self, span_id: str, message_id: str) -> None:
+        """门在这一轮开始前把一条延迟消息从邮箱取走、暂存到下一个周期（这一轮 span 上的
+        `message.deferred`）。回放的门在同一轮取走它，内核照样暂存。"""
+        located = self._turns.get(span_id)
+        if located is None:
+            return
+        agent_id, turn, _ = located
+        instance = self._instances.get(agent_id)
+        if instance is not None:
+            instance.deferred.setdefault(turn, []).append(message_id)
 
     def answered(self, span_id: str, message: Message) -> None:
         wait = self._waits.get(span_id)
@@ -357,11 +374,12 @@ class ReplayCapture:
         position = list(call.position)
         outcome = attributes.get('tool.outcome')
         recorded = call.tool in REPLAYED_TOOLS and call.returned is not None
-        if status is SpanStatus.CANCELLED and not isinstance(outcome, str) and not recorded:
-            # 开了头、被取消在半路上，结果没有落进轨迹。回放里真跑的内核工具（派活、发消息）在这里
-            # 不能交回，否则 Agent 就走到了原始 run 没走到的地方；记录了结局的外部工具由宿主动作的
-            # 等待名单停在原处。
-            instance.cut.append(position)
+        if status is SpanStatus.CANCELLED and not isinstance(outcome, str):
+            # 被取消时结果还没有落进轨迹。回放里这次调用不能让结果落下，否则 Agent 就走到了原始
+            # run 没走到的地方：没交回的（`cut`）停在半路上；外部工具交回了、结局记下了的
+            # （`unlanded`）拿到结局之后停住——打断它的可能是 kill、关机或宿主的中断，三者都没有
+            # 别的记录能把它停在这里。
+            (instance.unlanded if recorded else instance.cut).append(position)
         disposition = attributes.get('danger.disposition')
         if disposition is not None:
             gate: dict[str, object] = {
@@ -472,8 +490,19 @@ class ReplayCapture:
                             {'turn': turn, 'ids': ids}
                             for turn, ids in sorted(instance.messages.items())
                         ],
+                        **(
+                            {
+                                'deferred': [
+                                    {'turn': turn, 'ids': ids}
+                                    for turn, ids in sorted(instance.deferred.items())
+                                ]
+                            }
+                            if instance.deferred
+                            else {}
+                        ),
                         **({'continued': sorted(instance.continued)} if instance.continued else {}),
                         **({'cut': instance.cut} if instance.cut else {}),
+                        **({'unlanded': instance.unlanded} if instance.unlanded else {}),
                     }
                 )
             )

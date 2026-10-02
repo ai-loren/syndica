@@ -374,6 +374,8 @@ class _Missing:
     future: asyncio.Future[Any] | None = None
     fallback: object = None
     reported: bool = False
+    # 等在周期刚结束、记录说紧接着开了下一个周期的那次边界上：原始 run 里 Agent 没有停在这里。
+    boundary: bool = False
 
 
 class _Diverged:
@@ -595,6 +597,12 @@ class _Replay:
 
     def _stop(self) -> None:
         self._stopped = True
+        # 周期边界上的等待是内核的一次轮询被回放撑成了等：停下之后不再撑，答此刻邮箱里有什么。收尾
+        # 任务（被 kill 的 Agent 记丢弃的输入）也做这次轮询，而关机不取消收尾任务、只等它们——撑着
+        # 不放，关机就永远等不完。
+        for missing in self._waiting.values():
+            if missing.boundary and missing.future is not None and not missing.future.done():
+                missing.future.set_result(missing.fallback)
         if self._main is not None and not self._main.done():
             self._main.cancel()
 
@@ -797,9 +805,10 @@ class _Replay:
     def plan(self, agent_id: str) -> Plan | None:
         """这个收件人的记录；没有记录（手写的文档、记录里没有它、真时钟）时是 None。"""
         bound = self._bound.get(agent_id)
-        if not self._virtual or bound is None or bound.instance.messages is None:
+        instance = None if bound is None else bound.instance
+        if not self._virtual or instance is None or instance.messages is None:
             return None
-        return Plan(bound.instance.messages, bound.instance.continued)
+        return Plan(instance.messages, instance.continued, instance.deferred)
 
     def from_host(self, message: Message) -> bool:
         """宿主发的消息（入口、人的答复）：发送方不是回放里的哪个 Agent。"""
@@ -813,19 +822,26 @@ class _Replay:
         return info is not None and info.status is AgentStatus.ZOMBIE
 
     def hold(
-        self, agent_id: str, turn: int, missing: tuple[str, ...], waiter: asyncio.Future[object]
+        self,
+        agent_id: str,
+        turn: int,
+        missing: tuple[str, ...],
+        waiter: asyncio.Future[object],
+        boundary: bool,
     ) -> Callable[[], None]:
-        """记录里这一轮开始前注入的消息还没到：登记成一次停着的等待，run 安静下来时还在等就是
-        分叉。"""
+        """记录里这一轮开始前从邮箱取走的消息还没到：登记成一次停着的等待，run 安静下来时还在等
+        就是分叉。`boundary` 见 `_Missing`。"""
         key: StableKey = ('messages', agent_id, turn)
         entry = _Missing(
             Divergence(
                 'message',
                 f'{self._selector(agent_id)} 第 {turn} 轮',
-                f'记录里这一轮开始前注入了 {list(missing)!r}，回放安静下来时它们还不在它的邮箱里',
+                f'记录里这一轮开始前门从邮箱取走了 {list(missing)!r}，'
+                '回放安静下来时它们还不在它的邮箱里',
             ),
             waiter,
             GIVE_UP,
+            boundary=boundary,
         )
         self._waiting[key] = entry
 
@@ -837,8 +853,9 @@ class _Replay:
 
     async def settled(self, killer: str, target: str) -> None:
         """`KillAgent` 真的会落下（目标是发起方派出去的、还在的 Agent）时，发出之前等到 run 安静下
-        来、目标走到了原始 run 里 kill 落下的地方（见 `_at_kill_point`）。安静下来时还没走到也发出
-        去：它没走到的那些记录随后报成没用上。"""
+        来、目标走到了原始 run 里 kill 落下的地方（见 `_at_kill_point`）。安静下来时还没走到：还在
+        等记录里的消息就先报那一处（见 `_report_message_waits`）；不在等消息就照样发出去，它没走到
+        的那些记录随后报成没用上。"""
         if not self._virtual or self._stopped or not await self._lands(killer, target):
             return
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -864,12 +881,19 @@ class _Replay:
 
     def _at_kill_point(self, target: str) -> bool:
         """原始 run 里 kill 落下的那一刻目标停在哪里，回放里它就停在了那里：周期之间；记录里没有的
-        一步上（一次没有结局的模型或工具调用、一次没有答复的请求）；或者一次原始 run 里没交回的内核
-        工具调用里。周期里等着的消息不算：原始 run 里它在这个周期收到了它们，kill 在那之后。"""
+        一步上（一次没有结局的模型或工具调用、一次没有答复的请求、一次交回了却没落进轨迹的外部调用）；
+        或者一次原始 run 里没交回的内核工具调用里。等着的消息不算：周期里等的，原始 run 在这个周期
+        收到了它们；周期刚结束、记录说紧接着开了下一个周期时等的，原始 run 里它没有停在那里——kill
+        都在那之后。"""
+        waiting = [
+            (key[0], missing) for key, missing in self._waiting.items() if key[1:2] == (target,)
+        ]
+        if any(missing.boundary for _, missing in waiting):
+            return False
         tracer = self._tracer
         if tracer is None or not tracer.running(target):
             return True
-        waits = {key[0] for key in self._waiting if key[1:2] == (target,)}
+        waits = {kind for kind, _ in waiting}
         if 'messages' in waits:
             return False
         if waits:
@@ -976,9 +1000,11 @@ class _Replay:
                     )
                     if self._stopped:
                         return await self._parked()
-            if any(call.key in (action.waiting or ()) for action in self._pending):
-                # 原始 run 在这次调用交回之后、结果落进轨迹之前被打断（宿主的 hook 还在跑）：停在
-                # 这里，等那个打断同样地取消它。
+            if (bound is not None and position in bound.instance.unlanded) or any(
+                call.key in (action.waiting or ()) for action in self._pending
+            ):
+                # 原始 run 在这次调用交回之后、结果落进轨迹之前被打断（宿主的 hook 还在跑时来了
+                # kill、关机或宿主的中断）：停在这里，等同样的打断取消它。
                 cut = Divergence(
                     'tool',
                     where,

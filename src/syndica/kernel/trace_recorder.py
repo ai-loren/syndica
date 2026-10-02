@@ -680,12 +680,11 @@ class TraceRecorder:
 
     def add_event(self, span_id: str, name: str, attributes: dict[str, AttributeValue]) -> None:
         message_id = attributes.get('message.id')
-        if (
-            name == 'message.sent'
-            and isinstance(message_id, str)
-            and self._level is not TraceLevel.STRUCTURE
-        ):
-            self._capturing(lambda: self._capture.sent(message_id))
+        if isinstance(message_id, str) and self._level is not TraceLevel.STRUCTURE:
+            if name == 'message.sent':
+                self._capturing(lambda: self._capture.sent(message_id))
+            elif name == 'message.deferred':
+                self._capturing(lambda: self._capture.deferred(span_id, message_id))
         span = self._open.get(span_id)
         if span is None or self._failure is not None:
             return

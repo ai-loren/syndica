@@ -429,6 +429,11 @@ class _Tracing:
             return
         self.event('message.sent', {'message.id': message_id, 'message.to': receiver})
 
+    def deferred(self, message_id: str) -> None:
+        """门把这条消息从邮箱取走、暂存到下一个周期：在此刻的 span（取走它的那一轮）上记一个事件。
+        消息边仍在它真被注入的那一轮记。"""
+        self.event('message.deferred', {'message.id': message_id})
+
     def consumed(self, message_id: str) -> None:
         """消息边：发送时的 span → 此刻消费它的 span（注入它的那一轮，或等到它的那次等待）。"""
         sent = self._sent_from.pop(message_id, None)

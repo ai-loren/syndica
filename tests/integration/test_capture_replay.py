@@ -1061,6 +1061,299 @@ def test_an_interrupt_after_a_delegate_returned_but_before_its_result_landed_rep
     }
 
 
+def _replays(document: dict[str, Any], seeds: int) -> list[ReplayResult]:
+    """一次不加扰动的回放，再加 `seeds` 次加了扰动的。"""
+    scenario = parse_scenario_document(document, source='replay.json')
+    return [ReplayRunner().run(scenario)] + [
+        ReplayRunner(perturb=_noise(seed)).run(scenario) for seed in range(seeds)
+    ]
+
+
+def _delegated(trajectory: Sequence[ContextBlock], call_id: str) -> str:
+    [block] = [item for item in trajectory if item.role == 'tool' and item.tool_call_id == call_id]
+    return str(block.content)
+
+
+def test_a_delegated_child_woken_again_after_it_answered_hands_back_its_first_answer():
+    root: list[Step] = [
+        _calls(('d1', 'Delegate', {'agent': 'Lead', 'query': 'work'})),
+        _calls(('b1', 'Bash', {'command': 'sleep 0.8'})),
+        _say('lead done'),
+    ]
+    child: list[Step] = [
+        _calls(('d2', 'Delegate', {'agent': 'Lead', 'query': 'say hi'})),
+        lambda agents: _calls(
+            ('s1', 'SendMessage', {'agent_id': agents[2], 'content': 'report soon'})
+        ),
+        _say('first'),
+        _say('second'),
+    ]
+    grandchild: list[Step] = [
+        _say('gc hi'),
+        _calls(('g1', 'Bash', {'command': 'sleep 0.3'})),
+        lambda agents: _calls(('g2', 'SendMessage', {'agent_id': agents[1], 'content': 'report'})),
+        _say('gc done'),
+    ]
+
+    text, original = _kernel_capture([root, child, grandchild])
+    document = json.loads(text)
+    _, worker, _ = document['agents']['Lead']['instances']
+    lead_id = next(item['id'] for item in document['ids'] if item['key'] == ['host', 'spawn', 0])
+    results = _replays(document, 6)
+
+    assert 'first' in _delegated(original[lead_id], 'd1')
+    assert worker.get('continued') is None and len(worker['turns']) == 4
+    assert [result.divergences for result in results] == [()] * 7
+    assert all('first' in _delegated(result.trajectories['Lead[0]'], 'd1') for result in results)
+    assert _assert_same_trajectories(document, results[0], original) == {
+        'Lead[0]',
+        'Lead[1]',
+        'Lead[2]',
+    }
+
+
+def _goes_straight_on() -> list[list[Step]]:
+    """派出去的子 Agent 在最后一次模型调用的半路上收到孙 Agent 的报告，紧接着开了第二个周期；根的
+    派活要等它两个周期都跑完。"""
+    root: list[Step] = [
+        _calls(('d1', 'Delegate', {'agent': 'Lead', 'query': 'work'})),
+        _say('lead done'),
+    ]
+    child: list[Step] = [
+        _calls(('d2', 'Delegate', {'agent': 'Lead', 'query': 'say hi'})),
+        lambda agents: _calls(
+            ('s1', 'SendMessage', {'agent_id': agents[2], 'content': 'report soon'})
+        ),
+        _slow(1.0, _say('first')),
+        _say('second'),
+    ]
+    grandchild: list[Step] = [
+        _say('gc hi'),
+        _calls(('g1', 'Bash', {'command': 'sleep 0.2'})),
+        lambda agents: _calls(('g2', 'SendMessage', {'agent_id': agents[1], 'content': 'report'})),
+        _say('gc done'),
+    ]
+    return [root, child, grandchild]
+
+
+def test_a_delegated_child_that_went_straight_on_hands_back_its_second_answer_in_replay_too():
+    text, original = _kernel_capture(_goes_straight_on())
+    document = json.loads(text)
+    _, worker, _ = document['agents']['Lead']['instances']
+    lead_id = next(item['id'] for item in document['ids'] if item['key'] == ['host', 'spawn', 0])
+    results = _replays(document, 6)
+
+    assert 'second' in _delegated(original[lead_id], 'd1')
+    assert worker['continued'] == [4]
+    assert [result.divergences for result in results] == [()] * 7
+    assert all('second' in _delegated(result.trajectories['Lead[0]'], 'd1') for result in results)
+    assert _assert_same_trajectories(document, results[0], original) == {
+        'Lead[0]',
+        'Lead[1]',
+        'Lead[2]',
+    }
+
+
+def test_a_kill_after_a_child_went_straight_on_into_another_cycle_lands_inside_that_cycle():
+    from syndica.kernel import RetryModule
+
+    failure = LLMResponseError(expected='a reply', received='HTTP 503', next_action='retry later')
+    flags = {'llm_retry_attempts': 1, 'llm_retry_backoff_ms': 900}
+    root: list[Step] = [
+        _calls(('d1', 'Delegate', {'agent': 'Lead', 'query': 'say hi'})),
+        _calls(('d2', 'Delegate', {'agent': 'Lead', 'query': 'say hi'})),
+        lambda agents: _calls(('s1', 'SendMessage', {'agent_id': agents[1], 'content': 'go'})),
+        lambda agents: _calls(('s2', 'SendMessage', {'agent_id': agents[2], 'content': 'go'})),
+        _calls(('b1', 'Bash', {'command': 'sleep 2.2'})),
+        lambda agents: _calls(('k1', 'KillAgent', {'agent_id': agents[1]})),
+        _slow(
+            0.3,
+            lambda agents: _calls(
+                ('s3', 'SendMessage', {'agent_id': agents[1], 'content': 'resume'})
+            ),
+        ),
+        _calls(('b2', 'Bash', {'command': 'sleep 0.3'})),
+        _say('done'),
+    ]
+    killed: list[Step] = [
+        _say('hi'),
+        _calls(('c1', 'Bash', {'command': 'sleep 0.5'})),
+        _slow(1.0, _say('c done')),
+        _calls(('c2', 'Bash', {'command': 'sleep 30'})),
+        _say('resumed'),
+    ]
+    sender: list[Step] = [
+        _say('s hi'),
+        failure,
+        lambda agents: _calls(('m1', 'SendMessage', {'agent_id': agents[1], 'content': 'more'})),
+        _say('s done'),
+    ]
+
+    text, original = _kernel_capture(
+        [root, killed, sender],
+        runtime={'modules': (RetryModule({}),), 'flags': flags},
+        host={'modules': ['retry'], 'flags': flags},
+    )
+    document = json.loads(text)
+    _, child, _ = document['agents']['Lead']['instances']
+    results = _replays(document, 6)
+
+    assert child['continued'] == [4] and child['cut'] == [[3, 4, 0]]
+    assert [result.divergences for result in results] == [()] * 7
+    assert _assert_same_trajectories(document, results[0], original) == {
+        'Lead[0]',
+        'Lead[1]',
+        'Lead[2]',
+    }
+
+
+def _stashed_then_killed() -> list[list[Step]]:
+    """子 Agent 在一个周期的半路上暂存了一条延迟消息，随即在跑命令时被 kill；对 zombie 的第二次
+    kill 什么也不做，之后的一条消息把它叫醒，暂存的那条与它一起注入。"""
+    root: list[Step] = [
+        _calls(('d1', 'Delegate', {'agent': 'Lead', 'query': 'say hi'})),
+        lambda agents: _calls(('s1', 'SendMessage', {'agent_id': agents[1], 'content': 'go on'})),
+        _calls(('b1', 'Bash', {'command': 'sleep 0.1'})),
+        lambda agents: _calls(
+            (
+                's2',
+                'SendMessage',
+                {'agent_id': agents[1], 'content': 'later', 'trigger': 'deferred'},
+            )
+        ),
+        _calls(('b2', 'Bash', {'command': 'sleep 0.8'})),
+        lambda agents: _calls(('k1', 'KillAgent', {'agent_id': agents[1]})),
+        _slow(0.3, lambda agents: _calls(('k2', 'KillAgent', {'agent_id': agents[1]}))),
+        lambda agents: _calls(('s3', 'SendMessage', {'agent_id': agents[1], 'content': 'resume'})),
+        _calls(('b3', 'Bash', {'command': 'sleep 0.3'})),
+        _say('done'),
+    ]
+    child: list[Step] = [
+        _say('hi'),
+        _calls(('c1', 'Bash', {'command': 'sleep 0.5'})),
+        _calls(('c2', 'Bash', {'command': 'sleep 30'})),
+        _say('resumed'),
+    ]
+    return [root, child]
+
+
+def test_a_deferred_message_stashed_when_its_recipient_was_killed_stays_stashed_in_replay():
+    text, original = _kernel_capture(_stashed_then_killed())
+    document = json.loads(text)
+    _, killed = document['agents']['Lead']['instances']
+    [later] = killed['deferred']
+    results = _replays(document, 6)
+
+    assert later['turn'] == 3 and killed['cut'] == [[2, 3, 0]] and 'continued' not in killed
+    assert [(item['turn'], item['ids']) for item in killed['messages']][1] == (
+        4,
+        [*later['ids'], killed['messages'][1]['ids'][1]],
+    )
+    assert [result.divergences for result in results] == [()] * 7
+    assert _assert_same_trajectories(document, results[0], original) == {'Lead[0]', 'Lead[1]'}
+
+
+def test_a_replay_that_halts_while_a_killed_childs_teardown_waits_at_a_cycle_boundary_ends():
+    text, _ = _kernel_capture(_stashed_then_killed())
+    document = json.loads(text)
+    _, killed = document['agents']['Lead']['instances']
+    killed['continued'] = [4]
+
+    replayed = ReplayRunner().run(parse_scenario_document(document, source='replay.json'))
+
+    assert not replayed.reproduced
+    assert [(item.kind, item.where) for item in replayed.divergences] == [
+        ('message', 'Lead[1] 第 4 轮')
+    ]
+
+
+@pytest.mark.parametrize('cut_by', ['kill', 'shutdown'])
+def test_a_tool_that_returned_but_was_cut_before_its_result_landed_stays_cut_in_replay(
+    cut_by: str,
+):
+    def slow_hook(agent: Any) -> None:
+        from syndica.kernel import HookResult, Junction
+
+        async def after(tool_call: ToolCall, **_: Any) -> HookResult:
+            if tool_call.id == 'c1':
+                await asyncio.get_running_loop().create_future()
+            return HookResult()
+
+        agent.register_hook(Junction.POST_TOOL_USE, after)
+
+    kill: list[Step] = [lambda agents: _calls(('k1', 'KillAgent', {'agent_id': agents[1]}))]
+    root: list[Step] = [
+        _calls(('d1', 'Delegate', {'agent': 'Lead', 'query': 'say hi'})),
+        lambda agents: _calls(('s1', 'SendMessage', {'agent_id': agents[1], 'content': 'go on'})),
+        _calls(('b1', 'Bash', {'command': 'sleep 0.5'})),
+        *(kill if cut_by == 'kill' else []),
+        _say('done'),
+    ]
+    child: list[Step] = [
+        _say('hi'),
+        _calls(('c1', 'Bash', {'command': 'printf hi'})),
+        _say('never'),
+    ]
+
+    text, original = _kernel_capture([root, child], hook=slow_hook)
+    document = json.loads(text)
+    _, stopped = document['agents']['Lead']['instances']
+    results = _replays(document, 4)
+
+    assert stopped['unlanded'] == [[2, 2, 0]] and 'cut' not in stopped
+    assert [item['call'] for item in stopped['tool_results']] == [[2, 2, 0]]
+    assert document['host_actions'] == []
+    assert [result.divergences for result in results] == [()] * 5
+    assert _assert_same_trajectories(document, results[0], original) == {'Lead[0]', 'Lead[1]'}
+
+
+def test_a_kill_of_a_grandchild_waits_for_it_to_reach_where_the_original_kill_landed():
+    from syndica.kernel import RetryModule
+
+    failure = LLMResponseError(expected='a reply', received='HTTP 503', next_action='retry later')
+    flags = {'llm_retry_attempts': 1, 'llm_retry_backoff_ms': 300}
+    root: list[Step] = [
+        _calls(('d1', 'Delegate', {'agent': 'Lead', 'query': 'start'})),
+        _calls(('b1', 'Bash', {'command': 'sleep 0.8'})),
+        lambda agents: _calls(('k1', 'KillAgent', {'agent_id': agents[2]})),
+        _say('lead done'),
+    ]
+    child: list[Step] = [
+        _calls(('d2', 'Delegate', {'agent': 'Lead', 'query': 'say hi'})),
+        lambda agents: _calls(
+            ('s1', 'SendMessage', {'agent_id': agents[2], 'content': 'long job'})
+        ),
+        _say('child done'),
+    ]
+    grandchild: list[Step] = [
+        _say('gc hi'),
+        failure,
+        _calls(('g1', 'Bash', {'command': 'sleep 30'})),
+    ]
+
+    text, original = _kernel_capture(
+        [root, child, grandchild],
+        runtime={'modules': (RetryModule({}),), 'flags': flags},
+        host={'modules': ['retry'], 'flags': flags},
+    )
+    document = json.loads(text)
+    *_, killed = document['agents']['Lead']['instances']
+    results = _replays(document, 4)
+
+    assert killed['cut'] == [[2, 2, 0]]
+    assert [(reply['turn'], reply['attempt']) for reply in killed['turns']] == [
+        (1, 1),
+        (2, 1),
+        (2, 2),
+    ]
+    assert [result.divergences for result in results] == [()] * 5
+    assert _assert_same_trajectories(document, results[0], original) == {
+        'Lead[0]',
+        'Lead[1]',
+        'Lead[2]',
+    }
+
+
 def _risky(policy: object, **runtime: Any) -> tuple[str, dict[str, list[ContextBlock]]]:
     """一次跑在给定处置策略下的高风险命令（递归强删一个不存在的目录）：宿主档案照它写。"""
     from syndica.cli.capture import host_profile
