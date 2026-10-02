@@ -21,10 +21,11 @@ from syndica.cli import trace_commands
 from syndica.cli.handoff import trace_directory
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, TraceRequest, main
-from syndica.cli.trace_commands import Replayer
+from syndica.cli.trace_commands import Replayer, TraceUnusable, resolved, trace_list
 from syndica.kernel import (
     ContractViolation,
     FileTraceStore,
+    InMemoryTraceStore,
     LLMResponseError,
     RedactionRule,
     RuleRedactor,
@@ -801,6 +802,28 @@ def test_a_replay_trace_that_was_left_unfinished_is_labelled_so(tmp_path: Path):
     assert [line for line in reasons if '写入任务被取消' in line] == reasons[:1]
 
 
+def test_the_trace_commands_work_over_a_store_that_has_only_the_protocol():
+    store = InMemoryTraceStore()
+
+    async def run() -> tuple[str, TraceHeader, TraceUnusable, str]:
+        recorder = TraceRecorder(store, RuleRedactor())
+        await recorder.begin()
+        await recorder.finish(SpanStatus.OK)
+        listed = await trace_list(store)
+        header = await resolved(store, recorder.trace_id[:8])
+        try:
+            await resolved(store, '20261002T143807Z-' + recorder.trace_id[:8])
+        except TraceUnusable as refused:
+            return listed, header, refused, recorder.trace_id
+        raise AssertionError('a directory name means nothing to a store without directories')
+
+    listed, header, refused, trace_id = asyncio.run(run())
+
+    assert '大小不明' in listed and trace_id[:8] in listed
+    assert header.trace_id == trace_id
+    assert '20261002T143807Z' in refused.received
+
+
 def test_a_replay_puts_back_the_gitignore_that_keeps_traces_out_of_git(tmp_path: Path):
     original = _worker_run(tmp_path)
     gitignore = tmp_path / '.syndica' / '.gitignore'
@@ -998,7 +1021,7 @@ def test_prune_reports_a_trace_two_directories_claim_once(tmp_path: Path):
     assert claimed.trace_id[:8] in failures[0] and '只有一个目录' in failures[0]
 
 
-def test_a_directory_name_is_matched_only_against_the_traces_it_could_name(
+def test_a_directory_name_opens_that_directory_instead_of_looking_through_every_trace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     for prefix, started in [('aa', 1), ('bb', 2), ('cc', 3)]:
@@ -1013,10 +1036,11 @@ def test_a_directory_name_is_matched_only_against_the_traces_it_could_name(
 
     monkeypatch.setattr(FileTraceStore, 'directory', counting)
 
-    code, _, _ = _cli(tmp_path, ['trace', 'show', name])
+    code, out, _ = _cli(tmp_path, ['trace', 'show', name])
 
     assert code == 0
-    assert asked == ['bb' * 16]
+    assert 'bb' * 16 in out
+    assert asked == []
 
 
 @dataclass(frozen=True)

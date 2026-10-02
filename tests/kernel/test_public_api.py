@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import importlib
 import inspect
 import os
+import typing
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -100,7 +103,9 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'PrefixDriftModule',
     'PrefixDriftRecord',
     'PrefixDriftService',
+    'RedactedText',
     'RedactionRule',
+    'Redactor',
     'Reply',
     'RetryModule',
     'RiskLevel',
@@ -139,12 +144,14 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'WaitState',
     'Waiter',
     'Workspace',
+    'encode_redacted',
     'local_tools',
     'orchestration_tools',
     'parse_scenario_document',
     'provenance_of',
     'register_builtins',
     'strictest_trust',
+    'verbatim_attribute',
 )
 # contracts 随 wheel 发布，是第三方写 Store 实现的入口（spec §13.3），同属兼容承诺。
 _CONTRACT_EXPORTS: tuple[str, ...] = (
@@ -302,33 +309,51 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # - 八个工具类不进承诺面，宿主用 `local_tools` 按键取。
 # - `RuleTablePolicy`：M2 开发期宿主用的按表处置；进不进承诺面在 M12 冻结公开 API 时定。
 # - 三个规则工厂（`git_state_change_rule` 等）：M2 开发期宿主组合的可选规则，同上待 M12 定。
-# - `RedactedText` / `encode_redacted`：还没有公开入口收它们（trace 的写入面是第一个，到那时再判）。
-# - `Redactor`：还没有公开入口收一个脱敏器，宿主直接用 `RuleRedactor`。第一个收它的入口（trace 的
-#   写入面）还要规则集的摘要，协议的形状到那时连同这个成员一起定。
 # - `RULE_IDS` / `RULES_VERSION`：宿主不需要它们就能构造与使用脱敏器；两者都算进了
 #   `RuleRedactor.digest`，判断两套规则是不是同一套比摘要即可。
 # - `looks_secret`：宿主从自己的环境里挑密钥值时用；内核的公开入口只收挑好的值。
 # - `write_all` / `write_redacted`：包内落盘只经它们（写入点守卫认得的写法）；宿主不需要它们就能
 #   用任何一个公开入口。
 # - `RandomIds`：`Runtime(ids=None)` 的默认值，宿主不传就是它。「当前工具调用」与它的那几个进出
-#   函数（`current_tool_call`、`ToolCallKey`、`entering_tool_call` 等）是内核插桩与回放的接缝，
-#   trace 的公开面定下来时再判。
-# - trace 的模型、`TraceStore` 协议、内存实现与它的契约套件：还没有公开入口收一个 TraceStore。第一个
-#   是 `TraceRecorder`，trace 的公开面到那时一起定，契约套件随协议一起进承诺面。
-# - 场景文档各部分的类型（`ScenarioRole`、`ToolOutcome`、`HostProfile` 等）与 schema 的常量：
-#   回放（T13）与捕获（T14）还会动它们的形状。入口（`parse_scenario_document`、`ScenarioDocument`、
-#   `PayloadText`）先进承诺面，各部分到捕获写出的文档定稿时再判。
+#   函数（`current_tool_call`、`ToolCallKey`、`entering_tool_call` 等）是内核插桩与回放的接缝：
+#   tracer 从 span 的属性（`tool.call_id`、调用位置）拿到同样的信息，宿主不需要它们。
+# - `ATTRIBUTE_KINDS` / `ATTRIBUTE_DOMAINS` / `TRACE_SCHEMA` 与场景文档各部分的类型
+#   （`ScenarioRole`、`HostProfile` 等）：经各自的子模块承诺（`_PROMISED_VIA_SUBMODULE`），不进
+#   `kernel.__all__`——写第三方 store、导出器与读回放文档的人读它们，宿主经 `TraceRecorder` 与
+#   `parse_scenario_document` 用就够了。
 # - `RequestFingerprints` 与 `arguments_digest`：回放（runner）用它们对自己的请求与执行的参数取与
 #   记录时同样的指纹；宿主不需要它们就能记录与回放。
 # - `encode_prepared`：recorder 写回放文档用的编码（各项已在自己的上下文里脱敏）；宿主写自己的
 #   持久化内容用 `encode_redacted`。
 # - 回放文档的账本（`ReplayCapture`、`RecordingIds`、`Unreplayable`）：宿主经 `TraceRecorder.ids` 与
 #   `describe_run` 用它们，不直接碰；`REPLAYED_TOOLS` 是捕获与回放共用的名单，宿主不读它。
-# - `verbatim_attribute`：recorder 与 OTLP 导出共用的「哪些属性原样记、原样发」；宿主不需要它就能
-#   记录与导出。
 # - `NewerTraceSchema` / `readable_schema`：前者是 `ContractViolation` 的子类，宿主与 store 的作者按
 #   `ContractViolation` 接住就用得了每个公开入口；要把「更新版本写的」与「坏了」分开处理的第三方
 #   store 出现时再放出来。后者由 `TraceHeader` 自己调。
+# 不进 `kernel.__all__`、经子模块承诺的名字：写第三方 store、导出器与读回放文档的人从这里取，改它们
+# 同样是破坏性变更。它们同时在 `_WITHHELD` 里（那张表说的是「不在 kernel.__all__」）。
+_PROMISED_VIA_SUBMODULE: dict[str, tuple[str, ...]] = {
+    'syndica.kernel.trace': ('ATTRIBUTE_DOMAINS', 'ATTRIBUTE_KINDS', 'TRACE_SCHEMA'),
+    'syndica.kernel.scenario_schema': (
+        'DangerRuleSpec',
+        'FrozenRole',
+        'GateRecord',
+        'HostAction',
+        'HostProfile',
+        'ScenarioCall',
+        'ScenarioEntry',
+        'ScenarioError',
+        'ScenarioExpectation',
+        'ScenarioInstance',
+        'ScenarioReply',
+        'ScenarioResponse',
+        'ScenarioRole',
+        'ScenarioSource',
+        'SkippedCall',
+        'Text',
+        'ToolOutcome',
+    ),
+}
 _WITHHELD: tuple[str, ...] = (
     'ATTRIBUTE_DOMAINS',
     'ATTRIBUTE_KINDS',
@@ -364,8 +389,6 @@ _WITHHELD: tuple[str, ...] = (
     'Read',
     'ReadOnlyKwarg',
     'RecordingIds',
-    'RedactedText',
-    'Redactor',
     'ReplayCapture',
     'RequestFingerprints',
     'RuleTablePolicy',
@@ -401,7 +424,6 @@ _WITHHELD: tuple[str, ...] = (
     'current_tool_call',
     'disposition_of',
     'encode_prepared',
-    'encode_redacted',
     'entering_owner',
     'entering_tool_call',
     'git_state_change_rule',
@@ -426,7 +448,6 @@ _WITHHELD: tuple[str, ...] = (
     'validate_danger_options',
     'validate_max_concurrency',
     'validate_tool_names',
-    'verbatim_attribute',
     'workspace_root_removal_rule',
     'write_all',
     'write_redacted',
@@ -498,6 +519,111 @@ def _declared_exports() -> tuple[dict[str, set[str]], list[str]]:
                     f'got {type(element).__name__}'
                 )
     return declared, scanned
+
+
+_Shape = tuple[tuple[str, str, bool], ...]
+_POSITIONAL = 'POSITIONAL_OR_KEYWORD'
+# `Tracer` 与 `TraceStore` 协议每个方法的参数（名字、种类、有没有默认值）：冻结。多一个参数、改一个
+# 名字，按旧签名写的第三方实现在那个方法上全部失败——tracer 的失败按 D2 只计数，store 的失败让整个
+# trace 不完整。要新的通道就加新方法。
+_TRACER_METHODS: dict[str, _Shape] = {
+    'add_edge': (('self', _POSITIONAL, False), ('edge', _POSITIONAL, False)),
+    'add_event': (
+        ('self', _POSITIONAL, False),
+        ('span_id', _POSITIONAL, False),
+        ('name', _POSITIONAL, False),
+        ('attributes', _POSITIONAL, False),
+    ),
+    'end_span': (
+        ('self', _POSITIONAL, False),
+        ('span_id', _POSITIONAL, False),
+        ('status', _POSITIONAL, False),
+        ('attributes', _POSITIONAL, False),
+    ),
+    'llm_exchange': (
+        ('self', _POSITIONAL, False),
+        ('span_id', _POSITIONAL, False),
+        ('request', _POSITIONAL, False),
+        ('reply', _POSITIONAL, False),
+        ('error', _POSITIONAL, False),
+    ),
+    'start_span': (
+        ('self', _POSITIONAL, False),
+        ('span_id', _POSITIONAL, False),
+        ('parent_span_id', _POSITIONAL, False),
+        ('kind', _POSITIONAL, False),
+        ('name', _POSITIONAL, False),
+        ('agent_id', _POSITIONAL, False),
+        ('attributes', _POSITIONAL, False),
+    ),
+    'tool_result': (
+        ('self', _POSITIONAL, False),
+        ('span_id', _POSITIONAL, False),
+        ('result', _POSITIONAL, False),
+        ('error', _POSITIONAL, False),
+        ('arguments', 'KEYWORD_ONLY', True),
+    ),
+    'wait_answer': (
+        ('self', _POSITIONAL, False),
+        ('span_id', _POSITIONAL, False),
+        ('message', _POSITIONAL, False),
+    ),
+}
+_TRACE_STORE_METHODS: dict[str, _Shape] = {
+    'append': (
+        ('self', _POSITIONAL, False),
+        ('trace_id', _POSITIONAL, False),
+        ('spans', _POSITIONAL, True),
+        ('edges', _POSITIONAL, True),
+    ),
+    'begin': (('self', _POSITIONAL, False), ('header', _POSITIONAL, False)),
+    'delete': (('self', _POSITIONAL, False), ('trace_id', _POSITIONAL, False)),
+    'edges': (('self', _POSITIONAL, False), ('trace_id', _POSITIONAL, False)),
+    'find': (('self', _POSITIONAL, False), ('prefix', _POSITIONAL, False)),
+    'finish': (
+        ('self', _POSITIONAL, False),
+        ('trace_id', _POSITIONAL, False),
+        ('status', _POSITIONAL, False),
+        ('ended_ns', _POSITIONAL, False),
+    ),
+    'get': (('self', _POSITIONAL, False), ('trace_id', _POSITIONAL, False)),
+    'payload': (('self', _POSITIONAL, False), ('ref', _POSITIONAL, False)),
+    'put_payload': (
+        ('self', _POSITIONAL, False),
+        ('trace_id', _POSITIONAL, False),
+        ('payload', _POSITIONAL, False),
+    ),
+    'put_replay': (
+        ('self', _POSITIONAL, False),
+        ('trace_id', _POSITIONAL, False),
+        ('document', _POSITIONAL, False),
+    ),
+    'replay': (('self', _POSITIONAL, False), ('trace_id', _POSITIONAL, False)),
+    'spans': (('self', _POSITIONAL, False), ('trace_id', _POSITIONAL, False)),
+    'traces': (('self', _POSITIONAL, False),),
+}
+_TRACE_RECORDER_INIT: _Shape = (
+    ('self', _POSITIONAL, False),
+    ('store', _POSITIONAL, False),
+    ('redactor', _POSITIONAL, False),
+    ('level', 'KEYWORD_ONLY', True),
+    ('source', 'KEYWORD_ONLY', True),
+    ('clock', 'KEYWORD_ONLY', True),
+    ('monotonic', 'KEYWORD_ONLY', True),
+    ('trace_id', 'KEYWORD_ONLY', True),
+)
+_FILE_TRACE_STORE_INIT: _Shape = (('self', _POSITIONAL, False), ('root', _POSITIONAL, False))
+
+
+def _protocol_shapes(protocol: type) -> dict[str, _Shape]:
+    return {
+        name: tuple(
+            (parameter.name, parameter.kind.name, parameter.default is not inspect.Parameter.empty)
+            for parameter in inspect.signature(member).parameters.values()
+        )
+        for name, member in vars(protocol).items()
+        if not name.startswith('_') and callable(member)
+    }
 
 
 def _init_shape(cls: type) -> tuple[tuple[str, str, bool], ...]:
@@ -654,6 +780,27 @@ def test_the_runtime_spawn_shape_is_exactly_this():
     )
 
 
+def test_the_tracer_protocol_methods_keep_their_shapes():
+    from syndica.kernel.tracing import Tracer
+
+    assert _protocol_shapes(Tracer) == _TRACER_METHODS
+
+
+def test_the_trace_store_protocol_methods_keep_their_shapes():
+    from syndica.kernel.protocols.trace import TraceStore
+
+    assert _protocol_shapes(TraceStore) == _TRACE_STORE_METHODS
+
+
+def test_the_trace_recorder_and_the_file_trace_store_constructors_keep_their_shapes():
+    from syndica.kernel import FileTraceStore, TraceRecorder
+
+    assert (_init_shape(TraceRecorder), _init_shape(FileTraceStore)) == (
+        _TRACE_RECORDER_INIT,
+        _FILE_TRACE_STORE_INIT,
+    )
+
+
 def test_the_base_agent_constructor_shape_is_exactly_this():
     assert _init_shape(BaseAgent) == _BASE_AGENT_INIT
 
@@ -699,6 +846,47 @@ _PLAN3_PROMISED: tuple[str, ...] = (
 def test_promised_names_include_catalog_topology_and_orchestrator():
     missing = [name for name in _PLAN3_PROMISED if name not in kernel.__all__]
     assert missing == []
+
+
+def test_names_promised_through_a_submodule_are_exported_there_and_kept_out_of_the_kernel():
+    for module_name, names in _PROMISED_VIA_SUBMODULE.items():
+        module = importlib.import_module(module_name)
+        assert sorted(set(names) - set(module.__all__)) == [], module_name
+        assert sorted(set(names) - set(_WITHHELD)) == [], module_name
+
+
+def _syndica_classes(annotation: object) -> Iterator[type]:
+    if isinstance(annotation, type) and annotation.__module__.startswith('syndica.'):
+        yield annotation
+    for argument in typing.get_args(annotation):
+        yield from _syndica_classes(argument)
+
+
+def test_the_trace_seams_name_only_promised_types():
+    from syndica.kernel import FileTraceStore, TraceRecorder
+    from syndica.kernel.protocols.trace import TraceStore
+    from syndica.kernel.tracing import Tracer
+
+    promised = set(kernel.__all__) | {
+        name for names in _PROMISED_VIA_SUBMODULE.values() for name in names
+    }
+    seams = [
+        *(getattr(TraceStore, name) for name in _TRACE_STORE_METHODS),
+        *(getattr(Tracer, name) for name in _TRACER_METHODS),
+        TraceRecorder.__init__,
+        FileTraceStore.__init__,
+    ]
+    # 只为类型检查导入的名字（`if TYPE_CHECKING:`）不在模块的命名空间里：从内核的公开面补上。
+    fallback = {name: getattr(kernel, name) for name in kernel.__all__}
+    named = {
+        found.__name__
+        for seam in seams
+        for hint in typing.get_type_hints(seam, localns=fallback).values()
+        for found in _syndica_classes(hint)
+    }
+
+    assert 'RedactedText' in named
+    assert sorted(named - promised) == []
 
 
 def test_no_name_is_both_promised_and_withheld():

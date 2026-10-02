@@ -58,6 +58,10 @@ class Tracer(Protocol):
 
     `attributes` 是这次调用专属的一份，tracer 可以留着它。span 的开始与结束一一配对：结束时
     `status` 说明它怎么结束（取消也是一种结束），结束时的属性补在开始时那一份之上。
+
+    **已有方法的签名不再变**：不加参数、不改参数的名字与种类。要新的通道就加新方法，继承
+    `NullTracer` 的实现自动拿到它的空实现；给已有方法多加一个参数，按旧签名写的每一个 tracer 在那个
+    通道上全部失败，而 tracer 的失败只计数。
     """
 
     def start_span(
@@ -353,12 +357,12 @@ class _Tracing:
                 logger.error(
                     '期望: tracer %s 收下内核的每一次插桩。'
                     ' 实际: 它在 %s 里抛出 %s: %s；这一次的记录丢了，run 照常进行。'
-                    ' 下一步: 修好这个 tracer（它的方法必须同步返回、不抛异常、不是 async def '
-                    '或生成器）；此后它的失败只计数，Runtime 关闭时报一次总数。',
+                    ' 下一步: %s；此后它的失败只计数，Runtime 关闭时报一次总数。',
                     type(tracer).__name__,
                     step,
                     type(error).__name__,
                     error,
+                    _repair(error),
                 )
 
     def _current(self) -> _OpenSpan | None:
@@ -615,6 +619,16 @@ class _Attempt:
                 lambda tracer: tracer.llm_exchange(span_id, request, reply, error),
             )
         self._span.__exit__(exc_type, exc, tb)
+
+
+def _repair(error: BaseException) -> str:
+    """一次 tracer 失败的下一步。调用本身就失败的（参数个数、名字对不上）多半是照着另一个签名
+    写的。"""
+    if isinstance(error, TypeError) and 'argument' in str(error):
+        return (
+            '它的方法签名与 Tracer 协议对不上：照协议逐字写参数（继承 NullTracer、只覆写要的方法）'
+        )
+    return '修好这个 tracer（它的方法必须同步返回、不抛异常、不是 async def 或生成器）'
 
 
 def _failure_event(failure: object) -> dict[str, AttributeValue] | None:

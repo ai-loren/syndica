@@ -77,7 +77,14 @@ from syndica.kernel.modules import FlagDeclaration, RuntimeModule, SafetyModule
 from syndica.kernel.plugins import Plugin
 from syndica.kernel.prefix_drift import PrefixDriftModule, PrefixDriftRecord, PrefixDriftService
 from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback, TraceStore
-from syndica.kernel.redaction import Finding, RedactionRule, RuleRedactor
+from syndica.kernel.redaction import (
+    Finding,
+    RedactedText,
+    RedactionRule,
+    Redactor,
+    RuleRedactor,
+    encode_redacted,
+)
 from syndica.kernel.retry import RetryModule
 from syndica.kernel.runtime import AgentFactory, Runtime
 from syndica.kernel.scenario_schema import (
@@ -113,6 +120,7 @@ from syndica.kernel.trace import (
     TraceLevel,
     TraceRedaction,
     TraceSource,
+    verbatim_attribute,
 )
 from syndica.kernel.trace_recorder import TraceRecorder
 from syndica.kernel.tracing import NullTracer, Tracer
@@ -202,7 +210,9 @@ __all__ = [
     'PrefixDriftModule',
     'PrefixDriftRecord',
     'PrefixDriftService',
+    'RedactedText',
     'RedactionRule',
+    'Redactor',
     'Reply',
     'RetryModule',
     'RiskLevel',
@@ -241,10 +251,12 @@ __all__ = [
     'WaitState',
     'Waiter',
     'Workspace',
+    'encode_redacted',
     'local_tools',
     'orchestration_tools',
     'parse_scenario_document',
     'provenance_of',
     'register_builtins',
     'strictest_trust',
+    'verbatim_attribute',
 ]

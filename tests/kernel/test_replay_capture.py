@@ -351,6 +351,36 @@ async def test_a_model_failure_is_recorded_with_its_type_and_attempt():
     assert document['expect'] == {'stop_reasons': {'Lead[0]': 'error'}}
 
 
+class _Throttled(Exception):
+    def __init__(self, status_code: object, retry_after: object) -> None:
+        super().__init__('slow down')
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+@pytest.mark.parametrize(
+    ('status', 'wait', 'kept'),
+    [
+        (429, 2.5, {'status_code': 429, 'retry_after': 2.5}),
+        (429, float('inf'), {'status_code': 429}),
+        (429, float('nan'), {'status_code': 429}),
+        (429, -1, {'status_code': 429}),
+        (503.0, 1, {'retry_after': 1}),
+        (True, 1, {'retry_after': 1}),
+    ],
+    ids=['both', 'infinite-wait', 'nan-wait', 'negative-wait', 'float-status', 'bool-status'],
+)
+async def test_a_failures_status_and_wait_are_kept_only_as_the_document_can_hold_them(
+    status: object, wait: object, kept: dict[str, object]
+):
+    _, _, document = await _captured([ScriptedTurn(raises=_Throttled(status, wait))])
+
+    assert document is not None
+    [turn] = _lead(document)['turns']
+    raised = turn['raises']
+    assert {key: raised[key] for key in ('status_code', 'retry_after') if key in raised} == kept
+
+
 async def _asked(
     answer: Callable[[Runtime, Any], Any],
     *,

@@ -2,9 +2,10 @@
 
 所有实现共有的不变式：
 
-- **只追加**：一个 trace 由 `begin` 开始、`finish` 结束；其间 `append` 的 span 与边、
-  `put_payload` 的自由文本只增不改。没 `begin` 过、已经 `finish`、或已经 `delete` 的 trace 上的写
-  （含空的 `append`）报 `ContractViolation`。
+- **只追加，照存每一条**：一个 trace 由 `begin` 开始、`finish` 结束；其间 `append` 的 span 与边、
+  `put_payload` 的自由文本只增不改。span id 在一个 trace 里唯一由写入方保证，store 不必检查；
+  store 也不按 id、端点或内容合并：同一对 span 之间的几条消息边是几条边。没 `begin` 过、已经
+  `finish`、或已经 `delete` 的 trace 上的写（含空的 `append`）报 `ContractViolation`。
 - **拒绝即无副作用**：报错的写一项都不写——混着一条坏边的那批 span 也不写，被拒的 `put_payload`
   读不回来，被拒的 `finish` 不改结局。
 - **收不下一项不等于坏了**：`put_payload` / `put_replay` 收不下这一项（太大、超出单项配额）时报
@@ -18,6 +19,7 @@
 - **读到的是快照**：改读回的对象（含嵌套的属性、列表、事件与 `traces()` 交回的列表），再读不受
   影响；`append` 返回之后调用方再改传进来的对象，同样不影响已经存下的。
 - **读己所写**：写操作返回后，紧接着的读必须看到它；`get`、`find`、`traces()` 读到的是同一份头。
+- **签名不再变**：已有方法不加参数、不改参数的名字与种类；新的能力加新方法。
 
 读是提问不是要求：没有这个 trace 时 `get` / `payload` / `replay` 交回 None，`spans` / `edges` 交回空
 列表；`delete` 一个不存在的 trace 是 no-op，删掉的 trace id 可以重新 `begin`。payload 的引用属于它的

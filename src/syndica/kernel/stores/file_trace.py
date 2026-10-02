@@ -80,6 +80,8 @@ _HEADER_LIMIT = 4 * 1024 * 1024
 _FILE_LIMIT = 256 * 1024 * 1024
 _ENCODER = RuleRedactor()
 _HEADER = 'trace.json'
+# 目录名：`<UTC 开始时间>-<id 前 8 位>`，同一秒撞上前 8 位时是完整的 id（`_new_directory`）。
+_DIRECTORY_NAME = re.compile(r'\d{8}T\d{6}Z-(?:[0-9a-f]{8}|[0-9a-f]{32})')
 _SPANS = 'spans.jsonl'
 _EDGES = 'edges.jsonl'
 _PAYLOADS = 'payloads'
@@ -448,6 +450,26 @@ class FileTraceStore:
             with self._located(root, trace_id) as found:
                 name = None if found is None else found[0]
         return None if name is None else self._root / name
+
+    def names_a_trace(self, name: str) -> bool:
+        """`name` 是这个 store 给 trace 起的那种目录名（不管目录在不在）。"""
+        return _DIRECTORY_NAME.fullmatch(name) is not None
+
+    async def trace_named(self, name: str) -> str | None:
+        """目录名是 `name` 的那个 trace 的 id（宿主打印给人看的就是这个目录名）；名字不是这个 store
+        起的、没有这个目录、或它的头读不出来时 None。不在 `TraceStore` 协议里：别的 store 没有目录
+        可言。"""
+        if _DIRECTORY_NAME.fullmatch(name) is None:
+            return None
+        with self._root_fd() as root:
+            if root is None:
+                return None
+            try:
+                trace, header = self._opened_trace(root, name)
+            except (OSError, ContractViolation):
+                return None
+            os.close(trace)
+        return header.trace_id
 
     async def size(self, trace_id: str) -> int | None:
         """这个 trace 占的字节数（目录里的文件与 payload 目录里的文件），`trace list` 报给人看；没有

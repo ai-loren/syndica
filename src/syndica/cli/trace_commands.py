@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, cast, runtime_checkable
 
 from syndica.cli.export import ExportTarget, TraceExporter
 from syndica.cli.main import CliOutcome
@@ -20,13 +20,13 @@ from syndica.cli.terminal import one_line
 from syndica.cli.trace_view import TraceRow, render_list, render_show
 from syndica.kernel import (
     ConfigError,
-    FileTraceStore,
     RuleRedactor,
     ScenarioDocument,
     SyndicaError,
     TraceHeader,
     TraceLevel,
     TraceRecorder,
+    TraceStore,
     parse_scenario_document,
 )
 from syndica.kernel.redaction import RULES_VERSION, Redactor
@@ -46,9 +46,26 @@ __all__ = [
 ]
 
 
-# `FileTraceStore` 的目录名：`<UTC 开始时间>-<id 前 8 位>`，同一秒撞上前 8 位时是完整的 id。
-_DIRECTORY_NAME = re.compile(r'\d{8}T\d{6}Z-(?:[0-9a-f]{8}|[0-9a-f]{32})')
 _HEX = re.compile(r'[0-9a-f]{1,32}')
+
+
+# `TraceStore` 协议之外、`FileTraceStore` 有而别的 store 不一定有的几样：有就用，没有就少报一项。
+@runtime_checkable
+class _Sized(Protocol):
+    async def size(self, trace_id: str) -> int | None: ...
+
+
+@runtime_checkable
+class _Named(Protocol):
+    def names_a_trace(self, name: str) -> bool: ...
+
+    async def trace_named(self, name: str) -> str | None: ...
+
+
+@runtime_checkable
+class _Diagnosing(Protocol):
+    async def unreadable(self) -> list[tuple[str, str, str]]: ...
+
 
 _T = TypeVar('_T')
 
@@ -95,7 +112,7 @@ class TraceExportFailed(SyndicaError):
     """collector 没收下（或者导出器装不上）：CLI 以 1 退出，三件套经过脱敏。"""
 
 
-async def resolved(store: FileTraceStore, given: str | None) -> TraceHeader:
+async def resolved(store: TraceStore, given: str | None) -> TraceHeader:
     """按 id、它的唯一前缀或 trace 目录名找到一个 trace。目录名可以带着 stderr 上打出的那段路径，
     只认最后一级。找不到、对上不止一个都以 2 退出。"""
     if given is None:
@@ -105,7 +122,7 @@ async def resolved(store: FileTraceStore, given: str | None) -> TraceHeader:
             next_action='从 `syndica trace list` 的 id 列抄一段开头',
         )
     name = given.rstrip('/').rsplit('/', 1)[-1]
-    if _DIRECTORY_NAME.fullmatch(name):
+    if isinstance(store, _Named) and store.names_a_trace(name):
         return await _by_directory(store, name)
     if not _HEX.fullmatch(given):
         raise TraceUnusable(
@@ -127,14 +144,11 @@ async def resolved(store: FileTraceStore, given: str | None) -> TraceHeader:
     return header
 
 
-async def _by_directory(store: FileTraceStore, name: str) -> TraceHeader:
-    suffix = name.rsplit('-', 1)[1]
-    for header in await _read(store.traces()):
-        if not header.trace_id.startswith(suffix):
-            continue
-        directory = await _quietly(store.directory(header.trace_id))
-        if directory is not None and directory.name == name:
-            return header
+async def _by_directory(store: TraceStore, name: str) -> TraceHeader:
+    found = await _quietly(cast(_Named, store).trace_named(name))
+    header = None if found is None else await _read(store.get(found))
+    if header is not None:
+        return header
     await _unreadable_match(store, lambda candidate: candidate == name)
     raise TraceUnusable(
         expected=f'有一个目录名是 {name} 的 trace',
@@ -143,10 +157,10 @@ async def _by_directory(store: FileTraceStore, name: str) -> TraceHeader:
     )
 
 
-async def _unreadable_match(store: FileTraceStore, matches: Callable[[str], bool]) -> None:
+async def _unreadable_match(store: TraceStore, matches: Callable[[str], bool]) -> None:
     """找不到的那个其实在，只是头读不进来（更新版本的 syndica 写的，或者坏了）：说它为什么读不进来，
     而不是说它不在。"""
-    for name, received, next_action in await _quietly(store.unreadable()) or []:
+    for name, received, next_action in await _unreadable(store):
         if matches(name):
             raise TraceUnusable(
                 expected=f'.syndica/traces/{one_line(name)} 是这个版本读得懂的 trace',
@@ -155,23 +169,28 @@ async def _unreadable_match(store: FileTraceStore, matches: Callable[[str], bool
             )
 
 
-async def trace_list(store: FileTraceStore) -> str:
+async def trace_list(store: TraceStore) -> str:
     """一个 trace 读不了不拖垮整张表：span 读不进来的那一行照样列出（`trace show` 给出原因），头读
-    不进来的目录不列，只报有几个（原因在上面的 WARNING 里）。"""
+    不进来的目录不列，只报有几个（原因在上面的 WARNING 里）。量不出大小的 store 报「大小不明」。"""
     rows: list[TraceRow] = []
     for header in await _read(store.traces()):
-        size = await _quietly(store.size(header.trace_id))
+        size = await _quietly(store.size(header.trace_id)) if isinstance(store, _Sized) else None
         spans = await _quietly(store.spans(header.trace_id))
         if spans is None:
             rows.append(TraceRow(header, None, None, size))
             continue
         agents = {span.agent_id for span in spans}
         rows.append(TraceRow(header, len(agents), len(spans), size))
-    skipped = await _quietly(store.unreadable()) or []
-    return render_list(rows, unreadable=len(skipped))
+    return render_list(rows, unreadable=len(await _unreadable(store)))
 
 
-async def trace_show(store: FileTraceStore, prefix: str | None) -> str:
+async def _unreadable(store: TraceStore) -> list[tuple[str, str, str]]:
+    if not isinstance(store, _Diagnosing):
+        return []
+    return await _quietly(store.unreadable()) or []
+
+
+async def trace_show(store: TraceStore, prefix: str | None) -> str:
     header = await resolved(store, prefix)
     spans = await _read(store.spans(header.trace_id))
     edges = await _read(store.edges(header.trace_id))
@@ -179,7 +198,7 @@ async def trace_show(store: FileTraceStore, prefix: str | None) -> str:
 
 
 async def trace_export(
-    store: FileTraceStore,
+    store: TraceStore,
     prefix: str | None,
     *,
     target: ExportTarget,
@@ -216,7 +235,7 @@ async def trace_export(
     return CliOutcome(f'导出了 trace {header.trace_id} 的 {count} 个 span。', 0)
 
 
-async def trace_prune(store: FileTraceStore, keep: int, names: Sequence[str]) -> CliOutcome:
+async def trace_prune(store: TraceStore, keep: int, names: Sequence[str]) -> CliOutcome:
     """点了名就只删点名的那几个（没有结局的也删：那是人看过之后的决定）；没点名就按开始时间留下
     最近 `keep` 个有结局的 trace，连同它们的回放——回放自己的 trace 不占名额（它总是最新的，算进
     去就会先挤掉它回放的那一个），回放的那个被删时它也删。没有结局的不动：一次长跑的 trace 开始得
@@ -269,7 +288,7 @@ async def trace_prune(store: FileTraceStore, keep: int, names: Sequence[str]) ->
     return CliOutcome('\n'.join(lines), 1 if failed else 0)
 
 
-async def _removed(store: FileTraceStore, trace_id: str) -> str | None:
+async def _removed(store: TraceStore, trace_id: str) -> str | None:
     """删掉一个 trace，并确认它真的不在了；没删掉时交回原因。"""
     try:
         await store.delete(trace_id)
@@ -279,7 +298,7 @@ async def _removed(store: FileTraceStore, trace_id: str) -> str | None:
     return None if still is None else '删完之后它还在'
 
 
-async def unusable_replay(store: FileTraceStore, prefix: str | None) -> tuple[TraceHeader, str]:
+async def unusable_replay(store: TraceStore, prefix: str | None) -> tuple[TraceHeader, str]:
     """回放之前的那几道检查：trace 在、有结局、有回放文档。交回头与文档的原文。"""
     header = await resolved(store, prefix)
     if header.status is None:

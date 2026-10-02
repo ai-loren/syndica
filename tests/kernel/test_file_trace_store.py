@@ -77,6 +77,16 @@ async def _begun(tmp_path: Path) -> tuple[FileTraceStore, Path]:
     return store, _trace_dir(root)
 
 
+async def test_a_trace_is_found_by_the_directory_name_it_was_given(tmp_path: Path):
+    store, directory = await _begun(tmp_path)
+
+    assert store.names_a_trace(directory.name)
+    assert await store.trace_named(directory.name) == _TRACE
+    assert not store.names_a_trace('notes')
+    assert await store.trace_named('notes') is None
+    assert await store.trace_named('20200101T000000Z-' + '0' * 8) is None
+
+
 def test_the_root_must_be_a_path():
     with pytest.raises(ConfigError) as caught:
         FileTraceStore(b'/tmp/traces')  # pyright: ignore[reportArgumentType]

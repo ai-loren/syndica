@@ -189,6 +189,54 @@ async def _refused_writes(store: TraceStore, trace_id: str, why: str) -> None:
 
 
 class TraceStoreContract(ContractSuite):
+    async def test_spans_of_several_agents_come_back_interleaved_in_append_order(
+        self, store: TraceStore
+    ) -> None:
+        batches = [
+            [('a2', 7), ('a3', 3)],
+            [('a1', 5), ('a3', 9), ('a2', 2)],
+            [('a1', 8), ('a3', 1)],
+        ]
+        await store.begin(_header())
+        for batch in batches:
+            await store.append(
+                _TRACE,
+                [dataclasses.replace(_span(number), agent_id=agent) for agent, number in batch],
+            )
+
+        spans = await store.spans(_TRACE)
+
+        written = [pair for batch in batches for pair in batch]
+        read = [(span.agent_id, int(span.span_id, 16)) for span in spans]
+        assert read == written, (
+            '期望几个 Agent 的 span 交错着按 append 的顺序读回'
+            '（不按 Agent 分组、不按 id 或时间排序）；'
+            f'实际读回 {read}，写入的是 {written}。按追加顺序存，读时原样交回。'
+        )
+
+    async def test_two_edges_between_the_same_spans_are_both_kept(self, store: TraceStore) -> None:
+        source, target = 'b1' * 8, 'c2' * 8
+        await store.begin(_header())
+        await store.append(
+            _TRACE,
+            [],
+            [
+                CausalityEdge(EdgeKind.MESSAGE, source, target, {'message.id': 'm1'}),
+                CausalityEdge(EdgeKind.MESSAGE, source, target, {'message.id': 'm2'}),
+            ],
+        )
+        await store.append(
+            _TRACE, [], [CausalityEdge(EdgeKind.MESSAGE, source, target, {'message.id': 'm3'})]
+        )
+
+        edges = await store.edges(_TRACE)
+
+        assert [edge.attributes.get('message.id') for edge in edges] == ['m1', 'm2', 'm3'], (
+            '期望同一对 span 之间的几条消息边都在（一次工具调用给同一个收件人发几条消息就是这样）；'
+            f'实际读回 {[edge.attributes.get("message.id") for edge in edges]}。'
+            '边按追加的每一条存，不按端点合并。'
+        )
+
     async def test_spans_and_edges_come_back_in_append_order(self, store: TraceStore) -> None:
         await store.begin(_header())
         await store.append(_TRACE, [_span(5), _span(2)], [_edge(7)])

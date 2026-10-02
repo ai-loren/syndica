@@ -1,4 +1,4 @@
-"""捕获即回放（M3 T14）：recorder 在记录的同时攒下回放文档要的东西，`finish` 时写成 `replay.json`。
+"""捕获即回放：recorder 在记录的同时攒下回放文档要的东西，`finish` 时写成 `replay.json`。
 
 回放文档的大部分来自插桩本身：模型的回复与逐单元指纹、外部工具的结局与执行参数的指纹、跳过、
 闸门判定、每一轮开始前注入的消息、哪些周期是紧接着上一个开的（Agent 没有停下来等）、哪些调用开了头
@@ -15,6 +15,7 @@ id 由这里的 id 源交出（`TraceRecorder.ids`，宿主交给 `Runtime(ids=.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import cast
@@ -584,14 +585,24 @@ class ReplayCapture:
     # --- values -----------------------------------------------------------------------------
 
     def _raised(self, error: BaseException) -> dict[str, object]:
+        """只记回放文档收得下的：状态码是非负整数，等待是不小于 0 的有限秒数。别的取值（端点给的
+        `Retry-After: inf`）在 payload 里写成文字；回放用不上它们，它们只影响模型对象内部的轮换，
+        而回放里模型由记录代替。"""
         value: dict[str, object] = {
             'type': f'{type(error).__module__}.{type(error).__qualname__}',
             'message': self._jsonable(_message(error)),
         }
-        for name in ('status_code', 'retry_after'):
-            found = getattr(error, name, None)
-            if isinstance(found, int | float) and not isinstance(found, bool):
-                value[name] = found
+        status = getattr(error, 'status_code', None)
+        if isinstance(status, int) and not isinstance(status, bool) and status >= 0:
+            value['status_code'] = status
+        wait = getattr(error, 'retry_after', None)
+        if (
+            isinstance(wait, int | float)
+            and not isinstance(wait, bool)
+            and math.isfinite(wait)
+            and wait >= 0
+        ):
+            value['retry_after'] = wait
         return value
 
     def _result(self, result: ToolResult | None) -> dict[str, object]:

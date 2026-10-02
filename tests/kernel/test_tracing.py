@@ -1531,9 +1531,40 @@ async def test_a_tracer_that_always_raises_changes_nothing_and_is_reported_once_
     reports = [record for record in caplog.records if record.name.startswith('syndica.kernel')]
     first, total = reports
     assert first.levelno == total.levelno == logging.ERROR
-    assert first.args == ('_Broken', 'start_span', 'RuntimeError', broken.error)
+    assert cast(tuple[object, ...], first.args)[:4] == (
+        '_Broken',
+        'start_span',
+        'RuntimeError',
+        broken.error,
+    )
+    assert '同步返回' in str(cast(tuple[object, ...], first.args)[4])
     assert total.args == ('_Broken', broken.calls)
     assert broken.calls > 5
+
+
+class _OldSignature(NullTracer):
+    """照另一个签名写的 tracer：`tool_result` 少收了 `arguments`。"""
+
+    def tool_result(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, span_id: str, result: Any, error: Any
+    ) -> None:
+        del span_id, result, error
+
+
+def test_a_tracer_whose_method_signature_does_not_match_is_told_to_follow_the_protocol(
+    caplog: pytest.LogCaptureFixture,
+):
+    tracing = _Tracing(cast(Tracer, _OldSignature()))
+
+    with caplog.at_level(logging.ERROR, logger='syndica.kernel.tracing'):
+        tracing.call(
+            'tool_result', lambda tracer: tracer.tool_result('s', None, None, arguments={})
+        )
+
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.tracing']
+    args = cast(tuple[object, ...], record.args)
+    assert (args[1], args[2]) == ('tool_result', 'TypeError')
+    assert '签名与 Tracer 协议对不上' in str(args[4])
 
 
 @pytest.mark.parametrize(
@@ -1578,6 +1609,7 @@ def test_an_async_tracer_method_is_a_failure_and_its_coroutine_is_closed(
     assert inspect.getcoroutinestate(cast(Any, created[0])) == inspect.CORO_CLOSED
     [record] = caplog.records
     assert 'coroutine' in str(cast(tuple[object, ...], record.args)[3])
+    assert 'async def' in str(cast(tuple[object, ...], record.args)[4])
 
 
 @pytest.mark.parametrize('tracer', [_Recorder, object(), 'tracer'], ids=['class', 'object', 'str'])
