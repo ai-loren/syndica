@@ -35,6 +35,7 @@ __all__ = [
     'TraceLevel',
     'TraceRedaction',
     'TraceSource',
+    'verbatim_attribute',
 ]
 
 TRACE_SCHEMA = 'syndica.trace/1'
@@ -159,6 +160,23 @@ ATTRIBUTE_DOMAINS: Mapping[str, frozenset[str]] = MappingProxyType(
         'wait.outcome': frozenset({'answered', 'timeout', 'preempted', 'aborted'}),
     }
 )
+
+# 取值是内核生成的标识或摘要的属性。连同种类是 `payload` 的引用与 `ATTRIBUTE_DOMAINS` 里的闭集
+# 取值一起原样记、原样导出：脱敏规则（尤其是用户规则）可能认得一段十六进制或一个词，id 与引用
+# 换成占位符就断了，闭集取值换成占位符则整个 span 校验不过、写不出去。
+_IDENTIFIER_ATTRIBUTES = frozenset(
+    {'agent.id', 'child.agent_id', 'message.id', 'message.to', 'llm.request_digest'}
+)
+
+
+def verbatim_attribute(key: str) -> bool:
+    """这个属性的值是内核生成的标识、摘要、payload 引用或闭集取值：记录与导出都不经脱敏规则。"""
+    return (
+        key in _IDENTIFIER_ATTRIBUTES
+        or key in ATTRIBUTE_DOMAINS
+        or ATTRIBUTE_KINDS.get(key) == 'payload'
+    )
+
 
 _SPAN_ID = re.compile(r'[0-9a-f]{16}')
 _TRACE_ID = re.compile(r'[0-9a-f]{32}')

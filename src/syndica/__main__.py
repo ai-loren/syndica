@@ -21,9 +21,11 @@ from syndica.cli.main import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from syndica.cli.host import RuntimeCliHost
     from syndica.cli.trace_commands import Replayed
-    from syndica.kernel import LLM, ScenarioDocument, TraceRecorder
+    from syndica.kernel import LLM, ScenarioDocument, TraceRecorder, TraceStore
     from syndica.kernel.redaction import Redactor
 
 _OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1'
@@ -278,6 +280,30 @@ def _replay_document(
     )
 
 
+async def _export_trace(
+    store: TraceStore,
+    trace_id: str,
+    *,
+    url: str,
+    headers: Mapping[str, str],
+    resource: Mapping[str, str],
+    redactor: Redactor,
+) -> int:
+    """OTLP 导出：CLI 不 import backend，由组合根接上；httpx 是 extra `otel`。"""
+    try:
+        from syndica.backends.otel_otlp import OtlpHttpExporter
+    except ImportError as error:
+        from syndica.kernel import ConfigError
+
+        raise ConfigError(
+            expected='OTLP 导出要的 httpx 已经装好',
+            received=f'导入失败：{error}',
+            next_action="pip install 'syndica[otel]' 之后再试",
+        ) from error
+    exporter = OtlpHttpExporter(url, redactor=redactor, headers=headers, resource=resource)
+    return await exporter.export(store, trace_id)
+
+
 class _LazyHost:
     def __init__(self, io: CliIO) -> None:
         self._io = io
@@ -292,6 +318,7 @@ class _LazyHost:
                 model_factory=_configured_model,
                 workspace_root=Path.cwd(),
                 replayer=_replay_document,
+                exporter=_export_trace,
             )
         return self._host
 

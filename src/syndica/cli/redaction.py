@@ -11,6 +11,7 @@ import re
 from collections.abc import Mapping, Sequence
 from urllib.parse import urlsplit
 
+from syndica.cli.export import HEADER_VARIABLES, header_values
 from syndica.kernel.redaction import RedactionRule, RuleRedactor, looks_secret
 
 __all__ = ['host_redactor', 'host_secrets']
@@ -40,11 +41,14 @@ def _credential_like(value: str) -> bool:
 
 def host_secrets(environ: Mapping[str, str]) -> tuple[str, ...]:
     """名字像密钥、值像凭证的环境变量值。经 `echo | base64`、Kubernetes secret 传进来的值常带着
-    换行，正文里出现的是去掉它的那一份：两份都交。"""
+    换行，正文里出现的是去掉它的那一份：两份都交。OTLP 导出的头（多半是鉴权）不论名字都交。"""
     values: set[str] = set()
     for name, value in environ.items():
         if looks_secret(name):
             values.update(v for v in {value, value.strip()} if _credential_like(v))
+    for variable in HEADER_VARIABLES:
+        exported = header_values(environ.get(variable, ''))
+        values.update(v for v in exported if _credential_like(v))
     return tuple(sorted(values))
 
 

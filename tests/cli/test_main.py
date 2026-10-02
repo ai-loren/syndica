@@ -480,6 +480,11 @@ def test_host_configuration_errors_reach_stderr_with_a_nonzero_exit() -> None:
         (['trace', 'prune'], TraceRequest('prune', keep=PRUNE_KEEP)),
         (['trace', 'prune', '--keep', '0'], TraceRequest('prune', keep=0)),
         (['trace', 'prune', 'ab', 'cd'], TraceRequest('prune', names=('ab', 'cd'))),
+        (['trace', 'export', 'ab12'], TraceRequest('export', trace_id='ab12')),
+        (
+            ['trace', 'export', 'ab12', '--otlp', 'http://localhost:4318'],
+            TraceRequest('export', trace_id='ab12', otlp='http://localhost:4318'),
+        ),
         (['--config', 'other.yml', 'trace', 'list'], TraceRequest('list', config='other.yml')),
     ],
 )

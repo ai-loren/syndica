@@ -75,14 +75,16 @@ class InspectRequest:
 
 @dataclass(frozen=True)
 class TraceRequest:
-    """`syndica trace ...` 的一次请求：`list`、`show <id>`、`replay <id>`、`prune`。`trace_id` 是
-    id 或它的前缀；`names` 是 `prune` 点名要删的那几个（点了名就只删它们）。"""
+    """`syndica trace ...` 的一次请求：`list`、`show <id>`、`replay <id>`、`export <id>`、`prune`。
+    `trace_id` 是 id、它的前缀或目录名；`names` 是 `prune` 点名要删的那几个（点了名就只删它们）；
+    `otlp` 是 `export` 发往的端点。"""
 
-    action: Literal['list', 'show', 'replay', 'prune']
+    action: Literal['list', 'show', 'replay', 'export', 'prune']
     trace_id: str | None = None
     allow_divergence: bool = False
     keep: int = PRUNE_KEEP
     names: tuple[str, ...] = ()
+    otlp: str | None = None
     config: str = '.syndica.yaml'
     argv: tuple[str, ...] = ()
 
@@ -253,6 +255,15 @@ def _parser() -> _ArgumentParser:
         '--allow-divergence',
         action='store_true',
         help='分叉之后接着回放、把每一处分叉都报出来（仍以 1 退出）',
+    )
+    export = trace_actions.add_parser(
+        'export', help='把一个 trace 按 OTLP/HTTP JSON 发给 collector（失败以 1 退出）'
+    )
+    export.add_argument('trace_id')
+    export.add_argument(
+        '--otlp',
+        help='collector 的端点（如 http://localhost:4318），不带 OTEL_EXPORTER_OTLP_HEADERS；'
+        '不给时用环境里的端点与头',
     )
     prune = trace_actions.add_parser(
         'prune', help='删掉旧 trace：只留最近 --keep 个有结局的；点名的只删点名的'
@@ -536,6 +547,7 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
             allow_divergence=getattr(namespace, 'allow_divergence', False),
             keep=PRUNE_KEEP if keep is None else keep,
             names=tuple(getattr(namespace, 'trace_ids', ())),
+            otlp=getattr(namespace, 'otlp', None),
             config=namespace.config,
             argv=tuple(received),
         )

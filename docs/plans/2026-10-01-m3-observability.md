@@ -440,7 +440,9 @@ Bash 写下的文件再经 `Read` 读回就成了可信内容，这条洗白的�
 | `trace prune [--keep N]` | 只留最近 N 个，默认 50 |
 
 退出码在 M2 的 0 / 1 / 2 / 3 之外加 `130`（被 Ctrl-C 中断，优先于 1 与 3）。CLI 读的环境变量：
-`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`、`OTEL_EXPORTER_OTLP_ENDPOINT`、`OTEL_EXPORTER_OTLP_HEADERS`（内核不读）。
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`、`OTEL_EXPORTER_OTLP_ENDPOINT`、`OTEL_EXPORTER_OTLP_HEADERS`，以及 OpenTelemetry
+约定的 `OTEL_EXPORTER_OTLP_TRACES_HEADERS`、`OTEL_EXPORTER_OTLP_(TRACES_)PROTOCOL`、`OTEL_SDK_DISABLED`、
+`OTEL_TRACES_EXPORTER`、`OTEL_SERVICE_NAME`、`OTEL_RESOURCE_ATTRIBUTES`（T16；内核都不读）。
 
 ### `.syndica.yaml`
 
@@ -1109,7 +1111,7 @@ JSON；内联让文档自成一份、`trace replay` 不必再读一批 payload�
   trace 目录、按开始时间保留最近的，且不删还没有结局的 trace（一次长跑的 trace 开始得最早、却还在写；崩掉的 trace
   同样没有结局，要删它得显式点名）。`list` 的大小由文件实现自己报（协议里没有这一项，需要时在这里加）。
 
-**状态：完成。** `cli/trace_commands.py` 是四个动作，`cli/trace_view.py` 只管文字（三个回答、时间线、列表）：来自 trace
+**状态：完成（88321c4）。** `cli/trace_commands.py` 是四个动作，`cli/trace_view.py` 只管文字（三个回答、时间线、列表）：来自 trace
 的每个字符串经 `one_line()`（trace 目录是 Agent 的 Bash 改得到的，Agent id 也照样转义），时间按 UTC。回放由组合根
 （`__main__._replay_document`）把 runner 的 `ReplayRunner` 接给宿主，surface 之间互不依赖；回放本身按 structure 记成
 新 trace（`source.replay_of`、命令行、配置的 sha256），配置把记录关掉时不记，trace 目录准备不出来时告警、照常回放；
@@ -1162,7 +1164,46 @@ run 时整段 traceback 原样进终端）、`show` 里 Agent id 不转义、循
   明文 HTTP 的非回环地址不带头。
 - 依赖方向：内核不 import 这个 backend（`check_deps` 与一条字符串守卫）。
 
-阶段四收口：阶段审计。
+**状态：完成。** `backends/otel_otlp/`：`OtlpHttpExporter(url, *, redactor, headers=None, resource=None,
+client=None, batch=512, timeout=10, deadline=120)` 只从 `TraceStore` 读，组装 OTLP/HTTP JSON：十六进制 id、Unix 纳秒的
+十进制字符串、带类型的属性（`bool` 先于 `int` 判，值是 None 的不发）、整数枚举、`kind` INTERNAL、事件；因果边转成
+links，挂在结果那一端指向起因，结果那一端不在 trace 里时挂在起因上（`syndica.edge.points_at` 说指向哪一端）；每批
+512 个 span、用到才组装；payload 属性只发 sha256。自由文本经宿主的脱敏器逐叶过一遍（同一段文字只脱敏一次）；结构
+（id、时间、整数、闭集取值、内核生成的标识，与记录器同一个判据 `verbatim_attribute`）不过用户规则；正文经只有内置
+规则的 `encode_redacted` 编码。自建的 client 只在 https 下走代理、不跟重定向；单次请求与整次导出各有上限。
+`cli/export.py`：端点只从用户环境或 `--otlp` 来；`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` 原样用，
+`OTEL_EXPORTER_OTLP_ENDPOINT` 补 `/v1/traces`（不重复补，末尾的 `/` 去掉）；`OTEL_EXPORTER_OTLP_HEADERS` 与
+`..._TRACES_HEADERS`（同名按后者）只随环境里的端点发出；明文 HTTP 的非回环地址不带头，地址里也不许带凭证；
+`OTEL_SDK_DISABLED`、`OTEL_TRACES_EXPORTER` 关掉导出，协议是 grpc 时不导出；`OTEL_SERVICE_NAME` 与
+`OTEL_RESOURCE_ATTRIBUTES` 进资源属性。头的值（解码前后两份、鉴权方案之后的凭证）进脱敏器的 secrets；
+`workspace.pass_env` 不许含 `OTEL_EXPORTER_OTLP_*`；项目配置里像导出设置的键（含 otlp、otel、endpoint、export、
+collector，不分大小写）被拒并说明为什么。run 与 chat 结束时的导出放在结论打出之后（`close` 里）：失败与超时（30 s）
+只告警，补发有用时给出命令；这时按的 Ctrl-C 不改变已经打出的结论与退出码；被中断的 run 与不完整的 trace 不导出；
+发的是记录器自己写的（要导出时记录同时在内存里留一份），不是此刻 trace 目录里的文件。`trace export <id> [--otlp url]`：
+0 发完，1 collector 没收下（三件套经脱敏），2 trace 或端点用不了（含没有结局的 trace，发之前先读一遍）。
+
+偏差：(1) 导出器收完整的 traces 端点（端点规则在 CLI 里），另收一个 `Redactor`（D5）与资源属性。(2) `--otlp` 可以不
+给：不给时用环境里的端点与头（补发要带鉴权头）。(3) 正文的编码只用内置规则：D5 说「从 store 读出的已经脱敏，再过
+一遍是幂等的」对自由文本成立，对导出时才生成的十进制时间与十六进制 id 不成立——一条认得手机号的用户规则曾把每个
+时间戳换成占位符，collector 整批拒收。(4) 记录 trace 时多记工作区所在仓库的 HEAD（计划的 trace schema 里有、此前没有
+任务交付，阶段审计发现）。(5) 已知：`trace export` 读的是 trace 目录里的文件，Agent 的 Bash 改得到（D17，沙箱在 M5）；
+run 结束时的导出不受此影响。导出不重试：429 / 503 只告警，等 collector 好了用 `trace export` 补发。
+
+变异：两轮 118 条（首轮 61 条、评审之后 57 条），首轮存活 1 条（只断言了解码后那一份的头的值：解码前后共有 16 个
+字符以上的片段时，片段规则把另一份也换掉了，固定装置改成每段不足 16 个字符），评审之后存活 3 条：编码时的标识清单
+（只用内置规则之后它不再起作用，删掉）、鉴权方案之后的凭证（用例用了 `%20`，编码那一份没有空白、片段规则照样覆盖
+了它，改成真空格）、末尾的 `/`（`http.server` 把路径开头的 `//` 并成一个，测试的 collector 改按请求行记路径）；修后
+无存活。
+
+一路对抗评审（OTLP 的形状、安全、鲁棒性）：用户规则把导出时才生成的时间戳与 span id 换成占位符（collector 整批拒收）、
+项目配置能经 `pass_env` 把 collector 的鉴权头交给 Agent、导出时按 Ctrl-C 把做完的 run 变成被中断的（结论与交接文件
+都丢了）、环境里的端点在明文 HTTP 上带用户名与密码、代理绕过明文规则、Agent 塞进 trace 目录的 span 带着用户的凭证
+发出去且十六进制的值绕过脱敏、`trace export` 的报错不脱敏且显示路径里的令牌、鉴权头里方案之后的凭证单独出现时没被
+换掉、httpx 之外的失败落成笼统的错误、补发的建议自相矛盾（且部分成功时不该重发）、OpenTelemetry 的标准开关被忽略、
+`trace export` 没有总上限、没有结局的 trace 照样导出（与契约不符）、大 trace 的开销，以及 13 条存活变异。全部按上面
+的设计修掉并补了用例。
+
+阶段四收口：阶段审计，见 [M3 阶段四审计](../audits/2026-10-02-m3-phase4-audit.md)。
 
 ### 收口
 

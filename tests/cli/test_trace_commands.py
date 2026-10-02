@@ -665,7 +665,7 @@ def test_prune_naming_a_trace_that_is_not_there_deletes_nothing(tmp_path: Path):
         (['trace', 'prune', 'aa', '--keep', '3'], '去掉其中一个'),
         (['trace', 'prune', 'aa', '--keep', '0'], '去掉其中一个'),
         (['trace', 'prune', '--keep', '-1'], 'non-negative integer'),
-        (['trace'], '{list,show,replay,prune}'),
+        (['trace'], '{list,show,replay,export,prune}'),
     ],
 )
 def test_contradictory_or_malformed_trace_arguments_are_refused(

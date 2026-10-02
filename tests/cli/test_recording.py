@@ -9,6 +9,7 @@ import json
 import os
 import random
 import string
+import subprocess
 from io import StringIO
 from pathlib import Path
 from typing import Any, cast
@@ -658,3 +659,56 @@ def test_a_failed_turn_followed_by_a_good_one_ends_the_chat_trace_ok(tmp_path: P
     [(header, _, _)] = _recorded(tmp_path)
     assert answer == 'recovered'
     assert header.status is SpanStatus.OK
+
+
+def _git(root: Path, *args: str) -> str:
+    environ = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    completed = subprocess.run(
+        ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com', *args],
+        cwd=root,
+        env={**environ, 'HOME': str(root)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+def _bare_environ(root: Path) -> dict[str, str]:
+    environ = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    return {**environ, 'HOME': str(root)}
+
+
+def test_a_run_in_a_git_repository_records_the_commit_it_ran_on(tmp_path: Path):
+    _git(tmp_path, 'init', '-q')
+    (tmp_path / 'notes.txt').write_text('x', encoding='utf-8')
+    _git(tmp_path, 'add', 'notes.txt')
+    _git(tmp_path, 'commit', '-q', '-m', 'first')
+    head = _git(tmp_path, 'rev-parse', 'HEAD')
+
+    code, _, _ = _cli(
+        tmp_path,
+        ScriptedLLM([ScriptedTurn('done')]),
+        ['run', 'go', '--agent', 'Worker'],
+        environ=_bare_environ(tmp_path),
+    )
+
+    [(header, _, _)] = _recorded(tmp_path)
+    assert code == 0
+    assert header.source.git_commit == head
+
+
+@pytest.mark.parametrize('repository', ['none', 'no commits yet'])
+def test_a_run_with_no_commit_to_name_records_none(tmp_path: Path, repository: str):
+    if repository == 'no commits yet':
+        _git(tmp_path, 'init', '-q')
+
+    _cli(
+        tmp_path,
+        ScriptedLLM([ScriptedTurn('done')]),
+        ['run', 'go', '--agent', 'Worker'],
+        environ=_bare_environ(tmp_path),
+    )
+
+    [(header, _, _)] = _recorded(tmp_path)
+    assert header.source.git_commit is None

@@ -30,6 +30,12 @@ from syndica.cli.checks import parse_check
 from syndica.cli.config import CliConfig, load_config
 from syndica.cli.dev_module import DevLog, DevLogSnapshot, DevModule, last_answer
 from syndica.cli.environment import AgentEnvironment, agent_environment
+from syndica.cli.export import (
+    TraceExporter,
+    command_line_target,
+    environment_resource,
+    environment_target,
+)
 from syndica.cli.git_finish import (
     Finish,
     GitInterrupted,
@@ -70,6 +76,7 @@ from syndica.cli.main import (
 )
 from syndica.cli.policy import dev_danger_options
 from syndica.cli.recording import (
+    MirroredTraceStore,
     Recording,
     described,
     run_status,
@@ -82,6 +89,7 @@ from syndica.cli.terminal import one_line, terminal_safe
 from syndica.cli.trace_commands import (
     Replayer,
     TraceUnusable,
+    trace_export,
     trace_list,
     trace_prune,
     trace_replay,
@@ -114,6 +122,7 @@ from syndica.kernel import (
     Runtime,
     RuntimeModule,
     SafetyModule,
+    SpanStatus,
     StopReason,
     Subscription,
     SyndicaError,
@@ -163,6 +172,11 @@ _READ_ONLY_NOTICE = (
 _VERIFY_TIMEOUT = 900.0
 # doctor 跑 `command -v` 与 `<exe> --version` 的上限。
 _PROBE_TIMEOUT = 30.0
+# 记录开始时问一次 HEAD 的上限：问不出来就不记，不为它拖住 run。
+_HEAD_TIMEOUT = 5.0
+# run 结束时导出的总上限：一个慢的 collector 按批收，每批都在单次请求的超时以内，也能把命令行拖住。
+_EXPORT_DEADLINE = 30.0
+_COMMIT_ID = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
 _ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
 # 能不执行就找出来的程序名：普通名字或路径，外加 `[`；带 shell 语法或展开的词不在其中。
 _PROGRAM = re.compile(r'\[|[A-Za-z0-9_./+@%,:-]+')
@@ -1088,6 +1102,17 @@ class _TerminalLogHandler(logging.Handler):
             self.handleError(record)
 
 
+@dataclass(frozen=True)
+class _PendingExport:
+    """一个记完、等着在命令结束时导出的 trace（`complete` 为假时不导出）。"""
+
+    store: FileTraceStore
+    trace_id: str
+    error: BaseException | None
+    redactor: Redactor
+    complete: bool
+
+
 @dataclass
 class _ChatSession:
     config: str
@@ -1118,9 +1143,12 @@ class RuntimeCliHost:
         workspace_root: str | Path,
         environ: Mapping[str, str] | None = None,
         replayer: Replayer | None = None,
+        exporter: TraceExporter | None = None,
     ) -> None:
         self._io = io
         self._replayer = replayer
+        self._exporter = exporter
+        self._exports: list[_PendingExport] = []
         self._lines = _Lines(io.stdin)
         self._model_factory = model_factory
         self._workspace_root = Path(workspace_root)
@@ -1147,7 +1175,51 @@ class RuntimeCliHost:
                 return self._runner.run(trace_show(store, request.trace_id))
             if request.action == 'prune':
                 return self._runner.run(trace_prune(store, request.keep, request.names))
+            if request.action == 'export':
+                return self._trace_export(request, store)
             return self._trace_replay(request, store)
+
+    def _trace_export(self, request: TraceRequest, store: FileTraceStore) -> CliOutcome:
+        """`--otlp` 给的端点不带环境里的头；没给时用环境里的端点与头（与 run 结束时的导出同一套
+        规则）。"""
+        if self._exporter is None:
+            raise TraceUnusable(
+                expected='这个入口接上了 OTLP 导出（syndica 的命令行入口会接上）',
+                received='宿主建出来时没有给 exporter',
+                next_action='从 `syndica` 命令行运行 trace export',
+            )
+        try:
+            resource = environment_resource(self._environ)
+            if request.otlp is not None:
+                target = command_line_target(request.otlp)
+            else:
+                found = environment_target(self._environ)
+                if found is None:
+                    raise ConfigError(
+                        expected='trace export 有一个端点：--otlp <url>，或环境里的 '
+                        'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT',
+                        received='两样都没有',
+                        next_action='加上 --otlp http://localhost:4318 这样的端点再试',
+                    )
+                target = found
+        except ConfigError as error:
+            raise TraceUnusable(
+                expected=error.expected, received=error.received, next_action=error.next_action
+            ) from error
+        config = self._config(request.config)
+        redactor = host_redactor(self._environ, config.redaction_rules)
+        if target.note is not None:
+            self._warn(redactor.redact(target.note))
+        return self._runner.run(
+            trace_export(
+                store,
+                request.trace_id,
+                target=target,
+                resource=resource,
+                exporter=self._exporter,
+                redactor=redactor,
+            )
+        )
 
     def _trace_replay(self, request: TraceRequest, store: FileTraceStore) -> CliOutcome:
         """回放一个 trace，回放本身按 structure 记成一个指向原 trace 的新 trace（配置关掉记录时
@@ -1175,7 +1247,10 @@ class RuntimeCliHost:
                     redactor,
                     level=TraceLevel.STRUCTURE,
                     source=trace_source(
-                        request.argv, self._config_file(request.config), replay_of=header.trace_id
+                        request.argv,
+                        self._config_file(request.config),
+                        replay_of=header.trace_id,
+                        git_commit=self._head_commit(),
                     ),
                 )
         try:
@@ -1380,7 +1455,21 @@ class RuntimeCliHost:
         self._closed = True
         with self._logging_to_stderr():
             self._runner.run(self._close_sessions(interrupted=interrupted))
+            self._flush_exports()
         self._runner.close()
+
+    def _flush_exports(self) -> None:
+        """run 结束时的导出放在结论打出去之后：导出可能要等，这时按的 Ctrl-C 不该把一次做完的 run
+        变成被中断的。被打断就不再发剩下的，逐个说怎么补发。"""
+        pending, self._exports = self._exports, []
+        for number, item in enumerate(pending):
+            try:
+                self._runner.run(self._export(item))
+            except KeyboardInterrupt:
+                for skipped in pending[number:]:
+                    resend = f'syndica trace export {skipped.trace_id[:8]}'
+                    self._warn(skipped.redactor.redact(f'导出被中断；要导出就运行 {resend}。'))
+                return
 
     def _config_file(self, path: str) -> Path | None:
         """配置文件本身（trace 记下它的 sha256）；用的是内置默认配置时 None。"""
@@ -1405,8 +1494,31 @@ class RuntimeCliHost:
             argv=argv,
             config=self._config_file(path),
             warn=self._warn,
+            git_commit=None if level is TraceLevel.OFF else self._head_commit(),
+            mirror=self._exporter is not None and self._export_wanted(),
         )
         return recording, redactor
+
+    def _export_wanted(self) -> bool:
+        """环境里设了能用的 OTLP 端点：这次记录要在内存里留一份，结束时从它导出。"""
+        try:
+            return environment_target(self._environ) is not None
+        except ConfigError:
+            return False
+
+    def _head_commit(self) -> str | None:
+        """工作区所在仓库的 HEAD（trace 头记下它，说清这个 trace 是在哪个版本上记的）；不在 git 仓库
+        里、还没有提交、git 用不了时 None。经宿主 git 环境跑：仓库配置里的 fsmonitor 不会被执行。"""
+        try:
+            completed = HostGit(self._workspace_root, self._environ).attempt(
+                'rev-parse', '--verify', '--quiet', 'HEAD^{commit}', timeout=_HEAD_TIMEOUT
+            )
+        except GitUnavailable:
+            return None
+        if completed.returncode != 0:
+            return None
+        head = completed.stdout.decode('ascii', 'replace').strip()
+        return head if _COMMIT_ID.fullmatch(head) else None
 
     async def _finish_recording(
         self,
@@ -1434,6 +1546,70 @@ class RuntimeCliHost:
         self._warn(redactor.redact(f'{label}：{shown}'))
         if traces is not None:
             traces.append((shown, finished.complete))
+        if recording.store is not None and recording.recorder is not None:
+            self._exports.append(
+                _PendingExport(
+                    recording.store,
+                    recording.recorder.trace_id,
+                    error,
+                    redactor,
+                    finished.complete,
+                )
+            )
+
+    async def _export(self, item: _PendingExport) -> None:
+        """环境里设了 OTLP 端点就把这个 trace 发出去。失败只告警：run 的结论不受影响。被中断的 run
+        与不完整的 trace 不发：前者人已经按了 Ctrl-C，后者回放与导出都拒绝。"""
+        redactor, trace_id = item.redactor, item.trace_id
+        try:
+            target = environment_target(self._environ)
+            resource = environment_resource(self._environ)
+        except ConfigError as problem:
+            self._warn(
+                redactor.redact(f'trace 没有导出：{described(problem)}。run 的结论不受影响。')
+            )
+            return
+        if target is None:
+            return
+        resend = f'syndica trace export {trace_id[:8]}'
+        if run_status(item.error) is SpanStatus.CANCELLED:
+            self._warn(redactor.redact(f'被中断的 run 不导出 trace；要导出就运行 {resend}。'))
+            return
+        if not item.complete:
+            self._warn(redactor.redact('不完整的 trace 不导出（原因见上面的 ERROR）。'))
+            return
+        if target.note is not None:
+            self._warn(redactor.redact(target.note))
+        if self._exporter is None:
+            self._warn(
+                redactor.redact('环境里设了 OTLP 端点，但这个宿主没有接上导出器：trace 没有导出。')
+            )
+            return
+        store = item.store.mirror if isinstance(item.store, MirroredTraceStore) else item.store
+        try:
+            async with asyncio.timeout(_EXPORT_DEADLINE):
+                await self._exporter(
+                    store,
+                    trace_id,
+                    url=target.url,
+                    headers=target.headers,
+                    resource=resource,
+                    redactor=redactor,
+                )
+        except TimeoutError:
+            self._warn(
+                redactor.redact(
+                    f'trace 没有导出完：collector 在 {_EXPORT_DEADLINE:g} 秒里没有收完。'
+                    f'run 的结论不受影响；collector 快起来之后运行 {resend} 重发。'
+                )
+            )
+        except Exception as problem:
+            # 配置的毛病（没装 extra）重发也没用；collector 已经收下一部分的，重发会让它收到重复的。
+            resendable = getattr(problem, 'resendable', not isinstance(problem, ConfigError))
+            hint = f'collector 好了之后运行 {resend} 重发。' if resendable is True else ''
+            self._warn(
+                redactor.redact(f'trace 没有导出：{described(problem)}。run 的结论不受影响。{hint}')
+            )
 
     def _config(self, path: str) -> CliConfig:
         """相对路径按工作区根解析：配置属于工作区，不属于进程碰巧所在的目录（`python -m syndica`

@@ -322,6 +322,8 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 #   持久化内容用 `encode_redacted`。
 # - 回放文档的账本（`ReplayCapture`、`RecordingIds`、`Unreplayable`）：宿主经 `TraceRecorder.ids` 与
 #   `describe_run` 用它们，不直接碰；`REPLAYED_TOOLS` 是捕获与回放共用的名单，宿主不读它。
+# - `verbatim_attribute`：recorder 与 OTLP 导出共用的「哪些属性原样记、原样发」；宿主不需要它就能
+#   记录与导出。
 _WITHHELD: tuple[str, ...] = (
     'ATTRIBUTE_DOMAINS',
     'ATTRIBUTE_KINDS',
@@ -418,6 +420,7 @@ _WITHHELD: tuple[str, ...] = (
     'validate_danger_options',
     'validate_max_concurrency',
     'validate_tool_names',
+    'verbatim_attribute',
     'workspace_root_removal_rule',
     'write_all',
     'write_redacted',

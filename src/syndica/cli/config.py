@@ -59,6 +59,22 @@ def _config(expected: str, received: str, next_action: str) -> ConfigError:
     return ConfigError(expected=expected, received=received, next_action=next_action)
 
 
+# 名字里带这些的未知键多半是想设 OTLP 导出：单独说清为什么不行，而不是只说「未知键」（M3 D14）。
+_EXPORT_HINTS = ('otlp', 'otel', 'opentelemetry', 'endpoint', 'export', 'collector')
+
+
+def _refuse_export_settings(unknown: Sequence[str], where: str) -> None:
+    named = sorted(key for key in unknown if any(hint in key.lower() for hint in _EXPORT_HINTS))
+    if named:
+        raise _config(
+            'OTLP 导出的端点只从你自己的环境（OTEL_EXPORTER_OTLP_TRACES_ENDPOINT / '
+            'OTEL_EXPORTER_OTLP_ENDPOINT）或命令行（syndica trace export <id> --otlp <url>）来',
+            f'{where}里有 {named!r}',
+            '删掉它，改用环境变量或 --otlp：仓库里的配置可能来自不受信任的人，它选的端点会收到 '
+            'trace 的结构（命令、路径、工具名）与你的鉴权头',
+        )
+
+
 class _UniqueSafeLoader(yaml.SafeLoader):
     """SafeLoader variant that refuses duplicate mapping keys."""
 
@@ -180,6 +196,7 @@ def _trace(value: object) -> TraceLevel | None:
         )
     raw = cast(Mapping[object, object], value)
     unknown = [str(key) for key in raw if not isinstance(key, str) or key not in _TRACE_KEYS]
+    _refuse_export_settings(unknown, 'trace ')
     if unknown:
         raise _config(
             f'trace 只含 {sorted(_TRACE_KEYS)!r}',
@@ -280,6 +297,15 @@ def _workspace(value: object) -> WorkspaceConfig:
                 f'从 pass_env 删掉 {name}：宿主为每次 run 设它，透传会让 Agent 拿回你的 git / gh '
                 '配置',
             )
+        if name.startswith('OTEL_EXPORTER_OTLP_'):
+            raise _config(
+                'workspace.pass_env 不含 OTLP 导出的配置（OTEL_EXPORTER_OTLP_*）',
+                f'收到 {name!r}',
+                (
+                    f'从 pass_env 删掉 {name}：它们是宿主导出 trace 用的端点与鉴权头，交给 Agent '
+                    '等于把 collector 的凭证交给它'
+                ),
+            )
         if reopens_git(name):
             raise _config(
                 'workspace.pass_env 不含会重新打开 git / gh 配置的名字'
@@ -371,6 +397,7 @@ def _root_mapping(value: object, file: Path) -> Mapping[str, object]:
             '把这些键改成 version / agents / topologies / workspace / redaction 中的字符串',
         )
     unknown = [str(key) for key in root if key not in _ROOT_KEYS]
+    _refuse_export_settings(unknown, '配置根')
     if unknown:
         raise _config(
             f'配置根只含 {sorted(_ROOT_KEYS)!r}',

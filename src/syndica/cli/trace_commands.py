@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from typing import Protocol, TypeVar
 
+from syndica.cli.export import ExportTarget, TraceExporter
 from syndica.cli.main import CliOutcome
 from syndica.cli.terminal import one_line
 from syndica.cli.trace_view import TraceRow, render_list, render_show
@@ -31,8 +32,10 @@ from syndica.kernel.redaction import RULES_VERSION, Redactor
 __all__ = [
     'Replayed',
     'Replayer',
+    'TraceExportFailed',
     'TraceUnusable',
     'resolved',
+    'trace_export',
     'trace_list',
     'trace_prune',
     'trace_replay',
@@ -84,6 +87,10 @@ class TraceUnusable(ConfigError):
     """给的 trace 用不了：CLI 以 2 退出。"""
 
     exit_code = 2
+
+
+class TraceExportFailed(SyndicaError):
+    """collector 没收下（或者导出器装不上）：CLI 以 1 退出，三件套经过脱敏。"""
 
 
 async def resolved(store: FileTraceStore, given: str | None) -> TraceHeader:
@@ -151,6 +158,44 @@ async def trace_show(store: FileTraceStore, prefix: str | None) -> str:
     spans = await _read(store.spans(header.trace_id))
     edges = await _read(store.edges(header.trace_id))
     return render_show(header, spans, edges)
+
+
+async def trace_export(
+    store: FileTraceStore,
+    prefix: str | None,
+    *,
+    target: ExportTarget,
+    resource: Mapping[str, str],
+    exporter: TraceExporter,
+    redactor: Redactor,
+) -> CliOutcome:
+    """`trace export`：发出这个 trace 的全部 span。trace 用不了（找不到、没有结局、读不了）以 2
+    退出，在发之前先读一遍；collector 没收下以 1 退出。导出器的三件套可能带着 collector 回的原文
+    （有的会回显鉴权头），过一遍脱敏再报。"""
+    header = await resolved(store, prefix)
+    if header.status is None:
+        raise TraceUnusable(
+            expected='导出的 trace 有结局（记录完整）',
+            received=f'trace {header.trace_id} 记录到一半就断了：写入失败，或者那次 run 还没结束',
+            next_action='等它结束，或者换一个完整的 trace；不完整的 trace 不导出',
+        )
+    await _read(store.spans(header.trace_id))
+    await _read(store.edges(header.trace_id))
+    try:
+        count = await exporter(
+            store,
+            header.trace_id,
+            url=target.url,
+            headers=target.headers,
+            resource=resource,
+            redactor=redactor,
+        )
+    except SyndicaError as error:
+        parts = ('expected', 'received', 'next_action')
+        raise TraceExportFailed(
+            **{part: str(redactor.redact(getattr(error, part))) for part in parts}
+        ) from error
+    return CliOutcome(f'导出了 trace {header.trace_id} 的 {count} 个 span。', 0)
 
 
 async def trace_prune(store: FileTraceStore, keep: int, names: Sequence[str]) -> CliOutcome:

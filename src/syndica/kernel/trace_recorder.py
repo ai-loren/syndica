@@ -51,8 +51,6 @@ from syndica.kernel.replay_capture import ReplayCapture, Unreplayable
 from syndica.kernel.scenario_schema import parse_scenario_document
 from syndica.kernel.tool import ToolResult
 from syndica.kernel.trace import (
-    ATTRIBUTE_DOMAINS,
-    ATTRIBUTE_KINDS,
     AttributeValue,
     CausalityEdge,
     Span,
@@ -63,6 +61,7 @@ from syndica.kernel.trace import (
     TraceLevel,
     TraceRedaction,
     TraceSource,
+    verbatim_attribute,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,16 +76,6 @@ _MAX_DEPTH = 64
 _MAX_NODES = 100_000
 # 十进制转换有位数上限（`sys.get_int_max_str_digits`），JSON 编码这么大的整数会抛错；十六进制没有。
 _MAX_INT_BITS = 8192
-# 取值是内核生成的标识或摘要的属性。连同种类是 `payload` 的引用与 `ATTRIBUTE_DOMAINS` 里的闭集
-# 取值一起原样记：脱敏规则（尤其是用户规则）可能认得一段十六进制或一个词，id 与引用换成占位符
-# 就断了，闭集取值换成占位符则整个 span 校验不过、写不出去。
-_IDENTIFIERS = frozenset(
-    {'agent.id', 'child.agent_id', 'message.id', 'message.to', 'llm.request_digest'}
-)
-
-
-def _verbatim(key: str) -> bool:
-    return key in _IDENTIFIERS or key in ATTRIBUTE_DOMAINS or ATTRIBUTE_KINDS.get(key) == 'payload'
 
 
 class _Walk:
@@ -822,7 +811,7 @@ class TraceRecorder:
     def _attributes(self, attributes: Mapping[str, AttributeValue]) -> dict[str, AttributeValue]:
         redacted: dict[str, AttributeValue] = {}
         for key, value in attributes.items():
-            if _verbatim(key):
+            if verbatim_attribute(key):
                 redacted[key] = value
             elif isinstance(value, str):
                 redacted[key] = self._text(value)

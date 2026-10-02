@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,10 +18,14 @@ from pathlib import Path
 from syndica import __version__
 from syndica.cli.handoff import trace_directory
 from syndica.kernel import (
+    CausalityEdge,
     ConfigError,
     FileTraceStore,
+    InMemoryTraceStore,
     RuleRedactor,
+    Span,
     SpanStatus,
+    TraceHeader,
     TraceLevel,
     TraceRecorder,
     TraceSource,
@@ -29,6 +34,7 @@ from syndica.kernel import (
 __all__ = [
     'LEVELS',
     'Finished',
+    'MirroredTraceStore',
     'Recording',
     'described',
     'run_status',
@@ -88,6 +94,33 @@ class Finished:
     complete: bool
 
 
+class MirroredTraceStore(FileTraceStore):
+    """写进 trace 目录的同时在内存里留一份：run 结束时导出的是记录器自己写的，而不是此刻目录里的
+    文件。目录是 Agent 的 Bash 改得到的，从文件导出就是替 Agent 带着用户的凭证往 collector 写。
+    payload 不留：导出只发它们的 sha256。"""
+
+    def __init__(self, root: str | os.PathLike[str]) -> None:
+        super().__init__(root)
+        self.mirror = InMemoryTraceStore()
+
+    async def begin(self, header: TraceHeader) -> None:
+        await super().begin(header)
+        await self.mirror.begin(header)
+
+    async def append(
+        self,
+        trace_id: str,
+        spans: Sequence[Span] = (),
+        edges: Sequence[CausalityEdge] = (),
+    ) -> None:
+        await super().append(trace_id, spans, edges)
+        await self.mirror.append(trace_id, spans, edges)
+
+    async def finish(self, trace_id: str, status: SpanStatus, ended_ns: int) -> None:
+        await super().finish(trace_id, status, ended_ns)
+        await self.mirror.finish(trace_id, status, ended_ns)
+
+
 @dataclass
 class Recording:
     """一次记录。`recorder` 为 None 时这次不记：级别是 `off`，或 trace 目录写不进去。"""
@@ -109,9 +142,14 @@ class Recording:
 
 
 def trace_source(
-    argv: Sequence[str], config: Path | None, *, replay_of: str | None = None
+    argv: Sequence[str],
+    config: Path | None,
+    *,
+    replay_of: str | None = None,
+    git_commit: str | None = None,
 ) -> TraceSource:
-    """trace 头里的来源：命令行、配置文件的 sha256（读不到是 None）、版本，回放时加原 trace。"""
+    """trace 头里的来源：命令行、配置文件的 sha256（读不到是 None）、版本、工作区所在仓库的
+    HEAD，回放时加原 trace。"""
     digest = None
     if config is not None:
         try:
@@ -119,7 +157,11 @@ def trace_source(
         except OSError:
             digest = None
     return TraceSource(
-        argv=tuple(argv), config_sha256=digest, version=__version__, replay_of=replay_of
+        argv=tuple(argv),
+        config_sha256=digest,
+        version=__version__,
+        git_commit=git_commit,
+        replay_of=replay_of,
     )
 
 
@@ -140,13 +182,17 @@ async def start_recording(
     argv: Sequence[str],
     config: Path | None,
     warn: Callable[[str], None],
+    git_commit: str | None = None,
+    mirror: bool = False,
 ) -> Recording:
     """开始记录：建 `.syndica/traces`、写下 trace 的头。写不进去时 stderr 说一句、这次不记。"""
     if level is TraceLevel.OFF:
         return Recording(None, None)
     try:
-        store = FileTraceStore(trace_directory(root))
-        recorder = TraceRecorder(store, redactor, level=level, source=trace_source(argv, config))
+        directory = trace_directory(root)
+        store = MirroredTraceStore(directory) if mirror else FileTraceStore(directory)
+        source = trace_source(argv, config, git_commit=git_commit)
+        recorder = TraceRecorder(store, redactor, level=level, source=source)
         await recorder.begin()
     except Exception as error:
         warn(
