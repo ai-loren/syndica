@@ -901,7 +901,7 @@ recorder 脱敏（`redact_argv`，`--api-key <值>` 分成两项时也认），`
   第一次追加照常（Runtime 级切点不冻结任何 `Context`）。
 - 变异：计数不复位（之后所有写入都被拒）；只冻结工具段不冻结观察者分发；只在两个以上观察者时冻结。
 
-**状态：完成。** 按 D9 修订实现。`Context.append` 在这份轨迹的窗口里报三件套 `ContractViolation`、点名最近的
+**状态：完成（ef9ddf5）。** 按 D9 修订实现。`Context.append` 在这份轨迹的窗口里报三件套 `ContractViolation`、点名最近的
 那个窗口；窗口由 `context._frozen(ctx, window)` 开、记在 contextvar 里（可以嵌套、可以同名，异常与取消时照样关），
 `Runtime._drive` 开头调 `_no_windows()`。两类窗口：`HooksCenter.trigger` 的每一次带 `ctx` 的分发（可拦截与可观察
 都算），与 `ToolExecutor._run_segment` 的每一段（单个调用也算——`PRE_TOOL_USE`、`POST_TOOL_USE`、
@@ -932,6 +932,31 @@ Agent 自己的追加，模型的回复与结果块都会被拒；窗口里取�
   `TraceSource`（recorder 写头之前脱敏）、交接文件写 trace 目录、`.syndica/.gitignore` 照样建、Ctrl-C 时以 `cancelled`
   收尾、`begin` 失败（store 写不进去）时 stderr 一条说明且照常跑。人的答复不用宿主报：内核在等待等到它时交给 recorder。宿主档案（规则带参数、处置表、
   Flag、`--max-turns`、`--no-write`、模块、拓扑与入口）从 T12 起报。
+
+**状态：完成。** `kernel/stores/file_trace.py`：`FileTraceStore(root)` 过契约套件。每一级按名字以 `O_NOFOLLOW`（目录另加
+`O_DIRECTORY`）经 `dir_fd` 重开；文件另加 `O_NONBLOCK`、打开之后核对是普通文件，要写的只许有一个硬链接，读之前按大小设上限
+（头 4 MiB、别的 256 MiB，撞上已有的 payload 时按它应有的大小）；`root` 记下第一次打开时的身份，换成别的目录就拒绝；`begin`
+记下自己建的目录名，此后按名字直接打开、核对头里的 id，没记下的（别的 store 实例读）按目录名里的 id 前缀找，两个目录都自称是
+同一个 trace 时报错；payload 以 `O_EXCL` 创建并核对 sha256，写到一半失败删掉半截文件；头与记录读不成（包括模型类型自己的
+校验、嵌套过深）都报「这个 trace 已经不可信：删掉它所在的目录」。CLI：`run` / `chat` 默认记录到 `<工作区>/.syndica/traces`
+（`--trace`，再 `trace.level`，再 `replay`；chat 最高 `structure`，人点名要了更高的级别才在 stderr 说一句）；结束时 stderr 打出
+trace 目录（经宿主的脱敏器与转义，不完整时标出来），`--handoff` 的正文多一节 `## trace`（front matter 不变，不完整时多一句）；
+Ctrl-C 以 `cancelled` 收尾（`run --handoff` 期间第二次按键不再打断收尾），失败的 run、以失败的一轮结束的 chat 以 `error` 收尾；
+trace 开不了头（`.syndica` 是普通文件、`traces` 是符号链接、记录器自己出错）时 stderr 一条说明、照常跑。命令行参数逐项脱敏
+之后整行再过一遍：`API_TOKEN: <值>` 跨两项，连起来认出了就交回脱敏之后的一整行。recorder 的 store 失败报告用错误自己的下一步
+（三件套时），不再一律说「store 有缺陷」。
+
+与计划不同之处：(1) `FileTraceStore` 不收 `Redactor`：内容在 recorder 里已经按宿主的整套规则逐叶脱敏，store 再用一遍宿主的
+用户规则只会换掉内核生成的 id 与摘要（读回时校验不过）；它写盘时用只含内置规则的脱敏器再编码，对已脱敏的文本是幂等的。
+(2) 不攥长期的目录 fd：每次调用按名字重开、核对根的身份，「`delete` 之后的写报错」由此成立。(3) chat 的默认级别不提示。
+
+验证：自己的变异 53 条，存活 5 条（同一秒里同前缀的两个 trace、按完整 id 认目录、stderr 上两处的脱敏、交接文件的不完整标记），
+各补一条用例之后全杀。对抗评审一路：3 Medium（Agent 种下的 FIFO 或稀疏大文件让宿主挂住或撑爆内存；`NAME: <值>` 分成两个
+命令行参数时原样进了 `trace.json`；被改过的 trace 的报错让人去跑还不存在的 `trace prune`，外层又说 store 有缺陷）、7 Low（硬链接
+与上级目录的符号链接把写入带出 trace 目录；一个读不成的头让列表与查找都失败；`run --handoff` 的第二次 Ctrl-C 打断收尾、trace
+没有结局；每一次写都列一遍历史上所有的 trace，复制出的同名前缀目录能接走写入；chat 以失败的一轮结束时 trace 记成 ok；两个 run
+同时建 `.syndica` 时一个报错；未知级别是裸 `KeyError`），外加 14 条存活变异（其中 4 条已被评审导出之后补的用例杀掉）。全部修掉并
+各补用例；修复后的变异见提交说明。
 
 #### T12 — 场景格式 v2：内核的 schema 与 runner 的两种读法
 

@@ -64,6 +64,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'EventBus',
     'ExecResult',
     'ExitMode',
+    'FileTraceStore',
     'Finding',
     'FlagDeclaration',
     'HookCallback',

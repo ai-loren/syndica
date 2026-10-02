@@ -26,15 +26,17 @@ from syndica.kernel import (
     RedactionRule,
     RuleRedactor,
     Topology,
+    TraceLevel,
     register_builtins,
 )
 from syndica.kernel.redaction import looks_secret
 
 __all__ = ['CliConfig', 'WorkspaceConfig', 'load_config']
 
-_ROOT_KEYS = frozenset({'version', 'agents', 'topologies', 'workspace', 'redaction'})
+_ROOT_KEYS = frozenset({'version', 'agents', 'topologies', 'workspace', 'redaction', 'trace'})
 _WORKSPACE_KEYS = frozenset({'pass_env', 'verify', 'protected'})
 _REDACTION_KEYS = frozenset({'rules'})
+_TRACE_KEYS = frozenset({'level'})
 _RULE_KEYS = frozenset({'id', 'pattern'})
 _TOPOLOGY_KEYS = frozenset({'slots'})
 _SLOT_KEYS = frozenset(
@@ -121,7 +123,8 @@ class WorkspaceConfig:
 class CliConfig:
     """A validated CLI configuration snapshot.
 
-    `redaction_rules` 是 `redaction.rules` 里用户追加的脱敏规则，按声明顺序排在内置规则之后。
+    `redaction_rules` 是 `redaction.rules` 里用户追加的脱敏规则，按声明顺序排在内置规则之后；
+    `trace_level` 是 `trace.level`，命令行没给 `--trace` 时用它，没写时 None（宿主取默认级别）。
     """
 
     source: str
@@ -129,6 +132,7 @@ class CliConfig:
     topologies: Mapping[str, Topology]
     workspace: WorkspaceConfig = WorkspaceConfig()
     redaction_rules: tuple[RedactionRule, ...] = ()
+    trace_level: TraceLevel | None = None
 
 
 def load_config(path: str | Path) -> CliConfig:
@@ -163,7 +167,39 @@ def load_config(path: str | Path) -> CliConfig:
         topologies=MappingProxyType(topologies),
         workspace=_workspace(root.get('workspace', {})),
         redaction_rules=_redaction(root.get('redaction', {})),
+        trace_level=_trace(root.get('trace', {})),
     )
+
+
+def _trace(value: object) -> TraceLevel | None:
+    if not isinstance(value, Mapping):
+        raise _config(
+            'trace 是只含 level 的 Mapping',
+            f'收到 trace={value!r}，类型是 {type(value).__name__}',
+            '写成 `trace: {level: structure}`；不需要就省略整段（默认 replay）',
+        )
+    raw = cast(Mapping[object, object], value)
+    unknown = [str(key) for key in raw if not isinstance(key, str) or key not in _TRACE_KEYS]
+    if unknown:
+        raise _config(
+            f'trace 只含 {sorted(_TRACE_KEYS)!r}',
+            f'未知键 {sorted(unknown)!r}',
+            '删除这些键；未识别的配置不能静默忽略，否则用户会以为它已经生效',
+        )
+    if 'level' not in raw:
+        return None
+    level = raw['level']
+    # YAML 1.1 把不带引号的 off（还有 no、false）读成 false。
+    if level is False:
+        return TraceLevel.OFF
+    names = [member.value for member in TraceLevel]
+    if not isinstance(level, str) or level not in names:
+        raise _config(
+            f'trace.level 是 {" / ".join(names)} 之一',
+            f'收到 {level!r}（{type(level).__name__}）',
+            '改成其中之一；yes / on / true 会被 YAML 读成布尔值，不是级别',
+        )
+    return TraceLevel(level)
 
 
 def _redaction(value: object) -> tuple[RedactionRule, ...]:

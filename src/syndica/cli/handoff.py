@@ -43,6 +43,7 @@ __all__ = [
     'rewrite_handoff',
     'status_of',
     'terminal_safe',
+    'trace_directory',
     'write_handoff',
 ]
 
@@ -51,6 +52,7 @@ SCHEMA = 'syndica.handoff/1'
 BUILTIN_PROTECTED = ('**/.gitignore', '**/.gitattributes')
 _OWN = '.syndica'
 _HANDOFFS = 'handoffs'
+_TRACES = 'traces'
 # 公开契约里的标记行语法，逐行整行匹配（`\s` 按契约，含 `\r`、NBSP 与全角空格：只认空格与制表符
 # 时，CRLF 结尾的 `verdict: block` 不算数，后面一行 `verdict: pass` 就成了唯一的标记）。
 # 值按 ASCII 不分大小写：Unicode 的大小写折叠会让 `paſſ`（U+017F）也匹配上，front matter 就不再是
@@ -222,7 +224,8 @@ class VerifyResult:
 @dataclass(frozen=True)
 class HandoffFacts:
     """组装正文用到的事实，都由宿主得出；只有 `answer` 与 Reviewer 的标记来自模型。
-    `verify_error` 是复核没法下结论的原因（复核命令崩了、复核前后的快照取不到）。"""
+    `verify_error` 是复核没法下结论的原因（复核命令崩了、复核前后的快照取不到）。`trace` 是这次
+    run 的 trace 目录（相对工作区根，没记录时 None），`trace_complete` 为假时它不完整。"""
 
     prompt: str
     answer: str | None
@@ -238,6 +241,8 @@ class HandoffFacts:
     changed_by_verify: tuple[str, ...]
     run_errors: tuple[str, ...]
     next_steps: tuple[str, ...]
+    trace: str | None = None
+    trace_complete: bool = True
 
 
 def lock_workspace(root: Path) -> int:
@@ -269,13 +274,13 @@ def _checked_directory(root: Path, path: Path) -> bool:
         raise HandoffWriteError(
             expected=f'{path} 是工作区里的真目录',
             received='它是符号链接',
-            next_action='删掉它再跑：交接文件不写到链接指向的地方',
+            next_action='删掉它再跑：宿主不往链接指向的地方写交接文件与 trace',
         )
     if not stat.S_ISDIR(mode):
         raise HandoffWriteError(
             expected=f'{path} 是工作区里的真目录',
             received='它不是目录（是一个普通文件或别的类型的文件）',
-            next_action='删掉或挪开它再跑：交接文件写在这个目录里',
+            next_action='删掉或挪开它再跑：宿主的交接文件与 trace 写在这个目录里',
         )
     if not path.resolve().is_relative_to(root.resolve()):
         raise HandoffWriteError(
@@ -286,12 +291,12 @@ def _checked_directory(root: Path, path: Path) -> bool:
     return True
 
 
-def _handoff_directory(root: Path) -> Path:
+def _own_directory(root: Path, name: str) -> Path:
+    """`.syndica/<name>`：两级都核对过（不是符号链接、是真目录、在工作区里），缺了就建（0700）。"""
     own = root / _OWN
-    if not _checked_directory(root, own):
-        own.mkdir(mode=0o700)
+    _ensure_directory(root, own)
     # 缺了就补，已有的不动：Agent 先建出 `.syndica/` 时第一次创建的那一刻已经过去了，而没有它交接
-    # 文件就出现在 `git status` 里。`O_EXCL` 在路径已存在时失败，是符号链接也一样。
+    # 文件与 trace 就出现在 `git status` 里。`O_EXCL` 在路径已存在时失败，是符号链接也一样。
     try:
         descriptor = os.open(own / '.gitignore', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
@@ -301,10 +306,33 @@ def _handoff_directory(root: Path) -> Path:
             write_all(descriptor, b'*\n')
         finally:
             os.close(descriptor)
-    handoffs = own / _HANDOFFS
-    if not _checked_directory(root, handoffs):
-        handoffs.mkdir(mode=0o700)
-    return handoffs
+    directory = own / name
+    _ensure_directory(root, directory)
+    return directory
+
+
+def _ensure_directory(root: Path, path: Path) -> None:
+    """核对过的真目录，缺了就建（0700）。两个 run 同时开始时另一个可能抢先建好：那就照样核对它。"""
+    if _checked_directory(root, path):
+        return
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        if not _checked_directory(root, path):
+            raise HandoffWriteError(
+                expected=f'{path} 是工作区里的真目录',
+                received='它刚被别的进程建出来又不见了',
+                next_action='确认没有别的进程在删 .syndica，然后重跑',
+            ) from None
+
+
+def _handoff_directory(root: Path) -> Path:
+    return _own_directory(root, _HANDOFFS)
+
+
+def trace_directory(root: Path) -> Path:
+    """`.syndica/traces`：trace 的根目录，与交接文件同样核对，`.gitignore` 同样补。"""
+    return _own_directory(root, _TRACES)
 
 
 def write_handoff(root: Path, name: str, text: str, redactor: Redactor) -> Path:
@@ -429,5 +457,9 @@ def render(matter: str, facts: HandoffFacts, *, git_section: str) -> str:
         lines += ['run 没有正常结束：', *quoted(facts.failure), '']
     lines += quoted(facts.answer) if facts.answer else ['没有回答。']
     lines += ['', '## 下一步', '', *[f'- {step}' for step in facts.next_steps]]
+    if facts.trace is not None:
+        lines += ['', '## trace', '', f'`{one_line(facts.trace)}`']
+        if not facts.trace_complete:
+            lines += ['', '不完整：有记录没写进去（原因在 run 的 stderr 里），不要拿它回放或导出。']
     lines += ['', '## git 收尾', '', git_section, '']
     return '\n'.join(lines)

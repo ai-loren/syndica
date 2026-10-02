@@ -812,7 +812,11 @@ def encode_digests(digests: Sequence[str]) -> RedactedText:
 def redact_argv(argv: Sequence[str], redactor: Redactor) -> tuple[str, ...]:
     """命令行参数逐项脱敏。逐项看不见两项之间的关系：`--api-key <值>` 分成两项时，名字像密钥的
     开关让紧跟它的那一项按凭证判，脱敏之后仍像凭证就换成 `secret.named_assignment` 的占位符——与
-    `encode_redacted` 里一对键值的判法相同。写成一项的 `--api-key=<值>` 由规则本身认。"""
+    `encode_redacted` 里一对键值的判法相同。写成一项的 `--api-key=<值>` 由规则本身认。
+
+    之后整行（以空格连起来，就是人敲的样子）再过一遍：`API_TOKEN: <值>`、`password= <值>` 跨两项，
+    只有连起来规则才认得出。连起来认出了逐项漏掉的东西时交回连起来脱敏之后的一整行（只有一项）：
+    拆回各项要把占位符对回原来的位置，对不准的那一截就漏了。"""
     redacted: list[str] = []
     for index, item in enumerate(argv):
         text = redactor.redact(item)
@@ -824,7 +828,9 @@ def redact_argv(argv: Sequence[str], redactor: Redactor) -> tuple[str, ...]:
         ):
             text = _placeholder('secret.named_assignment')
         redacted.append(text)
-    return tuple(redacted)
+    joined = ' '.join(redacted)
+    whole = redactor.redact(joined)
+    return tuple(redacted) if whole == joined else (whole,)
 
 
 def write_all(fd: int, data: bytes) -> None:

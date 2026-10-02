@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tomllib
+from collections.abc import Sequence
 from dataclasses import asdict
 from io import StringIO
 from pathlib import Path
@@ -39,6 +40,7 @@ class _Host:
         self.doctor_configs: list[str] = []
         self.doctor_verify: list[bool] = []
         self.chat_turn_limits: list[int | None] = []
+        self.chat_traces: list[tuple[str | None, tuple[str, ...]]] = []
 
     def run_request(self, request: RunRequest) -> str:
         self.requests.append(request)
@@ -53,9 +55,17 @@ class _Host:
         self.doctor_verify.append(verify)
         return 'healthy'
 
-    def open_chat(self, config: str, max_turns: int | None = None) -> str:
+    def open_chat(
+        self,
+        config: str,
+        max_turns: int | None = None,
+        *,
+        trace: str | None = None,
+        argv: Sequence[str] = (),
+    ) -> str:
         assert config == '.syndica.yaml'
         self.chat_turn_limits.append(max_turns)
+        self.chat_traces.append((trace, tuple(argv)))
         return 'root-agent-id'
 
     def active_agents(self) -> str:
@@ -153,6 +163,8 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'no_write': False,
         'handoff': False,
         'git_mode': None,
+        'trace': None,
+        'argv': ('write', 'the report'),
     }
     assert asdict(host.requests[1]) == {
         'prompt': 'review this',
@@ -168,6 +180,28 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'no_write': True,
         'handoff': False,
         'git_mode': None,
+        'trace': None,
+        'argv': (
+            '--config',
+            'team.yaml',
+            'run',
+            'review this',
+            '--agent',
+            'Worker',
+            '--max-turns',
+            '7',
+            '--max-cost',
+            '1.5',
+            '--max-tokens',
+            '4096',
+            '--max-wall-clock',
+            '30',
+            '--flag',
+            'retry_enabled=true',
+            '--flag',
+            'attempts=3',
+            '--no-write',
+        ),
     }
 
 
@@ -487,27 +521,42 @@ def test_chat_forwards_its_turn_limit_to_the_host() -> None:
     assert host.chat_turn_limits == [4]
 
 
-def test_module_host_forwards_the_chat_turn_limit_to_the_runtime_host(
+def test_module_host_forwards_the_chat_options_and_the_interruption_to_the_runtime_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import syndica.cli.host as host_module
     from syndica.__main__ import _LazyHost  # pyright: ignore[reportPrivateUsage]
 
-    opened: list[tuple[str, int | None]] = []
+    opened: list[tuple[str, int | None, str | None, tuple[str, ...]]] = []
+    closed: list[bool] = []
 
     class RecordingHost:
         def __init__(self, **_: object) -> None:
             pass
 
-        def open_chat(self, config: str, max_turns: int | None = None) -> str:
-            opened.append((config, max_turns))
+        def open_chat(
+            self,
+            config: str,
+            max_turns: int | None = None,
+            *,
+            trace: str | None = None,
+            argv: Sequence[str] = (),
+        ) -> str:
+            opened.append((config, max_turns, trace, tuple(argv)))
             return 'root-agent-id'
+
+        def close(self, *, interrupted: bool = False) -> None:
+            closed.append(interrupted)
 
     monkeypatch.setattr(host_module, 'RuntimeCliHost', RecordingHost)
     lazy = _LazyHost(CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()))
 
-    assert lazy.open_chat('.syndica.yaml', 3) == 'root-agent-id'
-    assert opened == [('.syndica.yaml', 3)]
+    target = lazy.open_chat('.syndica.yaml', 3, trace='full', argv=['chat', '--trace', 'full'])
+    lazy.close(interrupted=True)
+
+    assert target == 'root-agent-id'
+    assert opened == [('.syndica.yaml', 3, 'full', ('chat', '--trace', 'full'))]
+    assert closed == [True]
 
 
 def test_module_entrypoint_lists_agents_without_model_configuration(

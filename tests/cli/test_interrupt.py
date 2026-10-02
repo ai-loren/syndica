@@ -26,6 +26,7 @@ from syndica.cli.host import (
     _interruptible,  # pyright: ignore[reportPrivateUsage]
     _Lines,  # pyright: ignore[reportPrivateUsage]
 )
+from syndica.kernel import FileTraceStore, SpanStatus, TraceHeader
 
 _DRIVER = """
 import json
@@ -206,11 +207,17 @@ def _assert_gone(pid: int) -> None:
     pytest.fail(f'process {pid} outlived the interrupted CLI')
 
 
+def _traces(root: Path) -> list[TraceHeader]:
+    return asyncio.run(FileTraceStore(root / '.syndica' / 'traces').traces())
+
+
 def _handoff_argv(tmp_path: Path) -> list[str]:
     return ['--config', str(tmp_path / 'syndica.yaml'), 'run', '--handoff', '--agent', 'Lead', 'go']
 
 
-def test_ctrl_c_during_the_run_writes_a_failed_handoff_and_exits_130(tmp_path: Path):
+def test_ctrl_c_during_the_run_writes_a_failed_handoff_naming_its_cancelled_trace(
+    tmp_path: Path,
+):
     root = _workspace(tmp_path, verify=['true'])
     child = _Child(
         tmp_path, root, _handoff_argv(tmp_path), [_call('b', 'Bash', command=_waiting('run'))]
@@ -222,6 +229,10 @@ def test_ctrl_c_during_the_run_writes_a_failed_handoff_and_exits_130(tmp_path: P
 
     (path,) = child.handoffs()
     matter = _matter(child.stdout)
+    [trace] = _traces(root)
+    [directory] = (root / '.syndica' / 'traces').iterdir()
+    assert trace.status is SpanStatus.CANCELLED
+    assert f'## trace\n\n`.syndica/traces/{directory.name}`\n' in child.stdout
     assert code == 130
     assert 'Traceback' not in child.stderr
     assert (matter['status'], matter['host_verify'], matter['git'], matter['exit_code']) == (
@@ -391,7 +402,7 @@ def test_a_run_whose_question_expired_does_not_wait_for_an_answer_afterwards(tmp
     assert 'which colour?' in child.stdout and 'done' in child.stdout
 
 
-def test_ctrl_c_in_an_ordinary_run_exits_130_without_a_traceback(tmp_path: Path):
+def test_ctrl_c_in_an_ordinary_run_exits_130_and_ends_its_trace_cancelled(tmp_path: Path):
     root = _workspace(tmp_path)
     argv = ['--config', str(tmp_path / 'syndica.yaml'), 'run', '--agent', 'Lead', 'go']
     child = _Child(tmp_path, root, argv, [_call('b', 'Bash', command=_waiting('plain'))])
@@ -400,6 +411,9 @@ def test_ctrl_c_in_an_ordinary_run_exits_130_without_a_traceback(tmp_path: Path)
     pid = int((root / 'plain.pid').read_text(encoding='utf-8'))
     code = child.interrupt()
 
+    [trace] = _traces(root)
+    assert trace.status is SpanStatus.CANCELLED
+    assert 'trace：.syndica/traces/' in child.stderr
     assert code == 130
     assert 'Traceback' not in child.stderr
     assert '被中断（Ctrl-C）：命令可能没有做完。' in child.stderr
@@ -407,7 +421,7 @@ def test_ctrl_c_in_an_ordinary_run_exits_130_without_a_traceback(tmp_path: Path)
     _assert_gone(pid)
 
 
-def test_ctrl_c_while_a_chat_agent_asks_the_human_does_not_wait_for_an_answer(tmp_path: Path):
+def test_ctrl_c_while_a_chat_agent_asks_the_human_ends_the_session_and_its_trace(tmp_path: Path):
     root = _workspace(tmp_path)
     config = tmp_path / 'syndica.yaml'
     config.write_text(
@@ -428,8 +442,10 @@ def test_ctrl_c_while_a_chat_agent_asks_the_human_does_not_wait_for_an_answer(tm
     child.wait_for(lambda: 'which shape?' in child.stdout, 'the question was asked')
     code = child.interrupt()
 
+    [trace] = _traces(root)
     assert code == 130
     assert 'Traceback' not in child.stderr
+    assert trace.status is SpanStatus.CANCELLED
 
 
 def test_ctrl_c_while_the_agent_asks_the_human_does_not_wait_for_an_answer(tmp_path: Path):
@@ -820,7 +836,7 @@ def test_once_the_host_is_closed_ctrl_c_is_ignored_while_the_interpreter_exits(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(entry, 'main', lambda **_: 0)
-    monkeypatch.setattr(entry._LazyHost, 'close', lambda self: None)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(entry._LazyHost, 'close', lambda self, **_: None)  # pyright: ignore[reportPrivateUsage]
     previous = signal.getsignal(signal.SIGINT)
     try:
         with pytest.raises(SystemExit) as exited:
@@ -836,13 +852,47 @@ def test_once_the_host_is_closed_ctrl_c_is_ignored_while_the_interpreter_exits(
 def test_a_ctrl_c_while_the_host_closes_keeps_the_exit_code_already_reported(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    def interrupted(self: object) -> None:
+    def interrupted(self: object, **_: object) -> None:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(entry, 'main', lambda **_: 3)
     monkeypatch.setattr(entry._LazyHost, 'close', interrupted)  # pyright: ignore[reportPrivateUsage]
 
     assert _exit_code_of_entrypoint() == 3
+
+
+@pytest.mark.parametrize(('outcome', 'interrupted'), [(0, False), (3, False), (130, True)])
+def test_the_host_is_told_whether_the_command_ended_interrupted(
+    monkeypatch: pytest.MonkeyPatch, outcome: int, interrupted: bool
+):
+    told: list[bool] = []
+
+    def close(self: object, *, interrupted: bool = False) -> None:
+        told.append(interrupted)
+
+    monkeypatch.setattr(entry, 'main', lambda **_: outcome)
+    monkeypatch.setattr(entry._LazyHost, 'close', close)  # pyright: ignore[reportPrivateUsage]
+
+    assert _exit_code_of_entrypoint() == outcome
+    assert told == [interrupted]
+
+
+def test_a_ctrl_c_escaping_main_tells_the_host_it_was_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    told: list[bool] = []
+
+    def interrupted(**_: object) -> int:
+        raise KeyboardInterrupt
+
+    def close(self: object, *, interrupted: bool = False) -> None:
+        told.append(interrupted)
+
+    monkeypatch.setattr(entry, 'main', interrupted)
+    monkeypatch.setattr(entry._LazyHost, 'close', close)  # pyright: ignore[reportPrivateUsage]
+
+    assert _exit_code_of_entrypoint() == 130
+    assert told == [True]
 
 
 def test_a_second_ctrl_c_while_main_reports_the_first_still_exits_130(
@@ -852,6 +902,6 @@ def test_a_second_ctrl_c_while_main_reports_the_first_still_exits_130(
         raise KeyboardInterrupt
 
     monkeypatch.setattr(entry, 'main', interrupted)
-    monkeypatch.setattr(entry._LazyHost, 'close', lambda self: None)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(entry._LazyHost, 'close', lambda self, **_: None)  # pyright: ignore[reportPrivateUsage]
 
     assert _exit_code_of_entrypoint() == 130

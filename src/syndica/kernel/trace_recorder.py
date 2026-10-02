@@ -693,9 +693,12 @@ class TraceRecorder:
     def _fail(self, step: str, error: BaseException) -> None:
         """只在还没失败过时调：此后的记录走 `_write` 开头只计数的那条路，这条 ERROR 恰好一条。"""
         self._failure = error
+        # 三件套的错误自己说得出下一步（store 发现目录被改过、recorder 发现 store 交回的引用不对），
+        # 一律换成「store 有缺陷」会让人去修一个没问题的 store。
+        own = getattr(error, 'next_action', None)
         repair = (
-            '这是 store 的缺陷（它违反了 TraceStore 契约），修好它'
-            if isinstance(error, ContractViolation)
+            own
+            if isinstance(own, str) and own.strip()
             else '检查 store（磁盘空间、权限、远端连通）'
         )
         logger.error(

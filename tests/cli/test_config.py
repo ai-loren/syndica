@@ -8,7 +8,7 @@ from types import MappingProxyType
 import pytest
 
 from syndica.cli.config import CliConfig, load_config
-from syndica.kernel import ConfigError, ExitMode
+from syndica.kernel import ConfigError, ExitMode, TraceLevel
 
 
 def _write(path: Path, text: str) -> Path:
@@ -542,3 +542,63 @@ def test_a_redaction_section_that_is_not_a_mapping_is_refused(tmp_path: Path) ->
         load_config(_write(tmp_path / 'syndica.yaml', 'version: 1\nredaction: [custom.x]\n'))
 
     assert '只含 rules 的 Mapping' in caught.value.expected
+
+
+# --- trace 段 ----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ('body', 'expected'),
+    [
+        ('', None),
+        ('trace: {}\n', None),
+        ('trace: {level: off}\n', TraceLevel.OFF),
+        ("trace: {level: 'off'}\n", TraceLevel.OFF),
+        ('trace: {level: structure}\n', TraceLevel.STRUCTURE),
+        ('trace: {level: replay}\n', TraceLevel.REPLAY),
+        ('trace: {level: full}\n', TraceLevel.FULL),
+    ],
+    ids=['absent', 'empty', 'unquoted-off', 'quoted-off', 'structure', 'replay', 'full'],
+)
+def test_the_trace_level_is_read_from_the_trace_section(
+    tmp_path: Path, body: str, expected: TraceLevel | None
+) -> None:
+    config = load_config(_write(tmp_path / 'syndica.yaml', f'version: 1\n{body}'))
+
+    assert config.trace_level is expected
+
+
+@pytest.mark.parametrize(
+    ('body', 'expected', 'received', 'next_action'),
+    [
+        ('trace: structure\n', '只含 level 的 Mapping', "trace='structure'", '{level: structure}'),
+        ('trace:\n', '只含 level 的 Mapping', 'trace=None', '{level: structure}'),
+        ('trace: {lvl: full}\n', "trace 只含 ['level']", "['lvl']", '删除这些键'),
+        ('trace: {level: yes}\n', 'off / structure / replay / full', 'True（bool）', '布尔值'),
+        ('trace: {level: verbose}\n', 'off / structure / replay / full', "'verbose'", '其中之一'),
+        ('trace: {level: 1}\n', 'off / structure / replay / full', '1（int）', '其中之一'),
+        ('trace: {level: 0}\n', 'off / structure / replay / full', '0（int）', '其中之一'),
+        ('trace: {level: null}\n', 'off / structure / replay / full', 'None', '其中之一'),
+        ("trace: {level: ''}\n", 'off / structure / replay / full', "''", '其中之一'),
+    ],
+    ids=[
+        'not-a-mapping',
+        'null',
+        'unknown-key',
+        'yaml-true',
+        'unknown-level',
+        'number',
+        'zero',
+        'null-level',
+        'empty-level',
+    ],
+)
+def test_a_malformed_trace_section_is_refused_with_what_to_write(
+    tmp_path: Path, body: str, expected: str, received: str, next_action: str
+) -> None:
+    with pytest.raises(ConfigError) as caught:
+        load_config(_write(tmp_path / 'syndica.yaml', f'version: 1\n{body}'))
+
+    assert expected in caught.value.expected
+    assert received in caught.value.received
+    assert next_action in caught.value.next_action

@@ -79,7 +79,12 @@ from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueC
 from syndica.kernel.redaction import Finding, RedactionRule, RuleRedactor
 from syndica.kernel.retry import RetryModule
 from syndica.kernel.runtime import AgentFactory, Runtime
-from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker, InMemoryTraceStore
+from syndica.kernel.stores import (
+    FileTraceStore,
+    InMemoryAgentRegistry,
+    InMemoryMessageBroker,
+    InMemoryTraceStore,
+)
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tools import (
     AskUser,
@@ -155,6 +160,7 @@ __all__ = [
     'EventBus',
     'ExecResult',
     'ExitMode',
+    'FileTraceStore',
     'Finding',
     'FlagDeclaration',
     'HookCallback',

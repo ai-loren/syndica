@@ -1276,7 +1276,7 @@ def test_a_root_failure_is_quoted_once_after_the_child_failures_before_it(
     assert 'root exploded' not in stderr.getvalue()
 
 
-def test_a_completed_run_writes_nothing_to_stderr(tmp_path: Path) -> None:
+def test_a_completed_run_writes_only_its_trace_directory_to_stderr(tmp_path: Path) -> None:
     stderr = StringIO()
     host = _host(tmp_path, {'default': ScriptedLLM([ScriptedTurn(content='done')])}, stderr)
     try:
@@ -1285,7 +1285,21 @@ def test_a_completed_run_writes_nothing_to_stderr(tmp_path: Path) -> None:
         host.close()
 
     assert output == 'done'
+    [directory] = (tmp_path / '.syndica' / 'traces').iterdir()
+    assert stderr.getvalue() == f'trace：.syndica/traces/{directory.name}\n'
+
+
+def test_a_run_with_tracing_off_writes_nothing_to_stderr_and_no_trace(tmp_path: Path) -> None:
+    stderr = StringIO()
+    host = _host(tmp_path, {'default': ScriptedLLM([ScriptedTurn(content='done')])}, stderr)
+    try:
+        output = host.run_request(RunRequest(prompt='go', agent='Worker', trace='off'))
+    finally:
+        host.close()
+
+    assert output == 'done'
     assert stderr.getvalue() == ''
+    assert not (tmp_path / '.syndica' / 'traces').exists()
 
 
 def test_a_run_that_ends_without_any_text_fails_with_its_stop_reason(tmp_path: Path) -> None:

@@ -59,6 +59,7 @@ from syndica.cli.handoff import (
 from syndica.cli.host_git import Change, GitUnavailable, HostGit
 from syndica.cli.main import EXIT_INTERRUPTED, CliIO, CliOutcome, InspectRequest, RunRequest
 from syndica.cli.policy import dev_danger_options
+from syndica.cli.recording import Recording, run_status, start_recording, trace_level
 from syndica.cli.redaction import host_redactor
 from syndica.cli.terminal import one_line, terminal_safe
 from syndica.kernel import (
@@ -92,6 +93,7 @@ from syndica.kernel import (
     ToolCall,
     ToolResult,
     Topology,
+    TraceRecorder,
     TrustLevel,
     local_tools,
     register_builtins,
@@ -111,6 +113,7 @@ _SHELL = '/bin/sh'
 # 文件工具碰不到的目录：trace 里存着此前标成不可信的工具输出，经 Read 读回来就成了可信内容；交接
 # 文件只由宿主写。不整个关 `.syndica`：本仓的 Worker 把长输出存进 `.syndica/tmp/` 再读。
 _PRIVATE = ('.syndica/traces', '.syndica/handoffs')
+_INCOMPLETE_TRACE = 'trace（不完整，原因见上面的 ERROR；不要拿它回放）'
 # CLI 拒收的 Flag 取值：`--flag` 报错，`flags show` 不列。
 _REFUSED_FLAG_VALUE = ('untrusted_high_risk', 'allow')
 # `run --no-write` 在清单与槽里留下的工具。白名单而不是去掉几个写工具：以后新增的可写工具默认
@@ -976,6 +979,26 @@ class _CtrlC:
         self._settled = True
 
 
+async def _despite_cancellation(work: Coroutine[Any, Any, _T]) -> _T:
+    """跑完 `work` 再理会取消，取消在它跑完之后照样抛出。trace 的收尾等着写入任务排空，`run
+    --handoff` 期间的第二次 Ctrl-C 只取消、不强制退出：收尾被它打断，trace 就没有结局，交接文件里也
+    没有它的目录。"""
+    task = asyncio.ensure_future(work)
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+        except BaseException:
+            break
+    if interrupted:
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError
+    return task.result()
+
+
 async def _interruptible(ctrl_c: _CtrlC, work: Coroutine[Any, Any, _T]) -> _T:
     """把这一段放进一个子任务里跑：Ctrl-C 取消的是它，不是主任务。已经按过就直接取消。"""
     task = asyncio.ensure_future(work)
@@ -1044,6 +1067,10 @@ class _ChatSession:
     agent_id: str
     subscription: Subscription
     pump: asyncio.Task[None]
+    recording: Recording
+    redactor: Redactor
+    # 最近一轮怎么结束的：chat 在一轮失败时就结束，会话的 trace 以它收尾。
+    failure: Exception | None = None
 
 
 class RuntimeCliHost:
@@ -1096,6 +1123,7 @@ class RuntimeCliHost:
                     ('topology', request.topology),
                     ('max_turns', request.max_turns),
                     ('flags', request.flags),
+                    ('trace', request.trace),
                 )
                 if value is not None and value != ()
             ]
@@ -1220,18 +1248,86 @@ class RuntimeCliHost:
     def doctor(self, config: str, *, verify: bool = False) -> CliOutcome:
         return self._runner.run(self._doctor(config, verify=verify))
 
-    def open_chat(self, config: str, max_turns: int | None = None) -> str:
-        return self._runner.run(self._open_chat(config, max_turns))
+    def open_chat(
+        self,
+        config: str,
+        max_turns: int | None = None,
+        *,
+        trace: str | None = None,
+        argv: Sequence[str] = (),
+    ) -> str:
+        with self._logging_to_stderr():
+            return self._runner.run(self._open_chat(config, max_turns, trace=trace, argv=argv))
 
     def active_agents(self) -> str:
         return self._runner.run(self._active_agents())
 
-    def close(self) -> None:
+    def close(self, *, interrupted: bool = False) -> None:
+        """收掉 chat 会话；`interrupted` 时它们的 trace 以 `cancelled` 收尾。"""
         if self._closed:
             return
         self._closed = True
-        self._runner.run(self._close_sessions())
+        with self._logging_to_stderr():
+            self._runner.run(self._close_sessions(interrupted=interrupted))
         self._runner.close()
+
+    def _config_file(self, path: str) -> Path | None:
+        """配置文件本身（trace 记下它的 sha256）；用的是内置默认配置时 None。"""
+        file = self._workspace_root / path
+        return file if file.is_file() else None
+
+    async def _start_recording(
+        self,
+        config: CliConfig,
+        requested: str | None,
+        argv: Sequence[str],
+        path: str,
+        *,
+        chat: bool,
+    ) -> tuple[Recording, Redactor]:
+        redactor = host_redactor(self._environ, config.redaction_rules)
+        level = trace_level(requested, config.trace_level, chat=chat, warn=self._warn)
+        recording = await start_recording(
+            self._workspace_root,
+            level,
+            redactor,
+            argv=argv,
+            config=self._config_file(path),
+            warn=self._warn,
+        )
+        return recording, redactor
+
+    async def _finish_recording(
+        self,
+        recording: Recording,
+        error: BaseException | None,
+        redactor: Redactor,
+        traces: list[tuple[str, bool]] | None = None,
+    ) -> None:
+        """收尾并在 stderr 打出 trace 目录（相对工作区根）与它完不完整；`traces` 收下这两样。收尾
+        自己出错只告警：它不能顶替 run 的结论。"""
+        try:
+            finished = await _despite_cancellation(recording.finish(run_status(error)))
+        except Exception as exc:
+            self._warn(
+                redactor.redact(
+                    f'trace 没能收尾：{type(exc).__name__}: {exc}。run 的结论不受影响；这个 trace '
+                    '没有结局，不要拿它回放。'
+                )
+            )
+            return
+        if finished is None:
+            return
+        directory = finished.directory
+        shown = (
+            str(directory.relative_to(self._workspace_root))
+            if directory.is_relative_to(self._workspace_root)
+            else str(directory)
+        )
+        label = 'trace' if finished.complete else _INCOMPLETE_TRACE
+        self._warn(redactor.redact(f'{label}：{shown}'))
+        if traces is not None:
+            traces.append((shown, finished.complete))
 
     def _config(self, path: str) -> CliConfig:
         """相对路径按工作区根解析：配置属于工作区，不属于进程碰巧所在的目录（`python -m syndica`
@@ -1467,10 +1563,17 @@ class RuntimeCliHost:
             return _first_line(version) or one_line(where)
         return f'版本未知：{_how_it_failed(version)}'
 
-    async def _open_chat(self, path: str, max_turns: int | None) -> str:
+    async def _open_chat(
+        self, path: str, max_turns: int | None, *, trace: str | None, argv: Sequence[str]
+    ) -> str:
         config = self._config(path)
         catalog = _turn_capped(config.catalog, max_turns)
-        workspace, environment = self._open_workspace(config)
+        recording, redactor = await self._start_recording(config, trace, argv, path, chat=True)
+        try:
+            workspace, environment = self._open_workspace(config)
+        except BaseException as exc:
+            await self._finish_recording(recording, exc, redactor)
+            raise
         runtime: Runtime | None = None
         subscription: Subscription | None = None
         pump: asyncio.Task[None] | None = None
@@ -1496,6 +1599,7 @@ class RuntimeCliHost:
                 orchestration=True,
                 modules=_agent_modules(self._workspace_root, self._environ),
                 confirmation_handler=MailboxConfirmationHandler(timeout=300),
+                tracer=recording.recorder,
             )
             subscription = runtime.events.subscribe()
             pump = asyncio.create_task(
@@ -1515,9 +1619,11 @@ class RuntimeCliHost:
                 agent_id=agent_id,
                 subscription=subscription,
                 pump=pump,
+                recording=recording,
+                redactor=redactor,
             )
             return agent_id
-        except BaseException:
+        except BaseException as exc:
             try:
                 if runtime is not None:
                     await runtime.shutdown()
@@ -1528,6 +1634,7 @@ class RuntimeCliHost:
                 await workspace.close()
             finally:
                 environment.remove()
+                await self._finish_recording(recording, exc, redactor)
             raise
 
     async def _run_session(self, session: _ChatSession, prompt: str) -> str:
@@ -1572,7 +1679,13 @@ class RuntimeCliHost:
                     f'创建时是 {session.config!r}，本次收到 {request.config!r}',
                     '不要在 chat 中切换 --config；退出后用新配置重新进入 chat',
                 )
-            return await self._run_session(session, request.prompt)
+            try:
+                answer = await self._run_session(session, request.prompt)
+            except Exception as exc:
+                root_session.failure = exc
+                raise
+            root_session.failure = None
+            return answer
         raise _config_error(
             'run --session 指向当前 chat 进程里的活动 Agent',
             (f'收到 session={target!r}；当前进程没有该目标，且里程碑 1 没有 SessionStore'),
@@ -1591,7 +1704,7 @@ class RuntimeCliHost:
                 rows.append(f'{info.agent_id} {info.name} {info.status.value}')
         return '\n'.join(rows)
 
-    async def _close_sessions(self) -> None:
+    async def _close_sessions(self, *, interrupted: bool = False) -> None:
         sessions = list(self._sessions.values())
         self._sessions.clear()
         for session in sessions:
@@ -1606,6 +1719,11 @@ class RuntimeCliHost:
                 await session.workspace.close()
             finally:
                 session.environment.remove()
+                await self._finish_recording(
+                    session.recording,
+                    KeyboardInterrupt() if interrupted else session.failure,
+                    session.redactor,
+                )
 
     async def _wait_with_pump(
         self,
@@ -1632,10 +1750,43 @@ class RuntimeCliHost:
         logs: list[DevLog] | None = None,
         stops: list[StopReason | None] | None = None,
         reports: list[str] | None = None,
+        traces: list[tuple[str, bool]] | None = None,
     ) -> str:
-        """一次 run 的回答。`logs` 收下这个 Runtime 的 `dev_log`（run 结束、Runtime 关掉之后照样
-        能读），`stops` 收下根 Agent 的结局，`reports` 收下运行中的错误报告。"""
+        """一次 run 的回答，记成一个 trace（D15）。`logs` 收下这个 Runtime 的 `dev_log`（run 结束、
+        Runtime 关掉之后照样能读），`stops` 收下根 Agent 的结局，`reports` 收下运行中的错误报告，
+        `traces` 收下 trace 目录（相对工作区根）与它完不完整。"""
         config = config or self._config(request.config)
+        recording, redactor = await self._start_recording(
+            config, request.trace, request.argv, request.config, chat=False
+        )
+        error: BaseException | None = None
+        try:
+            return await self._run_traced(
+                request,
+                flags,
+                config,
+                recording.recorder,
+                logs=logs,
+                stops=stops,
+                reports=reports,
+            )
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            await self._finish_recording(recording, error, redactor, traces)
+
+    async def _run_traced(
+        self,
+        request: RunRequest,
+        flags: Mapping[str, bool | int | str],
+        config: CliConfig,
+        tracer: TraceRecorder | None,
+        *,
+        logs: list[DevLog] | None,
+        stops: list[StopReason | None] | None,
+        reports: list[str] | None,
+    ) -> str:
         catalog = _turn_capped(config.catalog, request.max_turns)
         prompt = _READ_ONLY_NOTICE + request.prompt if request.no_write else request.prompt
         workspace, environment = self._open_workspace(config)
@@ -1670,6 +1821,7 @@ class RuntimeCliHost:
                     ),
                     flags=flags,
                     confirmation_handler=MailboxConfirmationHandler(timeout=300),
+                    tracer=tracer,
                 )
                 if logs is not None:
                     # 服务是装配时 setattr 上去的，Runtime 的静态类型里没有这个属性。
@@ -1821,6 +1973,7 @@ class RuntimeCliHost:
         logs: list[DevLog] = []
         stops: list[StopReason | None] = []
         reports: list[str] = []
+        traces: list[tuple[str, bool]] = []
         answer: str | None = None
         failure: str | None = None
         results: tuple[VerifyResult, ...] = ()
@@ -1844,7 +1997,13 @@ class RuntimeCliHost:
                 answer = await _interruptible(
                     ctrl_c,
                     self._run_request(
-                        request, flags, config=config, logs=logs, stops=stops, reports=reports
+                        request,
+                        flags,
+                        config=config,
+                        logs=logs,
+                        stops=stops,
+                        reports=reports,
+                        traces=traces,
                     ),
                 )
             except asyncio.CancelledError:
@@ -1941,6 +2100,8 @@ class RuntimeCliHost:
                 verify_error,
                 changed=bool(run_changes),
             ),
+            trace=traces[0][0] if traces else None,
+            trace_complete=traces[0][1] if traces else True,
         )
 
         def document(git_state: str, exit_code: int | None, section: str) -> str:

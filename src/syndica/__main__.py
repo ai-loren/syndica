@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import signal
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -284,15 +285,22 @@ class _LazyHost:
     def doctor(self, config: str, *, verify: bool = False) -> str | CliOutcome:
         return self._get().doctor(config, verify=verify)
 
-    def open_chat(self, config: str, max_turns: int | None = None) -> str:
-        return self._get().open_chat(config, max_turns)
+    def open_chat(
+        self,
+        config: str,
+        max_turns: int | None = None,
+        *,
+        trace: str | None = None,
+        argv: Sequence[str] = (),
+    ) -> str:
+        return self._get().open_chat(config, max_turns, trace=trace, argv=argv)
 
     def active_agents(self) -> str:
         return self._get().active_agents()
 
-    def close(self) -> None:
+    def close(self, *, interrupted: bool = False) -> None:
         if self._host is not None:
-            self._host.close()
+            self._host.close(interrupted=interrupted)
 
 
 def entrypoint() -> None:
@@ -306,7 +314,7 @@ def entrypoint() -> None:
         code = EXIT_INTERRUPTED
     finally:
         try:
-            host.close()
+            host.close(interrupted=code == EXIT_INTERRUPTED)
         except KeyboardInterrupt:
             # 关 Runtime 时按的 Ctrl-C 不改变已经打印出去的结论，退出码照旧与它一致。
             pass

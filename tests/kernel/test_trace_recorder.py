@@ -421,6 +421,11 @@ def _secrets(seed: int) -> Iterator[str]:
         (('{0}', 'run', '--api-key'), ('{0}', 'run', '--api-key')),
         (('run', '--api-key', 'short'), ('run', '--api-key', 'short')),
         (('run', '--trace', 'full', 'ship it'), ('run', '--trace', 'full', 'ship it')),
+        (
+            ('run', 'deploy', 'API_TOKEN:', '{0}', '--agent', 'Worker'),
+            ('run deploy API_TOKEN: [REDACTED:secret.named_assignment] --agent Worker',),
+        ),
+        (('run', 'password=', '{0}'), ('run password= [REDACTED:secret.named_assignment]',)),
     ],
     ids=[
         'flag-then-value',
@@ -431,6 +436,8 @@ def _secrets(seed: int) -> Iterator[str]:
         'first-item-before-a-trailing-flag',
         'short-value',
         'nothing-secret',
+        'assignment-across-two-words',
+        'equals-then-value',
     ],
 )
 async def test_argv_is_redacted_before_the_header_is_written(
@@ -1224,6 +1231,35 @@ async def test_a_failing_store_leaves_the_run_alone_and_reports_once(
     assert [t for t in asyncio.all_tasks() if t.get_name() == f'trace:{recorder.trace_id}'] == []
 
 
+class _Tampered(_Counting):
+    async def append(
+        self,
+        trace_id: str,
+        spans: Sequence[Span] = (),
+        edges: Sequence[CausalityEdge] = (),
+    ) -> None:
+        raise ContractViolation(
+            expected='trace 目录没被改过',
+            received='spans.jsonl 换成了 FIFO',
+            next_action='删掉被改过的那个 trace 目录',
+        )
+
+
+async def test_a_store_error_that_names_its_own_next_step_is_reported_with_that_step(
+    caplog: pytest.LogCaptureFixture,
+):
+    build, options = _delegating()
+
+    _, recorder, _, context = await _recorded(build, store=_Tampered(), **options)
+
+    [report] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
+    args = cast(tuple[object, ...], report.args)
+    assert context.stop_reason is StopReason.COMPLETED
+    assert (args[3], args[5]) == ('ContractViolation', '删掉被改过的那个 trace 目录')
+    assert '缺陷' not in report.getMessage()
+    assert recorder.dropped > 0
+
+
 class _Misreporting(_Counting):
     def __init__(self, wrong: str) -> None:
         super().__init__()
@@ -1253,7 +1289,8 @@ async def test_a_store_that_misreports_a_payload_reference_is_a_store_failure(
     [report] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
     error = cast(tuple[object, ...], report.args)[4]
     assert isinstance(error, ContractViolation) and 'put_payload' in error.next_action
-    assert 'store 的缺陷' in str(cast(tuple[object, ...], report.args)[5])
+    assert cast(tuple[object, ...], report.args)[5] == error.next_action
+    assert '修这个 store' in error.next_action
     assert recorder.dropped == produced
 
 

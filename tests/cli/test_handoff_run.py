@@ -1470,3 +1470,55 @@ def test_run_failed_with_changes_mentions_uncommitted_work(tmp_path: Path):
     assert run.code == 1
     assert run.matter['status'] == 'run_failed'
     assert '工作区里的改动还在，没有提交。' in run.stdout
+
+
+def test_the_handoff_names_the_runs_trace_and_the_trace_hides_the_hosts_secrets(tmp_path: Path):
+    root = _workspace(tmp_path)
+    answer = f'done with {_SECRET}\ncommit_title: add new'
+
+    run = _run(
+        tmp_path, _reviewed(answer=answer), config=_config(tmp_path, verify=['true']), root=root
+    )
+
+    (path,) = run.files
+    document = path.read_text(encoding='utf-8')
+    [directory] = (root / '.syndica' / 'traces').iterdir()
+    texts = [file.read_text(encoding='utf-8') for file in directory.rglob('*') if file.is_file()]
+    assert f'\n## trace\n\n`.syndica/traces/{directory.name}`\n' in document
+    assert f'trace：.syndica/traces/{directory.name}\n' in run.stderr
+    assert 'trace' not in run.matter
+    assert texts and not any(_SECRET in text for text in texts)
+    assert any('done with [REDACTED:secret.env_value]' in text for text in texts)
+
+
+class _LockingTraces(ScriptedLLM):
+    """第一次被调用时把这次 run 的 trace 目录改成只读：Agent 的 Bash 能做到的事。"""
+
+    def __init__(self, turns: list[ScriptedTurn], root: Path) -> None:
+        super().__init__(turns)
+        self._root = root
+        self.locked: list[Path] = []
+
+    async def create(self, messages: list[Any], **kwargs: Any) -> Any:
+        if not self.locked:
+            [directory] = (self._root / '.syndica' / 'traces').iterdir()
+            directory.chmod(0o500)
+            self.locked.append(directory)
+        return await super().create(messages, **kwargs)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root ignores directory permissions')
+def test_a_handoff_whose_trace_lost_records_says_the_trace_is_incomplete(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = _LockingTraces([ScriptedTurn(content='nothing to change')], root)
+    try:
+        run = _run(tmp_path, llm, config=_config(tmp_path, verify=['true']), root=root)
+    finally:
+        for directory in llm.locked:
+            directory.chmod(0o700)
+
+    (path,) = run.files
+    document = path.read_text(encoding='utf-8')
+    [directory] = llm.locked
+    assert f'`.syndica/traces/{directory.name}`\n\n不完整：有记录没写进去' in document
+    assert len([line for line in run.stderr.splitlines() if line.startswith('期望: trace ')]) == 1

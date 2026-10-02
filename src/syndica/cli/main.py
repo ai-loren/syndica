@@ -28,6 +28,7 @@ EXIT_INTERRUPTED = 130
 _COMMANDS = frozenset(
     {'run', 'chat', 'agents', 'topology', 'sessions', 'flags', 'doctor', 'version'}
 )
+_TRACE_LEVELS = ('off', 'structure', 'replay', 'full')
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,8 @@ class RunRequest:
     no_write: bool = False
     handoff: bool = False
     git_mode: str | None = None
+    trace: str | None = None
+    argv: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -85,7 +88,14 @@ class CliHost(Protocol):
 
     def doctor(self, config: str, *, verify: bool = False) -> str | CliOutcome: ...
 
-    def open_chat(self, config: str, max_turns: int | None = None) -> str: ...
+    def open_chat(
+        self,
+        config: str,
+        max_turns: int | None = None,
+        *,
+        trace: str | None = None,
+        argv: Sequence[str] = (),
+    ) -> str: ...
 
     def active_agents(self) -> str: ...
 
@@ -171,6 +181,15 @@ def _parser() -> _ArgumentParser:
     )
     chat = commands.add_parser('chat')
     chat.add_argument('--max-turns', type=_positive_int)
+    for command in (run, chat):
+        command.add_argument(
+            '--trace',
+            choices=_TRACE_LEVELS,
+            help=(
+                '记录级别：off 不记，structure 只记 span 与边，replay 再记回放要的东西（默认，或 '
+                '.syndica.yaml 的 trace.level），full 再记完整请求；chat 最高 structure'
+            ),
+        )
     for resource in ('agents', 'topology', 'flags'):
         noun = commands.add_parser(resource)
         actions = noun.add_subparsers(dest='action', required=True)
@@ -291,9 +310,17 @@ def _host_failure(exc: Exception, streams: CliIO) -> int:
     return 1
 
 
-def _chat(host: CliHost, config: str, streams: CliIO, max_turns: int | None) -> int:
+def _chat(
+    host: CliHost,
+    config: str,
+    streams: CliIO,
+    max_turns: int | None,
+    *,
+    trace: str | None,
+    argv: Sequence[str],
+) -> int:
     try:
-        target = host.open_chat(config, max_turns)
+        target = host.open_chat(config, max_turns, trace=trace, argv=argv)
     except Exception as exc:
         return _host_failure(exc, streams)
     while True:
@@ -445,7 +472,14 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
             return _host_call(lambda: host.doctor(namespace.config, verify=True), streams)
         return _host_call(lambda: host.doctor(namespace.config), streams)
     if namespace.command == 'chat':
-        return _chat(host, namespace.config, streams, namespace.max_turns)
+        return _chat(
+            host,
+            namespace.config,
+            streams,
+            namespace.max_turns,
+            trace=namespace.trace,
+            argv=received,
+        )
     request = RunRequest(
         prompt=' '.join(namespace.prompt),
         config=namespace.config,
@@ -460,5 +494,7 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
         no_write=namespace.no_write,
         handoff=namespace.handoff,
         git_mode=namespace.git_mode,
+        trace=namespace.trace,
+        argv=tuple(received),
     )
     return _host_call(lambda: host.run_request(request), streams)

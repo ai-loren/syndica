@@ -711,3 +711,39 @@ def test_the_body_says_why_changes_could_not_be_listed():
     text = render('---\n---\n', facts, git_section='x')
 
     assert '列不出改动：不是 git 仓库' in text
+
+
+@pytest.mark.parametrize(
+    ('trace', 'complete', 'section'),
+    [
+        (None, True, None),
+        (
+            '.syndica/traces/20261002T000000Z-ab12cd34',
+            True,
+            '`.syndica/traces/20261002T000000Z-ab12cd34`',
+        ),
+        (
+            '.syndica/traces/20261002T000000Z-ab12cd34',
+            False,
+            '`.syndica/traces/20261002T000000Z-ab12cd34`\n\n'
+            '不完整：有记录没写进去（原因在 run 的 stderr 里），不要拿它回放或导出。',
+        ),
+    ],
+    ids=['not-recorded', 'complete', 'incomplete'],
+)
+def test_the_trace_section_sits_before_the_git_step_and_says_when_it_is_incomplete(
+    trace: str | None, complete: bool, section: str | None
+):
+    text = render('---\n---\n', _facts(trace=trace, trace_complete=complete), git_section='x')
+
+    if section is None:
+        assert '## trace' not in text
+    else:
+        assert f'\n## 下一步\n\n- 提交。\n\n## trace\n\n{section}\n\n## git 收尾\n' in text
+
+
+def test_a_trace_directory_name_stays_on_one_line_in_the_body():
+    text = render('---\n---\n', _facts(trace='.syndica/traces/x\n## git 收尾\nok'), git_section='x')
+
+    assert text.count('\n## git 收尾\n') == 1
+    assert '`.syndica/traces/x\\n## git 收尾\\nok`' in text

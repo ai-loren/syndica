@@ -143,8 +143,9 @@ agents:
     finally:
         host.close()
 
+    [directory] = (tmp_path / '.syndica' / 'traces').iterdir()
     assert code == 0, stderr.getvalue()
-    assert stderr.getvalue() == ''
+    assert stderr.getvalue() == f'trace：.syndica/traces/{directory.name}\n'
     assert stdout.getvalue().endswith('CLI workflow complete\n')
     assert 'Continue?' in stdout.getvalue()
     assert 'dangerous-1' in stdout.getvalue()
