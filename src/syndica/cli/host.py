@@ -1023,8 +1023,10 @@ class _CtrlC:
                 self._raising = False
             yield started
         finally:
-            self._raising = False
+            # 先定结论再放下 `_raising`：两句之间也收得到信号，反过来的话那一刻按到第三次就强制
+            # 退出，交接文件打印到一半。
             self._settled = True
+            self._raising = False
 
     def settle(self) -> None:
         self._settled = True

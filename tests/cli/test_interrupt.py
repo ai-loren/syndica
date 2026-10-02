@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
 from typing import Any, TextIO, cast
@@ -593,6 +594,41 @@ def test_presses_between_phases_are_only_recorded_until_the_third_forces_an_exit
     assert '再按两次强制退出' in warnings[0] and '再按一次强制退出' in warnings[1]
     with pytest.raises(KeyboardInterrupt):
         _press(ctrl_c)
+
+
+class _PressedAsTheGitStepEnds(_CtrlC):
+    """git 收尾这一段放下 `_raising` 的那一刻再按一次：两句赋值之间也收得到信号。"""
+
+    armed = False
+
+    def __init__(self, warn: Callable[[str], None]) -> None:
+        super().__init__(warn)
+        self.late: list[BaseException | None] = []
+
+    def __setattr__(self, name: str, value: object) -> None:
+        super().__setattr__(name, value)
+        if name == '_raising' and value is False and self.armed:
+            self.armed = False
+            try:
+                _press(self)
+            except KeyboardInterrupt as error:
+                self.late.append(error)
+            else:
+                self.late.append(None)
+
+
+def test_a_press_landing_just_as_the_git_step_ends_finds_the_outcome_settled():
+    ctrl_c = _PressedAsTheGitStepEnds(lambda text: None)
+
+    with pytest.raises(KeyboardInterrupt), ctrl_c.raising():
+        try:
+            _press(ctrl_c)
+        finally:
+            _press(ctrl_c)
+            ctrl_c.armed = True
+
+    assert ctrl_c.presses == 3
+    assert ctrl_c.late == [None]
 
 
 def test_in_the_git_step_only_the_first_press_raises_and_the_rest_are_told_once():
