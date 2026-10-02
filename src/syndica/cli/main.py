@@ -32,6 +32,7 @@ _COMMANDS = frozenset(
 # `trace prune` 不点名时留下的、有结局的 trace 个数。
 PRUNE_KEEP = 50
 _TRACE_LEVELS = ('off', 'structure', 'replay', 'full')
+_TRACE_ID_HELP = 'trace id、它的唯一前缀，或 run 结束时 stderr 上打出的 trace 目录名'
 
 
 @dataclass(frozen=True)
@@ -243,14 +244,16 @@ def _parser() -> _ArgumentParser:
     trace = commands.add_parser('trace')
     trace_actions = trace.add_subparsers(dest='action', required=True)
     trace_actions.add_parser(
-        'list', help='列出 trace：开始时间（UTC）、id、状态、Agent 数、span 数、大小'
+        'list', help='列出 trace：开始时间（UTC）、id、状态、Agent 数、span 数、大小、命令'
     )
-    show = trace_actions.add_parser('show', help='时间线，以及谁创建了谁、谁在等谁、最慢的工具调用')
-    show.add_argument('trace_id')
+    show = trace_actions.add_parser(
+        'show', help='时间线，以及谁创建了谁、谁在等谁、最慢的工具调用、各 Agent 的模型调用'
+    )
+    show.add_argument('trace_id', help=_TRACE_ID_HELP)
     replay = trace_actions.add_parser(
         'replay', help='离线回放：0 复现，1 分叉或结局不同，2 回放文档用不了'
     )
-    replay.add_argument('trace_id')
+    replay.add_argument('trace_id', help=_TRACE_ID_HELP)
     replay.add_argument(
         '--allow-divergence',
         action='store_true',
@@ -259,16 +262,16 @@ def _parser() -> _ArgumentParser:
     export = trace_actions.add_parser(
         'export', help='把一个 trace 按 OTLP/HTTP JSON 发给 collector（失败以 1 退出）'
     )
-    export.add_argument('trace_id')
+    export.add_argument('trace_id', help=_TRACE_ID_HELP)
     export.add_argument(
         '--otlp',
         help='collector 的端点（如 http://localhost:4318），不带 OTEL_EXPORTER_OTLP_HEADERS；'
         '不给时用环境里的端点与头',
     )
     prune = trace_actions.add_parser(
-        'prune', help='删掉旧 trace：只留最近 --keep 个有结局的；点名的只删点名的'
+        'prune', help='删掉旧 trace：只留最近 --keep 个有结局的（连同它们的回放）；点名的只删点名的'
     )
-    prune.add_argument('trace_ids', nargs='*')
+    prune.add_argument('trace_ids', nargs='*', help=_TRACE_ID_HELP)
     prune.add_argument(
         '--keep', type=_non_negative_int, help=f'留下最近几个有结局的（默认 {PRUNE_KEEP}）'
     )

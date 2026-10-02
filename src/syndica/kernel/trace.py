@@ -5,6 +5,10 @@ span 与边只记结构与闭集里的属性；自由文本（回复、工具结
 
 属性是闭集：每个键有固定的类型，键不在表里或类型不对都报 `ContractViolation`。插桩写错一个键名时，
 trace 里不会悄悄多出一个读者认不得的字段。`bool` 不算 `int`：`agent.cycle=True` 是插桩写错了。
+
+闭集（属性、span 种类、边的种类、事件）有任何增减，`TRACE_SCHEMA` 的版本号随之加一：读者按版本号认
+自己读不读得懂，旧版本的 syndica 读到新版本的 trace 时报 `NewerTraceSchema`（升级 syndica），而不是
+把一个它不认得的字段当成 trace 被改过。
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ __all__ = [
     'AttributeValue',
     'CausalityEdge',
     'EdgeKind',
+    'NewerTraceSchema',
     'PayloadRef',
     'Span',
     'SpanEvent',
@@ -35,10 +40,41 @@ __all__ = [
     'TraceLevel',
     'TraceRedaction',
     'TraceSource',
+    'readable_schema',
     'verbatim_attribute',
 ]
 
 TRACE_SCHEMA = 'syndica.trace/1'
+_SCHEMA_VERSION = re.compile(r'syndica\.trace/([1-9][0-9]{0,8})')
+
+
+class NewerTraceSchema(ContractViolation):
+    """trace 头的 schema 是比这个 syndica 更新的版本：读不懂它，但它没有坏。"""
+
+
+def readable_schema(schema: object) -> None:
+    """这个版本的 syndica 读得懂 `schema` 吗：读不懂时，更新的版本报 `NewerTraceSchema`，别的报
+    `ContractViolation`。读 trace 的一方在读任何别的字段之前先问它：新版本的头可能连字段都不一样。
+    """
+    if schema == TRACE_SCHEMA:
+        return
+    current = _SCHEMA_VERSION.fullmatch(TRACE_SCHEMA)
+    given = _SCHEMA_VERSION.fullmatch(schema) if isinstance(schema, str) else None
+    if current is not None and given is not None and int(given[1]) > int(current[1]):
+        raise NewerTraceSchema(
+            expected=f'trace 是这个版本的 syndica 读得懂的 {TRACE_SCHEMA}',
+            received=f'它由更新版本的 syndica 写下（{schema}）',
+            next_action='用写下它的那个版本或更新的 syndica 读它；它没有坏，不要删掉',
+        )
+    raise ContractViolation(
+        expected=f'trace 头的 schema 是 {TRACE_SCHEMA}',
+        received=f'收到 {schema!r}',
+        next_action=(
+            '它不是这个版本的 syndica 写下的 trace 头（被改过，或来自一个不再支持的旧版本）：'
+            '不要了就删掉它所在的目录'
+        ),
+    )
+
 
 AttributeValue = str | int | bool | list[str] | None
 
@@ -80,8 +116,8 @@ class TraceLevel(Enum):
 
 
 # 属性的闭集：键 → 取值的种类。`?` 表示还可以是 None；`str[]` 是字符串列表；`payload` 是同一个
-# trace 里一份 payload 的引用（内容的 sha256，64 个小写十六进制）。读者（`trace show`、导出器、
-# 回放）按这张表认字段，新增一个属性就是在这里加一行。
+# trace 里一份 payload 的引用（内容的 sha256，64 个小写十六进制）。读者（`trace show`、导出器）按
+# 这张表认字段；新增一个属性是在这里加一行，并把 `TRACE_SCHEMA` 的版本号加一。
 ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
     {
         'agent.role': 'str',
@@ -451,6 +487,7 @@ class TraceHeader:
     schema: str = TRACE_SCHEMA
 
     def __post_init__(self) -> None:
+        readable_schema(self.schema)
         _identifier(self.trace_id, _TRACE_ID, 'TraceHeader.trace_id', length=32)
         _nanoseconds(self.started_ns, 'TraceHeader.started_ns')
         _member(self.level, TraceLevel, 'TraceHeader.level')
@@ -481,12 +518,6 @@ class TraceHeader:
                     received=f'started_ns={self.started_ns}，ended_ns={self.ended_ns}',
                     next_action='结束时间取 finish 那一刻的时钟；注入的时钟必须单调不减',
                 )
-        if self.schema != TRACE_SCHEMA:
-            raise ContractViolation(
-                expected=f'TraceHeader.schema 是 {TRACE_SCHEMA}',
-                received=f'收到 {self.schema!r}',
-                next_action='旧版本的 trace 先经读取兼容层转成当前版本',
-            )
 
 
 @dataclass(frozen=True)

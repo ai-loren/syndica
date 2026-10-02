@@ -60,6 +60,17 @@ class _PartlyRejected(OtlpExportError):
     resendable = False
 
 
+class _Incomplete(OtlpExportError):
+    resendable = False
+
+
+# 这次调用自己没成：工具抛了、判定器抛了、没有这个工具、参数解析不了、整批因它停下、要确认却没有
+# 通道。阻断、拒绝、跳过这些是处置的结论，不是失败：照样发 `tool.outcome`，状态不改。
+_FAILED_OUTCOMES = frozenset(
+    {'error', 'aborted', 'judge_failed', 'unknown_tool', 'bad_arguments', 'no_channel'}
+)
+
+
 def otlp_documents(
     header: TraceHeader,
     spans: Sequence[Span],
@@ -126,6 +137,12 @@ class OtlpHttpExporter:
                 expected=f'store 里有 trace {trace_id}',
                 received='没有',
                 next_action='确认 trace id 没写错',
+            )
+        if header.status is None:
+            raise _Incomplete(
+                expected='导出的 trace 有结局（记录完整）',
+                received=f'trace {trace_id} 记录到一半就断了：写入失败，或者那次 run 还没结束',
+                next_action='等它结束，或者换一个完整的 trace；不完整的 trace 不导出',
             )
         spans = await store.spans(trace_id)
         edges = await store.edges(trace_id)
@@ -235,7 +252,7 @@ def _span(
                 for event in span.events
             ],
             'links': links.get(span.span_id, []),
-            'status': _status(span.status),
+            'status': _status(span),
         }
     )
     return value
@@ -330,10 +347,13 @@ def _any_value(value: AttributeValue) -> dict[str, Any]:
     raise TypeError(f'trace 属性的值是 str / int / bool / list[str]，收到 {type(value).__name__}')
 
 
-def _status(status: SpanStatus) -> dict[str, Any]:
-    if status is SpanStatus.OK:
+def _status(span: Span) -> dict[str, Any]:
+    outcome = span.attributes.get('tool.outcome')
+    if span.status is SpanStatus.OK and outcome in _FAILED_OUTCOMES:
+        return {'code': _STATUS_ERROR, 'message': f'tool.outcome={outcome}'}
+    if span.status is SpanStatus.OK:
         return {'code': _STATUS_OK}
-    return {'code': _STATUS_ERROR, 'message': status.value}
+    return {'code': _STATUS_ERROR, 'message': span.status.value}
 
 
 def _rejected(response: httpx.Response) -> tuple[int, str]:

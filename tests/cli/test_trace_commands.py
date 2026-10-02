@@ -37,6 +37,7 @@ from syndica.kernel import (
     TraceLevel,
     TraceRecorder,
     TraceRedaction,
+    TraceSource,
 )
 from syndica.kernel.redaction import RULES_VERSION, Redactor
 
@@ -108,11 +109,21 @@ def _planted(
     *,
     finished: bool = True,
     ended_s: int | None = None,
+    level: TraceLevel = TraceLevel.STRUCTURE,
+    source: TraceSource | None = None,
 ) -> None:
     async def plant() -> None:
         store = _store(root)
         redaction = TraceRedaction(RuleRedactor().digest, RULES_VERSION)
-        await store.begin(TraceHeader(trace_id, started_s * 10**9, TraceLevel.STRUCTURE, redaction))
+        await store.begin(
+            TraceHeader(
+                trace_id,
+                started_s * 10**9,
+                level,
+                redaction,
+                source=TraceSource() if source is None else source,
+            )
+        )
         if finished:
             ended = started_s * 10**9 + 1 if ended_s is None else ended_s * 10**9
             await store.finish(trace_id, SpanStatus.OK, ended)
@@ -377,6 +388,14 @@ def _rules_that_cannot_coexist(root: Path) -> str:
     return header.trace_id[:8]
 
 
+def _no_document(argv: tuple[str, ...], level: TraceLevel) -> Any:
+    def make(root: Path) -> str:
+        _planted(root, 'ab' * 16, 10, level=level, source=TraceSource(argv=argv))
+        return 'abab'
+
+    return make
+
+
 def _refused_by_the_replay(root: Path) -> str:
     header = _worker_run(root)
     replay = _directory(root, header.trace_id) / 'replay.json'
@@ -399,6 +418,16 @@ def _refused_by_the_replay(root: Path) -> str:
         (_nested_too_deep, '重新记录这次 run'),
         (_rules_that_cannot_coexist, '这个 trace 的头被改过'),
         (_refused_by_the_replay, '用 --trace replay 重新跑一次那条命令'),
+        (_no_document(('chat',), TraceLevel.STRUCTURE), '用 `syndica run` 跑同样的需求'),
+        (
+            _no_document(('run', '--topology', 'dev', 'go'), TraceLevel.REPLAY),
+            '用 --agent <角色> 单独跑那个角色',
+        ),
+        (
+            _no_document(('run', '--topology=dev', 'go'), TraceLevel.STRUCTURE),
+            '用 --agent <角色> 单独跑那个角色',
+        ),
+        (_no_document(('run', 'go'), TraceLevel.REPLAY), 'stderr 上的那条 WARNING'),
     ],
     ids=[
         'unknown',
@@ -411,6 +440,10 @@ def _refused_by_the_replay(root: Path) -> str:
         'nested',
         'rules',
         'refused',
+        'chat',
+        'topology',
+        'topology-equals',
+        'capture-refused',
     ],
 )
 def test_a_trace_the_replay_cannot_use_exits_2_and_says_what_to_do(
@@ -606,10 +639,26 @@ def test_prune_keeps_the_newest_finished_traces_by_start_time(tmp_path: Path):
     assert _ids(tmp_path) == {'aa', 'cc', 'ee'}
     assert out.splitlines() == [
         f'删掉了 2 个 trace：{"dd" * 4}, {"bb" * 4}。',
-        '留下最近 2 个有结局的。',
+        '留下最近 2 个有结局的 trace，连同它们的回放。',
         f'没有结局的 1 个没动：{"ee" * 4}（还在写，或者记录到一半就断了；确认之后点名删：'
         'syndica trace prune <id>）。',
     ]
+
+
+def test_prune_keeps_the_replays_of_what_it_keeps_and_never_lets_them_crowd_out_an_original(
+    tmp_path: Path,
+):
+    _planted(tmp_path, 'aa' * 16, 10)
+    _planted(tmp_path, 'bb' * 16, 20)
+    _planted(tmp_path, 'cc' * 16, 30, source=TraceSource(replay_of='aa' * 16))
+    _planted(tmp_path, 'dd' * 16, 40, source=TraceSource(replay_of='bb' * 16))
+    _planted(tmp_path, 'ee' * 16, 50, source=TraceSource(replay_of='bb' * 16))
+
+    code, out, _ = _cli(tmp_path, ['trace', 'prune', '--keep', '1'])
+
+    assert code == 0
+    assert _ids(tmp_path) == {'bb', 'dd', 'ee'}
+    assert out.splitlines()[0] == f'删掉了 2 个 trace：{"cc" * 4}, {"aa" * 4}。'
 
 
 def test_prune_by_default_keeps_fifty(tmp_path: Path):
@@ -852,7 +901,7 @@ def test_prune_reports_the_traces_it_could_not_delete_and_exits_1(
     assert code == 1
     assert out.splitlines() == [
         '删掉了 0 个 trace。',
-        '留下最近 0 个有结局的。',
+        '留下最近 0 个有结局的 trace，连同它们的回放。',
         f'没删掉 {"bb" * 4}：删完之后它还在',
         f'没删掉 {"aa" * 4}：删完之后它还在',
     ]
@@ -866,11 +915,14 @@ def test_a_copied_trace_directory_is_neither_listed_nor_counted_as_deleted(tmp_p
     listed = _cli(tmp_path, ['trace', 'list'])
     pruned = _cli(tmp_path, ['trace', 'prune', '--keep', '0'])
 
-    assert len(listed[1].splitlines()) == 1
-    assert pruned[:2] == (
-        0,
-        f'删掉了 1 个 trace：{header.trace_id[:8]}。\n留下最近 0 个有结局的。\n',
-    )
+    [row, skipped] = listed[1].splitlines()
+    assert row.split()[2] == header.trace_id[:8]
+    assert skipped == '另有 1 个 trace 目录读不进来，没有列出（原因见上面的 WARNING）。'
+    assert pruned[0] == 0
+    assert pruned[1].splitlines() == [
+        f'删掉了 1 个 trace：{header.trace_id[:8]}。',
+        '留下最近 0 个有结局的 trace，连同它们的回放。',
+    ]
     assert _headers(tmp_path) == []
 
 
@@ -992,3 +1044,61 @@ def test_divergences_reported_by_the_replay_stay_one_line_each_and_inert(tmp_pat
     lines = out.splitlines()
     assert lines[1] == '  tool  Worker[0]\\x1b[2J：line one\\nline two\\x07'
     assert len(lines) == 2
+
+
+# --- traces this version cannot read --------------------------------------------------------
+
+
+def _rewritten_header(root: Path, change: Any) -> tuple[TraceHeader, str]:
+    header = _worker_run(root)
+    directory = _directory(root, header.trace_id)
+    path = directory / 'trace.json'
+    value = json.loads(path.read_text(encoding='utf-8'))
+    change(value)
+    path.write_text(json.dumps(value), encoding='utf-8')
+    return header, directory.name
+
+
+def _from_a_newer_syndica(value: dict[str, Any]) -> None:
+    value['schema'] = 'syndica.trace/2'
+    value['added_in_2'] = {'anything': True}
+    del value['redaction']
+
+
+def test_a_trace_from_a_newer_syndica_is_reported_as_newer_and_never_as_tampered(tmp_path: Path):
+    header, name = _rewritten_header(tmp_path, _from_a_newer_syndica)
+
+    listed = _cli(tmp_path, ['trace', 'list'])
+    by_prefix = _cli(tmp_path, ['trace', 'show', header.trace_id[:8]])
+    by_name = _cli(tmp_path, ['trace', 'replay', name])
+
+    assert listed[:2] == (0, '另有 1 个 trace 目录读不进来，没有列出（原因见上面的 WARNING）。\n')
+    for code, _, err in (by_prefix, by_name):
+        assert code == 2
+        assert 'syndica.trace/2' in err and '不要删掉' in err
+    for _, _, err in (listed, by_prefix, by_name):
+        assert '多半是 Agent 的 Bash' not in err and '被 prune 掉的找不回来' not in err
+
+
+def test_a_trace_whose_header_broke_is_named_as_unreadable_not_as_missing(tmp_path: Path):
+    header, _ = _rewritten_header(tmp_path, lambda value: value.update(started_ns='soon'))
+
+    code, _, err = _cli(tmp_path, ['trace', 'show', header.trace_id[:8]])
+
+    assert code == 2
+    assert '读不进来' in err and '不要了就删掉这个目录' in err
+    assert '被 prune 掉的找不回来' not in err
+
+
+def test_a_replay_still_runs_when_the_config_cannot_be_read_and_says_whose_rules_it_used(
+    tmp_path: Path,
+):
+    header = _worker_run(tmp_path)
+    (tmp_path / '.syndica.yaml').write_text('trace: [never closed\n', encoding='utf-8')
+
+    code, out, err = _cli(tmp_path, ['trace', 'replay', header.trace_id[:8]])
+
+    assert code == 0 and out.startswith('复现：'), err
+    assert '配置读不了' in err and '这个 trace 记下的脱敏规则' in err
+    [replayed] = [h for h in _headers(tmp_path) if h.source.replay_of == header.trace_id]
+    assert replayed.status is SpanStatus.OK

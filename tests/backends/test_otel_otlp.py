@@ -789,3 +789,57 @@ async def test_a_plaintext_export_never_goes_through_a_proxy(
         proxy.server_close()
 
     assert (len(received), proxied) == (1, [])
+
+
+async def test_an_unfinished_trace_is_refused_before_anything_is_sent_and_not_offered_again():
+    store = await _stored(_spans(), status=None, ended_ns=None)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        exporter = OtlpHttpExporter(_URL, client=client, redactor=RuleRedactor())
+        with pytest.raises(OtlpExportError) as caught:
+            await exporter.export(store, _TRACE)
+
+    assert seen == []
+    assert '记录到一半就断了' in caught.value.received
+    assert caught.value.resendable is False
+
+
+@pytest.mark.parametrize(
+    ('outcome', 'code'),
+    [
+        ('error', 2),
+        ('aborted', 2),
+        ('judge_failed', 2),
+        ('unknown_tool', 2),
+        ('bad_arguments', 2),
+        ('no_channel', 2),
+        ('ok', 1),
+        ('blocked', 1),
+        ('rejected', 1),
+        ('skipped', 1),
+        ('not_executed', 1),
+    ],
+)
+async def test_a_tool_call_that_failed_by_itself_is_an_error_and_a_refused_one_is_not(
+    outcome: str, code: int
+):
+    tool = _span(
+        1,
+        0,
+        kind=SpanKind.TOOL_CALL,
+        name='Bash',
+        attributes={'tool.name': 'Bash', 'tool.outcome': outcome},
+    )
+    store = await _stored([tool])
+
+    _, [request] = await _export(store)
+
+    [span] = _sent_spans(request)
+    assert span['status'] == (
+        {'code': 2, 'message': f'tool.outcome={outcome}'} if code == 2 else {'code': 1}
+    )

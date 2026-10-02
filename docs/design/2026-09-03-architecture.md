@@ -1548,7 +1548,7 @@ M3 的完成判据（统一 trace / span、跨 Agent 因果链、运行捕获为
 | 67 | 记忆分层 | 全局 + 工作区两层；**只有根协调者可写全局** |
 | 68 | 记忆注入 | 进历史不进 SP；缓存同一份块，仅压缩 / 新会话 / 过期时重载 |
 | 69 | 成本计量 | 价格表归 provider backend，内核不内置；**必须区分输入 / 输出 / 缓存命中三档** |
-| 70 | trace 保留 | 分级：span 结构永久留、失败轮次 payload 留、全量 payload 显式开启（不用采样） |
+| 70 | trace 保留 | 分级：span 结构永久留、失败轮次 payload 留、全量 payload 显式开启（不用采样）。**M3 起由 #111 取代**：默认「可回放」 |
 | 71 | 等待结果 | `answered` / `timeout` / `preempted` / `aborted`；**超时必需**，否则长跑中会永久挂起 |
 | 72 | Python 版本 | 3.11 起（`TaskGroup` / `ExceptionGroup` 对多 Agent 结构化取消直接有用） |
 | 73 | 工具链 | uv + ruff + pyright + pytest / pytest-asyncio |

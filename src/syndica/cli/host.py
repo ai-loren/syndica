@@ -1206,7 +1206,14 @@ class RuntimeCliHost:
             raise TraceUnusable(
                 expected=error.expected, received=error.received, next_action=error.next_action
             ) from error
-        config = self._config(request.config)
+        try:
+            config = self._config(request.config)
+        except ConfigError as error:
+            raise TraceUnusable(
+                expected='配置读得进来：导出要用它的脱敏规则，决定哪些东西能发出去',
+                received=one_line(f'{error.expected}；{error.received}'),
+                next_action='修好配置再导出（' + one_line(error.next_action) + '）',
+            ) from error
         redactor = host_redactor(self._environ, config.redaction_rules)
         if target.note is not None:
             self._warn(redactor.redact(target.note))
@@ -1231,10 +1238,23 @@ class RuntimeCliHost:
                 next_action='从 `syndica` 命令行运行 trace replay',
             )
         header, text = self._runner.run(unusable_replay(store, request.trace_id))
-        config = self._config(request.config)
-        redactor = host_redactor(self._environ, config.redaction_rules)
+        try:
+            config = self._config(request.config)
+        except ConfigError as error:
+            # 回放比的是记录下的东西，用不着配置；把它读坏的往往正是要回放的那次 run 里的 Agent。
+            redactor = host_redactor(self._environ, header.redaction.rules)
+            self._warn(
+                redactor.redact(
+                    f'配置读不了（{one_line(error.received)}）：回放本身的 trace'
+                    ' 用这个 trace 记下的脱敏规则，回放照常进行。'
+                )
+            )
+            configured = None
+        else:
+            redactor = host_redactor(self._environ, config.redaction_rules)
+            configured = config.trace_level
         recorder = None
-        if trace_level(None, config.trace_level, chat=False, warn=self._warn) is not TraceLevel.OFF:
+        if trace_level(None, configured, chat=False, warn=self._warn) is not TraceLevel.OFF:
             try:
                 trace_directory(self._workspace_root)
             except (HandoffWriteError, OSError) as error:

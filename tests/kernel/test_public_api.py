@@ -203,8 +203,8 @@ _BASE_AGENT_SURFACE: tuple[str, ...] = (
     'register_hook',
     'run',
 )
-# `TraceRecorder` 的公开面：宿主的生命周期（begin / finish / dropped / trace_id / level）加
-# `Tracer` 协议的七个方法。
+# `TraceRecorder` 的公开面：宿主的生命周期（begin / finish / dropped / trace_id / level）、捕获回放
+# 文档的三个入口（describe_run / ids / interrupted）加 `Tracer` 协议的七个方法。
 _TRACE_RECORDER_SURFACE: tuple[str, ...] = (
     'add_edge',
     'add_event',
@@ -324,6 +324,9 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 #   `describe_run` 用它们，不直接碰；`REPLAYED_TOOLS` 是捕获与回放共用的名单，宿主不读它。
 # - `verbatim_attribute`：recorder 与 OTLP 导出共用的「哪些属性原样记、原样发」；宿主不需要它就能
 #   记录与导出。
+# - `NewerTraceSchema` / `readable_schema`：前者是 `ContractViolation` 的子类，宿主与 store 的作者按
+#   `ContractViolation` 接住就用得了每个公开入口；要把「更新版本写的」与「坏了」分开处理的第三方
+#   store 出现时再放出来。后者由 `TraceHeader` 自己调。
 _WITHHELD: tuple[str, ...] = (
     'ATTRIBUTE_DOMAINS',
     'ATTRIBUTE_KINDS',
@@ -347,6 +350,7 @@ _WITHHELD: tuple[str, ...] = (
     'KillAgent',
     'KillBash',
     'LocalAgentTable',
+    'NewerTraceSchema',
     'NullTurnGate',
     'OBSERVABLE',
     'QueryAgent',
@@ -410,6 +414,7 @@ _WITHHELD: tuple[str, ...] = (
     'parse_mapping',
     'path_outside_workspace_rule',
     'peek_key',
+    'readable_schema',
     'redact_argv',
     'register_tool',
     'releasing_agent_id',

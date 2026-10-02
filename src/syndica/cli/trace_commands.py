@@ -1,16 +1,17 @@
-"""`syndica trace list / show / replay / prune`（M3 T15）。
+"""`syndica trace list / show / replay / export / prune`。
 
-回放跑在 runner 里，而 surface 之间互不依赖：宿主收一个 `Replayer`（组合根 `syndica.__main__`
-接上 `ReplayRunner`），这里只认它交回的分叉与没能重建的东西。退出码：`replay` 复现是 0、分叉或
-结局不同是 1、回放文档用不了（trace 不存在、记录到一半就断了、没有回放文档、读不进来）是 2；找不到
-trace 的 `show` 与 `prune` 同样是 2。
+回放跑在 runner 里、导出器在 backend 里，而 surface 之间互不依赖：宿主收一个 `Replayer` 与一个
+`TraceExporter`（组合根 `syndica.__main__` 接上 `ReplayRunner` 与 OTLP 导出器），这里只认它们交回
+的东西。退出码：`replay` 复现是 0、分叉或结局不同是 1、回放文档用不了（trace 不存在、记录到一半就
+断了、没有回放文档、读不进来）是 2；`export` 发出去了是 0、collector 没收下是 1、trace 或端点用不了
+是 2；找不到 trace 的 `show` 与 `prune` 同样是 2。
 """
 
 from __future__ import annotations
 
 import json
 import re
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Protocol, TypeVar
 
 from syndica.cli.export import ExportTarget, TraceExporter
@@ -24,6 +25,7 @@ from syndica.kernel import (
     ScenarioDocument,
     SyndicaError,
     TraceHeader,
+    TraceLevel,
     TraceRecorder,
     parse_scenario_document,
 )
@@ -116,6 +118,7 @@ async def resolved(store: FileTraceStore, given: str | None) -> TraceHeader:
         )
     header = await _read(store.find(given))
     if header is None:
+        await _unreadable_match(store, lambda name: name.rsplit('-', 1)[-1].startswith(given))
         raise TraceUnusable(
             expected=f'有一个 id 以 {given} 开头的 trace',
             received='.syndica/traces 里没有',
@@ -132,15 +135,29 @@ async def _by_directory(store: FileTraceStore, name: str) -> TraceHeader:
         directory = await _quietly(store.directory(header.trace_id))
         if directory is not None and directory.name == name:
             return header
+    await _unreadable_match(store, lambda candidate: candidate == name)
     raise TraceUnusable(
         expected=f'有一个目录名是 {name} 的 trace',
-        received='.syndica/traces 里没有（或者它的头读不进来）',
+        received='.syndica/traces 里没有',
         next_action='用 `syndica trace list` 看有哪些；被 prune 掉的找不回来',
     )
 
 
+async def _unreadable_match(store: FileTraceStore, matches: Callable[[str], bool]) -> None:
+    """找不到的那个其实在，只是头读不进来（更新版本的 syndica 写的，或者坏了）：说它为什么读不进来，
+    而不是说它不在。"""
+    for name, received, next_action in await _quietly(store.unreadable()) or []:
+        if matches(name):
+            raise TraceUnusable(
+                expected=f'.syndica/traces/{one_line(name)} 是这个版本读得懂的 trace',
+                received=one_line(received),
+                next_action=one_line(next_action),
+            )
+
+
 async def trace_list(store: FileTraceStore) -> str:
-    """一个 trace 读不了不拖垮整张表：那一行报读不进来、大小不明，`trace show` 给出原因。"""
+    """一个 trace 读不了不拖垮整张表：span 读不进来的那一行照样列出（`trace show` 给出原因），头读
+    不进来的目录不列，只报有几个（原因在上面的 WARNING 里）。"""
     rows: list[TraceRow] = []
     for header in await _read(store.traces()):
         size = await _quietly(store.size(header.trace_id))
@@ -150,7 +167,8 @@ async def trace_list(store: FileTraceStore) -> str:
             continue
         agents = {span.agent_id for span in spans}
         rows.append(TraceRow(header, len(agents), len(spans), size))
-    return render_list(rows)
+    skipped = await _quietly(store.unreadable()) or []
+    return render_list(rows, unreadable=len(skipped))
 
 
 async def trace_show(store: FileTraceStore, prefix: str | None) -> str:
@@ -200,8 +218,10 @@ async def trace_export(
 
 async def trace_prune(store: FileTraceStore, keep: int, names: Sequence[str]) -> CliOutcome:
     """点了名就只删点名的那几个（没有结局的也删：那是人看过之后的决定）；没点名就按开始时间留下
-    最近 `keep` 个有结局的。没有结局的不动：一次长跑的 trace 开始得最早、却还在写，崩掉的 trace
-    同样没有结局，分不出来。只报删完之后确实不在了的；有没删掉的以 1 退出。"""
+    最近 `keep` 个有结局的 trace，连同它们的回放——回放自己的 trace 不占名额（它总是最新的，算进
+    去就会先挤掉它回放的那一个），回放的那个被删时它也删。没有结局的不动：一次长跑的 trace 开始得
+    最早、却还在写，崩掉的 trace 同样没有结局，分不出来。只报删完之后确实不在了的；有没删掉的以 1
+    退出。"""
     if names:
         found: dict[str, TraceHeader] = {}
         for name in names:
@@ -216,7 +236,14 @@ async def trace_prune(store: FileTraceStore, keep: int, names: Sequence[str]) ->
             key=lambda header: header.started_ns,
             reverse=True,
         )
-        doomed = finished[keep:]
+        originals = [header for header in finished if header.source.replay_of is None]
+        kept = {header.trace_id for header in originals[:keep]}
+        doomed = [
+            header
+            for header in finished
+            if (header.trace_id if header.source.replay_of is None else header.source.replay_of)
+            not in kept
+        ]
         kept_unfinished = [header for header in headers if header.status is None]
     removed: list[TraceHeader] = []
     failed: list[tuple[TraceHeader, str]] = []
@@ -231,7 +258,7 @@ async def trace_prune(store: FileTraceStore, keep: int, names: Sequence[str]) ->
         + ('。' if not removed else f'：{", ".join(h.trace_id[:8] for h in removed)}。')
     ]
     if not names:
-        lines.append(f'留下最近 {keep} 个有结局的。')
+        lines.append(f'留下最近 {keep} 个有结局的 trace，连同它们的回放。')
     if kept_unfinished:
         lines.append(
             f'没有结局的 {len(kept_unfinished)} 个没动：'
@@ -269,15 +296,36 @@ async def unusable_replay(store: FileTraceStore, prefix: str | None) -> tuple[Tr
             next_action=f'回放原来那个：syndica trace replay {header.source.replay_of[:8]}',
         )
     if text is None:
+        received, next_action = _why_no_document(header)
         raise TraceUnusable(
             expected=f'trace {header.trace_id} 有回放文档（replay.json）',
-            received=(
-                '没有：它按 structure 记的、是 --topology 的 run，或者捕获时写不出'
-                '（当时 stderr 有说明）'
-            ),
-            next_action='用 --trace replay 重新跑一次这条命令，再回放新的那个 trace',
+            received=received,
+            next_action=next_action,
         )
     return header, text
+
+
+def _why_no_document(header: TraceHeader) -> tuple[str, str]:
+    argv = header.source.argv
+    if argv[:1] == ('chat',):
+        return (
+            '没有：chat 最多记到 structure，不写回放文档',
+            '要回放就用 `syndica run` 跑同样的需求（默认记到 replay）',
+        )
+    if any(arg == '--topology' or arg.startswith('--topology=') for arg in argv):
+        return (
+            '没有：--topology 的 run 不写回放文档（回放重建不出拓扑槽给角色附加的东西）',
+            '要回放就用 --agent <角色> 单独跑那个角色',
+        )
+    if header.level is TraceLevel.STRUCTURE:
+        return (
+            '没有：它按 structure 记的',
+            '用 --trace replay 重新跑一次这条命令，再回放新的那个 trace',
+        )
+    return (
+        '没有：这次 run 写不出回放文档（原因是那次 run 结束时 stderr 上的那条 WARNING）',
+        '那类 run 回放不出来；结构照常记下了，用 syndica trace show 看它',
+    )
 
 
 def trace_replay(

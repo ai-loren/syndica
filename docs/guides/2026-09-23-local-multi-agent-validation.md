@@ -381,7 +381,7 @@ uv run python -m syndica run --handoff --topology syndica-dev "……（点名�
   与函数。
 - 一次 run 用几十到上百次请求：一个 Worker 最多 30 轮，用完还会另派一个。Gemini 免费档的每分钟请求数与
   token 数先撞上限，轮换把请求交给 OpenRouter，而 OpenRouter 一天只有 50 次。
-- Ctrl-C 中断的 run 不留交接文件：交接文件在 Agent 都结束之后才写。
+- Ctrl-C 中断的 `--handoff` run 照样写交接文件：记成一次失败的 run、复核跳过，不提供 git 收尾。
 
 ---
 

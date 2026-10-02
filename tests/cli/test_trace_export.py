@@ -1142,3 +1142,20 @@ def test_a_chat_session_is_exported_when_the_host_closes(tmp_path: Path):
 
     assert code == 0
     assert [call['trace_id'][:8] for call in spy.calls] == [_only_directory(tmp_path)[-8:]]
+
+
+def test_an_export_refuses_with_2_when_the_config_it_redacts_with_cannot_be_read(tmp_path: Path):
+    spy = _Spy()
+    _run(tmp_path, {}, exporter=spy)
+    (tmp_path / '.syndica.yaml').write_text('trace: [never closed\n', encoding='utf-8')
+    [header] = asyncio.run(FileTraceStore(trace_directory(tmp_path)).traces())
+
+    code, out, err = _cli(
+        tmp_path,
+        ['trace', 'export', header.trace_id[:8], '--otlp', 'http://localhost:9'],
+        environ={},
+        exporter=spy,
+    )
+
+    assert (code, out, spy.calls) == (2, '', [])
+    assert '修好配置再导出' in err

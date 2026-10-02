@@ -1,4 +1,4 @@
-"""`syndica trace list` 与 `trace show` 的文字（M3 T15）。只读 trace 模型，不碰 store、不碰终端。
+"""`syndica trace list` 与 `trace show` 的文字。只读 trace 模型，不碰 store、不碰终端。
 
 trace 里的字符串（命令行参数、角色名、工具名、Agent id、等待的目标）有一部分来自模型与文件系统，
 trace 目录又是 Agent 的 Bash 改得到的：每一个进输出之前都经 `one_line()`（控制字符与换行都转义，
@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from syndica.cli.terminal import one_line
-from syndica.kernel import CausalityEdge, EdgeKind, Span, SpanKind, TraceHeader
+from syndica.kernel import CausalityEdge, EdgeKind, Span, SpanKind, SpanStatus, TraceHeader
 
 __all__ = ['TraceRow', 'render_list', 'render_show']
 
@@ -39,11 +39,19 @@ class _Agent:
     cycles: int = 0
     stop_reason: str | None = None
     children: list[str] = field(default_factory=list[str])
+    # 没有一个收了尾的工作周期：还在跑，或者 run 被强行打断（开着的 span 没写下来）。
+    unfinished: bool = False
 
 
-def render_list(rows: Sequence[TraceRow]) -> str:
+def render_list(rows: Sequence[TraceRow], *, unreadable: int = 0) -> str:
+    """`unreadable` 是头读不进来、因而不在 `rows` 里的 trace 目录有几个。"""
+    skipped = (
+        f'另有 {unreadable} 个 trace 目录读不进来，没有列出（原因见上面的 WARNING）。'
+        if unreadable
+        else ''
+    )
     if not rows:
-        return '还没有 trace（.syndica/traces 是空的）：run 与 chat 默认都会记录。'
+        return skipped or '还没有 trace（.syndica/traces 是空的）：run 与 chat 默认都会记录。'
     lines: list[str] = []
     for row in sorted(rows, key=lambda item: item.header.started_ns, reverse=True):
         header = row.header
@@ -62,6 +70,8 @@ def render_list(rows: Sequence[TraceRow]) -> str:
             f'{_utc(header.started_ns)}  {header.trace_id[:8]}  {status}  '
             f'{counts}  {size}  {command}{replay}'
         )
+    if skipped:
+        lines.append(skipped)
     return '\n'.join(lines)
 
 
@@ -78,8 +88,11 @@ def render_show(header: TraceHeader, spans: Sequence[Span], edges: Sequence[Caus
         '谁在等谁：',
         *_waits(spans, agents, labels),
         '',
-        f'最慢的工具调用（前 {_SLOWEST} 个）：',
+        f'最慢的工具调用（前 {_SLOWEST} 个，等别的 Agent 与人的时间不算）：',
         *_slowest(spans, labels),
+        '',
+        '模型调用：',
+        *_models(spans, labels),
         '',
         '时间线：',
         *_timeline(agents, labels, origin),
@@ -120,6 +133,14 @@ def _agents(spans: Sequence[Span], edges: Sequence[CausalityEdge]) -> dict[str, 
         # 最后一个工作周期的原因：被取消的周期没有原因，沿用前一个会把被切断的 Agent 报成做完了。
         reason = span.attributes.get('stop_reason')
         agent.stop_reason = reason if isinstance(reason, str) else None
+    for span in sorted(spans, key=lambda item: item.start_ns):
+        agent = agents.get(span.agent_id)
+        if agent is None:
+            agents[span.agent_id] = _Agent(
+                span.agent_id, '?', span.start_ns, span.end_ns, unfinished=True
+            )
+        elif agent.unfinished:
+            agent.end_ns = max(agent.end_ns, span.end_ns)
     by_span = {span.span_id: span for span in spans}
     for edge in edges:
         child = edge.attributes.get('child.agent_id')
@@ -269,22 +290,86 @@ def _target(wait: _Wait, labels: Mapping[str, str], spawned: set[str]) -> str:
 
 
 def _slowest(spans: Sequence[Span], labels: Mapping[str, str]) -> list[str]:
-    calls = sorted(
-        (span for span in spans if span.kind is SpanKind.TOOL_CALL),
-        key=lambda span: (-(span.end_ns - span.start_ns), span.start_ns),
+    """按工具自己用的时间排：减掉这次调用里同一个 Agent 等别人的那些 wait（派活等子 Agent 交回、
+    问人、等确认）。不减的话，派活的调用用的是子 Agent 的整次运行，问人的用的是人想了多久。"""
+    children: dict[str, list[Span]] = {}
+    for span in spans:
+        if span.parent_span_id is not None:
+            children.setdefault(span.parent_span_id, []).append(span)
+
+    def own(call: Span) -> int:
+        waited = 0
+        stack = list(children.get(call.span_id, []))
+        while stack:
+            span = stack.pop()
+            if span.agent_id != call.agent_id:
+                continue
+            if span.kind is SpanKind.WAIT:
+                waited += span.end_ns - span.start_ns
+            else:
+                stack.extend(children.get(span.span_id, []))
+        return call.end_ns - call.start_ns - waited
+
+    timed = sorted(
+        ((own(span), span) for span in spans if span.kind is SpanKind.TOOL_CALL),
+        key=lambda item: (-item[0], item[1].start_ns),
     )[:_SLOWEST]
-    if not calls:
+    if not timed:
         return ['  （没有工具调用）']
     lines: list[str] = []
-    for number, span in enumerate(calls, start=1):
+    for number, (spent, span) in enumerate(timed, start=1):
         name = span.attributes.get('tool.name', span.name)
         outcome = span.attributes.get('tool.outcome', span.status.value)
         lines.append(
-            f'  {number}. {_duration(span.end_ns - span.start_ns)}  '
+            f'  {number}. {_duration(spent)}  '
             f'{labels.get(span.agent_id, f"Agent {_short(span.agent_id)}")}  '
             f'{one_line(str(name))}  {one_line(str(outcome))}'
         )
     return lines
+
+
+def _models(spans: Sequence[Span], labels: Mapping[str, str]) -> list[str]:
+    """每个 Agent 的模型调用：次数、用时、token（报了的那些加起来）与平台故障。"""
+    calls: dict[str, list[Span]] = {}
+    for span in spans:
+        if span.kind is SpanKind.LLM_CALL:
+            calls.setdefault(span.agent_id, []).append(span)
+    if not calls:
+        return ['  （没有模型调用）']
+    order = sorted(calls, key=lambda agent_id: min(span.start_ns for span in calls[agent_id]))
+    lines: list[str] = []
+    for agent_id in order:
+        made = calls[agent_id]
+        spent = sum(span.end_ns - span.start_ns for span in made)
+        line = (
+            f'  {labels.get(agent_id, f"Agent {_short(agent_id)}")}  {len(made)} 次  '
+            f'{_duration(spent)}  {_tokens(made)}'
+        )
+        failed = sum(1 for span in made if span.status is SpanStatus.ERROR)
+        failovers = sum(
+            1 for span in made for event in span.events if event.name == 'llm.platform_failed'
+        )
+        if failed:
+            line += f'  失败 {failed} 次'
+        if failovers:
+            line += f'  平台故障 {failovers} 次（换了平台接着答）'
+        lines.append(line)
+    return lines
+
+
+def _tokens(calls: Sequence[Span]) -> str:
+    reported = [span for span in calls if isinstance(span.attributes.get('llm.input_tokens'), int)]
+    if not reported:
+        return 'token 没有报'
+    given = sum(_int(span.attributes.get('llm.input_tokens')) for span in reported)
+    taken = sum(_int(span.attributes.get('llm.output_tokens')) for span in reported)
+    missing = len(calls) - len(reported)
+    note = f'（{missing} 次没报）' if missing else ''
+    return f'输入 {given} / 输出 {taken} token{note}'
+
+
+def _int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _timeline(agents: Mapping[str, _Agent], labels: Mapping[str, str], origin: int) -> list[str]:
@@ -292,6 +377,12 @@ def _timeline(agents: Mapping[str, _Agent], labels: Mapping[str, str], origin: i
         return ['  （没有 Agent）']
     lines: list[str] = []
     for agent in sorted(agents.values(), key=lambda item: item.start_ns):
+        if agent.unfinished:
+            lines.append(
+                f'  +{_duration(agent.start_ns - origin)} → +{_duration(agent.end_ns - origin)}  '
+                f'{labels[agent.agent_id]}  没有收尾的工作周期（还在跑，或者 run 被强行打断）'
+            )
+            continue
         ended = '没有说明停下的原因' if agent.stop_reason is None else one_line(agent.stop_reason)
         lines.append(
             f'  +{_duration(agent.start_ns - origin)} → +{_duration(agent.end_ns - origin)}  '

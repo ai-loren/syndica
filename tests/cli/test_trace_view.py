@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections.abc import Iterator
 
@@ -14,6 +15,7 @@ from syndica.kernel import (
     EdgeKind,
     RuleRedactor,
     Span,
+    SpanEvent,
     SpanKind,
     SpanStatus,
     TraceHeader,
@@ -146,6 +148,9 @@ def _run() -> tuple[list[Span], list[CausalityEdge]]:
     return spans, edges
 
 
+_SLOWEST_TITLE = '最慢的工具调用（前 3 个，等别的 Agent 与人的时间不算）：'
+
+
 def _section(text: str, title: str) -> list[str]:
     lines = text.splitlines()
     start = lines.index(title) + 1
@@ -182,7 +187,7 @@ def test_who_waits_on_whom_is_followed_down_the_chain():
 def test_the_slowest_tool_calls_come_first_and_only_three_are_shown():
     spans, edges = _run()
 
-    slowest = _section(render_show(_header(), spans, edges), '最慢的工具调用（前 3 个）：')
+    slowest = _section(render_show(_header(), spans, edges), _SLOWEST_TITLE)
 
     assert slowest == [
         f'  1. 12.0 s  Lead {_LEAD[:8]}  Delegate  ok',
@@ -389,7 +394,7 @@ def test_slowest_calls_that_took_as_long_are_listed_in_the_order_they_started():
         _tool(_LEAD, 1, 'Grep', 2, 4),
     ]
 
-    slowest = _section(render_show(_header(), spans, []), '最慢的工具调用（前 3 个）：')
+    slowest = _section(render_show(_header(), spans, []), _SLOWEST_TITLE)
 
     assert slowest == [
         f'  1. 2.0 s  Lead {_LEAD[:8]}  Grep  ok',
@@ -445,3 +450,134 @@ def test_each_size_unit_starts_at_its_power_of_1024(size: int, shown: str):
     [line] = render_list([TraceRow(_header(), agents=1, spans=1, size=size)]).splitlines()
 
     assert f'  {shown}  ' in line
+
+
+def _llm(
+    agent_id: str,
+    turn: int,
+    start: int,
+    end: int,
+    *,
+    tokens: tuple[int, int] | None = (10, 2),
+    status: SpanStatus = SpanStatus.OK,
+    failovers: int = 0,
+) -> Span:
+    given, taken = (None, None) if tokens is None else tokens
+    return Span(
+        span_id=span_id_of(SpanKind.LLM_CALL, agent_id, turn, 1),
+        parent_span_id=None,
+        kind=SpanKind.LLM_CALL,
+        name='llm',
+        agent_id=agent_id,
+        start_ns=_ORIGIN + start * _S,
+        end_ns=_ORIGIN + end * _S,
+        status=status,
+        attributes={
+            'llm.platform': 'main',
+            'llm.model': 'm',
+            'llm.attempt': 1,
+            'llm.input_tokens': given,
+            'llm.output_tokens': taken,
+        },
+        events=tuple(
+            SpanEvent(
+                'llm.platform_failed',
+                _ORIGIN + start * _S,
+                {'llm.platform': 'gemini', 'llm.error': 'HTTP 429', 'llm.status': 429},
+            )
+            for _ in range(failovers)
+        ),
+    )
+
+
+def test_calls_are_ranked_by_their_own_time_without_their_waits_on_agents_or_people():
+    delegate = _tool(_LEAD, 0, 'Delegate', 0, 15)
+    explorer = dataclasses.replace(
+        _agent(_EARLY, 'Explorer', 1, 17), parent_span_id=delegate.span_id
+    )
+    asked = dataclasses.replace(_tool(_EARLY, 1, 'AskUser', 6, 16), parent_span_id=explorer.span_id)
+    confirmed = _tool(_LATE, 0, 'Bash', 1, 12)
+    confirmation = Span(
+        span_id=span_id_of(SpanKind.CONFIRMATION, _LATE, 1, 1, 0),
+        parent_span_id=confirmed.span_id,
+        kind=SpanKind.CONFIRMATION,
+        name='confirmation',
+        agent_id=_LATE,
+        start_ns=_ORIGIN + 2 * _S,
+        end_ns=_ORIGIN + 9 * _S,
+        status=SpanStatus.OK,
+        attributes={},
+    )
+    spans = [
+        _agent(_LEAD, 'Lead', 0, 20),
+        explorer,
+        _agent(_LATE, 'Worker', 1, 13),
+        delegate,
+        dataclasses.replace(
+            _wait(_LEAD, 0, 'agent', _EARLY, 1, 14), parent_span_id=delegate.span_id
+        ),
+        _tool(_EARLY, 0, 'Bash', 2, 5),
+        asked,
+        dataclasses.replace(
+            _wait(_EARLY, 0, 'human', '["k"]', 7, 16), parent_span_id=asked.span_id
+        ),
+        confirmed,
+        confirmation,
+        dataclasses.replace(
+            _wait(_LATE, 0, 'human', '["c"]', 2, 9), parent_span_id=confirmation.span_id
+        ),
+    ]
+
+    shown = render_show(_header(), spans, [_spawned(_LEAD, 0, _EARLY)])
+    slowest = _section(shown, _SLOWEST_TITLE)
+
+    assert slowest == [
+        f'  1. 4.0 s  Worker {_LATE[:8]}  Bash  ok',
+        f'  2. 3.0 s  Explorer {_EARLY[:8]}  Bash  ok',
+        f'  3. 2.0 s  Lead {_LEAD[:8]}  Delegate  ok',
+    ]
+    assert f'Lead {_LEAD[:8]} → Explorer {_EARLY[:8]} → 人（13.0 s' in shown
+
+
+def test_model_calls_are_summed_per_agent_with_tokens_failures_and_failovers():
+    spans = [
+        _agent(_LEAD, 'Lead', 0, 20),
+        _agent(_EARLY, 'Explorer', 2, 10),
+        _llm(_LEAD, 1, 0, 2, tokens=(100, 10)),
+        _llm(_LEAD, 2, 12, 13, tokens=(150, 5), failovers=2),
+        _llm(_EARLY, 1, 3, 4, tokens=None),
+        _llm(_EARLY, 2, 5, 6, tokens=(30, 3), status=SpanStatus.ERROR),
+    ]
+
+    models = _section(render_show(_header(), spans, []), '模型调用：')
+
+    assert models == [
+        f'  Lead {_LEAD[:8]}  2 次  3.0 s  输入 250 / 输出 15 token'
+        '  平台故障 2 次（换了平台接着答）',
+        f'  Explorer {_EARLY[:8]}  2 次  2.0 s  输入 30 / 输出 3 token（1 次没报）  失败 1 次',
+    ]
+
+
+def test_agents_whose_cycles_never_closed_still_show_up_as_unfinished():
+    spans = [_llm(_LEAD, 1, 0, 1), _llm(_EARLY, 1, 2, 3)]
+
+    shown = render_show(_header(status=None), spans, [_spawned(_LEAD, 0, _EARLY)])
+
+    assert _section(shown, '谁创建了谁：') == [f'  ? {_LEAD[:8]}', f'  ? {_EARLY[:8]}']
+    assert _section(shown, '时间线：') == [
+        f'  +0 ms → +1.0 s  ? {_LEAD[:8]}  没有收尾的工作周期（还在跑，或者 run 被强行打断）',
+        f'  +2.0 s → +3.0 s  ? {_EARLY[:8]}  没有收尾的工作周期（还在跑，或者 run 被强行打断）',
+    ]
+
+
+def test_a_list_says_how_many_directories_it_could_not_read_instead_of_calling_itself_empty():
+    row = TraceRow(_header(), agents=1, spans=1, size=1)
+
+    assert render_list([], unreadable=2) == (
+        '另有 2 个 trace 目录读不进来，没有列出（原因见上面的 WARNING）。'
+    )
+    assert render_list([row], unreadable=1).splitlines()[1] == (
+        '另有 1 个 trace 目录读不进来，没有列出（原因见上面的 WARNING）。'
+    )
+    assert render_list([]).startswith('还没有 trace')
+    assert len(render_list([row]).splitlines()) == 1

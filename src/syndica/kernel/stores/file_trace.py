@@ -55,6 +55,7 @@ from syndica.kernel.trace import (
     AttributeValue,
     CausalityEdge,
     EdgeKind,
+    NewerTraceSchema,
     PayloadRef,
     Span,
     SpanEvent,
@@ -64,6 +65,7 @@ from syndica.kernel.trace import (
     TraceLevel,
     TraceRedaction,
     TraceSource,
+    readable_schema,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,6 +145,7 @@ def _attributes(value: object) -> dict[str, AttributeValue]:
 
 
 def _header_from(value: Mapping[str, Any]) -> TraceHeader:
+    readable_schema(value.get('schema'))
     redaction = cast(Mapping[str, Any], value['redaction'])
     source = cast(Mapping[str, Any], value['source'])
     status = value['status']
@@ -502,9 +505,22 @@ class FileTraceStore:
                 )
             yield descriptor
 
-    def _headers(self, root: int) -> Iterator[tuple[str, TraceHeader]]:
-        """每个 trace 目录与它的头。读不出头的目录跳过并记一条 WARNING：一个坏掉的 trace 不能让别的
-        trace 都列不出来。"""
+    async def unreadable(self) -> list[tuple[str, str, str]]:
+        """读不出头、因而不在 `traces()` 里的那些 trace 目录：（目录名，怎么了，下一步）。不记日志：
+        `traces()` 已经为每一个记过一条。"""
+        with self._root_fd() as root:
+            if root is None:
+                return []
+            skipped: list[tuple[str, str, str]] = []
+            for _ in self._headers(root, skipped=skipped):
+                pass
+            return skipped
+
+    def _headers(
+        self, root: int, *, skipped: list[tuple[str, str, str]] | None = None
+    ) -> Iterator[tuple[str, TraceHeader]]:
+        """每个 trace 目录与它的头。读不出头的目录跳过：给了 `skipped` 就记进去，没给就记一条
+        WARNING——一个坏掉的 trace 不能让别的 trace 都列不出来。"""
         for name in sorted(os.listdir(root)):
             try:
                 mode = os.stat(name, dir_fd=root, follow_symlinks=False).st_mode
@@ -515,7 +531,23 @@ class FileTraceStore:
             try:
                 trace, header = self._opened_trace(root, name)
                 os.close(trace)
+            except NewerTraceSchema as error:
+                if skipped is not None:
+                    skipped.append((name, error.received, error.next_action))
+                    continue
+                logger.warning(
+                    '期望: %s 是这个版本的 syndica 读得懂的 trace。实际: %s。 下一步: %s。',
+                    self._root / name,
+                    error.received,
+                    error.next_action,
+                )
+                continue
             except (OSError, ContractViolation) as error:
+                if skipped is not None:
+                    skipped.append(
+                        (name, f'它的 {_HEADER} 读不进来（{error}）', '不要了就删掉这个目录')
+                    )
+                    continue
                 logger.warning(
                     '期望: %s 是一个 trace 目录，里面有可读的 %s。实际: %s。'
                     ' 下一步: 它不会出现在 trace 列表里；不要了就删掉这个目录。',
@@ -527,6 +559,15 @@ class FileTraceStore:
             # 按 id 找、按 id 删都只认名字对得上的目录（`_candidates`）：列出别的，就会有查不到、
             # 删不掉、却照样报「删掉了」的 trace。
             if not name.endswith(_suffixes(header.trace_id)):
+                if skipped is not None:
+                    skipped.append(
+                        (
+                            name,
+                            f'名字与头里的 trace {header.trace_id} 对不上（被改名或复制出来的）',
+                            '不要了就删掉这个目录',
+                        )
+                    )
+                    continue
                 logger.warning(
                     '期望: %s 的名字以它的头里的 trace id（前 8 位或完整的）结尾。'
                     ' 实际: 头是 trace %s。'
@@ -826,6 +867,8 @@ def _read_header(directory: int, where: str) -> TraceHeader:
     # 同 `_decoded`：头里的规则由 `RedactionRule` 自己校验，抛的是 ConfigError。
     try:
         return _header_from(cast(Mapping[str, Any], json.loads(text)))
+    except NewerTraceSchema:
+        raise
     except Exception as error:
         raise _corrupt(where, f'读不成 trace 头：{type(error).__name__}: {error}') from None
 

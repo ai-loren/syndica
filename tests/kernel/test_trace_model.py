@@ -19,6 +19,7 @@ from syndica.kernel.trace import (
     TRACE_SCHEMA,
     CausalityEdge,
     EdgeKind,
+    NewerTraceSchema,
     PayloadRef,
     Span,
     SpanEvent,
@@ -28,6 +29,7 @@ from syndica.kernel.trace import (
     TraceLevel,
     TraceRedaction,
     TraceSource,
+    readable_schema,
 )
 from syndica.kernel.waiting import WaitState
 
@@ -416,6 +418,30 @@ def test_a_malformed_edge_is_refused(arguments: tuple[Any, str, str]):
 def test_a_malformed_header_is_refused(changes: dict[str, Any]):
     with pytest.raises(ContractViolation):
         _header(**changes)
+
+
+@pytest.mark.parametrize('schema', ['syndica.trace/2', 'syndica.trace/10'])
+def test_a_header_from_a_newer_version_says_so_and_that_it_is_not_broken(schema: str):
+    with pytest.raises(NewerTraceSchema) as caught:
+        _header(schema=schema)
+
+    assert schema in caught.value.received
+    assert '不要删掉' in caught.value.next_action
+
+
+@pytest.mark.parametrize(
+    'schema', ['syndica.trace/0', 'syndica.trace/01', 'syndica.trace/1.1', 'other/2', 2, None]
+)
+def test_a_schema_that_is_not_a_newer_version_is_refused_as_unknown(schema: object):
+    with pytest.raises(ContractViolation) as caught:
+        readable_schema(schema)
+
+    assert not isinstance(caught.value, NewerTraceSchema)
+    assert '删掉它所在的目录' in caught.value.next_action
+
+
+def test_the_current_schema_reads():
+    readable_schema(TRACE_SCHEMA)
 
 
 def test_a_finished_header_carries_both_end_and_status():

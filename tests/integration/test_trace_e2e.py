@@ -248,7 +248,7 @@ def test_a_delegating_run_answers_the_three_questions_and_records_both_kinds_of_
     [chain] = _section(shown, '谁在等谁：')
     assert chain.startswith(f'  Worker {lead_id[:8]} → Explorer {child_id[:8]}（')
     assert chain.endswith('，answered）')
-    slowest = _section(shown, '最慢的工具调用（前 3 个）：')
+    slowest = _section(shown, '最慢的工具调用（前 3 个，等别的 Agent 与人的时间不算）：')
     assert slowest[0].split('  ')[2:4] == [f'Worker {lead_id[:8]}', 'Bash']
 
 

@@ -157,6 +157,7 @@ def test_discovery_covers_every_error_class_present_in_the_kernel():
         'ContextOverflowError',
         'ContractViolation',
         'LLMResponseError',
+        'NewerTraceSchema',
         'SyndicaError',
         'ToolFatalError',
     ]

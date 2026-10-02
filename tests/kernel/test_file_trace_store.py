@@ -818,3 +818,39 @@ async def test_a_span_file_over_the_read_limit_is_too_large_rather_than_changed(
 
     assert '读回的上限 512' in caught.value.expected
     assert '长跑' in caught.value.next_action
+
+
+async def test_unreadable_names_each_directory_traces_skips_with_why_and_logs_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    root = tmp_path / 'traces'
+    store = FileTraceStore(root)
+    newer, broken = 'cd' * 16, 'ef' * 16
+    for trace_id in (_TRACE, newer, broken):
+        await store.begin(_header(trace_id))
+    directories = {path.name.rsplit('-', 1)[1]: path for path in root.iterdir()}
+
+    def rewrite(trace_id: str, change: dict[str, object]) -> None:
+        path = directories[trace_id[:8]] / 'trace.json'
+        value = json.loads(path.read_text(encoding='utf-8'))
+        value.update(change)
+        path.write_text(json.dumps(value), encoding='utf-8')
+
+    rewrite(newer, {'schema': 'syndica.trace/7'})
+    rewrite(broken, {'started_ns': 'later'})
+    shutil.copytree(directories[_TRACE[:8]], root / 'copy')
+    caplog.clear()
+
+    skipped = await store.unreadable()
+    quiet = list(caplog.records)
+    listed = await store.traces()
+
+    names = [directories[newer[:8]].name, directories[broken[:8]].name, 'copy']
+    reasons = {name: (received, next_action) for name, received, next_action in skipped}
+    assert [header.trace_id for header in listed] == [_TRACE]
+    assert [name for name, _, _ in skipped] == sorted(names)
+    assert 'syndica.trace/7' in reasons[names[0]][0] and '不要删掉' in reasons[names[0]][1]
+    assert '读不进来' in reasons[names[1]][0] and '删掉这个目录' in reasons[names[1]][1]
+    assert '被改名或复制出来的' in reasons['copy'][0]
+    assert quiet == []
+    assert len([record for record in caplog.records if record.levelno == logging.WARNING]) == 3

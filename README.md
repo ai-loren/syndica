@@ -428,12 +428,15 @@ the replay cannot rebuild what topology slots attach to their roles.
   command; a replay's own trace says which trace it replayed).
   An id may be the full id, a unique prefix, or the directory name printed after a run.
 - `syndica trace show <id>` prints who created whom, who waits on whom (a wait cycle is marked),
-  the three slowest tool calls, and a timeline.
+  the three slowest tool calls (calls that only waited for another agent are left out), model calls
+  per agent (time, tokens, failures, platform failovers), and a timeline.
 - `syndica trace replay <id>` replays the trace offline: model replies, tool results, human answers
-  and host actions come from the record, while the kernel, its danger judgement and every hook run
-  for real and are compared item by item. Exit 0 means it reproduced, 1 that it diverged (each
-  divergence names the agent, turn and unit), 2 that the trace cannot be replayed. The replay
-  records itself as a new trace that points back to the original.
+  and host actions come from the record, while the kernel, its danger judgement and the modules the
+  replay can rebuild (safety, human interaction, retry) run for real and are compared item by item.
+  Host modules it cannot rebuild, such as the development guard, are named in the output; their
+  effects (the calls they skipped) are already in the record. Exit 0 means it reproduced, 1 that it
+  diverged (each divergence names the agent, turn and unit), 2 that the trace cannot be replayed.
+  The replay records itself as a new trace that points back to the original.
 - `syndica trace export <id> [--otlp <url>]` sends the trace to an OTLP/HTTP collector. Exports
   also happen at the end of every run when your environment names an endpoint
   (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`), honouring
@@ -442,8 +445,10 @@ the replay cannot rebuild what topology slots attach to their roles.
   another machine. A project's `.syndica.yaml` cannot choose the endpoint: a repository you do not
   trust would otherwise receive your traces and your collector credentials. Install the extra with
   `pip install 'syndica[otel]'`.
-- `syndica trace prune [--keep <n>]` keeps the newest `n` finished traces (default 50) and never
-  deletes an unfinished one; `syndica trace prune <id>...` deletes exactly the named traces.
+- `syndica trace prune [--keep <n>]` keeps the newest `n` finished traces (default 50) together
+  with their replays, and never deletes an unfinished one; `syndica trace prune <id>...` deletes
+  exactly the named traces. A trace written by a newer syndica is listed as unreadable with what to
+  do (upgrade), never as tampered.
 
 Everything written into a trace, a handoff file, a commit message or an export goes through the
 kernel `Redactor` first: secret-looking values from the host environment, built-in credential
@@ -456,7 +461,7 @@ until the sandbox of milestone 5.
 
 ```text
 syndica run <prompt>
-syndica chat [--max-turns <n>]
+syndica chat [--max-turns <n>] [--trace <level>]
 syndica agents list | show <name>
 syndica topology list | show <name>
 syndica flags list | show <key>
