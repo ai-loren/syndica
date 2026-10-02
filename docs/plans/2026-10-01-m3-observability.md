@@ -499,7 +499,8 @@ redaction:
   记录编码不出来时，只丢那一段或那一条（计入 `dropped`，第一次记一条 ERROR），其余照常写。这几种情况下都不写结局——
   头里 `status` 为空的 trace 是记录到一半就断了的，回放与导出据此拒绝它；只有回放文档被拒收时 trace 照常有结局。
   宿主据 `TraceRecorder.complete` 判断它完不完整，不读回头（头在 Agent 写得到的地方）。
-- 事件：`message.sent`（发送方的 span 上，投递成功才记，带 `message.id`、`message.to`）、`agent.despawned`（发起拆除
+- 事件：`message.sent`（发送方的 span 上，投递成功才记，带 `message.id`、`message.to`）、`message.deferred`（门把一条
+  延迟消息从邮箱取走、暂存到下一个周期时，在取走它的那一轮的 turn span 上，带 `message.id`）、`agent.despawned`（发起拆除
   的 span 上，带 `agent.id`；宿主、EXIT 收尾、kill 的收尾、关机发起的拆除不在任何 span 里，不记）、
   `llm.platform_failed`（llm_call span 上，同一次调用里每个被换掉的平台一个，带 `llm.platform`、`llm.error`、
   `llm.status`）。
@@ -541,6 +542,12 @@ redaction:
   `redact_argv`（命令行参数，`--api-key <值>` 两项一对）。
 - 哪些进 `kernel.__all__`、哪些进 `_WITHHELD`，在各自任务里按「宿主不用它就做不成某件事」判定并写进
   `tests/kernel/test_public_api.py`。
+- 收口之后的评审加上的：`PayloadRefused`（store 收不下单项时报）；`TraceRecorder.complete`；`RedactedText`、
+  `encode_redacted`、`Redactor`、`verbatim_attribute` 进 `kernel.__all__`，`ATTRIBUTE_KINDS` / `ATTRIBUTE_DOMAINS` /
+  `TRACE_SCHEMA` 与场景文档各部分的类型经子模块承诺；`FileTraceStore.names_a_trace` / `trace_named`（协议之外）；
+  场景格式 v2 的实例多了 `messages`、`deferred`、`continued`、`cut`、`unlanded`，回复多了 `request_prefix`，宿主
+  档案多了 `orchestration`、`confirmation_timeout` 与 `danger.policy`；`TurnGateDecision.deferred`（门这一次暂存了
+  哪些消息，只给插桩用）。`Tracer` 与 `TraceStore` 已有方法的签名冻结，新的通道与能力加新方法。
 
 ---
 
@@ -1275,6 +1282,15 @@ M3 自己的一条偶发失败的用例（负断言 `'caf' not in err` 与 trace
 换成 `quiz`，教训进 `AGENTS.md`。Agent 的改动原样带进本仓，另补四个单位各自起点的用例。详见
 [M3 收口审计](../audits/2026-10-02-m3-final-audit.md)。
 
+#### 收口之后的评审
+
+三路对抗评审（功能全面性、鲁棒性与稳定性、可扩展与可维护）之后，按发现修了九处，各自成提交：回放按记录的决定点投递
+消息、kill 等目标走到它在原始 run 里落下的地方（另有两轮专门的评审，第二轮又修了四处，其中一处是内核的竞态：派活的
+一方可能读到子 Agent 被一条消息复活之后的那个周期）；trace 命令；CLI 的鲁棒性；recorder 的失败处理与完整性判定；
+逐单元指纹的体量；非 CLI 宿主的回放；第三方接缝（签名冻结、契约多重性、公开面）；Ctrl-C 晚到的按键。
+上面「内核 API 增量」与 trace schema 两节已按修复后的样子改过。逐条与遗留见
+[M3 收口审计](../audits/2026-10-02-m3-final-audit.md)的「收口之后的评审」。
+
 ---
 
 ## 验证
@@ -1356,3 +1372,4 @@ M3 自己的一条偶发失败的用例（负断言 `'caf' not in err` 与 trace
 - **结论交回与打印之间的按键**（T2 第二轮评审）：`run --handoff` 的结论交回主程序之后、打印完之前（不到一毫秒；stdout
   堵住时更长）按下的 Ctrl-C 由主程序按普通中断报，退出 130，打印可能不全，而磁盘上的交接文件已经是最终那份。主程序
   的消息因此只说「可能没有做完」并指向交接文件。要关掉它得让宿主的处理一直装到打印完，与 CLI 的入口一起改。
+  **已修**（收口之后的评审，b68e44f）：负载下按键晚到，这个窗口宽到复现得出来；结论定下之后宿主的处理一直留到它关闭。
