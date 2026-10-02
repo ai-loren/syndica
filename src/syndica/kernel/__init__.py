@@ -48,6 +48,7 @@ from syndica.kernel.errors import (
     ConfigError,
     ContractViolation,
     LLMResponseError,
+    PayloadRefused,
     SyndicaError,
     ToolFatalError,
 )
@@ -194,6 +195,7 @@ __all__ = [
     'Orchestrator',
     'OverrideRecord',
     'PayloadRef',
+    'PayloadRefused',
     'PayloadText',
     'Plugin',
     'Portal',

@@ -137,8 +137,7 @@ class Recording:
         directory = await self.store.directory(trace_id)
         if directory is None:
             return None
-        header = await self.store.get(trace_id)
-        return Finished(directory, complete=header is not None and header.status is not None)
+        return Finished(directory, complete=self.recorder.complete)
 
 
 def trace_source(

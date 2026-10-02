@@ -795,8 +795,10 @@ def test_a_replay_trace_that_was_left_unfinished_is_labelled_so(tmp_path: Path):
 
     code, _, err = _cli(tmp_path, ['trace', 'replay', original.trace_id[:8]], replayer=abandoning)
 
+    *reasons, label = err.splitlines()
     assert code == 0
-    assert err.startswith('trace（不完整')
+    assert label.startswith('trace（不完整')
+    assert [line for line in reasons if '写入任务被取消' in line] == reasons[:1]
 
 
 def test_a_replay_puts_back_the_gitignore_that_keeps_traces_out_of_git(tmp_path: Path):

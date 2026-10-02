@@ -494,8 +494,11 @@ redaction:
   引用与有固定取值的属性原样记——用户规则可能认得一段十六进制或一个词，换掉之后引用就断了、span 就校验不过。
   `wait.target` 按自由文本脱敏（等 `Reply` 时它是调用方给的关联 id）：用户规则认得 id 时它会被换掉，Agent 之间的
   关系以边为准。
-- 不完整的 trace：store 失败、或一条记录编码不出来时，recorder 只丢那一条（计入 `dropped`，记一条 ERROR）并且不写
-  结局——头里 `status` 为空的 trace 是记录到一半就断了的，回放与导出据此拒绝它。
+- 不完整的 trace：store 坏了（它抛出的任何异常，含它自己抛出的 `CancelledError`；写入任务被宿主取消同样算）时，
+  recorder 第一次记一条 ERROR，此后的记录只计数（`dropped`）；store 收不下某一段 payload（`PayloadRefused`）、或一条
+  记录编码不出来时，只丢那一段或那一条（计入 `dropped`，第一次记一条 ERROR），其余照常写。这几种情况下都不写结局——
+  头里 `status` 为空的 trace 是记录到一半就断了的，回放与导出据此拒绝它；只有回放文档被拒收时 trace 照常有结局。
+  宿主据 `TraceRecorder.complete` 判断它完不完整，不读回头（头在 Agent 写得到的地方）。
 - 事件：`message.sent`（发送方的 span 上，投递成功才记，带 `message.id`、`message.to`）、`agent.despawned`（发起拆除
   的 span 上，带 `agent.id`；宿主、EXIT 收尾、kill 的收尾、关机发起的拆除不在任何 span 里，不记）、
   `llm.platform_failed`（llm_call span 上，同一次调用里每个被换掉的平台一个，带 `llm.platform`、`llm.error`、

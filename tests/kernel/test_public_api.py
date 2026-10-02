@@ -93,6 +93,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'Orchestrator',
     'OverrideRecord',
     'PayloadRef',
+    'PayloadRefused',
     'PayloadText',
     'Plugin',
     'Portal',
@@ -203,12 +204,13 @@ _BASE_AGENT_SURFACE: tuple[str, ...] = (
     'register_hook',
     'run',
 )
-# `TraceRecorder` 的公开面：宿主的生命周期（begin / finish / dropped / trace_id / level）、捕获回放
-# 文档的三个入口（describe_run / ids / interrupted）加 `Tracer` 协议的七个方法。
+# `TraceRecorder` 的公开面：宿主的生命周期（begin / finish / complete / dropped / trace_id /
+# level）、捕获回放文档的三个入口（describe_run / ids / interrupted）加 `Tracer` 协议的七个方法。
 _TRACE_RECORDER_SURFACE: tuple[str, ...] = (
     'add_edge',
     'add_event',
     'begin',
+    'complete',
     'describe_run',
     'dropped',
     'end_span',

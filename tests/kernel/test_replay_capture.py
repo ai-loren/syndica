@@ -22,6 +22,7 @@ from syndica.kernel import (
     HumanInteractionModule,
     InMemoryTraceStore,
     Junction,
+    PayloadRefused,
     RedactionRule,
     RuleRedactor,
     Runtime,
@@ -557,6 +558,32 @@ async def test_a_store_that_refuses_the_replay_document_leaves_the_trace_without
     header = await store.get(recorder.trace_id)
     assert document is None
     assert header is not None and header.status is None
+
+
+class _RefusesReplay(InMemoryTraceStore):
+    async def put_replay(self, trace_id: str, document: Any) -> None:
+        raise PayloadRefused(
+            expected='回放文档不超过 1 字节',
+            received=f'这份 {len(str(document))} 字节',
+            next_action='换一个单项上限更大的 store',
+        )
+
+
+async def test_a_replay_document_the_store_cannot_take_costs_only_the_document(
+    caplog: pytest.LogCaptureFixture,
+):
+    store = _RefusesReplay()
+    with caplog.at_level(logging.WARNING, logger='syndica.kernel.trace_recorder'):
+        _, recorder, document = await _captured([ScriptedTurn('done')], store=store)
+
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
+    args = cast(tuple[object, ...], record.args)
+    assert record.levelno == logging.WARNING
+    assert (args[0], args[3]) == (recorder.trace_id, '换一个单项上限更大的 store')
+    assert document is None
+    header = await store.get(recorder.trace_id)
+    assert header is not None and header.status is SpanStatus.OK
+    assert recorder.complete is True
 
 
 async def test_describe_run_refuses_what_is_not_a_mapping():

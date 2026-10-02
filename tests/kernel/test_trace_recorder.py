@@ -29,6 +29,7 @@ from syndica.kernel import (
     HumanInteractionModule,
     InMemoryTraceStore,
     Message,
+    PayloadRefused,
     Reply,
     RetryModule,
     Runtime,
@@ -47,6 +48,7 @@ from syndica.kernel import (
     Trigger,
     TrustLevel,
 )
+from syndica.kernel import trace_recorder as recorder_module
 from syndica.kernel.llm import LLMConfig
 from syndica.kernel.redaction import (
     RULES_VERSION,
@@ -1232,7 +1234,271 @@ async def test_a_failing_store_leaves_the_run_alone_and_reports_once(
     assert '检查 store' in str(cast(tuple[object, ...], report.args)[5])
     header = await store.get(recorder.trace_id)
     assert header is not None and header.status is None
+    assert recorder.complete is False
     assert [t for t in asyncio.all_tasks() if t.get_name() == f'trace:{recorder.trace_id}'] == []
+
+
+class _CancelsItself(_Counting):
+    """store 自己抛出 `CancelledError`（它内部的超时、它自己的任务被取消），写入任务并没有被
+    取消。"""
+
+    def __init__(self, method: str) -> None:
+        super().__init__()
+        self.method = method
+
+    async def put_payload(self, trace_id: str, payload: RedactedText) -> PayloadRef:
+        if self.method == 'put_payload':
+            raise asyncio.CancelledError()
+        return await super().put_payload(trace_id, payload)
+
+    async def append(
+        self,
+        trace_id: str,
+        spans: Sequence[Span] = (),
+        edges: Sequence[CausalityEdge] = (),
+    ) -> None:
+        if self.method == 'append':
+            raise asyncio.CancelledError()
+        await super().append(trace_id, spans, edges)
+
+    async def finish(self, trace_id: str, status: SpanStatus, ended_ns: int) -> None:
+        if self.method == 'finish':
+            raise asyncio.CancelledError()
+        await super().finish(trace_id, status, ended_ns)
+
+
+@pytest.mark.parametrize('method', ['put_payload', 'append', 'finish'])
+async def test_a_cancelled_error_the_store_raises_is_a_store_failure_and_not_a_cancellation(
+    method: str, caplog: pytest.LogCaptureFixture
+):
+    build, options = _delegating()
+    reference, reference_recorder, _, _ = await _recorded(build, **options)
+    produced = await _stored_count(cast(_Counting, reference), reference_recorder)
+
+    build, options = _delegating()
+    store = _CancelsItself(method)
+    caplog.clear()
+    _, recorder, _, context = await _recorded(build, store=store, **options)
+
+    assert context.stop_reason is StopReason.COMPLETED
+    [report] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
+    assert report.levelno == logging.ERROR
+    assert cast(tuple[object, ...], report.args)[3] == 'CancelledError'
+    assert recorder.dropped == produced - await _stored_count(store, recorder)
+    assert recorder.complete is False
+
+
+class _Gate(Tool):
+    __tool_name__ = 'Gate'
+    __tool_command_args__ = ()
+
+    def __init__(self, *, opened: bool = False) -> None:
+        self.entered = [asyncio.Event(), asyncio.Event()]
+        self.open = [asyncio.Event(), asyncio.Event()]
+        if opened:
+            for event in self.open:
+                event.set()
+        self._calls = 0
+
+    async def execute(self) -> ToolResult:
+        """第 n 次调用停在第 n 道门上，等测试放行。"""
+        index = self._calls
+        self._calls += 1
+        self.entered[index].set()
+        await self.open[index].wait()
+        return ToolResult(output='through')
+
+
+def _gated(gate: _Gate) -> Callable[[HooksCenter, EventBus], BaseAgent]:
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[_call('g1', 'Gate')]),
+            ScriptedTurn(tool_calls=[_call('e', 'Echo', text='between')]),
+            ScriptedTurn(tool_calls=[_call('g2', 'Gate')]),
+            ScriptedTurn('done'),
+        ]
+    )
+    return _factory('Root', llm, {'Gate': gate, 'Echo': _Echo()})
+
+
+async def test_a_writer_the_host_cancelled_costs_the_trace_and_not_whoever_finishes_it(
+    caplog: pytest.LogCaptureFixture,
+):
+    reference, reference_recorder, _, _ = await _recorded(_gated(_Gate(opened=True)))
+    produced = await _stored_count(cast(_Counting, reference), reference_recorder)
+
+    store = _Slow()
+    recorder = TraceRecorder(store, RuleRedactor())
+    await recorder.begin()
+    gate = _Gate()
+    runtime = Runtime(tracer=recorder)
+    try:
+        agent_id = await runtime.spawn(_gated(gate), query='go')
+        await asyncio.wait_for(store.entered.wait(), _TIMEOUT)
+        await asyncio.wait_for(gate.entered[0].wait(), _TIMEOUT)
+        gate.open[0].set()
+        await asyncio.wait_for(gate.entered[1].wait(), _TIMEOUT)
+        [writer] = [t for t in asyncio.all_tasks() if t.get_name() == f'trace:{recorder.trace_id}']
+        caplog.clear()
+        writer.cancel()
+        await asyncio.wait_for(_until(writer.done), _TIMEOUT)
+        await asyncio.sleep(0)
+        reported = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
+        gate.open[1].set()
+        context = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    await recorder.finish()
+
+    assert context.stop_reason is StopReason.COMPLETED
+    [report] = reported
+    assert [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder'] == [report]
+    args = cast(tuple[object, ...], report.args)
+    assert (report.levelno, args[0], args[1]) == (logging.ERROR, recorder.trace_id, '_Slow')
+    assert '写入任务被取消' in str(args[2])
+    assert cast(int, args[3]) > 0
+    assert recorder.dropped == produced - await _stored_count(store, recorder)
+    header = await store.get(recorder.trace_id)
+    assert header is not None and header.status is None
+    assert recorder.complete is False
+
+
+async def _relaying(store: _Counting, level: TraceLevel) -> tuple[TraceRecorder, Any]:
+    """十二轮 Echo，再派一个子 Agent、用一条消息叫醒它、销毁它：派生边、消息边与事件都在后头。"""
+    runtime_box: list[Runtime] = []
+    calls = [
+        ScriptedTurn(tool_calls=[_call(f'c{index}', 'Echo', text=f'turn {index}')])
+        for index in range(12)
+    ]
+    llm = ScriptedLLM(
+        [*calls, ScriptedTurn(tool_calls=[_call('r', 'Relay')]), ScriptedTurn('done')]
+    )
+    build = _factory('Root', llm, {'Echo': _Echo(), 'Relay': _Relay(runtime_box, [])})
+    recorder = TraceRecorder(store, RuleRedactor(), level=level)
+    recorder.describe_run(
+        host={},
+        roles={'Root': {'system_prompt': 'You help.', 'tools': ['Echo', 'Relay']}},
+        entry={'mode': 'query', 'agent': 'Root', 'prompt': 'go'},
+    )
+    await recorder.begin()
+    runtime = Runtime(agents={'Root': build}, tracer=recorder, ids=recorder.ids)
+    runtime_box.append(runtime)
+    try:
+        agent_id = await runtime.spawn(build, query='go')
+        context = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    await recorder.finish()
+    return recorder, context
+
+
+@pytest.mark.parametrize('level', [TraceLevel.REPLAY, TraceLevel.FULL])
+async def test_once_the_store_failed_nothing_more_is_encoded_and_dropped_stays_exact(
+    level: TraceLevel, monkeypatch: pytest.MonkeyPatch
+):
+    reference = _Counting()
+    reference_recorder, _ = await _relaying(reference, level)
+    produced = await _stored_count(reference, reference_recorder)
+
+    failed: list[logging.LogRecord] = []
+    after: list[str] = []
+
+    class _Noting(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.ERROR:
+                failed.append(record)
+
+    def counting(name: str, real: Callable[..., Any]) -> Callable[..., Any]:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            if failed:
+                after.append(name)
+            return real(*args, **kwargs)
+
+        return call
+
+    for name in ('encode_redacted', 'encode_digests'):
+        monkeypatch.setattr(recorder_module, name, counting(name, getattr(recorder_module, name)))
+    fingerprints = recorder_module.RequestFingerprints
+    monkeypatch.setattr(fingerprints, 'of_parts', counting('of_parts', fingerprints.of_parts))
+    capture = recorder_module.ReplayCapture
+    for name in ('started', 'ended', 'exchanged', 'returned', 'sent', 'consumed'):
+        monkeypatch.setattr(capture, name, counting(name, getattr(capture, name)))
+    monkeypatch.setattr(RuleRedactor, 'redact', counting('redact', RuleRedactor.redact))
+    handler = _Noting()
+    logging.getLogger('syndica.kernel.trace_recorder').addHandler(handler)
+    try:
+        store = _Failing('append')
+        recorder, context = await _relaying(store, level)
+    finally:
+        logging.getLogger('syndica.kernel.trace_recorder').removeHandler(handler)
+
+    assert context.stop_reason is StopReason.COMPLETED
+    assert len(failed) == 1
+    assert after == []
+    assert recorder.dropped == produced - await _stored_count(store, recorder)
+
+
+class _Capped(_Counting):
+    """单项有上限的 store（像 DynamoDB 的 400 KB）：大的那一段收不下，store 本身没坏。"""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = limit
+        self.refused: list[int] = []
+
+    async def put_payload(self, trace_id: str, payload: RedactedText) -> PayloadRef:
+        size = len(str(payload).encode('utf-8'))
+        if size > self.limit:
+            self.refused.append(size)
+            raise PayloadRefused(
+                expected=f'一段 payload 不超过 {self.limit} 字节',
+                received=f'这一段 {size} 字节',
+                next_action='换一个单项上限更大的 store，或让工具把大的输出写成文件',
+            )
+        return await super().put_payload(trace_id, payload)
+
+
+async def test_a_payload_the_store_cannot_take_costs_only_that_payload(
+    caplog: pytest.LogCaptureFixture,
+):
+    def build() -> Callable[[HooksCenter, EventBus], BaseAgent]:
+        llm = ScriptedLLM(
+            [
+                ScriptedTurn(tool_calls=[_call('c1', 'Echo', text='x' * 5000)]),
+                ScriptedTurn(tool_calls=[_call('c2', 'Echo', text='small')]),
+                ScriptedTurn('done'),
+            ]
+        )
+        return _factory('Root', llm, {'Echo': _Echo()})
+
+    reference, reference_recorder, _, _ = await _recorded(build())
+    produced = await _stored_count(cast(_Counting, reference), reference_recorder)
+    store = _Capped(4000)
+    caplog.clear()
+    _, recorder, _, context = await _recorded(build(), store=store)
+
+    assert context.stop_reason is StopReason.COMPLETED
+    [report] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
+    args = cast(tuple[object, ...], report.args)
+    assert report.levelno == logging.ERROR
+    assert (args[0], args[1], args[2]) == (recorder.trace_id, '_Capped', store.refused[0])
+    assert args[4] == '换一个单项上限更大的 store，或让工具把大的输出写成文件'
+    assert recorder.dropped == len(store.refused) >= 1
+    assert await _stored_count(store, recorder) == produced - len(store.refused)
+    header = await store.get(recorder.trace_id)
+    assert header is not None and header.status is None
+    assert recorder.complete is False
+
+
+async def test_complete_is_true_only_once_this_recorder_wrote_the_outcome():
+    store = InMemoryTraceStore()
+    recorder = TraceRecorder(store, RuleRedactor())
+    await recorder.begin()
+    before = recorder.complete
+
+    await recorder.finish(SpanStatus.ERROR)
+
+    assert (before, recorder.complete) == (False, True)
 
 
 class _Tampered(_Counting):

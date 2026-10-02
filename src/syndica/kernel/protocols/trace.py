@@ -7,6 +7,9 @@
   （含空的 `append`）报 `ContractViolation`。
 - **拒绝即无副作用**：报错的写一项都不写——混着一条坏边的那批 span 也不写，被拒的 `put_payload`
   读不回来，被拒的 `finish` 不改结局。
+- **收不下一项不等于坏了**：`put_payload` / `put_replay` 收不下这一项（太大、超出单项配额）时报
+  `PayloadRefused`，记录方只丢这一项、照常写其余的（这个 trace 因此不完整；丢的是回放文档时只少
+  它）。别的异常意味着 store 坏了，记录方从那一刻起不再写。
 - **自由文本只收 `RedactedText`**：`put_payload` 与 `put_replay` 运行时检查类型，收到普通 `str` 报
   `ContractViolation`。脱敏发生在写入之前，store 不再判断内容。
 - **一次写是原子的**：一次 `append` 整批出现、不被别的 `append` 插进来，批与批按调用顺序读回；
@@ -53,11 +56,12 @@ class TraceStore(Protocol):
 
     async def put_payload(self, trace_id: str, payload: RedactedText) -> PayloadRef:
         """存一段自由文本，交回它的引用。引用是内容 UTF-8 编码的 sha256，由 store 算；
-        同一个 trace 里内容相同的只存一份，交回同一个引用。"""
+        同一个 trace 里内容相同的只存一份，交回同一个引用。收不下这一段时报 `PayloadRefused`。"""
         ...
 
     async def put_replay(self, trace_id: str, document: RedactedText) -> None:
-        """存回放文档。每个 trace 至多一份：第二次报 `ContractViolation`。"""
+        """存回放文档。每个 trace 至多一份：第二次报 `ContractViolation`；收不下时报
+        `PayloadRefused`。"""
         ...
 
     async def finish(self, trace_id: str, status: SpanStatus, ended_ns: int) -> None:

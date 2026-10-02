@@ -10,9 +10,11 @@
 命令行参数。脱敏发生在写入之前——store 不再判断内容，第三方 store 拿到的已经是脱过敏的。内核生成的
 标识、摘要与闭集取值不是自由文本，原样保留（`_verbatim`）。
 
-记录不改变 run：store 坏掉时第一次失败记一条 ERROR，此后的记录丢弃并计数（`dropped`）；一条记录
-编码不出来时同样只丢那一条、记一条 ERROR。两种情况下这个 trace 都不写结局——没有结局的 trace 是
-不完整的，回放与导出据此拒绝它。
+记录不改变 run：store 坏掉时（它抛出的任何异常，含它自己抛出的 `CancelledError`）第一次失败记一条
+ERROR，此后的记录丢弃并计数（`dropped`），也不再算指纹、编码与记账；写入任务被宿主取消时同样如此。
+store 收不下某一段 payload（`PayloadRefused`）时只丢那一段，一条记录编码不出来时只丢那一条，各记一条
+ERROR、其余照常写。这几种情况下这个 trace 都不写结局——没有结局的 trace 是不完整的，回放与导出据此
+拒绝它；只有回放文档被拒收时，trace 照常有结局、只是没有回放文档。
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from enum import Enum
 from typing import Any, cast
 
 from syndica.kernel.context import ContextBlock, ToolCall
-from syndica.kernel.errors import ConfigError, ContractViolation
+from syndica.kernel.errors import ConfigError, ContractViolation, PayloadRefused
 from syndica.kernel.ids import IdSource
 from syndica.kernel.message import Message
 from syndica.kernel.protocols.trace import TraceStore
@@ -404,6 +406,9 @@ class TraceRecorder:
         self._finished = False
         self._failure: BaseException | None = None
         self._incomplete = False
+        self._refusals = 0
+        self._writer_gone = False
+        self._completed = False
         self._dropped = 0
 
     @property
@@ -463,10 +468,17 @@ class TraceRecorder:
         self._capturing(self._capture.interrupted)
 
     @property
+    def complete(self) -> bool:
+        """这个 recorder 写下了 trace 的结局：`finish` 走完了，每一条记录都写进了 store（`finish`
+        之后才到的不算）。为假时 store 里这个 trace 没有结局，回放与导出会拒绝它。判据是 recorder
+        自己的账，不是读回来的头：头在 Agent 写得到的地方。"""
+        return self._completed
+
+    @property
     def dropped(self) -> int:
-        """没写进 store 的记录数（payload、span、边各算一条）：store 失败之后的、编码不出来的，以及
-        `finish` 之后才开始的 span 与才到的边。被 `finish` 截断的 span 以 `cancelled` 写下，此后才到
-        的回复与工具结局不记：取消不是那次调用的结局。"""
+        """没写进 store 的记录数（payload、span、边各算一条）：store 失败或写入任务被取消之后的、
+        store 收不下的、编码不出来的，以及 `finish` 之后才开始的 span 与才到的边。被 `finish` 截断的
+        span 以 `cancelled` 写下，此后才到的回复与工具结局不记：取消不是那次调用的结局。"""
         return self._dropped
 
     async def begin(self) -> None:
@@ -511,10 +523,12 @@ class TraceRecorder:
         self._writer = asyncio.create_task(
             self._write_loop(self._queue), name=f'trace:{self._trace_id}'
         )
+        self._writer.add_done_callback(self._writer_ended)
 
     async def finish(self, status: SpanStatus = SpanStatus.OK) -> None:
         """收尾：还开着的 span 以 `cancelled` 写下，等写入任务排空，写下 trace 的结局。只调一次。
-        被取消时写入任务照样排空（不留下写了一半的批），结局不写；trace 不完整时结局也不写。"""
+        被取消时写入任务照样排空（不留下写了一半的批），结局不写；trace 不完整时结局也不写。写入任务
+        先被别人取消了不往这里抛：那是这个 trace 的失败，不是这次调用的。"""
         if not isinstance(cast(object, status), SpanStatus):
             raise ConfigError(
                 expected='status 是 SpanStatus 的成员',
@@ -541,7 +555,7 @@ class TraceRecorder:
             if self._queue is not None:
                 self._queue.put_nowait(_STOP)
             if self._writer is not None:
-                await asyncio.shield(self._writer)
+                await self._drained(self._writer)
         if self._failure is not None or self._incomplete:
             return
         await self._write_replay(status)
@@ -549,8 +563,12 @@ class TraceRecorder:
             return
         try:
             await self._store.finish(self._trace_id, status, self._now())
-        except Exception as error:
+        except BaseException as error:
+            if not _raised_by_store(error):
+                raise
             self._fail('finish', error)
+            return
+        self._completed = True
 
     # --- Tracer ---------------------------------------------------------------------------
 
@@ -602,6 +620,9 @@ class TraceRecorder:
         span = self._open.pop(span_id, None)
         if span is None:
             return
+        if self._failure is not None:
+            self._dropped += 1
+            return
         span.attributes.update(attributes)
         if self._level is not TraceLevel.STRUCTURE:
             self._capturing(
@@ -636,7 +657,7 @@ class TraceRecorder:
         ):
             self._capturing(lambda: self._capture.sent(message_id))
         span = self._open.get(span_id)
-        if span is None:
+        if span is None or self._failure is not None:
             return
         try:
             event = SpanEvent(
@@ -677,18 +698,25 @@ class TraceRecorder:
         if span is None or self._level is TraceLevel.STRUCTURE:
             return
         units: list[str] | None = None
-        try:
-            messages, params = _request_parts(request)
-            units = self._fingerprints.of_parts(messages, params)
-            span.attributes['llm.request_digest'] = hashlib.sha256(
-                ''.join(units).encode()
-            ).hexdigest()
-            span.attributes['llm.request_units'] = self._queued(encode_digests(units))
-            if self._level is TraceLevel.FULL:
-                whole = {'messages': [_unit_value(block) for block in messages], 'params': params}
-                span.attributes['llm.request'] = self._payload(whole)
-        except Exception as failure:
-            self._lose(f'llm_call span {span_id} 的请求', failure)
+        if self._failure is not None:
+            # 指纹与请求本该排进去的那几段 payload：不算，只计数。
+            self._dropped += 2 if self._level is TraceLevel.FULL else 1
+        else:
+            try:
+                messages, params = _request_parts(request)
+                units = self._fingerprints.of_parts(messages, params)
+                span.attributes['llm.request_digest'] = hashlib.sha256(
+                    ''.join(units).encode()
+                ).hexdigest()
+                span.attributes['llm.request_units'] = self._queued(encode_digests(units))
+                if self._level is TraceLevel.FULL:
+                    whole = {
+                        'messages': [_unit_value(block) for block in messages],
+                        'params': params,
+                    }
+                    span.attributes['llm.request'] = self._payload(whole)
+            except Exception as failure:
+                self._lose(f'llm_call span {span_id} 的请求', failure)
         if error is not None:
             self._attach(span, 'llm.response', lambda: _error_value(error))
         elif reply is not None:
@@ -731,8 +759,8 @@ class TraceRecorder:
 
     def _capturing(self, action: Callable[[], None]) -> None:
         """回放文档的账本出错只少这一份文档：trace 与 run 都不受影响，ERROR 恰好一条。宿主没有调
-        `describe_run` 时不记：不会写的文档，攒下来只占内存。"""
-        if self._capture_failed or not self._capture.wanted:
+        `describe_run` 时、store 已经坏了时不记：不会写的文档，攒下来只占内存。"""
+        if self._capture_failed or not self._capture.wanted or self._failure is not None:
             return
         try:
             action()
@@ -826,7 +854,19 @@ class TraceRecorder:
             return
         try:
             await self._store.put_replay(self._trace_id, text)
-        except Exception as error:
+        except PayloadRefused as refusal:
+            logger.warning(
+                '期望: store 收下 trace %s 的回放文档。'
+                ' 实际: store 收不下这份 %d 字节的文档：%s；这个 trace 没有回放文档，其余照常。'
+                ' 下一步: %s。',
+                self._trace_id,
+                len(text.encode('utf-8')),
+                refusal.received,
+                refusal.next_action,
+            )
+        except BaseException as error:
+            if not _raised_by_store(error):
+                raise
             self._fail('写回放文档', error)
 
     def _now(self) -> int:
@@ -852,6 +892,9 @@ class TraceRecorder:
         return redacted
 
     def _attach(self, span: _Open, key: str, build: Callable[[], object]) -> None:
+        if self._failure is not None:
+            self._dropped += 1
+            return
         try:
             span.attributes[key] = self._payload(build())
         except Exception as error:
@@ -895,10 +938,15 @@ class TraceRecorder:
         if self._failure is not None:
             self._dropped += len(payloads) + len(spans) + len(edges)
             return
-        written = 0
+        handled = 0
         try:
             for payload in payloads:
-                ref = await self._store.put_payload(self._trace_id, payload.text)
+                try:
+                    ref = await self._store.put_payload(self._trace_id, payload.text)
+                except PayloadRefused as refusal:
+                    self._refused(payload, refusal)
+                    handled += 1
+                    continue
                 if ref.trace_id != self._trace_id or ref.digest != payload.digest:
                     raise ContractViolation(
                         expected=(
@@ -909,12 +957,78 @@ class TraceRecorder:
                         next_action='修这个 store 的 put_payload：span 按内容的 sha256 引用 '
                         'payload，对不上就再也找不回内容',
                     )
-                written += 1
+                handled += 1
             if spans or edges:
                 await self._store.append(self._trace_id, spans, edges)
-        except Exception as error:
-            self._dropped += len(payloads) - written + len(spans) + len(edges)
+        except BaseException as error:
+            self._dropped += len(payloads) - handled + len(spans) + len(edges)
+            if not _raised_by_store(error):
+                raise
             self._fail('写入', error)
+
+    async def _drained(self, writer: asyncio.Task[None]) -> None:
+        try:
+            await asyncio.shield(writer)
+        except BaseException:
+            task = asyncio.current_task()
+            if not writer.done() or (task is not None and task.cancelling()):
+                raise
+            self._writer_ended(writer)
+
+    def _writer_ended(self, writer: asyncio.Task[None]) -> None:
+        """写入任务不是因为 `finish` 放进去的停止标记而结束的：宿主取消了它（关机时取消全部任务），
+        或者它死于 recorder 的缺陷。还排着的计入 `dropped`，此后的只计数；ERROR 恰好一条。"""
+        if self._writer_gone:
+            return
+        if writer.cancelled():
+            error: BaseException = asyncio.CancelledError()
+            cause = '写入任务被取消了（取消的是它本身，不是等它的那一方）'
+        else:
+            failure = writer.exception()
+            if failure is None:
+                return
+            error = failure
+            cause = f'写入任务抛出 {type(failure).__name__}: {failure}'
+        self._writer_gone = True
+        lost = 0
+        if self._queue is not None:
+            while not self._queue.empty():
+                if self._queue.get_nowait() is not _STOP:
+                    lost += 1
+        self._dropped += lost
+        if self._failure is not None:
+            return
+        self._failure = error
+        logger.error(
+            '期望: trace %s 的写入任务把每一条记录写进 %s。'
+            ' 实际: %s；还排着的 %d 条记录丢了，此后的只计数，run 照常进行。'
+            ' 下一步: 关机时先 await recorder.finish()，再取消别的任务（写入任务名为 trace:%s）；'
+            '这个 trace 不完整，不要拿它回放或导出。',
+            self._trace_id,
+            type(self._store).__name__,
+            cause,
+            lost,
+            self._trace_id,
+        )
+
+    def _refused(self, payload: _Payload, refusal: PayloadRefused) -> None:
+        """store 收不下这一段：只丢它，其余照常写，这个 trace 不写结局。ERROR 只记第一段。"""
+        self._dropped += 1
+        self._incomplete = True
+        self._refusals += 1
+        if self._refusals > 1:
+            return
+        logger.error(
+            '期望: trace %s 的每一条记录都写进 %s。'
+            ' 实际: store 收不下一段 %d 字节的 payload：%s；只丢了这一段（再收不下的只计数），'
+            '其余照常写，但这个 trace 不写结局。'
+            ' 下一步: %s；这个 trace 不完整，不要拿它回放或导出。',
+            self._trace_id,
+            type(self._store).__name__,
+            len(payload.text.encode('utf-8')),
+            refusal.received,
+            refusal.next_action,
+        )
 
     def _fail(self, step: str, error: BaseException) -> None:
         """只在还没失败过时调：此后的记录走 `_write` 开头只计数的那条路，这条 ERROR 恰好一条。"""
@@ -955,6 +1069,15 @@ class TraceRecorder:
             type(error).__name__,
             error,
         )
+
+
+def _raised_by_store(error: BaseException) -> bool:
+    """这是 store 的失败，而不是这个任务正在被取消、或解释器要退出：store 自己抛出的
+    `CancelledError`（它内部的超时、它自己的任务被取消）也算 store 的失败。"""
+    if isinstance(error, asyncio.CancelledError):
+        task = asyncio.current_task()
+        return task is not None and not task.cancelling()
+    return isinstance(error, Exception)
 
 
 def _not_begun(trace_id: str) -> ConfigError:

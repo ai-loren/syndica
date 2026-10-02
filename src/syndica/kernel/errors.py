@@ -9,6 +9,7 @@ __all__ = [
     'ConfigError',
     'ContractViolation',
     'LLMResponseError',
+    'PayloadRefused',
     'SyndicaError',
     'ToolFatalError',
 ]
@@ -93,6 +94,14 @@ class ConfigError(SyndicaError):
 
 class LLMResponseError(SyndicaError):
     """LLM 响应无法作为有效结果使用。"""
+
+
+class PayloadRefused(SyndicaError):
+    """`TraceStore` 收不下这一段自由文本（太大、超出单项配额），而 store 本身没坏。
+
+    与别的异常的分界：报它的写没有副作用，记录方只丢这一段、照常写其余的；别的异常意味着 store
+    坏了，记录方从那一刻起不再写。
+    """
 
 
 class ToolFatalError(SyndicaError):

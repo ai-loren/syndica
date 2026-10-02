@@ -374,6 +374,37 @@ def test_a_trace_that_loses_records_mid_run_is_flagged_incomplete_and_the_run_go
     assert lines[-1] == f'trace（不完整，原因见上面的 ERROR；不要拿它回放）：{shown}'
 
 
+class _Forging(ScriptedLLM):
+    """第一次被调用时把这次 run 的 trace 头改成已经有了结局：Agent 的 Bash 能做到的事。"""
+
+    def __init__(self, turns: list[ScriptedTurn], root: Path) -> None:
+        super().__init__(turns)
+        self._root = root
+        self.forged = False
+
+    async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        if not self.forged:
+            [directory] = (self._root / '.syndica' / 'traces').iterdir()
+            header = directory / 'trace.json'
+            value = json.loads(header.read_text(encoding='utf-8'))
+            value.update(status='ok', ended_ns=value['started_ns'])
+            header.write_text(json.dumps(value), encoding='utf-8')
+            self.forged = True
+        return await super().create(messages, **kwargs)
+
+
+def test_a_trace_whose_outcome_the_agent_forged_is_still_flagged_incomplete(tmp_path: Path):
+    llm = _Forging([ScriptedTurn(content='done')], tmp_path)
+
+    code, stdout, stderr = _cli(tmp_path, llm, ['run', 'go', '--agent', 'Worker'])
+
+    [(header, directory, _)] = _recorded(tmp_path)
+    shown = f'.syndica/traces/{directory.name}'
+    assert (code, stdout) == (0, 'done\n')
+    assert header.status is SpanStatus.OK
+    assert stderr.splitlines()[-1] == f'trace（不完整，原因见上面的 ERROR；不要拿它回放）：{shown}'
+
+
 def test_an_existing_gitignore_in_the_hosts_directory_is_left_alone(tmp_path: Path):
     (tmp_path / '.syndica').mkdir()
     (tmp_path / '.syndica' / '.gitignore').write_text('handoffs/\n', encoding='utf-8')
