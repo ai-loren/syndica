@@ -480,7 +480,7 @@ redaction:
   的是请求键（JSON；宿主直接发起、没有请求键的是空串），Delegate / Fork 等的是子 Agent 的 id，等 `Reply` 的是关联
   id。`danger.rule_ids` 没有规则命中时是空表。
 - payload 引用（种类 `payload`：同一个 trace 里一份 payload 的 sha256，64 个小写十六进制；`replay` 级起才有）：
-  `llm.request_units`（逐单元指纹的列表）、`llm.request`（`full` 才有：`{messages, params}`）、`llm.response`
+  `llm.request`（`full` 才有：`{messages, params}`）、`llm.response`
   （`{kind: reply, role, content, tool_calls: [{id, name, arguments | arguments_raw}], tool_call_id, extra, trust}`，
   `arguments` 是解析后的值，解析不了的原串记成 `arguments_raw`（原串 `ls` 与解析出来的字符串 `"ls"` 由此分得开）；或 `{kind: error, type, message, status_code?, retry_after?}`，`type` 是 `模块.限定名`）、`tool.result`
   （工具自己交回的、`POST_TOOL_USE` 改写之前的 `{kind: result, output, meta, trust, artifacts}`，或它抛出的
@@ -519,7 +519,8 @@ redaction:
 `max_turns`、`impl`）代替 `manifest`；`instances` 带稳定键（`key: {tool_call: …}`、`{host: n}`、`{slot, key, n}`）；
 回合的 `content` 可以是列表、带 `extra`、`tool_calls[].arguments`（解析后的任何 JSON 值，按 D11 编码；解析不了的原串写
 `arguments_raw`）、带类型的 `raises`、
-`request_digests`；实例的 `tool_results`（按调用键：`output`、`meta`、`trust`，或 `raised: {type, message}`）、
+`request_digests`（逐单元指纹；`request_prefix: n` 表示前 n 个与这个实例里上一次带指纹的请求相同、
+`request_digests` 只列其余的——请求只在末尾追加，整份照抄是轮数的平方）；实例的 `tool_results`（按调用键：`output`、`meta`、`trust`，或 `raised: {type, message}`）、
 `skipped`（按调用键的最终结果）、`gate`（按调用键的闸门判定）；`responses` 按请求的键，`kind` 加 `timeout`；
 `host_actions`（`abort` 按请求的键，`interrupt` 与 `shutdown` 按它发生的位置）；`ids`（稳定键 → 记录的 id）；
 `entry.mode`（`query send slot`）、`entry.trust`；拓扑槽不再受 v1 的限制；`source`。
@@ -537,7 +538,7 @@ redaction:
   导出。
 - `syndica.kernel.redaction`：`Redactor`、`RuleRedactor`、`RedactionRule`、`RedactedText`、`encode_redacted`、
   `write_redacted`、`write_all`、`Finding`、`RULE_IDS`、`RULES_VERSION`、`looks_secret`；不进 `kernel.__all__` 的
-  `redact_argv`（命令行参数，`--api-key <值>` 两项一对）与 `encode_digests`（只收 sha256 的不脱敏编码）。
+  `redact_argv`（命令行参数，`--api-key <值>` 两项一对）。
 - 哪些进 `kernel.__all__`、哪些进 `_WITHHELD`，在各自任务里按「宿主不用它就做不成某件事」判定并写进
   `tests/kernel/test_public_api.py`。
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from typing import Any, cast
 
@@ -29,6 +30,7 @@ from syndica.kernel import (
 from syndica.kernel.llm import LLMConfig
 from syndica.kernel.redaction import RuleRedactor
 from syndica.kernel.trace import EdgeKind, PayloadRef, Span
+from syndica.kernel.trace_recorder import RequestFingerprints
 from syndica.kernel.tracing import span_id_of
 
 _TIMEOUT = 5.0
@@ -90,18 +92,18 @@ async def test_a_fork_is_spawned_from_its_call_and_its_inherited_history_has_the
     assert spawn.source_span_id == fork_call
     assert spawn.target_span_id == span_id_of(SpanKind.AGENT, child, 1)
     assert spans[spawn.target_span_id].attributes['stop_reason'] == 'completed'
-    parent_units = await _payload(
-        store,
-        recorder,
-        spans[span_id_of(SpanKind.LLM_CALL, parent, 1, 1)].attributes['llm.request_units'],
-    )
-    child_units = await _payload(
-        store,
-        recorder,
-        spans[span_id_of(SpanKind.LLM_CALL, child, 1, 1)].attributes['llm.request_units'],
+    fingerprints = RequestFingerprints(RuleRedactor())
+    parent_units, child_units = (
+        fingerprints.of({'messages': messages, **kwargs})
+        for messages, kwargs in zip(llm.calls[:2], llm.call_kwargs[:2], strict=True)
     )
     assert child_units[:4] == parent_units[:4]
     assert len(child_units) > len(parent_units)
+    for agent, units in ((parent, parent_units), (child, child_units)):
+        span = spans[span_id_of(SpanKind.LLM_CALL, agent, 1, 1)]
+        assert span.attributes['llm.request_digest'] == (
+            hashlib.sha256(''.join(units).encode()).hexdigest()
+        )
 
 
 async def test_an_instance_taken_from_a_topology_slot_is_spawned_from_the_call_that_took_it():

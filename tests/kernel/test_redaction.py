@@ -25,7 +25,6 @@ from syndica.kernel.redaction import (
     RULES_VERSION,
     RedactedText,
     _entropy,  # pyright: ignore[reportPrivateUsage]
-    encode_digests,
     encode_prepared,
     encode_redacted,
     looks_secret,
@@ -1801,26 +1800,6 @@ def test_redaction_and_the_commit_gate_are_linear(text: str):
     redactor.scan(text)
 
     assert time.process_time() - started < 4
-
-
-def test_digests_are_encoded_as_they_are_because_nothing_else_gets_in():
-    digests = ['ab' * 32, '0f' * 32, 'ab' * 32]
-
-    assert json.loads(encode_digests(digests)) == digests
-
-
-@pytest.mark.parametrize(
-    'bad',
-    [['AB' * 32], ['ab' * 31], ['ab' * 33], [' ' + 'ab' * 32], ['api_key=' + 'a' * 56], [64]],
-    ids=['uppercase', 'short', 'long', 'padded', 'text', 'int'],
-)
-def test_anything_but_a_digest_is_refused_by_the_unredacted_encoder(bad: list[Any]):
-    with pytest.raises(ContractViolation) as caught:
-        encode_digests(['cd' * 32, *bad])
-
-    assert '第 1 项' in caught.value.received
-    assert 'encode_redacted' in caught.value.next_action
-    assert 'api_key' not in caught.value.received
 
 
 def test_kernel_identifiers_are_kept_verbatim_even_under_a_key_named_like_a_secret():

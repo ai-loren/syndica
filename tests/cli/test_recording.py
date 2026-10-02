@@ -119,10 +119,7 @@ def test_a_run_is_recorded_at_replay_by_default_and_its_directory_is_printed(tmp
     assert (header.source.version, header.source.config_sha256) == (__version__, None)
     assert directory.parent == tmp_path / '.syndica' / 'traces'
     assert stderr == f'trace：.syndica/traces/{directory.name}\n'
-    assert [key for key in _PAYLOAD_KEYS if key in span.attributes] == [
-        'llm.request_units',
-        'llm.response',
-    ]
+    assert [key for key in _PAYLOAD_KEYS if key in span.attributes] == ['llm.response']
     assert (tmp_path / '.syndica' / '.gitignore').read_text(encoding='utf-8') == '*\n'
 
 
@@ -130,8 +127,8 @@ def test_a_run_is_recorded_at_replay_by_default_and_its_directory_is_printed(tmp
     ('level', 'payloads'),
     [
         ('structure', []),
-        ('replay', ['llm.request_units', 'llm.response']),
-        ('full', ['llm.request_units', 'llm.response', 'llm.request']),
+        ('replay', ['llm.response']),
+        ('full', ['llm.response', 'llm.request']),
     ],
 )
 def test_the_trace_flag_picks_what_is_recorded(tmp_path: Path, level: str, payloads: list[str]):

@@ -65,6 +65,7 @@ from syndica.kernel.trace import (
     PayloadRef,
     Span,
 )
+from syndica.kernel.trace_recorder import RequestFingerprints
 from syndica.kernel.tracing import span_id_of
 
 _TIMEOUT = 5.0
@@ -209,13 +210,15 @@ def _exchange(
     recorder.end_span(span_id, SpanStatus.OK, {})
 
 
-async def _units(recorder: TraceRecorder, span_id: str = _LLM) -> list[str]:
-    store = cast(InMemoryTraceStore, recorder._store)  # pyright: ignore[reportPrivateUsage]
-    await recorder.finish()
-    spans = await _spans(store, recorder)
-    return cast(
-        list[str], await _payload(store, recorder, spans[span_id].attributes['llm.request_units'])
-    )
+def _fingerprinted(
+    messages: Sequence[object], redactor: RuleRedactor | None = None, **params: Any
+) -> list[str]:
+    fingerprints = RequestFingerprints(RuleRedactor() if redactor is None else redactor)
+    return fingerprints.of({'messages': list(messages), **params})
+
+
+def _whole(units: Sequence[str]) -> str:
+    return hashlib.sha256(''.join(units).encode()).hexdigest()
 
 
 # --- construction and lifecycle --------------------------------------------------------------
@@ -625,7 +628,7 @@ async def test_every_payload_is_stored_before_the_span_that_refers_to_it():
     )
 
     assert store.missing == []
-    assert store.checked == 2 * 3 + 2 + 1
+    assert store.checked == 2 * 2 + 2 + 1
 
 
 async def test_spans_are_stored_in_the_order_they_ended_across_batches():
@@ -730,8 +733,8 @@ async def test_replay_records_replies_results_answers_and_fingerprints_but_not_r
     llm_calls = [span for span in spans.values() if span.kind is SpanKind.LLM_CALL]
     assert len(llm_calls) == 3
     for span in llm_calls:
-        assert {'llm.request_digest', 'llm.request_units', 'llm.response'} <= set(span.attributes)
-        assert 'llm.request' not in span.attributes
+        assert {'llm.request_digest', 'llm.response'} <= set(span.attributes)
+        assert not {'llm.request', 'llm.request_units'} & set(span.attributes)
     for index in (0,):
         tool = spans[span_id_of(SpanKind.TOOL_CALL, agent_id, 1, 1, index)]
         assert (await _payload(store, recorder, tool.attributes['tool.result']))['output'] == 'a'
@@ -991,7 +994,7 @@ async def test_a_request_is_fingerprinted_as_params_system_tools_and_each_messag
     await recorder.finish()
 
     spans = await _spans(store, recorder)
-    units = await _payload(store, recorder, spans[_LLM].attributes['llm.request_units'])
+    units = _fingerprinted(messages, tools=tools, temperature=0)
     assert units == [
         _unit_digest({'temperature': 0}),
         _unit_digest(_block_unit('system', 'You help.')),
@@ -1006,17 +1009,12 @@ async def test_a_request_is_fingerprinted_as_params_system_tools_and_each_messag
             }
         ),
     ]
-    assert (
-        spans[_LLM].attributes['llm.request_digest']
-        == hashlib.sha256(''.join(units).encode()).hexdigest()
-    )
+    assert spans[_LLM].attributes['llm.request_digest'] == _whole(units)
+    assert 'llm.request_units' not in spans[_LLM].attributes
 
 
 async def test_a_request_without_a_system_message_fingerprints_an_empty_system_unit():
-    recorder = await _begun()
-    _exchange(recorder, [ContextBlock(role='user', content='go')])
-
-    units = await _units(recorder)
+    units = _fingerprinted([ContextBlock(role='user', content='go')])
 
     assert units == [
         _unit_digest({}),
@@ -1055,22 +1053,17 @@ async def test_a_request_without_a_system_message_fingerprints_an_empty_system_u
 async def test_what_the_provider_never_sees_does_not_change_a_fingerprint(
     left: ContextBlock, right: ContextBlock
 ):
-    digests: list[list[str]] = []
-    for block in (left, right):
-        recorder = await _begun()
-        _exchange(recorder, [block])
-        digests.append(await _units(recorder))
+    digests = [_fingerprinted([block]) for block in (left, right)]
 
     assert digests[0] == digests[1]
 
 
 async def test_a_fingerprint_is_taken_after_redaction():
     keys = _secrets(11)
-    digests: list[list[str]] = []
-    for _ in range(2):
-        recorder = await _begun()
-        _exchange(recorder, [ContextBlock(role='user', content=f'use API_TOKEN={next(keys)}')])
-        digests.append(await _units(recorder))
+    digests = [
+        _fingerprinted([ContextBlock(role='user', content=f'use API_TOKEN={next(keys)}')])
+        for _ in range(2)
+    ]
 
     assert digests[0] == digests[1]
     assert digests[0][3] == _unit_digest(
@@ -1108,32 +1101,94 @@ async def test_each_unit_is_redacted_once_however_many_requests_repeat_it(
     ]
 
 
-async def test_the_unit_cache_is_keyed_by_content_and_not_by_position():
-    recorder = await _begun()
-    first = span_id_of(SpanKind.LLM_CALL, 'agent', 1, 1)
-    second = span_id_of(SpanKind.LLM_CALL, 'other', 1, 1)
-    _exchange(
-        recorder,
-        [ContextBlock(role='system', content='A'), ContextBlock(role='user', content='u')],
-        span_id=first,
-    )
-    _exchange(
-        recorder,
-        [
-            ContextBlock(role='system', content='B'),
-            ContextBlock(role='user', content='v'),
-            ContextBlock(role='user', content='u'),
-        ],
-        span_id=second,
-    )
-    store = cast(InMemoryTraceStore, recorder._store)  # pyright: ignore[reportPrivateUsage]
-    await recorder.finish()
+def test_the_unit_cache_is_keyed_by_content_and_not_by_position():
+    fingerprints = RequestFingerprints(RuleRedactor())
 
-    spans = await _spans(store, recorder)
-    one = await _payload(store, recorder, spans[first].attributes['llm.request_units'])
-    two = await _payload(store, recorder, spans[second].attributes['llm.request_units'])
+    one = fingerprints.of(
+        {
+            'messages': [
+                ContextBlock(role='system', content='A'),
+                ContextBlock(role='user', content='u'),
+            ]
+        }
+    )
+    two = fingerprints.of(
+        {
+            'messages': [
+                ContextBlock(role='system', content='B'),
+                ContextBlock(role='user', content='v'),
+                ContextBlock(role='user', content='u'),
+            ]
+        }
+    )
+
     assert one[1] != two[1] and one[3] != two[3]
     assert one[3] == two[4] == _unit_digest(_block_unit('user', 'u'))
+
+
+def _history(turns: int) -> list[ContextBlock]:
+    blocks = [ContextBlock(role='system', content='You help.')]
+    for index in range(turns):
+        blocks.append(
+            ContextBlock(
+                role='assistant',
+                content=None,
+                tool_calls=[ToolCall(f'c{index}', 'Echo', json.dumps({'text': f't{index}'}))],
+            )
+        )
+        blocks.append(ContextBlock(role='tool', content=f'out {index}', tool_call_id=f'c{index}'))
+    return blocks
+
+
+def test_a_warm_unit_cache_gives_what_a_cold_one_gives_however_the_history_grows():
+    warm = RequestFingerprints(RuleRedactor())
+    history = _history(6)
+    requests = [history[: 2 * turns + 1] for turns in range(1, 7)]
+    requests.append([*history[:-1], dataclasses.replace(history[-1], content='changed')])
+    requests.append(
+        [
+            *history,
+            ContextBlock(role='tool', content='out 0', tool_call_id='c-other'),
+            ContextBlock(role='user', content='same words'),
+            ContextBlock(role='assistant', content='same words'),
+            ContextBlock(role='user', content=[{'type': 'text', 'text': 'same words'}]),
+        ]
+    )
+
+    def both(messages: list[ContextBlock]) -> tuple[list[str], list[str]]:
+        cold = RequestFingerprints(RuleRedactor())
+        return warm.of({'messages': list(messages)}), cold.of({'messages': list(messages)})
+
+    def alone(block: ContextBlock) -> str:
+        return RequestFingerprints(RuleRedactor()).of({'messages': [block]})[3]
+
+    pairs = [both(messages) for messages in requests]
+    near = requests[-1]
+    assert pairs[-1][0][3:] == [alone(block) for block in near[1:]]
+    history[-2].tool_calls[0] = ToolCall('c5', 'Echo', '{"text": "rewritten"}')
+    pairs.append(both(history))
+
+    assert [seen for seen, _ in pairs] == [fresh for _, fresh in pairs]
+    assert pairs[-1][0][-2] != pairs[-3][0][-2]
+
+
+def test_each_history_block_is_encoded_once_however_many_requests_repeat_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    encoded: list[object] = []
+    real = recorder_module._unit_value  # pyright: ignore[reportPrivateUsage]
+
+    def counting(block: object) -> object:
+        encoded.append(block)
+        return real(block)
+
+    monkeypatch.setattr(recorder_module, '_unit_value', counting)
+    fingerprints = RequestFingerprints(RuleRedactor())
+    history = _history(30)
+    for turns in range(1, 31):
+        fingerprints.of({'messages': [dataclasses.replace(b) for b in history[: 2 * turns + 1]]})
+
+    assert len(encoded) == len(history) - 1
 
 
 async def test_a_hook_that_put_something_else_in_the_messages_does_not_lose_the_exchange():
@@ -1416,8 +1471,9 @@ async def test_once_the_store_failed_nothing_more_is_encoded_and_dropped_stays_e
 
         return call
 
-    for name in ('encode_redacted', 'encode_digests'):
-        monkeypatch.setattr(recorder_module, name, counting(name, getattr(recorder_module, name)))
+    monkeypatch.setattr(
+        recorder_module, 'encode_redacted', counting('encode', recorder_module.encode_redacted)
+    )
     fingerprints = recorder_module.RequestFingerprints
     monkeypatch.setattr(fingerprints, 'of_parts', counting('of_parts', fingerprints.of_parts))
     capture = recorder_module.ReplayCapture
@@ -1586,7 +1642,7 @@ async def test_a_refused_begin_reaches_the_host_and_later_records_are_only_count
     await recorder.finish()
 
     assert context.stop_reason is StopReason.COMPLETED
-    assert recorder.dropped == 3 + 2
+    assert recorder.dropped == 3 + 1
     assert [r for r in caplog.records if r.name.startswith('syndica.kernel')] == []
 
 
@@ -1894,16 +1950,11 @@ async def test_kernel_identifiers_references_and_closed_values_are_kept_verbatim
                 await _payload(store, recorder, span.attributes[key])
         if 'llm.request_digest' in span.attributes:
             assert len(cast(str, span.attributes['llm.request_digest'])) == 64
-    assert references == 2 * 5 + 2 + 1
-    for span in spans.values():
-        if span.kind is SpanKind.LLM_CALL:
-            units = cast(
-                list[str], await _payload(store, recorder, span.attributes['llm.request_units'])
-            )
-            assert all(re.fullmatch(r'[0-9a-f]{64}', unit) for unit in units), units
-            assert span.attributes['llm.request_digest'] == (
-                hashlib.sha256(''.join(units).encode()).hexdigest()
-            )
+    assert references == 5 + 2 + 1
+    llm_calls = [span for span in spans.values() if span.kind is SpanKind.LLM_CALL]
+    assert len(llm_calls) == 5
+    for span in llm_calls:
+        assert re.fullmatch(r'[0-9a-f]{64}', cast(str, span.attributes['llm.request_digest']))
     assert relay.attributes['tool.call_id'] == 'r' and relay.name == 'Relay'
 
 
@@ -1970,7 +2021,7 @@ async def test_a_lone_surrogate_in_a_request_does_not_stop_the_recording():
     spans = await _spans(store, recorder)
     for turn in (1, 2, 3):
         attributes = spans[span_id_of(SpanKind.LLM_CALL, agent_id, turn, 1)].attributes
-        assert {'llm.request_units', 'llm.response'} <= set(attributes), turn
+        assert {'llm.request_digest', 'llm.response'} <= set(attributes), turn
     tool = spans[span_id_of(SpanKind.TOOL_CALL, agent_id, 1, 1, 0)]
     assert (await _payload(store, recorder, tool.attributes['tool.result']))['output'] == (
         'smile \ud83d'
@@ -2179,9 +2230,10 @@ async def test_every_channel_uses_the_hosts_whole_redactor():
     assert header is not None and header.source.argv == ('run', redacted)
     assert (tool.name, tool.attributes['tool.name']) == (redacted, redacted)
     assert (await _payload(store, recorder, tool.attributes['tool.result']))['output'] == redacted
-    units = await _payload(store, recorder, spans[_LLM].attributes['llm.request_units'])
-    unit = _block_unit('user', text)
-    assert units[3] == _unit_digest(unit, redactor) != _unit_digest(unit)
+    request = [ContextBlock(role='user', content=text)]
+    assert spans[_LLM].attributes['llm.request_digest'] == _whole(_fingerprinted(request, redactor))
+    assert _fingerprinted(request, redactor)[3] == _unit_digest(_block_unit('user', text), redactor)
+    assert _fingerprinted(request, redactor) != _fingerprinted(request)
 
 
 async def test_end_attributes_land_on_top_of_start_attributes_and_tuples_are_redacted_too():

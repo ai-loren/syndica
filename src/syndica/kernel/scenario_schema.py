@@ -12,7 +12,8 @@ v1 是手写脚本：只存回复的一侧，工具真跑，人的答复按请�
 - `agents.<角色>.frozen`：冻结后的角色（系统提示词正文、有序的工具名、轮数、`impl`），
   代替 `manifest`；
 - `instances[].key`：创建这个实例的稳定键（内核 `ids` 的原样数组）；`turns[]` 多出 `turn` /
-  `attempt`（「当前 LLM 调用」的键）、`extra`、`trust`、`request_digests`、带类型的 `raises`，
+  `attempt`（「当前 LLM 调用」的键）、`extra`、`trust`、`request_digests`（可以带
+  `request_prefix`：前 n 个与这个实例里上一次带指纹的请求相同）、带类型的 `raises`，
   `content` 可以是列表，`tool_calls[].arguments` 可以是解析不了的原串；`tool_results` /
   `skipped` / `gate` 按调用位置（`[周期, 轮, 批内位置]`）；`messages` 是每一轮开始前注入的消息，
   `continued` 是哪些周期紧接着上一个开（Agent 没有停下来等），`cut` 是开了头却没有返回的调用；
@@ -104,7 +105,9 @@ _V2_INSTANCE = _V1_INSTANCE | frozenset(
 )
 _INJECTED = frozenset({'turn', 'ids'})
 _V1_TURN = frozenset({'content', 'tool_calls', 'raises'})
-_V2_TURN = _V1_TURN | frozenset({'turn', 'attempt', 'extra', 'trust', 'request_digests'})
+_V2_TURN = _V1_TURN | frozenset(
+    {'turn', 'attempt', 'extra', 'trust', 'request_digests', 'request_prefix'}
+)
 _V1_CALL = frozenset({'id', 'name', 'arguments'})
 _V2_CALL = _V1_CALL | frozenset({'arguments_raw'})
 _V1_ERROR = frozenset({'kind', 'message'})
@@ -825,9 +828,14 @@ def _instance(
                 '一个稳定键只创建一个 Agent：照捕获的文档原样抄写，不要复制实例',
             )
         keys[key] = field
-    replies = tuple(
-        _reply(f'{field}.turns[{index}]', item, version, call_ids)
-        for index, item in enumerate(_sequence(data['turns'], f'{field}.turns'))
+    turns = _sequence(data['turns'], f'{field}.turns')
+    replies = _expanded(
+        field,
+        tuple(
+            _reply(f'{field}.turns[{index}]', item, version, call_ids)
+            for index, item in enumerate(turns)
+        ),
+        turns,
     )
     _check_reply_keys(replies, field)
     outcomes = tuple(
@@ -877,6 +885,39 @@ def _instance(
         continued=continued,
         cut=cut,
     )
+
+
+def _expanded(
+    field: str, replies: tuple[ScenarioReply, ...], turns: Sequence[object]
+) -> tuple[ScenarioReply, ...]:
+    """`request_prefix: n` 是「这个实例里上一次带指纹的请求的前 n 个单元」，`request_digests` 只列
+    其余的：展开成完整的一份。上一次按 `turns` 里的先后数。"""
+    previous: tuple[str, ...] = ()
+    expanded: list[ScenarioReply] = []
+    for index, (reply, item) in enumerate(zip(replies, turns, strict=True)):
+        data = cast(Mapping[str, object], item)
+        if 'request_prefix' in data:
+            where = f'{field}.turns[{index}]'
+            if reply.request_digests is None:
+                raise _error(
+                    f'{where} 有 request_prefix 时也有 request_digests（其余的单元，可以是空表）',
+                    '只有 request_prefix',
+                    '照捕获的文档原样抄写这一项',
+                )
+            prefix = _integer(data['request_prefix'], f'{where}.request_prefix', minimum=1)
+            if prefix > len(previous):
+                raise _error(
+                    f'{where}.request_prefix 不超过这个实例里上一次带指纹的请求的单元数',
+                    f'request_prefix={prefix}，上一次只有 {len(previous)} 个单元',
+                    '照捕获的文档原样抄写 turns：删掉或重排其中的项，前缀就对不上了',
+                )
+            reply = dataclasses.replace(
+                reply, request_digests=previous[:prefix] + reply.request_digests
+            )
+        if reply.request_digests is not None:
+            previous = reply.request_digests
+        expanded.append(reply)
+    return tuple(expanded)
 
 
 def _continued(

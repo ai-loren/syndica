@@ -924,9 +924,10 @@ def test_an_instance_key_is_unique_across_roles():
         (('agents', 'Root', 'instances', 0, 'continued'), [], "['continued']"),
         (('agents', 'Root', 'instances', 0, 'cut'), [], "['cut']"),
         (('agents', 'Root', 'instances', 0, 'turns', 0, 'turn'), 1, "['turn']"),
+        (('agents', 'Root', 'instances', 0, 'turns', 0, 'request_prefix'), 1, "['request_prefix']"),
         (('entry', 'mode'), 'slot', "['mode']"),
     ],
-    ids=['root', 'agent', 'instance', 'messages', 'continued', 'cut', 'turn', 'entry'],
+    ids=['root', 'agent', 'instance', 'messages', 'continued', 'cut', 'turn', 'prefix', 'entry'],
 )
 def test_a_v2_key_in_a_v1_document_points_at_version_two(
     path: tuple[Any, ...], value: object, newer: str
@@ -1090,6 +1091,70 @@ def test_malformed_cut_calls_are_refused_with_what_to_change(
 ):
     with pytest.raises(ConfigError) as caught:
         parse_scenario_document(_cutting(cut, **instance), source='captured.json')
+
+    assert received in caught.value.received
+    assert next_action in caught.value.next_action + caught.value.expected
+
+
+def _prefixed(**turns: dict[str, object]) -> dict[str, Any]:
+    """在基准文档的三项回复（重试前失败的、带两个指纹的、最后那一项）上改：键是它们的下标。"""
+    document = _v2()
+    [lead] = document['agents']['Lead']['instances']
+    for index, fields in turns.items():
+        lead['turns'][int(index.removeprefix('t'))].update(fields)
+    return document
+
+
+def _digests_of(document: dict[str, Any]) -> list[tuple[str, ...] | None]:
+    parsed = parse_scenario_document(document, source='captured.json')
+    return [reply.request_digests for reply in parsed.roles['Lead'].instances[0].replies]
+
+
+def test_a_request_prefix_expands_into_the_first_units_of_the_previous_request():
+    document = _prefixed(t2={'request_prefix': 2, 'request_digests': ['f' * 64]})
+
+    assert _digests_of(document) == [None, ('b' * 64, 'd' * 64), ('b' * 64, 'd' * 64, 'f' * 64)]
+
+
+def test_a_request_prefix_counts_from_the_last_request_that_had_units():
+    document = _prefixed(
+        t0={'request_digests': ['a' * 64, 'c' * 64, 'e' * 64]},
+        t1={'request_prefix': 1, 'request_digests': []},
+        t2={'request_prefix': 1},
+    )
+    document['agents']['Lead']['instances'][0]['turns'][2]['request_digests'] = ['0' * 64]
+
+    assert _digests_of(document) == [
+        ('a' * 64, 'c' * 64, 'e' * 64),
+        ('a' * 64,),
+        ('a' * 64, '0' * 64),
+    ]
+
+
+@pytest.mark.parametrize(
+    ('turns', 'received', 'next_action'),
+    [
+        ({'t2': {'request_prefix': 2}}, '只有 request_prefix', '原样抄写这一项'),
+        (
+            {'t2': {'request_prefix': 3, 'request_digests': []}},
+            'request_prefix=3，上一次只有 2 个单元',
+            '前缀就对不上了',
+        ),
+        (
+            {'t1': {'request_prefix': 1}},
+            'request_prefix=1，上一次只有 0 个单元',
+            '前缀就对不上了',
+        ),
+        ({'t2': {'request_prefix': 0, 'request_digests': []}}, '0', '1 或更大'),
+        ({'t2': {'request_prefix': True, 'request_digests': []}}, 'True', 'yes / on / true'),
+    ],
+    ids=['without-digests', 'longer-than-before', 'nothing-before', 'zero', 'bool'],
+)
+def test_a_malformed_request_prefix_is_refused_with_what_to_change(
+    turns: dict[str, dict[str, object]], received: str, next_action: str
+):
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(_prefixed(**turns), source='captured.json')
 
     assert received in caught.value.received
     assert next_action in caught.value.next_action + caught.value.expected

@@ -147,7 +147,12 @@ async def test_a_described_run_writes_a_replay_document_that_reads_back():
     assert document['source']['trace_id'] == recorder.trace_id
     assert tuple(instance['key']) == key == ('host', 'spawn', 0)
     assert [(turn['turn'], turn['attempt']) for turn in instance['turns']] == [(1, 1), (2, 1)]
-    assert all(len(turn['request_digests']) >= 4 for turn in instance['turns'])
+    first, second = instance['turns']
+    assert len(first['request_digests']) >= 4 and 'request_prefix' not in first
+    assert second['request_prefix'] >= 4
+    full = [reply.request_digests for reply in parsed.roles['Lead'].instances[0].replies]
+    assert full[1] is not None and full[0] == full[1][: second['request_prefix']]
+    assert list(full[1][second['request_prefix'] :]) == second['request_digests']
     assert instance['tool_results'][0]['call'] == [1, 1, 0]
     assert instance['tool_results'][0]['output'] == 'ran ls'
     assert document['expect'] == {'stop_reasons': {'Lead[0]': 'completed'}}
@@ -584,6 +589,35 @@ async def test_a_replay_document_the_store_cannot_take_costs_only_the_document(
     header = await store.get(recorder.trace_id)
     assert header is not None and header.status is SpanStatus.OK
     assert recorder.complete is True
+
+
+class _Sizing(InMemoryTraceStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.payload_bytes = 0
+
+    async def put_payload(self, trace_id: str, payload: Any) -> Any:
+        self.payload_bytes += len(str(payload).encode('utf-8'))
+        return await super().put_payload(trace_id, payload)
+
+
+async def test_the_replay_document_and_the_payloads_grow_linearly_with_the_turns():
+    async def sizes(turns: int) -> tuple[int, int]:
+        script = [
+            ScriptedTurn(tool_calls=[_call(f'c{index}', 'Bash', command=f'echo {index}')])
+            for index in range(turns)
+        ]
+        store = _Sizing()
+        _, recorder, _ = await _captured([*script, ScriptedTurn('done')], store=store)
+        text = await store.replay(recorder.trace_id)
+        assert text is not None
+        return len(text), store.payload_bytes
+
+    document_40, payloads_40 = await sizes(40)
+    document_80, payloads_80 = await sizes(80)
+
+    assert document_80 / document_40 < 2.5
+    assert payloads_80 / payloads_40 < 2.5
 
 
 async def test_describe_run_refuses_what_is_not_a_mapping():

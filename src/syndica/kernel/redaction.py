@@ -42,7 +42,6 @@ __all__ = [
     'RedactionRule',
     'Redactor',
     'RuleRedactor',
-    'encode_digests',
     'encode_prepared',
     'encode_redacted',
     'looks_secret',
@@ -798,7 +797,6 @@ def encode_redacted(
     return RedactedText(escaped, _mint=_MINT)
 
 
-_SHA256 = re.compile(r'[0-9a-f]{64}')
 _IDENTIFIER = re.compile(r'[0-9a-f]{32}|[0-9a-f]{64}')
 
 
@@ -899,22 +897,6 @@ def _prepared(value: object, redactor: Redactor, path: str, keep: frozenset[str]
         received=f'{path} 是 {type(value).__name__}',
         next_action='先把它转成上面这些类型',
     )
-
-
-def encode_digests(digests: Sequence[str]) -> RedactedText:
-    """一组 sha256 摘要的规范 JSON 编码，不经脱敏：里面没有自由文本，而用户规则可能认得一段
-    十六进制，换掉之后摘要就对不上了。每一项必须是 64 个小写十六进制字符——这道校验是它不经脱敏的
-    前提。"""
-    items = list(cast(Sequence[object], digests))
-    for index, item in enumerate(items):
-        if not isinstance(item, str) or _SHA256.fullmatch(item) is None:
-            shape = f'长度 {len(item)} 的字符串' if isinstance(item, str) else type(item).__name__
-            raise ContractViolation(
-                expected='encode_digests 的每一项是 64 个小写十六进制字符的 sha256',
-                received=f'第 {index} 项是 {shape}',
-                next_action='别的内容走 encode_redacted：只有摘要可以不经脱敏',
-            )
-    return RedactedText(json.dumps(items, separators=(',', ':')), _mint=_MINT)
 
 
 def redact_argv(argv: Sequence[str], redactor: Redactor) -> tuple[str, ...]:

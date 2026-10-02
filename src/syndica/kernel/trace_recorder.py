@@ -4,7 +4,8 @@
 一个写入任务按收到的先后去做，`finish` 等它排空。
 
 记什么由级别定（D8）：`structure` 只记 span 与边；`replay` 再记回放要的东西——模型的回复（含带类型
-的错误）、工具的结局、人的答复，以及每次请求逐单元的指纹（不记请求本身）；`full` 再记完整的请求。
+的错误）、工具的结局、人的答复，以及每次请求的指纹（span 上是整份请求的一个，逐单元的只在回放文档里
+存一份）；`full` 再记完整的请求。
 
 一切自由文本在交给 store 之前逐叶脱敏（D4）：span 名、字符串属性、事件、边的属性、payload、头里的
 命令行参数。脱敏发生在写入之前——store 不再判断内容，第三方 store 拿到的已经是脱过敏的。内核生成的
@@ -44,7 +45,6 @@ from syndica.kernel.redaction import (
     Redactor,
     RuleRedactor,
     _placeholder,  # pyright: ignore[reportPrivateUsage]
-    encode_digests,
     encode_prepared,
     encode_redacted,
     redact_argv,
@@ -251,12 +251,15 @@ def arguments_digest(arguments: Mapping[str, object], redactor: Redactor) -> str
 class RequestFingerprints:
     """一次模型请求的逐单元指纹（D11）：模型参数、system、工具定义、每条历史。每个单元先逐叶脱敏、
     再规范编码、再取 sha256；按单元原文的 sha256 缓存（原文按 ASCII 编码：落单的代理字符照样有键），
-    每轮把整段上下文重新脱敏是轮数的平方。记录与回放用同一份：回放拿记录下的规则集对自己发出的请求
-    算一遍，第一个对不上的单元就是分叉的地方。"""
+    每轮把整段上下文重新脱敏是轮数的平方。历史里正文是字符串的块另按它进指纹的四项（角色、正文、
+    工具调用、`tool_call_id`）缓存：每轮重新编码一遍整段历史同样是轮数的平方，而每轮交来的块是拷贝、
+    认不得同一个对象，正文却是同一个字符串。记录与回放用同一份：回放拿记录下的规则集对自己发出的
+    请求算一遍，第一个对不上的单元就是分叉的地方。"""
 
     def __init__(self, redactor: Redactor) -> None:
         self._redactor = redactor
         self._units: dict[str, str] = {}
+        self._blocks: dict[tuple[object, ...], str] = {}
 
     def of(self, request: Mapping[str, Any]) -> list[str]:
         """`request` 是交给 `create` 的那一份：`messages` 加上其余关键字参数。"""
@@ -270,23 +273,42 @@ class RequestFingerprints:
             system = _block_value(first)
             history = messages[1:]
         model_params = {key: value for key, value in params.items() if key != 'tools'}
-        units: list[object] = [
-            model_params,
-            system,
-            params.get('tools', []),
-            *(_unit_value(block) for block in history),
+        digests = [
+            self._digest(model_params),
+            self._digest(system),
+            self._digest(params.get('tools', [])),
         ]
-        digests: list[str] = []
-        for unit in units:
-            raw = json.dumps(unit, sort_keys=True)
-            key = hashlib.sha256(raw.encode('ascii')).hexdigest()
-            digest = self._units.get(key)
+        for block in history:
+            key = _block_key(block)
+            digest = None if key is None else self._blocks.get(key)
             if digest is None:
-                redacted = encode_redacted(unit, self._redactor)
-                digest = hashlib.sha256(redacted.encode('utf-8')).hexdigest()
-                self._units[key] = digest
+                digest = self._digest(_unit_value(block))
+                if key is not None:
+                    self._blocks[key] = digest
             digests.append(digest)
         return digests
+
+    def _digest(self, unit: object) -> str:
+        raw = json.dumps(unit, sort_keys=True)
+        key = hashlib.sha256(raw.encode('ascii')).hexdigest()
+        digest = self._units.get(key)
+        if digest is None:
+            redacted = encode_redacted(unit, self._redactor)
+            digest = hashlib.sha256(redacted.encode('utf-8')).hexdigest()
+            self._units[key] = digest
+        return digest
+
+
+def _block_key(block: object) -> tuple[object, ...] | None:
+    """一块历史进指纹的全部四项（`_block_value` 读的就是它们）；正文不是字符串或 None 时交回 None，
+    走按原文的那一层缓存。"""
+    if not isinstance(block, ContextBlock):
+        return None
+    content = cast(object, block.content)
+    if content is not None and not isinstance(content, str):
+        return None
+    calls = tuple((call.id, call.name, call.arguments) for call in block.tool_calls)
+    return (block.role, content, block.tool_call_id, calls)
 
 
 @dataclass(frozen=True)
@@ -699,8 +721,8 @@ class TraceRecorder:
             return
         units: list[str] | None = None
         if self._failure is not None:
-            # 指纹与请求本该排进去的那几段 payload：不算，只计数。
-            self._dropped += 2 if self._level is TraceLevel.FULL else 1
+            # 完整的请求本该排进去的那一段 payload：不算，只计数。
+            self._dropped += 1 if self._level is TraceLevel.FULL else 0
         else:
             try:
                 messages, params = _request_parts(request)
@@ -708,7 +730,6 @@ class TraceRecorder:
                 span.attributes['llm.request_digest'] = hashlib.sha256(
                     ''.join(units).encode()
                 ).hexdigest()
-                span.attributes['llm.request_units'] = self._queued(encode_digests(units))
                 if self._level is TraceLevel.FULL:
                     whole = {
                         'messages': [_unit_value(block) for block in messages],

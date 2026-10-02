@@ -432,12 +432,14 @@ class ReplayCapture:
                 clean(
                     {
                         'key': list(key),
-                        'turns': sorted(
-                            instance.replies,
-                            key=lambda reply: (
-                                cast(int, reply['turn']),
-                                cast(int, reply['attempt']),
-                            ),
+                        'turns': _sharing_prefixes(
+                            sorted(
+                                instance.replies,
+                                key=lambda reply: (
+                                    cast(int, reply['turn']),
+                                    cast(int, reply['attempt']),
+                                ),
+                            )
                         ),
                         'tool_results': instance.tool_results,
                         'skipped': instance.skipped,
@@ -578,6 +580,30 @@ class ReplayCapture:
             'trust': result.trust.value,
             'artifacts': self._jsonable(list(result.artifacts)),
         }
+
+
+def _sharing_prefixes(replies: list[dict[str, object]]) -> list[dict[str, object]]:
+    """逐单元指纹写成「这个实例里上一次带指纹的请求的前 n 个」（`request_prefix`）加上其余的：请求
+    只在末尾追加（前缀缓存的约束），每次照抄整份是轮数的平方。"""
+    previous: list[str] = []
+    written: list[dict[str, object]] = []
+    for reply in replies:
+        found = reply.get('request_digests')
+        if not isinstance(found, list):
+            written.append(reply)
+            continue
+        units = cast(list[str], found)
+        shared = 0
+        for mine, theirs in zip(units, previous, strict=False):
+            if mine != theirs:
+                break
+            shared += 1
+        entry = {**reply, 'request_digests': units[shared:]}
+        if shared:
+            entry['request_prefix'] = shared
+        written.append(entry)
+        previous = units
+    return written
 
 
 def _call_value(call: ToolCall, jsonable: Callable[[object], object]) -> dict[str, object]:

@@ -133,6 +133,7 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'llm.output_tokens': 'int?',
         'llm.cached_input_tokens': 'int?',
         'llm.request_digest': 'str',
+        # 不再写；留着是为了读得回写过它的 trace（去掉它，那些 trace 就读不进来了）。
         'llm.request_units': 'payload',
         'llm.request': 'payload',
         'llm.response': 'payload',

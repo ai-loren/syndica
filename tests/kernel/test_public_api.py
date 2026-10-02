@@ -400,7 +400,6 @@ _WITHHELD: tuple[str, ...] = (
     'current_span_id',
     'current_tool_call',
     'disposition_of',
-    'encode_digests',
     'encode_prepared',
     'encode_redacted',
     'entering_owner',
