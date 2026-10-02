@@ -148,6 +148,9 @@ _RUNTIME_LOGGER = 'syndica.kernel.runtime'
 # Bash 每条输出流、Glob 与 Grep 每次结果最多展示给模型的字符数。整份 pytest 输出进上下文会挤掉别的
 # 一切，而汇总行在末尾，local_tools 截断时留开头 20%、结尾 80%；一次宽泛的 Grep 同理。
 _OUTPUT_LIMIT = 10_000
+# Runtime 的装配：构造 Runtime 与写回放文档的宿主档案用同一份，回放按它重建。
+_ORCHESTRATION = True
+_CONFIRMATION_TIMEOUT = 300.0
 # Agent 的 Bash 用的 shell。HostFacts 把它告诉模型，两处必须是同一个值。
 _SHELL = '/bin/sh'
 # 文件工具碰不到的目录：trace 里存着此前标成不可信的工具输出，经 Read 读回来就成了可信内容；交接
@@ -1946,9 +1949,9 @@ class RuntimeCliHost:
             )
             runtime = Runtime(
                 agents=factories,
-                orchestration=True,
+                orchestration=_ORCHESTRATION,
                 modules=_agent_modules(self._workspace_root, self._environ),
-                confirmation_handler=MailboxConfirmationHandler(timeout=300),
+                confirmation_handler=MailboxConfirmationHandler(timeout=_CONFIRMATION_TIMEOUT),
                 tracer=recording.recorder,
             )
             subscription = runtime.events.subscribe()
@@ -2217,10 +2220,10 @@ class RuntimeCliHost:
                 )
                 runtime = Runtime(
                     agents={} if request.topology is not None else factories,
-                    orchestration=True,
+                    orchestration=_ORCHESTRATION,
                     modules=modules,
                     flags=flags,
-                    confirmation_handler=MailboxConfirmationHandler(timeout=300),
+                    confirmation_handler=MailboxConfirmationHandler(timeout=_CONFIRMATION_TIMEOUT),
                     tracer=tracer,
                     ids=None if tracer is None else tracer.ids,
                 )
@@ -2240,6 +2243,8 @@ class RuntimeCliHost:
                             max_turns=request.max_turns,
                             no_write=request.no_write,
                             modules=modules,
+                            orchestration=_ORCHESTRATION,
+                            confirmation_timeout=_CONFIRMATION_TIMEOUT,
                         ),
                         prompt,
                     )

@@ -192,15 +192,52 @@ async def test_an_agent_the_id_source_did_not_issue_is_named_with_its_role(
     assert header is not None and header.status is SpanStatus.OK
 
 
-async def test_a_role_the_host_did_not_describe_is_named(caplog: pytest.LogCaptureFixture):
+async def test_an_entry_role_the_host_did_not_describe_is_refused_as_it_is_described(
+    caplog: pytest.LogCaptureFixture,
+):
+    recorder = TraceRecorder(InMemoryTraceStore(), RuleRedactor())
+
     with caplog.at_level(logging.WARNING, logger='syndica.kernel.trace_recorder'):
-        _, _, document = await _captured(
-            [ScriptedTurn('done')], roles={'Other': {'system_prompt': 'x', 'tools': []}}
+        recorder.describe_run(
+            host={},
+            roles={'Other': {'system_prompt': 'x', 'tools': []}},
+            entry={'mode': 'query', 'agent': 'Lead', 'prompt': 'go'},
         )
 
     [record] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
-    assert document is None
-    assert "角色 'Lead' 不在其中" in cast(tuple[str, str, str], record.args)[1]
+    args = cast(tuple[str, str, str], record.args)
+    assert record.levelno == logging.WARNING
+    assert 'describe_run' in args[0] and "'Lead'" in args[1]
+    assert '不写回放文档' in args[2]
+
+
+async def test_a_role_that_ran_without_being_described_is_named(
+    caplog: pytest.LogCaptureFixture,
+):
+    store = InMemoryTraceStore()
+    recorder = TraceRecorder(store, RuleRedactor())
+    await recorder.begin()
+    recorder.describe_run(
+        host={}, roles=_roles([]), entry={'mode': 'query', 'agent': 'Lead', 'prompt': 'go'}
+    )
+    llm = ScriptedLLM([ScriptedTurn('done')])
+
+    def other(hooks_center: HooksCenter, events: EventBus) -> BaseAgent:
+        options = AgentOptions(name='Other', llm=llm, tools={}, system_prompt='x')
+        return BaseAgent(options, hooks=hooks_center, events=events)
+
+    runtime = Runtime(agents={'Other': other}, tracer=recorder, ids=recorder.ids)
+    try:
+        agent_id = await runtime.spawn(other, query='go')
+        await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    with caplog.at_level(logging.WARNING, logger='syndica.kernel.trace_recorder'):
+        await recorder.finish(SpanStatus.OK)
+
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
+    assert await store.replay(recorder.trace_id) is None
+    assert "角色 'Other' 不在其中" in cast(tuple[str, str, str], record.args)[1]
 
 
 async def test_kernel_identifiers_stay_verbatim_where_a_user_rule_or_a_key_would_change_them():
@@ -486,13 +523,15 @@ async def test_a_failure_while_capturing_costs_only_the_replay_document(
 async def test_a_description_that_does_not_fit_the_format_writes_no_document(
     caplog: pytest.LogCaptureFixture,
 ):
-    with caplog.at_level(logging.ERROR, logger='syndica.kernel.trace_recorder'):
+    with caplog.at_level(logging.WARNING, logger='syndica.kernel.trace_recorder'):
         store, recorder, document = await _captured(
             [ScriptedTurn('done')], host={'danger': {'rules': [{'id': 'shell.no_such_rule'}]}}
         )
 
-    [record] = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
     header = await store.get(recorder.trace_id)
+    assert record.levelno == logging.WARNING
+    assert 'shell.no_such_rule' in cast(tuple[str, str, str], record.args)[1]
     assert document is None
     assert 'describe_run' in record.getMessage()
     assert record.getMessage().count('下一步') == 1
@@ -526,7 +565,11 @@ async def test_an_environment_secret_that_rewrites_part_of_the_document_is_expla
     with caplog.at_level(logging.WARNING, logger='syndica.kernel.trace_recorder'):
         _, _, document = await _captured(
             [ScriptedTurn('done')],
-            host={'danger': {'rules': [{'id': 'shell.workspace_root_removal', 'params': {}}]}},
+            host={
+                'danger': {
+                    'rules': [{'id': 'shell.workspace_root_removal', 'params': {'root': '/srv'}}]
+                }
+            },
             redactor=RuleRedactor(secrets=('workspace',)),
         )
 
@@ -549,8 +592,9 @@ async def test_a_description_that_does_not_fit_stays_an_error_beside_an_unrelate
 
     [record] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
     assert document is None
-    assert record.levelno == logging.ERROR
+    assert record.levelno == logging.WARNING
     assert 'describe_run' in record.getMessage()
+    assert 'custom.word' not in record.getMessage()
 
 
 async def test_a_store_that_refuses_the_replay_document_leaves_the_trace_without_an_outcome():
@@ -638,7 +682,9 @@ async def test_one_stable_key_issued_twice_writes_no_document(caplog: pytest.Log
     store = InMemoryTraceStore()
     recorder = TraceRecorder(store, RuleRedactor())
     await recorder.begin()
-    recorder.describe_run(host={}, roles=_roles([]), entry={'mode': 'query', 'agent': 'Lead'})
+    recorder.describe_run(
+        host={}, roles=_roles([]), entry={'mode': 'query', 'agent': 'Lead', 'prompt': 'go'}
+    )
     recorder.ids.agent_id(('host', 'spawn', 0))
     recorder.ids.agent_id(('host', 'spawn', 0))
 

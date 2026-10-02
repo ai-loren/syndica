@@ -259,6 +259,79 @@ def test_ordered_fields_keep_the_order_they_were_written_in():
     ]
 
 
+def _hosted(**fields: object) -> dict[str, Any]:
+    document = _v2()
+    document['host'].update(fields)
+    return document
+
+
+def test_a_host_that_says_nothing_about_its_runtime_was_assembled_like_the_cli():
+    host = parse_scenario_document(_v2(), source='captured.json').host
+
+    assert host is not None
+    assert (host.orchestration, host.confirmation_timeout) == (True, 300.0)
+    assert host.danger_policy == 'table'
+
+
+def test_the_runtime_assembly_and_the_policy_kind_are_read_from_the_host():
+    document = _hosted(
+        orchestration=False,
+        confirmation_timeout=None,
+        danger={'rules': [{'id': 'shell.privilege_escalation'}], 'policy': 'allow_all'},
+    )
+
+    host = parse_scenario_document(document, source='captured.json').host
+
+    assert host is not None
+    assert (host.orchestration, host.confirmation_timeout) == (False, None)
+    assert (host.danger_policy, host.danger_table) == ('allow_all', None)
+
+
+def test_a_host_without_a_policy_or_a_table_leaves_the_kernel_default():
+    document = _hosted(danger={'rules': [{'id': 'shell.privilege_escalation'}]})
+
+    host = parse_scenario_document(document, source='captured.json').host
+
+    assert host is not None and host.danger_policy is None
+
+
+@pytest.mark.parametrize(
+    ('fields', 'received', 'next_action'),
+    [
+        ({'orchestration': 'yes'}, "'yes'", 'true / false'),
+        ({'confirmation_timeout': True}, 'True', '没有确认通道就写 null'),
+        ({'confirmation_timeout': 0}, '0', '没有确认通道就写 null'),
+        ({'confirmation_timeout': float('inf')}, 'inf', '没有确认通道就写 null'),
+        ({'confirmation_timeout': '300'}, "'300'", '没有确认通道就写 null'),
+        ({'danger': {'policy': 'mine:Policy'}}, "'mine:Policy'", '改成其中之一'),
+        ({'danger': {'policy': 'table'}}, "policy='table'，table 没有", '不写表'),
+        (
+            {'danger': {'policy': 'allow_all', 'table': {'shell.git_state_change': 'block'}}},
+            "policy='allow_all'，table 有",
+            '不写表',
+        ),
+    ],
+    ids=[
+        'orchestration-text',
+        'timeout-bool',
+        'timeout-zero',
+        'timeout-infinite',
+        'timeout-text',
+        'policy-unknown',
+        'table-without-table',
+        'allow-all-with-table',
+    ],
+)
+def test_a_malformed_runtime_assembly_or_policy_is_refused_with_what_to_change(
+    fields: dict[str, object], received: str, next_action: str
+):
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(_hosted(**fields), source='captured.json')
+
+    assert received in caught.value.received
+    assert next_action in caught.value.next_action
+
+
 def test_a_v1_document_reads_as_before_with_slot_entry_and_ordered_responses():
     document = parse_scenario_document(_v1(), source='scenario.yaml')
 

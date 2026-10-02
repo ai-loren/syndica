@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import os
 import random
 import signal
@@ -16,7 +17,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from io import StringIO
 from pathlib import Path
 from typing import Any, cast
@@ -897,6 +898,9 @@ def _kernel_capture(
     hook: Callable[[Any], None] | None = None,
     interrupt_when: Callable[[], Any] | None = None,
     entry: str = 'query',
+    runtime: Mapping[str, Any] | None = None,
+    agent: Mapping[str, Any] | None = None,
+    host: Mapping[str, object] | None = None,
 ) -> tuple[str, dict[str, list[ContextBlock]]]:
     """在内核里捕获一次 run（真的本地工具、开着编排、没有 Module），交回回放文档与原始轨迹。
     `interrupt_when` 是一个可等待的东西：等到它就像 Ctrl-C 那样打断这次 run；`entry='send'` 时根
@@ -922,40 +926,45 @@ def _kernel_capture(
 
         def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
             options = AgentOptions(
-                name=role, llm=llm, tools={'Bash': tools['Bash']}, system_prompt='You lead.'
+                name=role,
+                llm=llm,
+                tools={'Bash': tools['Bash']},
+                system_prompt='You lead.',
+                **dict(agent or {}),
             )
-            agent = BaseAgent(options, hooks=hooks, events=events)
+            built = BaseAgent(options, hooks=hooks, events=events)
             if hook is not None:
-                hook(agent)
-            return agent
+                hook(built)
+            return built
 
-        runtime = Runtime(
-            agents={role: build}, orchestration=True, tracer=recorder, ids=recorder.ids
+        runtime_options = {'orchestration': True, **dict(runtime or {})}
+        built_runtime = Runtime(
+            agents={role: build}, tracer=recorder, ids=recorder.ids, **runtime_options
         )
         recorder.describe_run(
-            host={'modules': []},
+            host={'modules': []} if host is None else host,
             roles={role: {'system_prompt': 'You lead.', 'tools': ['Bash']}},
             entry={'mode': entry, 'agent': role, 'prompt': 'go'},
         )
         status = SpanStatus.OK
         try:
             if entry == 'query':
-                agent_id = await runtime.spawn(build, query='go')
+                agent_id = await built_runtime.spawn(build, query='go')
             else:
-                agent_id = await runtime.spawn(build)
-                assert (await runtime.send(agent_id, 'go')).ok
+                agent_id = await built_runtime.spawn(build)
+                assert (await built_runtime.send(agent_id, 'go')).ok
             if interrupt_when is None:
-                await asyncio.wait_for(runtime.wait(agent_id), timeout=_WITHIN)
+                await asyncio.wait_for(built_runtime.wait(agent_id), timeout=_WITHIN)
             else:
                 await asyncio.wait_for(interrupt_when(), timeout=_WITHIN)
                 recorder.interrupted()
                 status = SpanStatus.CANCELLED
         finally:
-            await runtime.shutdown()
+            await built_runtime.shutdown()
             await workspace.close()
         trajectories = {
-            info.agent_id: list((await runtime.wait(info.agent_id)).current_traj)
-            for info in await runtime.registry.list()
+            info.agent_id: list((await built_runtime.wait(info.agent_id)).current_traj)
+            for info in await built_runtime.registry.list()
         }
         await recorder.finish(status)
         text = await store.replay(recorder.trace_id)
@@ -1050,6 +1059,126 @@ def test_an_interrupt_after_a_delegate_returned_but_before_its_result_landed_rep
         'Lead[1]',
         'Lead[2]',
     }
+
+
+def _risky(policy: object, **runtime: Any) -> tuple[str, dict[str, list[ContextBlock]]]:
+    """一次跑在给定处置策略下的高风险命令（递归强删一个不存在的目录）：宿主档案照它写。"""
+    from syndica.cli.capture import host_profile
+    from syndica.kernel import DEFAULT_RULES, DangerJudge, HostFacts
+
+    judge = DangerJudge(DEFAULT_RULES)
+    options = {'orchestration': True, 'confirmation_timeout': None, **runtime}
+    host = host_profile(
+        flags={},
+        judge=judge,
+        policy=cast(Any, policy),
+        output_limit=10_000,
+        facts=HostFacts(os='posix', platform='test', shell='/bin/sh'),
+        max_turns=None,
+        no_write=False,
+        modules=[],
+        orchestration=cast(bool, options['orchestration']),
+        confirmation_timeout=cast(Any, options['confirmation_timeout']),
+    )
+    return _kernel_capture(
+        [[_calls(('c1', 'Bash', {'command': 'rm -rf ./nothing-here'})), _say('done')]],
+        runtime={'orchestration': options['orchestration']},
+        agent={'danger_judge': judge, 'danger_policy': policy},
+        host=host,
+    )
+
+
+@pytest.mark.parametrize('kind', ['allow_all', 'block_high_risk', 'table'])
+def test_a_run_under_any_built_in_policy_replays_under_the_same_one(kind: str):
+    from syndica.kernel import AllowAll, BlockHighRisk, Disposition
+    from syndica.kernel.danger import RuleTablePolicy
+
+    policy = {
+        'allow_all': AllowAll(),
+        'block_high_risk': BlockHighRisk(),
+        'table': RuleTablePolicy({'shell.recursive_force_remove': Disposition.ALLOW}),
+    }[kind]
+
+    text, original = _risky(policy)
+    document = json.loads(text)
+    replayed = ReplayRunner().run(parse_scenario_document(document, source='replay.json'))
+
+    [lead] = document['agents']['Lead']['instances']
+    assert document['host']['danger']['policy'] == kind
+    assert lead['gate'][0]['disposition'] == ('block' if kind == 'block_high_risk' else 'allow')
+    assert replayed.reproduced, replayed.divergences
+    assert 'Lead[0]' in _assert_same_trajectories(document, replayed, original)
+
+
+def test_a_run_without_orchestration_replays_without_it():
+    from syndica.kernel import BlockHighRisk
+
+    text, original = _risky(BlockHighRisk(), orchestration=False)
+    document = json.loads(text)
+    replayed = ReplayRunner().run(parse_scenario_document(document, source='replay.json'))
+
+    assert document['host']['orchestration'] is False
+    assert replayed.reproduced, replayed.divergences
+    assert 'Lead[0]' in _assert_same_trajectories(document, replayed, original)
+
+
+def test_a_run_without_a_confirmation_channel_replays_without_one():
+    from syndica.kernel import Disposition
+    from syndica.kernel.danger import RuleTablePolicy
+
+    text, original = _risky(RuleTablePolicy({'shell.recursive_force_remove': Disposition.CONFIRM}))
+    document = json.loads(text)
+    replayed = ReplayRunner().run(parse_scenario_document(document, source='replay.json'))
+
+    [lead] = document['agents']['Lead']['instances']
+    assert document['host']['confirmation_timeout'] is None
+    assert lead['gate'][0]['disposition'] == 'confirm'
+    assert replayed.reproduced, replayed.divergences
+    assert 'Lead[0]' in _assert_same_trajectories(document, replayed, original)
+
+
+def test_a_policy_the_replay_cannot_rebuild_is_named_when_the_run_is_described(
+    caplog: pytest.LogCaptureFixture,
+):
+    from syndica.cli.capture import host_profile
+    from syndica.kernel import (
+        DEFAULT_RULES,
+        DangerJudge,
+        Disposition,
+        HostFacts,
+        InMemoryTraceStore,
+        TraceRecorder,
+    )
+
+    class _Lenient:
+        def decide(self, request: object) -> Disposition:
+            return Disposition.ALLOW
+
+    host = host_profile(
+        flags={},
+        judge=DangerJudge(DEFAULT_RULES),
+        policy=cast(Any, _Lenient()),
+        output_limit=10_000,
+        facts=HostFacts(os='posix', platform='test', shell='/bin/sh'),
+        max_turns=None,
+        no_write=False,
+        modules=[],
+        orchestration=True,
+        confirmation_timeout=None,
+    )
+    recorder = TraceRecorder(InMemoryTraceStore(), RuleRedactor())
+
+    with caplog.at_level(logging.WARNING, logger='syndica.kernel.trace_recorder'):
+        recorder.describe_run(
+            host=host,
+            roles={'Lead': {'system_prompt': 'You lead.', 'tools': ['Bash']}},
+            entry={'mode': 'query', 'agent': 'Lead', 'prompt': 'go'},
+        )
+
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.trace_recorder']
+    assert record.levelno == logging.WARNING
+    assert '_Lenient' in cast(tuple[str, str, str], record.args)[1]
+    assert '不写回放文档' in cast(tuple[str, str, str], record.args)[2]
 
 
 def test_a_role_named_like_a_secret_keeps_the_provider_ids_under_it():

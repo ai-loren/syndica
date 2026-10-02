@@ -100,6 +100,9 @@ from syndica.kernel import (
 )
 from syndica.kernel.context import ArtifactRef
 from syndica.kernel.danger import (
+    AllowAll,
+    BlockHighRisk,
+    DangerPolicy,
     DangerRule,
     RuleTablePolicy,
     git_state_change_rule,
@@ -1051,15 +1054,17 @@ class _Replay:
 
     # --- host profile ----------------------------------------------------------------------
 
-    def _danger(self) -> tuple[DangerJudge | None, RuleTablePolicy | None]:
+    def _danger(self) -> tuple[DangerJudge | None, DangerPolicy | None]:
         rules = self._host.danger_rules
         judge = None if rules is None else DangerJudge(tuple(_rule(spec) for spec in rules))
         table = self._host.danger_table
-        policy = (
-            None
-            if table is None
-            else RuleTablePolicy({key: Disposition(value) for key, value in table.items()})
-        )
+        policy: DangerPolicy | None = None
+        if self._host.danger_policy == 'allow_all':
+            policy = AllowAll()
+        elif self._host.danger_policy == 'block_high_risk':
+            policy = BlockHighRisk()
+        elif table is not None:
+            policy = RuleTablePolicy({key: Disposition(value) for key, value in table.items()})
         return judge, policy
 
     def _modules(self, llm: _ReplayLLM) -> tuple[tuple[RuntimeModule, ...], tuple[str, ...]]:
@@ -1130,7 +1135,7 @@ class _Replay:
         tools: Mapping[str, Tool],
         llm: _ReplayLLM,
         judge: DangerJudge | None,
-        policy: RuleTablePolicy | None,
+        policy: DangerPolicy | None,
     ) -> AgentFactory:
         frozen = role.frozen
         assert frozen is not None
@@ -1532,10 +1537,14 @@ class _Replay:
                     asleep=self.asleep,
                 ),
                 agents=factories,
-                orchestration=True,
+                orchestration=self._host.orchestration,
                 modules=modules,
                 flags=flags,
-                confirmation_handler=MailboxConfirmationHandler(timeout=300),
+                confirmation_handler=(
+                    None
+                    if self._host.confirmation_timeout is None
+                    else MailboxConfirmationHandler(timeout=self._host.confirmation_timeout)
+                ),
                 ids=_ReplayIds(self) if self._keyed else None,
                 tracer=tracer,
             )

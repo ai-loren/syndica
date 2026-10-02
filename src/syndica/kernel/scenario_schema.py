@@ -151,9 +151,23 @@ _HOST_ACTION = frozenset({'kind', 'key', 'waiting'})
 _HOST_ACTION_KINDS = ('abort', 'interrupt', 'shutdown')
 _ID = frozenset({'key', 'id'})
 _HOST = frozenset(
-    {'flags', 'danger', 'output_limit', 'host_facts', 'max_turns', 'no_write', 'modules'}
+    {
+        'flags',
+        'danger',
+        'output_limit',
+        'host_facts',
+        'max_turns',
+        'no_write',
+        'modules',
+        'orchestration',
+        'confirmation_timeout',
+    }
 )
-_DANGER = frozenset({'rules', 'table'})
+_DANGER = frozenset({'rules', 'table', 'policy'})
+_POLICIES = ('table', 'allow_all', 'block_high_risk')
+# 这两项是 CLI 一直以来的装配：在它们进宿主档案之前写下的文档都是这样跑的。
+_ORCHESTRATION = True
+_CONFIRMATION_TIMEOUT = 300.0
 _RULE = frozenset({'id', 'params'})
 _HOST_FACTS = frozenset({'os', 'platform', 'shell'})
 _SOURCE = frozenset({'trace_id', 'argv', 'version', 'config_sha256', 'git_commit'})
@@ -348,16 +362,22 @@ class DangerRuleSpec:
 
 @dataclass(frozen=True)
 class HostProfile:
-    """宿主档案（v2）：回放据此重建 Runtime 的装配。没写的项是 None / 空。"""
+    """宿主档案（v2）：回放据此重建 Runtime 的装配。没写的项是 None / 空；`orchestration` 与
+    `confirmation_timeout` 没写时是 CLI 的装配（编排开着、确认等 300 秒）。`danger_policy` 是处置
+    策略的种类：`table`（按 `danger_table` 查表）、`allow_all`、`block_high_risk`；None 是内核默认。
+    `confirmation_timeout` 为 None 时没有确认通道。"""
 
     flags: Mapping[str, bool | int | str] = dataclasses.field(default_factory=_no_entries)
     danger_rules: tuple[DangerRuleSpec, ...] | None = None
     danger_table: Mapping[str, str] | None = None
+    danger_policy: str | None = None
     output_limit: int | None = None
     host_facts: HostFacts | None = None
     max_turns: int | None = None
     no_write: bool = False
     modules: tuple[str, ...] | None = None
+    orchestration: bool = _ORCHESTRATION
+    confirmation_timeout: float | None = _CONFIRMATION_TIMEOUT
 
 
 @dataclass(frozen=True)
@@ -1636,7 +1656,7 @@ def _host(value: object) -> HostProfile:
                 'Flag 的取值只有这三种类型；照 `syndica flags show <key>` 的默认值写',
             )
         flags[key] = item
-    rules = table = None
+    rules = table = policy = None
     if 'danger' in data:
         danger = _mapping(data['danger'], 'host.danger', allowed=_DANGER)
         if 'rules' in danger:
@@ -1646,6 +1666,7 @@ def _host(value: object) -> HostProfile:
                 _rule_id(key): _choice(item, f'host.danger.table.{key}', _DISPOSITIONS)
                 for key, item in _mapping(danger['table'], 'host.danger.table').items()
             }
+        policy = _policy(danger, table is not None)
     facts = None
     if 'host_facts' in data:
         raw_facts = _mapping(
@@ -1661,12 +1682,49 @@ def _host(value: object) -> HostProfile:
         flags=MappingProxyType(flags),
         danger_rules=rules,
         danger_table=None if table is None else MappingProxyType(table),
+        danger_policy=policy,
         output_limit=_optional_positive(data.get('output_limit'), 'host.output_limit'),
         host_facts=facts,
         max_turns=_optional_positive(data.get('max_turns'), 'host.max_turns'),
         no_write=_boolean(data.get('no_write', False), 'host.no_write'),
         modules=modules,
+        orchestration=_boolean(data.get('orchestration', _ORCHESTRATION), 'host.orchestration'),
+        confirmation_timeout=_seconds(
+            data.get('confirmation_timeout', _CONFIRMATION_TIMEOUT), 'host.confirmation_timeout'
+        ),
     )
+
+
+def _policy(danger: Mapping[str, object], has_table: bool) -> str | None:
+    """处置策略的种类。只写了表的是查表；种类与表必须对得上：查表要有表，别的种类用不上表。"""
+    if 'policy' not in danger:
+        return 'table' if has_table else None
+    policy = _choice(danger['policy'], 'host.danger.policy', _POLICIES)
+    if (policy == 'table') != has_table:
+        raise _error(
+            'host.danger.policy 是 table 时有 host.danger.table，是别的种类时没有',
+            f'policy={policy!r}，table {"有" if has_table else "没有"}',
+            '照宿主用的策略写：RuleTablePolicy 写 table 与表，AllowAll / BlockHighRisk 不写表',
+        )
+    return policy
+
+
+def _seconds(value: object, field: str) -> float | None:
+    """一段等待的秒数（正的有限数），或 None（不等，没有这个通道）。"""
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise _error(
+            f'{field} 是正的有限秒数，或 null',
+            f'收到 {value!r}，类型是 {type(value).__name__}',
+            '照宿主给确认通道的超时写（例如 300）；没有确认通道就写 null',
+        )
+    return float(value)
 
 
 def _rule_id(key: str) -> str:

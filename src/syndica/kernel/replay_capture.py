@@ -20,10 +20,11 @@ from dataclasses import dataclass, field
 from typing import cast
 
 from syndica.kernel.context import ContextBlock, ToolCall
+from syndica.kernel.errors import ConfigError
 from syndica.kernel.ids import RandomIds, StableKey, current_tool_call
 from syndica.kernel.message import Message
 from syndica.kernel.redaction import Redactor, encode_redacted
-from syndica.kernel.scenario_schema import FROZEN_IMPLS, REPLAYED_TOOLS
+from syndica.kernel.scenario_schema import FROZEN_IMPLS, REPLAYED_TOOLS, parse_scenario_document
 from syndica.kernel.tool import ToolResult
 from syndica.kernel.trace import AttributeValue, SpanKind, SpanStatus, TraceSource
 
@@ -132,11 +133,33 @@ class ReplayCapture:
         roles: Mapping[str, Mapping[str, object]],
         entry: Mapping[str, object],
     ) -> None:
-        self._run = {
+        frozen = {str(name): self._jsonable(dict(role)) for name, role in roles.items()}
+        run: dict[str, object] = {
             'host': self._jsonable(dict(host)),
-            'roles': {str(name): self._jsonable(dict(role)) for name, role in roles.items()},
+            'roles': frozen,
             'entry': self._jsonable(dict(entry)),
         }
+        probe: dict[str, object] = {
+            'version': 2,
+            'name': 'describe_run',
+            'host': run['host'],
+            'agents': {name: {'frozen': role, 'instances': []} for name, role in frozen.items()},
+            'entry': run['entry'],
+            'ids': [],
+            'expect': {},
+        }
+        try:
+            parse_scenario_document(probe, source='describe_run')
+        except ConfigError as error:
+            raise Unreplayable(
+                expected=(
+                    'describe_run 交来的宿主档案、角色与入口写得进回放文档'
+                    '（回放按它们重建这次 run）'
+                ),
+                received=f'{error.expected}；{error.received}',
+                next_action=f'{error.next_action}；这个 trace 不写回放文档，结构照常记录',
+            ) from error
+        self._run = run
 
     def interrupted(self) -> None:
         """宿主要因为人打断而拆掉 run：记下此刻还在等外部世界的调用——在飞的模型调用、开着的外部

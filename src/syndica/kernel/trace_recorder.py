@@ -480,6 +480,14 @@ class TraceRecorder:
             return
         try:
             self._capture.describe(host, roles, entry)
+        except Unreplayable as reason:
+            self._capture_failed = True
+            logger.warning(
+                '期望: %s。 实际: %s。 下一步: %s。',
+                reason.expected,
+                reason.received,
+                reason.next_action,
+            )
         except Exception as error:
             self._capture_broken(error)
 
