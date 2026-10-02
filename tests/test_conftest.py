@@ -78,3 +78,41 @@ def test_opentelemetry_settings_from_the_developers_shell_are_removed(
 
 def test_no_test_sees_an_opentelemetry_setting() -> None:
     assert [name for name in os.environ if name.startswith('OTEL_')] == []
+
+
+def test_relative_search_path_entries_are_made_absolute_for_the_subprocesses_tests_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('PYTHONPATH', os.pathsep.join(['src', '', str(tmp_path / 'lib')]))
+
+    _conftest().absolute_search_path()
+
+    assert os.environ['PYTHONPATH'].split(os.pathsep) == [
+        str((tmp_path / 'src').resolve()),
+        str((tmp_path / 'lib').resolve()),
+    ]
+
+
+def test_every_search_path_entry_this_run_hands_to_a_subprocess_is_absolute() -> None:
+    entries = [entry for entry in os.environ.get('PYTHONPATH', '').split(os.pathsep) if entry]
+
+    assert all(Path(entry).is_absolute() for entry in entries), entries
+
+
+def test_a_run_started_with_a_relative_search_path_hands_on_an_absolute_one() -> None:
+    probe = (
+        'tests/test_conftest.py::'
+        'test_every_search_path_entry_this_run_hands_to_a_subprocess_is_absolute'
+    )
+    completed = subprocess.run(
+        [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', probe],
+        cwd=_REPO,
+        env={**os.environ, 'PYTHONPATH': 'src'},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert '1 passed' in completed.stdout

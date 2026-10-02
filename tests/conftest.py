@@ -19,7 +19,19 @@ def _shell_under_test() -> str:
     return os.environ.get('SYNDICA_TEST_SHELL', _DEFAULT_SHELL)
 
 
+def absolute_search_path() -> None:
+    """用例起的 Python 子进程（`python -m syndica`、驱动脚本）继承 `PYTHONPATH`，工作目录却各不
+    相同：相对的条目在那里解析不到，子进程就悄悄导入装在环境里的另一份 syndica——对变异的、导出的
+    那份代码跑的用例于是在测别的代码。"""
+    value = os.environ.get('PYTHONPATH')
+    if value:
+        os.environ['PYTHONPATH'] = os.pathsep.join(
+            str(Path(entry).resolve()) for entry in value.split(os.pathsep) if entry
+        )
+
+
 def pytest_configure(config: pytest.Config) -> None:
+    absolute_search_path()
     shell = Path(_shell_under_test())
     if not shell.is_absolute() or not shell.is_file() or not os.access(shell, os.X_OK):
         raise pytest.UsageError(
