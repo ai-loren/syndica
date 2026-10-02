@@ -631,6 +631,56 @@ def test_a_press_landing_just_as_the_git_step_ends_finds_the_outcome_settled():
     assert ctrl_c.late == [None]
 
 
+def test_once_settled_the_handler_outlives_the_run_until_it_is_released():
+    ctrl_c = _CtrlC(lambda text: None)
+    before = signal.getsignal(signal.SIGINT)
+
+    async def run() -> None:
+        with ctrl_c.installed():
+            ctrl_c.settle()
+
+    asyncio.run(run())
+    kept = signal.getsignal(signal.SIGINT)
+    _press(ctrl_c)
+    ctrl_c.release(before)
+
+    assert kept is ctrl_c
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+def test_release_leaves_alone_a_handler_someone_else_installed_since():
+    ctrl_c = _CtrlC(lambda text: None)
+    before = signal.getsignal(signal.SIGINT)
+
+    async def run() -> None:
+        with ctrl_c.installed():
+            ctrl_c.settle()
+
+    def theirs(signum: int, frame: object) -> None:
+        del signum, frame
+
+    asyncio.run(run())
+    signal.signal(signal.SIGINT, theirs)
+    try:
+        ctrl_c.release(before)
+        assert signal.getsignal(signal.SIGINT) is theirs
+    finally:
+        signal.signal(signal.SIGINT, before)
+
+
+def test_an_unsettled_run_puts_the_previous_handler_back_at_once():
+    ctrl_c = _CtrlC(lambda text: None)
+    before = signal.getsignal(signal.SIGINT)
+
+    async def run() -> None:
+        with ctrl_c.installed():
+            pass
+
+    asyncio.run(run())
+
+    assert signal.getsignal(signal.SIGINT) is before
+
+
 def test_in_the_git_step_only_the_first_press_raises_and_the_rest_are_told_once():
     warnings: list[str] = []
     ctrl_c = _CtrlC(warnings.append)
@@ -1079,3 +1129,24 @@ def test_the_loop_is_closed_even_when_closing_the_sessions_is_interrupted(
 
     with pytest.raises(RuntimeError, match='closed'):
         host._runner.get_loop()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_press_while_the_sessions_close_stays_an_interruption_when_the_loop_then_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    host = _closing_host(tmp_path)
+    runner = host._runner  # pyright: ignore[reportPrivateUsage]
+    real_close = runner.close
+
+    async def interrupted(*, interrupted: bool = False) -> None:
+        raise KeyboardInterrupt
+
+    def stopped() -> None:
+        real_close()
+        raise RuntimeError('Event loop stopped before Future completed.')
+
+    monkeypatch.setattr(host, '_close_sessions', interrupted)
+    monkeypatch.setattr(runner, 'close', stopped)
+
+    with pytest.raises(KeyboardInterrupt):
+        host.close()

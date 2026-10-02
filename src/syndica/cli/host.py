@@ -997,7 +997,8 @@ class _CtrlC:
     @contextmanager
     def installed(self) -> Generator[None, None, None]:
         """装上这个处理，结束时换回原来的。继承来的「忽略 SIGINT」照旧忽略；不在主线程时什么都不装
-        （只有主线程装得了信号处理）。"""
+        （只有主线程装得了信号处理）。结论定下之后结束的，不在这里换回：宿主交回结论到 CLI 把它
+        打印出来之间的按键还该什么都不改——宿主关闭时 `release`。"""
         if threading.current_thread() is not threading.main_thread():
             yield
             return
@@ -1010,7 +1011,18 @@ class _CtrlC:
         try:
             yield
         finally:
-            signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
+            if not self._settled:
+                signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
+
+    def release(self, handler: Any) -> None:
+        """结论定下之后还装着的这个处理换成 `handler`。`handler` 是宿主进这次请求之前的那一个：
+        `installed` 看到的「原来的」是 `asyncio.Runner` 为这次 `run` 装的，它绑着一个已经结束的
+        任务。"""
+        if (
+            threading.current_thread() is threading.main_thread()
+            and signal.getsignal(signal.SIGINT) is self
+        ):
+            signal.signal(signal.SIGINT, signal.SIG_DFL if handler is None else handler)
 
     @contextmanager
     def raising(self) -> Generator[bool, None, None]:
@@ -1176,6 +1188,8 @@ class RuntimeCliHost:
         self._environ: Mapping[str, str] = os.environ if environ is None else environ
         self._runner = asyncio.Runner(loop_factory=_host_loop)
         self._closed = False
+        self._ctrl_c: _CtrlC | None = None
+        self._sigint_before: Any = None
         self._sessions: dict[str, _ChatSession] = {}
         # `--handoff` 下 stdout 只有交接文件，问人的提示改走 stderr。
         self._prompts_to_stderr = False
@@ -1364,6 +1378,7 @@ class RuntimeCliHost:
                 return self._runner.run(self._run_chat_request(request))
         with self._logging_to_stderr():
             if request.handoff:
+                self._sigint_before = signal.getsignal(signal.SIGINT)
                 return self._runner.run(self._run_handoff(request, flags))
             return self._runner.run(self._run_request(request, flags))
 
@@ -1494,18 +1509,24 @@ class RuntimeCliHost:
         if self._closed:
             return
         self._closed = True
+        if self._ctrl_c is not None:
+            self._ctrl_c.release(self._sigint_before)
+        pressed = False
         try:
             with self._logging_to_stderr():
                 self._runner.run(self._close_sessions(interrupted=interrupted))
                 self._flush_exports()
+        except KeyboardInterrupt:
+            pressed = True
+            raise
         finally:
-            self._close_loop()
+            self._close_loop(pressed=pressed)
 
-    def _close_loop(self) -> None:
-        """关掉事件循环。这时按的 Ctrl-C 会把循环停在关线程池的半路上，asyncio 交出的是
-        「Event loop stopped before Future completed」这个 RuntimeError 而不是 KeyboardInterrupt；
-        循环照样关掉了，结论早已打出去，按过键时两者都不再往外抛。没按过键的 RuntimeError 照抛。"""
-        pressed = False
+    def _close_loop(self, *, pressed: bool = False) -> None:
+        """关掉事件循环。这时按的 Ctrl-C、或者收会话时按的那一次（它把循环停在了半路上），会让
+        关线程池交出「Event loop stopped before Future completed」这个 RuntimeError 而不是
+        KeyboardInterrupt；循环照样关掉了，结论早已打出去，按过键时两者都不再往外抛——收会话时
+        按的那一次由 `close` 接着往外抛。没按过键的 RuntimeError 照抛。"""
 
         def press(signum: int, frame: object) -> None:
             nonlocal pressed
@@ -2373,6 +2394,7 @@ class RuntimeCliHost:
                 '等那个 run 结束（它退出时会把交接文件路径打到 stderr），或者到别的工作区里跑',
             ) from exc
         ctrl_c = _CtrlC(self._warn)
+        self._ctrl_c = ctrl_c
         try:
             with ctrl_c.installed():
                 return await self._handoff(request, flags, config, redactor, ctrl_c)
