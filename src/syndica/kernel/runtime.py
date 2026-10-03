@@ -172,7 +172,7 @@ from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tools import orchestration_tools
-from syndica.kernel.trace import SpanKind
+from syndica.kernel.trace import AttributeValue, SpanKind
 from syndica.kernel.tracing import (
     Tracer,
     _Span,  # pyright: ignore[reportPrivateUsage]
@@ -967,6 +967,11 @@ class Runtime:
         self.events: EventBus = EventBus()
         self.hooks: HooksCenter = HooksCenter()
         self.hooks._serve_runtime()  # pyright: ignore[reportPrivateUsage]
+        # 扩展切点被触发时记在当前 span 上；在本 Runtime 任何 span 之外触发的不记（没有可挂的
+        # 地方）。
+        self.hooks._observe_extensions(  # pyright: ignore[reportPrivateUsage]
+            lambda name: self._tracing.event('junction.triggered', {'junction.name': name})
+        )
         # Module 清单里的切点先于一切第三方代码（Runtime 插件的 register 是第一段）声明：名字在
         # 那之前被占住，别人就抢不走。
         self.hooks._reserve_owners(frozenset(module_assembly.names))  # pyright: ignore[reportPrivateUsage]
@@ -1197,7 +1202,9 @@ class Runtime:
         try:
             role_tools = frozenset(agent.options.tools)
             self._install_orchestration(agent, agent_id)
-            module_tools = self._module_assembly.install_agent(self, agent, agent_flags)
+            module_tools, module_plugins = self._module_assembly.install_agent(
+                self, agent, agent_flags
+            )
             self._install_slot_tools(agent, role_tools, module_tools)
             installed_by_modules = {name: agent.options.tools[name] for name in module_tools}
             agent._configure_untrusted_output(  # pyright: ignore[reportPrivateUsage]
@@ -1317,8 +1324,33 @@ class Runtime:
         # 派生边在任务建好之后：put 与 create_task 之间一句别的都不放。终点是它在这里的第一个周期
         # ——工厂交回的可能是一个已经跑过几个周期的 Agent。
         self._tracing.spawned(agent_id, agent._cycle + 1)  # pyright: ignore[reportPrivateUsage]
+        self._trace_modules(agent_id, module_tools, module_plugins)
         await self.hooks._dispatch(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)  # pyright: ignore[reportPrivateUsage]
         return agent_id
+
+    def _trace_modules(
+        self, agent_id: str, tools: Mapping[str, str], plugins: Mapping[str, str]
+    ) -> None:
+        """每个已装的 Module 一个开即关的根 span（只声明 Flag 或服务的也有）：trace 自己就说得清
+        这个 Agent 在哪些 Module 下跑、各自给了它什么。只在 spawn 提交之后记，回滚掉的 spawn 不留
+        痕迹。"""
+        for module in self._module_assembly.module_objects:
+            attributes: dict[str, AttributeValue] = {
+                'module.name': module.name,
+                'module.version': module.version,
+                'module.tools': [name for name, owner in tools.items() if owner == module.name],
+                'module.plugins': [name for name, owner in plugins.items() if owner == module.name],
+                'module.flags': [flag.key for flag in module.flags],
+            }
+            with self._tracing.span(
+                SpanKind.MODULE,
+                (agent_id, module.name),
+                name=module.name,
+                agent_id=agent_id,
+                attributes=attributes,
+                detached=True,
+            ):
+                pass
 
     async def _confirm(self, request: ConfirmationRequest) -> ConfirmationOutcome:
         handler = self._confirmation_handler

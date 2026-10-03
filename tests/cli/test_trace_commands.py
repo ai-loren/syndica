@@ -1089,7 +1089,7 @@ def _rewritten_header(root: Path, change: Any) -> tuple[TraceHeader, str]:
 
 
 def _from_a_newer_syndica(value: dict[str, Any]) -> None:
-    value['schema'] = 'syndica.trace/2'
+    value['schema'] = 'syndica.trace/3'
     value['added_in_2'] = {'anything': True}
     del value['redaction']
 
@@ -1104,9 +1104,28 @@ def test_a_trace_from_a_newer_syndica_is_reported_as_newer_and_never_as_tampered
     assert listed[:2] == (0, '另有 1 个 trace 目录读不进来，没有列出（原因见上面的 WARNING）。\n')
     for code, _, err in (by_prefix, by_name):
         assert code == 2
-        assert 'syndica.trace/2' in err and '不要删掉' in err
+        assert 'syndica.trace/3' in err and '不要删掉' in err
     for _, _, err in (listed, by_prefix, by_name):
         assert '多半是 Agent 的 Bash' not in err and '被 prune 掉的找不回来' not in err
+
+
+def _from_the_first_schema(value: dict[str, Any]) -> None:
+    value['schema'] = 'syndica.trace/1'
+
+
+@pytest.mark.parametrize(
+    'command',
+    [['trace', 'list'], ['trace', 'show'], ['trace', 'replay']],
+    ids=['list', 'show', 'replay'],
+)
+def test_a_trace_written_under_the_first_schema_is_still_read(tmp_path: Path, command: list[str]):
+    header, _ = _rewritten_header(tmp_path, _from_the_first_schema)
+    argv = command if command == ['trace', 'list'] else [*command, header.trace_id[:8]]
+
+    code, out, err = _cli(tmp_path, argv)
+
+    assert code == 0, err
+    assert '读不进来' not in out + err
 
 
 def test_a_trace_whose_header_broke_is_named_as_unreadable_not_as_missing(tmp_path: Path):

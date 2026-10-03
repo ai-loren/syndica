@@ -375,6 +375,24 @@ def test_trace_export_to_a_given_endpoint_sends_none_of_the_environment_headers(
     assert 'x-token' not in {key.lower() for key in headers}
 
 
+def test_a_trace_written_under_the_first_schema_still_exports(
+    tmp_path: Path, collector: _Collector
+):
+    _run(tmp_path, {}, exporter=_Spy())
+    name = _only_directory(tmp_path)
+    header = trace_directory(tmp_path) / name / 'trace.json'
+    value = json.loads(header.read_text(encoding='utf-8'))
+    value['schema'] = 'syndica.trace/1'
+    header.write_text(json.dumps(value), encoding='utf-8')
+
+    code, out, err = _cli(
+        tmp_path, ['trace', 'export', name, '--otlp', collector.address], environ={}
+    )
+
+    assert code == 0, err
+    assert out.startswith('导出了 trace ')
+
+
 def test_trace_export_without_otlp_uses_the_environment_endpoint_and_its_headers(
     tmp_path: Path, collector: _Collector
 ):

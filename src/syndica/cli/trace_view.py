@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import cast
 
 from syndica.cli.terminal import one_line
 from syndica.kernel import CausalityEdge, EdgeKind, Span, SpanKind, SpanStatus, TraceHeader
@@ -96,8 +97,49 @@ def render_show(header: TraceHeader, spans: Sequence[Span], edges: Sequence[Caus
         '',
         '时间线：',
         *_timeline(agents, labels, origin),
+        '',
+        'Module：',
+        *_modules(spans, labels),
     ]
     return '\n'.join(sections)
+
+
+def _names(value: object) -> str:
+    listed = cast(list[object], value) if isinstance(value, list) else []
+    return '、'.join(one_line(item) for item in listed if isinstance(item, str)) or '无'
+
+
+def _modules(spans: Sequence[Span], labels: Mapping[str, str]) -> list[str]:
+    """每个 Agent 从哪个 Module 拿到哪些工具与插件，以及扩展切点各被触发了几次。"""
+    by_agent: dict[str, list[str]] = {}
+    triggered: dict[str, int] = {}
+    for span in sorted(spans, key=lambda item: item.start_ns):
+        for event in span.events:
+            name = event.attributes.get('junction.name')
+            if event.name == 'junction.triggered' and isinstance(name, str):
+                triggered[name] = triggered.get(name, 0) + 1
+        if span.kind is not SpanKind.MODULE:
+            continue
+        name = span.attributes.get('module.name')
+        version = span.attributes.get('module.version')
+        by_agent.setdefault(span.agent_id, []).append(
+            f'    {one_line(str(name))} {one_line(str(version))}：'
+            f'工具 {_names(span.attributes.get("module.tools"))}；'
+            f'插件 {_names(span.attributes.get("module.plugins"))}'
+        )
+    if not by_agent:
+        return ['  （没有记下：/1 的 trace 不记 Module）']
+    lines: list[str] = []
+    for agent_id, entries in by_agent.items():
+        lines.append(f'  {labels.get(agent_id, _short(agent_id))}')
+        lines.extend(entries)
+    if triggered:
+        counts = '、'.join(
+            f'{one_line(name)} ×{count}' for name, count in sorted(triggered.items())
+        )
+        lines.append(f'  扩展切点：{counts}')
+    lines.append('  扩展切点的触发记在触发它的 span 上；在任何 span 之外触发的（宿主代码）不记。')
+    return lines
 
 
 def _summary(header: TraceHeader) -> list[str]:
@@ -134,6 +176,9 @@ def _agents(spans: Sequence[Span], edges: Sequence[CausalityEdge]) -> dict[str, 
         reason = span.attributes.get('stop_reason')
         agent.stop_reason = reason if isinstance(reason, str) else None
     for span in sorted(spans, key=lambda item: item.start_ns):
+        # Module span 在 spawn 提交时就记了：一个还没跑过的 Agent 只有它们，不是一个没结束的 Agent。
+        if span.kind is SpanKind.MODULE:
+            continue
         agent = agents.get(span.agent_id)
         if agent is None:
             agents[span.agent_id] = _Agent(

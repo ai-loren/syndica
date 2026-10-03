@@ -44,7 +44,7 @@ __all__ = [
     'verbatim_attribute',
 ]
 
-TRACE_SCHEMA = 'syndica.trace/1'
+TRACE_SCHEMA = 'syndica.trace/2'
 _SCHEMA_VERSION = re.compile(r'syndica\.trace/([1-9][0-9]{0,8})')
 
 
@@ -55,11 +55,16 @@ class NewerTraceSchema(ContractViolation):
 def readable_schema(schema: object) -> None:
     """这个版本的 syndica 读得懂 `schema` 吗：读不懂时，更新的版本报 `NewerTraceSchema`，别的报
     `ContractViolation`。读 trace 的一方在读任何别的字段之前先问它：新版本的头可能连字段都不一样。
+
+    更旧的版本照样读：闭集只增不减，旧 trace 里的每个字段新读者都认得（`/2` 加了 Module 的 span
+    属性与扩展切点事件）。按相等判的话，升一次版本就让此前的每一个 trace 报「删掉它」。
     """
     if schema == TRACE_SCHEMA:
         return
     current = _SCHEMA_VERSION.fullmatch(TRACE_SCHEMA)
     given = _SCHEMA_VERSION.fullmatch(schema) if isinstance(schema, str) else None
+    if current is not None and given is not None and int(given[1]) <= int(current[1]):
+        return
     if current is not None and given is not None and int(given[1]) > int(current[1]):
         raise NewerTraceSchema(
             expected=f'trace 是这个版本的 syndica 读得懂的 {TRACE_SCHEMA}',
@@ -158,6 +163,13 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'message.to': 'str',
         'child.agent_id': 'str',
         'agent.id': 'str',
+        # 第三方写的名字：照常过脱敏（用户规则认得的工具名在工具 span 上被换掉，这里也要换）。
+        'module.name': 'str',
+        'module.version': 'str',
+        'module.tools': 'str[]',
+        'module.plugins': 'str[]',
+        'module.flags': 'str[]',
+        'junction.name': 'str',
     }
 )
 

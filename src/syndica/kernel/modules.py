@@ -763,9 +763,10 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
         runtime: Runtime,
         agent: BaseAgent,
         flags: Mapping[str, FlagValue],
-    ) -> dict[str, str]:
+    ) -> tuple[dict[str, str], dict[str, str]]:
         """构造完全部注入物后，一次性装到 Agent 自己的 Module 层。交回「工具名 → 装它的 Module
-        名」，之后装上的工具撞名时据此点名对方。"""
+        名」与「插件名 → 装它的 Module 名」：之后装上的工具撞名时据此点名对方，trace 的 `module`
+        span 据此写出每个 Module 给了这个 Agent 什么。"""
         plugins: list[Plugin] = []
         plugin_owners: dict[str, str] = {}
         tool_batches: list[tuple[str, dict[str, Tool]]] = []
@@ -867,7 +868,7 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
         agent._install_module_plugins(plugins)  # pyright: ignore[reportPrivateUsage]
         if tools:
             agent.install_runtime_tools(tools)
-        return owners
+        return owners, plugin_owners
 
     def declare_junctions(self, hooks: HooksCenter) -> None:
         """按对象声明全部 Module 清单里的切点。Module 名各不相同、切点的 owner 段等于 Module 名，

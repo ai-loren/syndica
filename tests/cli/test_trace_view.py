@@ -581,3 +581,72 @@ def test_a_list_says_how_many_directories_it_could_not_read_instead_of_calling_i
     )
     assert render_list([]).startswith('还没有 trace')
     assert len(render_list([row]).splitlines()) == 1
+
+
+def _module(agent_id: str, name: str, *, tools: list[str], plugins: list[str]) -> Span:
+    return Span(
+        span_id=span_id_of(SpanKind.MODULE, agent_id, name),
+        parent_span_id=None,
+        kind=SpanKind.MODULE,
+        name=name,
+        agent_id=agent_id,
+        start_ns=_ORIGIN,
+        end_ns=_ORIGIN,
+        status=SpanStatus.OK,
+        attributes={
+            'module.name': name,
+            'module.version': '1.2.0',
+            'module.tools': tools,
+            'module.plugins': plugins,
+            'module.flags': [],
+        },
+    )
+
+
+def test_the_module_section_says_what_each_module_gave_each_agent():
+    tool = dataclasses.replace(
+        _tool(_LEAD, 0, 'Record', 1, 2),
+        events=(
+            SpanEvent(
+                name='junction.triggered',
+                time_ns=_ORIGIN + 1 * _S,
+                attributes={'junction.name': 'audit:recorded'},
+            ),
+        ),
+    )
+    spans = [
+        _agent(_LEAD, 'Orchestrator', 0, 5),
+        _module(_LEAD, 'audit', tools=['Zeta', 'Alpha'], plugins=['audit-hooks']),
+        _module(_LEAD, 'quiet', tools=[], plugins=[]),
+        tool,
+    ]
+
+    section = _section(render_show(_header(), spans, []), 'Module：')
+
+    assert section[0].strip().startswith('Orchestrator')
+    assert section[1].strip() == 'audit 1.2.0：工具 Zeta、Alpha；插件 audit-hooks'
+    assert section[2].strip() == 'quiet 1.2.0：工具 无；插件 无'
+    assert '扩展切点：audit:recorded ×1' in section[3]
+
+
+def test_an_agent_that_only_has_module_spans_is_not_drawn_as_an_unfinished_agent():
+    spans = [
+        _agent(_LEAD, 'Orchestrator', 0, 5),
+        _module(_EARLY, 'audit', tools=['Zeta'], plugins=[]),
+    ]
+
+    tree = _section(render_show(_header(), spans, []), '谁创建了谁：')
+
+    assert len(tree) == 1
+    assert 'Orchestrator' in tree[0]
+
+
+def test_a_module_name_that_could_forge_a_line_is_escaped():
+    spans = [
+        _agent(_LEAD, 'Orchestrator', 0, 5),
+        _module(_LEAD, 'audit', tools=['Zeta\nforged line'], plugins=[]),
+    ]
+
+    text = render_show(_header(), spans, [])
+
+    assert '\nforged line' not in text

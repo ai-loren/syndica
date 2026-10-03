@@ -116,7 +116,7 @@ def test_the_enum_values_are_the_schema():
         'REPLAY': 'replay',
         'FULL': 'full',
     }
-    assert TRACE_SCHEMA == 'syndica.trace/1'
+    assert TRACE_SCHEMA == 'syndica.trace/2'
 
 
 def test_the_attribute_set_is_exactly_the_schema():
@@ -158,6 +158,12 @@ def test_the_attribute_set_is_exactly_the_schema():
         'message.to': 'str',
         'child.agent_id': 'str',
         'agent.id': 'str',
+        'module.name': 'str',
+        'module.version': 'str',
+        'module.tools': 'str[]',
+        'module.plugins': 'str[]',
+        'module.flags': 'str[]',
+        'junction.name': 'str',
     }
 
 
@@ -420,7 +426,7 @@ def test_a_malformed_header_is_refused(changes: dict[str, Any]):
         _header(**changes)
 
 
-@pytest.mark.parametrize('schema', ['syndica.trace/2', 'syndica.trace/10'])
+@pytest.mark.parametrize('schema', ['syndica.trace/3', 'syndica.trace/10'])
 def test_a_header_from_a_newer_version_says_so_and_that_it_is_not_broken(schema: str):
     with pytest.raises(NewerTraceSchema) as caught:
         _header(schema=schema)
@@ -569,3 +575,8 @@ def test_a_whole_header_and_span_survive_leaf_redaction_unchanged():
 
     for value in (header, span):
         assert json.loads(encode_redacted(_plain(value), RuleRedactor())) == _plain(value)
+
+
+def test_a_header_from_an_older_version_is_still_read_as_written():
+    header = _header(schema='syndica.trace/1')
+    assert header.schema == 'syndica.trace/1'

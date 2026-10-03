@@ -625,7 +625,13 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 
 ### 阶段四：trace 与回放
 
-#### T12 — `module` span、扩展切点事件、`trace show` 的 Module 一节（D14）
+#### T12 — `module` span、扩展切点事件、`trace show` 的 Module 一节（D14，完成）
+- `TRACE_SCHEMA` 升到 `syndica.trace/2`，读者接受 `/1` 到当前版本（`/1` 的 trace 照样 list、show、replay、export）。
+- spawn 提交之后（入表、任务建好、派生边记下）每个已装 Module 一个开即关的根 span，带 `module.name` / `version` /
+  `tools`（装配次序）/ `plugins` / `flags`；`install_agent` 一并交回插件归属。这些属性都过脱敏。
+- 扩展切点的分发经 Runtime 接在自己中心上的观察者记 `junction.triggered`（链上任何一层沿 `outer` 找到它，有没有
+  hook 都记）；本 Runtime 的 span 之外触发的不记。`trace show` 加「Module」一节，不把只有 Module span 的 Agent
+  画成没结束的 Agent。
 #### T13 — 拓扑 run 回放（M3 遗留）
 - 宿主把实际装配的拓扑（CLI 改写过预算与只读工具之后的那一份）交给 `describe_run`，回放文档写 `topology` 段与
   `entry: {mode: slot, slot: <根槽>}`。

@@ -386,6 +386,7 @@ class HooksCenter:
         self._one_agent = False
         self._runtime_owned = False
         self._reserved_owners: frozenset[str] = frozenset()
+        self._on_extension: Callable[[str], None] | None = None
 
     def declare_extension_junction(self, name: str, kind: JunctionKind) -> ExtensionJunction:
         """声明一个扩展切点及其分类，交回触发它要用的句柄。
@@ -508,6 +509,10 @@ class HooksCenter:
         resolved = self._resolved(junction)
         # 分类在空列表检查之前取：未归类的切点无论有没有 hook 都必须响亮失败。
         kind = self._kind(resolved)
+        if isinstance(resolved, str):
+            observer = self._extension_observer()
+            if observer is not None:
+                observer(resolved)
         chain = self._collect_authored(resolved)
         if not chain:
             return HookResult(), Authorship()
@@ -517,6 +522,17 @@ class HooksCenter:
         with _window(resolved, kwargs):
             await self._trigger_parallel(resolved, [cb for cb, _ in chain], **kwargs)
         return HookResult(), Authorship()
+
+    def _observe_extensions(self, observer: Callable[[str], None]) -> None:
+        """每次分发扩展切点都叫一次 `observer`（交给它切点名），有没有 hook 都叫。Runtime 把它接在
+        自己的中心上：链上任何一层分发时沿 `outer` 找到它，`trigger_extension` 从 Agent 的局部层分发
+        也一样。"""
+        self._on_extension = observer
+
+    def _extension_observer(self) -> Callable[[str], None] | None:
+        if self._on_extension is not None:
+            return self._on_extension
+        return self._outer._extension_observer() if self._outer is not None else None
 
     def _serve_one_agent(self) -> None:
         """本中心服务单个 Agent（局部层或 Module 层）：`RUNTIME_ONLY` 的切点从此挂不上来。"""

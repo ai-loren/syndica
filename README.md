@@ -492,7 +492,9 @@ the replay cannot rebuild what topology slots attach to their roles.
   An id may be the full id, a unique prefix, or the directory name printed after a run.
 - `syndica trace show <id>` prints who created whom, who waits on whom (a wait cycle is marked),
   the three slowest tool calls (calls that only waited for another agent are left out), model calls
-  per agent (time, tokens, failures, platform failovers), and a timeline.
+  per agent (time, tokens, failures, platform failovers), a timeline, and which tools and plugins
+  each module gave each agent, with how often each extension junction fired. Traces are written
+  as `syndica.trace/2`; traces written as `/1` are still read.
 - `syndica trace replay <id>` replays the trace offline: model replies, tool results, human answers
   and host actions come from the record, while the kernel, its danger judgement and the modules the
   replay can rebuild (safety, human interaction, retry) run for real and are compared item by item.

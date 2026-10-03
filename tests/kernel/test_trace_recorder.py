@@ -716,7 +716,10 @@ async def test_structure_records_spans_and_edges_and_no_payload_or_fingerprint()
 
     spans = await _spans(cast(_Counting, store), recorder)
     assert cast(_Counting, store).payload_texts == []
-    assert len(spans) == 1 + 3 + 3 + 2 + 1
+    assert len(spans) == 1 + 3 + 3 + 2 + 1 + 1
+    assert [span.name for span in spans.values() if span.kind is SpanKind.MODULE] == [
+        'human-interaction'
+    ]
     assert all(
         key not in span.attributes
         for span in spans.values()
@@ -2275,9 +2278,15 @@ def test_the_free_text_attributes_are_exactly_these():
     assert _free_text_keys() == [
         'agent.role',
         'danger.rule_ids',
+        'junction.name',
         'llm.error',
         'llm.model',
         'llm.platform',
+        'module.flags',
+        'module.name',
+        'module.plugins',
+        'module.tools',
+        'module.version',
         'tool.call_id',
         'tool.name',
         'wait.target',
