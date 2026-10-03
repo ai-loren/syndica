@@ -15,7 +15,7 @@ from syndica.kernel.context import ContextBlock
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import ExtensionJunction, HookResult, HooksCenter, Junction, JunctionKind
-from syndica.kernel.hooks.installing import installing
+from syndica.kernel.hooks.installing import Installer, current_installer, installing
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.modules import RuntimeModule
 from syndica.kernel.plugins import install_plugins
@@ -420,29 +420,58 @@ async def test_trigger_extension_refuses_kernel_junctions_and_foreign_handles():
 
 
 async def test_the_driver_task_does_not_inherit_the_installer_that_spawned_it():
-    outcomes: list[str] = []
+    seen: list[Installer | None] = []
     runtime = Runtime()
 
-    async def declare(**_: object) -> HookResult:
-        runtime.hooks.declare_extension_junction('host:started', JunctionKind.OBSERVABLE)
-        outcomes.append('declared')
-        return HookResult()
+    class Recording(BaseAgent):
+        def get_system_prompt(self) -> str:
+            seen.append(current_installer())
+            return super().get_system_prompt()
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return Recording(
+            AgentOptions(name='Worker', llm=ScriptedLLM([ScriptedTurn(content='done')])),
+            hooks=hooks,
+            events=events,
+        )
+
+    try:
+        with installing('plugin', 'spawner'):
+            agent_id = await runtime.spawn(build, query='go')
+        await runtime.wait(agent_id)
+        assert seen == [None]
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.parametrize('junction', [Junction.PRE_LLM_REQUEST, Junction.AGENT_START])
+async def test_a_hook_runs_under_the_identity_it_was_registered_with(junction: Junction):
+    seen: list[Installer | None] = []
+
+    async def record(**_: object) -> None:
+        seen.append(current_installer())
+
+    async def host(**_: object) -> None:
+        seen.append(current_installer())
 
     captured: list[BaseAgent] = []
     factory = _agent_factory(captured)
 
     def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
         agent = factory(hooks, events)
-        agent.register_hook(Junction.AGENT_START, declare)
+        with installing('plugin', 'audit'):
+            agent.register_hook(junction, record)
+        agent.register_hook(junction, host)
         return agent
 
+    runtime = Runtime()
     try:
         with installing('plugin', 'spawner'):
             agent_id = await runtime.spawn(build, query='go')
         await runtime.wait(agent_id)
-        assert outcomes == ['declared']
     finally:
         await runtime.shutdown()
+    assert seen == [Installer('plugin', 'audit'), Installer('plugin', 'spawner')]
 
 
 async def test_the_shutdown_task_does_not_inherit_the_installer_of_its_caller():

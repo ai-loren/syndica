@@ -361,8 +361,10 @@ def test_a_kernel_that_now_recovers_from_the_failure_is_caught_by_the_outcome(
     root = _restored(tmp_path)
     original = _failing_run(root)
 
-    async def recovered(self: BaseAgent, ctx: Any, request: Any, error: Exception) -> ContextBlock:
-        return ContextBlock(role='assistant', content='recovered')
+    async def recovered(
+        self: BaseAgent, ctx: Any, request: Any, error: Exception
+    ) -> tuple[ContextBlock, bool]:
+        return ContextBlock(role='assistant', content='recovered'), False
 
     monkeypatch.setattr(BaseAgent, '_substituted', recovered)
 

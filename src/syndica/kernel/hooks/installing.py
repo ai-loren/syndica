@@ -5,8 +5,12 @@
 靠持有句柄，不靠它。
 
 它随 contextvar 进入装配代码里建的任务（比如服务工厂里 `create_task`），在那些任务里声明切点仍按
-装配期的规则判：只会更严，不会更松。内核自己建的任务（`_drive`、收割、关机）开头清掉它；装配期之外
-跑的 Module 代码（`on_shutdown`、工具的 `execute`）没有装配期身份，按宿主代码的规则声明。
+装配期的规则判：只会更严，不会更松。内核自己建的任务（`_drive`、收割、关机）开头清掉它。
+
+装配期之后它还在两处设：分发时每个 hook 回调按**注册它的那段代码**的身份跑，Module 装的工具的
+`execute` 按那个 Module 的身份跑。hook 的作者按注册时的身份记，而回调里、工具里再注册的 hook 不设
+就记成宿主的——被收紧的 Module 于是能在装配期之后挂一个改写，绕过按作者的收紧。`on_shutdown` 没有
+身份。
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal
 
-__all__ = ['Installer', 'current_installer', 'installing', 'no_installer']
+__all__ = ['Installer', 'acting_as', 'current_installer', 'installing', 'no_installer']
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,16 @@ _INSTALLER: ContextVar[Installer | None] = ContextVar('syndica_installer', defau
 @contextmanager
 def installing(kind: Literal['plugin', 'module'], name: str) -> Generator[None, None, None]:
     token = _INSTALLER.set(Installer(kind, name))
+    try:
+        yield
+    finally:
+        _INSTALLER.reset(token)
+
+
+@contextmanager
+def acting_as(installer: Installer | None) -> Generator[None, None, None]:
+    """按 `installer` 的身份跑一段代码；None 是宿主（装配期之外的代码）。"""
+    token = _INSTALLER.set(installer)
     try:
         yield
     finally:

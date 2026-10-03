@@ -1247,6 +1247,7 @@ class Runtime:
                     name for name, owner in module_tools.items() if owner in self._untrusted_output
                 ),
                 self._untrusted_output,
+                module_tools,
             )
             # 旗子只决定其它角色。Orchestrator 在旗子关掉时仍要能派活，所以每个角色都有一次
             # 自己装工具的机会；缺省实现什么都不做。

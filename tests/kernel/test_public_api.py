@@ -428,6 +428,7 @@ _WITHHELD: tuple[str, ...] = (
     'UNSAFE_TEXT',
     'Unreplayable',
     'Write',
+    'acting_as',
     'arguments_digest',
     'assigned_agent_id',
     'assigning_agent_id',

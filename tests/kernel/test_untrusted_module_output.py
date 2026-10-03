@@ -278,7 +278,8 @@ async def test_install_own_tools_may_not_replace_a_module_tool():
         assert "'Extra'（Module 'extra'）" in excinfo.value.received
         assert '换一个名字' in excinfo.value.next_action
         (agent,) = captured
-        assert agent._executor._untrusted_output() == (frozenset(), frozenset())  # pyright: ignore[reportPrivateUsage]
+        tools, modules, owners = agent._executor._untrusted_output()  # pyright: ignore[reportPrivateUsage]
+        assert (tools, modules, dict(owners)) == (frozenset(), frozenset(), {})
         assert await runtime.registry.list() == []
     finally:
         await runtime.shutdown()

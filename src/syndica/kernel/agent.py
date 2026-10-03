@@ -71,9 +71,10 @@ block——provider 会拒掉这样的消息。本类是那份 Context 此后唯
 
 from __future__ import annotations
 
+import copy
 import itertools
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
@@ -97,6 +98,7 @@ from syndica.kernel.hooks import (
     Junction,
     JunctionRef,
 )
+from syndica.kernel.hooks.installing import Installer
 from syndica.kernel.ids import assigned_agent_id
 from syndica.kernel.llm import LLM, ContextOverflowError
 from syndica.kernel.plugins import Plugin, install_plugins
@@ -498,7 +500,7 @@ class BaseAgent:
         str | None,
         ConfirmationCallback | None,
         _Tracing,
-        tuple[frozenset[str], frozenset[str]],
+        tuple[frozenset[str], frozenset[str], Mapping[str, str]],
     ]:
         """保存 Runtime 装配前本对象自己拥有的可变状态。"""
         return (
@@ -528,7 +530,7 @@ class BaseAgent:
             str | None,
             ConfirmationCallback | None,
             _Tracing,
-            tuple[frozenset[str], frozenset[str]],
+            tuple[frozenset[str], frozenset[str], Mapping[str, str]],
         ],
     ) -> None:
         """恢复 `_assembly_snapshot`；被拒的 spawn 不留下半套 Agent。"""
@@ -571,10 +573,13 @@ class BaseAgent:
                 confirmation,
             )
 
-    def _configure_untrusted_output(self, tools: frozenset[str], modules: frozenset[str]) -> None:
-        """被收紧的第三方 Module 装的工具与它们的名字（语义见执行器的同名方法）。"""
+    def _configure_untrusted_output(
+        self, tools: frozenset[str], modules: frozenset[str], owners: Mapping[str, str]
+    ) -> None:
+        """被收紧的第三方 Module 装的工具与它们的名字，Module 装的每个工具是谁的（语义见执行器的
+        同名方法）。"""
         self._executor._configure_untrusted_output(  # pyright: ignore[reportPrivateUsage]
-            tools, modules
+            tools, modules, owners
         )
 
     def _install_module_plugins(self, plugins: Iterable[Plugin]) -> None:
@@ -834,42 +839,75 @@ class BaseAgent:
             'messages': [system_block, *(_isolated(block) for block in ctx.current_traj)],
             'tools': tool_defs,
         }
-        hooked = await self._hooks._dispatch(Junction.PRE_LLM_REQUEST, ctx=ctx, request=request)  # pyright: ignore[reportPrivateUsage]
+        # 被收紧的 Module 经这几个切点写下的东西（改写或就地改的请求、跳过时交出的响应、替身、改写或
+        # 就地改的响应）进了这一轮的 assistant block：整块标成不可信，溯源据此升级它带出的调用。
+        hooked, pre = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
+            Junction.PRE_LLM_REQUEST, self._watch('request'), ctx=ctx, request=request
+        )
         rewritten = hooked.get('request', request)
         if not isinstance(rewritten, dict):
             raise _bad_request(rewritten)
         request = cast(dict[str, Any], rewritten)
         if 'messages' not in request:
             raise _bad_request(request)
+        floored = self._by_floored(pre.wrote.get('request', ()), pre.changed.get('request', ()))
 
         if hooked.skip:
             response = _skipped_response(hooked.result)
+            floored = floored or self._by_floored((pre.skipped_by,))
         else:
-            response = await self._called(ctx, request)
-            if response is None:
+            called = await self._called(ctx, request)
+            if called is None:
                 return None
+            response, substituted = called
+            floored = floored or substituted
 
-        post = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
-            Junction.POST_LLM_RESPONSE, ctx=ctx, request=request, response=response
+        post, reviewers = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
+            Junction.POST_LLM_RESPONSE,
+            self._watch('response'),
+            ctx=ctx,
+            request=request,
+            response=response,
         )
         if post.result is not None:
             raise _bad_post_response_idiom(post)
         reviewed = post.get('response', response)
         if not isinstance(reviewed, ContextBlock) or reviewed.role != 'assistant':
             raise _bad_response(reviewed)
+        floored = floored or self._by_floored(
+            reviewers.wrote.get('response', ()), reviewers.changed.get('response', ())
+        )
         if _is_empty(reviewed):
-            return await self._substituted(ctx, request, _empty_response_error(self.options.llm))
+            reviewed, substituted = await self._substituted(
+                ctx, request, _empty_response_error(self.options.llm)
+            )
+            floored = floored or substituted
+        if floored and reviewed.trust is not TrustLevel.UNTRUSTED:
+            return replace(reviewed, trust=TrustLevel.UNTRUSTED)
         return reviewed
 
-    async def _called(self, ctx: Context, request: dict[str, Any]) -> ContextBlock | None:
-        """递交请求；返回 None 表示超窗已被插件处理。"""
+    def _watch(self, key: str) -> Mapping[str, Callable[[Any], object]]:
+        """有被收紧的 Module 时才盯住 `key` 的就地改动：投影是整份深拷贝，每个回调前后各一次。"""
+        if not self._executor._untrusted_output()[1]:  # pyright: ignore[reportPrivateUsage]
+            return {}
+        return {key: copy.deepcopy}
+
+    def _by_floored(self, *groups: Iterable[Installer | None]) -> bool:
+        return self._executor._by_untrusted(  # pyright: ignore[reportPrivateUsage]
+            tuple(itertools.chain.from_iterable(groups))
+        )
+
+    async def _called(
+        self, ctx: Context, request: dict[str, Any]
+    ) -> tuple[ContextBlock, bool] | None:
+        """递交请求，交回（响应，它是不是被收紧的 Module 给的替身）；None 表示超窗已被插件处理。"""
         messages = request['messages']
         kwargs = {key: value for key, value in request.items() if key != 'messages'}
         try:
             with llm_attempt(self.options.llm, request) as attempt:
                 reply = await self.options.llm.create(messages, **kwargs)
                 attempt.observe(reply)
-                return reply
+                return reply, False
         except ContextOverflowError as exc:
             outcome = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
                 Junction.CONTEXT_OVERFLOW, ctx=ctx, request=request, error=exc
@@ -885,9 +923,10 @@ class BaseAgent:
 
     async def _substituted(
         self, ctx: Context, request: dict[str, Any], error: Exception
-    ) -> ContextBlock:
-        """向 LLM_FAILURE 要一个替身；无人给出则打上失败标记并上抛 error。"""
-        outcome = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
+    ) -> tuple[ContextBlock, bool]:
+        """向 LLM_FAILURE 要一个替身，交回（替身，给它的是不是被收紧的 Module）；无人给出则打上失败
+        标记并上抛 error。"""
+        outcome, authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
             Junction.LLM_FAILURE, ctx=ctx, request=request, error=error
         )
         if outcome.skip or outcome.result is not None:
@@ -902,7 +941,7 @@ class BaseAgent:
             or _is_empty(substitute)
         ):
             raise _bad_substitute(substitute)
-        return substitute
+        return substitute, self._by_floored(authors.wrote.get('response', ()))
 
     async def _emit(self, kind: str, payload: dict[str, Any]) -> None:
         await self._events.emit(Event(kind=kind, agent_id=self.agent_id, payload=payload))

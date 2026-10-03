@@ -104,12 +104,14 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any, cast
 
 from syndica.kernel.context import (
@@ -138,7 +140,7 @@ from syndica.kernel.danger import (
 )
 from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction, ReadOnlyKwarg
-from syndica.kernel.hooks.installing import Installer
+from syndica.kernel.hooks.installing import Installer, acting_as
 from syndica.kernel.ids import ToolCallKey, entering_tool_call, leaving_tool_call, peek_key
 from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
 from syndica.kernel.trace import AttributeValue, SpanKind
@@ -262,6 +264,11 @@ def _described(exc: BaseException) -> str:
         return f'{type(exc).__name__}: {exc}'
     except Exception:
         return type(exc).__name__
+
+
+def _result_content(result: ToolResult) -> object:
+    """一份结果里进模型上下文的部分（`meta` 只给工作流代码读，不算）。"""
+    return copy.deepcopy(result.output), list(result.artifacts), result.trust
 
 
 def _tightened(baseline: TrustLevel, derived: ToolResult) -> ToolResult:
@@ -650,6 +657,7 @@ class ToolExecutor:
         self._tracing = _Tracing()
         self._untrusted_tools: frozenset[str] = frozenset()
         self._untrusted_modules: frozenset[str] = frozenset()
+        self._tool_owners: Mapping[str, str] = MappingProxyType({})
 
     def _attach_tracing(self, tracing: _Tracing) -> None:
         self._tracing = tracing
@@ -687,15 +695,22 @@ class ToolExecutor:
         validate_tool_names(tools)
         self._tools = tools
 
-    def _configure_untrusted_output(self, tools: frozenset[str], modules: frozenset[str]) -> None:
+    def _configure_untrusted_output(
+        self,
+        tools: frozenset[str],
+        modules: frozenset[str],
+        owners: Mapping[str, str] = MappingProxyType({}),
+    ) -> None:
         """被收紧的第三方 Module：`tools` 是它们装的工具，结果在 `execute` 一返回时就收紧，早于
         trace 与 `POST_TOOL_USE`（之后的 hook 看到的已经是收紧过的）；`modules` 是它们的名字，它们的
-        hook 写下的跳过结果、参数与结果改写同样收紧，不论是哪个工具的调用。"""
+        hook 写下的跳过结果、参数与结果改写同样收紧，不论是哪个工具的调用。`owners` 是 Module 装的
+        每个工具 → 它的 Module：`execute` 按那个 Module 的身份跑，里面再注册的 hook 记在它头上。"""
         self._untrusted_tools = tools
         self._untrusted_modules = modules
+        self._tool_owners = MappingProxyType(dict(owners))
 
-    def _untrusted_output(self) -> tuple[frozenset[str], frozenset[str]]:
-        return self._untrusted_tools, self._untrusted_modules
+    def _untrusted_output(self) -> tuple[frozenset[str], frozenset[str], Mapping[str, str]]:
+        return self._untrusted_tools, self._untrusted_modules, self._tool_owners
 
     def _by_untrusted(self, installers: Sequence[Installer | None]) -> bool:
         return any(
@@ -1113,8 +1128,10 @@ class ToolExecutor:
             # 工具还是来自 hook。cast 到 object 是因为要挡的正是违反 execute 标注的运行时取值，不擦
             # 掉静态类型，下面的 isinstance 就成了 pyright 眼里的死代码。
             outcome = 'ok'
+            owner = self._tool_owners.get(call.name)
             try:
-                returned = cast(object, await tool.execute(**args))
+                with acting_as(None if owner is None else Installer('module', owner)):
+                    returned = cast(object, await tool.execute(**args))
             except SyndicaError as exc:
                 # 三件套写给程序员或运维，模型执行不了它的 next_action。
                 if traced is not None:
@@ -1136,8 +1153,12 @@ class ToolExecutor:
             if traced is not None:
                 traced[1].attributes.update(_recorded_exit(result.meta))
 
+            # 结果是可变的：就地把 trust 改回 TRUSTED 不经 `modified`，收紧的底线于是按分发之前的
+            # 那个值算；被收紧的 Module 就地改了内容，同样按它是作者收紧。
+            handed_trust = result.trust
+            watch = {'result': _result_content} if self._untrusted_modules else {}
             post, post_authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
-                Junction.POST_TOOL_USE, tool_call=call, tool=tool, args=args, result=result
+                Junction.POST_TOOL_USE, watch, tool_call=call, tool=tool, args=args, result=result
             )
             if post.result is not None:
                 raise _post_result_slot_rejected(post)
@@ -1147,7 +1168,8 @@ class ToolExecutor:
             baseline = (
                 TrustLevel.UNTRUSTED
                 if self._by_untrusted(post_authors.wrote.get('result', ()))
-                else _strictest(result, post.rewrites('result'))
+                or self._by_untrusted(post_authors.changed.get('result', ()))
+                else strictest_trust(handed_trust, _strictest(result, post.rewrites('result')))
             )
             return _tightened(baseline, rewritten), outcome
 

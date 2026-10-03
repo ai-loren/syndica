@@ -41,7 +41,7 @@ from syndica.kernel.context import (
     _frozen,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.kernel.errors import ConfigError, ContractViolation
-from syndica.kernel.hooks.installing import Installer, current_installer
+from syndica.kernel.hooks.installing import Installer, acting_as, current_installer
 from syndica.kernel.hooks.junctions import (
     INTERCEPTABLE,
     MODULE_NAME,
@@ -67,15 +67,23 @@ HookCallback = Callable[..., Awaitable[HookResult | None]]
 class Authorship:
     """一次可拦截分发里，写下 skip 与每个键的改写的那些 hook 是谁装的（`register` 时的装配期身份；
     None 是装配期之外的代码）。内核据此判一段结果出自谁：结论本身不带作者，而被收紧的 Module 能借
-    一次 skip 或改写替任何工具交出一段带着缺省 `TRUSTED` 的文本。"""
+    一次 skip 或改写替任何工具交出一段带着缺省 `TRUSTED` 的文本。
+
+    `changed` 是分发时要求盯住的那几个参数里，被哪些 hook 就地改过（交给它的对象在它跑完之后与跑之前
+    不一样）：就地改不经 `modified`，`wrote` 看不见它。"""
 
     skipped_by: Installer | None = None
     wrote: Mapping[str, tuple[Installer | None, ...]] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    changed: Mapping[str, tuple[Installer | None, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 _Authored = tuple[HookCallback, Installer | None]
+Watch = Mapping[str, Callable[[Any], object]]
+_NO_WATCH: Watch = MappingProxyType({})
 _Snapshot = tuple[
     dict[JunctionRef, list[HookCallback]],
     dict[str, tuple[ExtensionJunction, str]],
@@ -84,12 +92,38 @@ _Snapshot = tuple[
 
 
 def _authorship(
-    wrote: Mapping[str, list[Installer | None]], skipped_by: Installer | None
+    wrote: Mapping[str, list[Installer | None]],
+    skipped_by: Installer | None,
+    changed: Mapping[str, list[Installer | None]],
 ) -> Authorship:
     return Authorship(
         skipped_by=skipped_by,
         wrote=MappingProxyType({key: tuple(authors) for key, authors in wrote.items()}),
+        changed=MappingProxyType({key: tuple(authors) for key, authors in changed.items()}),
     )
+
+
+class _Unreadable:
+    """投影取不出来时的占位：每个实例只等于它自己，所以前后两次都取不出来也算「变了」。"""
+
+
+def _projected(project: Callable[[Any], object], value: object) -> object:
+    try:
+        return project(value)
+    except Exception:
+        return _Unreadable()
+
+
+def _differs(before: object, after: object) -> bool:
+    try:
+        return bool(before != after)
+    except Exception:
+        return True
+
+
+async def _acting(installer: Installer | None, awaitable: Awaitable[object]) -> object:
+    with acting_as(installer):
+        return await awaitable
 
 
 def _label(junction: JunctionRef) -> str:
@@ -481,16 +515,20 @@ class HooksCenter:
             raise _foreign_handle(junction, self._declarer_of(junction.name) or '别处')
         return await self._dispatch(resolved, **kwargs)
 
-    async def _dispatch(self, junction: JunctionRef, **kwargs: Any) -> HookResult:
+    async def _dispatch(self, junction: JunctionRef, /, **kwargs: Any) -> HookResult:
         """分发一次，只要结论。语义见 `_dispatch_attributed`。"""
         result, _ = await self._dispatch_attributed(junction, **kwargs)
         return result
 
     async def _dispatch_attributed(
-        self, junction: JunctionRef, **kwargs: Any
+        self, junction: JunctionRef, watch: Watch = _NO_WATCH, /, **kwargs: Any
     ) -> tuple[HookResult, Authorship]:
         """唯一的分发路径，另交回结论出自谁（`Authorship`）。内核切点由内核在固定位置经这里触发，
         扩展切点经公开的 `trigger`。
+
+        每个回调按注册它的那段代码的身份跑（见 `installing`）。`watch` 是参数名 → 投影：可拦截切点上
+        每个回调跑之前与之后各取一次交给它的那个对象的投影，不同就记进 `Authorship.changed`。投影要
+        把内容拷出来（就地改的正是同一个对象），取不出来按「变了」算。
 
         可拦截切点按注册顺序串行：前一个 hook 的 `modified` 并入后续 hook 的 kwargs，返回的
         `modified` 只含被改过的键而非整份 kwargs；`skip=True` 终止后续 hook 并带出它的
@@ -518,9 +556,9 @@ class HooksCenter:
             return HookResult(), Authorship()
         if kind is JunctionKind.INTERCEPTABLE:
             with _window(resolved, kwargs):
-                return await self._trigger_serial(resolved, chain, **kwargs)
+                return await self._trigger_serial(resolved, chain, watch, **kwargs)
         with _window(resolved, kwargs):
-            await self._trigger_parallel(resolved, [cb for cb, _ in chain], **kwargs)
+            await self._trigger_parallel(resolved, chain, **kwargs)
         return HookResult(), Authorship()
 
     def _observe_extensions(self, observer: Callable[[str], None]) -> None:
@@ -688,17 +726,26 @@ class HooksCenter:
         self,
         junction: JunctionRef,
         chain: list[_Authored],
+        watch: Watch,
+        /,
         **kwargs: Any,
     ) -> tuple[HookResult, Authorship]:
         merged: dict[str, Any] = {}
         history: dict[str, list[Any]] = {}
         wrote: dict[str, list[Installer | None]] = {}
+        changed: dict[str, list[Installer | None]] = {}
         current = dict(kwargs)
         for cb, installer in chain:
-            returned = cast(object, cb(**current))
-            if not inspect.isawaitable(returned):
-                raise _not_awaitable(junction, cb, returned)
-            outcome = cast(object, await returned)
+            handed = {key: current[key] for key in watch if key in current}
+            before = {key: _projected(watch[key], value) for key, value in handed.items()}
+            with acting_as(installer):
+                returned = cast(object, cb(**current))
+                if not inspect.isawaitable(returned):
+                    raise _not_awaitable(junction, cb, returned)
+                outcome = cast(object, await returned)
+            for key, value in handed.items():
+                if _differs(before[key], _projected(watch[key], value)):
+                    changed.setdefault(key, []).append(installer)
             if outcome is None:
                 continue
             if not isinstance(outcome, HookResult):
@@ -713,18 +760,19 @@ class HooksCenter:
             if outcome.skip:
                 return (
                     HookResult(skip=True, modified=merged, result=outcome.result, history=history),
-                    _authorship(wrote, installer),
+                    _authorship(wrote, installer, changed),
                 )
-        return HookResult(modified=merged, history=history), _authorship(wrote, None)
+        return HookResult(modified=merged, history=history), _authorship(wrote, None, changed)
 
     async def _trigger_parallel(
-        self, junction: JunctionRef, hooks: list[HookCallback], **kwargs: Any
+        self, junction: JunctionRef, chain: list[_Authored], **kwargs: Any
     ) -> None:
         started: list[HookCallback] = []
         awaitables: list[Awaitable[object]] = []
-        for cb in hooks:
+        for cb, installer in chain:
             try:
-                returned = cast(object, cb(**kwargs))
+                with acting_as(installer):
+                    returned = cast(object, cb(**kwargs))
             except Exception:
                 logger.error('observable hook failed at %s', _label(junction), exc_info=True)
                 continue
@@ -740,7 +788,7 @@ class HooksCenter:
                 )
                 continue
             started.append(cb)
-            awaitables.append(returned)
+            awaitables.append(_acting(installer, returned))
         outcomes = await asyncio.gather(*awaitables, return_exceptions=True)
         for cb, outcome in zip(started, outcomes, strict=True):
             if isinstance(outcome, BaseException):
