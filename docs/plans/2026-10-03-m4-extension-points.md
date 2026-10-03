@@ -196,7 +196,7 @@ M1 的理由仍成立（插件实例难冻结、撑大公开面），而 M4 的�
 证实环境身份会经子 Agent 的驱动任务、服务调用、并行分发泄漏或洗白）。
 
 - **句柄**：`ExtensionJunction(name, kind)` 是公开类型，按对象身份比较（两个同名对象不相等）。声明之后，触发这个切点
-  必须交回**同一个**对象：`HooksCenter.trigger(handle, **kwargs)`；拿字符串触发扩展切点报 `ContractViolation`
+  必须交回**同一个**对象：`HooksCenter.trigger(handle, /, **kwargs)`；拿字符串触发扩展切点报 `ContractViolation`
   （「字符串谁都拼得出来，用声明时的那个 ExtensionJunction 触发」）。挂 hook 仍可以用名字（监听不是冒用）。
 - **Module 的切点**：写在清单 `junctions` 里（作者在定义 Module 时构造这些对象，工具与插件引用同一批对象）。Runtime
   在任何第三方代码跑之前按对象声明它们（D3）。owner 段等于 Module 名在构造 `RuntimeModule` 时就查。**Module 名是保留
@@ -223,8 +223,8 @@ M1 的理由仍成立（插件实例难冻结、撑大公开面），而 M4 的�
 
 - `HooksCenter.extension_junctions() -> Mapping[str, JunctionKind]`：整条装配链上已声明的扩展切点，按名字排序的只读
   映射，供宿主查询。`modules show` 读清单里的 `junctions`，trace 经私有的观察入口记每次触发，都不经它。
-- `BaseAgent.trigger_extension(handle, **kwargs) -> HookResult`：在这个 Agent 的整条链（局部 → Module 层 → Runtime）
-  上触发一个扩展切点，句柄规则同上。名字带 `_extension`：`trigger` 太容易与类式角色自己的属性撞名（评审 L5）。
+- `BaseAgent.trigger_extension(handle, /, **kwargs) -> HookResult`：在这个 Agent 的整条链（局部 → Module 层 → Runtime）
+  上触发一个扩展切点，句柄规则同上。句柄只能按位置传，负载里于是可以有 `handle` / `junction` 这两个键（收口评审 B 的 F5）。名字带 `_extension`：`trigger` 太容易与类式角色自己的属性撞名（评审 L5）。
   Module 的工具工厂与插件工厂都收到 `agent`，因此拿得到它。`_BASE_AGENT_SURFACE` 加这一个名字，理由写进守卫。
 - 触发仍只有一条分发路径；`trigger_extension` 只是选了起点。
 
@@ -492,7 +492,7 @@ M1 的理由仍成立（插件实例难冻结、撑大公开面），而 M4 的�
 - 声明：Module 写在清单 `junctions` 里（owner 段 = Module 名，Module 名是保留 owner）；其余经
   `HooksCenter.declare_extension_junction(name, kind) -> ExtensionJunction`（插件里声明时 owner 段 = 插件名）。同名只能
   声明一次。
-- 触发：`HooksCenter.trigger(handle, **kwargs)` 与 `BaseAgent.trigger_extension(handle, **kwargs)` 只收声明时交回的
+- 触发：`HooksCenter.trigger(handle, /, **kwargs)` 与 `BaseAgent.trigger_extension(handle, /, **kwargs)` 只收声明时交回的
   那个句柄；字符串触发扩展切点报 `ContractViolation`；装配链上有一层属于 Runtime 时公开入口触发内核 `Junction` 也报
   （独立的中心照收，供插件单测）。挂 hook 可以用名字或句柄（`HooksCenter.register`、`BaseAgent.register_hook`）。
 - `HooksCenter.extension_junctions() -> Mapping[str, JunctionKind]`。

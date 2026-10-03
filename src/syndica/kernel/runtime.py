@@ -1343,7 +1343,14 @@ class Runtime:
         # 因为能注销这个条目的级联必然先把它钉住、且钉住活到该级联自己结束：还在飞的被 `_doomed`
         # 按住，已经跑完的被这次 get 按住。顺序是**先带 await 的那一问、再读两个同步标志位**，
         # 于是最后一道守卫与 create_task 之间没有挂起点。
+        refusal: ContractViolation | None = None
         if await self.registry.get(agent_id) is None:
+            refusal = _entry_vanished_during_spawn(agent_id, parent_id)
+        elif self._closed:
+            refusal = _already_shut_down()
+        elif parent_id is not None and parent_id in self._doomed:
+            refusal = _parent_being_destroyed(parent_id)
+        if refusal is not None:
             await self._rollback_unstarted_spawn(
                 agent_id,
                 agent,
@@ -1352,27 +1359,7 @@ class Runtime:
                 registered=True,
                 queue_attempted=True,
             )
-            raise _entry_vanished_during_spawn(agent_id, parent_id)
-        if self._closed:
-            await self._rollback_unstarted_spawn(
-                agent_id,
-                agent,
-                assembly_snapshot,
-                runtime_added,
-                registered=True,
-                queue_attempted=True,
-            )
-            raise _already_shut_down()
-        if parent_id is not None and parent_id in self._doomed:
-            await self._rollback_unstarted_spawn(
-                agent_id,
-                agent,
-                assembly_snapshot,
-                runtime_added,
-                registered=True,
-                queue_attempted=True,
-            )
-            raise _parent_being_destroyed(parent_id)
+            raise refusal
         # put 先于 create_task：put 被拒时还没有任务可泄漏。两者之间没有挂起点，任务因此不会在
         # set_task 之前就跑起来。
         self._table.put(agent_id, agent)

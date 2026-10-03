@@ -707,6 +707,9 @@ async def test_a_slot_a_listed_module_wakes_runs_its_role_as_the_host():
         worker = await runtime.resolve('worker')
         assert worker is not None
         assert await _held_trust(runtime, worker) is TrustLevel.TRUSTED
+        context = await runtime.wait(worker)
+        [message] = [block for block in context.current_traj if block.role == 'user']
+        assert (message.content, message.trust) == ('go', TrustLevel.UNTRUSTED)
     finally:
         await runtime.shutdown()
 

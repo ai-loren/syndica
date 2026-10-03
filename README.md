@@ -354,7 +354,8 @@ when it loads one.
   has shut down.
 - Junctions a module owns are listed in its manifest,
   `junctions=[ExtensionJunction('<name>:<event>', JunctionKind.OBSERVABLE)]` (or `INTERCEPTABLE`),
-  and triggered with that same object through `agent.trigger_extension(handle, **kwargs)`. It
+  and triggered with that same object through `agent.trigger_extension(handle, **kwargs)`. The
+  handle is positional only, so the payload may use any key, `handle` and `junction` included. It
   returns the chain's merged `HookResult`; for an interceptable junction the module decides what a
   `skip` or a rewrite means.
 - Manifest fields: `version`, `description`, `capabilities` (a subset of `environment`,

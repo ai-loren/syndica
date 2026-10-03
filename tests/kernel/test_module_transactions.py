@@ -18,10 +18,12 @@ from syndica.kernel.hooks.installing import current_installer, installing
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.modules import RuntimeModule
 from syndica.kernel.runtime import Runtime
+from syndica.kernel.stores.memory_broker import InMemoryMessageBroker
 from syndica.kernel.stores.memory_registry import InMemoryAgentRegistry
 from syndica.kernel.tool import Tool, ToolResult
 
 _INTERRUPTIONS = [RuntimeError('boom'), KeyboardInterrupt(), asyncio.CancelledError()]
+_TIMEOUT = 3.0
 
 
 class _Injected(Tool):
@@ -548,6 +550,71 @@ async def test_a_late_spawn_failure_leaves_hooks_that_were_there_before_it_even_
 
     assert chain == [(shared, None)]
     assert seen == ['shared']
+
+
+class _HoldsTheQueue(InMemoryMessageBroker):
+    """`ensure_queue` 停在 `release` 上：spawn 停在它注册之后的那个 await 里。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def ensure_queue(self, agent_id: str) -> None:
+        self.reached.set()
+        await self.release.wait()
+        await super().ensure_queue(agent_id)
+
+
+class _ForgetsOnReadBack(InMemoryAgentRegistry):
+    """第一次读回时那一条已经不在：一条并发的级联在这段窗口里注销了它。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._forgot = False
+
+    async def get(self, agent_id: str) -> AgentInfo | None:
+        if not self._forgot:
+            self._forgot = True
+            await self.unregister(agent_id)
+        return await super().get(agent_id)
+
+
+def _registers_a_runtime_hook(seen: list[str]) -> RuntimeModule:
+    def registers(runtime: Runtime, agent: object, flags: object) -> Mapping[str, Tool]:
+        del agent, flags
+        runtime.hooks.register(Junction.AGENT_DESPAWN, _recorder(seen, 'refused-spawn'))
+        return {}
+
+    return RuntimeModule('first', tool_factories=(registers,))
+
+
+async def test_a_spawn_that_lands_after_shutdown_takes_back_the_runtime_hooks_its_factory_added():
+    broker = _HoldsTheQueue()
+    runtime = Runtime(modules=[_registers_a_runtime_hook([])], broker=broker)
+    spawning = asyncio.create_task(runtime.spawn(_factory([])))
+    await asyncio.wait_for(broker.reached.wait(), _TIMEOUT)
+    await runtime.shutdown()
+    broker.release.set()
+
+    with pytest.raises(ContractViolation) as refused:
+        await asyncio.wait_for(spawning, _TIMEOUT)
+
+    assert 'shutdown' in refused.value.received
+    assert runtime.hooks._collect_authored(Junction.AGENT_DESPAWN) == []  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_a_spawn_whose_entry_vanished_takes_back_the_runtime_hooks_its_factory_added():
+    seen: list[str] = []
+    runtime = Runtime(modules=[_registers_a_runtime_hook(seen)], registry=_ForgetsOnReadBack())
+    try:
+        with pytest.raises(ContractViolation) as refused:
+            await runtime.spawn(_factory([]))
+        assert '刚注册进去的条目' in refused.value.expected
+        await runtime.hooks._dispatch(Junction.AGENT_DESPAWN, agent_id='a')  # pyright: ignore[reportPrivateUsage]
+        assert seen == []
+    finally:
+        await runtime.shutdown()
 
 
 def _boom(*_: object) -> NoReturn:
