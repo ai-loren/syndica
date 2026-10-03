@@ -24,6 +24,8 @@ spec §15 的完成判据——**三层装配 + Runtime Module + 命名空间切
   `module_records` 记下 `syndica-example-module 0.1.0`。在去掉两个 API key、HTTP(S) 代理指到不通端口的环境里，
   `trace replay` 以 0 退出、报「复现」，示例 Module 被重建，没有重建的只有宿主自己的 `dev`。trace 目录里没有
   API key 的原文，也没有它任何 16 字符片段。
+- 收口复核改过 spawn 之后，在最终的树（`9063dc3`）上照同样的步骤重跑了一次：trace `7fdafccf`（2 次请求，4.1 s），
+  结论逐项相同——`Greet` 的结果记成 `untrusted`，离线回放报「复现」，trace 目录里没有 key 的原文与 16 字符片段。
 
 ## 完成判据 × 证据
 
@@ -113,7 +115,7 @@ uv run pyright                                               0 errors
 uv run python scripts/check_deps.py                          通过
 uv run python scripts/check_links.py                         通过
 uv run python scripts/gen_flag_reference.py --check          通过
-uv run pytest -q                                             8219 passed
+uv run pytest -q                                             8239 passed
 ```
 
 推送前对提交的树做了导出验证（把这次提交单独检出到临时目录、在那里跑上面每一道门禁）。

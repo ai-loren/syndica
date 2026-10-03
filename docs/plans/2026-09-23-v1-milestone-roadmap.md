@@ -100,8 +100,8 @@ deferred items」。
 | B-06 | `ConfigError` 被借来表达调用方误用 | M12 | v1.0 冻结公开 API 时统一错误分类 |
 | B-07 | 关联 ID 是扁平命名空间 | 接受 | 已裁决不加前缀，理由在 `wait_for` docstring |
 | B-08 | 危险规则不认经中间工具执行、落盘后再执行 | M5 | 与安全矩阵、溯源链同期 |
-| B-09 | 未声明 `__tool_command_args__` 的非文本参数被静默跳过 | M4 | 第三方工具随 Module 装配时强制声明 |
-| B-10 | 未声明工具的文本参数被散文误报 | M4 | 同 B-09 |
+| B-09 | 未声明 `__tool_command_args__` 的非文本参数被静默跳过 | 已修 | M4 D7：Module 的工具与类式角色自己装的工具必须在自己的类上声明，登记表已关闭 |
+| B-10 | 未声明工具的文本参数被散文误报 | 已修 | 同 B-09 |
 | B-11 | `DangerRequest` 不可哈希 | 接受 | 同 B-04 |
 | B-12 | 无 `functools.wraps` 的装饰器让声明落空 | 接受 | 管不了第三方装饰器，已写进 docstring |
 | B-13 | wrapper 兜底带来的误报 | M5 | wrapper 选项表与兜底并存 |
@@ -115,13 +115,13 @@ deferred items」。
 | B-22 | `KillAgent` 的后代遍历是 O(子树) | M6 | Store 契约给「后代」一个单一定义 |
 | B-23 | `_DRIVING_AGENT` 被第三方任务继承导致保守误拒 | 接受 | asyncio 不暴露 await 链；误拒是安全侧 |
 | D-40 | `ReadOnlyKwarg` 只护顶层 | M5 | 真实溯源链让「作者」判据不再必要 |
-| D-42 | 可观察切点丢弃返回值，typing 看不见 | M4 | 切点 API 定型时复核；须在 M12 冻结前定 |
+| D-42 | 可观察切点丢弃返回值，typing 看不见 | 已关闭 | M4 D9 裁决不拆回调类型，登记表已关闭 |
 | D-43 | 扩展切点分类冲突只沿向外方向查 | 接受 | 单向引用结构上补不全，危险方向已挡住 |
 | D-46 | 派活 / 分叉树没有上限也没有回收 | M8 | 预算树与回收策略 |
 | 验收后续 | Agent 看不到自己还剩几轮，紧预算下一直调工具不收尾 | M8 | `GetBudget` 与预算注入历史 |
 | 验收后续 | `--max-turns` 是每个 Agent 各自的上限，总请求数没有严格上界 | M8 | 父子预算树 |
 | 轮换后续 | `ModelRouter` 不实现 `CachePrefixProvider`：经它的漂移检测只做逻辑比对，换平台记成一次 `identity` 漂移 | 已修 | M3 T8：LLM span 记下作答平台，`ModelRouter` 转发作答成员的前缀单位 |
-| 轮换后续 | 清单显式写的模型名只走 OpenRouter / `OPENAI_*`，一次 run 只能用一个 Gemini 型号 | M4 | 第三方 backend 装配定型时，给清单的 `model` 一个「平台 + 型号」的写法 |
+| 轮换后续 | 清单显式写的模型名只走 OpenRouter / `OPENAI_*`，一次 run 只能用一个 Gemini 型号 | 已修 | M4 D10（T6）：清单的 `model` 可以写「平台:型号」 |
 | D-61 | `Delegate` 对用完轮数的子 Agent 仍建议 SendMessage 继续 | 已修 | 登记表已关闭 |
 | M-3 | `provenance_of` / `strictest_trust` 不满足「公开签名需要它」 | M12 | API 冻结时决定是否扣留 |
 | M-4 | 端到端 WAITING 断言只有一跳调度余量 | 已修 | 登记表已关闭 |
@@ -374,6 +374,15 @@ Runtime events
 
 把第三方能力接入从“能手写插件”补成完整机制：三层装配、Runtime Module、命名空间切点、Flag 文档、
 能力声明、启停顺序与失败回滚。
+
+### 当前状态
+
+已完成并审计通过（2026-10-03）。实现计划见 [`2026-10-03-m4-extension-points.md`](./2026-10-03-m4-extension-points.md)，
+收口审计见 [`docs/audits/2026-10-03-m4-final-audit.md`](../audits/2026-10-03-m4-final-audit.md)。与下面原始 TODO 的
+差别：Module 启停失败响亮失败而不是只记日志（D1：启用了的 Module 是宿主要的能力）；§4.7 槽的 `plugins` 字段 v1 不做
+（D4）；第三方 Module 的输出缺省不可信，只能在用户级逐个放开，工作区的项目配置要先经人确认（D15）；D-42 裁决不拆回调
+类型（D9）。收紧仍挡不住的三条（开发期记录器的次序、直接往 broker 发消息、经扩展切点流动的数据）登记为 D-62、D-63、
+D-64，归 M5。
 
 ### 依赖
 
