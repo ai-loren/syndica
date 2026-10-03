@@ -47,6 +47,7 @@ HOST_SET_ENV: tuple[str, ...] = (
     'GH_CONFIG_DIR',
     'GH_TOKEN',
     'GH_ENTERPRISE_TOKEN',
+    'SYNDICA_TRUST_STORE',
 )
 # 这些名字会让 Agent 的 git 重新用上配置、凭证、别的仓库或别的可执行文件，`pass_env` 同样不收。
 _GIT_REOPENERS = re.compile(
@@ -121,6 +122,8 @@ def agent_environment(
             'GH_CONFIG_DIR': str(gh_config),
             'GH_TOKEN': _NO_GH_LOGIN,
             'GH_ENTERPRISE_TOKEN': _NO_GH_LOGIN,
+            # Agent 里嵌套起来的 syndica 把信任记在这次 run 的临时目录里，碰不到用户的信任存储。
+            'SYNDICA_TRUST_STORE': str(scratch / 'trusted.json'),
         }
     )
     return AgentEnvironment(values=MappingProxyType(values), scratch=scratch)

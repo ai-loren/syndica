@@ -35,6 +35,7 @@ _COMMANDS = frozenset(
         'sessions',
         'flags',
         'modules',
+        'config',
         'doctor',
         'version',
         'trace',
@@ -129,6 +130,8 @@ class CliHost(Protocol):
     ) -> str: ...
 
     def active_agents(self) -> str: ...
+
+    def trust_config(self, config: str, sha256: str | None) -> str: ...
 
     def trace(self, request: TraceRequest) -> str | CliOutcome: ...
 
@@ -245,6 +248,10 @@ def _parser() -> _ArgumentParser:
     for action in ('show', 'resume', 'rm'):
         session_action = session_actions.add_parser(action)
         session_action.add_argument('name')
+    config = commands.add_parser('config')
+    config_actions = config.add_subparsers(dest='action', required=True)
+    trust = config_actions.add_parser('trust')
+    trust.add_argument('--sha256')
     doctor = commands.add_parser('doctor')
     doctor.add_argument(
         '--verify',
@@ -553,6 +560,8 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
             config=namespace.config,
         )
         return _host_call(lambda: host.inspect(request), streams)
+    if namespace.command == 'config':
+        return _host_call(lambda: host.trust_config(namespace.config, namespace.sha256), streams)
     if namespace.command == 'trace':
         keep: int | None = getattr(namespace, 'keep', None)
         trace_request = TraceRequest(

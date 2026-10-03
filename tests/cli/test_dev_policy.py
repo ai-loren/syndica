@@ -14,6 +14,7 @@ from syndica.cli.dev_module import DevModule
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, RunRequest
 from syndica.cli.policy import dev_danger_options, dev_guard_judge
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     ConfigError,
     ContextBlock,
@@ -78,6 +79,7 @@ def _run(
     path.write_text(config, encoding='utf-8')
     stdout = StringIO()
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(stdin), stdout=stdout, stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=root,
@@ -370,6 +372,7 @@ def test_a_chat_session_uses_the_same_policy_and_guard(tmp_path: Path) -> None:
     llm = _turns([_bash('bad', 'git push')], [_bash('read', 'cat /etc/hosts')])
     stdout = StringIO()
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO('approve\n'), stdout=stdout, stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=root,

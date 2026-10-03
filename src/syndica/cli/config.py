@@ -36,7 +36,14 @@ from syndica.kernel.hooks.junctions import MODULE_NAME
 from syndica.kernel.manifest import prompt_file
 from syndica.kernel.redaction import looks_secret
 
-__all__ = ['CliConfig', 'WorkspaceConfig', 'load_config']
+__all__ = [
+    'CliConfig',
+    'WorkspaceConfig',
+    'config_from_text',
+    'load_config',
+    'parse_yaml',
+    'yaml_file',
+]
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +173,7 @@ class CliConfig:
 
 def load_config(path: str | Path) -> CliConfig:
     """Load one YAML mapping and translate it to kernel values."""
-    file = _yaml_file(path)
+    file = yaml_file(path)
     try:
         text = file.read_text(encoding='utf-8')
     except (OSError, UnicodeError) as exc:
@@ -175,6 +182,11 @@ def load_config(path: str | Path) -> CliConfig:
             f'读取 {str(file)!r} 失败：{type(exc).__name__}: {exc}',
             '检查文件权限、路径与编码后重试；配置必须保存为 UTF-8',
         ) from exc
+    return config_from_text(file, text)
+
+
+def parse_yaml(file: Path, text: str) -> Mapping[str, object]:
+    """配置文件的根映射（已校验键与版本），不建任何 kernel 对象。"""
     try:
         raw = yaml.load(text, Loader=_UniqueSafeLoader)
     except yaml.YAMLError as exc:
@@ -185,10 +197,18 @@ def load_config(path: str | Path) -> CliConfig:
         ) from exc
     root = _root_mapping(raw, file)
     _version(root.get('version'), file)
+    return root
 
+
+def config_from_text(
+    file: Path, text: str, *, prompts: Mapping[int, str] | None = None
+) -> CliConfig:
+    """从已经读出的配置文本建配置。给了 `prompts`（agents 的序号 → 读好的提示词正文）时，提示词一律
+    按给出的正文、不再按路径读文件：读文件的那一方已经读过一次，摘要算的就是那一份（M4 D15）。"""
+    root = parse_yaml(file, text)
     catalog = AgentCatalog()
     register_builtins(catalog)
-    _load_agents(catalog, root.get('agents', ()), file)
+    _load_agents(catalog, root.get('agents', ()), file, prompts)
     topologies = _load_topologies(root.get('topologies', {}), catalog, file)
     return CliConfig(
         source=str(file),
@@ -486,7 +506,7 @@ def _strings(value: object, field: str) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _yaml_file(path: object) -> Path:
+def yaml_file(path: object) -> Path:
     if not isinstance(path, str | Path):
         raise _config(
             '配置路径是 .yaml / .yml 文件路径',
@@ -555,7 +575,9 @@ def _sequence(value: object, field: str) -> Sequence[object]:
     return cast(Sequence[object], value)
 
 
-def _load_agents(catalog: AgentCatalog, value: object, file: Path) -> None:
+def _load_agents(
+    catalog: AgentCatalog, value: object, file: Path, prompts: Mapping[int, str] | None
+) -> None:
     entries = _sequence(value, 'agents')
     names: list[str] = []
     for index, item in enumerate(entries):
@@ -571,12 +593,17 @@ def _load_agents(catalog: AgentCatalog, value: object, file: Path) -> None:
                 names.append(name)
         location = f'{str(file)}#agents[{index}]'
         origin = str(file.parent.resolve())
+        entry = cast(object, item)
         if isinstance(item, Mapping):
-            prompt = cast(Mapping[object, object], item).get('system_prompt')
-            _warn_if_a_path_went_missing(prompt, origin, location)
+            table = cast(Mapping[object, object], item)
+            _warn_if_a_path_went_missing(table.get('system_prompt'), origin, location)
+            if prompts is not None and index in prompts:
+                entry = {**table, 'system_prompt': prompts[index]}
         catalog.load_mapping(
-            cast(object, item),
-            source=ManifestSource(kind='yaml_file', location=location, origin=origin),
+            entry,
+            source=ManifestSource(
+                kind='yaml_file', location=location, origin=None if prompts is not None else origin
+            ),
         )
 
 

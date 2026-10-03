@@ -12,6 +12,8 @@ import re
 import secrets
 import shlex
 import signal
+import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -28,7 +30,7 @@ from typing import Any, TextIO, TypeVar, cast
 from syndica import __version__
 from syndica.cli.capture import frozen_role_policies, frozen_roles, host_profile
 from syndica.cli.checks import parse_check
-from syndica.cli.config import CliConfig, load_config
+from syndica.cli.config import CliConfig, load_config, yaml_file
 from syndica.cli.dev_module import DevLog, DevLogSnapshot, DevModule, last_answer
 from syndica.cli.environment import AgentEnvironment, agent_environment
 from syndica.cli.executor import DaemonExecutor
@@ -105,6 +107,15 @@ from syndica.cli.trace_commands import (
     trace_replay,
     trace_show,
     unusable_replay,
+)
+from syndica.cli.trust import (
+    ConfigSnapshot,
+    TrustGate,
+    TrustStore,
+    config_of,
+    describe,
+    read_snapshot,
+    within,
 )
 from syndica.kernel import (
     LLM,
@@ -1224,9 +1235,11 @@ class RuntimeCliHost:
         replayer: Replayer | None = None,
         exporter: TraceExporter | None = None,
         entry_points: EntryPointSource = no_entry_points,
+        trust: TrustGate,
     ) -> None:
         self._io = io
         self._entry_points = entry_points
+        self._trust = trust
         self._replayer = replayer
         self._exporter = exporter
         self._exports: list[_PendingExport] = []
@@ -1794,6 +1807,95 @@ class RuntimeCliHost:
             return _default_config(Path(path))
         return load_config(file)
 
+    def _trusted_config(self, path: str) -> CliConfig:
+        """run、chat、doctor 用的配置：工作区之内的那一份要先被信任（M4 D15）。工作区之外的是人
+        显式指过去的，Agent 碰不到。"""
+        file = self._workspace_root / path
+        if path == '.syndica.yaml' and not file.exists():
+            return _default_config(Path(path))
+        if self._trust.store_for is None or not within(file, self._workspace_root):
+            return load_config(file)
+        store = self._trust_store()
+        snapshot = self._snapshot(file)
+        config = config_of(snapshot)
+        if store.get(snapshot.path) != snapshot.digest:
+            self._confirm(snapshot, config)
+            store.put(snapshot.path, snapshot.digest)
+        if any(impl.files for impl in snapshot.impls) and sys.pycache_prefix is None:
+            # 工作区里种下的 `.pyc` 会被当成源文件的缓存：字节码改放到工作区之外。
+            sys.pycache_prefix = str(Path(tempfile.gettempdir()) / 'syndica-pycache')
+        return config
+
+    def _snapshot(self, file: Path) -> ConfigSnapshot:
+        return read_snapshot(yaml_file(file), self._workspace_root, discover(self._entry_points))
+
+    def _trust_store(self) -> TrustStore:
+        assert self._trust.store_for is not None
+        store = self._trust.store_for(self._environ)
+        if store is None:
+            raise _config_error(
+                '找得到放信任存储的地方',
+                'SYNDICA_TRUST_STORE、XDG_CONFIG_HOME 与 HOME 都没有设',
+                '设置 XDG_CONFIG_HOME（或 HOME）后重试',
+            )
+        if within(store.path, self._workspace_root):
+            raise _config_error(
+                '信任存储在工作区之外',
+                f'{one_line(str(store.path))} 在工作区之内，Agent 改得到它',
+                '把 XDG_CONFIG_HOME 或 SYNDICA_TRUST_STORE 指到工作区之外',
+            )
+        return store
+
+    def _confirm(self, snapshot: ConfigSnapshot, config: CliConfig) -> None:
+        """问人。只认交互终端：管道里的 `yes` 不算。提示与回答走 stderr，不混进 run 的答案。"""
+        shown = one_line(str(snapshot.path))
+        if not (self._io.stdin.isatty() and self._io.stderr.isatty()):
+            raise _config_error(
+                f'工作区之内的配置 {shown} 经人确认之后才用（第一次用或改过之后）',
+                f'它没有被信任（摘要 {snapshot.digest}），而 stdin / stderr 不是交互终端',
+                f'看过这份配置之后运行 syndica config trust --sha256 {snapshot.digest}，再重跑',
+            )
+        self._io.stderr.write(describe(snapshot, config) + '\n信任这份配置并继续？[y/N] ')
+        self._io.stderr.flush()
+        if self._lines.readline().strip().lower() not in {'y', 'yes'}:
+            raise _config_error(
+                f'确认之后才用 {shown}',
+                '回答不是 y',
+                '看过之后重跑并回答 y，或运行 syndica config trust',
+            )
+        again = self._snapshot(snapshot.path)
+        if again.digest != snapshot.digest:
+            raise _config_error(
+                '确认的那一份就是要用的那一份',
+                f'确认期间 {shown} 或它引用的文件变了',
+                '重跑这条命令，看过新的内容再确认',
+            )
+
+    def trust_config(self, config: str, sha256: str | None) -> str:
+        """`syndica config trust`：记下这份配置现在的摘要。非交互时必须给 `--sha256`，从拒绝消息里
+        抄来的摘要等于人读过。"""
+        file = yaml_file(self._workspace_root / config)
+        if not within(file, self._workspace_root):
+            return f'{one_line(str(file))} 在工作区之外，用它不需要信任确认'
+        if self._trust.store_for is None:
+            raise _config_error(
+                '宿主接着信任存储',
+                '这个宿主是不设信任闸构造的',
+                '用 syndica 命令行运行 config trust',
+            )
+        store = self._trust_store()
+        snapshot = self._snapshot(file)
+        if sha256 is None:
+            self._confirm(snapshot, config_of(snapshot))
+        elif sha256 != snapshot.digest:
+            raise _config_error(
+                '--sha256 是这份配置现在的摘要',
+                f'给的是 {one_line(sha256)}，现在是 {snapshot.digest}',
+                '配置在那之后变了：重新看一遍，再用新的摘要运行 syndica config trust --sha256',
+            )
+        store.put(snapshot.path, snapshot.digest)
+        return f'已信任 {one_line(str(snapshot.path))}（摘要 {snapshot.digest}）'
+
     def _open_workspace(self, config: CliConfig) -> tuple[LocalWorkspace, AgentEnvironment]:
         """run、chat、doctor 共用的入口：Agent 在哪条路径上都拿到同一份环境。"""
         environment = agent_environment(
@@ -1919,7 +2021,7 @@ class RuntimeCliHost:
     async def _doctor(self, path: str, *, verify: bool) -> CliOutcome:
         """D16：在 Agent 的环境里自检。git 与 python 两行只是情况说明；verify 用到的可执行文件跑不
         起来、`--verify` 里有命令没过，退出 1。"""
-        config = self._config(path)
+        config = self._trusted_config(path)
         workspace, environment = self._open_workspace(config)
         failed = False
         try:
@@ -2024,7 +2126,7 @@ class RuntimeCliHost:
     async def _open_chat(
         self, path: str, max_turns: int | None, *, trace: str | None, argv: Sequence[str]
     ) -> str:
-        config = self._config(path)
+        config = self._trusted_config(path)
         catalog = _turn_capped(config.catalog, max_turns)
         recording, redactor = await self._start_recording(config, trace, argv, path, chat=True)
         try:
@@ -2265,7 +2367,7 @@ class RuntimeCliHost:
         """一次 run 的回答，记成一个 trace（D15）。`logs` 收下这个 Runtime 的 `dev_log`（run 结束、
         Runtime 关掉之后照样能读），`stops` 收下根 Agent 的结局，`reports` 收下运行中的错误报告，
         `traces` 收下 trace 目录（相对工作区根）与它完不完整。"""
-        config = config or self._config(request.config)
+        config = config or self._trusted_config(request.config)
         recording, redactor = await self._start_recording(
             config, request.trace, request.argv, request.config, chat=False
         )
@@ -2484,7 +2586,7 @@ class RuntimeCliHost:
         """D13：锁住工作区 → 运行前快照 → run → 复核 → 写交接文件 → git 收尾 → 重写并打印。
         `verify`、`protected`、`pass_env` 都取开始时加载的配置：Agent 中途改 `.syndica.yaml`
         不影响。"""
-        config = self._config(request.config)
+        config = self._trusted_config(request.config)
         redactor = host_redactor(self._environ, config.redaction_rules)
         try:
             lock = lock_workspace(self._workspace_root)

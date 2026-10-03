@@ -405,8 +405,10 @@ OpenRouter 时）仍只收免费模型；平台没配置时报三件套（点名
     过它（`terminal_safe` 保留换行，多行配置值能伪造出一行假的确认，第二轮评审 H1 残留）。
   - 确认的提示与回答走 stderr（不混进 run 的答案，stdout 被重定向时也看得见，第二轮评审 M14）。
   - 只认人：答案必须来自交互终端（stdin 与 stderr 都是 TTY，管道里的 `yes` 不算）；非交互时拒绝并给出下一步
-    `syndica config trust --sha256 <摘要>`（摘要从拒绝消息里抄，等于人读过）。开发期守卫拦下 `syndica config trust`
-    与对信任存储路径的 shell 写入（尽力而为，同 git 写的守卫）。TTY 判定同样是尽力而为（`script` 之类的 pty 包装能
+    `syndica config trust --sha256 <摘要>`（摘要从拒绝消息里抄，等于人读过）。开发期守卫**不另加规则**：Agent
+    环境里的 `SYNDICA_TRUST_STORE` 让嵌套的 syndica 写临时存储，直接写用户信任存储的 shell 命令落在工作区之外，
+    已有的 `shell.path_outside_workspace` 要人确认（实现时的裁决：一条只靠文本匹配的新规则挡不住
+    `python -m syndica` 与 `python -c`，加了只多一张要维护的表）。TTY 判定同样是尽力而为（`script` 之类的 pty 包装能
     同时伪造 stdin 与 stderr，第三轮评审 M5），真正的隔离在 M5：宿主在 Agent 的环境里设 `SYNDICA_TRUST_STORE`
     指向这次 run 的临时目录，`pass_env` 拒收这个名字——Agent 里嵌套起来的 syndica 写的是那份，碰不到用户的信任存储。
   - 存储：`$XDG_CONFIG_HOME/syndica/trusted.json`（缺省 `~/.config/syndica/`），按配置文件的绝对路径记摘要；存储在
@@ -557,7 +559,7 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 - `.syndica.yaml` 的 `modules:` 在这里解析，只启用内置的（`retry`、`prefix-drift`）；第三方名字在 T9b 落地之前报
   「启用第三方 Module 要先有信任确认」（第三轮评审 M4：`modules list` 的状态与 T11 的摘要都要读它）。
 - 变异（安全）：`modules list` 触发 import 必须变红。
-#### T11 — 项目配置的信任确认（D15）
+#### T11 — 项目配置的信任确认（D15，完成）
 - 摘要的每一部分、只读一次与答后复查、终端转义、只认 TTY、`config trust --sha256`、开发期守卫拦下 `config trust`、
   存储不在工作区内、原子写入。
 - `config` 进命令表；`--config` 的字面缺省改为自动发现；提示与回答走 stderr；信任闸是宿主的必填参数。

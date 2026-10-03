@@ -16,6 +16,7 @@ import pytest
 import syndica.cli.host as host_module
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, CliOutcome, main
+from syndica.cli.trust import NO_TRUST_GATE, JsonTrustStore, read_snapshot
 from syndica.kernel import ScriptedLLM
 
 _SECRET = 'Zq9' + 'Lm4Xw7Pk2Rt8Vb5Nc3Jd6'
@@ -80,6 +81,7 @@ def _doctor(
     tmp_path: Path, root: Path, config: Path, *, verify: bool = False, **extra: str
 ) -> CliOutcome:
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: ScriptedLLM([]),
         workspace_root=root,
@@ -681,6 +683,7 @@ def test_the_cli_exits_1_when_a_check_fails(tmp_path: Path):
     stdout = StringIO()
     io = CliIO(stdin=StringIO(), stdout=stdout, stderr=StringIO())
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: ScriptedLLM([]),
         workspace_root=root,
@@ -734,6 +737,11 @@ def test_the_module_entrypoint_routes_verify(tmp_path: Path):
             'OPENAI_MODEL': 'm',
         }
     )
+    # 工作区里的配置要先被信任；存储放在工作区之外，这里替人记下它此刻的摘要。
+    store = tmp_path.parent / f'{tmp_path.name}-trusted.json'
+    config = tmp_path / '.syndica.yaml'
+    JsonTrustStore(store).put(config.resolve(), read_snapshot(config, tmp_path).digest)
+    env['SYNDICA_TRUST_STORE'] = str(store)
 
     done = subprocess.run(
         [sys.executable, '-m', 'syndica', 'doctor', '--verify'],

@@ -15,6 +15,7 @@ import pytest
 
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, InspectRequest, RunRequest, main
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     ConfigError,
     Context,
@@ -36,6 +37,7 @@ def test_run_request_uses_the_real_runtime_with_an_injected_model(
     llm = ScriptedLLM([ScriptedTurn(content='runtime completed')])
     io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO())
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -80,6 +82,7 @@ def test_run_request_answers_human_tools_through_the_runtime_mailbox(
     )
     stdout = StringIO()
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(
             stdin=StringIO('Loren\nbeta\n'),
             stdout=stdout,
@@ -130,6 +133,7 @@ def test_run_request_can_approve_one_dangerous_tool_call(
     )
     stdout = StringIO()
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO('approve\n'), stdout=stdout, stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -173,6 +177,7 @@ topologies:
         return ScriptedLLM([ScriptedTurn(content=content)])
 
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=model_factory,
         workspace_root=tmp_path,
@@ -208,6 +213,7 @@ def test_unsupported_or_invalid_run_options_fail_before_model_creation(
 ) -> None:
     calls: list[str] = []
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda name: calls.append(name) or ScriptedLLM([]),
         workspace_root=tmp_path,
@@ -249,6 +255,7 @@ topologies:
         encoding='utf-8',
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: ScriptedLLM([]),
         workspace_root=tmp_path,
@@ -309,6 +316,7 @@ topologies:
 def test_doctor_validates_config_models_and_workspace(tmp_path: Path) -> None:
     requested_models: list[str] = []
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda name: requested_models.append(name) or ScriptedLLM([]),
         workspace_root=tmp_path,
@@ -334,6 +342,7 @@ def test_chat_session_reuses_one_agent_and_lists_the_current_target(
         ]
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -372,6 +381,7 @@ def test_eof_aborts_a_pending_human_question(tmp_path: Path) -> None:
         ]
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -414,6 +424,7 @@ def test_a_human_input_failure_after_the_agent_finished_still_fails_the_run(
     llm = ScriptedLLM([ScriptedTurn(content='finished first')])
     _break_the_pump_once_the_agent_is_done(monkeypatch)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -445,6 +456,7 @@ def test_a_human_input_failure_while_the_agent_waits_is_reported_once(tmp_path: 
     )
     stderr = StringIO()
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=Broken(), stdout=StringIO(), stderr=stderr),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -470,6 +482,7 @@ def test_a_human_input_failure_does_not_replace_the_runs_own_error(
     monkeypatch.setattr(RuntimeCliHost, '_answer', failed)
     stderr = StringIO()
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -510,6 +523,7 @@ def test_eof_rejects_confirmation_without_executing_the_tool(tmp_path: Path) -> 
         ]
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -540,6 +554,7 @@ def test_max_turns_limits_the_selected_agent(tmp_path: Path) -> None:
         ]
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -556,6 +571,7 @@ def test_max_turns_limits_the_selected_agent(tmp_path: Path) -> None:
 def test_agent_error_is_reported_as_a_three_part_cli_failure(tmp_path: Path) -> None:
     llm = ScriptedLLM([ScriptedTurn(raises=RuntimeError('injected failure'))])
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -592,6 +608,7 @@ def test_agent_error_does_not_print_runtime_traceback_to_cli(
     )
     llm = ScriptedLLM([ScriptedTurn(raises=error)])
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -618,7 +635,9 @@ def test_a_root_agent_failing_on_a_syndica_error_shows_that_error_once(tmp_path:
     llm = ScriptedLLM([ScriptedTurn(raises=error)])
     stderr = StringIO()
     io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr)
-    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=tmp_path)
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE, io=io, model_factory=lambda _: llm, workspace_root=tmp_path
+    )
     try:
         code = main(['run', '--agent', 'Worker', 'fail'], host=host, io=io)
     finally:
@@ -661,7 +680,9 @@ def test_after_a_subagent_failed_the_roots_own_error_is_the_one_shown(tmp_path: 
     )
     stderr = StringIO()
     io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr)
-    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=tmp_path)
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE, io=io, model_factory=lambda _: llm, workspace_root=tmp_path
+    )
     try:
         code = main(['run', 'fail twice'], host=host, io=io)
     finally:
@@ -686,6 +707,7 @@ def test_a_chat_agent_failing_on_a_syndica_error_is_named_with_its_own_error(
     llm = ScriptedLLM([ScriptedTurn(raises=error)])
     stderr = StringIO()
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -740,7 +762,9 @@ _CHILD_ERROR = LLMResponseError(
 def _cli_run(tmp_path: Path, llm: ScriptedLLM, argv: list[str]) -> tuple[int, str]:
     stderr = StringIO()
     io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr)
-    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=tmp_path)
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE, io=io, model_factory=lambda _: llm, workspace_root=tmp_path
+    )
     try:
         code = main(argv, host=host, io=io)
     finally:
@@ -909,6 +933,7 @@ def test_a_chat_target_chosen_by_id_is_the_one_named(tmp_path: Path) -> None:
 
     llm = _PerAgentLLM(behave)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -939,6 +964,7 @@ topologies:
         encoding='utf-8',
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: ScriptedLLM([]),
         workspace_root=tmp_path,
@@ -985,6 +1011,7 @@ agents:
         ]
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda name: worker_llm if name == 'worker-model' else root_llm,
         workspace_root=tmp_path,
@@ -1022,6 +1049,7 @@ def test_chat_session_rejects_options_that_cannot_be_changed_after_spawn(
     changes: dict[str, object],
 ) -> None:
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: ScriptedLLM([ScriptedTurn(content='unused')]),
         workspace_root=tmp_path,
@@ -1064,6 +1092,7 @@ agents:
         ]
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -1110,6 +1139,7 @@ topologies:
         ]
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -1183,6 +1213,7 @@ def _child_id(root: ScriptedLLM, call: int) -> str:
 
 def _host(tmp_path: Path, models: dict[str, ScriptedLLM], stderr: StringIO) -> RuntimeCliHost:
     return RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
         model_factory=lambda name: models.get(name, models['default']),
         workspace_root=tmp_path,

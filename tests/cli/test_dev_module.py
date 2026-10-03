@@ -19,6 +19,7 @@ from syndica import __version__
 from syndica.cli.dev_module import AgentRun, DevLog, DevModule
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, RunRequest
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     AgentInfo,
     ConfigError,
@@ -547,6 +548,7 @@ def _run(
     path = tmp_path / 'syndica.yaml'
     path.write_text(config, encoding='utf-8')
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=workspace,

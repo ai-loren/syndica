@@ -13,6 +13,7 @@ import syndica.cli.host as host_module
 from syndica import __version__
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, RunRequest
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     ConfigError,
     ContextBlock,
@@ -73,6 +74,7 @@ def _run(
     path = tmp_path / 'syndica.yaml'
     path.write_text(config, encoding='utf-8')
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=root,
@@ -244,6 +246,7 @@ def test_a_session_cannot_be_turned_read_only(tmp_path: Path) -> None:
     llm = ScriptedLLM([ScriptedTurn(content='never')])
     root = _workspace(tmp_path)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=root,

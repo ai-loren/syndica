@@ -286,6 +286,21 @@ names an existing file is read as well, so a typo in it would silently become th
 warns when a single-word string that looks like a path names no file. `model` takes the
 `<platform>:<model>` form described under Retries and several platforms.
 
+A `.syndica.yaml` inside the workspace is untrusted input: an agent can edit it, and it decides
+which commands run and which code loads. `run`, `chat`, and `doctor` therefore ask you to confirm
+it the first time and after every change, showing the prompt files, `impl:` classes, verify
+commands, `pass_env`, models, modules, and safety settings it would use; nothing in it runs before
+you answer `y` on a terminal. The confirmation covers the bytes of the configuration and of every
+prompt file it reads, and the whole package of an `impl:` class kept inside the workspace (code
+installed elsewhere is named but not covered). Where no terminal is available, review the
+configuration and run `syndica config trust --sha256 <digest>` with the digest from the refusal.
+Confirmations live in `$XDG_CONFIG_HOME/syndica/trusted.json` (default `~/.config/syndica/`),
+never inside the workspace; an agent's own `syndica` writes to a store in its scratch directory
+instead. A configuration outside the workspace, passed with `--config`, needs no confirmation.
+
+`modules:` enables optional modules in the order written; `syndica modules list` shows which ones
+exist and where they come from without importing any of them.
+
 `danger.roles` gives a role a stricter disposition than the development table every run uses:
 `rules` raises single rules to `confirm` or `block`, and `policy: block_high_risk` blocks every
 high-risk rule. A project configuration can only tighten: `allow`, `allow_all`, and anything looser
@@ -495,6 +510,8 @@ syndica chat [--max-turns <n>] [--trace <level>]
 syndica agents list | show <name>
 syndica topology list | show <name>
 syndica flags list | show <key>
+syndica modules list | show <name>
+syndica config trust [--sha256 <digest>]
 syndica sessions list | show <id> | resume <id> | rm <id>   # reserved for M6
 syndica doctor [--verify]
 syndica trace list | show <id> | replay <id> [--allow-divergence]

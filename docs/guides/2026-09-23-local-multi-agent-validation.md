@@ -89,6 +89,9 @@ unset OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY SYNDICA_LLM_ORDER
 uv run python -m syndica doctor
 ```
 
+工作区里的 `.syndica.yaml` 第一次用（以及每次改过之后）会先列出它要用的提示词文件、`impl:`、verify 命令与模型，
+等你在终端里回答 `y`；不在终端里时它拒绝并给出 `syndica config trust --sha256 <摘要>`，看过配置之后照着跑一次即可。
+
 符合预期：
 
 ```text

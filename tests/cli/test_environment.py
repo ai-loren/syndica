@@ -15,6 +15,7 @@ import pytest
 from syndica.cli.environment import FIXED_PASS_ENV, agent_environment
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, RunRequest
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import ConfigError, ScriptedLLM, ScriptedTurn, ToolCall
 
 _SECRETS = {
@@ -27,7 +28,7 @@ _SECRETS = {
 _WHITELIST = ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR']
 _WHITELIST += ['XDG_CACHE_HOME', 'UV_CACHE_DIR']
 _HOST_SET = ['GIT_TERMINAL_PROMPT', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GH_CONFIG_DIR']
-_HOST_SET += ['GH_TOKEN', 'GH_ENTERPRISE_TOKEN']
+_HOST_SET += ['GH_TOKEN', 'GH_ENTERPRISE_TOKEN', 'SYNDICA_TRUST_STORE']
 _HOST_ENV = {
     **os.environ,
     'LANG': 'C.UTF-8',
@@ -77,6 +78,7 @@ def _probing_llm(command: str = _PROBE) -> ScriptedLLM:
 
 def _host(tmp_path: Path, llm: ScriptedLLM) -> RuntimeCliHost:
     return RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path / 'ws',
@@ -387,6 +389,7 @@ def test_chat_still_cleans_up_after_reading_human_input_failed(tmp_path: Path) -
         ]
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=_BrokenStdin(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path / 'ws',
@@ -407,6 +410,7 @@ def _no_model(name: str) -> ScriptedLLM:
 def test_a_failing_model_factory_leaves_no_scratch_behind(tmp_path: Path, path: str) -> None:
     config = _config(tmp_path)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=_no_model,
         workspace_root=tmp_path / 'ws',
@@ -429,6 +433,7 @@ def test_a_missing_workspace_root_is_reported_and_leaves_no_scratch_behind(
 ) -> None:
     config = _config(tmp_path)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: _probing_llm(),
         workspace_root=tmp_path / 'missing',

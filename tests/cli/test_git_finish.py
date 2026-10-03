@@ -42,6 +42,7 @@ from syndica.cli.git_finish import (
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.host_git import Change, HostGit
 from syndica.cli.main import CliIO, main
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import ContextBlock, RuleRedactor, ScriptedLLM, ScriptedTurn, ToolCall
 
 _SECRET = 'Zq9' + 'Lm4Xw7Pk2Rt8Vb5Nc3Jd6'
@@ -235,6 +236,7 @@ def _run(
         stdin=StringIO(stdin) if isinstance(stdin, str) else stdin, stdout=stdout, stderr=stderr
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: model,
         workspace_root=root,
@@ -1502,7 +1504,9 @@ def test_without_verify_a_reviewer_pass_is_not_enough(tmp_path: Path):
 def test_git_mode_requires_handoff_and_refuses_no_write(tmp_path: Path, mode: str):
     stderr = StringIO()
     io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr)
-    host = RuntimeCliHost(io=io, model_factory=lambda _: ScriptedLLM([]), workspace_root=tmp_path)
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE, io=io, model_factory=lambda _: ScriptedLLM([]), workspace_root=tmp_path
+    )
     try:
         alone = main(['run', '--git-mode', mode, 'x'], host=host, io=io)
         read_only = main(

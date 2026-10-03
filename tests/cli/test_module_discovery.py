@@ -21,6 +21,7 @@ from syndica.cli.modules import (
     module_rows,
     validated_modules,
 )
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import ConfigError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -173,6 +174,7 @@ def test_malformed_module_lists_are_refused(tmp_path: Path, body: str, anchor: s
 def _host(tmp_path: Path, *entries: _EntryPoint) -> tuple[RuntimeCliHost, CliIO]:
     io = CliIO(stdin=StringIO(''), stdout=StringIO(), stderr=StringIO())
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: None,  # pyright: ignore[reportArgumentType]
         workspace_root=tmp_path,

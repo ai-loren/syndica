@@ -24,6 +24,7 @@ import yaml
 
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, main
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import ContextBlock, LLMConfig, ScriptedLLM, ScriptedTurn, ToolCall
 
 REPO = Path(__file__).resolve().parents[2]
@@ -173,7 +174,11 @@ def _cli(tmp_path: Path, llm: Any, root: Path, argv: list[str], *, stdin: str = 
     stdout, stderr = StringIO(), StringIO()
     io = CliIO(stdin=StringIO(stdin), stdout=stdout, stderr=stderr)
     host = RuntimeCliHost(
-        io=io, model_factory=lambda _: llm, workspace_root=root, environ=_env(tmp_path)
+        trust=NO_TRUST_GATE,
+        io=io,
+        model_factory=lambda _: llm,
+        workspace_root=root,
+        environ=_env(tmp_path),
     )
     try:
         code = main(argv, host=host, io=io)

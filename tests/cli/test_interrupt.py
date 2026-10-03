@@ -30,6 +30,7 @@ from syndica.cli.host import (
     _Lines,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.cli.main import CliIO
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import FileTraceStore, ScriptedLLM, SpanStatus, TraceHeader
 
 _DRIVER = """
@@ -1069,7 +1070,11 @@ def test_a_second_ctrl_c_while_main_reports_the_first_still_exits_130(
 def _closing_host(tmp_path: Path) -> RuntimeCliHost:
     io = CliIO(stdin=StringIO(''), stdout=StringIO(), stderr=StringIO())
     return RuntimeCliHost(
-        io=io, model_factory=lambda _: ScriptedLLM([]), workspace_root=tmp_path, environ={}
+        trust=NO_TRUST_GATE,
+        io=io,
+        model_factory=lambda _: ScriptedLLM([]),
+        workspace_root=tmp_path,
+        environ={},
     )
 
 

@@ -22,6 +22,7 @@ from syndica.cli.handoff import trace_directory
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, TraceRequest, main
 from syndica.cli.trace_commands import Replayer, TraceUnusable, resolved, trace_list
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     ContractViolation,
     FileTraceStore,
@@ -55,6 +56,7 @@ def _cli(
     stdout, stderr = StringIO(), StringIO()
     io = CliIO(stdin=StringIO(''), stdout=stdout, stderr=stderr)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: _model(llm),
         workspace_root=root,
@@ -842,6 +844,7 @@ def test_a_host_asked_about_a_trace_without_its_id_says_what_is_missing(
     _worker_run(tmp_path)
     io = CliIO(stdin=StringIO(''), stdout=StringIO(), stderr=StringIO())
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: _model(None),
         workspace_root=tmp_path,

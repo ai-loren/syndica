@@ -24,6 +24,7 @@ from syndica.cli.host import (
 )
 from syndica.cli.main import CliIO, RunRequest, main
 from syndica.cli.recording import run_status, trace_level
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     ConfigError,
     ContextBlock,
@@ -61,6 +62,7 @@ def _cli(
     stdout, stderr = StringIO(), StringIO()
     io = CliIO(stdin=StringIO(stdin), stdout=stdout, stderr=stderr)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: llm,
         workspace_root=tmp_path,
@@ -298,6 +300,7 @@ def test_a_chat_session_trace_ends_when_the_host_closes(
 
 def test_a_turn_in_an_open_session_cannot_change_the_trace_level(tmp_path: Path):
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: _done(),
         workspace_root=tmp_path,
@@ -459,7 +462,9 @@ def test_a_chat_trace_that_fails_as_the_host_closes_reports_on_the_hosts_stderr(
     stderr = StringIO()
     io = CliIO(stdin=StringIO('hello\n'), stdout=StringIO(), stderr=stderr)
     llm = ScriptedLLM([ScriptedTurn(content='hi')])
-    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=tmp_path)
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE, io=io, model_factory=lambda _: llm, workspace_root=tmp_path
+    )
     locked: list[Path] = []
     try:
         code = main(['chat'], host=host, io=io)
@@ -561,6 +566,7 @@ def test_a_chat_that_ends_on_a_failed_turn_ends_its_trace_in_error(tmp_path: Pat
 
 def test_a_trace_level_the_host_does_not_know_is_refused_before_the_run(tmp_path: Path):
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: _done(),
         workspace_root=tmp_path,
@@ -667,6 +673,7 @@ async def test_a_second_interruption_while_the_trace_finishes_does_not_lose_its_
     tmp_path: Path,
 ):
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: _done(),
         workspace_root=tmp_path,
@@ -699,6 +706,7 @@ def test_a_failed_turn_followed_by_a_good_one_ends_the_chat_trace_ok(tmp_path: P
         ]
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: llm,
         workspace_root=tmp_path,

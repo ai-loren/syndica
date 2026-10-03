@@ -28,6 +28,7 @@ from syndica.cli.export import TraceExporter
 from syndica.cli.handoff import trace_directory
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, TraceRequest, main
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     ConfigError,
     ContextBlock,
@@ -126,6 +127,7 @@ def _cli(
     stdout, stderr = StringIO(), StringIO()
     io = CliIO(stdin=StringIO(''), stdout=stdout, stderr=stderr)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: llm or _llm(),
         workspace_root=root,
@@ -1130,6 +1132,7 @@ def test_a_chat_session_is_exported_when_the_host_closes(tmp_path: Path):
     stdout, stderr = StringIO(), StringIO()
     io = CliIO(stdin=StringIO('hello\n'), stdout=stdout, stderr=stderr)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: ScriptedLLM([ScriptedTurn(content='hi')]),
         workspace_root=tmp_path,
@@ -1177,6 +1180,7 @@ def test_a_collector_name_that_takes_forever_to_resolve_cannot_keep_the_host_fro
     stdout, stderr = StringIO(), StringIO()
     io = CliIO(stdin=StringIO(''), stdout=stdout, stderr=stderr)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: _llm(),
         workspace_root=tmp_path,

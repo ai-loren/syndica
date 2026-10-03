@@ -27,6 +27,7 @@ import pytest
 import syndica.cli.host as host_module
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, main
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     ContextBlock,
     FileTraceStore,
@@ -128,6 +129,7 @@ def _cli(tmp_path: Path, llm: Any, argv: list[str], *, stdin: str = '') -> tuple
     stdout, stderr = StringIO(), StringIO()
     io = CliIO(stdin=StringIO(stdin), stdout=stdout, stderr=stderr)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: llm,
         workspace_root=tmp_path,

@@ -367,6 +367,7 @@ class _LazyHost:
         if self._host is None:
             from syndica.cli.host import RuntimeCliHost
             from syndica.cli.modules import installed_entry_points
+            from syndica.cli.trust import real_trust_gate
 
             self._host = RuntimeCliHost(
                 io=self._io,
@@ -375,6 +376,7 @@ class _LazyHost:
                 replayer=_replay_document,
                 exporter=_export_trace,
                 entry_points=installed_entry_points,
+                trust=real_trust_gate(),
             )
         return self._host
 
@@ -383,6 +385,9 @@ class _LazyHost:
 
     def inspect(self, request: InspectRequest) -> str:
         return self._get().inspect(request)
+
+    def trust_config(self, config: str, sha256: str | None) -> str:
+        return self._get().trust_config(config, sha256)
 
     def doctor(self, config: str, *, verify: bool = False) -> str | CliOutcome:
         return self._get().doctor(config, verify=verify)

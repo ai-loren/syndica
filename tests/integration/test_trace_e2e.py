@@ -31,6 +31,7 @@ import syndica.__main__ as entry
 from syndica.cli.handoff import trace_directory
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, main
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     BaseAgent,
     ContextBlock,
@@ -151,6 +152,7 @@ def _cli(
     stdout, stderr = StringIO(), StringIO()
     io = CliIO(stdin=StringIO(stdin), stdout=stdout, stderr=stderr)
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda _: llm,
         workspace_root=root,

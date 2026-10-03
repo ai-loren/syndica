@@ -14,6 +14,7 @@ from syndica.cli.config import load_config
 from syndica.cli.handoff import commit_title, marker_verdict, protected_matcher
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, main
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     AgentOptions,
     EventBus,
@@ -222,7 +223,9 @@ def test_each_role_has_exactly_its_tools(frozen: dict[str, AgentOptions]):
 def test_the_topology_is_exactly_one_root_singleton_orchestrator_slot():
     stdout = StringIO()
     io = CliIO(stdin=StringIO(), stdout=stdout, stderr=StringIO())
-    host = RuntimeCliHost(io=io, model_factory=lambda _: ScriptedLLM([]), workspace_root=REPO)
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE, io=io, model_factory=lambda _: ScriptedLLM([]), workspace_root=REPO
+    )
     try:
         code = main(['--config', str(CONFIG), 'topology', 'show', 'syndica-dev'], host=host, io=io)
     finally:
@@ -260,7 +263,10 @@ def test_relative_config_paths_belong_to_the_workspace_not_the_process_cwd(
         stdout = StringIO()
         io = CliIO(stdin=StringIO(), stdout=stdout, stderr=StringIO())
         host = RuntimeCliHost(
-            io=io, model_factory=lambda _: ScriptedLLM([]), workspace_root=workspace
+            trust=NO_TRUST_GATE,
+            io=io,
+            model_factory=lambda _: ScriptedLLM([]),
+            workspace_root=workspace,
         )
         try:
             assert main([*argv, 'agents', 'list'], host=host, io=io) == 0
@@ -273,6 +279,7 @@ def test_relative_config_paths_belong_to_the_workspace_not_the_process_cwd(
 
     (workspace / '.syndica.yaml').write_text('version: 1\n', encoding='utf-8')
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: ScriptedLLM([]),
         workspace_root=workspace,

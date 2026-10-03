@@ -65,6 +65,8 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
     # 看，或者由 `write_redacted` 在运行时查过类型。
     'kernel/redaction.py': ('os.write',),
     'kernel/tools/local.py': ('write_text',),
+    # 信任存储：配置文件的绝对路径与它们的摘要，不含密钥；写在工作区之外（M4 D15）。
+    'cli/trust.py': ('write_text',),
 }
 
 _CONTENT_METHODS = frozenset({'write_text', 'write_bytes'})

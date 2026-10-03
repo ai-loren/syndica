@@ -7,6 +7,7 @@ from pathlib import Path
 
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, main
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import ScriptedLLM, ScriptedTurn, ToolCall
 from syndica.runner import ScenarioRunner, load_scenario
 
@@ -123,6 +124,7 @@ agents:
         stderr=stderr,
     )
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=io,
         model_factory=lambda name: worker_llm if name == 'worker-model' else root_llm,
         workspace_root=tmp_path,

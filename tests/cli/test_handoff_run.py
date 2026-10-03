@@ -22,6 +22,7 @@ import syndica.cli.host as host_module
 from syndica.cli.handoff import lock_workspace
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, RunRequest, main
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import ConfigError, LLMResponseError, ScriptedLLM, ScriptedTurn, ToolCall
 
 _SECRET = 'Zq9' + 'Lm4Xw7Pk2Rt8Vb5Nc3Jd6'
@@ -140,7 +141,11 @@ def _run(
     stdout, stderr = StringIO(), StringIO()
     io = CliIO(stdin=StringIO(stdin), stdout=stdout, stderr=stderr)
     host = RuntimeCliHost(
-        io=io, model_factory=lambda _: llm, workspace_root=root, environ=_env(tmp_path)
+        trust=NO_TRUST_GATE,
+        io=io,
+        model_factory=lambda _: llm,
+        workspace_root=root,
+        environ=_env(tmp_path),
     )
     try:
         code = main(
@@ -208,7 +213,11 @@ def test_a_topology_run_hands_off_like_a_single_agent_run(tmp_path: Path):
     io = CliIO(stdin=StringIO(''), stdout=stdout, stderr=stderr)
     llm = _reviewed()
     host = RuntimeCliHost(
-        io=io, model_factory=lambda _: llm, workspace_root=root, environ=_env(tmp_path)
+        trust=NO_TRUST_GATE,
+        io=io,
+        model_factory=lambda _: llm,
+        workspace_root=root,
+        environ=_env(tmp_path),
     )
     try:
         code = main(
@@ -243,7 +252,11 @@ def test_a_topology_root_that_runs_out_of_turns_is_a_failed_run(tmp_path: Path):
     stdout = StringIO()
     io = CliIO(stdin=StringIO(''), stdout=stdout, stderr=StringIO())
     host = RuntimeCliHost(
-        io=io, model_factory=lambda _: llm, workspace_root=root, environ=_env(tmp_path)
+        trust=NO_TRUST_GATE,
+        io=io,
+        model_factory=lambda _: llm,
+        workspace_root=root,
+        environ=_env(tmp_path),
     )
     try:
         code = main(
@@ -371,7 +384,9 @@ def test_outside_git_the_handoff_says_why_it_cannot_list_changes(tmp_path: Path)
     stdout, stderr = StringIO(), StringIO()
     io = CliIO(stdin=StringIO(), stdout=stdout, stderr=stderr)
     llm = _reviewed()
-    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=root, environ=env)
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE, io=io, model_factory=lambda _: llm, workspace_root=root, environ=env
+    )
     try:
         code = main(
             [
@@ -1114,6 +1129,7 @@ def test_a_verify_run_of_pytest_that_prints_no_summary_does_not_pass(tmp_path: P
 
 def test_the_host_refuses_a_handoff_for_a_session_on_its_own(tmp_path: Path):
     host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
         io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
         model_factory=lambda _: ScriptedLLM([]),
         workspace_root=_workspace(tmp_path),
@@ -1166,7 +1182,13 @@ def test_a_model_that_fails_outright_still_leaves_a_run_failed_handoff(tmp_path:
     def broken(name: str) -> ScriptedLLM:
         raise RuntimeError('provider down \x1b]0;pwned\x07')
 
-    host = RuntimeCliHost(io=io, model_factory=broken, workspace_root=root, environ=_env(tmp_path))
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
+        io=io,
+        model_factory=broken,
+        workspace_root=root,
+        environ=_env(tmp_path),
+    )
     try:
         code = main(
             ['--config', str(_config(tmp_path)), 'run', '--handoff', '--agent', 'Lead', 'go'],
@@ -1334,7 +1356,13 @@ def test_verification_runs_in_the_agents_environment_not_the_hosts(tmp_path: Pat
     io = CliIO(stdin=StringIO(), stdout=stdout, stderr=stderr)
     llm = _reviewed()
     environ = {**_env(tmp_path), 'DEPLOY_REGION': 'host-only'}
-    host = RuntimeCliHost(io=io, model_factory=lambda _: llm, workspace_root=root, environ=environ)
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
+        io=io,
+        model_factory=lambda _: llm,
+        workspace_root=root,
+        environ=environ,
+    )
     config = _config(tmp_path, verify=['test -n "$DEPLOY_REGION"'])
     try:
         code = main(
