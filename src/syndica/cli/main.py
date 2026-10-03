@@ -384,6 +384,14 @@ def _host_call(action: Callable[[], str | CliOutcome], streams: CliIO) -> int:
     return outcome.exit_code
 
 
+def _redacted(text: str) -> str:
+    """没被宿主接住的异常文字可能出自第三方代码：按内置规则脱敏再显示。内核只在出错时才 import：
+    `version` 命令不加载内核。"""
+    from syndica.kernel import RuleRedactor
+
+    return str(RuleRedactor().redact(text))
+
+
 def _host_failure(exc: Exception, streams: CliIO) -> int:
     parts = (
         getattr(exc, 'expected', None),
@@ -393,9 +401,16 @@ def _host_failure(exc: Exception, streams: CliIO) -> int:
     if all(isinstance(part, str) and part.strip() for part in parts):
         expected, received, next_action = parts
     else:
+        notes = [str(note) for note in getattr(exc, '__notes__', ())]
         expected = 'CLI host 完成当前命令'
-        received = f'{type(exc).__name__}: {exc}'
-        next_action = '检查 Runtime host 配置和错误日志后重试'
+        received = _redacted(
+            f'{type(exc).__name__}: {exc}' + ''.join(f'（{note}）' for note in notes)
+        )
+        next_action = (
+            '修好上面说的那个 Runtime Module，或从配置的 modules 里删掉它，再重跑'
+            if any('Runtime Module' in note for note in notes)
+            else '检查 Runtime host 配置和错误日志后重试'
+        )
     text = f'期望: {expected}\n实际: {received}\n下一步: {next_action}'
     # 宿主可以给一行说明放在三件套前面（比如是哪个 Agent 以错误结束）。
     headline = getattr(exc, 'headline', None)

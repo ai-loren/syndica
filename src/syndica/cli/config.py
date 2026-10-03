@@ -559,7 +559,7 @@ def _root_mapping(value: object, file: Path) -> Mapping[str, object]:
         raise _config(
             '配置根是 Mapping，至少含 version: 1',
             f'{str(file)!r} 的根是 {type(value).__name__}：{value!r}',
-            '把文件改成 version / agents / topologies / workspace / redaction 组成的单个 YAML 对象',
+            f'把文件改成由 {" / ".join(sorted(_ROOT_KEYS))} 组成的单个 YAML 对象',
         )
     root = cast(Mapping[object, object], value)
     non_strings = [key for key in root if not isinstance(key, str)]
@@ -567,7 +567,7 @@ def _root_mapping(value: object, file: Path) -> Mapping[str, object]:
         raise _config(
             '配置根的键都是字符串',
             f'非字符串键为 {non_strings!r}',
-            '把这些键改成 version / agents / topologies / workspace / redaction 中的字符串',
+            f'把这些键改成 {" / ".join(sorted(_ROOT_KEYS))} 之一',
         )
     unknown = [str(key) for key in root if key not in _ROOT_KEYS]
     _refuse_export_settings(unknown, '配置根')

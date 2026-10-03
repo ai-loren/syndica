@@ -232,8 +232,8 @@ def test_flags_list_the_agents_tools_and_the_trace_name_the_same_declaration_and
     _cli(workspace, ['run'], _greet_llm())
 
     assert code == 0
-    [row] = [line for line in listed.splitlines() if 'example_greeting' in line]
-    assert 'example' in row
+    [row] = [line for line in listed.splitlines() if line.startswith('example_greeting\t')]
+    assert row.split('\t')[1] == 'example'
     store = FileTraceStore(workspace / '.syndica' / 'traces')
 
     async def read() -> tuple[list[Any], str | None]:

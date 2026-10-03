@@ -1756,3 +1756,10 @@ async def test_duplicate_id_register_failure_does_not_delete_the_existing_agent(
         await broker.remove_queue(agent.agent_id)
         await registry.unregister(agent.agent_id)
         await runtime.shutdown()
+
+
+@pytest.mark.parametrize('key', [' alpha_x', 'alpha_x ', 'alpha_x\n', 'alpha _x'], ids=repr)
+def test_a_flag_key_with_whitespace_is_refused_not_stripped(key: str):
+    with pytest.raises(ConfigError) as excinfo:
+        FlagDeclaration(key=key, default=0, description='d')
+    assert repr(key) in excinfo.value.received

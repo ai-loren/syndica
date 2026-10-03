@@ -12,7 +12,7 @@ import json
 from collections.abc import Iterable, Mapping, Sequence
 
 from syndica.cli.terminal import one_line
-from syndica.kernel import ConfigError, FlagDeclaration, FlagRow
+from syndica.kernel import ConfigError, FlagDeclaration, FlagRow, FlagValue
 
 __all__ = [
     'FlagValue',
@@ -23,8 +23,6 @@ __all__ = [
     'render_reference',
     'resolved_flags',
 ]
-
-FlagValue = bool | int | str
 
 # 项目配置只能收紧的 Flag → 它在配置里能取的值。
 _CONFIG_TIGHTENS: Mapping[str, frozenset[FlagValue]] = {

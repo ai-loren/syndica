@@ -1076,3 +1076,25 @@ def test_module_entrypoint_requires_an_openrouter_key_when_its_model_is_configur
     assert completed.returncode == 1
     assert completed.stdout == ''
     assert 'OPENROUTER_API_KEY' in completed.stderr
+
+
+def test_an_error_a_module_raised_names_the_module_and_hides_secret_shaped_text() -> None:
+    class FailingHost(_Host):
+        def run_request(self, request: RunRequest) -> str:
+            error = ValueError('database unreachable (token=sk-abcdefghijklmnopqrstuvwx1234)')
+            error.add_note("Runtime Module 'svcfail' 的 service 'svcfail_db' 抛出了它")
+            raise error
+
+    stderr = StringIO()
+
+    code = main(
+        ['run', 'go'],
+        host=FailingHost(),
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
+    )
+
+    text = stderr.getvalue()
+    assert code == 1
+    assert "（Runtime Module 'svcfail' 的 service 'svcfail_db' 抛出了它）" in text
+    assert 'sk-abcdefghijklmnopqrstuvwx1234' not in text
+    assert '从配置的 modules 里删掉它' in text

@@ -85,6 +85,7 @@ from syndica.cli.modules import (
     load_module,
     module_rows,
     no_entry_points,
+    runs_code,
     third_party,
     validated_modules,
 )
@@ -341,13 +342,20 @@ def _agent_modules(
     return (*_modules(), *configured, *read_only, DevModule(workspace_root, environ))
 
 
-def _runs_code(module: RuntimeModule) -> bool:
-    return bool(
-        module.services
-        or module.on_start is not None
-        or module.on_shutdown is not None
-        or module.agent_plugins
-        or module.tool_factories
+def _shutdown_failure(error: Exception) -> str:
+    parts: tuple[BaseException, ...] = (
+        tuple(cast('BaseExceptionGroup[BaseException]', error).exceptions)
+        if isinstance(error, BaseExceptionGroup)
+        else (error,)
+    )
+    described = '；'.join(
+        f'{type(part).__name__}: {part}'
+        + ''.join(f'（{note}）' for note in getattr(part, '__notes__', ()))
+        for part in parts
+    )
+    return (
+        f'期望: Runtime 关闭时每个 Module 的 on_shutdown 都正常结束。 实际: {described}。'
+        ' 下一步: 修好那个 Module 的 on_shutdown，或从 modules 里删掉它；这次 run 的结论照常交出。'
     )
 
 
@@ -1360,6 +1368,7 @@ class RuntimeCliHost:
                     replayer=self._replayer,
                     allow_divergence=request.allow_divergence,
                     recorder=recorder,
+                    config_file=self._config_file(request.config),
                 )
         finally:
             if recorder is not None:
@@ -1483,7 +1492,7 @@ class RuntimeCliHost:
         blocking = [
             module.name
             for module in modules
-            if module.name in third and not module.replay_safe and _runs_code(module)
+            if module.name in third and not module.replay_safe and runs_code(module)
         ]
         if blocking:
             return (
@@ -1552,7 +1561,7 @@ class RuntimeCliHost:
                 config = self._trusted_config(request.config)
                 _require_enabled(name, config)
             module = self._loaded(config, (name,))[0]
-        return json.dumps(_manifest(module), ensure_ascii=False, indent=2)
+        return terminal_safe(json.dumps(_manifest(module), ensure_ascii=False, indent=2))
 
     def _code_inside(self, target: str) -> bool:
         """入口点的代码在不在工作区之内；认不出位置的按在里面算。"""
@@ -1612,7 +1621,9 @@ class RuntimeCliHost:
         )
         source = 'flags:' if row.key in resolved else '缺省'
         effective = resolved.get(row.key, row.default)
-        return json.dumps(flag_details(row, effective, source), ensure_ascii=False, indent=2)
+        return terminal_safe(
+            json.dumps(flag_details(row, effective, source), ensure_ascii=False, indent=2)
+        )
 
     def _builtin_modules(self) -> tuple[RuntimeModule, ...]:
         return (
@@ -2696,7 +2707,16 @@ class RuntimeCliHost:
                         tracer.interrupted()
                     raise
                 finally:
-                    await runtime.shutdown()
+                    try:
+                        await runtime.shutdown()
+                    except Exception as error:
+                        # Module 的 on_shutdown 坏了不改 run 的结论：答案已经算出来，丢掉它不比
+                        # 报出来更有用。
+                        self._warn(
+                            host_redactor(self._environ, config.redaction_rules).redact(
+                                _shutdown_failure(error)
+                            )
+                        )
                     # Runtime 关了，泵即使收到答复也送不出去；它可能正等着人敲回车（被 Ctrl-C 取消、
                     # 问题已经超时而 Agent 先结束），不取消就一直等下去。
                     if not pump.done():

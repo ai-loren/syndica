@@ -12,7 +12,8 @@ import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from syndica.cli.modules import EntryPointSource, discover, load_module
+from syndica.cli.modules import EntryPointSource, discover, load_module, runs_code
+from syndica.cli.terminal import one_line
 from syndica.cli.trust import (
     JsonTrustStore,
     PinnedImports,
@@ -31,27 +32,39 @@ _TRUST = '先在这个工作区运行 syndica config trust（或 run / doctor �
 
 
 def module_rebuilder(
-    *, workspace_root: Path, environ: Mapping[str, str], entry_points: EntryPointSource
+    *,
+    workspace_root: Path,
+    environ: Mapping[str, str],
+    entry_points: EntryPointSource,
+    config_file: Path | None = None,
 ) -> Callable[[ModuleRecord, ModuleHost], RuntimeModule | str]:
-    """回放用的判据：交回重建好的 Module，或一句为什么不重建（带上下一步）。"""
+    """回放用的判据：交回重建好的 Module，或一句为什么不重建（带上下一步）。`config_file` 是
+    `trace replay --config` 给的那份，缺省是工作区的 `.syndica.yaml`；与 run 一样，工作区之内的要被
+    信任，工作区之外的是人显式指过去的。"""
 
     def rebuild(record: ModuleRecord, host: ModuleHost) -> RuntimeModule | str:
-        config_file = workspace_root / '.syndica.yaml'
+        config = config_file or workspace_root / '.syndica.yaml'
+        shown = one_line(config.name if within(config, workspace_root) else str(config))
+        if not config.is_file():
+            return f'这个工作区没有 {shown}：{_TRUST}'
+        inside = within(config, workspace_root)
         trusted = store_path(environ)
-        if trusted is None or not config_file.is_file():
-            return f'这个工作区没有受信任的 .syndica.yaml：{_TRUST}'
-        if within(trusted, workspace_root):
+        if inside and trusted is None:
+            return f'这个工作区没有受信任的 {shown}：{_TRUST}'
+        if inside and trusted is not None and within(trusted, workspace_root):
             return (
                 f'信任存储 {trusted} 在工作区之内，Agent 改得到它：'
                 '把 XDG_CONFIG_HOME 或 SYNDICA_TRUST_STORE 指到工作区之外再回放'
             )
         discovered = discover(entry_points)
         try:
-            snapshot = read_snapshot(config_file, workspace_root, discovered)
+            snapshot = read_snapshot(config, workspace_root, discovered)
         except ConfigError as error:
-            return f'读工作区配置失败（{error.received}）：修好配置之后{_TRUST}'
-        if JsonTrustStore(trusted).get(snapshot.path) != snapshot.digest:
-            return f'这份工作区配置还没被信任，或信任之后改过：{_TRUST}'
+            return f'读配置 {shown} 失败（{error.received}）：修好配置之后{_TRUST}'
+        if inside and (
+            trusted is None or JsonTrustStore(trusted).get(snapshot.path) != snapshot.digest
+        ):
+            return f'这份工作区配置 {shown} 还没被信任，或信任之后改过：{_TRUST}'
         if record.name not in config_of(snapshot).modules:
             return '这份工作区配置没有启用它：在 modules 里写上它、确认配置之后再回放'
         entry = next((item for item in discovered if item.name == record.name), None)
@@ -74,7 +87,7 @@ def module_rebuilder(
             module = load_module(entry, host, host.redactor)
         except ConfigError as error:
             return f'import 它失败（{error.received}）：修好这个发行版的安装之后再回放'
-        if not module.replay_safe:
+        if not module.replay_safe and runs_code(module):
             return (
                 '装着的那一份没声明 replay_safe：它的代码不能在回放里再跑一遍'
                 '（要回放，请作者确认它不做 I/O 之后声明 replay_safe）'

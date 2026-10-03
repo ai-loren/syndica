@@ -427,7 +427,7 @@ def test_trace_export_that_the_collector_refuses_exits_1(tmp_path: Path, collect
 @pytest.mark.parametrize(
     ('argv', 'said'),
     [
-        (['trace', 'export', 'cd', '--otlp', 'http://localhost:9'], '被 prune 掉的找不回来'),
+        (['trace', 'export', 'ABSENT', '--otlp', 'http://localhost:9'], '被 prune 掉的找不回来'),
         (['trace', 'export', 'NAME', '--otlp', 'not a url'], 'http:// 或 https://'),
         (
             ['trace', 'export', 'NAME', '--otlp', 'http://user:pw@collector.example'],
@@ -440,9 +440,13 @@ def test_trace_export_that_cannot_start_exits_2(tmp_path: Path, argv: list[str],
     _run(tmp_path, {}, exporter=_Spy())
     spy = _Spy()
     name = _only_directory(tmp_path)
+    absent = next(
+        prefix for prefix in ('cd', 'ef') if not name.rpartition('-')[2].startswith(prefix)
+    )
+    given = {'NAME': name, 'ABSENT': absent}
 
     code, _, err = _cli(
-        tmp_path, [name if item == 'NAME' else item for item in argv], environ={}, exporter=spy
+        tmp_path, [given.get(item, item) for item in argv], environ={}, exporter=spy
     )
 
     assert (code, spy.calls) == (2, [])

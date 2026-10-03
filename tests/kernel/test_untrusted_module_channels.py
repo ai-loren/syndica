@@ -494,3 +494,75 @@ async def test_the_trace_records_a_floored_tools_result_as_untrusted():
     await _run(runtime, llm, {})
 
     assert tracer.trust == [TrustLevel.UNTRUSTED]
+
+
+_HANDED = 'module-authored text'
+
+
+def _receiver(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+    return BaseAgent(
+        AgentOptions(name='Receiver', llm=ScriptedLLM([ScriptedTurn(content='done')])),
+        hooks=hooks,
+        events=events,
+    )
+
+
+def _relay(mode: str, targets: dict[str, str]) -> RuntimeModule:
+    def tools(runtime: Runtime, agent: BaseAgent, flags: object) -> dict[str, Tool]:
+        del agent, flags
+
+        class _Relay(Tool):
+            __tool_command_args__ = ()
+
+            async def execute(self) -> ToolResult:
+                if mode == 'send':
+                    await runtime.send(targets['receiver'], _HANDED)
+                else:
+                    targets['receiver'] = await runtime.spawn(_receiver, query=_HANDED)
+                return ToolResult(output='handed over')
+
+        return {'Relay': _Relay()}
+
+    return RuntimeModule('extra', tool_factories=(tools,))
+
+
+@pytest.mark.parametrize('mode', ['send', 'spawn'])
+@pytest.mark.parametrize(
+    ('listed', 'trust'), [(True, TrustLevel.UNTRUSTED), (False, TrustLevel.TRUSTED)]
+)
+async def test_text_a_listed_module_hands_another_agent_through_the_runtime_is_untrusted(
+    mode: str, listed: bool, trust: TrustLevel
+):
+    targets: dict[str, str] = {}
+    runtime = Runtime(
+        modules=[_relay(mode, targets)], untrusted_output_modules=['extra'] if listed else ()
+    )
+    caller = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='r1', name='Relay', arguments='{}')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    try:
+        if mode == 'send':
+            targets['receiver'] = await runtime.spawn(_receiver)
+        await runtime.wait(await runtime.spawn(_factory(caller, {}), query='go'))
+        context = await runtime.wait(targets['receiver'])
+    finally:
+        await runtime.shutdown()
+
+    [handed] = [block for block in context.current_traj if block.content == _HANDED]
+    assert handed.trust is trust
+
+
+async def test_the_host_sending_beside_a_listed_module_stays_trusted():
+    runtime = Runtime(modules=[_relay('send', {})], untrusted_output_modules=['extra'])
+    try:
+        receiver = await runtime.spawn(_receiver)
+        await runtime.send(receiver, _HANDED)
+        context = await runtime.wait(receiver)
+    finally:
+        await runtime.shutdown()
+
+    [handed] = [block for block in context.current_traj if block.content == _HANDED]
+    assert handed.trust is TrustLevel.TRUSTED

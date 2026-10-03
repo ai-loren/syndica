@@ -9,7 +9,8 @@ from __future__ import annotations
 import inspect
 import keyword
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -126,6 +127,20 @@ class FlagDeclaration:
                 '传 list 或 tuple；不限制枚举值就省略 choices',
             )
         choices = tuple(cast(Sequence[object], raw_choices))
+        for field, value in (
+            ('default', default),
+            *((f'choices[{index}]', choice) for index, choice in enumerate(choices)),
+        ):
+            if not isinstance(value, str):
+                continue
+            unsafe = UNSAFE_TEXT.search(value)
+            if unsafe is not None:
+                raise _config(
+                    f'Flag {field} 的字符串不含控制字符、双向格式字符或落单的代理',
+                    f'{field} 在第 {unsafe.start()} 个字符处有 {value[unsafe.start()]!r}',
+                    '改用可见字符：它显示在 flags list / show 与参考文档里，'
+                    '控制字符能在终端上改写显示',
+                )
         for index, choice in enumerate(choices):
             if type(choice) is not type(default):
                 raise _config(
@@ -401,7 +416,11 @@ class RuntimeModule:
     装配失败按快照回滚内核持有的状态（hook 中心、服务）；已经 `on_start` 过的 Module 不补偿：
     `on_shutdown` 是异步的，同步的 Runtime 构造里调不了。第三方在 `on_start` 里起的任务、写的
     文件不在回滚承诺内，副作用请放进服务的惰性方法里。
+
+    按值比较，不可哈希（含映射与可调用对象）：别把它当 dict 键或放进 set。
     """
+
+    __hash__ = None  # pyright: ignore[reportAssignmentType]
 
     name: str
     flags: tuple[FlagDeclaration, ...]
@@ -710,6 +729,17 @@ def _overrides(
     return resolved
 
 
+@contextmanager
+def _noted(module: str, stage: str) -> Generator[None, None, None]:
+    """第三方代码自己抛的异常原样上抛，只加一条说明它出自哪个 Module 的哪一步：原样上抛让嵌入的宿主
+    还能按类型接，说明让命令行说得出该修哪个 Module。"""
+    try:
+        yield
+    except Exception as exc:
+        exc.add_note(f'Runtime Module {module!r} 的 {stage} 抛出了它')
+        raise
+
+
 class _ModulePlugin:
     """冻结一次读到的插件名，同时保留原插件的 register 行为。register 期间的装配期身份是 Module 名，
     不是插件名：Module 的切点写在清单里，它的插件不在 register 里声明。"""
@@ -726,9 +756,9 @@ class _ModulePlugin:
 
     def register(self, hooks: HooksCenter) -> None:
         before = dict(self._agent.options.tools)
-        with installing('module', self._module):
-            self._plugin.register(hooks)
         where = f'插件 {self._name!r} 的 register'
+        with installing('module', self._module), _noted(self._module, where):
+            self._plugin.register(hooks)
         _refuse_direct_installs(self._agent, before, self._module, where)
 
 
@@ -774,7 +804,10 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
         for module in self.module_objects:
             for index, factory in enumerate(module.agent_plugins):
                 before = dict(agent.options.tools)
-                with installing('module', module.name):
+                with (
+                    installing('module', module.name),
+                    _noted(module.name, f'agent_plugins[{index}]'),
+                ):
                     produced = cast(object, factory(runtime, agent, flags))
                 _refuse_direct_installs(agent, before, module.name, f'agent_plugins[{index}]')
                 if inspect.isawaitable(produced):
@@ -825,7 +858,10 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
                 )
             for index, factory in enumerate(module.tool_factories):
                 before = dict(agent.options.tools)
-                with installing('module', module.name):
+                with (
+                    installing('module', module.name),
+                    _noted(module.name, f'tool_factories[{index}]'),
+                ):
                     produced = cast(object, factory(runtime, agent, flags))
                 _refuse_direct_installs(agent, before, module.name, f'tool_factories[{index}]')
                 if inspect.isawaitable(produced):
@@ -903,7 +939,7 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
         mounted: list[str] = []
         try:
             for _module, name, factory in services:
-                with installing('module', _module.name):
+                with installing('module', _module.name), _noted(_module.name, f'service {name!r}'):
                     service = factory(runtime, self.flags)
                 if inspect.isawaitable(service):
                     if inspect.iscoroutine(service):
@@ -921,7 +957,7 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
             for module in self.module_objects:
                 if module.on_start is None:
                     continue
-                with installing('module', module.name):
+                with installing('module', module.name), _noted(module.name, 'on_start'):
                     returned = module.on_start(runtime, self.flags)
                 if returned is not None:
                     if inspect.iscoroutine(returned):
@@ -963,6 +999,8 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
                         '让 on_shutdown 的异步清理结束时 return None',
                     )
             except BaseException as exc:
+                if isinstance(exc, Exception):
+                    exc.add_note(f'Runtime Module {module.name!r} 的 on_shutdown 抛出了它')
                 failures.append(exc)
         return failures
 
@@ -1009,7 +1047,12 @@ class ModuleHost:
     加一个没有默认值的字段，那些构造就全断了，删字段同理。`environment`
     是宿主交给 Agent 的那份白名单环境，不是进程的完整环境；Module 与 syndica 同进程，真要读完整
     环境它也读得到，这份是让守规矩的 Module 不必去碰 `os.environ`。
+
+    按值比较，不可哈希（`environment` 是映射）：别把它当 dict 键，也别给收它的函数加
+    `functools.cache`。
     """
+
+    __hash__ = None  # pyright: ignore[reportAssignmentType]
 
     workspace_root: Path
     environment: Mapping[str, str]

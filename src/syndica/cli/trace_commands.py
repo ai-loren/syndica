@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Protocol, TypeVar, cast, runtime_checkable
 
 from syndica.cli.export import ExportTarget, TraceExporter
@@ -99,6 +100,7 @@ class Replayer(Protocol):
         redactor: Redactor,
         allow_divergence: bool,
         recorder: TraceRecorder | None,
+        config_file: Path | None,
     ) -> Replayed: ...
 
 
@@ -350,6 +352,7 @@ def trace_replay(
     replayer: Replayer,
     allow_divergence: bool,
     recorder: TraceRecorder | None,
+    config_file: Path | None = None,
 ) -> CliOutcome:
     """回放一个 trace 的文档。规则集与记录时不同（内置规则改过）单独报一处分叉：指纹按记录时的规则
     算，换了规则多半处处对不上，先说清楚是为什么。"""
@@ -384,7 +387,11 @@ def trace_replay(
         )
     try:
         replayed = replayer(
-            document, redactor=redactor, allow_divergence=allow_divergence, recorder=recorder
+            document,
+            redactor=redactor,
+            allow_divergence=allow_divergence,
+            recorder=recorder,
+            config_file=config_file,
         )
     except ConfigError as error:
         # 回放器的「下一步」写给调用 ReplayRunner 的代码；命令行用户能做的是重新记录。

@@ -80,6 +80,7 @@ from enum import Enum
 from typing import TypeAlias
 
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.terminal_text import UNSAFE_TEXT
 
 __all__ = [
     'ExtensionJunction',
@@ -225,6 +226,16 @@ def validated_extension_name(name: object) -> str:
             next_action=(
                 '去掉空白后重新声明。这里刻意不自动 strip：两种拼法在日志与错误消息里长得一样，'
                 '却是两个互不相干的切点'
+            ),
+        )
+    unsafe = UNSAFE_TEXT.search(name)
+    if unsafe is not None:
+        raise ConfigError(
+            expected='扩展切点名不含控制字符、双向格式字符或落单的代理',
+            received=f'收到 {name!r}，第 {unsafe.start()} 个字符是 {name[unsafe.start()]!r}',
+            next_action=(
+                '用可见字符重写切点名：它显示在 modules show 与 trace show 里，'
+                '控制字符能在终端上改写或重排显示出来的内容'
             ),
         )
     separators = name.count(_NAMESPACE_SEPARATOR)

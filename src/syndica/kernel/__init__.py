@@ -77,6 +77,7 @@ from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.modules import (
     FlagDeclaration,
     FlagRow,
+    FlagValue,
     ModuleHost,
     RuntimeModule,
     SafetyModule,
@@ -187,6 +188,7 @@ __all__ = [
     'Finding',
     'FlagDeclaration',
     'FlagRow',
+    'FlagValue',
     'HookCallback',
     'HookResult',
     'HooksCenter',

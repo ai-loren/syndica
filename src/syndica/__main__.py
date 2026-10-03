@@ -367,15 +367,19 @@ def _replay_document(
     redactor: Redactor,
     allow_divergence: bool,
     recorder: TraceRecorder | None,
+    config_file: Path | None,
 ) -> Replayed:
     """`trace replay` 的回放：CLI 与 runner 互不依赖，由组合根把两边接上。第三方 Module 按
-    当前工作区（受信任的配置、装着的发行版）判能不能重建（D13）。"""
+    当前工作区与 `--config` 给的那份配置（受信任的配置、装着的发行版）判能不能重建（D13）。"""
     from syndica.cli.modules import installed_entry_points
     from syndica.cli.replay_modules import module_rebuilder
     from syndica.runner.replay import ReplayRunner
 
     rebuilder = module_rebuilder(
-        workspace_root=Path.cwd(), environ=os.environ, entry_points=installed_entry_points
+        workspace_root=Path.cwd(),
+        environ=os.environ,
+        entry_points=installed_entry_points,
+        config_file=config_file,
     )
     return ReplayRunner(
         redactor=redactor, allow_divergence=allow_divergence, modules=rebuilder

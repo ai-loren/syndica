@@ -547,3 +547,71 @@ def test_trace_replay_through_the_command_line_rebuilds_a_module_only_while_trus
     assert untrusted.returncode == 2, untrusted.stderr
     assert "没有重建 'alpha'" in untrusted.stderr
     assert 'syndica config trust' in untrusted.stderr
+
+
+def test_a_module_that_only_declares_flags_is_captured_and_rebuilt_without_replay_safe(
+    tmp_path: Path,
+):
+    build = _module(replay_safe=False, tools=False)
+    text, _ = _capture(tmp_path, _EntryPoint(build, _Dist()))
+    workspace = tmp_path / 'ws'
+    point = _EntryPoint(build, _Dist())
+    store = tmp_path / 'store.json'
+    _trust(workspace, store, point)
+
+    rebuild = module_rebuilder(
+        workspace_root=workspace, environ={STORE_ENV: str(store)}, entry_points=lambda: [point]
+    )
+    result = ReplayRunner(modules=rebuild).run(
+        parse_scenario_document(json.loads(text), source='replay.json')
+    )
+
+    assert result.reproduced, result.divergences
+    assert point.loads == 1
+
+
+def test_replay_rebuilds_every_builtin_module_the_cli_can_install():
+    from syndica.cli.modules import MANDATORY, OPTIONAL_BUILTINS
+    from syndica.runner import replay as replay_module
+
+    builders = replay_module._builtin_modules(cast(Any, None), '')  # pyright: ignore[reportPrivateUsage]
+
+    assert sorted(builders) == sorted((*MANDATORY, *OPTIONAL_BUILTINS))
+
+
+def test_a_config_named_outside_the_workspace_rebuilds_without_a_trust_entry(tmp_path: Path):
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    outside = tmp_path / 'team.yaml'
+    outside.write_text('version: 1\nmodules: [alpha]\n', encoding='utf-8')
+    point = _EntryPoint(_module(), _Dist())
+    rebuild = module_rebuilder(
+        workspace_root=workspace, environ={}, entry_points=lambda: [point], config_file=outside
+    )
+
+    outcome = rebuild(
+        _RECORD, ModuleHost(workspace_root=workspace, environment={}, redactor=RuleRedactor())
+    )
+
+    assert isinstance(outcome, RuntimeModule) and outcome.name == 'alpha'
+
+
+def test_an_untrusted_config_named_inside_the_workspace_is_named_in_the_refusal(tmp_path: Path):
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    team = workspace / 'team.yaml'
+    team.write_text('version: 1\nmodules: [alpha]\n', encoding='utf-8')
+    point = _EntryPoint(_module(), _Dist())
+    rebuild = module_rebuilder(
+        workspace_root=workspace,
+        environ={STORE_ENV: str(tmp_path / 'store.json')},
+        entry_points=lambda: [point],
+        config_file=team,
+    )
+
+    outcome = rebuild(
+        _RECORD, ModuleHost(workspace_root=workspace, environment={}, redactor=RuleRedactor())
+    )
+
+    assert isinstance(outcome, str) and 'team.yaml' in outcome and '还没被信任' in outcome
+    assert point.loads == 0

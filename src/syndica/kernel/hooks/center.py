@@ -82,6 +82,7 @@ class Authorship:
 
 
 _Authored = tuple[HookCallback, Installer | None]
+_Added = tuple[dict[JunctionRef, list[_Authored]], list[str]]
 Watch = Mapping[str, Callable[[Any], object]]
 _NO_WATCH: Watch = MappingProxyType({})
 _Snapshot = tuple[
@@ -119,6 +120,22 @@ def _differs(before: object, after: object) -> bool:
         return bool(before != after)
     except Exception:
         return True
+
+
+def _report_observable_failure(
+    junction: JunctionRef, cb: HookCallback, error: BaseException
+) -> None:
+    """可观察切点上一个 hook 抛出：只记这一条，异常不传给触发方。它是这次失败留下的唯一痕迹，
+    所以要说清是谁的 hook。"""
+    logger.error(
+        '期望: 挂在可观察切点 %s 上的 hook %s 正常返回。'
+        ' 实际: 它抛出了 %s，这一次什么都没做成；其余 hook 与触发方照常。'
+        ' 下一步: 照下面的 traceback 修好这个 hook。',
+        _label(junction),
+        _qualname(cb),
+        type(error).__name__,
+        exc_info=error,
+    )
 
 
 async def _acting(installer: Installer | None, awaitable: Awaitable[object]) -> object:
@@ -489,7 +506,7 @@ class HooksCenter:
         self._hooks.setdefault(resolved, []).append(cb)
         self._authors.setdefault(resolved, []).append(current_installer())
 
-    async def trigger(self, junction: ExtensionJunction | Junction, **kwargs: Any) -> HookResult:
+    async def trigger(self, junction: ExtensionJunction | Junction, /, **kwargs: Any) -> HookResult:
         """触发一个扩展切点，返回可拦截链的合并结论（spec §5.4）。
 
         只收声明时交回的那个句柄：字符串谁都拼得出来。从 Runtime 的中心触发只跑 Runtime 级的
@@ -635,6 +652,34 @@ class HooksCenter:
         """还原一份快照。**本中心就此接管它**，同一份快照不得还原两遍。"""
         self._hooks, self._declared, self._authors = snapshot
 
+    def _added_since(self, snapshot: _Snapshot) -> _Added:
+        """快照之后本中心多出来的回调（连同作者）与声明的切点名。只在与取快照同一段同步代码里调：
+        那时快照里的每个槽位都还是现在的前缀，多出来的就是末尾那几个。"""
+        hooks, declared, _ = snapshot
+        added: dict[JunctionRef, list[_Authored]] = {}
+        for junction, callbacks in self._hooks.items():
+            authored = list(zip(callbacks, self._authors.get(junction, []), strict=True))
+            tail = authored[len(hooks.get(junction, [])) :]
+            if tail:
+                added[junction] = tail
+        return added, [name for name in self._declared if name not in declared]
+
+    def _withdraw(self, added: _Added) -> None:
+        """撤回 `_added_since` 交回的那些：一次在 await 之后才失败的装配用它，整份还原会盖掉别的
+        任务在这期间挂上的 hook。按对象身份认，别人挂上的同一个回调不动。"""
+        hooks, declared = added
+        for junction, entries in hooks.items():
+            callbacks = self._hooks.get(junction, [])
+            authors = self._authors.get(junction, [])
+            for callback, installer in entries:
+                for index, (present, author) in enumerate(zip(callbacks, authors, strict=True)):
+                    if present is callback and author == installer:
+                        del callbacks[index]
+                        del authors[index]
+                        break
+        for name in declared:
+            self._declared.pop(name, None)
+
     def _collect(self, junction: JunctionRef) -> list[HookCallback]:
         """这个切点上要跑的整条链：本层在前，外层在后。"""
         return [cb for cb, _ in self._collect_authored(junction)]
@@ -679,15 +724,25 @@ class HooksCenter:
             raise _not_a_junction(junction)
         validated = validated_extension_name(junction)
         if self._declared_kind(validated) is None:
+            owner = validated.partition(':')[0]
+            installer = current_installer()
+            if installer is not None and installer.kind == 'module' and installer.name == owner:
+                next_action = (
+                    f'把 ExtensionJunction({validated!r}, kind) 写进 RuntimeModule({owner!r}, '
+                    'junctions=...)：Module 名下的切点只由它的清单声明'
+                )
+            else:
+                next_action = (
+                    '先声明它再 register / trigger：Module 的切点写进它的清单（RuntimeModule 的 '
+                    'junctions=），插件在 register 里调 declare_extension_junction(name, kind)；'
+                    '确认该能力已加载，且名字逐字一致（不折叠大小写）'
+                )
             raise ContractViolation(
                 expected=f'扩展切点 {validated} 在本层或外层已经声明过',
                 received=(
                     f'沿装配链找不到 {validated}；已声明的扩展切点: {self._declared_names()}'
                 ),
-                next_action=(
-                    '先由声明它的那个能力调 declare_extension_junction(name, kind) 给出分类，'
-                    '再 register / trigger；确认该能力已加载，且名字逐字一致（不折叠大小写）'
-                ),
+                next_action=next_action,
             )
         return validated
 
@@ -765,7 +820,7 @@ class HooksCenter:
         return HookResult(modified=merged, history=history), _authorship(wrote, None, changed)
 
     async def _trigger_parallel(
-        self, junction: JunctionRef, chain: list[_Authored], **kwargs: Any
+        self, junction: JunctionRef, chain: list[_Authored], /, **kwargs: Any
     ) -> None:
         started: list[HookCallback] = []
         awaitables: list[Awaitable[object]] = []
@@ -773,8 +828,8 @@ class HooksCenter:
             try:
                 with acting_as(installer):
                     returned = cast(object, cb(**kwargs))
-            except Exception:
-                logger.error('observable hook failed at %s', _label(junction), exc_info=True)
+            except Exception as exc:
+                _report_observable_failure(junction, cb, exc)
                 continue
             if not inspect.isawaitable(returned):
                 logger.error(
@@ -792,6 +847,6 @@ class HooksCenter:
         outcomes = await asyncio.gather(*awaitables, return_exceptions=True)
         for cb, outcome in zip(started, outcomes, strict=True):
             if isinstance(outcome, BaseException):
-                logger.error('observable hook failed at %s', _label(junction), exc_info=outcome)
+                _report_observable_failure(junction, cb, outcome)
             elif _carries_intent(outcome):
                 _report_discarded_return(junction, cb, outcome)

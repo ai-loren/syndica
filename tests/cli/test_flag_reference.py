@@ -258,3 +258,32 @@ def test_fallback_models_are_refused_because_the_cli_gives_retry_none(
         host.close()
     assert 'llm_fallbacks 是空的' in excinfo.value.expected
     assert '<平台>:<型号>' in excinfo.value.next_action
+
+
+@pytest.mark.parametrize('character', ['\u202e', '\x9b', '\x1b'], ids=['rlo', 'c1-csi', 'esc'])
+@pytest.mark.parametrize('where', ['default', 'choices'])
+def test_a_flag_string_value_that_could_rewrite_the_terminal_is_refused(character: str, where: str):
+    value = f'he{character}llo'
+    with pytest.raises(ConfigError) as excinfo:
+        if where == 'default':
+            FlagDeclaration(key='alpha_x', default=value, description='d')
+        else:
+            FlagDeclaration(
+                key='alpha_x', default='hello', description='d', choices=('hello', value)
+            )
+    assert '控制字符' in excinfo.value.expected
+    assert repr(character) in excinfo.value.received
+
+
+def test_flags_show_escapes_a_configured_value_that_could_rewrite_the_terminal(tmp_path: Path):
+    config = tmp_path / '.syndica.yaml'
+    config.write_text(
+        'version: 1\nmodules: [alpha]\nflags:\n  alpha_greeting: "hi\\u202eyo"\n', encoding='utf-8'
+    )
+    host = _host(tmp_path, lambda: [_EntryPoint(_alpha)])
+    try:
+        shown = _inspect(host, config, 'show', 'alpha_greeting')
+    finally:
+        host.close()
+    assert '\u202e' not in shown
+    assert '\\u202e' in shown

@@ -148,7 +148,7 @@ from syndica.kernel.events import (
     _why_copying_failed,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.kernel.hooks import HooksCenter, Junction
-from syndica.kernel.hooks.installing import no_installer
+from syndica.kernel.hooks.installing import current_installer, no_installer
 from syndica.kernel.ids import (
     IdSource,
     RandomIds,
@@ -1156,6 +1156,7 @@ class Runtime:
 
         工厂收下本 Runtime 的 hooks 与事件总线：Agent 自己新建一份，宿主注册的切点与订阅就都落空了。
         """
+        query_trust = self._from_listed_module(query_trust)
         # 键在两道取决于调度的拒绝之前占用（并发的关机、并发的拆除）：被拒的这一次也占掉它的序号，
         # 后面的 spawn 才在两次运行里拿到同一个键（M3 D10）。
         key = self._agent_key()
@@ -1281,6 +1282,9 @@ class Runtime:
             agent._assembly_restore(assembly_snapshot)  # pyright: ignore[reportPrivateUsage]
             self.hooks._assembly_restore(runtime_hooks)  # pyright: ignore[reportPrivateUsage]
             raise
+        # 与快照同一段同步代码里取：此后的 await 期间别的 spawn 也会往 Runtime 级挂 hook，失败时只撤
+        # 这一次装上的。
+        runtime_added = self.hooks._added_since(runtime_hooks)  # pyright: ignore[reportPrivateUsage]
         registered = False
         queue_attempted = False
         try:
@@ -1302,6 +1306,7 @@ class Runtime:
                 agent_id,
                 agent,
                 assembly_snapshot,
+                runtime_added,
                 registered=registered,
                 queue_attempted=queue_attempted,
             )
@@ -1322,6 +1327,7 @@ class Runtime:
                 agent_id,
                 agent,
                 assembly_snapshot,
+                runtime_added,
                 registered=True,
                 queue_attempted=True,
             )
@@ -1331,6 +1337,7 @@ class Runtime:
                 agent_id,
                 agent,
                 assembly_snapshot,
+                runtime_added,
                 registered=True,
                 queue_attempted=True,
             )
@@ -1340,6 +1347,7 @@ class Runtime:
                 agent_id,
                 agent,
                 assembly_snapshot,
+                runtime_added,
                 registered=True,
                 queue_attempted=True,
             )
@@ -1530,11 +1538,25 @@ class Runtime:
             agent.agent_id,
         )
 
+    def _from_listed_module(self, trust: TrustLevel) -> TrustLevel:
+        """被收紧的 Module 的代码（它的工具、hook、`on_start` 与它们起的任务）经 `send` /
+        `send_to_slot` / `spawn(query=)` 写下的文字同样不可信：它们拿得到 runtime，而缺省的
+        `TRUSTED` 会让收件人的高风险调用绕过 §12.2 的升级。宿主代码没有身份，照它给的算。"""
+        installer = current_installer()
+        if (
+            installer is not None
+            and installer.kind == 'module'
+            and installer.name in self._untrusted_output
+        ):
+            return TrustLevel.UNTRUSTED
+        return trust
+
     async def _rollback_unstarted_spawn(
         self,
         agent_id: str,
         agent: BaseAgent,
         assembly_snapshot: tuple[Any, ...],
+        runtime_added: Any,
         *,
         registered: bool,
         queue_attempted: bool,
@@ -1557,6 +1579,7 @@ class Runtime:
                     agent_id,
                 )
         agent._assembly_restore(assembly_snapshot)  # pyright: ignore[reportPrivateUsage]
+        self.hooks._withdraw(runtime_added)  # pyright: ignore[reportPrivateUsage]
 
     async def _unbuild(self, agent_id: str) -> None:
         """把 `spawn` 已经建好的两样按逆序还回去，不留半个 Agent。
@@ -1970,6 +1993,7 @@ class Runtime:
         """
         # 键在查注册表之前占用：收件人此刻还在不在取决于调度（它可能正好退出），投不出去的这一条
         # 也要占掉它的序号，后面的消息才在两次运行里拿到同一个键（M3 D10）。
+        trust = self._from_listed_module(trust)
         key = self._message_key(agent_id, correlation_id)
         if await self.registry.get(agent_id) is None:
             return DeliveryResult(

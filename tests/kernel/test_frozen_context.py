@@ -483,7 +483,7 @@ async def test_an_observer_cannot_write_the_trajectory_even_when_it_is_alone(
 
     assert context.stop_reason is StopReason.COMPLETED
     assert [block.content for block in context.current_traj] == ['go', 'done']
-    [record] = [r for r in caplog.records if 'observable hook failed' in r.getMessage()]
+    [record] = [r for r in caplog.records if '挂在可观察切点 turn_end 上的 hook' in r.getMessage()]
     assert record.exc_info is not None
     error = record.exc_info[1]
     assert isinstance(error, ContractViolation)

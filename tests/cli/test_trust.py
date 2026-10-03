@@ -898,3 +898,18 @@ def test_a_pin_whose_file_is_gone_does_not_claim_a_file_that_reused_its_inode(
     finally:
         pins.remove()
         sys.modules.pop('otherpkg', None)
+
+
+def test_a_store_written_by_a_newer_syndica_is_not_trusted_and_not_overwritten(tmp_path: Path):
+    store = JsonTrustStore(tmp_path / 'trusted.json')
+    store.path.write_text(
+        json.dumps({'version': 2, 'configs': {'/x/.syndica.yaml': 'a' * 64}}), encoding='utf-8'
+    )
+
+    assert store.get(Path('/x/.syndica.yaml')) is None
+    with pytest.raises(ConfigError) as excinfo:
+        store.put(Path('/y/.syndica.yaml'), 'b' * 64)
+
+    assert 'version 2' in excinfo.value.received
+    assert 'SYNDICA_TRUST_STORE' in excinfo.value.next_action
+    assert json.loads(store.path.read_text(encoding='utf-8'))['version'] == 2

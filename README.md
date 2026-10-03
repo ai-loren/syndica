@@ -8,7 +8,7 @@ acceptance criteria, and eventually training-data export.
 
 > Status: **pre-release**.
 >
-> Milestones 1 and 2 are complete on `main`. The project is still pre-v1.0, so public APIs may
+> Milestones 1 to 4 are complete on `main`. The project is still pre-v1.0, so public APIs may
 > change until the release boundary is frozen.
 
 ## Why Syndica Exists
@@ -317,8 +317,9 @@ the workspace. `syndica modules show <name>` imports a module to show its manife
 is inside the workspace, the configuration must enable it and be confirmed first. Besides the built-in `retry` and
 `prefix-drift`, it can name a third-party module installed under the `syndica.modules` entry-point
 group. Its entry point is a callable `factory(host: ModuleHost) -> RuntimeModule`; the entry-point
-name must equal the module's name, and its flag keys must start with the module name (`example`
-becomes `example_`) and must not look like secrets. A third-party module runs in-process with
+name must equal the module's name, and its flag keys must start with the module name, hyphens
+turned into underscores (`example` gives `example_`, `git-notes` gives `git_notes_`), and must not
+look like secrets. A third-party module runs in-process with
 your full environment, so the confirmation shows it and covers its code when that code lives in
 the workspace; a distribution installed inside the workspace is also checked against its
 `RECORD`. Its tool results, and any result its hooks write for other tools, are marked untrusted;
@@ -327,12 +328,50 @@ configuration cannot. [examples/syndica-example-module](examples/syndica-example
 minimal third-party module to start from: one flag, one tool that triggers the module's own
 extension junction, and one plugin that records what it hears there.
 
+Writing a module: the entry point returns a `RuntimeModule`, and the kernel checks the following
+when it loads one.
+
+- Name: lowercase letters and digits in hyphen-separated segments (`ledger`, `git-notes`). It is
+  also the entry-point name, the owner segment of the module's junctions and the `modules:` entry.
+  Flag keys start with the name, hyphens turned into underscores (`git-notes` gives `git_notes_`).
+  This makes clashes unlikely, not impossible; two enabled modules declaring the same key are
+  refused.
+- Tools come only from `tool_factories`, callables `(runtime, agent, flags) -> {name: Tool}`.
+  Installing tools on the agent from anywhere else is refused. Each tool class declares
+  `__tool_command_args__` itself: the names of the arguments it hands to a shell, interpreter or
+  remote command, or `()` when it runs none of them. The danger judge inspects only the declared
+  arguments, so `()` on a tool that runs commands turns the check off for that tool, and a
+  declaration inherited from a parent class does not count.
+- Plugins (`agent_plugins`, callables `(runtime, agent, flags) -> Plugin`) register hooks for one
+  agent, on the module layer, in module order. Registering with `agent.register_hook` from a
+  factory instead puts the hook on the agent's own layer, ahead of every module, where a `skip` on
+  `POST_TOOL_USE` also hides the call from the CLI's development log. `AGENT_SPAWN`,
+  `AGENT_DESPAWN` and `RUNTIME_SHUTDOWN` fire only on the runtime's own hook center, so register
+  those on `runtime.hooks` from `on_start`.
+- `on_start(runtime, flags)` is synchronous and returns `None`; `on_shutdown(runtime)` returns an
+  awaitable. A service factory or `on_start` that raises fails the whole runtime construction and
+  rolls back what the kernel holds; `on_shutdown` failures are raised together after every module
+  has shut down.
+- Junctions a module owns are listed in its manifest,
+  `junctions=[ExtensionJunction('<name>:<event>', JunctionKind.OBSERVABLE)]` (or `INTERCEPTABLE`),
+  and triggered with that same object through `agent.trigger_extension(handle, **kwargs)`. It
+  returns the chain's merged `HookResult`; for an interceptable junction the module decides what a
+  `skip` or a rewrite means.
+- Manifest fields: `version`, `description`, `capabilities` (a subset of `environment`,
+  `filesystem`, `network` and `subprocess`; `None` means undeclared and is shown as all of them),
+  `requires` (modules that must be installed earlier; the CLI always installs `safety` and
+  `human-interaction` first), `replay_safe` (its code does no I/O, reads no clock or randomness and
+  starts no threads, so a replay may run it again) and `security_notes`.
+- Flags: `FlagDeclaration(key, default, description, choices=(), minimum=None, maximum=None)`, with
+  a `bool`, `int` or `str` default.
+
 `flags:` overrides flag defaults for the run; `--flag key=value` overrides `flags:`. Both go through
 the same checks against the installed modules' declarations, and a project configuration may only
 tighten: `untrusted_high_risk` accepts only `reject` there. The built-in flags are listed in
 [docs/reference/flags.md](docs/reference/flags.md); `syndica flags list` and `syndica flags show
 <key>` show the flags of the modules a configuration installs, with the value in effect and where
-it comes from.
+it comes from. When the configuration enables a third-party module they confirm the configuration
+first, because they import the module to read its declarations.
 
 `danger.roles` gives a role a stricter disposition than the development table every run uses:
 `rules` raises single rules to `confirm` or `block`, and `policy: block_high_risk` blocks every
@@ -498,8 +537,9 @@ actually assembled (after `--max-turns` and `--no-write` rewrote it); replay ass
 the same slot logic and enters through the root slot, so slot tools, budgets and stable ids match
 the original run. A run with a third-party module is replayable only if that module declares
 `replay_safe` or runs no code of its own (flags only). Replay rebuilds such a module only when the
-workspace's trusted `.syndica.yaml` enables it and the installed distribution has the recorded
-name and version; it checks all three before importing anything. When it cannot rebuild one,
+configuration enables it (the workspace's `.syndica.yaml`, or the file given with `--config`, which
+must be trusted when it lies inside the workspace, as for `run`) and the installed distribution has
+the recorded name and version; it checks all of this before importing anything. When it cannot rebuild one,
 `trace replay` exits 2 and names the module and the reason: replaying without code the original
 run ran would not be the same run.
 
@@ -513,7 +553,8 @@ run ran would not be the same run.
   as `syndica.trace/2`; traces written as `/1` are still read.
 - `syndica trace replay <id>` replays the trace offline: model replies, tool results, human answers
   and host actions come from the record, while the kernel, its danger judgement and the modules the
-  replay can rebuild (safety, human interaction, retry) run for real and are compared item by item.
+  replay can rebuild (safety, human interaction, retry, prefix drift, and third-party modules as
+  described above) run for real and are compared item by item.
   Host modules it cannot rebuild, such as the development guard, are named in the output; their
   effects (the calls they skipped) are already in the record. Every agent sees its messages when the
   record says it did (injected into the same turn, a deferred message put aside in the same turn; a
@@ -548,7 +589,7 @@ until the sandbox of milestone 5.
 
 ```text
 syndica run <prompt>
-syndica chat [--max-turns <n>] [--trace <level>]
+syndica chat [--max-turns <n>] [--trace <level>] [--trust-module-output <name>]
 syndica agents list | show <name>
 syndica topology list | show <name>
 syndica flags list | show <key>
@@ -572,6 +613,7 @@ syndica version
 --max-tokens <n>
 --max-wall-clock <seconds>
 --flag <key=value>        repeatable
+--trust-module-output <name>  repeatable; this run treats that third-party module's output as trusted
 --no-write                read-only tools only
 --handoff                 host verification, a redacted handoff file, and the Git question
 --git-mode <mode>         commit | push | manual, answered in advance; requires --handoff
@@ -678,7 +720,7 @@ The v1.0 roadmap has 12 internal milestones:
 | 1 | Kernel skeleton | Done |
 | 2 | Self-bootstrapping | Done |
 | 3 | Observability + redaction | Done |
-| 4 | Complete extension system | Planned |
+| 4 | Complete extension system | Done |
 | 5 | Complete execution layer + provenance | Planned |
 | 6 | State: sessions, compression, memory | Planned |
 | 7 | Artifacts and acceptance | Planned |

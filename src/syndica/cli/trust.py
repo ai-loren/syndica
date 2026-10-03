@@ -57,6 +57,7 @@ __all__ = [
 # 用户的。
 STORE_ENV = 'SYNDICA_TRUST_STORE'
 _DIGEST_FORMAT = 'syndica-trust/2'
+_STORE_VERSION = 1
 
 
 def _sha(data: bytes) -> str:
@@ -575,7 +576,8 @@ def describe(snapshot: ConfigSnapshot, config: CliConfig) -> str:
             *config.modules,
             *(
                 f'{module.name} 来自 {module.distribution} {module.version}（{module.target}，'
-                f'{source.where}）；能力在信任之后用 syndica modules show 查看'
+                f'{source.where}）；能力用 syndica modules show {module.name} 查看'
+                f'{"（代码在工作区之内，先确认这份配置）" if source.inside else ""}'
                 for module, source in zip(snapshot.modules, snapshot.module_sources, strict=True)
             ),
         ],
@@ -614,30 +616,51 @@ class JsonTrustStore:
     def path(self) -> Path:
         return self._path
 
-    def _entries(self) -> dict[str, str]:
+    def _load(self) -> tuple[dict[str, str], object]:
+        """条目与文件里写的格式版本；读不出时是空的、版本 None（按未信任处理，下次写时整份
+        重写）。"""
         try:
             data = json.loads(self._path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
-            return {}
-        configs = cast(dict[str, object], data).get('configs') if isinstance(data, dict) else None
+            return {}, None
+        if not isinstance(data, dict):
+            return {}, None
+        body = cast(dict[str, object], data)
+        configs = body.get('configs')
         if not isinstance(configs, dict):
-            return {}
-        return {
+            return {}, body.get('version')
+        entries = {
             str(key): value
             for key, value in cast(dict[object, object], configs).items()
             if isinstance(value, str)
         }
+        return entries, body.get('version')
 
     def get(self, config: Path) -> str | None:
-        return self._entries().get(str(config))
+        entries, version = self._load()
+        if version not in (None, _STORE_VERSION):
+            return None
+        return entries.get(str(config))
 
     def put(self, config: Path, digest: str) -> None:
-        entries = self._entries()
+        entries, version = self._load()
+        if version not in (None, _STORE_VERSION):
+            raise ConfigError(
+                expected=f'信任存储是这个 syndica 写得了的格式（version {_STORE_VERSION}）',
+                received=(
+                    f'{one_line(str(self._path))} 是 version {version!r}，由更新的 syndica 写下'
+                ),
+                next_action=(
+                    '升级 syndica，或用 SYNDICA_TRUST_STORE 指到另一个文件；'
+                    '在这里重写会抹掉新版本记下的条目'
+                ),
+            )
         entries[str(config)] = digest
         self._path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._path.with_name(f'.{self._path.name}.{os.getpid()}.tmp')
         temporary.write_text(
-            json.dumps({'version': 1, 'configs': entries}, indent=2, sort_keys=True) + '\n',
+            json.dumps({'version': _STORE_VERSION, 'configs': entries}, indent=2, sort_keys=True)
+            + '\n',
             encoding='utf-8',
         )
         os.replace(temporary, self._path)

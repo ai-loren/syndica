@@ -283,3 +283,44 @@ async def test_a_child_spawned_inside_a_tool_call_still_gets_root_module_spans()
     [child] = spawners[0].children
     child_spans = [value for _, value in spans.module_spans() if value[3] == child]
     assert [value[0] for value in child_spans] == [None]
+
+
+async def test_a_module_span_lists_its_tools_in_assembly_order_not_sorted():
+    spans = _Spans()
+    module = RuntimeModule(
+        'audit',
+        tool_factories=(lambda *_: {name: _Named(name) for name in ('Mike', 'Alpha', 'Zulu')},),
+    )
+    runtime = Runtime(modules=[module], tracer=spans)
+    try:
+        await runtime.spawn(_factory())
+    finally:
+        await runtime.shutdown()
+
+    [(_, value)] = spans.module_spans()
+    assert value[4]['module.tools'] == ['Mike', 'Alpha', 'Zulu']
+
+
+async def test_a_module_span_lists_plugins_and_flags_in_declaration_order_not_sorted():
+    spans = _Spans()
+
+    def plugin(name: str) -> Callable[..., _Plugin]:
+        return lambda *_: _Plugin(name)
+
+    module = RuntimeModule(
+        'audit',
+        agent_plugins=tuple(plugin(name) for name in ('mike-hooks', 'alpha-hooks', 'zulu-hooks')),
+        flags=tuple(
+            FlagDeclaration(key=key, default=0, description='d')
+            for key in ('audit_mike', 'audit_alpha', 'audit_zulu')
+        ),
+    )
+    runtime = Runtime(modules=[module], tracer=spans)
+    try:
+        await runtime.spawn(_factory())
+    finally:
+        await runtime.shutdown()
+
+    [(_, value)] = spans.module_spans()
+    assert value[4]['module.plugins'] == ['mike-hooks', 'alpha-hooks', 'zulu-hooks']
+    assert value[4]['module.flags'] == ['audit_mike', 'audit_alpha', 'audit_zulu']

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
@@ -587,7 +588,7 @@ async def test_an_observable_hook_that_raises_before_awaiting_fails_alone(
         await center._dispatch(Junction.TURN_START, turn=1)  # pyright: ignore[reportPrivateUsage]
     assert sorted(seen) == ['after', 'before']
     (record,) = [record for record in caplog.records if record.levelno == logging.ERROR]
-    assert record.args == ('turn_start',)
+    assert record.args == ('turn_start', repr(explodes.__qualname__), 'RuntimeError')
     assert record.exc_info is not None
 
 
@@ -704,3 +705,95 @@ def test_register_hook_with_an_unhashable_junction_gets_the_centers_three_part_e
         agent.register_hook(['x'], noop)  # pyright: ignore[reportArgumentType]
     _three_parts(excinfo.value)
     assert "['x']" in excinfo.value.received
+
+
+async def _noop(**_: object) -> None:
+    return None
+
+
+@pytest.mark.parametrize(
+    'character', ['\u202e', '\x9b', '\x1b', '\u200f'], ids=['rlo', 'c1-csi', 'esc', 'rlm']
+)
+def test_a_junction_name_with_a_control_or_bidi_character_is_refused(character: str):
+    with pytest.raises(ConfigError) as excinfo:
+        ExtensionJunction(f'audit:re{character}corded', JunctionKind.OBSERVABLE)
+
+    assert '控制字符' in excinfo.value.expected
+    assert repr(character) in excinfo.value.received
+    assert 'modules show' in excinfo.value.next_action
+
+
+async def test_a_module_listening_on_its_own_undeclared_junction_is_told_to_use_its_manifest():
+    def plugin(*_: object) -> _Plugin:
+        return _Plugin('ledger-hooks', lambda hooks: hooks.register('ledger:posted', _noop))
+
+    runtime = Runtime(modules=[RuntimeModule('ledger', agent_plugins=(plugin,))])
+    try:
+        with pytest.raises(ContractViolation) as excinfo:
+            await runtime.spawn(_agent_factory([]))
+    finally:
+        await runtime.shutdown()
+
+    assert "RuntimeModule('ledger', junctions=...)" in excinfo.value.next_action
+
+
+def test_a_host_registering_on_an_undeclared_junction_hears_about_both_ways_to_declare():
+    center = HooksCenter()
+
+    with pytest.raises(ContractViolation) as excinfo:
+        center.register('ledger:posted', _noop)
+
+    assert 'junctions=' in excinfo.value.next_action
+    assert 'declare_extension_junction' in excinfo.value.next_action
+
+
+def test_the_trigger_entry_points_take_their_handle_positionally():
+    trigger = inspect.signature(HooksCenter.trigger).parameters['junction']
+    extension = inspect.signature(BaseAgent.trigger_extension).parameters['handle']
+
+    assert (trigger.kind, extension.kind) == (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_ONLY,
+    )
+
+
+async def test_a_payload_may_use_the_keys_junction_and_handle():
+    center = HooksCenter()
+    seen: list[list[str]] = []
+    handle = center.declare_extension_junction('audit:recorded', JunctionKind.OBSERVABLE)
+
+    async def record(**kwargs: object) -> None:
+        seen.append(sorted(kwargs))
+
+    center.register(handle, record)
+    await center.trigger(handle, junction='j', handle='h')
+
+    assert seen == [['handle', 'junction']]
+
+
+async def _raises_now(**_: object) -> None:
+    raise RuntimeError('broken hook')
+
+
+def _raises_before_awaiting(**_: object) -> None:
+    raise RuntimeError('broken before the coroutine')
+
+
+@pytest.mark.parametrize('hook', [_raises_now, _raises_before_awaiting], ids=['async', 'sync'])
+async def test_a_failing_observable_hook_is_logged_with_its_name_and_what_to_do(
+    hook: Callable[..., object], caplog: pytest.LogCaptureFixture
+):
+    center = HooksCenter()
+    handle = center.declare_extension_junction('audit:recorded', JunctionKind.OBSERVABLE)
+    center.register(handle, cast(Any, hook))
+
+    with caplog.at_level(logging.ERROR, logger='syndica.kernel.hooks.center'):
+        await center.trigger(handle)
+
+    [record] = [r for r in caplog.records if r.name == 'syndica.kernel.hooks.center']
+    assert cast(tuple[object, ...], record.args)[:3] == (
+        'audit:recorded',
+        repr(hook.__qualname__),
+        'RuntimeError',
+    )
+    assert '下一步' in record.msg

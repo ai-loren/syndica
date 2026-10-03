@@ -448,8 +448,9 @@ class DevModule(RuntimeModule):
             recorder = _Recorder(
                 log, host, member.agent_id, role, git if role in reviewers else None
             )
-            # 记录挂在 Agent 的局部层：它排在整条链最前，后面任何一个 hook 的裸 skip 都截不断它，
-            # 它看到的也是工具自己交回的结果，而不是别人改写过的那一份。
+            # 记录挂在 Agent 的局部层：Module 层与 Runtime 层的 skip 截不断它，它看到的也是工具自己
+            # 交回的结果。在它之前装配的 Module 从工厂里往局部层挂的 POST_TOOL_USE hook 排在它前面，
+            # 那个 hook 的 skip 会让这次调用记不下。
             member.register_hook(Junction.POST_TOOL_USE, recorder._recorded)  # pyright: ignore[reportPrivateUsage]
             return recorder
 

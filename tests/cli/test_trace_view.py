@@ -675,3 +675,52 @@ def test_a_trace_without_module_spans_says_why_and_still_counts_junctions(schema
 
     assert said in section[0]
     assert any('扩展切点：host:checkpoint ×1' in line for line in section)
+
+
+def test_a_module_name_version_or_junction_name_that_could_forge_a_line_is_escaped():
+    module = _module(_LEAD, 'audit', tools=[], plugins=[])
+    forged = dataclasses.replace(
+        module,
+        attributes={
+            **module.attributes,
+            'module.name': 'audit\nforged name',
+            'module.version': '1.0\nforged version',
+        },
+    )
+    tool = dataclasses.replace(
+        _tool(_LEAD, 0, 'Record', 1, 2),
+        events=(
+            SpanEvent(
+                name='junction.triggered',
+                time_ns=_ORIGIN + 1 * _S,
+                attributes={'junction.name': 'audit:x\nforged junction'},
+            ),
+        ),
+    )
+
+    text = render_show(_header(), [_agent(_LEAD, 'Orchestrator', 0, 5), forged, tool], [])
+
+    assert '\nforged' not in text
+
+
+def test_junction_counts_are_listed_by_name():
+    tool = dataclasses.replace(
+        _tool(_LEAD, 0, 'Record', 1, 2),
+        events=tuple(
+            SpanEvent(
+                name='junction.triggered',
+                time_ns=_ORIGIN + index * _S,
+                attributes={'junction.name': name},
+            )
+            for index, name in enumerate(('mid:b', 'alpha:a', 'zulu:c', 'mid:b'))
+        ),
+    )
+    spans = [
+        _agent(_LEAD, 'Orchestrator', 0, 5),
+        _module(_LEAD, 'audit', tools=[], plugins=[]),
+        tool,
+    ]
+
+    section = _section(render_show(_header(), spans, []), 'Module：')
+
+    assert any('扩展切点：alpha:a ×1、mid:b ×2、zulu:c ×1' in line for line in section)

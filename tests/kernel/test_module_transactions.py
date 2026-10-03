@@ -5,16 +5,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from typing import NoReturn
 
 import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
+from syndica.kernel.agent_types import AgentInfo
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import ExtensionJunction, HookResult, HooksCenter, Junction, JunctionKind
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.modules import RuntimeModule
 from syndica.kernel.runtime import Runtime
+from syndica.kernel.stores.memory_registry import InMemoryAgentRegistry
 from syndica.kernel.tool import Tool, ToolResult
 
 _INTERRUPTIONS = [RuntimeError('boom'), KeyboardInterrupt(), asyncio.CancelledError()]
@@ -475,3 +478,139 @@ async def test_an_agent_built_on_the_runtime_center_itself_is_refused():
         runtime.hooks.register(Junction.AGENT_SPAWN, noop)
     finally:
         await runtime.shutdown()
+
+
+class _RefusesOnce(InMemoryAgentRegistry):
+    """第一次注册在一次 await 之后失败；失败之前让 `meanwhile` 跑一下（别的 spawn 同时在装）。"""
+
+    def __init__(self, meanwhile: Callable[[], None]) -> None:
+        super().__init__()
+        self._meanwhile = meanwhile
+        self._refused = False
+
+    async def register(self, info: AgentInfo) -> None:
+        if not self._refused:
+            self._refused = True
+            self._meanwhile()
+            await asyncio.sleep(0)
+            raise RuntimeError('registry hiccup')
+        await super().register(info)
+
+
+async def test_a_spawn_that_fails_after_its_awaits_takes_out_only_its_own_runtime_hooks():
+    seen: list[str] = []
+    runtimes: list[Runtime] = []
+
+    def registers(runtime: Runtime, agent: object, flags: object) -> Mapping[str, Tool]:
+        del agent, flags
+        runtime.hooks.register(Junction.AGENT_DESPAWN, _recorder(seen, 'failed-spawn'))
+        return {}
+
+    def meanwhile() -> None:
+        runtimes[0].hooks.register(Junction.AGENT_DESPAWN, _recorder(seen, 'concurrent'))
+
+    runtime = Runtime(
+        modules=[RuntimeModule('first', tool_factories=(registers,))],
+        registry=_RefusesOnce(meanwhile),
+    )
+    runtimes.append(runtime)
+    try:
+        with pytest.raises(RuntimeError, match='registry hiccup'):
+            await runtime.spawn(_factory([]))
+        await runtime.hooks._dispatch(Junction.AGENT_DESPAWN, agent_id='a')  # pyright: ignore[reportPrivateUsage]
+        assert seen == ['concurrent']
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_late_spawn_failure_leaves_hooks_that_were_there_before_it_even_the_same_callback():
+    seen: list[str] = []
+    shared = _recorder(seen, 'shared')
+
+    def registers(runtime: Runtime, agent: object, flags: object) -> Mapping[str, Tool]:
+        del agent, flags
+        runtime.hooks.register(Junction.AGENT_DESPAWN, shared)
+        return {}
+
+    runtime = Runtime(
+        modules=[RuntimeModule('first', tool_factories=(registers,))],
+        registry=_RefusesOnce(lambda: None),
+    )
+    runtime.hooks.register(Junction.AGENT_DESPAWN, shared)
+    try:
+        with pytest.raises(RuntimeError, match='registry hiccup'):
+            await runtime.spawn(_factory([]))
+        chain = runtime.hooks._collect_authored(Junction.AGENT_DESPAWN)  # pyright: ignore[reportPrivateUsage]
+        await runtime.hooks._dispatch(Junction.AGENT_DESPAWN, agent_id='a')  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runtime.shutdown()
+
+    assert chain == [(shared, None)]
+    assert seen == ['shared']
+
+
+def _boom(*_: object) -> NoReturn:
+    raise ValueError('third-party failure')
+
+
+class _ExplodingPlugin:
+    name = 'beta-hooks'
+
+    def register(self, hooks: HooksCenter) -> None:
+        raise ValueError('third-party failure')
+
+
+@pytest.mark.parametrize(
+    ('module', 'stage'),
+    [
+        (RuntimeModule('beta', services={'beta_store': _boom}), "service 'beta_store'"),
+        (RuntimeModule('beta', on_start=lambda runtime, flags: _boom()), 'on_start'),
+    ],
+    ids=['service', 'on-start'],
+)
+def test_a_module_failing_while_the_runtime_starts_keeps_its_error_and_names_itself(
+    module: RuntimeModule, stage: str
+):
+    with pytest.raises(ValueError, match='third-party failure') as excinfo:
+        Runtime(modules=[module])
+
+    assert excinfo.value.__notes__ == [f"Runtime Module 'beta' 的 {stage} 抛出了它"]
+
+
+@pytest.mark.parametrize(
+    ('module', 'stage'),
+    [
+        (RuntimeModule('beta', tool_factories=(_boom,)), 'tool_factories[0]'),
+        (RuntimeModule('beta', agent_plugins=(_boom,)), 'agent_plugins[0]'),
+        (
+            RuntimeModule('beta', agent_plugins=(lambda *_: _ExplodingPlugin(),)),
+            "插件 'beta-hooks' 的 register",
+        ),
+    ],
+    ids=['tool-factory', 'plugin-factory', 'plugin-register'],
+)
+async def test_a_module_failing_while_an_agent_is_assembled_keeps_its_error_and_names_itself(
+    module: RuntimeModule, stage: str
+):
+    runtime = Runtime(modules=[module])
+    try:
+        with pytest.raises(ValueError, match='third-party failure') as excinfo:
+            await runtime.spawn(_factory([]))
+    finally:
+        await runtime.shutdown()
+
+    assert excinfo.value.__notes__ == [f"Runtime Module 'beta' 的 {stage} 抛出了它"]
+
+
+async def test_a_failing_on_shutdown_names_its_module_inside_the_group():
+    async def fails(runtime: Runtime) -> None:
+        del runtime
+        raise ValueError('cannot flush')
+
+    runtime = Runtime(modules=[RuntimeModule('beta', on_shutdown=fails)])
+
+    with pytest.raises(ExceptionGroup) as excinfo:
+        await runtime.shutdown()
+
+    [failure] = excinfo.value.exceptions
+    assert failure.__notes__ == ["Runtime Module 'beta' 的 on_shutdown 抛出了它"]

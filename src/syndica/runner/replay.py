@@ -144,6 +144,18 @@ logger = logging.getLogger(__name__)
 ModuleRebuilder = Callable[[ModuleRecord, ModuleHost], RuntimeModule | str]
 
 
+def _builtin_modules(llm: _ReplayLLM, fallbacks: str) -> dict[str, Callable[[], RuntimeModule]]:
+    """回放按名字重建的内置 Module。`retry` 的备用模型在回放里都是同一个替身。"""
+    return {
+        'safety': SafetyModule,
+        'human-interaction': HumanInteractionModule,
+        'retry': lambda: RetryModule(
+            {name.strip(): llm for name in fallbacks.split(',') if name.strip()}
+        ),
+        'prefix-drift': PrefixDriftModule,
+    }
+
+
 class ModulesNotRebuilt(SyndicaError):
     """文档记着的第三方 Module 在这里重建不了，或重建的 Module 依赖的 Module 没重建：原因在当前
     环境（信任、启用、装着的版本），不在文档里，重新记录一次修不好它。"""
@@ -152,8 +164,8 @@ class ModulesNotRebuilt(SyndicaError):
 def _not_rebuilt(name: str, why: str, next_action: str) -> ModulesNotRebuilt:
     return ModulesNotRebuilt(
         expected=(
-            f'回放重建这份文档记着的第三方 Module {name!r}（它的代码在原始 run 里跑过，'
-            '回放里不跑就不是同一次 run）'
+            f'回放重建这份文档记着的第三方 Module {name!r}（原始 run 装过它，回放里少了它'
+            '就不是同一次 run）'
         ),
         received=f'没有重建 {name!r}：{why}',
         next_action=next_action,
@@ -1125,22 +1137,14 @@ class _Replay:
     def _modules(
         self, llm: _ReplayLLM, root: Path
     ) -> tuple[tuple[RuntimeModule, ...], tuple[str, ...]]:
-        """重建得出的 Module 与没重建的宿主 Module（`dev`、`read-only`：它们的作用已经在记录里）。
-        内置的按名字重建；第三方的交给注入的判据，交给它的 `ModuleHost` 是回放的工作区根、空环境
-        （回放不跑真命令）与回放的脱敏器。第三方的重建不了，这次回放就不是同一次 run：它的代码在
-        原始 run 里跑过，抛 `ModulesNotRebuilt`，而不是少它一个接着跑、再把差别报成分叉。"""
+        """重建得出的 Module 与没重建的宿主 Module（没有记录的那些，如开发期守卫：它们的作用
+        已经在记录里）。内置的按名字重建；第三方的交给注入的判据，交给它的 `ModuleHost` 是回放的
+        工作区根、空环境（回放不跑真命令）与回放的脱敏器。第三方的重建不了，这次回放就不是同一次
+        run：原始 run 装过它，抛 `ModulesNotRebuilt`，而不是少它一个接着跑、再把差别报成分叉。"""
         names = self._host.modules
         if names is None:
             return (SafetyModule(), HumanInteractionModule()), ()
-        fallbacks = str(self._host.flags.get('llm_fallbacks', ''))
-        builders: dict[str, Callable[[], RuntimeModule]] = {
-            'safety': SafetyModule,
-            'human-interaction': HumanInteractionModule,
-            'retry': lambda: RetryModule(
-                {name.strip(): llm for name in fallbacks.split(',') if name.strip()}
-            ),
-            'prefix-drift': PrefixDriftModule,
-        }
+        builders = _builtin_modules(llm, str(self._host.flags.get('llm_fallbacks', '')))
         records = {record.name: record for record in self._host.module_records}
         rebuild = self._runner._module_rebuilder  # pyright: ignore[reportPrivateUsage]
         built: list[RuntimeModule] = []

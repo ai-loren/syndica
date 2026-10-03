@@ -573,3 +573,76 @@ def test_flags_list_names_a_bad_modules_entry_before_asking_for_trust(
     assert code != 0
     assert anchor in err
     assert 'config trust' not in err
+
+
+def test_the_prefix_error_does_not_promise_that_two_modules_can_never_clash(tmp_path: Path):
+    flags = (FlagDeclaration(key='greeting', default='x', description='d'),)
+
+    with pytest.raises(ConfigError) as excinfo:
+        _run(tmp_path, _entry(_module_factory([], flags=flags)), _echo_llm())
+
+    assert 'alpha_greeting' in excinfo.value.next_action
+    assert '同时启用时会被拒' in excinfo.value.next_action
+
+
+@pytest.mark.parametrize(('key', 'refused'), [('git_notes_level', False), ('gitnotes_level', True)])
+def test_a_hyphenated_module_name_becomes_an_underscored_flag_prefix(
+    tmp_path: Path, key: str, refused: bool
+):
+    flags = (FlagDeclaration(key=key, default=1, description='d'),)
+    factory = _module_factory([], name='git-notes', flags=flags)
+    config = tmp_path / 'syndica.yaml'
+
+    def run() -> object:
+        (tmp_path / 'ws').mkdir(exist_ok=True)
+        config.write_text('version: 1\nmodules: [git-notes]\n', encoding='utf-8')
+        host = RuntimeCliHost(
+            trust=NO_TRUST_GATE,
+            io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
+            model_factory=lambda _: _echo_llm(),
+            workspace_root=tmp_path / 'ws',
+            environ={'PATH': '/usr/bin:/bin', 'HOME': str(tmp_path)},
+            entry_points=_entry(factory, name='git-notes'),
+        )
+        try:
+            return host.run_request(RunRequest(prompt='go', config=str(config)))
+        finally:
+            host.close()
+
+    if refused:
+        with pytest.raises(ConfigError) as excinfo:
+            run()
+        assert "以 'git_notes_' 开头" in excinfo.value.expected
+    else:
+        run()
+
+
+def test_a_module_whose_on_shutdown_fails_still_hands_back_the_runs_answer(tmp_path: Path):
+    async def fails(runtime: Any) -> None:
+        del runtime
+        raise RuntimeError('could not flush the cache')
+
+    def build(host: ModuleHost) -> RuntimeModule:
+        del host
+        return RuntimeModule('alpha', on_shutdown=fails)
+
+    (tmp_path / 'ws').mkdir()
+    config = tmp_path / 'syndica.yaml'
+    config.write_text('version: 1\nmodules: [alpha]\n', encoding='utf-8')
+    stderr = StringIO()
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
+        model_factory=lambda _: ScriptedLLM([ScriptedTurn(content='THE-ANSWER')]),
+        workspace_root=tmp_path / 'ws',
+        environ={'PATH': '/usr/bin:/bin', 'HOME': str(tmp_path)},
+        entry_points=_entry(build),
+    )
+    try:
+        answer = host.run_request(RunRequest(prompt='go', config=str(config)))
+    finally:
+        host.close()
+
+    assert str(answer).rstrip().endswith('THE-ANSWER')
+    assert "Runtime Module 'alpha' 的 on_shutdown 抛出了它" in stderr.getvalue()
+    assert '照常交出' in stderr.getvalue()

@@ -72,6 +72,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'Finding',
     'FlagDeclaration',
     'FlagRow',
+    'FlagValue',
     'HookCallback',
     'HookResult',
     'HooksCenter',
@@ -922,3 +923,77 @@ def test_no_name_is_both_promised_and_withheld():
     """两份清单必须互斥：一个名字同时出现在两边时，上一条会因为差集少一项而变红，而读者看到的
     却是「它在扣留清单里」——把这条矛盾单独判出来，才不用靠另一条断言的算术去发现它。"""
     assert sorted(set(_WITHHELD) & set(kernel.__all__)) == []
+
+
+def test_an_extension_junction_handle_exposes_only_its_name_kind_and_owner():
+    from syndica.kernel import ExtensionJunction, JunctionKind
+
+    handle = ExtensionJunction('audit:recorded', JunctionKind.OBSERVABLE)
+
+    assert [name for name in dir(handle) if not name.startswith('_')] == ['kind', 'name', 'owner']
+
+
+def test_flag_row_fields_keep_their_published_order():
+    import dataclasses
+
+    from syndica.kernel import FlagRow
+
+    assert [field.name for field in dataclasses.fields(FlagRow)] == [
+        'key',
+        'module',
+        'kind',
+        'default',
+        'choices',
+        'minimum',
+        'maximum',
+        'description',
+    ]
+
+
+def test_every_field_added_to_module_host_after_the_first_three_has_a_default():
+    import dataclasses
+
+    from syndica.kernel import ModuleHost
+
+    assert [
+        (
+            field.name,
+            field.default is not dataclasses.MISSING
+            or field.default_factory is not dataclasses.MISSING,
+        )
+        for field in dataclasses.fields(ModuleHost)
+    ] == [('workspace_root', False), ('environment', False), ('redactor', False)]
+
+
+@pytest.mark.parametrize(
+    ('owner', 'method', 'parameter'),
+    [
+        ('AgentCatalog', 'freeze', 'role_policies'),
+        ('Runtime', 'assemble', 'role_policies'),
+        ('TraceRecorder', 'describe_run', 'topology'),
+    ],
+)
+def test_the_parameters_m4_added_stay_keyword_only(owner: str, method: str, parameter: str):
+    import inspect
+
+    target = getattr(getattr(kernel, owner), method)
+
+    assert inspect.signature(target).parameters[parameter].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@pytest.mark.parametrize('value', ['module', 'host'])
+def test_modules_and_module_hosts_compare_by_value_and_refuse_to_be_hashed(value: str):
+    from pathlib import Path
+
+    from syndica.kernel import ModuleHost, RuleRedactor, RuntimeModule
+
+    redactor = RuleRedactor()
+
+    def make() -> object:
+        if value == 'module':
+            return RuntimeModule('alpha')
+        return ModuleHost(workspace_root=Path('.'), environment={}, redactor=redactor)
+
+    assert make() == make()
+    with pytest.raises(TypeError, match=f"unhashable type: '{type(make()).__name__}'"):
+        hash(make())

@@ -481,7 +481,7 @@ class BaseAgent:
         """
         self._hooks.register(junction, cb)
 
-    async def trigger_extension(self, handle: ExtensionJunction, **kwargs: Any) -> HookResult:
+    async def trigger_extension(self, handle: ExtensionJunction, /, **kwargs: Any) -> HookResult:
         """在这个 Agent 的整条链（局部 → Module 层 → Runtime）上触发一个扩展切点，返回可拦截链的
         合并结论。只收声明时交回的那个句柄（规则同 `HooksCenter.trigger`）；Module 的工具与插件工厂
         都收到 `agent`，因此拿得到这里。"""

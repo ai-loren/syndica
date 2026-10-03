@@ -546,6 +546,7 @@ def _spying(seen: _Seen) -> Replayer:
         redactor: Redactor,
         allow_divergence: bool,
         recorder: TraceRecorder | None,
+        config_file: Path | None = None,
     ) -> _Verdict:
         seen.calls.append({'redactor': redactor, 'allow_divergence': allow_divergence})
         return _Verdict()
@@ -580,6 +581,7 @@ def test_a_replay_that_fails_still_reports_where_its_own_trace_went(tmp_path: Pa
         redactor: Redactor,
         allow_divergence: bool,
         recorder: TraceRecorder | None,
+        config_file: Path | None = None,
     ) -> _Verdict:
         assert recorder is not None
 
@@ -791,6 +793,7 @@ def test_a_replay_trace_that_was_left_unfinished_is_labelled_so(tmp_path: Path):
         redactor: Redactor,
         allow_divergence: bool,
         recorder: TraceRecorder | None,
+        config_file: Path | None = None,
     ) -> _Verdict:
         assert recorder is not None
         asyncio.run(recorder.begin())
@@ -1062,6 +1065,7 @@ def test_divergences_reported_by_the_replay_stay_one_line_each_and_inert(tmp_pat
         redactor: Redactor,
         allow_divergence: bool,
         recorder: TraceRecorder | None,
+        config_file: Path | None = None,
     ) -> _Verdict:
         return _Verdict(
             divergences=[_Divergence('tool', 'Worker[0]\x1b[2J', 'line one\nline two\x07')]

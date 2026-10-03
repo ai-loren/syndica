@@ -30,6 +30,7 @@ __all__ = [
     'load_module',
     'module_rows',
     'no_entry_points',
+    'runs_code',
     'third_party',
     'validated_modules',
 ]
@@ -275,6 +276,19 @@ def load_module(entry: Discovered, host: ModuleHost, redactor: Redactor) -> Runt
     return module
 
 
+def runs_code(module: RuntimeModule) -> bool:
+    """这个 Module 有没有会在 run 里跑的代码（服务、启停钩子、插件工厂、工具工厂）。只声明 Flag 的
+    没有：捕获不因它挡回放文档，回放也不因它没声明 `replay_safe` 就不重建。两处用这同一个判据，
+    否则捕获写下的文档回放一定拒绝。"""
+    return bool(
+        module.services
+        or module.on_start is not None
+        or module.on_shutdown is not None
+        or module.agent_plugins
+        or module.tool_factories
+    )
+
+
 def _check_flag_keys(module: RuntimeModule) -> None:
     """第三方 Flag 的键带着 Module 名做前缀，且不像密钥：Flag 的值会写进宿主档案与回放文档，
     凭证要从环境来。"""
@@ -284,7 +298,10 @@ def _check_flag_keys(module: RuntimeModule) -> None:
             raise ConfigError(
                 expected=f'Module {module.name!r} 的 Flag 键以 {prefix!r} 开头',
                 received=f'它声明了 {declaration.key!r}',
-                next_action=f'改成 {prefix}{declaration.key}；前缀让两个 Module 的 Flag 撞不了名',
+                next_action=(
+                    f'改成 {prefix}{declaration.key}；前缀让两个 Module 的 Flag 难以撞名'
+                    '（撞上了，两者同时启用时会被拒）'
+                ),
             )
         if looks_secret(declaration.key):
             raise ConfigError(

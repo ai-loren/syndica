@@ -54,6 +54,7 @@ class Greet(Tool):
         name: Who to greet.
     """
 
+    # Greet hands none of its arguments to a shell or interpreter; a tool that does lists them here.
     __tool_command_args__ = ()
 
     def __init__(self, agent: BaseAgent, greeting: str) -> None:

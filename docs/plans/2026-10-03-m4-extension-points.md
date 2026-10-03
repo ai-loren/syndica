@@ -222,7 +222,7 @@ M1 的理由仍成立（插件实例难冻结、撑大公开面），而 M4 的�
 ### D6 查询与 Agent 范围的触发
 
 - `HooksCenter.extension_junctions() -> Mapping[str, JunctionKind]`：整条装配链上已声明的扩展切点，按名字排序的只读
-  映射。`modules show` 与 trace 用它。
+  映射，供宿主查询。`modules show` 读清单里的 `junctions`，trace 经私有的观察入口记每次触发，都不经它。
 - `BaseAgent.trigger_extension(handle, **kwargs) -> HookResult`：在这个 Agent 的整条链（局部 → Module 层 → Runtime）
   上触发一个扩展切点，句柄规则同上。名字带 `_extension`：`trigger` 太容易与类式角色自己的属性撞名（评审 L5）。
   Module 的工具工厂与插件工厂都收到 `agent`，因此拿得到它。`_BASE_AGENT_SURFACE` 加这一个名字，理由写进守卫。
@@ -310,8 +310,10 @@ M1 的理由仍成立（插件实例难冻结、撑大公开面），而 M4 的�
   第三轮评审 L1），改动了就不写回放文档。「受信任」由回放**被动地**查信任存储，从不发问（第二轮评审
   H4：`trace` 命令不经信任确认，所以回放不能自己去问人）；没被信任时不重建，next_action 指向 `syndica config trust`。
   判据读已安装的 Module 与本地配置，不读文档里的声明。
-- Module 的组装（次序、第三方工具结果的信任标记、Flag 规则）只有一份 CLI 函数，由组合根注入 `run` 与回放两处
-  （`runner` 不得依赖 `cli`，依赖规则 2；第二轮评审 M9：只注入发现不够，组装的规则也要同一份）。
+- 组合根注入回放的只有第三方 Module 的重建判据（`runner` 不得依赖 `cli`，依赖规则 2）。回放按名字重建内置
+  Module 的那张表与 CLI 的 `MANDATORY` / `OPTIONAL_BUILTINS` 各有一份，由一条跨层用例钉住相等：漏了一个，那个内置
+  Module 就会被当成「作用已经在记录里」的宿主 Module 放过去（收口评审 B 的 F13）。没有记录的名字是宿主自己的
+  Module（开发期守卫、嵌入的宿主自装的），照旧列出、不重建。
 - 其余第三方 Module 只要有一点会跑的代码（服务、`on_start`、插件工厂、工具工厂任一）就让这次 run 在 `describe_run`
   时判 `Unreplayable`（说清是哪个 Module、为什么、要怎样才能回放）；只声明 Flag 的 Module 不挡回放。`on_start` 能往
   Runtime 级挂作用于每个 Agent 的 hook（`PrefixDriftModule` 就是），服务能被别的 Module 的工具调用，跳过它们会静默
@@ -393,9 +395,12 @@ M1 的理由仍成立（插件实例难冻结、撑大公开面），而 M4 的�
     声明了 `replay_safe` 时才重建（D13）；被放宽的结果在回放里能驱动的只有替身工具、内核工具与这些声明了不做 I/O 的
     工具。项目配置放不开（第二轮评审 High 2：没有开关的保守标记会让一次第三方调用之后的每个高风险调用都被拒）。
   - 开发期守卫对这些工具不认它们自己声明的 `()`，按「每个字符串参数都可能被执行」判（第二轮评审 M12；实现按类定义在
-    不在 syndica 包里认，`impl:` 角色自己的工具一并收紧）。开发期记录器挪到 Agent 的局部层：它排在整条链最前，后面任何
-    hook 的裸 `skip` 都截不断它，看到的也是工具自己交回的结果（第四轮评审 Low 给的两个选项之一；另一项「执行器一侧的
-    私有回调」要给内核加一个只供 CLI 用的私有入口，而记录器还要往结果里写 `check`，回调做不到）。
+    不在 syndica 包里认，`impl:` 角色自己的工具一并收紧）。开发期记录器挪到 Agent 的局部层：Module 层与 Runtime 层的
+    `skip` 截不断它，看到的也是工具自己交回的结果（第四轮评审 Low 给的两个选项之一；另一项「执行器一侧的
+    私有回调」要给内核加一个只供 CLI 用的私有入口，而记录器还要往结果里写 `check`，回调做不到）。它**不是**整条链
+    最前（收口评审 A 的 F3）：`dev` 最后装，在它之前的 Module 的工厂拿得到 Agent，往局部层挂的 POST_TOOL_USE hook 排在
+    它前面，那个 hook 的 skip 让这次调用记不下。挡掉就得拒收 Module 身份下的局部层注册，而 `dev` 自己正是这样挂的；
+    登记为 D-62，归里程碑 5（执行面在执行器里记下每个调用的结局）。
 - **第三方 Flag**：键必须以 `<Module 名的下划线写法>_` 开头（`example` → `example_greeting`），像密钥的键名一律拒收
   （「凭证从环境来，不进 Flag」）——Flag 的值会进宿主档案与回放文档。
 - **`modules:` / `flags:`**：`modules:` 是名字列表；`flags:` 与 `--flag` 走**同一个**校验函数，CLI 拒收的取值（如
@@ -441,7 +446,8 @@ M1 的理由仍成立（插件实例难冻结、撑大公开面），而 M4 的�
     文件交给模型的字节与此前不同，前缀缓存整体失效（第四轮评审 Low）；人答完之后重读一遍再比，变了就中止并要求重跑
     （AGENTS.md：检查与动作之间隔着一次问人，要再查一次）。
   - **确认之前不 import 任何第三方代码**（第二轮评审 B1）：展示只用元数据——启用的 Module 的入口点目标、发行版名与
-    版本；能力要 import 才知道，展示里写明「能力在信任之后用 `syndica modules show <name>` 查看」。另外展示
+    版本；能力要 import 才知道，展示里写明「能力用 `syndica modules show <name>` 查看」（代码在工作区之内的，先确认
+    这份配置才看得到）。另外展示
     `workspace.verify`、`pass_env`、每个角色的平台与模型、`impl:` 目标、提示词文件；单行字段过 `one_line`、多行字段逐行
     过它并加固定的缩进前缀（`terminal_safe` 保留换行，多行配置值能伪造出一行顶格的假确认，第二轮评审 H1 残留、第三轮
     评审 M10）。
@@ -519,7 +525,8 @@ danger:
     Explorer: {policy: block_high_risk}
     Worker: {rules: {shell.path_outside_workspace: block}}
 agents:
-  Planner:
+  - name: Planner
+    description: 拆解需求
     system_prompt: {file: docs/agents/planner.md}
 ```
 
