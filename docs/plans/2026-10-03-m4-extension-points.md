@@ -706,7 +706,8 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
   `module` span 指向同一份声明；这次 run 离线回放复现。再加一条运行期错误：可观察切点上的 hook 抛错只记 ERROR、run
   照常完成；可拦截切点上的抛错上抛（路线图：除非切点声明为必须失败）。
 
-#### T16 — 真实模型 E2E、文档与收口
+#### T16 — 真实模型 E2E、文档与收口（完成）
+- 结论与证据见 [M4 收口审计](../audits/2026-10-03-m4-final-audit.md)。
 - 仓库副本里把示例包装进副本的环境，`XDG_CONFIG_HOME` 指向临时目录（不写真实的信任存储），用免费模型跑一次启用它
   的 run：Agent 用了 Module 的工具，trace 有 `module` span
   与切点事件，`flags list` 列出它的 Flag，回放复现。

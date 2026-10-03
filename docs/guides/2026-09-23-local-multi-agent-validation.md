@@ -416,13 +416,54 @@ uv run python -m syndica trace prune --keep 50
 
 不符合预期 / 常见情况：
 
-- `trace replay` 以 2 退出、说没有回放文档：这个 trace 是 `--trace structure` 或 `--topology` 的 run 记的。
+- `trace replay` 以 2 退出、说没有回放文档：这个 trace 是 `--trace structure` 的 run 记的，或那次 run 装了一个有会跑的
+  代码、又没声明 `replay_safe` 的第三方 Module（原因写在 run 结束时的 stderr 里）。
 - 回放以 1 退出：分叉那一行说是哪个 Agent、第几轮、哪个单元；你刚改过内核或宿主配置时这正是它该报的。
 - `trace list` 里一行写着「span 读不进来」：那个 trace 被改过（多半是 Agent 的 Bash），`trace show` 说是哪一行。
 
 ---
 
-## 12. 当前已知限制
+## 12. 第三方 Module（里程碑 4）
+
+目的：验证一个经入口点安装的第三方 Module 装得上、看得见、受信任确认约束，它的工具结果不可信，run 照样能回放。
+在仓库副本里跑，信任存储放进临时目录（不碰你真实的 `~/.config/syndica`）：
+
+```bash
+uv pip install -e examples/syndica-example-module
+export XDG_CONFIG_HOME="$(mktemp -d)"
+printf 'version: 1\nmodules: [example]\nflags:\n  example_greeting: hi\n' > .syndica.yaml
+uv run python -m syndica run --agent Worker "Use the Greet tool to greet Ada." < /dev/null
+uv run python -m syndica config trust --sha256 <上一条拒绝里的摘要>
+uv run python -m syndica modules list
+uv run python -m syndica modules show example
+uv run python -m syndica flags show example_greeting
+uv run python -m syndica run --agent Worker "Use the Greet tool to greet Ada, then reply with exactly the text the tool returned."
+uv run python -m syndica trace show <id>
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY uv run python -m syndica trace replay <id>
+```
+
+符合预期：
+
+- 第一次 run 以非 0 退出，说配置没被信任并给出摘要：确认之前配置里的任何东西都不执行。
+- `modules list` 里 `example` 一行是「已启用」，来源是 `syndica-example-module 0.1.0`；代码装在工作区之内时那一行
+  会标出来。`modules show example` 打出清单：`example:greeted` 是可观察切点，`replay_safe` 为真，能力为空。
+- `flags show example_greeting` 的 `effective` 是 `hi`、`source` 是 `flags:`。
+- run 的答案是 `hi, Ada`。`trace show` 的 Module 一节里 `example 0.1.0` 带着工具 `Greet` 与插件 `example-recorder`，
+  扩展切点 `example:greeted ×1`。
+- 回放在没有任何 API key 的环境里以 0 退出、打出「复现」：示例 Module 被重建（它声明了 `replay_safe`，配置受信任、
+  启用了它，装着的发行版与记录一致），没有重建的只有宿主自己的 `dev`。
+- trace 目录里 `Greet` 的结果记成 `untrusted`：第三方 Module 的输出一律不可信，`--trust-module-output example`
+  只在这次 run 放开。
+
+不符合预期 / 常见情况：
+
+- 回放说「这个工作区没有受信任的 .syndica.yaml」：回放时的 `XDG_CONFIG_HOME` 与 run 时不同，信任是被动查的、
+  回放从不发问。
+- 改了 `.syndica.yaml` 或 Module 在工作区里的代码之后再跑，会重新要确认：摘要盖住它们。
+
+---
+
+## 13. 当前已知限制
 
 - OpenRouter 免费模型每天有额度限制。`free-models-per-day` 429 是外部额度耗尽，不是 Syndica 逻辑
   错误。Gemini 免费档同样按型号限额。
