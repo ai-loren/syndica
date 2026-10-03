@@ -1471,7 +1471,7 @@ def test_the_virtual_clock_jumps_exactly_to_each_timer():
 def test_timers_far_in_the_future_elapse_without_spinning():
     retried = _retried(
         ['safety', 'human-interaction', 'retry'],
-        {'llm_retry_attempts': 1, 'llm_retry_backoff_ms': 10**15},
+        {'llm_retry_attempts': 1, 'llm_retry_backoff_ms': 60_000},
     )
     asked, _ = _asked({'kind': 'timeout'})
     asked['agents']['Lead']['instances'][0]['turns'][0]['tool_calls'][0]['arguments'] = {

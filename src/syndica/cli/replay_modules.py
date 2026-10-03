@@ -8,11 +8,19 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from syndica.cli.modules import EntryPointSource, discover, load_module
-from syndica.cli.trust import JsonTrustStore, config_of, read_snapshot, store_path
+from syndica.cli.trust import (
+    JsonTrustStore,
+    PinnedImports,
+    config_of,
+    private_pycache_prefix,
+    read_snapshot,
+    store_path,
+)
 from syndica.kernel import ConfigError, ModuleHost, RuntimeModule
 from syndica.kernel.scenario_schema import ModuleRecord
 
@@ -50,6 +58,12 @@ def module_rebuilder(
                 f'装着的是 {entry.distribution} {entry.version}，记录里是 '
                 f'{record.distribution} {record.distribution_version}：装上记录里的版本再回放'
             )
+        inside = [source for source in snapshot.module_sources if source.inside]
+        if inside:
+            # 与 run 一样：工作区里种下的 `.pyc` 不当缓存用，import 时按确认时的内容核对。回放这个
+            # 进程里一直生效。
+            sys.pycache_prefix = private_pycache_prefix()
+            PinnedImports(inside).install()
         try:
             module = load_module(entry, host, host.redactor)
         except ConfigError as error:

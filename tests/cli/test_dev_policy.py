@@ -395,3 +395,14 @@ def test_a_chat_session_uses_the_same_policy_and_guard(tmp_path: Path) -> None:
 
     assert '已拦截' in str(blocks['bad'].content)
     assert 'Approve Bash (read)' in stdout.getvalue()
+
+
+class _Lookalike(_Declares):
+    pass
+
+
+_Lookalike.__module__ = 'syndica_extra.tools'
+
+
+async def test_a_package_whose_name_starts_with_syndica_is_not_syndica(tmp_path: Path) -> None:
+    assert await _guarded(tmp_path, _Lookalike(), {'note': 'git push'})

@@ -610,6 +610,13 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
   `PathFinder`、只摘 `.py`、固定的 `pycache_prefix`、不展示工作区里的 `sys.path` 条目、按字节原样解码，都必须变红。
 - `config` 进命令表；`--config` 的字面缺省改为自动发现；提示与回答走 stderr；信任闸是宿主的必填参数。
 - Agent 的环境里设 `SYNDICA_TRUST_STORE`，`pass_env` 拒收它。
+- 阶段三评审的修补：「在工作区之内」按字面或解析之后有一种在里面就算、按文件身份比（工作区里的符号链接 Agent
+  改得到指向；大小写不敏感的卷上同一个目录有多种拼法）；摘包时走进链接进来的目录；工作区之外的代码进摘要的是
+  它解析之后的位置（摘要格式升到 `syndica-trust/2`）；Module 的代码在工作区之内时同样换私有的 `pycache_prefix`；
+  摘进去的代码在 import 时按确认时的内容核对（`PinnedImports`，惰性 import 在 run 中途才读盘），回放重建时也装；
+  `modules show` 对工作区之内的代码要求先启用、经确认；`modules list` 标出它；确认提示列出 `flags:`；`retry` 的
+  两个 Flag 设上限（10 次、60000 毫秒）；一个发行版的 `entry_points.txt` 坏了只坏它那一行。仍挡不住的：工作区里
+  `sys.path` 条目上没摘进去的代码（只展示，见上），以及在任何确认之前就跑的 `.pth`。
 - 变异：摘要漏掉任一部分（提示词文件、`impl:` 与工作区内的整棵包、Module 的发行版版本）、答后不复查、展示不转义、
   管道输入被当成确认、非交互时放行、确认之前 import 了第三方代码（含找 `impl:` 源文件时）、Agent 的环境里没有
   `SYNDICA_TRUST_STORE`，都必须变红（安全）。

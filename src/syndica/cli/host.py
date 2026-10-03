@@ -112,8 +112,10 @@ from syndica.cli.trace_commands import (
 )
 from syndica.cli.trust import (
     ConfigSnapshot,
+    PinnedImports,
     TrustGate,
     TrustStore,
+    code_location,
     config_of,
     describe,
     private_pycache_prefix,
@@ -347,6 +349,15 @@ def _runs_code(module: RuntimeModule) -> bool:
         or module.agent_plugins
         or module.tool_factories
     )
+
+
+def _require_enabled(name: str, config: CliConfig) -> None:
+    if name not in config.modules:
+        raise _config_error(
+            '代码在工作区之内的第三方 Module 先在 modules 里启用、经信任确认才 import',
+            f'{name!r} 的代码在工作区之内（Agent 写得到），这份配置没有启用它',
+            f'在 modules 里写上 {name!r}、确认配置之后再查看',
+        )
 
 
 def reference_modules() -> tuple[RuntimeModule, ...]:
@@ -1220,6 +1231,7 @@ class RuntimeCliHost:
         self._closed = False
         self._ctrl_c: _CtrlC | None = None
         self._sigint_before: Any = None
+        self._pins: PinnedImports | None = None
         self._sessions: dict[str, _ChatSession] = {}
         # `--handoff` 下 stdout 只有交接文件，问人的提示改走 stderr。
         self._prompts_to_stderr = False
@@ -1508,8 +1520,16 @@ class RuntimeCliHost:
         config = self._config(request.config)
         discovered = discover(self._entry_points)
         if request.action == 'list':
+            inside = {
+                entry.name: '（代码在工作区之内，Agent 写得到）'
+                for entry in discovered
+                if entry.problem is None and self._code_inside(entry.target)
+            }
             return '\n'.join(
-                '\t'.join(one_line(part) for part in (row.name, row.source, row.status))
+                '\t'.join(
+                    one_line(part)
+                    for part in (row.name, row.source + inside.get(row.name, ''), row.status)
+                )
                 for row in module_rows(config.modules, discovered)
             )
         builtins = {module.name: module for module in self._builtin_modules()}
@@ -1525,9 +1545,21 @@ class RuntimeCliHost:
                     + ('' if entry is None else f'，它装不上：{entry.problem}'),
                     '运行 syndica modules list 查看全部 Module 与它们的状态',
                 )
-            # 点名要看才 import：这是用户在命令行上的请求，不是配置替它选的代码。
+            # 点名要看才 import：这是用户在命令行上的请求，不是配置替它选的代码。代码在工作区之内
+            # 的不算——那是 Agent 写得到的代码，与配置里的代码一样先过信任确认。
+            if self._code_inside(entry.target):
+                _require_enabled(name, config)
+                config = self._trusted_config(request.config)
+                _require_enabled(name, config)
             module = self._loaded(config, (name,))[0]
         return json.dumps(_manifest(module), ensure_ascii=False, indent=2)
+
+    def _code_inside(self, target: str) -> bool:
+        """入口点的代码在不在工作区之内；认不出位置的按在里面算。"""
+        try:
+            return code_location(target, self._workspace_root).inside
+        except ConfigError:
+            return True
 
     def _loaded(self, config: CliConfig, names: Sequence[str]) -> tuple[RuntimeModule, ...]:
         """import 这几个第三方 Module，交给它们一份与 run 相同的白名单环境（用完即删）。"""
@@ -1550,15 +1582,18 @@ class RuntimeCliHost:
         """这份配置会装的 Module 声明的 Flag。配置启用了第三方 Module 时先过信任确认：要 import
         它们才知道它们声明了什么。"""
         config = self._config(request.config)
-        third = third_party(config.modules)
-        if third:
+        discovered = discover(self._entry_points)
+        validated_modules(config.modules, discovered)
+        if third_party(config.modules):
             config = self._trusted_config(request.config)
+        names = validated_modules(config.modules, discovered)
+        third = third_party(names)
         loaded = dict(zip(third, self._loaded(config, third), strict=True))
         modules = (
             *_modules(),
             *(
                 _optional_builtin(name) if name in OPTIONAL_BUILTINS else loaded[name]
-                for name in validated_modules(config.modules, discover(self._entry_points))
+                for name in names
             ),
         )
         rows = flag_reference(modules)
@@ -1683,6 +1718,8 @@ class RuntimeCliHost:
         if self._closed:
             return
         self._closed = True
+        if self._pins is not None:
+            self._pins.remove()
         if self._ctrl_c is not None:
             self._ctrl_c.release(self._sigint_before)
         pressed = False
@@ -1901,9 +1938,16 @@ class RuntimeCliHost:
         if store.get(snapshot.path) != snapshot.digest:
             self._confirm(snapshot, config)
             store.put(snapshot.path, snapshot.digest)
-        if any(impl.files for impl in snapshot.impls):
+        digested = [
+            source for source in (*snapshot.impls, *snapshot.module_sources) if source.inside
+        ]
+        if digested:
             # 工作区里种下的 `.pyc` 会被当成源文件的缓存：字节码改放到本进程新建的目录。
             sys.pycache_prefix = private_pycache_prefix()
+            if self._pins is not None:
+                self._pins.remove()
+            self._pins = PinnedImports(digested)
+            self._pins.install()
         return config
 
     def _snapshot(self, file: Path) -> ConfigSnapshot:

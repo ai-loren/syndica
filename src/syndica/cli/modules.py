@@ -7,6 +7,7 @@ import 就是在跑它的代码。入口点的来源可注入，组合根接上 
 from __future__ import annotations
 
 import importlib.metadata
+import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, cast
@@ -67,9 +68,44 @@ class _EntryPoint(Protocol):
 EntryPointSource = Callable[[], Iterable[_EntryPoint]]
 
 
+@dataclass(frozen=True)
+class _Unreadable:
+    """一个 `entry_points.txt` 读不了的发行版：只有它自己的那一行是坏的。"""
+
+    name: str
+    dist: _Distribution
+    problem: str
+    value: str = ''
+
+    def load(self) -> object:
+        raise ImportError(self.problem)
+
+
 def installed_entry_points() -> Iterable[_EntryPoint]:
-    """当前环境里 `syndica.modules` 组的入口点。只读元数据。"""
-    return cast(Iterable[_EntryPoint], importlib.metadata.entry_points(group=ENTRY_POINT_GROUP))
+    """当前环境里 `syndica.modules` 组的入口点。只读元数据。逐个发行版读：整组一起读时，一个
+    无关的发行版的 `entry_points.txt` 坏了，每次发现（于是每次 run）都失败，而且不说是哪一个。
+    同名的发行版只认 `sys.path` 上的第一个，与 `importlib.metadata.entry_points` 一致。"""
+    found: list[_EntryPoint] = []
+    seen: set[str] = set()
+    for dist in importlib.metadata.distributions():
+        name = cast('str | None', dist.metadata['Name']) or ''
+        key = re.sub(r'[-_.]+', '-', name).lower()
+        if key and key in seen:
+            continue
+        seen.add(key)
+        try:
+            points = [point for point in dist.entry_points if point.group == ENTRY_POINT_GROUP]
+        except Exception as exc:
+            found.append(
+                _Unreadable(
+                    name or '来源不明的发行版',
+                    cast(_Distribution, dist),
+                    f'它的 entry_points.txt 读不了（{type(exc).__name__}: {exc}）；重装或卸掉它',
+                )
+            )
+            continue
+        found.extend(cast(list[_EntryPoint], points))
+    return found
 
 
 def no_entry_points() -> Iterable[_EntryPoint]:
@@ -112,6 +148,7 @@ def discover(source: EntryPointSource) -> tuple[Discovered, ...]:
                 entry.value,
                 distribution,
                 version,
+                cast('str | None', getattr(entry, 'problem', None)),
                 load=cast('Callable[[], object] | None', getattr(entry, 'load', None)),
                 dist=entry.dist,
             )
@@ -133,7 +170,7 @@ def discover(source: EntryPointSource) -> tuple[Discovered, ...]:
                 entry.target,
                 entry.distribution,
                 entry.version,
-                problem,
+                entry.problem or problem,
                 load=entry.load,
                 dist=entry.dist,
             )

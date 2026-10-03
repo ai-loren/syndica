@@ -5,7 +5,8 @@
 
 **只读一次**：配置文件与它引用的每个提示词文件在这里读一遍，摘要算的、给人看的、交给内核的都是这一份；
 内核拿到的提示词是正文、不带 origin，不会再按路径读。人答完之后重读一遍再比：检查与动作之间隔着一次
-问人，问题挂着的这段时间文件照样能被改。
+问人，问题挂着的这段时间文件照样能被改。摘进去的工作区代码在 import 时再按摘要核对一次
+（`PinnedImports`）：惰性 import 的模块在 run 中途才从磁盘读，那时 Agent 早就改得到它了。
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import os
 import shutil
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.machinery import ModuleSpec
 from pathlib import Path
@@ -39,8 +40,10 @@ __all__ = [
     'STORE_ENV',
     'ConfigSnapshot',
     'JsonTrustStore',
+    'PinnedImports',
     'TrustGate',
     'TrustStore',
+    'code_location',
     'config_of',
     'describe',
     'private_pycache_prefix',
@@ -53,7 +56,7 @@ __all__ = [
 # Agent 的环境里宿主把它设到这次 run 的临时目录：Agent 里嵌套起来的 syndica 写的是那份存储，碰不到
 # 用户的。
 STORE_ENV = 'SYNDICA_TRUST_STORE'
-_DIGEST_FORMAT = 'syndica-trust/1'
+_DIGEST_FORMAT = 'syndica-trust/2'
 
 
 def _sha(data: bytes) -> str:
@@ -61,12 +64,28 @@ def _sha(data: bytes) -> str:
 
 
 def within(path: Path, root: Path) -> bool:
-    """path 解析之后是不是 root 或在它之下。"""
+    """path 是不是 root 或在它之下：按字面（不解析符号链接）或解析之后，有一种在里面就算。
+
+    工作区里的符号链接 Agent 改得到指向：只看解析之后的位置，一条指到外面的链接就让它后面的代码算成
+    「工作区之外」、不进摘要。比较按文件身份而不是拼写：大小写不敏感的卷上同一个目录有多种拼法。
+    """
     try:
-        path.resolve().relative_to(root.resolve())
-    except (OSError, ValueError):
+        target = os.stat(root)
+    except OSError:
         return False
-    return True
+    candidates = [Path(os.path.normpath(path.absolute()))]
+    try:
+        candidates.append(path.resolve())
+    except (OSError, RuntimeError):
+        pass
+    for candidate in candidates:
+        for ancestor in (candidate, *candidate.parents):
+            try:
+                if os.path.samestat(os.stat(ancestor), target):
+                    return True
+            except OSError:
+                continue
+    return False
 
 
 @dataclass(frozen=True)
@@ -79,6 +98,21 @@ class ImplSource:
     where: str
     root: Path | None
     files: tuple[tuple[str, bytes], ...] = ()
+
+    @property
+    def inside(self) -> bool:
+        """代码在工作区之内（Agent 写得到）。"""
+        return bool(self.files)
+
+    def location(self) -> str | None:
+        """解析之后的位置，进摘要：工作区之外的代码不摘内容，挪到别处（换了一条符号链接、换了一个
+        环境）摘要要变。"""
+        if self.root is None:
+            return None
+        try:
+            return str(self.root.resolve())
+        except (OSError, RuntimeError):
+            return str(self.root)
 
 
 @dataclass(frozen=True)
@@ -122,12 +156,20 @@ def _decoded(data: bytes, path: Path, what: str) -> str:
 
 
 def _package_files(root: Path) -> Iterator[tuple[str, bytes]]:
-    """包目录下除 `__pycache__` 之外的每个文件，按相对路径排序。不 import 任何东西。"""
+    """包目录下除 `__pycache__` 之外的每个文件，按相对路径排序。不 import 任何东西。指向目录的
+    符号链接照样走进去：import 也会走进去，不走就是一块不进摘要的代码。按文件身份去重，链接成环
+    也走得完。"""
     if root.is_file():
         yield root.name, root.read_bytes()
         return
     found: list[Path] = []
-    for directory, subdirs, names in os.walk(root):
+    seen: set[tuple[int, int]] = set()
+    for directory, subdirs, names in os.walk(root, followlinks=True):
+        info = os.stat(directory)
+        if (info.st_dev, info.st_ino) in seen:
+            subdirs[:] = []
+            continue
+        seen.add((info.st_dev, info.st_ino))
         subdirs[:] = sorted(name for name in subdirs if name != '__pycache__')
         found.extend(Path(directory) / name for name in names)
     for path in sorted(found):
@@ -216,6 +258,149 @@ def _impl_source(index: int, target: str, workspace: Path) -> ImplSource:
     )
 
 
+class _Pin:
+    """摘进去的一个文件：确认时的内容摘要，与那时的文件身份。"""
+
+    def __init__(self, path: Path, data: bytes) -> None:
+        info = os.stat(path)
+        self.path = path
+        self.identity = (info.st_dev, info.st_ino)
+        self.sha = _sha(data)
+
+    def current(self) -> bool:
+        """它还在原处：文件或目录删掉之后 inode 会被复用，过期的钉子不能认别人的文件。"""
+        try:
+            info = os.stat(self.path)
+        except OSError:
+            return False
+        return (info.st_dev, info.st_ino) == self.identity
+
+
+def _changed_after_trust(path: str, why: str) -> ImportError:
+    return ImportError(
+        f'期望：信任确认之后 import 的工作区代码与确认时的内容相同。实际：{one_line(path)} {why}。'
+        '下一步：这次 run 里有东西改了确认过的代码；重跑这条命令，看过新的内容再确认'
+    )
+
+
+class _PinnedSource(importlib.machinery.SourceFileLoader):
+    def __init__(self, fullname: str, path: str, sha: str) -> None:
+        super().__init__(fullname, path)
+        self._sha = sha
+
+    def get_data(self, path: str) -> bytes:
+        data = super().get_data(path)
+        if path == self.path and _sha(data) != self._sha:
+            raise _changed_after_trust(path, '在确认之后被改过')
+        return data
+
+
+class _PinnedSourceless(importlib.machinery.SourcelessFileLoader):
+    def __init__(self, fullname: str, path: str, sha: str) -> None:
+        super().__init__(fullname, path)
+        self._sha = sha
+
+    def get_data(self, path: str) -> bytes:
+        data = super().get_data(path)
+        if path == self.path and _sha(data) != self._sha:
+            raise _changed_after_trust(path, '在确认之后被改过')
+        return data
+
+
+class PinnedImports:
+    """确认过的工作区代码在 import 时按确认时的内容核对：改过的、确认之后才出现在摘进去的包里的，
+    一律不让 import。核对读的就是要编译的那份字节（加载器的 `get_data`），读与核之间没有窗口。
+
+    按文件身份（设备、inode）认文件：经符号链接、换一种大小写拼法 import 到的是同一份。几组同时
+    生效时共用 `sys.meta_path` 最前面的一个 finder，互不递归。"""
+
+    def __init__(self, sources: Iterable[ImplSource]) -> None:
+        self._pins: dict[tuple[int, int], _Pin] = {}
+        self._roots: list[Path] = []
+        for source in sources:
+            if not source.inside or source.root is None:
+                continue
+            self._roots.append(source.root)
+            for name, data in source.files:
+                path = source.root / name if source.root.is_dir() else source.root
+                try:
+                    pin = _Pin(path, data)
+                except OSError:
+                    continue
+                self._pins[pin.identity] = pin
+
+    def install(self) -> None:
+        if self not in _ACTIVE:
+            _ACTIVE.append(self)
+        if _FINDER not in sys.meta_path:
+            sys.meta_path.insert(0, _FINDER)
+
+    def remove(self) -> None:
+        if self in _ACTIVE:
+            _ACTIVE.remove(self)
+        if not _ACTIVE and _FINDER in sys.meta_path:
+            sys.meta_path.remove(_FINDER)
+
+    def _pin_for(self, identity: tuple[int, int]) -> _Pin | None:
+        pin = self._pins.get(identity)
+        return pin if pin is not None and pin.current() else None
+
+    def _covers(self, origin: Path) -> bool:
+        return any(root.exists() and within(origin, root) for root in self._roots)
+
+
+class _PinnedFinder:
+    """按 import 系统的次序问 `sys.meta_path` 上它后面的 finder，再按生效的那几组核对。"""
+
+    def find_spec(
+        self, fullname: str, path: Sequence[str] | None = None, target: object = None
+    ) -> ModuleSpec | None:
+        spec: ModuleSpec | None = None
+        for finder in sys.meta_path:
+            find_spec = getattr(finder, 'find_spec', None)
+            if finder is self or find_spec is None:
+                continue
+            spec = cast('ModuleSpec | None', find_spec(fullname, path, target))
+            if spec is not None:
+                break
+        if spec is None or not spec.has_location or spec.origin is None:
+            return spec
+        try:
+            info = os.stat(spec.origin)
+        except OSError:
+            return spec
+        identity = (info.st_dev, info.st_ino)
+        for active in _ACTIVE:
+            pin = active._pin_for(identity)  # pyright: ignore[reportPrivateUsage]
+            if pin is not None:
+                return _verified(spec, pin)
+        if any(active._covers(Path(spec.origin)) for active in _ACTIVE):  # pyright: ignore[reportPrivateUsage]
+            raise _changed_after_trust(spec.origin, '是确认之后才出现在摘进去的包里的')
+        return spec
+
+
+def _verified(spec: ModuleSpec, pin: _Pin) -> ModuleSpec:
+    """让加载器在编译之前核对它读到的字节；不经 `get_data` 读文件的加载器在这里先核一次。"""
+    origin = cast(str, spec.origin)
+    loader = spec.loader
+    if isinstance(loader, importlib.machinery.SourceFileLoader):
+        spec.loader = _PinnedSource(spec.name, origin, pin.sha)
+    elif isinstance(loader, importlib.machinery.SourcelessFileLoader):
+        spec.loader = _PinnedSourceless(spec.name, origin, pin.sha)
+    elif _sha(Path(origin).read_bytes()) != pin.sha:
+        raise _changed_after_trust(origin, '在确认之后被改过')
+    return spec
+
+
+_ACTIVE: list[PinnedImports] = []
+_FINDER = _PinnedFinder()
+
+
+def code_location(target: str, workspace: Path) -> ImplSource:
+    """一个入口点或 `impl:` 目标的代码在哪、在工作区之内时有哪些文件。不 import。"""
+    return _impl_source(-1, target, workspace)
+
+
 def read_snapshot(
     path: Path, workspace: Path, discovered: Sequence[Discovered] = ()
 ) -> ConfigSnapshot:
@@ -226,7 +411,8 @@ def read_snapshot(
     text = _decoded(raw, file, '配置文件')
     root = parse_yaml(file, text)
     named = root.get('modules', ())
-    wanted = set(cast(Sequence[object], named)) if isinstance(named, list) else set[object]()
+    items = cast(Sequence[object], named) if isinstance(named, list) else ()
+    wanted = {item for item in items if isinstance(item, str)}
     enabled = tuple(module for module in discovered if module.name in wanted)
     origin = str(file.parent)
     prompts: dict[int, tuple[Path, str]] = {}
@@ -252,7 +438,7 @@ def read_snapshot(
             json.dumps(['prompt', index, str(prompts[index][0]), _sha(prompt_bytes[index])])
         )
     for impl in impls:
-        lines.append(json.dumps(['impl', impl.index, impl.target, impl.where]))
+        lines.append(json.dumps(['impl', impl.index, impl.target, impl.where, impl.location()]))
         lines.extend(json.dumps(['file', name, _sha(data)]) for name, data in impl.files)
     module_sources: list[ImplSource] = []
     for module in enabled:
@@ -261,7 +447,7 @@ def read_snapshot(
         )
         source = _impl_source(-1, module.target, workspace)
         module_sources.append(source)
-        lines.append(json.dumps(['module-code', module.name, source.where]))
+        lines.append(json.dumps(['module-code', module.name, source.where, source.location()]))
         lines.extend(
             json.dumps(['module-file', module.name, name, _sha(data)])
             for name, data in source.files
@@ -392,6 +578,13 @@ def describe(snapshot: ConfigSnapshot, config: CliConfig) -> str:
                 f'{source.where}）；能力在信任之后用 syndica modules show 查看'
                 for module, source in zip(snapshot.modules, snapshot.module_sources, strict=True)
             ),
+        ],
+    )
+    lines += _section(
+        'flags',
+        [
+            f'{key}: {json.dumps(value, ensure_ascii=False)}'
+            for key, value in sorted(config.flags.items())
         ],
     )
     lines += _section('danger.roles（只能收紧）', sorted(config.danger_roles))

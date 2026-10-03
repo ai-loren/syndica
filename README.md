@@ -290,11 +290,16 @@ warns when a single-word string that looks like a path names no file. `model` ta
 A `.syndica.yaml` inside the workspace is untrusted input: an agent can edit it, and it decides
 which commands run and which code loads. `run`, `chat`, and `doctor` therefore ask you to confirm
 it the first time and after every change, showing the prompt files, `impl:` classes, verify
-commands, `pass_env`, models, modules, and safety settings it would use; nothing in it runs before
-you answer `y` on a terminal. The confirmation covers the bytes of the configuration and of every
-prompt file it reads, and the whole package of an `impl:` class kept inside the workspace (code
-installed elsewhere is named but not covered). Where no terminal is available, review the
-configuration and run `syndica config trust --sha256 <digest>` with the digest from the refusal.
+commands, `pass_env`, models, modules, flags, and safety settings it would use; nothing in it runs
+before you answer `y` on a terminal. The confirmation covers the bytes of the configuration and of
+every prompt file it reads, and the whole package of an `impl:` class kept inside the workspace,
+including directories linked into it (code installed elsewhere is named and its location
+recorded, but its contents are not covered). A file or package counts as inside the workspace if
+its path is inside either as written or after following symlinks, so a `.syndica.yaml` that is a
+symlink to a file elsewhere is still confirmed. Code that was confirmed is checked again when it is
+imported: a module the confirmed package imports later in the run is refused if it changed since
+you confirmed, or did not exist then. Where no terminal is available, review the configuration and
+run `syndica config trust --sha256 <digest>` with the digest from the refusal.
 Confirmations live in `$XDG_CONFIG_HOME/syndica/trusted.json` (default `~/.config/syndica/`),
 never inside the workspace; an agent's own `syndica` writes to a store in its scratch directory
 by default, which guards against accidental nesting rather than isolating the agent. A
@@ -307,7 +312,9 @@ confirmation lists such `sys.path` entries so you can see them. Install syndica 
 workspaces agents operate on to avoid this.
 
 `modules:` enables optional modules in the order written; `syndica modules list` shows which ones
-exist and where they come from without importing any of them. Besides the built-in `retry` and
+exist and where they come from without importing any of them, and marks those whose code is inside
+the workspace. `syndica modules show <name>` imports a module to show its manifest; when its code
+is inside the workspace, the configuration must enable it and be confirmed first. Besides the built-in `retry` and
 `prefix-drift`, it can name a third-party module installed under the `syndica.modules` entry-point
 group. Its entry point is a callable `factory(host: ModuleHost) -> RuntimeModule`; the entry-point
 name must equal the module's name, and its flag keys must start with the module name (`example`

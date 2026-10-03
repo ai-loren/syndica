@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.machinery
 import importlib.util
 import json
@@ -21,7 +22,9 @@ from syndica.cli.modules import Discovered
 from syndica.cli.trust import (
     NO_TRUST_GATE,
     JsonTrustStore,
+    PinnedImports,
     TrustGate,
+    code_location,
     config_of,
     describe,
     read_snapshot,
@@ -585,3 +588,313 @@ def test_trusting_an_in_workspace_impl_uses_a_fresh_private_bytecode_directory(
     assert prefix != fixed
     assert prefix.name.startswith('syndica-pycache-')
     assert stat.S_IMODE(prefix.stat().st_mode) == 0o700
+
+
+def test_an_auto_discovered_config_that_links_outside_the_workspace_is_still_gated(
+    tmp_path: Path,
+):
+    workspace = tmp_path / 'repo' / 'sub'
+    workspace.mkdir(parents=True)
+    (tmp_path / 'repo' / 'linked.yaml').write_text('version: 1\n', encoding='utf-8')
+    (workspace / '.syndica.yaml').symlink_to('../linked.yaml')
+    store = _store(tmp_path)
+
+    code, stdout, stderr, built = _run(workspace, store)
+
+    assert code != 0
+    assert (stdout, built) == ('', [])
+    assert 'syndica config trust --sha256' in stderr
+
+
+def _linked_role_package(tmp_path: Path, name: str, marker: str) -> Path:
+    package = tmp_path / name / 'rolepkg'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_text(f'MARK = {marker!r}\n', encoding='utf-8')
+    (package / 'roles.py').write_text(
+        'from syndica.kernel import BaseAgent\n\n\nclass Role(BaseAgent):\n    """r"""\n',
+        encoding='utf-8',
+    )
+    return package
+
+
+def test_a_role_package_linked_into_the_workspace_is_digested_and_pinned_to_its_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path, _IMPL_CONFIG)
+    reviewed = _linked_role_package(tmp_path, 'reviewed', 'reviewed')
+    swapped = _linked_role_package(tmp_path, 'swapped', 'swapped')
+    (workspace / 'rolepkg').symlink_to(reviewed, target_is_directory=True)
+    monkeypatch.syspath_prepend(str(workspace))
+
+    before = read_snapshot(workspace / '.syndica.yaml', workspace)
+    (workspace / 'rolepkg').unlink()
+    (workspace / 'rolepkg').symlink_to(swapped, target_is_directory=True)
+
+    (impl,) = before.impls
+    assert impl.inside
+    assert [name for name, _ in impl.files] == ['__init__.py', 'roles.py']
+    assert _digest(workspace) != before.digest
+
+
+def test_a_directory_linked_inside_a_package_is_part_of_the_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path, _IMPL_CONFIG)
+    _role_package(workspace)
+    nested = tmp_path / 'elsewhere' / 'nested'
+    nested.mkdir(parents=True)
+    (nested / 'tool.py').write_text('VALUE = 1\n', encoding='utf-8')
+    (workspace / 'rolepkg' / 'nested').symlink_to(nested, target_is_directory=True)
+    (workspace / 'rolepkg' / 'loop').symlink_to(workspace / 'rolepkg', target_is_directory=True)
+    monkeypatch.syspath_prepend(str(workspace))
+
+    (impl,) = read_snapshot(workspace / '.syndica.yaml', workspace).impls
+    before = _digest(workspace)
+    (nested / 'tool.py').write_text('VALUE = 2\n', encoding='utf-8')
+
+    assert 'nested/tool.py' in [name for name, _ in impl.files]
+    assert not any(name.startswith('loop/') for name, _ in impl.files)
+    assert _digest(workspace) != before
+
+
+def test_a_sys_path_entry_spelled_in_another_case_still_reaches_in_workspace_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path, _IMPL_CONFIG)
+    _role_package(workspace)
+    upper = tmp_path / 'WS'
+    if not upper.exists():
+        pytest.skip('case-sensitive volume: the two spellings are different directories')
+    monkeypatch.syspath_prepend(str(upper))
+
+    (impl,) = read_snapshot(workspace / '.syndica.yaml', workspace).impls
+
+    assert impl.inside
+    assert [name for name, _ in impl.files] == ['__init__.py', 'helper.py', 'roles.py']
+
+
+def test_the_digest_pins_where_outside_code_lives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = _workspace(tmp_path, _IMPL_CONFIG)
+    first = _linked_role_package(tmp_path, 'first', 'first')
+    second = _linked_role_package(tmp_path, 'second', 'second')
+    monkeypatch.setattr(sys, 'path', [str(first.parent), *sys.path])
+    before = _digest(workspace)
+    monkeypatch.setattr(sys, 'path', [str(second.parent), *sys.path[1:]])
+
+    (impl,) = read_snapshot(workspace / '.syndica.yaml', workspace).impls
+
+    assert not impl.inside
+    assert _digest(workspace) != before
+
+
+def _in_workspace_module(workspace: Path) -> Discovered:
+    package = workspace / 'extmod'
+    package.mkdir()
+    (package / '__init__.py').write_text(
+        'from syndica.kernel import RuntimeModule\n\n\n'
+        'def build(host):\n    return RuntimeModule("ext")\n',
+        encoding='utf-8',
+    )
+    return Discovered('ext', 'extmod:build', 'ext-dist', '1.0')
+
+
+def test_trusting_a_config_whose_module_code_is_in_the_workspace_moves_bytecode_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path, 'version: 1\nmodules: [ext]\n')
+    entry = _in_workspace_module(workspace)
+    monkeypatch.syspath_prepend(str(workspace))
+    monkeypatch.setattr(sys, 'pycache_prefix', None)
+
+    snapshot = read_snapshot(workspace / '.syndica.yaml', workspace, [entry])
+    host, _, _ = _host(workspace, _store(tmp_path), stdin=_Tty('y\n'), stderr=_Tty())
+    host._snapshot = lambda file: snapshot  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    try:
+        host._trusted_config('.syndica.yaml')  # pyright: ignore[reportPrivateUsage]
+        assert sys.pycache_prefix is not None
+        assert not Path(sys.pycache_prefix).resolve().is_relative_to(workspace.resolve())
+    finally:
+        host.close(interrupted=False)
+        sys.modules.pop('extmod', None)
+
+
+def _pinned_package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, PinnedImports]:
+    workspace = tmp_path / 'ws'
+    package = workspace / 'pinpkg'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_text('', encoding='utf-8')
+    (package / 'later.py').write_text('VALUE = "reviewed"\n', encoding='utf-8')
+    monkeypatch.syspath_prepend(str(workspace))
+    monkeypatch.setattr(sys, 'pycache_prefix', str(tmp_path / 'private-pycache'))
+    pins = PinnedImports([code_location('pinpkg', workspace)])
+    pins.install()
+    return package, pins
+
+
+@pytest.fixture
+def _forget_pinpkg():
+    yield
+    for name in [name for name in sys.modules if name.split('.')[0] == 'pinpkg']:
+        del sys.modules[name]
+
+
+@pytest.mark.usefixtures('_forget_pinpkg')
+def test_trusted_code_imports_as_it_was_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _, pins = _pinned_package(tmp_path, monkeypatch)
+    try:
+        import pinpkg.later  # pyright: ignore[reportMissingImports]
+
+        assert pinpkg.later.VALUE == 'reviewed'  # pyright: ignore[reportUnknownMemberType]
+    finally:
+        pins.remove()
+
+
+@pytest.mark.usefixtures('_forget_pinpkg')
+@pytest.mark.parametrize('change', ['edited', 'added'])
+def test_code_changed_after_trust_is_refused_when_imported_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+):
+    package, pins = _pinned_package(tmp_path, monkeypatch)
+    name = 'later' if change == 'edited' else 'planted'
+    (package / f'{name}.py').write_text('VALUE = "changed"\n', encoding='utf-8')
+    try:
+        with pytest.raises(ImportError) as excinfo:
+            importlib.import_module(f'pinpkg.{name}')
+    finally:
+        pins.remove()
+    assert f'{name}.py' in str(excinfo.value)
+    assert '看过新的内容再确认' in str(excinfo.value)
+
+
+@pytest.mark.usefixtures('_forget_pinpkg')
+def test_removed_pins_no_longer_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    package, pins = _pinned_package(tmp_path, monkeypatch)
+    pins.remove()
+    (package / 'later.py').write_text('VALUE = "changed"\n', encoding='utf-8')
+
+    assert importlib.import_module('pinpkg.later').VALUE == 'changed'
+
+
+def test_the_confirmation_shows_the_flags_the_config_sets(tmp_path: Path):
+    workspace = _workspace(tmp_path, 'version: 1\nflags:\n  max_wait_seconds: 30\n')
+    snapshot = read_snapshot(workspace / '.syndica.yaml', workspace)
+
+    shown = describe(snapshot, config_of(snapshot))
+
+    assert 'max_wait_seconds: 30' in shown
+
+
+def test_a_terminal_on_stdin_alone_is_not_a_person(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    store = _store(tmp_path)
+    host, io, built = _host(workspace, store, stdin=_Tty('y\n'), stderr=StringIO())
+    try:
+        code = main(['run', '--agent', 'Worker', 'go'], host=host, io=io)
+    finally:
+        host.close(interrupted=False)
+
+    assert code != 0
+    assert built == []
+    assert '不是交互终端' in io.stderr.getvalue()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_the_current_directory_on_sys_path_is_shown_when_it_is_the_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path)
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(sys, 'path', ['', *sys.path])
+
+    snapshot = read_snapshot(workspace / '.syndica.yaml', workspace)
+
+    assert str(workspace) in [str(Path(entry).resolve()) for entry in snapshot.path_entries]
+
+
+def test_a_non_string_modules_item_reaches_the_config_check_instead_of_crashing(tmp_path: Path):
+    workspace = _workspace(tmp_path, 'version: 1\nmodules: [[nested], {a: 1}]\n')
+
+    snapshot = read_snapshot(workspace / '.syndica.yaml', workspace)
+
+    assert snapshot.modules == ()
+
+
+def test_a_config_named_through_an_outside_link_into_the_workspace_is_gated(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    link = tmp_path / 'outside.yaml'
+    link.symlink_to(workspace / '.syndica.yaml')
+    store = _store(tmp_path)
+
+    code, _, stderr, built = _run(workspace, store, ['--config', str(link), 'doctor'])
+
+    assert code != 0
+    assert built == []
+    assert 'syndica config trust --sha256' in stderr
+
+
+def test_the_digest_pins_where_outside_module_code_lives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path, 'version: 1\nmodules: [ext]\n')
+    entry = Discovered('ext', 'extmod:build', 'ext-dist', '1.0')
+    for name in ('first', 'second'):
+        package = tmp_path / name / 'extmod'
+        package.mkdir(parents=True)
+        (package / '__init__.py').write_text('', encoding='utf-8')
+    monkeypatch.setattr(sys, 'path', [str(tmp_path / 'first'), *sys.path])
+    before = read_snapshot(workspace / '.syndica.yaml', workspace, [entry]).digest
+    monkeypatch.setattr(sys, 'path', [str(tmp_path / 'second'), *sys.path[1:]])
+
+    after = read_snapshot(workspace / '.syndica.yaml', workspace, [entry])
+
+    assert not after.module_sources[0].inside
+    assert after.digest != before
+
+
+@pytest.mark.usefixtures('_forget_pinpkg')
+def test_a_trusted_run_pins_digested_code_until_the_host_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(
+        tmp_path, 'version: 1\nagents:\n  - {name: Kilo, description: k, impl: pinpkg:Role}\n'
+    )
+    package = workspace / 'pinpkg'
+    package.mkdir()
+    (package / '__init__.py').write_text(
+        'from syndica.kernel import BaseAgent\n\n\nclass Role(BaseAgent):\n    """r"""\n',
+        encoding='utf-8',
+    )
+    (package / 'later.py').write_text('VALUE = "reviewed"\n', encoding='utf-8')
+    monkeypatch.syspath_prepend(str(workspace))
+    monkeypatch.setattr(sys, 'pycache_prefix', None)
+    host, _, _ = _host(workspace, _store(tmp_path), stdin=_Tty('y\n'), stderr=_Tty())
+    try:
+        host._trusted_config('.syndica.yaml')  # pyright: ignore[reportPrivateUsage]
+        (package / 'later.py').write_text('VALUE = "changed"\n', encoding='utf-8')
+        with pytest.raises(ImportError):
+            importlib.import_module('pinpkg.later')
+    finally:
+        host.close(interrupted=False)
+
+    assert importlib.import_module('pinpkg.later').VALUE == 'changed'
+
+
+@pytest.mark.usefixtures('_forget_pinpkg')
+def test_a_pin_whose_file_is_gone_does_not_claim_a_file_that_reused_its_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    package, pins = _pinned_package(tmp_path, monkeypatch)
+    stale = next(iter(pins._pins.values()))  # pyright: ignore[reportPrivateUsage]
+    other = tmp_path / 'other'
+    (other / 'otherpkg').mkdir(parents=True)
+    (other / 'otherpkg' / '__init__.py').write_text('VALUE = 1\n', encoding='utf-8')
+    info = (other / 'otherpkg' / '__init__.py').stat()
+    pins._pins[(info.st_dev, info.st_ino)] = stale  # pyright: ignore[reportPrivateUsage]
+    for path in sorted(package.iterdir(), reverse=True):
+        path.unlink()
+    package.rmdir()
+    monkeypatch.syspath_prepend(str(other))
+    try:
+        assert importlib.import_module('otherpkg').VALUE == 1
+    finally:
+        pins.remove()
+        sys.modules.pop('otherpkg', None)

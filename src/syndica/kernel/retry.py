@@ -204,12 +204,14 @@ class RetryModule(RuntimeModule):
                     default=0,
                     description='初次调用失败后，对原 LLM 额外重试的次数',
                     minimum=0,
+                    maximum=10,
                 ),
                 FlagDeclaration(
                     key='llm_retry_backoff_ms',
                     default=0,
                     description='每次重试或故障转移调用前等待的毫秒数',
                     minimum=0,
+                    maximum=60_000,
                 ),
                 FlagDeclaration(
                     key='llm_fallbacks',

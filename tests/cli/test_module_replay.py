@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import Callable, Sequence
 from io import StringIO
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any, cast
 
 import pytest
 
+import syndica.cli.trust as trust_module
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, RunRequest
 from syndica.cli.modules import discover
@@ -289,3 +291,30 @@ def test_a_rebuilt_module_whose_requirement_was_not_rebuilt_stops_the_replay(tmp
 
     assert '依赖的 Module 也都重建了' in excinfo.value.expected
     assert "['ghost']" in excinfo.value.received
+
+
+def test_rebuilding_a_module_whose_code_is_in_the_workspace_pins_it_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path)
+    package = workspace / 'extmod'
+    package.mkdir()
+    (package / '__init__.py').write_text('', encoding='utf-8')
+    monkeypatch.syspath_prepend(str(workspace))
+    monkeypatch.setattr(sys, 'pycache_prefix', None)
+    point = _EntryPoint(_module(), _Dist())
+    point.value = 'extmod:build'
+    _trust(workspace, tmp_path / 'store.json', point)
+    active = list(trust_module._ACTIVE)  # pyright: ignore[reportPrivateUsage]
+
+    outcome = _rebuild(workspace, tmp_path / 'store.json', point)
+
+    added = [pins for pins in trust_module._ACTIVE if pins not in active]  # pyright: ignore[reportPrivateUsage]
+    try:
+        assert isinstance(outcome, RuntimeModule)
+        assert sys.pycache_prefix is not None
+        assert not Path(sys.pycache_prefix).resolve().is_relative_to(workspace.resolve())
+        assert len(added) == 1
+    finally:
+        for pins in added:
+            pins.remove()

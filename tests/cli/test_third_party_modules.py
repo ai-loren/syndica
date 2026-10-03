@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sys
 from collections.abc import Callable, Sequence
 from io import StringIO
 from pathlib import Path
@@ -15,9 +16,9 @@ import pytest
 
 import syndica.cli.host as host_module
 from syndica.cli.host import RuntimeCliHost
-from syndica.cli.main import CliIO, RunRequest
-from syndica.cli.modules import discover
-from syndica.cli.trust import NO_TRUST_GATE, read_snapshot
+from syndica.cli.main import CliIO, RunRequest, main
+from syndica.cli.modules import discover, installed_entry_points
+from syndica.cli.trust import NO_TRUST_GATE, JsonTrustStore, TrustGate, read_snapshot
 from syndica.kernel import (
     ConfigError,
     FlagDeclaration,
@@ -401,3 +402,174 @@ def test_a_yaml_boolean_for_an_int_flag_fails_before_any_model_is_built(tmp_path
         host.close()
     assert 'yes / on' in excinfo.value.next_action
     assert built == []
+
+
+def test_a_consistent_rewrite_of_an_in_workspace_distribution_still_changes_the_digest(
+    tmp_path: Path,
+):
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    (workspace / '.syndica.yaml').write_text('version: 1\nmodules: [alpha]\n', encoding='utf-8')
+    before = _snapshot_with(workspace, _installed_in_the_workspace(workspace))
+    (workspace / '.venv' / 'site' / 'alpha_pkg' / 'module.py').write_text(
+        'VALUE = 2\n', encoding='utf-8'
+    )
+    rewritten = _Dist(
+        'alpha',
+        '1.0',
+        root=workspace / '.venv' / 'site',
+        files=[
+            _Recorded('alpha_pkg/module.py', _Hash(b'VALUE = 2\n')),
+            _Recorded('alpha_pkg/__pycache__/module.cpython-311.pyc', None),
+            _Recorded('alpha-1.0.dist-info/RECORD', None),
+        ],
+    )
+
+    assert _snapshot_with(workspace, rewritten) != before
+
+
+def _planted_in_the_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    workspace = tmp_path / 'ws'
+    site = workspace / '.venv' / 'site'
+    info = site / 'syndica_gitflow-0.3.dist-info'
+    info.mkdir(parents=True)
+    (info / 'METADATA').write_text(
+        'Metadata-Version: 2.1\nName: syndica-gitflow\nVersion: 0.3\n', encoding='utf-8'
+    )
+    (info / 'entry_points.txt').write_text(
+        '[syndica.modules]\ngitflow = gitflow_mod:build\n', encoding='utf-8'
+    )
+    (site / 'gitflow_mod.py').write_text(
+        'from pathlib import Path\n'
+        'Path(__file__).with_name("IMPORTED").write_text("x")\n'
+        'from syndica.kernel import RuntimeModule\n\n\n'
+        'def build(host):\n    return RuntimeModule("gitflow", description="git helpers")\n',
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(site))
+    return workspace
+
+
+def _inspect(
+    workspace: Path,
+    argv: list[str],
+    *,
+    trust: TrustGate = NO_TRUST_GATE,
+    stdin: StringIO | None = None,
+) -> tuple[int, str, str]:
+    stderr = _Tty() if isinstance(stdin, _Tty) else StringIO()
+    io = CliIO(stdin=stdin or StringIO(), stdout=StringIO(), stderr=stderr)
+    host = RuntimeCliHost(
+        io=io,
+        model_factory=lambda _: ScriptedLLM([]),
+        workspace_root=workspace,
+        environ={},
+        entry_points=installed_entry_points,
+        trust=trust,
+    )
+    try:
+        code = main(argv, host=host, io=io)
+    finally:
+        host.close()
+        sys.modules.pop('gitflow_mod', None)
+    return code, io.stdout.getvalue(), io.stderr.getvalue()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+class _Tty(StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_modules_list_says_when_a_modules_code_is_inside_the_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _planted_in_the_workspace(tmp_path, monkeypatch)
+    (workspace / '.syndica.yaml').write_text('version: 1\n', encoding='utf-8')
+
+    code, out, _ = _inspect(workspace, ['modules', 'list'])
+
+    assert code == 0
+    [row] = [line for line in out.splitlines() if line.startswith('gitflow\t')]
+    assert '代码在工作区之内' in row
+    assert not (workspace / '.venv' / 'site' / 'IMPORTED').exists()
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_modules_show_does_not_import_workspace_code_the_config_has_not_vetted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool
+):
+    workspace = _planted_in_the_workspace(tmp_path, monkeypatch)
+    body = 'modules: [gitflow]\n' if enabled else ''
+    (workspace / '.syndica.yaml').write_text(f'version: 1\n{body}', encoding='utf-8')
+    store = JsonTrustStore(tmp_path / 'outside' / 'trusted.json')
+
+    code, _, err = _inspect(
+        workspace, ['modules', 'show', 'gitflow'], trust=TrustGate(store_for=lambda _: store)
+    )
+
+    assert code != 0
+    assert not (workspace / '.venv' / 'site' / 'IMPORTED').exists()
+    assert ('syndica config trust' if enabled else "在 modules 里写上 'gitflow'") in err
+
+
+def test_modules_show_imports_workspace_code_once_the_config_enabling_it_is_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _planted_in_the_workspace(tmp_path, monkeypatch)
+    (workspace / '.syndica.yaml').write_text('version: 1\nmodules: [gitflow]\n', encoding='utf-8')
+    store = JsonTrustStore(tmp_path / 'outside' / 'trusted.json')
+
+    code, out, err = _inspect(
+        workspace,
+        ['modules', 'show', 'gitflow'],
+        trust=TrustGate(store_for=lambda _: store),
+        stdin=_Tty('y\n'),
+    )
+
+    assert code == 0, err
+    assert json.loads(out)['description'] == 'git helpers'
+
+
+def test_a_distribution_with_a_broken_entry_points_file_is_one_bad_row_not_a_broken_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    site = tmp_path / 'site'
+    info = site / 'broken_dist-1.0.dist-info'
+    info.mkdir(parents=True)
+    (info / 'METADATA').write_text(
+        'Metadata-Version: 2.1\nName: broken-dist\nVersion: 1.0\n', encoding='utf-8'
+    )
+    (info / 'entry_points.txt').write_text(
+        '[syndica.modules]\nthis line has no equals sign\n', encoding='utf-8'
+    )
+    monkeypatch.syspath_prepend(str(site))
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    (workspace / '.syndica.yaml').write_text('version: 1\n', encoding='utf-8')
+
+    code, out, _ = _inspect(workspace, ['modules', 'list'])
+
+    assert code == 0
+    [row] = [line for line in out.splitlines() if line.startswith('broken-dist\t')]
+    assert 'entry_points.txt 读不了' in row
+
+
+@pytest.mark.parametrize(
+    ('modules', 'anchor'),
+    [('[ghost]', "没有名为 'ghost'"), ('[safety]', '宿主必装'), ('[dev]', '开发期')],
+)
+@pytest.mark.parametrize('gated', [False, True])
+def test_flags_list_names_a_bad_modules_entry_before_asking_for_trust(
+    tmp_path: Path, modules: str, anchor: str, gated: bool
+):
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    (workspace / '.syndica.yaml').write_text(f'version: 1\nmodules: {modules}\n', encoding='utf-8')
+    store = JsonTrustStore(tmp_path / 'outside' / 'trusted.json')
+    trust = TrustGate(store_for=lambda _: store) if gated else NO_TRUST_GATE
+
+    code, _, err = _inspect(workspace, ['flags', 'list'], trust=trust)
+
+    assert code != 0
+    assert anchor in err
+    assert 'config trust' not in err

@@ -89,8 +89,8 @@ def test_retry_module_declares_the_three_fixed_flags_and_constructor_shape():
         )
         for flag in module.flags
     ] == [
-        ('llm_retry_attempts', 0, (), 0, None, True),
-        ('llm_retry_backoff_ms', 0, (), 0, None, True),
+        ('llm_retry_attempts', 0, (), 0, 10, True),
+        ('llm_retry_backoff_ms', 0, (), 0, 60_000, True),
         ('llm_fallbacks', '', (), None, None, True),
     ]
     assert len(module.agent_plugins) == 1
@@ -531,3 +531,13 @@ async def test_two_agents_interleave_without_sharing_retry_counters():
         assert len(second.calls) == 3
     finally:
         await runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ('key', 'limit'), [('llm_retry_attempts', 10), ('llm_retry_backoff_ms', 60_000)]
+)
+def test_retry_flags_are_bounded_so_a_project_config_cannot_retry_without_end(key: str, limit: int):
+    Runtime(modules=[RetryModule({})], flags={key: limit})
+    with pytest.raises(ConfigError) as excinfo:
+        Runtime(modules=[RetryModule({})], flags={key: limit + 1})
+    assert key in excinfo.value.expected + excinfo.value.received
