@@ -138,3 +138,32 @@ def test_an_explicit_file_name_longer_than_the_file_system_allows_is_a_config_er
         _load({'file': 'p' * 300}, tmp_path)
     assert "'" + 'p' * 300 + "'" in excinfo.value.received
     _three_parts(excinfo.value)
+
+
+def test_a_plain_string_symlinked_out_of_the_origin_stays_text(tmp_path: Path):
+    secret = tmp_path / 'credentials'
+    secret.write_text('outside the project\n', encoding='utf-8')
+    origin = tmp_path / 'project'
+    origin.mkdir()
+    (origin / 'planner.md').symlink_to(secret)
+
+    assert prompt_file('planner.md', str(origin)) is None
+    assert _load('planner.md', origin) == 'planner.md'
+
+
+def test_a_plain_string_naming_a_symlink_loop_stays_text(tmp_path: Path):
+    (tmp_path / 'a.md').symlink_to(tmp_path / 'b.md')
+    (tmp_path / 'b.md').symlink_to(tmp_path / 'a.md')
+
+    assert prompt_file('a.md', str(tmp_path)) is None
+    assert _load('a.md', tmp_path) == 'a.md'
+
+
+def test_an_explicit_file_naming_a_symlink_loop_is_a_config_error(tmp_path: Path):
+    (tmp_path / 'a.md').symlink_to(tmp_path / 'b.md')
+    (tmp_path / 'b.md').symlink_to(tmp_path / 'a.md')
+
+    with pytest.raises(ConfigError) as excinfo:
+        _load({'file': 'a.md'}, tmp_path)
+    _three_parts(excinfo.value)
+    assert "'a.md'" in excinfo.value.received

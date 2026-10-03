@@ -1534,22 +1534,49 @@ def test_a_topology_run_writes_no_replay_document_and_says_so_only_when_asked(
     assert ('trace 里不写回放文档：--topology 的 run 还不能捕获' in stderr) is asked
 
 
+def _roles_module(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    source: str,
+) -> None:
+    directory = tmp_path_factory.mktemp('roles')
+    (directory / f'{name}.py').write_text(source, encoding='utf-8')
+    monkeypatch.syspath_prepend(str(directory))
+    monkeypatch.delitem(sys.modules, name, raising=False)
+
+
+_CUSTOM = """from syndica.kernel import BaseAgent
+
+
+class Custom(BaseAgent):
+    \"\"\"改文件时用我。\"\"\"
+"""
+
+_CUSTOM_WORKER = """version: 1
+agents:
+  - name: Worker
+    description: 改文件时用我
+    impl: 'capture_custom_role:Custom'
+"""
+
+
 @pytest.mark.parametrize('asked', [True, False], ids=['replay-asked-for', 'default-level'])
 def test_a_custom_class_based_role_writes_no_replay_document(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, asked: bool
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    asked: bool,
 ):
-    real = host_module.frozen_roles
-
-    def with_a_custom_role(catalog: Any, factories: Any) -> dict[str, dict[str, object]]:
-        roles = real(catalog, factories)
-        roles['Worker'] = {**roles['Worker'], 'impl': 'acme.roles:Custom'}
-        return roles
-
-    monkeypatch.setattr(host_module, 'frozen_roles', with_a_custom_role)
+    _roles_module(tmp_path_factory, monkeypatch, 'capture_custom_role', _CUSTOM)
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(_CUSTOM_WORKER, encoding='utf-8')
     trace = ['--trace', 'replay'] if asked else []
 
     code, _, stderr = _cli(
-        tmp_path, _PerAgent([_say('done')]), ['run', 'go', '--agent', 'Worker', *trace]
+        tmp_path,
+        _PerAgent([_say('done')]),
+        ['--config', str(config), 'run', 'go', '--agent', 'Worker', *trace],
     )
 
     assert code == 0, stderr
@@ -1557,21 +1584,48 @@ def test_a_custom_class_based_role_writes_no_replay_document(
     assert ('角色 Worker 是自定义的类式角色' in stderr) is asked
 
 
-def test_a_role_that_cannot_be_built_costs_only_the_replay_document(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    def broken(catalog: Any, factories: Any) -> dict[str, dict[str, object]]:
-        raise RuntimeError('constructor needs a network')
+_UNUSED_FLAKY_ROLE = (
+    _TOPOLOGY
+    + """agents:
+  - name: Flaky
+    description: 这次 run 用不到我
+    impl: 'capture_flaky_role:Flaky'
+"""
+)
 
-    monkeypatch.setattr(host_module, 'frozen_roles', broken)
+_FLAKY = """from syndica.kernel import BaseAgent
+
+
+class Flaky(BaseAgent):
+    \"\"\"这次 run 用不到我。\"\"\"
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise RuntimeError('constructor needs a network')
+"""
+
+
+@pytest.mark.parametrize(
+    'target', [['--agent', 'Worker'], ['--topology', 'solo']], ids=['agent', 'topology']
+)
+def test_a_role_whose_constructor_fails_costs_only_the_replay_document(
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    target: list[str],
+):
+    _roles_module(tmp_path_factory, monkeypatch, 'capture_flaky_role', _FLAKY)
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(_UNUSED_FLAKY_ROLE, encoding='utf-8')
 
     code, stdout, stderr = _cli(
-        tmp_path, _PerAgent([_say('done')]), ['run', 'go', '--agent', 'Worker']
+        tmp_path,
+        _PerAgent([_say('done')]),
+        ['--config', str(config), 'run', 'go', *target, '--trace', 'replay'],
     )
 
     assert code == 0 and stdout.rstrip().endswith('done'), stderr
     assert _without_document(tmp_path)
-    assert 'constructor needs a network' in stderr
+    assert ('constructor needs a network' in stderr) is (target[0] == '--agent')
 
 
 # --- Ctrl-C: a real SIGINT to a CLI in a child process ------------------------------------
@@ -1689,6 +1743,19 @@ def test_a_role_tightened_by_the_project_config_is_recorded_and_replays(
     [lead] = document['agents']['Worker']['instances']
     assert [gate['disposition'] for gate in lead['gate']] == ['block']
     assert replayed.reproduced, replayed.divergences
+
+
+def test_a_run_without_role_tightening_writes_a_version_2_document(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    code, _, stderr = _cli(
+        tmp_path, _PerAgent([_say('done')], []), ['run', 'go', '--agent', 'Worker']
+    )
+    _, document = _trace(tmp_path)
+
+    assert code == 0, stderr
+    assert document['version'] == 2
+    assert 'roles' not in document['host']['danger']
 
 
 def test_a_read_only_run_keeps_the_role_tightening_of_the_project_config(

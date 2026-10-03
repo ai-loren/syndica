@@ -2274,7 +2274,36 @@ def test_the_role_policy_in_the_host_profile_decides_that_roles_calls():
 
 def test_a_role_without_its_own_policy_keeps_the_hosts_table():
     document = _role_gated('confirm', host='block', recorded='block')
+    document['agents']['Helper'] = {
+        'frozen': {'system_prompt': 'You help.', 'tools': []},
+        'instances': [],
+    }
     document['host']['danger']['roles'] = {
         'Helper': document['host']['danger']['roles'].pop('Lead')
     }
     assert _replay(document).reproduced
+
+
+def test_a_manifest_roles_policy_in_the_host_profile_decides_its_calls():
+    document = _role_gated('block', host='confirm', recorded='block')
+    document['agents']['Lead'] = {
+        'manifest': {'name': 'Lead', 'description': 'leads', 'tools': ['Bash', 'Read']},
+        'instances': document['agents']['Lead']['instances'],
+    }
+    assert _replay(document).reproduced
+
+
+def test_a_block_high_risk_role_spec_is_rebuilt_for_that_role():
+    document = _role_gated('block', host='confirm', recorded='block')
+    document['host']['danger']['roles'] = {'Lead': {'policy': 'block_high_risk'}}
+    assert _replay(document).reproduced
+
+
+def test_a_role_policy_naming_a_role_the_document_does_not_have_is_refused():
+    document = _role_gated('confirm', host='block', recorded='block')
+    document['host']['danger']['roles'] = {'Ghost': document['host']['danger']['roles'].pop('Lead')}
+    with pytest.raises(ConfigError) as excinfo:
+        _replay(document)
+    assert 'host.danger.roles 的键是本文档 agents 里的角色名' in excinfo.value.expected
+    assert "['Ghost']" in excinfo.value.received
+    assert '两处一起改' in excinfo.value.next_action

@@ -28,7 +28,7 @@ from types import MappingProxyType
 from typing import Any, TextIO, TypeVar, cast
 
 from syndica import __version__
-from syndica.cli.capture import frozen_role_policies, frozen_roles, host_profile
+from syndica.cli.capture import frozen_roles, host_profile
 from syndica.cli.checks import parse_check
 from syndica.cli.config import CliConfig, load_config, yaml_file
 from syndica.cli.dev_module import DevLog, DevLogSnapshot, DevModule, last_answer
@@ -128,6 +128,7 @@ from syndica.kernel import (
     ConfigError,
     Context,
     ContractViolation,
+    DangerPolicy,
     ExecResult,
     ExitMode,
     FileTraceStore,
@@ -2295,7 +2296,8 @@ class RuntimeCliHost:
         config: CliConfig,
         catalog: AgentCatalog,
         factories: Mapping[str, AgentFactory],
-        host: Mapping[str, object],
+        profile: Callable[[Mapping[str, DangerPolicy]], dict[str, object]],
+        policy: DangerPolicy,
         prompt: str,
     ) -> None:
         """把回放文档里只有宿主知道的部分交给 recorder。回放造不出来的 run 不交（trace 照常记录），
@@ -2303,11 +2305,12 @@ class RuntimeCliHost:
         explicit = request.trace is not None or config.trace_level is not None
         reason: str | None = None
         roles: dict[str, dict[str, object]] = {}
+        role_policies: dict[str, DangerPolicy] = {}
         if request.topology is not None:
             reason = '--topology 的 run 还不能捕获（拓扑槽给角色附加的工具与预算，回放重建不出来）'
         else:
             try:
-                roles = frozen_roles(catalog, factories)
+                roles, role_policies = frozen_roles(catalog, factories, policy)
             except Exception as error:
                 # 建不出角色只少回放文档：这次 run 要不要用到那个角色，要等它跑起来才知道。
                 reason = f'读冻结之后的角色时出错：{type(error).__name__}: {error}'
@@ -2327,7 +2330,7 @@ class RuntimeCliHost:
                 self._warn(f'trace 里不写回放文档：{reason}；trace replay 回放不了这次 run。')
             return
         tracer.describe_run(
-            host=host,
+            host=profile(role_policies),
             roles=roles,
             entry={
                 'mode': 'query',
@@ -2452,13 +2455,9 @@ class RuntimeCliHost:
                     ids=None if tracer is None else tracer.ids,
                 )
                 if tracer is not None and tracer.level is not TraceLevel.STRUCTURE:
-                    self._describe_run(
-                        tracer,
-                        request,
-                        config,
-                        catalog,
-                        factories,
-                        host_profile(
+
+                    def profile(roles: Mapping[str, DangerPolicy]) -> dict[str, object]:
+                        return host_profile(
                             flags=flags,
                             judge=judge,
                             policy=policy,
@@ -2469,9 +2468,11 @@ class RuntimeCliHost:
                             modules=modules,
                             orchestration=_ORCHESTRATION,
                             confirmation_timeout=_CONFIRMATION_TIMEOUT,
-                            roles=frozen_role_policies(catalog, factories, policy),
-                        ),
-                        prompt,
+                            roles=roles,
+                        )
+
+                    self._describe_run(
+                        tracer, request, config, catalog, factories, profile, policy, prompt
                     )
                 if logs is not None:
                     # 服务是装配时 setattr 上去的，Runtime 的静态类型里没有这个属性。

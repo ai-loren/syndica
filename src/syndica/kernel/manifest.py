@@ -335,7 +335,8 @@ def _implicit_prompt_file(text: str, origin: str | None) -> Path | None:
     """origin 目录内、相对路径指向真实文件时交回它；否则 text 就是提示词。
 
     探测失败一律当正文：一段内联提示词里任何一节超过文件系统的名字上限，`is_file` 就抛
-    `OSError`，而它本来就不是路径。多行的字符串不去碰文件系统。
+    `OSError`，而它本来就不是路径。符号链接成环时 3.11 的 `resolve` 抛 `RuntimeError`，同样当正文。
+    多行的字符串不去碰文件系统。
     """
     if origin is None or '\n' in text:
         return None
@@ -349,7 +350,7 @@ def _implicit_prompt_file(text: str, origin: str | None) -> Path | None:
         candidate = (base / relative).resolve()
         candidate.relative_to(base.resolve())
         return candidate if candidate.is_file() else None
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         return None
 
 
@@ -378,7 +379,7 @@ def _explicit_prompt_file(table: Mapping[object, object], origin: str | None) ->
     try:
         rooted = base.resolve()
         candidate = (base / relative).resolve()
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         raise ConfigError(
             expected=f'system_prompt.file 是 {origin} 之内的一个文件',
             received=f'解析 {shown!r} 失败：{exc}',

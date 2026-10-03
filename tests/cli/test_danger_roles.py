@@ -50,7 +50,22 @@ def test_a_config_without_danger_tightens_nothing(tmp_path: Path):
         (
             '  roles: {Mike: {rules: {shell.path_outside_workspace: allow}}}\n',
             '项目配置只能收紧处置',
-            '项目配置做不到',
+            '项目配置放不开',
+        ),
+        (
+            '  roles: {Mike: {rules: {shell.path_outside_workspace: [block]}}}\n',
+            '是 confirm 或 block',
+            '写字符串 confirm 或 block',
+        ),
+        (
+            '  roles: {Mike: {rules: {shell.path_outside_workspace: {level: block}}}}\n',
+            '是 confirm 或 block',
+            '写字符串 confirm 或 block',
+        ),
+        (
+            '  roles: {Mike: {rules: {shell.path_outside_workspace: 1}}}\n',
+            '是 confirm 或 block',
+            '写字符串 confirm 或 block',
         ),
         (
             '  roles: {Mike: {rules: {shell.git_state_change: confirm}}}\n',
@@ -114,3 +129,18 @@ def test_a_tightening_never_loosens_an_entry(tmp_path: Path):
         {'Mike': RoleTightening(rules={'shell.git_state_change': Disposition.CONFIRM})},
     )['Mike'].table
     assert table['shell.git_state_change'] is Disposition.BLOCK
+
+
+def test_one_roles_tightening_does_not_leak_into_the_next_roles_table(tmp_path: Path):
+    judge, _ = dev_danger_options(tmp_path)
+    policies = role_policies(
+        judge,
+        {
+            'Mike': RoleTightening(rules={'shell.path_outside_workspace': Disposition.BLOCK}),
+            'Kilo': RoleTightening(rules={'shell.git_state_change': Disposition.BLOCK}),
+            'Alpha': RoleTightening(rules={'shell.raw_device_write': Disposition.BLOCK}),
+        },
+    )
+    assert policies['Mike'].table['shell.path_outside_workspace'] is Disposition.BLOCK
+    assert policies['Kilo'].table['shell.path_outside_workspace'] is Disposition.CONFIRM
+    assert policies['Alpha'].table['shell.path_outside_workspace'] is Disposition.CONFIRM

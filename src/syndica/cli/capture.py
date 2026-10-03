@@ -27,7 +27,7 @@ from syndica.kernel.danger import (
     RuleTablePolicy,
 )
 
-__all__ = ['frozen_role_policies', 'frozen_roles', 'host_profile']
+__all__ = ['frozen_roles', 'host_profile']
 
 
 def host_profile(
@@ -79,28 +79,20 @@ def _policy(policy: DangerPolicy) -> dict[str, object]:
     return {'policy': f'{kind.__module__}:{kind.__qualname__}'}
 
 
-def frozen_role_policies(
-    catalog: AgentCatalog, factories: Mapping[str, AgentFactory], default: DangerPolicy
-) -> dict[str, DangerPolicy]:
-    """处置与 `default` 不是同一个对象的那些角色：从冻结出的 Agent 上读，而不是从宿主拼的那张表上
-    读——`--no-write` 重新冻结过，读真正交给 Agent 的那一份才不会记错。"""
-    roles: dict[str, DangerPolicy] = {}
-    for name in catalog.names():
-        policy = factories[name](HooksCenter(), EventBus()).options.danger_policy
-        if policy is not None and policy is not default:
-            roles[name] = policy
-    return roles
-
-
 def frozen_roles(
-    catalog: AgentCatalog, factories: Mapping[str, AgentFactory]
-) -> dict[str, dict[str, object]]:
-    """每个角色冻结之后的样子：建一个 Agent 读它的选项（系统提示词是插值之后的正文、工具按顺序）。
-    编排工具不在其中：它们由 Runtime 在 spawn 时装，回放的 Runtime 同样会装。"""
+    catalog: AgentCatalog, factories: Mapping[str, AgentFactory], default: DangerPolicy
+) -> tuple[dict[str, dict[str, object]], dict[str, DangerPolicy]]:
+    """每个角色冻结之后的样子，以及处置不是 `default` 那个对象的角色各自的策略。都从建出来的
+    Agent 上读（系统提示词是插值之后的正文、工具按顺序）：`--no-write` 重新冻结过，读真正交给
+    Agent 的那一份才不会记错。每个角色只建一次——第三方的构造函数不该为了记录多跑一遍。编排工具
+    不在其中：它们由 Runtime 在 spawn 时装，回放的 Runtime 同样会装。"""
     roles: dict[str, dict[str, object]] = {}
+    policies: dict[str, DangerPolicy] = {}
     for name in catalog.names():
         agent = factories[name](HooksCenter(), EventBus())
         options = agent.options
+        if options.danger_policy is not None and options.danger_policy is not default:
+            policies[name] = options.danger_policy
         cls = type(agent)
         manifest = catalog.get(name)
         roles[name] = {
@@ -111,4 +103,4 @@ def frozen_roles(
             'model': manifest.model,
             'description': manifest.description,
         }
-    return roles
+    return roles, policies

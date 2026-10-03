@@ -57,13 +57,20 @@ def test_a_platform_prefixed_name_goes_to_that_platform_only(
     monkeypatch: pytest.MonkeyPatch, name: str, platform: str, model: str
 ):
     _every_platform(monkeypatch)
+    monkeypatch.setenv('SYNDICA_LLM_ORDER', 'gemini,openrouter,openai')
     llm = _configured_model(name)
     assert _members(llm) == [platform]
     assert llm.config.model == model
 
 
 @pytest.mark.parametrize(
-    'name', ['cohere/north-mini-code:free', 'meta-llama/llama-4.1:free', 'openrouter/free']
+    'name',
+    [
+        'cohere/north-mini-code:free',
+        'meta-llama/llama-4.1:free',
+        'openrouter/free',
+        'llama3.1:free',
+    ],
 )
 def test_a_slash_or_dot_before_the_first_colon_makes_it_a_model_name(
     monkeypatch: pytest.MonkeyPatch, name: str
@@ -160,3 +167,92 @@ def test_a_paid_model_through_an_openrouter_generic_endpoint_is_blamed_on_the_ma
     with pytest.raises(ConfigError) as excinfo:
         _configured_model('openai:vendor/paid-model')
     assert '清单的 model' in excinfo.value.expected + excinfo.value.received
+
+
+@pytest.mark.parametrize(
+    'name', ['openai:gpt-5', 'vendor/model'], ids=['prefixed', 'unprefixed-without-openrouter']
+)
+def test_the_generic_endpoint_needs_the_users_own_environment_to_choose_it(
+    monkeypatch: pytest.MonkeyPatch, name: str
+):
+    _only(
+        monkeypatch,
+        GEMINI_API_KEY='test-gemini-key',
+        OPENAI_BASE_URL='https://llm.example.test/v1',
+        OPENAI_MODEL='env-model',
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        _configured_model(name)
+    error = excinfo.value
+    assert 'OPENAI_*' in error.expected
+    assert repr(name) in error.received
+    assert 'SYNDICA_LLM_ORDER 里列上 openai' in error.next_action
+
+
+@pytest.mark.parametrize(
+    'env',
+    [
+        {'SYNDICA_LLM_ORDER': 'gemini,openai'},
+        {'SYNDICA_LLM_ORDER': 'openai'},
+        {},
+    ],
+    ids=['listed-after-gemini', 'listed-alone', 'the-only-platform'],
+)
+def test_the_generic_endpoint_is_used_once_the_users_environment_chose_it(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+):
+    base = {'OPENAI_BASE_URL': 'https://llm.example.test/v1', 'OPENAI_MODEL': 'env-model'}
+    if env:
+        base['GEMINI_API_KEY'] = 'test-gemini-key'
+    _only(monkeypatch, **base, **env)
+    llm = _configured_model('openai:gpt-5')
+    assert _members(llm) == ['openai']
+    assert llm.config.model == 'gpt-5'
+
+
+@pytest.mark.parametrize(
+    ('name', 'shown'),
+    [
+        ('g\u0435mini:x:free', 'U+0435'),
+        ('gemini\uff1ax', 'U+FF1A'),
+        ('openrouter/free\u200b', 'U+200B'),
+    ],
+    ids=['cyrillic-e', 'fullwidth-colon', 'zero-width-space'],
+)
+def test_a_model_name_with_a_non_ascii_character_is_refused(
+    monkeypatch: pytest.MonkeyPatch, name: str, shown: str
+):
+    _every_platform(monkeypatch)
+    with pytest.raises(ConfigError) as excinfo:
+        _configured_model(name)
+    assert 'ASCII' in excinfo.value.expected
+    assert shown in excinfo.value.received
+    assert '全角冒号写成 :' in excinfo.value.next_action
+
+
+@pytest.mark.parametrize('name', ['gemini: x', 'gemini:x ', 'openrouter:\tvendor/model:free'])
+def test_whitespace_around_the_model_after_the_prefix_is_refused(
+    monkeypatch: pytest.MonkeyPatch, name: str
+):
+    _every_platform(monkeypatch)
+    with pytest.raises(ConfigError) as excinfo:
+        _configured_model(name)
+    prefix, _, model = name.partition(':')
+    assert '冒号后面紧跟型号' in excinfo.value.expected
+    assert f'写成 {prefix}:{model.strip()}' in excinfo.value.next_action
+
+
+@pytest.mark.parametrize(
+    ('name', 'platform', 'model'),
+    [
+        ('gemini:default', 'gemini', 'gemini-env-choice'),
+        ('openrouter:default', 'openrouter', 'openrouter/free'),
+    ],
+)
+def test_platform_colon_default_is_that_platforms_default_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, name: str, platform: str, model: str
+):
+    _every_platform(monkeypatch)
+    llm = _configured_model(name)
+    assert _members(llm) == [platform]
+    assert llm.config.model == model

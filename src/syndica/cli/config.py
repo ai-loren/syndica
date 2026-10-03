@@ -304,13 +304,13 @@ def _tightened_rules(value: object, field_name: str) -> dict[str, Disposition]:
                 f'没有规则 {rule_id!r}',
                 f'改成 {sorted(base)} 之一；规则 ID 拼错时不能静默回落',
             )
-        if raw == 'allow' or raw not in choices:
+        if not isinstance(raw, str) or raw not in choices:
             raise _config(
                 f'{field_name}.rules.{rule_id} 是 confirm 或 block：项目配置只能收紧处置',
-                f'收到 {raw!r}',
-                '写 confirm 或 block；要放开一条规则得由用户在命令行上决定，项目配置做不到',
+                f'收到 {raw!r}，类型是 {type(raw).__name__}',
+                '写字符串 confirm 或 block；项目配置放不开开发期的规则，当前也没有别的放开入口',
             )
-        chosen = choices[cast(str, raw)]
+        chosen = choices[raw]
         if STRICTNESS[chosen] < STRICTNESS[base[rule_id]]:
             raise _config(
                 f'{field_name}.rules.{rule_id} 只能比开发期的处置更严：项目配置只能收紧处置',
@@ -608,22 +608,46 @@ def _load_agents(
 
 
 def _warn_if_a_path_went_missing(prompt: object, origin: str, location: str) -> None:
-    """一个长得像路径、却没有对应文件的字符串会被当成提示词正文原样交给模型，而 run 照常跑完。"""
+    """一个长得像路径、却不会被读的字符串会被当成提示词正文原样交给模型，而 run 照常跑完。"""
     if not isinstance(prompt, str) or not prompt or any(ch.isspace() for ch in prompt):
         return
     if not ('/' in prompt or '\\' in prompt or prompt.endswith(('.md', '.txt'))):
         return
     if prompt_file(prompt, origin) is not None:
         return
+    reason, fix = _why_not_read(prompt, origin)
     logger.warning(
-        '期望: %s 的 system_prompt %r 是 %s 下的一个文件。'
-        ' 实际: 没有这个文件，它会被当成提示词正文原样交给模型。'
-        ' 下一步: 修正路径，或写成 {file: %s}，路径写错时直接报错；本意就是这段正文就不用管。',
+        '期望: %s 的 system_prompt %r 是 %s 之内的一个文件。'
+        ' 实际: %s，它会被当成提示词正文原样交给模型。'
+        ' 下一步: %s；本意就是这段正文就不用管。',
         location,
         prompt,
         origin,
-        prompt,
+        reason,
+        fix,
     )
+
+
+def _why_not_read(prompt: str, origin: str) -> tuple[str, str]:
+    """(没读它的原因, 走得通的下一步)。规则同 `prompt_file`：只读 origin 之内、相对路径指向的真实
+    文件。文件在 origin 之外时 `{file:}` 同样会拒，下一步只能是把文件挪进来。"""
+    move = f'把文件放进 {origin} 之内并写相对路径'
+    relative = Path(prompt)
+    if relative.is_absolute():
+        return '它是绝对路径，只读清单所在目录之内的相对路径', move
+    if '..' in relative.parts:
+        return '它含 ..，只读清单所在目录之内的相对路径', move
+    try:
+        candidate = (Path(origin) / relative).resolve()
+    except (OSError, RuntimeError) as exc:
+        return f'解析它失败（{exc}）', '修正路径'
+    try:
+        candidate.relative_to(Path(origin).resolve())
+    except ValueError:
+        return f'它解析到 {candidate}，在 {origin} 之外', move
+    if candidate.exists():
+        return f'{candidate} 不是文件', '修正路径'
+    return '没有这个文件', f'修正路径，或写成 {{file: {prompt}}}，路径写错时直接报错'
 
 
 def _load_topologies(value: object, catalog: AgentCatalog, file: Path) -> dict[str, Topology]:

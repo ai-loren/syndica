@@ -177,7 +177,8 @@ def _document(version: int, roles: dict[str, Any]) -> dict[str, Any]:
         'version': version,
         'name': 'captured',
         'agents': {
-            'Lead': {'frozen': {'system_prompt': 'You lead.', 'tools': []}, 'instances': []}
+            'Lead': {'frozen': {'system_prompt': 'You lead.', 'tools': []}, 'instances': []},
+            'Helper': {'frozen': {'system_prompt': 'You help.', 'tools': []}, 'instances': []},
         },
         'entry': {'mode': 'query', 'agent': 'Lead', 'prompt': 'go'},
         'host': {

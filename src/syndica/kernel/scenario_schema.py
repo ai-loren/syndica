@@ -737,6 +737,7 @@ def _document(raw: object, source: str) -> ScenarioDocument:
     _check_entry(entry, topology, roles)
     responses = _responses(root.get('responses', ()), version)
     host = _host(root['host'], version) if 'host' in root else None
+    _check_role_policies(host, roles)
     host_actions = _host_actions(root.get('host_actions', ()))
     ids = _ids(root.get('ids', ()))
     _check_injected(roles, ids)
@@ -1791,6 +1792,20 @@ def _host(value: object, version: int) -> HostProfile:
         ),
         danger_roles=MappingProxyType(roles),
     )
+
+
+def _check_role_policies(host: HostProfile | None, roles: Mapping[str, ScenarioRole]) -> None:
+    """`host.danger.roles` 的键是本文档 agents 里的角色：对不上的那条若静默回落到宿主的处置，回放
+    就按一份比记录宽的处置跑。"""
+    if host is None:
+        return
+    unknown = sorted(set(host.danger_roles) - set(roles))
+    if unknown:
+        raise _error(
+            'host.danger.roles 的键是本文档 agents 里的角色名',
+            f'没有角色 {unknown!r}（agents 里有 {sorted(roles)!r}）',
+            '照 agents 的键改名，或删掉这几条；手改过角色名就两处一起改',
+        )
 
 
 def _role_policies(value: object) -> dict[str, DangerPolicySpec]:

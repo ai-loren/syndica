@@ -41,11 +41,13 @@ _GEMINI_FOREIGN_TOOL_CALL_EXTRA = {
 _ORDER_ENV = 'SYNDICA_LLM_ORDER'
 # 清单 model 的 `<平台>:<型号>`：第一个 `:` 之前形如一个名字（没有 `/` 与 `.`）时它就是平台
 # 前缀，且只能是这三个之一。命名空间是封闭的：未知前缀此刻就报错，以后加平台不会改变任何已有字符串
-# 的含义。
+# 的含义。只收 ASCII：全角冒号、看起来像拉丁字母的西里尔字母会让前缀检查认不出平台名。
+# `<平台>:default` 是那一家在环境里配置的缺省型号。
 _PLATFORMS = ('gemini', 'openrouter', 'openai')
 _PLATFORM_PREFIX = re.compile(r'\s*[A-Za-z][A-Za-z0-9_-]*\s*:')
 # 不设 SYNDICA_LLM_ORDER 时进轮换的平台及顺序。通用的 OPENAI_* 端点不在其中：它可能是付费端点，
-# 只在这两家都没配置时单独使用，或在 SYNDICA_LLM_ORDER 里被显式点名。
+# 只在这两家都没配置时单独使用，或在 SYNDICA_LLM_ORDER 里被显式点名。清单（项目配置，不可信）
+# 点名它同样要满足这一条，见 `_require_generic_endpoint`。
 _DEFAULT_RING = ('gemini', 'openrouter')
 
 
@@ -177,6 +179,15 @@ def _platform_and_model(name: str) -> tuple[str | None, str]:
     """清单的 model → (平台, 型号)；没有平台前缀时平台是 None。按**第一个** `:` 切。"""
     from syndica.kernel import ConfigError
 
+    if not name.isascii():
+        odd = ', '.join(f'U+{ord(char):04X}' for char in sorted(set(name)) if not char.isascii())
+        raise ConfigError(
+            expected='清单 model 只含 ASCII 字符（平台前缀与模型 ID 都是 ASCII）',
+            received=f'收到 model={name!r}，其中 {odd} 不是 ASCII',
+            next_action=(
+                '把这些字符换成 ASCII：全角冒号写成 :，看起来像拉丁字母的别的字母换成拉丁字母'
+            ),
+        )
     if _PLATFORM_PREFIX.match(name) is None:
         return None, name
     prefix, _, model = name.partition(':')
@@ -203,7 +214,38 @@ def _platform_and_model(name: str) -> tuple[str | None, str]:
                 f'在冒号后面写上 {prefix} 平台上的型号；用平台的缺省型号就把 model 写成 default'
             ),
         )
+    if model != model.strip():
+        raise ConfigError(
+            expected=f'清单 model 写成 {prefix}:<型号>，冒号后面紧跟型号',
+            received=f'收到 model={name!r}，型号前后带空白',
+            next_action=f'写成 {prefix}:{model.strip()}',
+        )
     return prefix, model
+
+
+def _require_generic_endpoint(name: str, model: str) -> None:
+    """清单来自项目配置，而通用的 OPENAI_* 端点可能付费：要用户自己的环境选了它——`SYNDICA_LLM_ORDER`
+    里列了 openai，或两家免费平台都没配置、它本来就是唯一的平台。"""
+    from syndica.kernel import ConfigError
+
+    if 'openai' in _ring_order():
+        return
+    openrouter = (
+        ''
+        if _openrouter_configured()
+        else '设置 OPENROUTER_API_KEY 让不带前缀的名字走 OpenRouter（只收 :free 模型）；'
+    )
+    raise ConfigError(
+        expected='清单的 model 走通用的 OPENAI_* 端点之前，你自己的环境选了它（它可能是付费端点）',
+        received=(
+            f'model={name!r} 要走 OPENAI_*，而已配置了 Gemini 或 OpenRouter，'
+            f'{_ORDER_ENV} 里也没有 openai'
+        ),
+        next_action=(
+            f'要用 Gemini 就写成 gemini:{model}；{openrouter}'
+            f'确实要走 OPENAI_* 就在 {_ORDER_ENV} 里列上 openai（如 gemini,openrouter,openai）'
+        ),
+    )
 
 
 def _configured_model(name: str) -> LLM:
@@ -222,14 +264,14 @@ def _configured_model(name: str) -> LLM:
     elif platform == 'openrouter':
         members = [('openrouter', _openrouter_model(model))]
     elif platform == 'openai':
+        _require_generic_endpoint(name, model)
         members = [('openai', _openai_model(model))]
     elif name != 'default':
-        explicit = (
-            ('openrouter', _openrouter_model(name))
-            if _openrouter_configured()
-            else ('openai', _openai_model(name))
-        )
-        members = [explicit]
+        if _openrouter_configured():
+            members = [('openrouter', _openrouter_model(name))]
+        else:
+            _require_generic_endpoint(name, name)
+            members = [('openai', _openai_model(name))]
     else:
         builders = {
             'gemini': lambda: _gemini_model('default'),

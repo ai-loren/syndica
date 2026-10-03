@@ -614,7 +614,8 @@ def _one_agent(prompt: str) -> str:
 
 
 @pytest.mark.parametrize(
-    'prompt', ['docs/agents/planner.md', 'prompts/notes.txt', 'planner.md', 'docs\\x.md']
+    'prompt',
+    ['docs/agents/planner.md', 'prompts/notes.txt', 'planner.md', 'notes.txt', 'docs\\x.md'],
 )
 def test_a_path_like_prompt_without_a_file_is_warned_about(
     tmp_path: Path, prompt: str, caplog: pytest.LogCaptureFixture
@@ -623,13 +624,68 @@ def test_a_path_like_prompt_without_a_file_is_warned_about(
     with caplog.at_level(logging.WARNING):
         load_config(path)
     (record,) = [record for record in caplog.records if record.levelno == logging.WARNING]
-    location, shown, origin, suggested = cast(tuple[str, str, str, str], record.args)
+    location, shown, origin, reason, fix = cast(tuple[str, str, str, str, str], record.args)
     assert location.endswith('.syndica.yaml#agents[0]')
-    assert shown == suggested == prompt
+    assert shown == prompt
     assert origin == str(tmp_path.resolve())
+    assert reason == '没有这个文件'
+    assert f'{{file: {prompt}}}' in fix
 
 
-@pytest.mark.parametrize('prompt', ['You plan carefully.', 'planner', '"plan: first"'])
+def _outside(project: Path) -> Path:
+    shared = project.parent / 'shared'
+    shared.mkdir()
+    (shared / 'planner.md').write_text('You plan.', encoding='utf-8')
+    return shared / 'planner.md'
+
+
+@pytest.mark.parametrize(
+    ('how', 'anchor'),
+    [
+        ('absolute', '它是绝对路径'),
+        ('dot-dot', '它含 ..'),
+        ('symlink', '之外'),
+    ],
+)
+def test_a_path_like_prompt_naming_a_file_outside_the_config_says_why_and_how_to_fix(
+    tmp_path: Path, how: str, anchor: str, caplog: pytest.LogCaptureFixture
+):
+    project = tmp_path / 'project'
+    project.mkdir()
+    outside = _outside(project)
+    if how == 'absolute':
+        prompt = str(outside)
+    elif how == 'dot-dot':
+        prompt = '../shared/planner.md'
+    else:
+        (project / 'planner.md').symlink_to(outside)
+        prompt = 'planner.md'
+    path = _write(project / '.syndica.yaml', _one_agent(prompt))
+    with caplog.at_level(logging.WARNING):
+        config = load_config(path)
+    (record,) = [record for record in caplog.records if record.levelno == logging.WARNING]
+    _, _, _, reason, fix = cast(tuple[str, str, str, str, str], record.args)
+    assert anchor in reason
+    assert '之内并写相对路径' in fix
+    assert '{file:' not in fix
+    assert config.catalog.get('Planner').system_prompt == prompt
+
+
+def test_a_path_like_prompt_naming_a_directory_says_it_is_not_a_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    (tmp_path / 'docs' / 'planner.md').mkdir(parents=True)
+    path = _write(tmp_path / '.syndica.yaml', _one_agent('docs/planner.md'))
+    with caplog.at_level(logging.WARNING):
+        load_config(path)
+    (record,) = [record for record in caplog.records if record.levelno == logging.WARNING]
+    _, _, _, reason, _ = cast(tuple[str, str, str, str, str], record.args)
+    assert reason.endswith('不是文件')
+
+
+@pytest.mark.parametrize(
+    'prompt', ['You plan carefully.', 'planner', '"plan: first"', 'Read docs/planner.md first']
+)
 def test_a_prompt_that_does_not_look_like_a_path_is_not_warned_about(
     tmp_path: Path, prompt: str, caplog: pytest.LogCaptureFixture
 ):

@@ -176,15 +176,16 @@ Gemini with the placeholder signature Google documents for that case.
 A role whose manifest names a model leaves the rotation and calls one platform. Write the model as
 `<platform>:<model>`, where the platform is `gemini`, `openrouter` or `openai` (the generic
 `OPENAI_*` endpoint): `gemini:gemini-3.8-flash`, `openrouter:cohere/north-mini-code:free`,
-`openai:qwen3:8b`. The name is split at its first colon. A name with a `/` or `.` before its first
+`openai:qwen3:8b`. `<platform>:default` is that platform's default model from the environment. The
+name must be ASCII and is split at its first colon. A name with a `/` or `.` before its first
 colon, such as `cohere/north-mini-code:free`, is a plain model name and goes to OpenRouter when it
 is configured, otherwise to `OPENAI_*`. Any other word before the first colon is an error that
 names the fix, so a tag like `qwen3:8b` has to be written `openai:qwen3:8b`. OpenRouter still
 accepts only free models, whichever way the name reaches it.
 
-A model name written explicitly in a role manifest belongs to a single platform and is not rotated:
-it goes to OpenRouter when OpenRouter is configured, and to the generic `OPENAI_*` endpoint
-otherwise.
+The generic `OPENAI_*` endpoint may be a paid one, and a manifest can come from a project's
+configuration. A manifest therefore reaches it only when your own environment chose it: `openai`
+is listed in `SYNDICA_LLM_ORDER`, or neither Gemini nor OpenRouter is configured.
 
 ### Keys and quotas
 
