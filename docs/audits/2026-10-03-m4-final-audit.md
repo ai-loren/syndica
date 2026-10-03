@@ -47,6 +47,9 @@ spec §15 的完成判据——**三层装配 + Runtime Module + 命名空间切
   `TRUSTED` 的文字，于是全部按作者收紧：hook 回调与 Module 工具按注册它的代码的身份跑，作者是被收紧的 Module 时
   这一轮的 assistant block、就地改过的对象、它发出的消息都标 `UNTRUSTED`。仍挡不住的写进计划 D15：在没有身份的
   地方（事件订阅者、线程）注册的 hook，与就地改轨迹里已有的 block。
+- **Agent 工厂按交出它的那一方的身份跑。** 登记的角色按登记时的身份（`Runtime(agents=)` 算宿主，`assemble` 按调用方），
+  经拓扑槽起的按那个角色的，`Fork` 照源 Agent 当初的；调用方直接交给 `spawn` 的按调用方。Module 把宿主的函数直接交给
+  `spawn` 时仍算 Module 的，这一格偏保守：宿主要让角色按自己跑就登记它。
 - **信任确认在 import 时再核一次。** 计划只摘要配置引用的代码；评审证明符号链接、大小写不敏感的卷、预先种下的
   字节码与 run 中途的惰性 import 都能让没被确认的代码跑起来。现在「在工作区之内」按字面或解析之后有一种在里面
   就算、按文件身份比；摘进去的代码在 import 时按确认时的内容核对（`PinnedImports`）；摘要格式升到
@@ -72,6 +75,8 @@ spec §15 的完成判据——**三层装配 + Runtime Module + 命名空间切
 - 登记表关闭 B-09、B-10（D7：第三方工具必须在自己的类上声明命令参数）与 D-42（D9：不拆回调类型）。
 - 新登记 D-62（归里程碑 5）：CLI 的开发期记录器挂在 Agent 的局部层，更早装配的 Module 从工厂里往局部层挂的
   `POST_TOOL_USE` hook 能用 `skip` 让一次调用不进开发期日志。
+- 新登记 D-63、D-64（归里程碑 5 的溯源链）：被收紧的 Module 直接往 `runtime.broker` 发的 `Message` 不收紧；收紧不跟着
+  数据走过扩展切点的负载。
 - 负载下偶发失败、单独重跑都过的用例（留到统一补跑 CI 时处理）：`test_messages_from_two_senders_to_a_woken_child_replay_into_the_same_turns_under_noise`、
   `test_a_hook_that_ignores_sigterm_is_killed`、`test_a_deferred_message_and_a_kill_replay_into_the_cycle_after_the_kill`、
   `test_ctrl_c_mashed_at_the_git_question_still_prints_the_handoff`。`test_trace_export_that_cannot_start_exits_2`
@@ -86,12 +91,12 @@ spec §15 的完成判据——**三层装配 + Runtime Module + 命名空间切
 | 阶段二 | 0 / 1 / 3 / 6 | `cf1fcaf` |
 | 阶段三（信任闸与输出收紧） | 0 / 3 / 6 / 5（评审写报告时被内容过滤截断，结论按它的探针与笔记重建） | `1beaa42`、`08ffcbd` |
 | 阶段四（trace 与回放） | 0 / 1 / 3 / 14；它的 58 条变异 20 条存活，全部补了用例 | `e77a645` |
-| 收口 A（功能与鲁棒性） | High：`send` / `spawn(query=)` 没收紧；Medium：await 之后失败的 spawn 留下 Runtime 级 hook、第三方失败的报错既不点名也不脱敏且关机失败丢掉答案；Low：开发期记录器的次序、`--config` 下的回放 | 收口修复提交（记录器次序登记为 D-62） |
+| 收口 A（功能与鲁棒性） | 0 / 1 / 3 / 4。High：`send` / `spawn(query=)` 没收紧；Medium：await 之后失败的 spawn 留下 Runtime 级 hook、第三方失败的报错既不点名也不脱敏且关机失败丢掉答案、收紧不跟着数据走过扩展切点；Low：开发期记录器的次序、`--config` 下的回放、重名工具与服务没有定向用例、宿主工厂继承调用它的 Module 的身份。它的 124 条变异 9 条存活，补了用例（一条是不可达分支） | 收口修复两次提交；记录器次序、直接往 broker 发消息、经扩展切点流动的数据登记为 D-62、D-63、D-64 |
 | 收口 B（扩展与可维护） | 0 / 0 / 4 / 13；它的 41 条变异 12 条存活，全部补了用例 | 收口修复提交 |
 
 本里程碑自己的变异（每条都对改动的文件按 sha256 先校验、施加、清字节码、跑用例、还原、再校验）：阶段一修复 17、
 阶段二修复 19、T11 修补 9、T9b 34、T10 7、T12 6、T13 8、T14 11、阶段三内核修复 22、阶段三 CLI 修复 27、阶段四
-修复 27、收口修复 33，全部杀死；收口时第一次跑出的存活变异（「撤回快照之后的全部」「撤回不比作者」）各补了一条
+修复 27、收口修复 33、收口 A 的后续 15（工厂身份的每条来路与两个方向各一条），全部杀死；收口时第一次跑出的存活变异（「撤回快照之后的全部」「撤回不比作者」）各补了一条
 用例。
 
 ## 验证

@@ -148,7 +148,12 @@ from syndica.kernel.events import (
     _why_copying_failed,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.kernel.hooks import HooksCenter, Junction
-from syndica.kernel.hooks.installing import current_installer, no_installer
+from syndica.kernel.hooks.installing import (
+    Installer,
+    acting_as,
+    current_installer,
+    no_installer,
+)
 from syndica.kernel.ids import (
     IdSource,
     RandomIds,
@@ -211,11 +216,16 @@ class _SlotSpawn:
     `per_caller`：on-demand 槽每次要都新建一个，实例就是要它的那次调用的，键跟着调用方；singleton
     与 keyed 的实例由槽与键确定，谁先来要都是同一个——键里带上先到者，回放时换一个先到者它就换了
     id。
+
+    `installer`：槽上那个角色登记时的身份。工厂与 `install_own_tools` 按它跑，不按触发这次寻址的
+    调用方：被收紧的 Module 寻址一个宿主的槽时，那个角色自己挂的 hook 若记在 Module 头上，它写下的
+    文字就会被收紧成不可信。
     """
 
     name: str
     key: str
     per_caller: bool
+    installer: Installer | None
 
 
 _SLOT_SPAWN: ContextVar[_SlotSpawn | None] = ContextVar('syndica_slot_spawn', default=None)
@@ -717,7 +727,8 @@ class _Slot:
 
     `factory` 留着是为了分叉：`Fork` 要照着源 Agent 再造一个**同类型**的，而「同类型」的实际
     含义就是同一个工厂——同一份 System Prompt、同一套工具与次序（spec §5.2 纪律 4：同类型分叉
-    继承缓存亲和）。
+    继承缓存亲和）。`installer` 是那个工厂当初按谁的身份跑的：分叉时 `Fork` 在源 Agent 的驱动
+    任务里调 spawn，那里没有身份，照它再跑才不会把 Module 的工厂当成宿主的。
     """
 
     exit_mode: ExitMode
@@ -725,6 +736,7 @@ class _Slot:
     gate: BrokerTurnGate
     factory: AgentFactory
     flags: Mapping[str, FlagValue]
+    installer: Installer | None
     owned: bool = False
     # 此刻代表这个 Agent 在等答复的那一个。一个 Agent 是一份注意力，因此这里是一个而不是一组；
     # 按 agent 分槽而不是放在 Runtime 上，一次抢占或中止才只落在被点名的那个 Agent 上。
@@ -1020,6 +1032,9 @@ class Runtime:
         # 宿主此后每一次 append 都改掉了早先每个读者看到的那个答案。与 `AgentOptions.tools` 相反
         # ——那里共用是为了热插拔，而角色表的载入与同名覆盖归计划 3，在那一层收口。
         self._agents: dict[str, AgentFactory] = dict(agents or {})
+        # 登记的工厂按登记它的那一方的身份跑，不按此刻调 spawn 的那一方（身份跟着代码走）。构造
+        # Runtime 的就是宿主；`assemble` 谁都调得到，按调用方记。
+        self._agent_installers: dict[str, Installer | None] = dict.fromkeys(self._agents)
         self._orchestration = orchestration
         self._confirmation_handler = confirmation_handler
         self._table: LocalAgentTable[BaseAgent] = LocalAgentTable()
@@ -1157,9 +1172,12 @@ class Runtime:
         工厂收下本 Runtime 的 hooks 与事件总线：Agent 自己新建一份，宿主注册的切点与订阅就都落空了。
         """
         query_trust = self._from_listed_module(query_trust)
+        # 取走而不是只读：工厂与 hook 里再 spawn 的 Agent 不是这个槽的，也不该拿这个槽的身份。
+        slot_spawn = _SLOT_SPAWN.get()
+        _SLOT_SPAWN.set(None)
         # 键在两道取决于调度的拒绝之前占用（并发的关机、并发的拆除）：被拒的这一次也占掉它的序号，
         # 后面的 spawn 才在两次运行里拿到同一个键（M3 D10）。
-        key = self._agent_key()
+        key = self._agent_key(slot_spawn)
         if self._closed:
             raise _already_shut_down()
         if parent_id is not None and parent_id in self._doomed:
@@ -1171,9 +1189,11 @@ class Runtime:
         # 下面的 isinstance 就成了 pyright 眼里的死代码。
         module_hooks = HooksCenter(outer=self.hooks)
         module_hooks._serve_one_agent()  # pyright: ignore[reportPrivateUsage]
+        runs_as = self._factory_installer(factory, slot_spawn, fork_from)
         token = assigning_agent_id(assigned)
         try:
-            produced = cast('object', factory(module_hooks, self.events))
+            with acting_as(runs_as):
+                produced = cast('object', factory(module_hooks, self.events))
         finally:
             releasing_agent_id(token)
         if not isinstance(produced, BaseAgent):
@@ -1253,7 +1273,8 @@ class Runtime:
             # 旗子只决定其它角色。Orchestrator 在旗子关掉时仍要能派活，所以每个角色都有一次
             # 自己装工具的机会；缺省实现什么都不做。
             before_own = dict(agent.options.tools)
-            agent.install_own_tools(self)
+            with acting_as(runs_as):
+                agent.install_own_tools(self)
             for name, tool in agent.options.tools.items():
                 if before_own.get(name) is not tool:
                     require_own_command_args(
@@ -1361,6 +1382,7 @@ class Runtime:
             gate=gate,
             factory=factory,
             flags=agent_flags,
+            installer=runs_as,
         )
         seed = None if query is None else _Seed(text=query, trust=query_trust)
         task = asyncio.create_task(self._drive(agent_id, agent, seed), name=f'agent:{agent_id}')
@@ -1408,16 +1430,14 @@ class Runtime:
             )
         return await handler.confirm(self, request)
 
-    def _agent_key(self) -> StableKey:
+    def _agent_key(self, slot: _SlotSpawn | None) -> StableKey:
         """这次 spawn 的稳定键：当前出处（工具调用或属主）里的第几个，否则是宿主的第几次。
 
         经拓扑槽的在前面加上槽名与键。on-demand 槽的实例属于要它的那次调用，跟着调用方的出处取
         （不在任何出处里时按这个槽的第几个）；singleton 与 keyed 的按这个槽、这个键的第几个，**不
         占用调用方的计数**——它们由槽与键确定，谁先来寻址都是同一个。
         """
-        slot = _SLOT_SPAWN.get()
         if slot is not None:
-            _SLOT_SPAWN.set(None)
             if slot.per_caller:
                 origin = next_key('spawn')
                 if origin is not None:
@@ -1550,6 +1570,26 @@ class Runtime:
         ):
             return TrustLevel.UNTRUSTED
         return trust
+
+    def _factory_installer(
+        self, factory: AgentFactory, slot: _SlotSpawn | None, fork_from: str | None
+    ) -> Installer | None:
+        """工厂与 `install_own_tools` 按把这个工厂交给内核的那一方的身份跑：登记的角色按登记时的，
+        经拓扑槽的按槽上那个角色的，分叉按源 Agent 当初的，调用方自己交给 spawn 的按调用方的。
+
+        宿主登记的角色若继承起它的 Module 的身份，它自己挂的 hook 写下的文字会被收紧，它声明扩展
+        切点会被当成 Module 越权；反过来，把 Module 交进来的工厂当成宿主的，就把它写下的文字放成了
+        可信。内核分辨不出一个交进来的函数是谁写的，所以只认这几条登记过的来路。"""
+        if slot is not None:
+            return slot.installer
+        if fork_from is not None:
+            source = self._slots.get(fork_from)
+            if source is not None and source.factory is factory:
+                return source.installer
+        for name, registered in self._agents.items():
+            if registered is factory:
+                return self._agent_installers[name]
+        return current_installer()
 
     async def _rollback_unstarted_spawn(
         self,
@@ -3038,6 +3078,7 @@ class Runtime:
             if name in self._agents:
                 logger.info('catalog 覆盖了 Runtime(agents=) 里同名工厂 %s', name)
             self._agents[name] = factory
+            self._agent_installers[name] = current_installer()
         self._topology_tools = dict(tool_table)
         bindings: dict[str, _TopologyBinding] = {}
         for slot in received_topology.slots:
@@ -3168,7 +3209,12 @@ class Runtime:
             if existing is not None:
                 return existing
         token = _SLOT_SPAWN.set(
-            _SlotSpawn(slot.name, key or '', per_caller=slot.cardinality == 'on-demand')
+            _SlotSpawn(
+                slot.name,
+                key or '',
+                per_caller=slot.cardinality == 'on-demand',
+                installer=self._agent_installers[slot.agent],
+            )
         )
         try:
             agent_id = await self.spawn(

@@ -364,6 +364,12 @@ when it loads one.
   starts no threads, so a replay may run it again) and `security_notes`.
 - Flags: `FlagDeclaration(key, default, description, choices=(), minimum=None, maximum=None)`, with
   a `bool`, `int` or `str` default.
+- To hand text to another agent, use `runtime.send` or `runtime.spawn(query=...)`; text a listed
+  module writes there is marked untrusted. A `Message` published straight to `runtime.broker`
+  carries whatever trust it was given.
+- A factory your module passes to `runtime.spawn` runs as your module, so hooks it or the agent's
+  `install_own_tools` registers count as yours. Roles the host registered (`Runtime(agents=...)`,
+  `assemble`) run as the host even when your tool spawns them.
 
 `flags:` overrides flag defaults for the run; `--flag key=value` overrides `flags:`. Both go through
 the same checks against the installed modules' declarations, and a project configuration may only

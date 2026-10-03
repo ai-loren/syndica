@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import pytest
@@ -13,11 +13,14 @@ from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.context import ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.danger import AllowAll
 from syndica.kernel.events import EventBus
-from syndica.kernel.hooks import HookResult, HooksCenter, Junction
+from syndica.kernel.hooks import HookResult, HooksCenter, Junction, JunctionKind
+from syndica.kernel.hooks.installing import installing
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.modules import RuntimeModule
 from syndica.kernel.runtime import Runtime
 from syndica.kernel.tool import Tool, ToolResult
+from syndica.kernel.tools import Fork
+from syndica.kernel.topology import AgentSlot, Topology
 from syndica.kernel.tracing import NullTracer
 
 _DANGER = 'sudo rm -rf /srv'
@@ -566,3 +569,243 @@ async def test_the_host_sending_beside_a_listed_module_stays_trusted():
 
     [handed] = [block for block in context.current_traj if block.content == _HANDED]
     assert handed.trust is TrustLevel.TRUSTED
+
+
+_HELD = 'held by the role guard'
+
+
+async def _hold(**_: Any) -> HookResult:
+    return HookResult(skip=True, result=ToolResult(output=_HELD))
+
+
+def _probing_turns() -> list[ScriptedTurn]:
+    return [ScriptedTurn(tool_calls=[_shell_call('ls')]), ScriptedTurn(content='done')]
+
+
+def _guarded(
+    *, declares: bool = False, turns: Iterator[list[ScriptedTurn]] | None = None
+) -> Callable[[HooksCenter, EventBus], BaseAgent]:
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        hooks.register(Junction.PRE_TOOL_USE, _hold)
+        if declares:
+            hooks.declare_extension_junction('host:started', JunctionKind.OBSERVABLE)
+        script = _probing_turns() if turns is None else next(turns)
+        return BaseAgent(
+            AgentOptions(
+                name='Child',
+                llm=ScriptedLLM(script),
+                tools={'Shell': _Shell()},
+                danger_policy=AllowAll(),
+            ),
+            hooks=hooks,
+            events=events,
+        )
+
+    return build
+
+
+class _GuardsItself(BaseAgent):
+    def install_own_tools(self, runtime: object) -> None:
+        del runtime
+        self.register_hook(Junction.PRE_TOOL_USE, _hold)
+
+
+def _class_role(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+    return _GuardsItself(
+        AgentOptions(
+            name='Child',
+            llm=ScriptedLLM(_probing_turns()),
+            tools={'Shell': _Shell()},
+            danger_policy=AllowAll(),
+        ),
+        hooks=hooks,
+        events=events,
+    )
+
+
+def _acting(action: Callable[[Runtime], Awaitable[None]]) -> RuntimeModule:
+    def tools(runtime: Runtime, agent: BaseAgent, flags: object) -> dict[str, Tool]:
+        del agent, flags
+
+        class _Acts(Tool):
+            __tool_command_args__ = ()
+
+            async def execute(self) -> ToolResult:
+                await action(runtime)
+                return ToolResult(output='acted')
+
+        return {'Acts': _Acts()}
+
+    return RuntimeModule('extra', tool_factories=(tools,))
+
+
+async def _act_as_the_module(runtime: Runtime) -> None:
+    caller = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='p1', name='Acts', arguments='{}')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    await runtime.wait(await runtime.spawn(_factory(caller, {}), query='go'))
+
+
+async def _held_trust(runtime: Runtime, agent_id: str) -> TrustLevel:
+    context = await runtime.wait(agent_id)
+    [held] = [block for block in context.current_traj if block.role == 'tool']
+    assert held.content == _HELD
+    return held.trust
+
+
+def _lazy_slot() -> Topology:
+    return Topology(
+        slots=(AgentSlot(name='worker', agent='Child', cardinality='singleton', boot='lazy'),)
+    )
+
+
+async def test_a_role_the_host_registered_runs_as_the_host_when_a_listed_module_spawns_it():
+    spawned: dict[str, str] = {}
+
+    async def spawn_role(runtime: Runtime) -> None:
+        factory = runtime.agent_factory('Child')
+        assert factory is not None
+        spawned['child'] = await runtime.spawn(factory, query='go')
+
+    runtime = Runtime(
+        agents={'Child': _guarded(declares=True)},
+        modules=[_acting(spawn_role)],
+        untrusted_output_modules=['extra'],
+    )
+    try:
+        await _act_as_the_module(runtime)
+        assert await _held_trust(runtime, spawned['child']) is TrustLevel.TRUSTED
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_factory_a_listed_module_hands_to_spawn_itself_runs_as_that_module():
+    spawned: dict[str, str] = {}
+
+    async def spawn_own(runtime: Runtime) -> None:
+        spawned['child'] = await runtime.spawn(_guarded(), query='go')
+
+    runtime = Runtime(modules=[_acting(spawn_own)], untrusted_output_modules=['extra'])
+    try:
+        await _act_as_the_module(runtime)
+        assert await _held_trust(runtime, spawned['child']) is TrustLevel.UNTRUSTED
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_slot_a_listed_module_wakes_runs_its_role_as_the_host():
+    async def wake(runtime: Runtime) -> None:
+        await runtime.send_to_slot('worker', 'go')
+
+    runtime = Runtime(modules=[_acting(wake)], untrusted_output_modules=['extra'])
+    try:
+        await runtime.assemble(_lazy_slot(), {'Child': _guarded(declares=True)}, tools={})
+        await _act_as_the_module(runtime)
+        worker = await runtime.resolve('worker')
+        assert worker is not None
+        assert await _held_trust(runtime, worker) is TrustLevel.TRUSTED
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_spawn_from_a_hook_while_a_slot_boots_does_not_take_the_slot_identity():
+    spawned: dict[str, str] = {}
+    runtime = Runtime(modules=[RuntimeModule('extra')], untrusted_output_modules=['extra'])
+
+    async def spawn_own(**_: Any) -> None:
+        if spawned:
+            return
+        spawned['child'] = ''
+        spawned['child'] = await runtime.spawn(_guarded(), query='go')
+
+    try:
+        await runtime.assemble(_lazy_slot(), {'Child': _guarded()}, tools={})
+        with installing('module', 'extra'):
+            runtime.hooks.register(Junction.AGENT_SPAWN, spawn_own)
+        await runtime.send_to_slot('worker', 'go')
+        assert await _held_trust(runtime, spawned['child']) is TrustLevel.UNTRUSTED
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.parametrize('route', ['slot', 'agent_factory'])
+async def test_a_role_assembled_by_module_code_runs_as_that_module(route: str):
+    runtime = Runtime(modules=[RuntimeModule('extra')], untrusted_output_modules=['extra'])
+    try:
+        with installing('module', 'extra'):
+            await runtime.assemble(_lazy_slot(), {'Child': _guarded()}, tools={})
+        if route == 'slot':
+            await runtime.send_to_slot('worker', 'go')
+            agent_id = await runtime.resolve('worker')
+        else:
+            factory = runtime.agent_factory('Child')
+            assert factory is not None
+            agent_id = await runtime.spawn(factory, query='go')
+        assert agent_id is not None
+        assert await _held_trust(runtime, agent_id) is TrustLevel.UNTRUSTED
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ('registered', 'trust'), [(True, TrustLevel.TRUSTED), (False, TrustLevel.UNTRUSTED)]
+)
+async def test_a_class_role_installs_its_own_hooks_under_the_identity_of_its_factory(
+    registered: bool, trust: TrustLevel
+):
+    spawned: dict[str, str] = {}
+
+    async def spawn_role(runtime: Runtime) -> None:
+        factory = runtime.agent_factory('Child') if registered else _class_role
+        assert factory is not None
+        spawned['child'] = await runtime.spawn(factory, query='go')
+
+    runtime = Runtime(
+        agents={'Child': _class_role} if registered else {},
+        modules=[_acting(spawn_role)],
+        untrusted_output_modules=['extra'],
+    )
+    try:
+        await _act_as_the_module(runtime)
+        assert await _held_trust(runtime, spawned['child']) is trust
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_fork_reruns_the_factory_under_the_identity_its_source_ran_under():
+    spawned: dict[str, str] = {}
+    own = _guarded(turns=iter([[ScriptedTurn(content='source done')], _probing_turns()]))
+
+    async def spawn_own(runtime: Runtime) -> None:
+        spawned['source'] = await runtime.spawn(own, query='go')
+
+    runtime = Runtime(modules=[_acting(spawn_own)], untrusted_output_modules=['extra'])
+    try:
+        await _act_as_the_module(runtime)
+        await runtime.wait(spawned['source'])
+        forked = await Fork(runtime, spawned['source']).execute(query='onward')
+        assert await _held_trust(runtime, forked.meta['agent_id']) is TrustLevel.UNTRUSTED
+    finally:
+        await runtime.shutdown()
+
+
+async def test_forking_with_another_factory_does_not_borrow_the_identity_of_the_source():
+    spawned: dict[str, str] = {}
+
+    async def fork_with_own(runtime: Runtime) -> None:
+        spawned['twin'] = await runtime.spawn(
+            _guarded(), query='onward', fork_from=spawned['source']
+        )
+
+    runtime = Runtime(modules=[_acting(fork_with_own)], untrusted_output_modules=['extra'])
+    try:
+        source = _factory(ScriptedLLM([ScriptedTurn(content='source done')]), {})
+        spawned['source'] = await runtime.spawn(source, query='go')
+        await runtime.wait(spawned['source'])
+        await _act_as_the_module(runtime)
+        assert await _held_trust(runtime, spawned['twin']) is TrustLevel.UNTRUSTED
+    finally:
+        await runtime.shutdown()

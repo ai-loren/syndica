@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
-from typing import NoReturn
+from typing import Any, NoReturn, cast
 
 import pytest
 
@@ -14,6 +14,7 @@ from syndica.kernel.agent_types import AgentInfo
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import ExtensionJunction, HookResult, HooksCenter, Junction, JunctionKind
+from syndica.kernel.hooks.installing import current_installer, installing
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.modules import RuntimeModule
 from syndica.kernel.runtime import Runtime
@@ -614,3 +615,116 @@ async def test_a_failing_on_shutdown_names_its_module_inside_the_group():
 
     [failure] = excinfo.value.exceptions
     assert failure.__notes__ == ["Runtime Module 'beta' 的 on_shutdown 抛出了它"]
+
+
+async def test_on_shutdown_runs_without_the_identity_of_whoever_called_shutdown():
+    seen: list[object] = []
+
+    async def record(runtime: Runtime) -> None:
+        del runtime
+        seen.append(current_installer())
+
+    runtime = Runtime(modules=[RuntimeModule('beta', on_shutdown=record)])
+    with installing('module', 'alpha'):
+        await runtime.shutdown()
+
+    assert seen == [None]
+
+
+class _Echo(Tool):
+    __tool_command_args__ = ()
+
+    async def execute(self) -> ToolResult:
+        return ToolResult(output='ok')
+
+
+async def test_two_modules_handing_out_the_same_tool_name_are_refused():
+    runtime = Runtime(
+        modules=[
+            RuntimeModule('first', tool_factories=(lambda *_: {'Echo': _Echo()},)),
+            RuntimeModule('second', tool_factories=(lambda *_: {'Echo': _Echo()},)),
+        ]
+    )
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_factory([]))
+    finally:
+        await runtime.shutdown()
+
+    assert '只新增工具' in excinfo.value.expected
+    assert "'Echo'" in excinfo.value.received and "'second'" in excinfo.value.received
+
+
+def test_two_modules_mounting_the_same_service_name_are_refused():
+    with pytest.raises(ConfigError) as excinfo:
+        Runtime(
+            modules=[
+                RuntimeModule('first', services={'shared_store': lambda *_: object()}),
+                RuntimeModule('second', services={'shared_store': lambda *_: object()}),
+            ]
+        )
+
+    assert "service 'shared_store'" in excinfo.value.received
+    assert '前面的另一个 Runtime Module' in excinfo.value.received
+
+
+async def test_a_tool_factory_replacing_an_existing_tool_in_place_is_refused():
+    def replaces(runtime: Runtime, agent: BaseAgent, flags: object) -> Mapping[str, Tool]:
+        del runtime, flags
+        agent.options.tools['Echo'] = _Echo()
+        return {}
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(
+                name='Worker',
+                llm=ScriptedLLM([ScriptedTurn(content='done')]),
+                tools={'Echo': _Echo()},
+            ),
+            hooks=hooks,
+            events=events,
+        )
+
+    runtime = Runtime(modules=[RuntimeModule('first', tool_factories=(replaces,))])
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(build)
+    finally:
+        await runtime.shutdown()
+
+    assert "['Echo']" in excinfo.value.received
+    assert 'tool_factories' in excinfo.value.expected
+
+
+class _PluginClass:
+    name = 'beta-hooks'
+
+    def register(self, hooks: HooksCenter) -> None:
+        del hooks
+
+
+async def _async_tools(*_: object) -> Mapping[str, Tool]:
+    return {}
+
+
+@pytest.mark.parametrize(
+    ('field', 'anchor'),
+    [('agent_plugins', '加上括号'), ('tool_factories', '同步返回工具 Mapping')],
+    ids=['plugin-class', 'coroutine-from-a-tool-factory'],
+)
+async def test_a_factory_returning_the_wrong_kind_of_thing_says_what_to_return(
+    field: str, anchor: str
+):
+    module = (
+        RuntimeModule('beta', agent_plugins=(cast(Any, lambda *_: _PluginClass),))
+        if field == 'agent_plugins'
+        else RuntimeModule('beta', tool_factories=(cast(Any, lambda *_: _async_tools()),))
+    )
+    runtime = Runtime(modules=[module])
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_factory([]))
+    finally:
+        await runtime.shutdown()
+
+    assert anchor in excinfo.value.expected + excinfo.value.next_action

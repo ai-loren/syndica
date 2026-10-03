@@ -287,3 +287,24 @@ def test_flags_show_escapes_a_configured_value_that_could_rewrite_the_terminal(t
         host.close()
     assert '\u202e' not in shown
     assert '\\u202e' in shown
+
+
+@pytest.mark.parametrize(('value', 'refused'), [(10, False), (11, True)])
+def test_a_configured_flag_above_its_maximum_is_refused_before_anything_runs(
+    tmp_path: Path, value: int, refused: bool
+):
+    config = tmp_path / '.syndica.yaml'
+    config.write_text(
+        f'version: 1\nmodules: [retry]\nflags:\n  llm_retry_attempts: {value}\n', encoding='utf-8'
+    )
+    host = _host(tmp_path)
+    try:
+        if refused:
+            with pytest.raises(ConfigError) as excinfo:
+                _inspect(host, config, 'show', 'llm_retry_attempts')
+            assert '小于或等于 10' in excinfo.value.expected
+        else:
+            shown = json.loads(_inspect(host, config, 'show', 'llm_retry_attempts'))
+            assert shown['effective'] == 10
+    finally:
+        host.close()

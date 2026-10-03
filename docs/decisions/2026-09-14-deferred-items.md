@@ -95,6 +95,8 @@
 
 | # | 内容 | 理由 |
 |---|---|---|
+| D-63 | **被收紧的 Module 直接往 `runtime.broker` 发一条 `Message`，文字不收紧。** `Runtime.send` / `send_to_slot` / `spawn(query=)` 按调用方的身份收紧（收口评审 A 的 F1），而 broker 是存储层的公开协议，`publish` 收到的 `Message` 照它自己的 `trust`（缺省 `TRUSTED`）落进收件人的轨迹 | 在 broker 上收紧要么包一层代理换掉 `runtime.broker`（宿主手里的引用与它不再是同一个对象），要么让存储层知道 Runtime 的收紧名单（一个 broker 可以服务几个 Runtime）。真正的修法是让消息带上出处、按出处判信任，归**里程碑 5** 的溯源链；在那之前文档写明：Module 发消息用 `send` |
+| D-64 | **收紧不跟着数据走过扩展切点。** `trigger` 交回的结论不带作者：被收紧的 Module 的 hook 改写了另一个（未收紧的）Module 的扩展切点的负载，那个 Module 把结果放进自己的工具结果或宿主插件的请求改写时，带着缺省的 `TRUSTED` | 内核不知道扩展切点负载的语义，交回作者也只是把判断推给每个触发方。这是数据流上的溯源，归**里程碑 5**（产物溯源 §7.3 + trace 因果链 §11.1 让「这份数据从哪来」能回答）；现在能挡住的是直接通道（工具结果、内核切点上的改写与跳过、模型侧切点、就地改动、`send` / `spawn`） |
 | D-62 | **CLI 的开发期记录器可以被更早装配的 Module 截掉。** 它挂在 Agent 的局部层，Module 层与 Runtime 层的 `skip` 截不断它；但 `dev` 最后装，在它之前的 Module 的工厂拿得到 Agent，用 `agent.register_hook` 往局部层挂的 `POST_TOOL_USE` hook 排在它前面，那个 hook 的 `skip` 让这次调用不进开发期日志。日志喂给 `reviewer_verdict`（写过文件的 Reviewer 不算数）与 git 收尾的标注，漏记一次 Write 就是一次判错 | 挡掉要拒收 Module 身份下的局部层注册，而 `dev` 自己正是这样挂上记录器的；另两条路（宿主包住每个角色工厂先挂记录器、把记录器拆成最先装的独立 Module）都要改 CLI 的装配与 trace 里的 Module 清单。归**里程碑 5**：执行面在执行器里记下每个调用的结局，记录器改读那一份就不再依赖 hook 次序。在那之前 README 的「Writing a module」写明局部层的这个后果（收口评审 A 的 F3） |
 | B-01 | 租约字段只能经无条件 `update` 写，真做孤儿回收需要原子操作 | 孤儿回收不在 spec §15 的里程碑 1 判据内 |
 | B-02 | **`ControlBlock.wait_until_parked` 有与计划 2 Task 9 的 C1 同形的洞**（`asyncio.wait_for` 会吞掉到达的取消） | 三条依据：(a) 它**没有生产调用方**，只在测试里用；(b) `ControlBlock` 不在 `kernel.__all__`、也不在 Task 16 的 59 项导出清单里，不是公开面；(c) 直接换 `asyncio.timeout` 会把 3.11 的窗口压成 0 槽，让计划 1 Task 1 那条复检守卫**再没有任何变异能证明它承重**——正是 AGENTS.md 新增的「只能被联合变异证明的守卫」那类退化。**正解**：先把那条用例改成自己确定性地构造窗口（不再依赖 `wait_for` 的实现细节），再换实现。与 Task 1 那条裁决一起重裁 |
