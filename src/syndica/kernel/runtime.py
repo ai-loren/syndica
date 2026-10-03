@@ -453,6 +453,42 @@ def validate_agent_factories(agents: Mapping[str, AgentFactory]) -> None:
             ) from exc
 
 
+def _untrusted_output_modules(value: object, installed: Sequence[str]) -> frozenset[str]:
+    if isinstance(value, str | bytes | bytearray) or not isinstance(value, Sequence):
+        raise ConfigError(
+            expected='untrusted_output_modules 是已装 Module 名的 list / tuple',
+            received=f'收到 {value!r}，类型是 {type(value).__name__}',
+            next_action=(
+                f'写成 [{value!r}]；一个字符串会被逐字符当成 Module 名'
+                if isinstance(value, str)
+                else '传 Module 名组成的 list；没有要收紧的就省略这个参数'
+            ),
+        )
+    names = list(cast('Sequence[object]', value))
+    unknown = [name for name in names if not isinstance(name, str) or name not in installed]
+    if unknown:
+        raise ConfigError(
+            expected=f'untrusted_output_modules 里每一项是已装的 Module 名（{list(installed)}）',
+            received=f'认不出 {unknown!r}',
+            next_action='改成 modules 里某个 Module 的名字；认不出的名字什么都不收紧，等于没设',
+        )
+    return frozenset(cast('list[str]', names))
+
+
+def _module_tool_replaced(
+    cls: type[BaseAgent], replaced: Sequence[str], owners: Mapping[str, str]
+) -> ConfigError:
+    shown = '、'.join(f'{name!r}（Module {owners[name]!r}）' for name in replaced)
+    return ConfigError(
+        expected=f'类式角色 {cls.__qualname__} 的 install_own_tools 不替换 Module 装的工具',
+        received=f'它换掉或删掉了 {shown}',
+        next_action=(
+            '给自己的工具换一个名字；'
+            'Module 的工具按来自哪个 Module 收紧结果，换掉之后归属就对不上了'
+        ),
+    )
+
+
 def _agent_on_the_runtime_center(factory: AgentFactory) -> ContractViolation:
     return ContractViolation(
         expected='工厂用 spawn 交给它的 hooks 构造 Agent',
@@ -891,6 +927,7 @@ class Runtime:
         confirmation_handler: ConfirmationHandler | None = None,
         ids: IdSource | None = None,
         tracer: Tracer | None = None,
+        untrusted_output_modules: Sequence[str] = (),
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
@@ -912,6 +949,11 @@ class Runtime:
         self._tracing = _Tracing(checked_tracer)
         self._host_waits = 0
         module_assembly = _RuntimeModuleAssembly(modules, flags)
+        # 第三方 Module 的输出一律当作不可信（spec §12.2 对第三方 Skill 的同一条处理）：它们的工具
+        # 交回的结果、它们的 hook 写下的跳过与改写，执行器都收紧成 UNTRUSTED。
+        self._untrusted_output = _untrusted_output_modules(
+            untrusted_output_modules, module_assembly.names
+        )
         self.registry: AgentRegistry = (
             InMemoryAgentRegistry()
             if registry is None
@@ -1157,6 +1199,13 @@ class Runtime:
             self._install_orchestration(agent, agent_id)
             module_tools = self._module_assembly.install_agent(self, agent, agent_flags)
             self._install_slot_tools(agent, role_tools, module_tools)
+            installed_by_modules = {name: agent.options.tools[name] for name in module_tools}
+            agent._configure_untrusted_output(  # pyright: ignore[reportPrivateUsage]
+                frozenset(
+                    name for name, owner in module_tools.items() if owner in self._untrusted_output
+                ),
+                self._untrusted_output,
+            )
             # 旗子只决定其它角色。Orchestrator 在旗子关掉时仍要能派活，所以每个角色都有一次
             # 自己装工具的机会；缺省实现什么都不做。
             before_own = dict(agent.options.tools)
@@ -1166,6 +1215,13 @@ class Runtime:
                     require_own_command_args(
                         tool, name, f'类式角色 {type(agent).__qualname__} 的 install_own_tools'
                     )
+            replaced = sorted(
+                name
+                for name, tool in installed_by_modules.items()
+                if agent.options.tools.get(name) is not tool
+            )
+            if replaced:
+                raise _module_tool_replaced(type(agent), replaced, module_tools)
             agent._configure_runtime_flags(  # pyright: ignore[reportPrivateUsage]
                 agent_flags
             )

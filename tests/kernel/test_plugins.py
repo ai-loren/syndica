@@ -9,6 +9,7 @@ import ast
 import asyncio
 import os
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -517,40 +518,46 @@ _OTHER_TRIGGER_SITES: tuple[str, ...] = ('kernel/agent.py', 'kernel/tool_executo
 _RUNTIME_MODULE = 'kernel/runtime.py'
 
 
-def _trigger_dispatch_calls(tree: ast.Module) -> list[ast.Call]:
-    """`HooksCenter.trigger` 里的 `_dispatch(...)`：扩展切点与独立中心上的内核切点从这里进同一条
-    分发路径，触发的是调用方交来的那一个，不是内核在固定位置的触发点。"""
-    found: list[ast.Call] = []
+_DISPATCH_NAMES = frozenset({'_dispatch', '_dispatch_attributed'})
+_PLUMBING = frozenset({'trigger', '_dispatch'})
+
+
+def _is_dispatch(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _DISPATCH_NAMES
+    )
+
+
+def _plumbing_dispatch_calls(tree: ast.Module) -> list[tuple[str, ast.Call]]:
+    """`HooksCenter.trigger` 与 `HooksCenter._dispatch` 里的分发调用：扩展切点与独立中心上的内核
+    切点从这里进同一条分发路径，触发的是调用方交来的那一个，不是内核在固定位置的触发点。"""
+    found: list[tuple[str, ast.Call]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef) or node.name != 'HooksCenter':
             continue
         for member in node.body:
-            if (
-                isinstance(member, ast.AsyncFunctionDef | ast.FunctionDef)
-                and member.name == 'trigger'
-            ):
+            if not isinstance(member, ast.AsyncFunctionDef | ast.FunctionDef):
+                continue
+            if member.name in _PLUMBING:
                 found.extend(
-                    inner
+                    (member.name, cast(ast.Call, inner))
                     for inner in ast.walk(member)
-                    if isinstance(inner, ast.Call)
-                    and isinstance(inner.func, ast.Attribute)
-                    and inner.func.attr == '_dispatch'
+                    if _is_dispatch(inner)
                 )
     return found
 
 
 def _kernel_dispatches(tree: ast.Module) -> list[ast.Call]:
-    """所有 `<接收者>._dispatch(...)`，不论接收者怎么写（`hooks = self._hooks; hooks._dispatch(...)`
-    也是一次内核触发），只除去 `HooksCenter.trigger` 里的那两处——按它们在哪里认，不按接收者的
-    形状认。"""
-    excluded = {id(call) for call in _trigger_dispatch_calls(tree)}
+    """所有 `<接收者>._dispatch(...)` 与 `._dispatch_attributed(...)`，不论接收者怎么写
+    （`hooks = self._hooks; hooks._dispatch(...)` 也是一次内核触发），只除去分发路径自己的那几处
+    ——按它们在哪里认，不按接收者的形状认。"""
+    excluded = {id(call) for _, call in _plumbing_dispatch_calls(tree)}
     return [
-        node
+        cast(ast.Call, node)
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == '_dispatch'
-        and id(node) not in excluded
+        if _is_dispatch(node) and id(node) not in excluded
     ]
 
 
@@ -642,10 +649,17 @@ def test_the_dispatch_matcher_sees_every_kernel_dispatch_call():
     assert matched == total
 
 
-def test_the_only_dispatches_the_matcher_skips_are_the_two_inside_the_public_trigger():
+def test_the_only_dispatches_the_matcher_skips_are_the_dispatch_paths_own():
     tree = ast.parse((_PACKAGE / 'kernel' / 'hooks' / 'center.py').read_text(encoding='utf-8'))
-    skipped = _trigger_dispatch_calls(tree)
-    assert sorted(ast.unparse(call.args[0]) for call in skipped) == ['junction', 'resolved']
+    skipped = sorted(
+        (method, cast(ast.Attribute, call.func).attr, ast.unparse(call.args[0]))
+        for method, call in _plumbing_dispatch_calls(tree)
+    )
+    assert skipped == [
+        ('_dispatch', '_dispatch_attributed', 'junction'),
+        ('trigger', '_dispatch', 'junction'),
+        ('trigger', '_dispatch', 'resolved'),
+    ]
 
 
 def test_no_kernel_junction_goes_through_the_public_trigger():

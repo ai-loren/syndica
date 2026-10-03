@@ -138,6 +138,7 @@ from syndica.kernel.danger import (
 )
 from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction, ReadOnlyKwarg
+from syndica.kernel.hooks.installing import Installer
 from syndica.kernel.ids import ToolCallKey, entering_tool_call, leaving_tool_call, peek_key
 from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
 from syndica.kernel.trace import AttributeValue, SpanKind
@@ -647,6 +648,8 @@ class ToolExecutor:
         self._confirmation_agent_id: str | None = None
         self._confirmation: ConfirmationCallback | None = None
         self._tracing = _Tracing()
+        self._untrusted_tools: frozenset[str] = frozenset()
+        self._untrusted_modules: frozenset[str] = frozenset()
 
     def _attach_tracing(self, tracing: _Tracing) -> None:
         self._tracing = tracing
@@ -683,6 +686,29 @@ class ToolExecutor:
         """
         validate_tool_names(tools)
         self._tools = tools
+
+    def _configure_untrusted_output(self, tools: frozenset[str], modules: frozenset[str]) -> None:
+        """被收紧的第三方 Module：`tools` 是它们装的工具，结果在 `execute` 一返回时就收紧，早于
+        trace 与 `POST_TOOL_USE`（之后的 hook 看到的已经是收紧过的）；`modules` 是它们的名字，它们的
+        hook 写下的跳过结果、参数与结果改写同样收紧，不论是哪个工具的调用。"""
+        self._untrusted_tools = tools
+        self._untrusted_modules = modules
+
+    def _untrusted_output(self) -> tuple[frozenset[str], frozenset[str]]:
+        return self._untrusted_tools, self._untrusted_modules
+
+    def _by_untrusted(self, installers: Sequence[Installer | None]) -> bool:
+        return any(
+            installer is not None
+            and installer.kind == 'module'
+            and installer.name in self._untrusted_modules
+            for installer in installers
+        )
+
+    def _floored(self, call: ToolCall, result: ToolResult) -> ToolResult:
+        if call.name in self._untrusted_tools and result.trust is not TrustLevel.UNTRUSTED:
+            return replace(result, trust=TrustLevel.UNTRUSTED)
+        return result
 
     def _configure_untrusted_high_risk(self, disposition: Disposition) -> None:
         """配置 HIGH + UNTRUSTED 的宿主处置；值已经由 SafetyModule Flag 解析。"""
@@ -1024,21 +1050,25 @@ class ToolExecutor:
                 decoded = json.loads(call.arguments)
             except json.JSONDecodeError as exc:
                 detail = f'解析失败于 {exc.msg}（位置 {exc.pos}）'
-                return _bad_arguments_result(call, tool, detail), 'bad_arguments'
+                bad = _bad_arguments_result(call, tool, detail)
+                return self._floored(call, bad), 'bad_arguments'
             if not isinstance(decoded, dict):
                 detail = f'解析出的是 {type(decoded).__name__}，不是 JSON 对象'
-                return _bad_arguments_result(call, tool, detail), 'bad_arguments'
+                bad = _bad_arguments_result(call, tool, detail)
+                return self._floored(call, bad), 'bad_arguments'
             args = cast(dict[str, Any], decoded)
 
         # 只读视图只活在这一次触发里：就地改一份没有声明的参数躲得过下面那个作者判据，而那正是
         # 决定要不要重算溯源的依据。只包最初这一份就够——一旦链上有人声明过改写，重取已经触发，
         # 此后再有人就地改也改不掉那个结论。
         handed = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', args)
-        pre = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
+        pre, pre_authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
             Junction.PRE_TOOL_USE, tool_call=call, tool=tool, args=handed
         )
         if pre.skip:
             skipped = _skipped_result(call, pre.result)
+            if pre.result is not None and self._by_untrusted((pre_authors.skipped_by,)):
+                skipped = replace(skipped, trust=TrustLevel.UNTRUSTED)
             if traced is not None:
                 self._tracing.tool_result(traced[1], skipped, None)
             return skipped, 'skipped'
@@ -1059,7 +1089,7 @@ class ToolExecutor:
             # §12.2 低风险那一格的记录义务也会一起无声消失。
             provenance = (
                 TrustLevel.UNTRUSTED
-                if has_siblings
+                if has_siblings or self._by_untrusted(pre_authors.wrote.get('args', ()))
                 else strictest_trust(provenance, provenance_of(ctx))
             )
         # 拆掉只读视图：闸、工具与 POST 切点拿到的永远是一份普通 dict。留着它，一个 POST hook 的
@@ -1096,6 +1126,8 @@ class ToolExecutor:
                 returned = _tool_raised_result(call, exc)
                 outcome = 'error'
             else:
+                if isinstance(returned, ToolResult):
+                    returned = self._floored(call, returned)
                 if traced is not None and isinstance(returned, ToolResult):
                     self._tracing.tool_result(traced[1], returned, None, arguments=args)
             if not isinstance(returned, ToolResult):
@@ -1104,7 +1136,7 @@ class ToolExecutor:
             if traced is not None:
                 traced[1].attributes.update(_recorded_exit(result.meta))
 
-            post = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
+            post, post_authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
                 Junction.POST_TOOL_USE, tool_call=call, tool=tool, args=args, result=result
             )
             if post.result is not None:
@@ -1112,7 +1144,12 @@ class ToolExecutor:
             rewritten = post.get('result', result)
             if not isinstance(rewritten, ToolResult):
                 raise _rewrite_rejected(Junction.POST_TOOL_USE, 'result', ToolResult, rewritten)
-            return _tightened(_strictest(result, post.rewrites('result')), rewritten), outcome
+            baseline = (
+                TrustLevel.UNTRUSTED
+                if self._by_untrusted(post_authors.wrote.get('result', ()))
+                else _strictest(result, post.rewrites('result'))
+            )
+            return _tightened(baseline, rewritten), outcome
 
     async def _gated(
         self,

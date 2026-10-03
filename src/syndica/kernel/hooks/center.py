@@ -32,6 +32,7 @@ import contextlib
 import inspect
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, cast
 
@@ -40,7 +41,7 @@ from syndica.kernel.context import (
     _frozen,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.kernel.errors import ConfigError, ContractViolation
-from syndica.kernel.hooks.installing import current_installer
+from syndica.kernel.hooks.installing import Installer, current_installer
 from syndica.kernel.hooks.junctions import (
     INTERCEPTABLE,
     MODULE_NAME,
@@ -60,6 +61,35 @@ __all__ = ['HookCallback', 'HooksCenter']
 logger = logging.getLogger(__name__)
 
 HookCallback = Callable[..., Awaitable[HookResult | None]]
+
+
+@dataclass(frozen=True)
+class Authorship:
+    """一次可拦截分发里，写下 skip 与每个键的改写的那些 hook 是谁装的（`register` 时的装配期身份；
+    None 是装配期之外的代码）。内核据此判一段结果出自谁：结论本身不带作者，而被收紧的 Module 能借
+    一次 skip 或改写替任何工具交出一段带着缺省 `TRUSTED` 的文本。"""
+
+    skipped_by: Installer | None = None
+    wrote: Mapping[str, tuple[Installer | None, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+
+_Authored = tuple[HookCallback, Installer | None]
+_Snapshot = tuple[
+    dict[JunctionRef, list[HookCallback]],
+    dict[str, tuple[ExtensionJunction, str]],
+    dict[JunctionRef, list[Installer | None]],
+]
+
+
+def _authorship(
+    wrote: Mapping[str, list[Installer | None]], skipped_by: Installer | None
+) -> Authorship:
+    return Authorship(
+        skipped_by=skipped_by,
+        wrote=MappingProxyType({key: tuple(authors) for key, authors in wrote.items()}),
+    )
 
 
 def _label(junction: JunctionRef) -> str:
@@ -346,6 +376,10 @@ class HooksCenter:
         # 构造时就校验：错配的症状是第一次 trigger 沿链取 hook 时抛一条指着本类内部的
         # AttributeError，而那时调用栈里已经没有写下这个参数的那一行。
         self._hooks: dict[JunctionRef, list[HookCallback]] = {junction: [] for junction in Junction}
+        # 与 `_hooks` 逐项对齐：每个回调注册时的装配期身份。
+        self._authors: dict[JunctionRef, list[Installer | None]] = {
+            junction: [] for junction in Junction
+        }
         # 扩展切点名 → (句柄, 声明者)。分类在句柄上：一份状态，还原时不会只还原一半。
         self._declared: dict[str, tuple[ExtensionJunction, str]] = {}
         self._outer = _validated_outer(outer)
@@ -418,6 +452,7 @@ class HooksCenter:
             raise _runtime_only_here(resolved)
         # setdefault 而非下标：外层声明的扩展切点在本层的表里没有键，而它是合法的注册目标。
         self._hooks.setdefault(resolved, []).append(cb)
+        self._authors.setdefault(resolved, []).append(current_installer())
 
     async def trigger(self, junction: ExtensionJunction | Junction, **kwargs: Any) -> HookResult:
         """触发一个扩展切点，返回可拦截链的合并结论（spec §5.4）。
@@ -446,7 +481,15 @@ class HooksCenter:
         return await self._dispatch(resolved, **kwargs)
 
     async def _dispatch(self, junction: JunctionRef, **kwargs: Any) -> HookResult:
-        """唯一的分发路径。内核切点由内核在固定位置经这里触发，扩展切点经公开的 `trigger`。
+        """分发一次，只要结论。语义见 `_dispatch_attributed`。"""
+        result, _ = await self._dispatch_attributed(junction, **kwargs)
+        return result
+
+    async def _dispatch_attributed(
+        self, junction: JunctionRef, **kwargs: Any
+    ) -> tuple[HookResult, Authorship]:
+        """唯一的分发路径，另交回结论出自谁（`Authorship`）。内核切点由内核在固定位置经这里触发，
+        扩展切点经公开的 `trigger`。
 
         可拦截切点按注册顺序串行：前一个 hook 的 `modified` 并入后续 hook 的 kwargs，返回的
         `modified` 只含被改过的键而非整份 kwargs；`skip=True` 终止后续 hook 并带出它的
@@ -465,15 +508,15 @@ class HooksCenter:
         resolved = self._resolved(junction)
         # 分类在空列表检查之前取：未归类的切点无论有没有 hook 都必须响亮失败。
         kind = self._kind(resolved)
-        hooks = self._collect(resolved)
-        if not hooks:
-            return HookResult()
+        chain = self._collect_authored(resolved)
+        if not chain:
+            return HookResult(), Authorship()
         if kind is JunctionKind.INTERCEPTABLE:
             with _window(resolved, kwargs):
-                return await self._trigger_serial(resolved, hooks, **kwargs)
+                return await self._trigger_serial(resolved, chain, **kwargs)
         with _window(resolved, kwargs):
-            await self._trigger_parallel(resolved, hooks, **kwargs)
-        return HookResult()
+            await self._trigger_parallel(resolved, [cb for cb, _ in chain], **kwargs)
+        return HookResult(), Authorship()
 
     def _serve_one_agent(self) -> None:
         """本中心服务单个 Agent（局部层或 Module 层）：`RUNTIME_ONLY` 的切点从此挂不上来。"""
@@ -519,12 +562,7 @@ class HooksCenter:
         declaration = self._declaration(name)
         return None if declaration is None else declaration[1]
 
-    def _assembly_snapshot(
-        self,
-    ) -> tuple[
-        dict[JunctionRef, list[HookCallback]],
-        dict[str, tuple[ExtensionJunction, str]],
-    ]:
+    def _assembly_snapshot(self) -> _Snapshot:
         """本中心此刻的全部可写状态，供一次失败的装配还原（见 `plugins.install_plugins`）。
         构造期一次设定的配置（服务单个 Agent、保留的 owner）不在其列：它们早于任何装配。
 
@@ -536,24 +574,22 @@ class HooksCenter:
         return (
             {junction: list(cbs) for junction, cbs in self._hooks.items()},
             dict(self._declared),
+            {junction: list(installers) for junction, installers in self._authors.items()},
         )
 
-    def _assembly_restore(
-        self,
-        snapshot: tuple[
-            dict[JunctionRef, list[HookCallback]],
-            dict[str, tuple[ExtensionJunction, str]],
-        ],
-    ) -> None:
+    def _assembly_restore(self, snapshot: _Snapshot) -> None:
         """还原一份快照。**本中心就此接管它**，同一份快照不得还原两遍。"""
-        self._hooks, self._declared = snapshot
+        self._hooks, self._declared, self._authors = snapshot
 
     def _collect(self, junction: JunctionRef) -> list[HookCallback]:
         """这个切点上要跑的整条链：本层在前，外层在后。"""
-        own = list(self._hooks.get(junction, []))
+        return [cb for cb, _ in self._collect_authored(junction)]
+
+    def _collect_authored(self, junction: JunctionRef) -> list[_Authored]:
+        own = list(zip(self._hooks.get(junction, []), self._authors.get(junction, []), strict=True))
         if self._outer is None:
             return own
-        return own + self._outer._collect(junction)
+        return own + self._outer._collect_authored(junction)
 
     def _declared_kind(self, name: str) -> JunctionKind | None:
         """沿装配链取这个扩展切点的分类；没人声明过交回 None。
@@ -633,12 +669,16 @@ class HooksCenter:
         return declared
 
     async def _trigger_serial(
-        self, junction: JunctionRef, hooks: list[HookCallback], **kwargs: Any
-    ) -> HookResult:
+        self,
+        junction: JunctionRef,
+        chain: list[_Authored],
+        **kwargs: Any,
+    ) -> tuple[HookResult, Authorship]:
         merged: dict[str, Any] = {}
         history: dict[str, list[Any]] = {}
+        wrote: dict[str, list[Installer | None]] = {}
         current = dict(kwargs)
-        for cb in hooks:
+        for cb, installer in chain:
             returned = cast(object, cb(**current))
             if not inspect.isawaitable(returned):
                 raise _not_awaitable(junction, cb, returned)
@@ -652,12 +692,14 @@ class HooksCenter:
             merged.update(outcome.modified)
             for key, value in outcome.modified.items():
                 history.setdefault(key, []).append(value)
+                wrote.setdefault(key, []).append(installer)
             current.update(outcome.modified)
             if outcome.skip:
-                return HookResult(
-                    skip=True, modified=merged, result=outcome.result, history=history
+                return (
+                    HookResult(skip=True, modified=merged, result=outcome.result, history=history),
+                    _authorship(wrote, installer),
                 )
-        return HookResult(modified=merged, history=history)
+        return HookResult(modified=merged, history=history), _authorship(wrote, None)
 
     async def _trigger_parallel(
         self, junction: JunctionRef, hooks: list[HookCallback], **kwargs: Any

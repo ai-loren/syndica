@@ -498,6 +498,7 @@ class BaseAgent:
         str | None,
         ConfirmationCallback | None,
         _Tracing,
+        tuple[frozenset[str], frozenset[str]],
     ]:
         """保存 Runtime 装配前本对象自己拥有的可变状态。"""
         return (
@@ -511,6 +512,7 @@ class BaseAgent:
             self._executor._confirmation_agent_id,  # pyright: ignore[reportPrivateUsage]
             self._executor._confirmation,  # pyright: ignore[reportPrivateUsage]
             self._tracing,
+            self._executor._untrusted_output(),  # pyright: ignore[reportPrivateUsage]
         )
 
     def _assembly_restore(
@@ -526,6 +528,7 @@ class BaseAgent:
             str | None,
             ConfirmationCallback | None,
             _Tracing,
+            tuple[frozenset[str], frozenset[str]],
         ],
     ) -> None:
         """恢复 `_assembly_snapshot`；被拒的 spawn 不留下半套 Agent。"""
@@ -540,8 +543,12 @@ class BaseAgent:
             confirmation_agent_id,
             confirmation,
             tracing,
+            untrusted_output,
         ) = snapshot
         self._attach_tracing(tracing)
+        self._executor._configure_untrusted_output(  # pyright: ignore[reportPrivateUsage]
+            *untrusted_output
+        )
         options.tools.clear()
         options.tools.update(tools)
         self.options = options
@@ -563,6 +570,12 @@ class BaseAgent:
                 confirmation_agent_id,
                 confirmation,
             )
+
+    def _configure_untrusted_output(self, tools: frozenset[str], modules: frozenset[str]) -> None:
+        """被收紧的第三方 Module 装的工具与它们的名字（语义见执行器的同名方法）。"""
+        self._executor._configure_untrusted_output(  # pyright: ignore[reportPrivateUsage]
+            tools, modules
+        )
 
     def _install_module_plugins(self, plugins: Iterable[Plugin]) -> None:
         """把 Module 插件装进 local 与 Runtime 之间的独立一层。"""

@@ -251,6 +251,7 @@ _RUNTIME_INIT: tuple[tuple[str, str, bool], ...] = (
     ('confirmation_handler', 'KEYWORD_ONLY', True),
     ('ids', 'KEYWORD_ONLY', True),
     ('tracer', 'KEYWORD_ONLY', True),
+    ('untrusted_output_modules', 'KEYWORD_ONLY', True),
 )
 _RUNTIME_SPAWN: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),
