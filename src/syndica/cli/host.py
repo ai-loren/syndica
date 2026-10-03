@@ -76,6 +76,14 @@ from syndica.cli.main import (
     RunRequest,
     TraceRequest,
 )
+from syndica.cli.modules import (
+    OPTIONAL_BUILTINS,
+    EntryPointSource,
+    discover,
+    module_rows,
+    no_entry_points,
+    validated_modules,
+)
 from syndica.cli.policy import dev_danger_options, role_policies
 from syndica.cli.recording import (
     MirroredTraceStore,
@@ -121,6 +129,8 @@ from syndica.kernel import (
     LocalWorkspace,
     MailboxConfirmationHandler,
     Portal,
+    PrefixDriftModule,
+    RetryModule,
     Runtime,
     RuntimeModule,
     SafetyModule,
@@ -163,6 +173,12 @@ _REFUSED_FLAG_VALUE = ('untrusted_high_risk', 'allow')
 # `run --no-write` 在清单与槽里留下的工具。白名单而不是去掉几个写工具：以后新增的可写工具默认
 # 进不来。派活与问人的工具不经清单，由 Runtime 与 Module 另装。
 _READ_ONLY_TOOLS = frozenset({'Glob', 'Grep', 'Read'})
+_READ_ONLY_MANIFEST: dict[str, Any] = {
+    'version': __version__,
+    'description': '--no-write：只放行只读、派活与问人的工具',
+    'capabilities': (),
+    'replay_safe': True,
+}
 # 只读 run 里放行的派活与问人的工具，按确切类型认：同名的替身（自己装一个叫 Delegate 的工具）不算。
 _AGENT_TOOL_TYPES: frozenset[type] = frozenset(
     {AskUser, AskUserQuestion, Delegate, Fork, KillAgent, QueryAgent, SendMessage}
@@ -261,6 +277,28 @@ class _ReadOnlyGuard:
         )
 
 
+def _read_only_manifest() -> RuntimeModule:
+    """只读闸的清单（`modules show` 用）：插件要拿 run 的只读工具实例才建得出来。"""
+    return RuntimeModule('read-only', **_READ_ONLY_MANIFEST)
+
+
+def _manifest(module: RuntimeModule) -> dict[str, object]:
+    """`modules show` 的输出：清单字段与它声明的 Flag。能力未声明写「未声明」。"""
+    return {
+        'name': module.name,
+        'version': module.version,
+        'description': module.description,
+        'capabilities': '未声明' if module.capabilities is None else list(module.capabilities),
+        'requires': list(module.requires),
+        'junctions': [
+            {'name': junction.name, 'kind': junction.kind.value} for junction in module.junctions
+        ],
+        'replay_safe': module.replay_safe,
+        'security_notes': module.security_notes,
+        'flags': [flag.key for flag in module.flags],
+    }
+
+
 def _read_only_module(tools: Mapping[str, Tool]) -> RuntimeModule:
     guard = _ReadOnlyGuard(tuple(tools[name] for name in sorted(_READ_ONLY_TOOLS)))
 
@@ -268,28 +306,28 @@ def _read_only_module(tools: Mapping[str, Tool]) -> RuntimeModule:
         del runtime, agent, flags
         return guard
 
-    return RuntimeModule(
-        'read-only',
-        agent_plugins=(plugin,),
-        version=__version__,
-        description='--no-write：只放行只读、派活与问人的工具',
-        capabilities=(),
-        replay_safe=True,
-    )
+    return RuntimeModule('read-only', agent_plugins=(plugin,), **_READ_ONLY_MANIFEST)
 
 
 def _agent_modules(
     workspace_root: Path,
     environ: Mapping[str, str],
     read_only_tools: Mapping[str, Tool] | None = None,
+    configured: Sequence[RuntimeModule] = (),
 ) -> tuple[RuntimeModule, ...]:
-    """run 与 chat 的 Runtime 装的 Module；给了 `read_only_tools` 就另装只读闸。
+    """run 与 chat 的 Runtime 装的 Module：必装的、配置里启用的、只读闸（给了 `read_only_tools`
+    时）、开发期 Module。
 
     开发期 Module 排在最后：可拦截切点按注册顺序串行，前面的 hook 改过的参数传给后面的；排在它
     后面的插件再改参数，守卫判的就是改之前的那一份。
     """
     read_only = () if read_only_tools is None else (_read_only_module(read_only_tools),)
-    return (*_modules(), *read_only, DevModule(workspace_root, environ))
+    return (*_modules(), *configured, *read_only, DevModule(workspace_root, environ))
+
+
+def _optional_builtin(name: str) -> RuntimeModule:
+    """按名字启用的内置 Module。`retry` 没有备用模型：CLI 不给 fallbacks。"""
+    return RetryModule({}) if name == 'retry' else PrefixDriftModule()
 
 
 def _model_names(config: CliConfig) -> tuple[str, ...]:
@@ -1185,8 +1223,10 @@ class RuntimeCliHost:
         environ: Mapping[str, str] | None = None,
         replayer: Replayer | None = None,
         exporter: TraceExporter | None = None,
+        entry_points: EntryPointSource = no_entry_points,
     ) -> None:
         self._io = io
+        self._entry_points = entry_points
         self._replayer = replayer
         self._exporter = exporter
         self._exports: list[_PendingExport] = []
@@ -1400,7 +1440,40 @@ class RuntimeCliHost:
         finally:
             root.removeHandler(handler)
 
+    def _configured_modules(self, config: CliConfig) -> tuple[RuntimeModule, ...]:
+        names = validated_modules(config.modules, discover(self._entry_points))
+        return tuple(_optional_builtin(name) for name in names)
+
+    def _inspect_modules(self, request: InspectRequest) -> str:
+        config = self._config(request.config)
+        discovered = discover(self._entry_points)
+        if request.action == 'list':
+            return '\n'.join(
+                '\t'.join(one_line(part) for part in (row.name, row.source, row.status))
+                for row in module_rows(config.modules, discovered)
+            )
+        builtins = {module.name: module for module in self._builtin_modules()}
+        module = builtins.get(cast(str, request.name))
+        if module is None:
+            raise _config_error(
+                f'Module 是内置的之一：{sorted(builtins)!r}',
+                f'收到 {request.name!r}',
+                '运行 syndica modules list 查看全部 Module；'
+                '第三方 Module 的清单要等它能被启用之后再看',
+            )
+        return json.dumps(_manifest(module), ensure_ascii=False, indent=2)
+
+    def _builtin_modules(self) -> tuple[RuntimeModule, ...]:
+        return (
+            *_modules(),
+            *(_optional_builtin(name) for name in OPTIONAL_BUILTINS),
+            _read_only_manifest(),
+            DevModule(self._workspace_root, self._environ),
+        )
+
     def inspect(self, request: InspectRequest) -> str:
+        if request.resource == 'modules':
+            return self._inspect_modules(request)
         if request.resource == 'flags':
             declarations = tuple(item for module in _modules() for item in module.flags)
             if request.action == 'list':
@@ -1983,7 +2056,9 @@ class RuntimeCliHost:
             runtime = Runtime(
                 agents=factories,
                 orchestration=_ORCHESTRATION,
-                modules=_agent_modules(self._workspace_root, self._environ),
+                modules=_agent_modules(
+                    self._workspace_root, self._environ, configured=self._configured_modules(config)
+                ),
                 confirmation_handler=MailboxConfirmationHandler(timeout=_CONFIRMATION_TIMEOUT),
                 tracer=recording.recorder,
             )
@@ -2260,7 +2335,10 @@ class RuntimeCliHost:
                         role_policies=per_role,
                     )
                 modules = _agent_modules(
-                    self._workspace_root, self._environ, tools if request.no_write else None
+                    self._workspace_root,
+                    self._environ,
+                    tools if request.no_write else None,
+                    configured=self._configured_modules(config),
                 )
                 runtime = Runtime(
                     agents={} if request.topology is not None else factories,

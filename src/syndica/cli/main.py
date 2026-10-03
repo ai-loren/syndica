@@ -27,7 +27,18 @@ __all__ = [
 # 被 Ctrl-C 中断：优先于 1（没通过）与 3（被拒绝），中断本身就是没做完的原因。
 EXIT_INTERRUPTED = 130
 _COMMANDS = frozenset(
-    {'run', 'chat', 'agents', 'topology', 'sessions', 'flags', 'doctor', 'version', 'trace'}
+    {
+        'run',
+        'chat',
+        'agents',
+        'topology',
+        'sessions',
+        'flags',
+        'modules',
+        'doctor',
+        'version',
+        'trace',
+    }
 )
 # `trace prune` 不点名时留下的、有结局的 trace 个数。
 PRUNE_KEEP = 50
@@ -68,7 +79,7 @@ class CliOutcome:
 class InspectRequest:
     """One list/show request for a declarative CLI resource."""
 
-    resource: Literal['agents', 'topology', 'flags']
+    resource: Literal['agents', 'topology', 'flags', 'modules']
     action: Literal['list', 'show']
     name: str | None
     config: str = '.syndica.yaml'
@@ -222,7 +233,7 @@ def _parser() -> _ArgumentParser:
                 '.syndica.yaml 的 trace.level），full 再记完整请求；chat 最高 structure'
             ),
         )
-    for resource in ('agents', 'topology', 'flags'):
+    for resource in ('agents', 'topology', 'flags', 'modules'):
         noun = commands.add_parser(resource)
         actions = noun.add_subparsers(dest='action', required=True)
         actions.add_parser('list')
@@ -534,9 +545,9 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
             '下一步: 通过 console composition root 创建 host 后重试',
         )
         return 2
-    if namespace.command in {'agents', 'topology', 'flags'}:
+    if namespace.command in {'agents', 'topology', 'flags', 'modules'}:
         request = InspectRequest(
-            resource=cast(Literal['agents', 'topology', 'flags'], namespace.command),
+            resource=cast(Literal['agents', 'topology', 'flags', 'modules'], namespace.command),
             action=namespace.action,
             name=getattr(namespace, 'name', None),
             config=namespace.config,

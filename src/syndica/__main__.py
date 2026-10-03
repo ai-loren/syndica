@@ -366,6 +366,7 @@ class _LazyHost:
     def _get(self) -> RuntimeCliHost:
         if self._host is None:
             from syndica.cli.host import RuntimeCliHost
+            from syndica.cli.modules import installed_entry_points
 
             self._host = RuntimeCliHost(
                 io=self._io,
@@ -373,6 +374,7 @@ class _LazyHost:
                 workspace_root=Path.cwd(),
                 replayer=_replay_document,
                 exporter=_export_trace,
+                entry_points=installed_entry_points,
             )
         return self._host
 

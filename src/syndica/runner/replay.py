@@ -80,6 +80,7 @@ from syndica.kernel import (
     ManifestSource,
     Message,
     Orchestrator,
+    PrefixDriftModule,
     RetryModule,
     Runtime,
     RuntimeModule,
@@ -1105,6 +1106,7 @@ class _Replay:
             'retry': lambda: RetryModule(
                 {name.strip(): llm for name in fallbacks.split(',') if name.strip()}
             ),
+            'prefix-drift': PrefixDriftModule,
         }
         built = tuple(builders[name]() for name in names if name in builders)
         return built, tuple(name for name in names if name not in builders)

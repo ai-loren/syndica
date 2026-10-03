@@ -552,7 +552,7 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 次序是 T9a → T11 → T9b → T10：信任的摘要要盖住第三方 Module 的发行版版本，所以发现先于信任；启用第三方 Module
 的配置不能早于信任确认落地，所以启用在信任之后（第二轮评审 M13）。
 
-#### T9a — 发现、`modules:` 的解析与 `modules list`（D15）
+#### T9a — 发现、`modules:` 的解析与 `modules list`（D15，完成）
 - 发现只读元数据（入口点名、目标、发行版名与版本），不 import；内置名保留、重名有歧义；`modules` 进命令表。
 - `.syndica.yaml` 的 `modules:` 在这里解析，只启用内置的（`retry`、`prefix-drift`）；第三方名字在 T9b 落地之前报
   「启用第三方 Module 要先有信任确认」（第三轮评审 M4：`modules list` 的状态与 T11 的摘要都要读它）。

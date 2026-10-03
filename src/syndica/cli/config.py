@@ -32,6 +32,7 @@ from syndica.kernel import (
     TraceLevel,
     register_builtins,
 )
+from syndica.kernel.hooks.junctions import MODULE_NAME
 from syndica.kernel.manifest import prompt_file
 from syndica.kernel.redaction import looks_secret
 
@@ -40,7 +41,7 @@ __all__ = ['CliConfig', 'WorkspaceConfig', 'load_config']
 logger = logging.getLogger(__name__)
 
 _ROOT_KEYS = frozenset(
-    {'version', 'agents', 'topologies', 'workspace', 'redaction', 'trace', 'danger'}
+    {'version', 'agents', 'topologies', 'workspace', 'redaction', 'trace', 'danger', 'modules'}
 )
 _DANGER_KEYS = frozenset({'roles'})
 _ROLE_DANGER_KEYS = frozenset({'rules', 'policy'})
@@ -160,6 +161,7 @@ class CliConfig:
     redaction_rules: tuple[RedactionRule, ...] = ()
     trace_level: TraceLevel | None = None
     danger_roles: Mapping[str, RoleTightening] = field(default_factory=lambda: MappingProxyType({}))
+    modules: tuple[str, ...] = ()
 
 
 def load_config(path: str | Path) -> CliConfig:
@@ -196,7 +198,28 @@ def load_config(path: str | Path) -> CliConfig:
         redaction_rules=_redaction(root.get('redaction', {})),
         trace_level=_trace(root.get('trace', {})),
         danger_roles=_danger(root.get('danger', {}), catalog),
+        modules=_module_names(root.get('modules', ())),
     )
+
+
+def _module_names(value: object) -> tuple[str, ...]:
+    """`modules:` 的名字，按写的次序装。名字能不能装由宿主对着内置表与发现结果判。"""
+    names: list[str] = []
+    for index, item in enumerate(_sequence(value, 'modules')):
+        if not isinstance(item, str) or MODULE_NAME.fullmatch(item) is None:
+            raise _config(
+                'modules 的每一项是 Module 名（小写字母开头、单个连字符分段）',
+                f'modules[{index}]={item!r}，类型是 {type(item).__name__}',
+                '照 syndica modules list 的名字逐字写，例如 retry',
+            )
+        if item in names:
+            raise _config(
+                'modules 里每个名字只写一次',
+                f'modules[{index}]={item!r} 与前面重复',
+                '删掉重复的那一项；装配次序就是写的次序',
+            )
+        names.append(item)
+    return tuple(names)
 
 
 def _danger(value: object, catalog: AgentCatalog) -> Mapping[str, RoleTightening]:

@@ -1708,3 +1708,27 @@ def test_a_read_only_run_keeps_the_role_tightening_of_the_project_config(
     assert code == 0, stderr
     roles = document['host']['danger']['roles']
     assert roles['Worker']['table']['shell.path_outside_workspace'] == 'block'
+
+
+def test_builtin_modules_enabled_by_the_project_config_install_in_order_and_replay(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    (tmp_path / '.syndica.yaml').write_text(
+        'version: 1\nmodules: [prefix-drift, retry]\n', encoding='utf-8'
+    )
+
+    code, stdout, stderr = _cli(
+        tmp_path, _PerAgent([_say('done')], []), ['run', 'go', '--agent', 'Worker']
+    )
+    header, document = _trace(tmp_path)
+    replayed = _replayed(header, document)
+
+    assert code == 0 and stdout.rstrip().endswith('done'), stderr
+    assert document['host']['modules'] == [
+        'safety',
+        'human-interaction',
+        'prefix-drift',
+        'retry',
+        'dev',
+    ]
+    assert replayed.reproduced, replayed.divergences
