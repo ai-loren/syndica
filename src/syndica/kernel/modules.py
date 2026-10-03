@@ -395,7 +395,8 @@ class RuntimeModule:
     清单字段（`version` 起）供人审查与回放判据：`capabilities=None` 是**未声明**，按拥有全部
     能力对待；`replay_safe=True` 是作者声明它的工具、hook、服务与启停钩子不做 I/O、不读时钟与
     随机数、不起线程或执行器——回放跑在虚拟时钟上，等一个线程会让事件循环看起来空闲、定时器提前
-    触发。声明错了，回放报分叉。
+    触发。回放交给入口点的 `ModuleHost` 是空环境，读 `environment` 决定行为的工厂会分叉。声明错了，
+    回放报分叉。
 
     装配失败按快照回滚内核持有的状态（hook 中心、服务）；已经 `on_start` 过的 Module 不补偿：
     `on_shutdown` 是异步的，同步的 Runtime 构造里调不了。第三方在 `on_start` 里起的任务、写的

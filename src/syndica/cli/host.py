@@ -339,6 +339,16 @@ def _agent_modules(
     return (*_modules(), *configured, *read_only, DevModule(workspace_root, environ))
 
 
+def _runs_code(module: RuntimeModule) -> bool:
+    return bool(
+        module.services
+        or module.on_start is not None
+        or module.on_shutdown is not None
+        or module.agent_plugins
+        or module.tool_factories
+    )
+
+
 def reference_modules() -> tuple[RuntimeModule, ...]:
     """参考文档的 Flag 来源：宿主必装与可选的内置 Module，按装配次序。不含第三方：参考文档不随
     谁的环境里装了什么而变。"""
@@ -1432,6 +1442,55 @@ class RuntimeCliHost:
             for name in names
         )
 
+    def _module_records(
+        self, modules: Sequence[RuntimeModule], config: CliConfig
+    ) -> list[dict[str, str]]:
+        """第三方 Module 的记录：回放按装着的那一份的发行版名与版本判能不能重建它（D13）。"""
+        entries = {entry.name: entry for entry in discover(self._entry_points)}
+        third = set(third_party(config.modules))
+        records: list[dict[str, str]] = []
+        for module in modules:
+            if module.name not in third:
+                continue
+            record = {'name': module.name, 'module_version': module.version}
+            entry = entries.get(module.name)
+            if entry is not None and entry.distribution is not None:
+                record['distribution'] = entry.distribution
+            if entry is not None and entry.version is not None:
+                record['distribution_version'] = entry.version
+            records.append(record)
+        return records
+
+    def _unreplayable_modules(
+        self, modules: Sequence[RuntimeModule], config: CliConfig
+    ) -> str | None:
+        """这些 Module 让 run 回放不了的原因；回放得了是 None。第三方 Module 只要有一点会跑的代码
+        （服务、启停钩子、插件工厂、工具工厂）又没声明 `replay_safe`，回放就得在这台机器上再跑一遍
+        别人的代码；只声明 Flag 的不挡。Module 名与发行版被脱敏改掉的，回放认不出是哪一个。"""
+        third = set(third_party(config.modules))
+        blocking = [
+            module.name
+            for module in modules
+            if module.name in third and not module.replay_safe and _runs_code(module)
+        ]
+        if blocking:
+            return (
+                f'第三方 Module {", ".join(blocking)} 有会跑的代码、又没声明 replay_safe：'
+                '回放不能在这台机器上再跑一遍它们的代码'
+                '（要回放，请作者确认不做 I/O 之后声明 replay_safe）'
+            )
+        redactor = host_redactor(self._environ, config.redaction_rules)
+        named = [
+            value for record in self._module_records(modules, config) for value in record.values()
+        ]
+        changed = sorted({value for value in named if redactor.redact(value) != value})
+        if changed:
+            return (
+                f'脱敏规则会改掉 Module 的名字或发行版 {changed!r}：回放认不出该重建哪一个'
+                '（收窄认得它们的那条用户规则）'
+            )
+        return None
+
     def _untrusted_output(self, config: CliConfig, trusted: Sequence[str]) -> tuple[str, ...]:
         """结果要收紧的第三方 Module：启用的第三方 Module 里，用户没在命令行上放开的那些。"""
         enabled = third_party(config.modules)
@@ -2333,6 +2392,7 @@ class RuntimeCliHost:
         policy: DangerPolicy,
         prompt: str,
         assembled: tuple[Topology, AgentSlot] | None,
+        modules: Sequence[RuntimeModule],
     ) -> None:
         """把回放文档里只有宿主知道的部分交给 recorder。回放造不出来的 run 不交（trace 照常记录），
         只在人点名要了 replay / full 时说一句：默认级别下每次 run 都说同一句是噪音。"""
@@ -2340,13 +2400,8 @@ class RuntimeCliHost:
         reason: str | None = None
         roles: dict[str, dict[str, object]] = {}
         role_policies: dict[str, DangerPolicy] = {}
-        third = third_party(config.modules)
-        if third:
-            reason = (
-                f'启用了第三方 Module {", ".join(third)}：回放还重建不了第三方 Module，'
-                '它们的代码不能在回放里再跑一遍'
-            )
-        else:
+        reason = self._unreplayable_modules(modules, config)
+        if reason is None:
             try:
                 roles, role_policies = frozen_roles(catalog, factories, policy)
             except Exception as error:
@@ -2501,6 +2556,7 @@ class RuntimeCliHost:
                     untrusted_output_modules=untrusted,
                 )
                 if tracer is not None and tracer.level is not TraceLevel.STRUCTURE:
+                    records = self._module_records(modules, config)
 
                     def profile(roles: Mapping[str, DangerPolicy]) -> dict[str, object]:
                         return host_profile(
@@ -2515,6 +2571,8 @@ class RuntimeCliHost:
                             orchestration=_ORCHESTRATION,
                             confirmation_timeout=_CONFIRMATION_TIMEOUT,
                             roles=roles,
+                            module_records=records,
+                            untrusted_output_modules=untrusted,
                         )
 
                     self._describe_run(
@@ -2527,6 +2585,7 @@ class RuntimeCliHost:
                         policy,
                         prompt,
                         assembled,
+                        modules,
                     )
                 if logs is not None:
                     # 服务是装配时 setattr 上去的，Runtime 的静态类型里没有这个属性。

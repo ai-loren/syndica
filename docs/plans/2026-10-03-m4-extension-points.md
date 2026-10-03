@@ -650,7 +650,12 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 - `assemble` 收冻结工厂时：每个角色的 `artifact_kinds` 由调用方给出、按名字校验拓扑（不要求 `AgentCatalog`）、
   `models` 可省（第二轮评审 M4）。`runner/scenario.py` 的槽入口同样绕过了 `assemble`，一并改走它，改不了就登记。
 - 变异：回放丢掉槽的工具或预算、走回 `spawn` 而不是 `send_to_slot`，都必须报分叉（确定性）。
-#### T14 — Module 的 run 回放（D13）
+#### T14 — Module 的 run 回放（D13，完成）
+- 宿主档案只在有第三方 Module 时写 `module_records`（`{name, module_version, distribution?, distribution_version?}`）
+  与非空的 `untrusted_output_modules`（都是 v3 的键；没有第三方 Module 的 run 照旧写 v2）。捕获时第三方 Module 有会
+  跑的代码又没声明 `replay_safe` 就不写回放文档（只声明 Flag 的不挡）；脱敏会改掉 Module 名或发行版的同样不写。
+- 回放的判据在 `cli/replay_modules.py`，由组合根注入 `ReplayRunner(modules=)`；重建的 Module 依赖的 Module 没重建
+  时回放拒绝开始；被收紧的名单照档案重建（只对重建了的 Module）。
 - `replay_safe`、已安装发行版名字版本一致、当前配置受信任（被动查）且启用了它，才重建；否则有可跑代码的第三方
   Module 让 run 判 `Unreplayable`。宿主档案加 `module_records`；回放文档格式升到 3。
 - 变异：读文档里的声明而不是已安装的那一份、版本不比、`replay_safe=False` 也重建、不查信任、只有 `on_start` 的

@@ -79,6 +79,7 @@ from syndica.kernel import (
     MailboxConfirmationHandler,
     ManifestSource,
     Message,
+    ModuleHost,
     Orchestrator,
     PrefixDriftModule,
     RetryModule,
@@ -118,6 +119,7 @@ from syndica.kernel.scenario_schema import (
     DangerRuleSpec,
     HostAction,
     HostProfile,
+    ModuleRecord,
     PayloadText,
     ScenarioError,
     ScenarioInstance,
@@ -133,9 +135,13 @@ from syndica.kernel.tracing import NullTracer, current_llm_call, span_id_of
 from syndica.runner.replay_broker import GIVE_UP, Plan, ScheduledBroker
 from syndica.runner.scenario import ScenarioEvent, ScenarioResult
 
-__all__ = ['Divergence', 'ReplayResult', 'ReplayRunner']
+__all__ = ['Divergence', 'ModuleRebuilder', 'ReplayResult', 'ReplayRunner']
 
 logger = logging.getLogger(__name__)
+
+# 第三方 Module 的重建：交回重建好的 Module，或一句为什么不重建。判据（信任、启用、版本、
+# replay_safe）在宿主一侧，runner 不依赖 CLI，由组合根注入（M4 D13）。
+ModuleRebuilder = Callable[[ModuleRecord, ModuleHost], RuntimeModule | str]
 
 # `host.no_write` 下放行的工具：只读的三件、派活与消息、问人。
 _READ_ONLY_TOOLS = frozenset(
@@ -407,12 +413,14 @@ class ReplayRunner:
         allow_divergence: bool = False,
         perturb: Callable[[], Awaitable[None]] | None = None,
         real_tools: bool = False,
+        modules: ModuleRebuilder | None = None,
     ) -> None:
         self._payloads = payloads
         self._redactor = RuleRedactor() if redactor is None else redactor
         self._allow = allow_divergence
         self._perturb = perturb
         self._real_tools = real_tools
+        self._module_rebuilder = modules
 
     def run(
         self,
@@ -1097,7 +1105,12 @@ class _Replay:
                 roles[role] = built
         return judge, policy, roles
 
-    def _modules(self, llm: _ReplayLLM) -> tuple[tuple[RuntimeModule, ...], tuple[str, ...]]:
+    def _modules(
+        self, llm: _ReplayLLM, root: Path
+    ) -> tuple[tuple[RuntimeModule, ...], tuple[str, ...]]:
+        """重建得出的 Module 与没重建的那些（第三方的带上原因）。内置的按名字重建；第三方的交给
+        注入的判据，交给它的 `ModuleHost` 是回放的工作区根、空环境（回放不跑真命令）与回放的
+        脱敏器。"""
         names = self._host.modules
         if names is None:
             return (SafetyModule(), HumanInteractionModule()), ()
@@ -1110,8 +1123,41 @@ class _Replay:
             ),
             'prefix-drift': PrefixDriftModule,
         }
-        built = tuple(builders[name]() for name in names if name in builders)
-        return built, tuple(name for name in names if name not in builders)
+        records = {record.name: record for record in self._host.module_records}
+        rebuild = self._runner._module_rebuilder  # pyright: ignore[reportPrivateUsage]
+        built: list[RuntimeModule] = []
+        unrebuilt: list[str] = []
+        for name in names:
+            builder = builders.get(name)
+            record = records.get(name)
+            if builder is not None:
+                built.append(builder())
+            elif record is None or rebuild is None:
+                unrebuilt.append(name)
+            else:
+                host = ModuleHost(
+                    workspace_root=root,
+                    environment={},
+                    redactor=self._runner._redactor,  # pyright: ignore[reportPrivateUsage]
+                )
+                outcome = rebuild(record, host)
+                if isinstance(outcome, str):
+                    unrebuilt.append(f'{name}（{outcome}）')
+                else:
+                    built.append(outcome)
+        rebuilt = {module.name for module in built}
+        for module in built:
+            missing = [required for required in module.requires if required not in rebuilt]
+            if missing:
+                raise ConfigError(
+                    expected=f'回放重建的 Module {module.name!r} 依赖的 Module 也都重建了',
+                    received=f'没重建 {missing!r}',
+                    next_action=(
+                        '这个 trace 回放不了：先让那些 Module 回放得了（它们的作者声明 '
+                        'replay_safe，且当前工作区受信任的配置启用了它们），或换一个不用它的 trace'
+                    ),
+                )
+        return tuple(built), tuple(unrebuilt)
 
     def _flags(
         self, modules: Sequence[RuntimeModule]
@@ -1565,7 +1611,8 @@ class _Replay:
         unrebuilt: tuple[str, ...] = ()
         events: list[ScenarioEvent] = []
         try:
-            modules, unrebuilt_modules = self._modules(llm)
+            modules, unrebuilt_modules = self._modules(llm, root)
+            rebuilt = {module.name for module in modules}
             flags, dropped = self._flags(modules)
             unrebuilt = unrebuilt_modules + tuple(f'flags.{key}' for key in dropped)
             factories = self._factories(self._tools(workspace), llm)
@@ -1588,6 +1635,9 @@ class _Replay:
                 ),
                 ids=_ReplayIds(self) if self._keyed else None,
                 tracer=tracer,
+                untrusted_output_modules=[
+                    name for name in self._host.untrusted_output_modules if name in rebuilt
+                ],
             )
             self._runtime = runtime
             subscription = runtime.events.subscribe()

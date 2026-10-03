@@ -43,6 +43,8 @@ def host_profile(
     orchestration: bool,
     confirmation_timeout: float | None,
     roles: Mapping[str, DangerPolicy] | None = None,
+    module_records: Sequence[Mapping[str, str]] = (),
+    untrusted_output_modules: Sequence[str] = (),
 ) -> dict[str, object]:
     danger: dict[str, object] = {
         'rules': [{'id': rule.rule_id, 'params': dict(rule.params)} for rule in judge.rules],
@@ -50,7 +52,7 @@ def host_profile(
     }
     if roles:
         danger['roles'] = {role: _policy(role_policy) for role, role_policy in roles.items()}
-    return {
+    profile: dict[str, object] = {
         'flags': dict(flags),
         'danger': danger,
         'output_limit': output_limit,
@@ -61,6 +63,12 @@ def host_profile(
         'orchestration': orchestration,
         'confirmation_timeout': confirmation_timeout,
     }
+    # 只在有第三方 Module 时写：内置的按名字重建，不必记，没有第三方的 run 照旧写 v2。
+    if module_records:
+        profile['module_records'] = [dict(record) for record in module_records]
+    if untrusted_output_modules:
+        profile['untrusted_output_modules'] = list(untrusted_output_modules)
+    return profile
 
 
 def _policy(policy: DangerPolicy) -> dict[str, object]:

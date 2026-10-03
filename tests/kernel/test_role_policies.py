@@ -26,7 +26,11 @@ from syndica.kernel.replay_capture import (
     _document_version,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.kernel.runtime import Runtime
-from syndica.kernel.scenario_schema import DangerPolicySpec, parse_scenario_document
+from syndica.kernel.scenario_schema import (
+    DangerPolicySpec,
+    ModuleRecord,
+    parse_scenario_document,
+)
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.topology import AgentSlot, Topology
 
@@ -272,3 +276,55 @@ def test_a_policy_type_is_a_protocol_not_a_base_class():
         {'Shell': _Shell()}, _models(), role_policies={'Kilo': custom}
     )
     assert _policy_of(factories, 'Kilo') is custom
+
+
+def _with_modules(version: int, **host: object) -> dict[str, Any]:
+    document = _document(version, {})
+    del document['host']['danger']['roles']
+    document['host']['modules'] = ['safety', 'alpha']
+    document['host'].update(host)
+    return document
+
+
+_ALPHA_RECORD = {
+    'name': 'alpha',
+    'module_version': '2.0.0',
+    'distribution': 'alpha-dist',
+    'distribution_version': '1.0',
+}
+
+
+def test_a_v3_host_records_third_party_modules_and_the_untrusted_list():
+    parsed = parse_scenario_document(
+        _with_modules(3, module_records=[_ALPHA_RECORD], untrusted_output_modules=['alpha']),
+        source='captured.json',
+    )
+    assert parsed.host is not None
+    assert parsed.host.module_records == (
+        ModuleRecord(
+            name='alpha',
+            module_version='2.0.0',
+            distribution='alpha-dist',
+            distribution_version='1.0',
+        ),
+    )
+    assert parsed.host.untrusted_output_modules == ('alpha',)
+
+
+@pytest.mark.parametrize(
+    ('version', 'host', 'anchor'),
+    [
+        (2, {'module_records': [_ALPHA_RECORD]}, 'version'),
+        (3, {'module_records': [{**_ALPHA_RECORD, 'name': 'ghost'}]}, "'ghost'"),
+        (3, {'untrusted_output_modules': ['ghost']}, "['ghost']"),
+        (3, {'module_records': [{'name': 'alpha'}]}, 'module_version'),
+    ],
+    ids=['v2', 'record-not-installed', 'untrusted-not-installed', 'no-version'],
+)
+def test_module_records_that_do_not_match_the_host_are_refused(
+    version: int, host: dict[str, object], anchor: str
+):
+    with pytest.raises(ConfigError) as excinfo:
+        parse_scenario_document(_with_modules(version, **host), source='captured.json')
+    error = excinfo.value
+    assert anchor in error.expected + error.received + error.next_action

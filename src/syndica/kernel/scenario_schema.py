@@ -55,6 +55,7 @@ __all__ = [
     'GateRecord',
     'HostAction',
     'HostProfile',
+    'ModuleRecord',
     'PayloadText',
     'ScenarioCall',
     'ScenarioDocument',
@@ -176,6 +177,9 @@ _HOST = frozenset(
         'confirmation_timeout',
     }
 )
+# v3 加上第三方 Module 的记录与结果被收紧的那份名单（M4 D13）。
+_V3_HOST = _HOST | frozenset({'module_records', 'untrusted_output_modules'})
+_MODULE_RECORD = frozenset({'name', 'module_version', 'distribution', 'distribution_version'})
 _DANGER = frozenset({'rules', 'table', 'policy'})
 # v3 加上逐个角色的处置（M4 D12）。v2 文档里出现它报「把 version 改成 3」而不是被当成未知键丢掉。
 _V3_DANGER = _DANGER | frozenset({'roles'})
@@ -413,6 +417,19 @@ class HostProfile:
     orchestration: bool = _ORCHESTRATION
     confirmation_timeout: float | None = _CONFIRMATION_TIMEOUT
     danger_roles: Mapping[str, DangerPolicySpec] = dataclasses.field(default_factory=_no_entries)
+    module_records: tuple[ModuleRecord, ...] = ()
+    untrusted_output_modules: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ModuleRecord:
+    """一个第三方 Module 的记录（v3，M4 D13）：回放据此判能不能重建它——装着的那一份的发行版名与
+    版本要与这里相同。内置的 Module 按名字重建，不记。"""
+
+    name: str
+    module_version: str
+    distribution: str | None = None
+    distribution_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1751,7 +1768,11 @@ def _ids(value: object) -> tuple[tuple[tuple[str | int, ...], str], ...]:
 
 
 def _host(value: object, version: int) -> HostProfile:
-    data = _mapping(value, 'host', allowed=_HOST)
+    data = (
+        _mapping(value, 'host', allowed=_V3_HOST)
+        if version >= 3
+        else _mapping(value, 'host', allowed=_HOST, later=_V3_HOST, later_version=3)
+    )
     flags: dict[str, bool | int | str] = {}
     for key, item in _mapping(data.get('flags', {}), 'host.flags').items():
         if isinstance(item, float) or not isinstance(item, bool | int | str):
@@ -1792,6 +1813,15 @@ def _host(value: object, version: int) -> HostProfile:
             shell=_nonblank(raw_facts['shell'], 'host.host_facts.shell'),
         )
     modules = _names(data['modules'], 'host.modules') if 'modules' in data else None
+    records = _module_records(data.get('module_records', ()), modules)
+    untrusted = _names(data.get('untrusted_output_modules', ()), 'host.untrusted_output_modules')
+    stray = sorted(set(untrusted) - set(modules or ()))
+    if stray:
+        raise _error(
+            'host.untrusted_output_modules 里的名字都在 host.modules 里',
+            f'{stray!r} 不在其中',
+            '照 host.modules 的名字写；没装的 Module 没有输出可收紧',
+        )
     return HostProfile(
         flags=MappingProxyType(flags),
         danger_rules=rules,
@@ -1807,7 +1837,40 @@ def _host(value: object, version: int) -> HostProfile:
             data.get('confirmation_timeout', _CONFIRMATION_TIMEOUT), 'host.confirmation_timeout'
         ),
         danger_roles=MappingProxyType(roles),
+        module_records=records,
+        untrusted_output_modules=untrusted,
     )
+
+
+def _module_records(value: object, modules: tuple[str, ...] | None) -> tuple[ModuleRecord, ...]:
+    records: list[ModuleRecord] = []
+    for index, raw in enumerate(_sequence(value, 'host.module_records')):
+        field = f'host.module_records[{index}]'
+        data = _mapping(
+            raw, field, allowed=_MODULE_RECORD, required=frozenset({'name', 'module_version'})
+        )
+        name = _nonblank(data['name'], f'{field}.name')
+        if name not in (modules or ()):
+            raise _error(
+                f'{field}.name 是 host.modules 里的一个 Module',
+                f'收到 {name!r}（host.modules 是 {list(modules or ())!r}）',
+                '只给装上的第三方 Module 写记录',
+            )
+        distribution = data.get('distribution')
+        version = data.get('distribution_version')
+        records.append(
+            ModuleRecord(
+                name=name,
+                module_version=_nonblank(data['module_version'], f'{field}.module_version'),
+                distribution=None
+                if distribution is None
+                else _nonblank(distribution, f'{field}.distribution'),
+                distribution_version=(
+                    None if version is None else _nonblank(version, f'{field}.distribution_version')
+                ),
+            )
+        )
+    return tuple(records)
 
 
 def _check_role_policies(host: HostProfile | None, roles: Mapping[str, ScenarioRole]) -> None:

@@ -342,7 +342,9 @@ def test_a_distribution_outside_the_workspace_is_not_read(tmp_path: Path):
     read_snapshot(workspace / '.syndica.yaml', workspace, discover(lambda: [point]))
 
 
-def test_a_run_with_a_third_party_module_says_why_it_has_no_replay_document(tmp_path: Path):
+def test_a_run_with_a_module_that_runs_code_and_is_not_replay_safe_says_why_it_has_no_document(
+    tmp_path: Path,
+):
     stderr = StringIO()
     host = RuntimeCliHost(
         trust=NO_TRUST_GATE,
@@ -356,7 +358,7 @@ def test_a_run_with_a_third_party_module_says_why_it_has_no_replay_document(tmp_
         host.run_request(RunRequest(prompt='go', config=_config(tmp_path), trace='replay'))
     finally:
         host.close()
-    assert '启用了第三方 Module alpha' in stderr.getvalue()
+    assert '第三方 Module alpha 有会跑的代码、又没声明 replay_safe' in stderr.getvalue()
 
 
 def test_an_enabled_modules_code_inside_the_workspace_is_part_of_the_digest(

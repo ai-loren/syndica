@@ -316,7 +316,7 @@ your full environment, so the confirmation shows it and covers its code when tha
 the workspace; a distribution installed inside the workspace is also checked against its
 `RECORD`. Its tool results, and any result its hooks write for other tools, are marked untrusted;
 `--trust-module-output <name>` on `run` or `chat` lifts that for one module, and a project
-configuration cannot. Runs with a third-party module do not write a replay document yet.
+configuration cannot.
 
 `flags:` overrides flag defaults for the run; `--flag key=value` overrides `flags:`. Both go through
 the same checks against the installed modules' declarations, and a project configuration may only
@@ -487,7 +487,11 @@ Set the level per run with `--trace` or for the project with `trace: {level: ...
 `.syndica.yaml`; `chat` records at most `structure`. A `--topology` run records the topology as
 actually assembled (after `--max-turns` and `--no-write` rewrote it); replay assembles it through
 the same slot logic and enters through the root slot, so slot tools, budgets and stable ids match
-the original run. Runs with a third-party module write no replay document yet.
+the original run. A run with a third-party module is replayable only if that module declares
+`replay_safe` or runs no code of its own (flags only). Replay rebuilds such a module only when the
+workspace's trusted `.syndica.yaml` enables it and the installed distribution has the recorded
+name and version; it checks all three before importing anything, and names the module and the
+reason when it does not rebuild it.
 
 - `syndica trace list` lists traces newest first (UTC time, id, status, agents, spans, size,
   command; a replay's own trace says which trace it replayed).
