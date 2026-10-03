@@ -373,32 +373,28 @@ class ScenarioRunner:
         collector = asyncio.create_task(collect(), name=f'scenario-events:{scenario.name}')
         shutdown = False
         try:
-            slot_ids: dict[str, str] = {}
-            for slot in scenario.topology.slots:
-                if slot.boot != 'eager':
-                    continue
-                slot_ids[slot.name] = await runtime.spawn(
-                    factories[slot.agent],
-                    exit_mode=slot.exit_mode,
-                    metadata=dict(slot.metadata),
-                )
-            entry_slot = next(
-                slot for slot in scenario.topology.slots if slot.name == scenario.entry_slot
+            # 与真实的拓扑 run 同一段装配：eager 的槽由 assemble 建，入口经 send_to_slot。
+            await runtime.assemble(
+                scenario.topology,
+                factories,
+                tools=tools,
+                artifact_kinds={
+                    role: tuple(agent.manifest.artifact_kinds) for role, agent in roles.items()
+                },
             )
-            root_id = slot_ids.get(entry_slot.name)
-            if root_id is None:
-                root_id = await runtime.spawn(
-                    factories[entry_slot.agent],
-                    exit_mode=entry_slot.exit_mode,
-                    metadata=dict(entry_slot.metadata),
-                )
-                slot_ids[entry_slot.name] = root_id
-            delivered = await runtime.send(root_id, scenario.prompt)
+            delivered = await runtime.send_to_slot(scenario.entry_slot, scenario.prompt)
             if not delivered.ok:
                 raise ScenarioMismatch(
                     expected=f'entry.slot={scenario.entry_slot!r} 接受初始消息',
                     received=delivered.reason or 'broker 未给出失败原因',
                     next_action='检查 entry.slot、拓扑 boot/cardinality 与根 Agent 生命周期',
+                )
+            root_id = await runtime.resolve(scenario.entry_slot)
+            if root_id is None:
+                raise ScenarioMismatch(
+                    expected=f'entry.slot={scenario.entry_slot!r} 收下初始消息之后有一个 Agent',
+                    received='resolve 交回 None',
+                    next_action='L2 v1 的入口槽是 singleton；检查 entry.slot 是否指向它',
                 )
             await runtime.wait(root_id)
             await runtime.shutdown()

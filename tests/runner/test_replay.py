@@ -137,6 +137,10 @@ def test_a_captured_run_replays_without_touching_the_outside_world(
     assert started == []
 
 
+_LEAD_SLOT_KEY = ['slot', 'lead', '', 0]
+_HELPER_SLOT_KEY = ['slot', 'helper', '', 0]
+
+
 def _peers(*, perturbed: bool = False) -> dict[str, Any]:
     send = _call('s1', 'SendMessage', agent_id=_HELPER, content='help', trigger='pending')
     return {
@@ -147,7 +151,7 @@ def _peers(*, perturbed: bool = False) -> dict[str, Any]:
                 'frozen': {'system_prompt': 'You lead.', 'tools': ['Read']},
                 'instances': [
                     {
-                        'key': _LEAD_KEY,
+                        'key': _LEAD_SLOT_KEY,
                         'turns': [_turn(1, tool_calls=[send]), _turn(2, content='lead done')],
                         'gate': [_allowed(1, 1, 0)],
                     }
@@ -156,7 +160,7 @@ def _peers(*, perturbed: bool = False) -> dict[str, Any]:
             'Helper': {
                 'frozen': {'system_prompt': 'You help.', 'tools': ['Read']},
                 'instances': [
-                    {'key': ['host', 'spawn', 1], 'turns': [_turn(1, content='helper done')]}
+                    {'key': _HELPER_SLOT_KEY, 'turns': [_turn(1, content='helper done')]}
                 ],
             },
         },
@@ -174,8 +178,8 @@ def _peers(*, perturbed: bool = False) -> dict[str, Any]:
         },
         'entry': {'slot': 'lead', 'prompt': 'go'},
         'ids': [
-            {'key': _LEAD_KEY, 'id': _LEAD},
-            {'key': ['host', 'spawn', 1], 'id': _HELPER},
+            {'key': _LEAD_SLOT_KEY, 'id': _LEAD},
+            {'key': _HELPER_SLOT_KEY, 'id': _HELPER},
             _HOST_MESSAGE,
             {'key': ['tool_call', _LEAD, 1, 1, 0, 'message', 0], 'id': 'e8' * 16},
         ],

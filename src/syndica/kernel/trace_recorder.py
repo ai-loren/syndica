@@ -52,6 +52,7 @@ from syndica.kernel.redaction import (
 from syndica.kernel.replay_capture import ReplayCapture, Unreplayable
 from syndica.kernel.scenario_schema import parse_scenario_document
 from syndica.kernel.tool import ToolResult
+from syndica.kernel.topology import Topology
 from syndica.kernel.trace import (
     AttributeValue,
     CausalityEdge,
@@ -453,11 +454,13 @@ class TraceRecorder:
         host: Mapping[str, object],
         roles: Mapping[str, Mapping[str, object]],
         entry: Mapping[str, object],
+        topology: Topology | None = None,
     ) -> None:
         """回放文档里只有宿主知道的部分，写法同场景格式 v2：`host`（宿主档案）、`roles`（角色名
         → 冻结后的角色：`system_prompt` 正文、`tools` 按顺序、`max_turns`、`impl` 等）、`entry`
-        （入口）。run 开始之前调；不调就不写回放文档。值在这里取走一份，此后宿主改它们不影响
-        文档。"""
+        （入口）。拓扑 run 另交 `topology`：实际装配的那一份（宿主改写过预算与工具之后），入口
+        写成 `{mode: slot, slot: <根槽>}`。run 开始之前调；不调就不写回放文档。值在这里取走一份，
+        此后宿主改它们不影响文档。"""
         for name, value in (('host', host), ('roles', roles), ('entry', entry)):
             if not isinstance(cast(object, value), Mapping):
                 raise ConfigError(
@@ -479,7 +482,7 @@ class TraceRecorder:
         if self._capture_failed:
             return
         try:
-            self._capture.describe(host, roles, entry)
+            self._capture.describe(host, roles, entry, topology)
         except Unreplayable as reason:
             self._capture_failed = True
             logger.warning(

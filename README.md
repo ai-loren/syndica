@@ -484,8 +484,10 @@ replayed nor exported.
 | `full` | yes | yes | yes, redacted leaf by leaf |
 
 Set the level per run with `--trace` or for the project with `trace: {level: ...}` in
-`.syndica.yaml`; `chat` records at most `structure`. `--topology` runs write no replay document:
-the replay cannot rebuild what topology slots attach to their roles.
+`.syndica.yaml`; `chat` records at most `structure`. A `--topology` run records the topology as
+actually assembled (after `--max-turns` and `--no-write` rewrote it); replay assembles it through
+the same slot logic and enters through the root slot, so slot tools, budgets and stable ids match
+the original run. Runs with a third-party module write no replay document yet.
 
 - `syndica trace list` lists traces newest first (UTC time, id, status, agents, spans, size,
   command; a replay's own trace says which trace it replayed).

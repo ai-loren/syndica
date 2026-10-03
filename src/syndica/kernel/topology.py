@@ -76,14 +76,21 @@ class Topology:
         _reject_extra_roots(self.slots)
 
     def validate(self, catalog: object) -> None:
-        """每个槽的 `agent` 都必须是目录里的角色名。缺失名全部列出，不要停在第一个。"""
-        if not isinstance(catalog, AgentCatalog):
+        """每个槽的 `agent` 都必须是目录里的角色名。缺失名全部列出，不要停在第一个。也收
+        「角色名 → 已冻结的工厂」的映射，按它的键校验（回放与场景交冻结工厂装配时没有目录）。"""
+        if isinstance(catalog, Mapping):
+            names = [
+                name for name in cast('Mapping[object, object]', catalog) if isinstance(name, str)
+            ]
+        elif isinstance(catalog, AgentCatalog):
+            names = list(catalog.names())
+        else:
             raise ConfigError(
-                expected='catalog 是 AgentCatalog',
+                expected='catalog 是 AgentCatalog，或「角色名 → 已冻结的工厂」的映射',
                 received=f'收到 {type(catalog).__name__} 类型的 {catalog!r}',
                 next_action='传入 AgentCatalog；先 load_mapping / register_class 再 validate',
             )
-        known = set(catalog.names())
+        known = set(names)
         missing: list[str] = []
         for slot in self.slots:
             if slot.agent not in known and slot.agent not in missing:
@@ -91,7 +98,7 @@ class Topology:
         if missing:
             raise ConfigError(
                 expected='每个槽的 agent 都是目录里已有的角色名',
-                received=(f'目录现有 {list(catalog.names())!r}，缺少 {missing!r}'),
+                received=(f'目录现有 {names!r}，缺少 {missing!r}'),
                 next_action=(
                     '先 load_mapping / register_class / register_builtin 登记这些角色，'
                     '或改槽的 agent 字段。names() 给出第一次见到的顺序'

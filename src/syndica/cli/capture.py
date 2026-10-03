@@ -102,5 +102,8 @@ def frozen_roles(
             'impl': None if cls is BaseAgent else f'{cls.__module__}:{cls.__qualname__}',
             'model': manifest.model,
             'description': manifest.description,
+            **(
+                {'artifact_kinds': list(manifest.artifact_kinds)} if manifest.artifact_kinds else {}
+            ),
         }
     return roles, policies

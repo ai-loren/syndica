@@ -131,6 +131,8 @@ _ERROR_KINDS: Mapping[str, str] = MappingProxyType(
     }
 )
 _FROZEN = frozenset({'system_prompt', 'tools', 'max_turns', 'impl', 'model', 'description'})
+# v3 加上冻结角色的产物种类（拓扑槽上建出的实例按它写 metadata）。
+_V3_FROZEN = _FROZEN | frozenset({'artifact_kinds'})
 _OUTCOME = frozenset({'call', 'output', 'meta', 'trust', 'artifacts', 'raised', 'arguments_digest'})
 _SKIPPED = frozenset({'call', 'output', 'meta', 'trust', 'artifacts'})
 _GATE = frozenset({'call', 'rule_ids', 'risk', 'provenance', 'decided_by', 'disposition'})
@@ -328,6 +330,7 @@ class FrozenRole:
     impl: str | None = None
     model: str = 'default'
     description: str | None = None
+    artifact_kinds: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -787,7 +790,7 @@ def _roles(value: object, version: int) -> dict[str, ScenarioRole]:
         if 'manifest' in data:
             manifest = _manifest(data['manifest'], field)
         else:
-            frozen = _frozen(data['frozen'], f'{field}.frozen')
+            frozen = _frozen(data['frozen'], f'{field}.frozen', version)
         raw_instances = _sequence(data['instances'], f'{field}.instances')
         # v2 的角色可以一个实例都没有：捕获的文档列出宿主目录里的每个角色（回放要建得出它们，
         # 交给模型的工具定义里会点它们的名），没跑过的那些就没有实例。
@@ -824,8 +827,15 @@ def _manifest(value: object, field: str) -> Mapping[str, object]:
     return cast(Mapping[str, object], _json_value(data, f'{field}.manifest'))
 
 
-def _frozen(value: object, field: str) -> FrozenRole:
-    data = _mapping(value, field, allowed=_FROZEN, required=frozenset({'system_prompt', 'tools'}))
+def _frozen(value: object, field: str, version: int) -> FrozenRole:
+    required = frozenset({'system_prompt', 'tools'})
+    data = (
+        _mapping(value, field, allowed=_V3_FROZEN, required=required)
+        if version >= 3
+        else _mapping(
+            value, field, allowed=_FROZEN, required=required, later=_V3_FROZEN, later_version=3
+        )
+    )
     tools = _names(data['tools'], f'{field}.tools')
     impl = data.get('impl')
     if impl is not None and (not isinstance(impl, str) or impl not in FROZEN_IMPLS):
@@ -838,10 +848,16 @@ def _frozen(value: object, field: str) -> FrozenRole:
     return FrozenRole(
         system_prompt=_text(data['system_prompt'], f'{field}.system_prompt'),
         tools=tools,
-        max_turns=_optional_positive(data.get('max_turns'), f'{field}.max_turns'),
+        # 0 合法：拓扑槽的预算可以把一个角色压到一轮都不跑。
+        max_turns=(
+            None
+            if data.get('max_turns') is None
+            else _integer(data['max_turns'], f'{field}.max_turns', minimum=0)
+        ),
         impl=impl,
         model=_nonblank(data.get('model', 'default'), f'{field}.model'),
         description=None if description is None else _nonblank(description, f'{field}.description'),
+        artifact_kinds=_names(data.get('artifact_kinds', ()), f'{field}.artifact_kinds'),
     )
 
 

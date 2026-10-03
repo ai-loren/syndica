@@ -27,6 +27,7 @@ from syndica.kernel.message import Message
 from syndica.kernel.redaction import Redactor, encode_redacted
 from syndica.kernel.scenario_schema import FROZEN_IMPLS, REPLAYED_TOOLS, parse_scenario_document
 from syndica.kernel.tool import ToolResult
+from syndica.kernel.topology import Topology
 from syndica.kernel.trace import AttributeValue, SpanKind, SpanStatus, TraceSource
 
 __all__ = ['RecordingIds', 'ReplayCapture', 'Unreplayable']
@@ -98,12 +99,36 @@ class _Wait:
     answer: dict[str, object] | None = None
 
 
-def _document_version(host: object) -> int:
+def _document_version(host: object, roles: object) -> int:
     """写得下这份内容的最低版本：没用到 v3 的键就写 2，旧版本的读者照样读得进。"""
     danger = cast(Mapping[str, object], host).get('danger') if isinstance(host, Mapping) else None
     if isinstance(danger, Mapping) and 'roles' in cast(Mapping[str, object], danger):
         return 3
+    frozen = cast(Mapping[str, object], roles).values() if isinstance(roles, Mapping) else ()
+    if any(isinstance(role, Mapping) and 'artifact_kinds' in role for role in frozen):
+        return 3
     return 2
+
+
+def _topology_document(topology: Topology) -> dict[str, object]:
+    """`topology` 段的写法同场景格式：回放按它装配，与原始 run 走同一段装配逻辑。"""
+    return {
+        'slots': [
+            {
+                'name': slot.name,
+                'agent': slot.agent,
+                'is_root': slot.is_root,
+                'cardinality': slot.cardinality,
+                'key_field': slot.key_field,
+                'boot': slot.boot,
+                'exit_mode': slot.exit_mode.value,
+                'extra_tools': list(slot.extra_tools),
+                'budget': None if slot.budget is None else dict(slot.budget),
+                'metadata': dict(slot.metadata),
+            }
+            for slot in topology.slots
+        ]
+    }
 
 
 class ReplayCapture:
@@ -143,6 +168,7 @@ class ReplayCapture:
         host: Mapping[str, object],
         roles: Mapping[str, Mapping[str, object]],
         entry: Mapping[str, object],
+        topology: Topology | None = None,
     ) -> None:
         frozen = {str(name): self._jsonable(dict(role)) for name, role in roles.items()}
         run: dict[str, object] = {
@@ -150,8 +176,10 @@ class ReplayCapture:
             'roles': frozen,
             'entry': self._jsonable(dict(entry)),
         }
+        if topology is not None:
+            run['topology'] = self._jsonable(_topology_document(topology))
         probe: dict[str, object] = {
-            'version': _document_version(run['host']),
+            'version': _document_version(run['host'], frozen),
             'name': 'describe_run',
             'host': run['host'],
             'agents': {name: {'frozen': role, 'instances': []} for name, role in frozen.items()},
@@ -159,6 +187,8 @@ class ReplayCapture:
             'ids': [],
             'expect': {},
         }
+        if 'topology' in run:
+            probe['topology'] = run['topology']
         try:
             parse_scenario_document(probe, source='describe_run')
         except ConfigError as error:
@@ -528,7 +558,7 @@ class ReplayCapture:
                 action['waiting'] = [key for _, key in waiting]
             host_actions.append(action)
         document: dict[str, object] = {
-            'version': _document_version(run['host']),
+            'version': _document_version(run['host'], run['roles']),
             'name': clean(f'trace {trace_id}'),
             'source': clean(
                 {
@@ -545,6 +575,7 @@ class ReplayCapture:
                 for name, raw in names.items()
             },
             'entry': clean(run['entry']),
+            **({'topology': clean(run['topology'])} if 'topology' in run else {}),
             'responses': [
                 clean(response)
                 for response in sorted(self._responses, key=lambda item: json.dumps(item['key']))

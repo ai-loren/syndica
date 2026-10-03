@@ -499,7 +499,7 @@ _INVALID: list[tuple[str, tuple[Any, ...], object, str, str, str]] = [
         'short',
         '不要截断',
     ),
-    ('frozen-turns', ('agents', 'Lead', 'frozen', 'max_turns'), 0, '不小于 1', '0', '更大的整数'),
+    ('frozen-turns', ('agents', 'Lead', 'frozen', 'max_turns'), -1, '不小于 0', '-1', '更大的整数'),
     ('frozen-tools', ('agents', 'Lead', 'frozen', 'tools'), _DELETE, '必填键', "['tools']", '补齐'),
     ('key-empty', (*_INSTANCE, 'key'), [], '稳定键', '[]', "['host', 'spawn', 0]"),
     ('key-bool', (*_INSTANCE, 'key'), ['host', True], '字符串或整数', 'True', '不是整数'),

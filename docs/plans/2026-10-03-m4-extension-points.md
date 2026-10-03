@@ -632,7 +632,12 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 - 扩展切点的分发经 Runtime 接在自己中心上的观察者记 `junction.triggered`（链上任何一层沿 `outer` 找到它，有没有
   hook 都记）；本 Runtime 的 span 之外触发的不记。`trace show` 加「Module」一节，不把只有 Module span 的 Agent
   画成没结束的 Agent。
-#### T13 — 拓扑 run 回放（M3 遗留）
+#### T13 — 拓扑 run 回放（M3 遗留，完成）
+- 已落地：`assemble` 另收冻结工厂（`artifact_kinds` 由调用方给，`models` 可省、冻结用的参数一律拒收），
+  `Topology.validate` 按工厂表的名字校验；CLI 在建 Runtime 之前算出实际装配的拓扑交给 `describe_run`
+  （`topology=`，入口 `mode: slot`），冻结角色记 `artifact_kinds`（有就写 v3），`max_turns` 允许 0；回放与
+  `runner/scenario.py` 的槽入口都改走 `assemble` + `send_to_slot`。根结束之后平级 Agent 再给它发消息那一条登记为
+  已知限制（见风险），没写用例：它取决于两个 Agent 的先后，CLI 的捕获里排不出稳定的一次。
 - 宿主把实际装配的拓扑（CLI 改写过预算与只读工具之后的那一份）交给 `describe_run`，回放文档写 `topology` 段与
   `entry: {mode: slot, slot: <根槽>}`。
 - 内核：`Runtime.assemble` 的第二个参数另收 `Mapping[str, AgentFactory]`（已冻结的工厂，不再冻结一次，也不覆盖
@@ -763,6 +768,8 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
   <摘要>`，或用工作区之外的 `--config`（工作区之内的显式 `--config` 同样要确认）。
 - **spawn 之后装上的工具不收紧。** 第三方代码能留住 Agent 的引用、在 spawn 之后再装工具，那些工具按宿主的算，结果
   不收紧、不过 D7。同进程的代码挡不住这一条，真正的边界是 M5 的沙箱。
+- **根结束之后平级 Agent 再给它发消息，回放可能与原始 run 分叉。** 原始 run 在根结束后立刻关机，那条消息的
+  激活可能被拒；回放的收尾先让剩下的 Agent 跑完，于是根被叫醒。拓扑 run 能被捕获之后这条路可达（M3 登记）。
 - **工作区里的 `sys.path` 条目在任何闸之前运行。** syndica 装在工作区里的 `.venv`（uv 的缺省）时，Agent 写得到那里的
   `.pth` 与已装的代码，下一次启动就在信任确认之前、带着完整环境运行；工作区内 `impl:` 包 import 的其它顶层模块也不在
   摘要里。摘要盖不住这些，信任展示逐条列出这样的条目；把 syndica 装在工作区之外才真正避开。

@@ -1515,23 +1515,96 @@ def _without_document(root: Path) -> bool:
     return asyncio.run(read()) is None
 
 
-@pytest.mark.parametrize('asked', [True, False], ids=['replay-asked-for', 'default-level'])
-def test_a_topology_run_writes_no_replay_document_and_says_so_only_when_asked(
-    tmp_path: Path, asked: bool
+def _slot_topology(turns: int) -> str:
+    return f"""version: 1
+topologies:
+  solo:
+    slots:
+      - name: root
+        agent: Worker
+        is_root: true
+        cardinality: singleton
+        boot: eager
+        extra_tools: [Grep]
+        budget: {{turns: {turns}}}
+"""
+
+
+def test_a_topology_run_is_captured_with_its_slot_tools_and_budget_and_replays(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
 ):
     config = tmp_path / 'syndica.yaml'
-    config.write_text(_TOPOLOGY, encoding='utf-8')
-    trace = ['--trace', 'replay'] if asked else []
+    config.write_text(_slot_topology(2), encoding='utf-8')
+    (tmp_path / 'notes.txt').write_text('plain notes\n', encoding='utf-8')
+    root: list[Step] = [_calls(('g1', 'Grep', {'pattern': 'plain'})), _say('done')]
+
+    code, stdout, stderr = _cli(
+        tmp_path, _PerAgent(root), ['--config', str(config), 'run', 'go', '--topology', 'solo']
+    )
+    header, document = _trace(tmp_path)
+    replayed = _replayed(header, document)
+
+    assert code == 0 and stdout.rstrip().endswith('done'), stderr
+    assert document['entry'] == {'mode': 'slot', 'slot': 'root', 'prompt': 'go', 'trust': 'trusted'}
+    [slot] = document['topology']['slots']
+    assert (slot['extra_tools'], slot['budget']) == (['Grep'], {'turns': 2})
+    assert replayed.reproduced, replayed.divergences
+
+
+def test_the_captured_topology_is_the_one_assembled_after_the_turn_cap(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(_slot_topology(2), encoding='utf-8')
+
+    _cli(
+        tmp_path,
+        _PerAgent([_say('done')]),
+        ['--config', str(config), 'run', 'go', '--topology', 'solo', '--max-turns', '1'],
+    )
+    _, document = _trace(tmp_path)
+
+    assert document['topology']['slots'][0]['budget'] == {'turns': 1}
+
+
+def test_a_roles_artifact_kinds_are_captured_in_a_version_3_document(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(
+        _slot_topology(2)
+        + 'agents:\n  - name: Worker\n    description: 写报告\n    tools: [Read]\n'
+        '    artifact_kinds: [report]\n',
+        encoding='utf-8',
+    )
 
     code, _, stderr = _cli(
         tmp_path,
         _PerAgent([_say('done')]),
-        ['--config', str(config), 'run', 'go', '--topology', 'solo', *trace],
+        ['--config', str(config), 'run', 'go', '--topology', 'solo'],
     )
+    header, document = _trace(tmp_path)
+    replayed = _replayed(header, document)
 
     assert code == 0, stderr
-    assert _without_document(tmp_path)
-    assert ('trace 里不写回放文档：--topology 的 run 还不能捕获' in stderr) is asked
+    assert document['version'] == 3
+    assert document['agents']['Worker']['frozen']['artifact_kinds'] == ['report']
+    assert replayed.reproduced, replayed.divergences
+
+
+def test_a_topology_runs_budget_is_replayed_not_the_roles_own(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(_slot_topology(1), encoding='utf-8')
+    root: list[Step] = [_calls(('g1', 'Grep', {'pattern': 'plain'}))]
+
+    _cli(tmp_path, _PerAgent(root), ['--config', str(config), 'run', 'go', '--topology', 'solo'])
+    header, document = _trace(tmp_path)
+    replayed = _replayed(header, document)
+
+    assert document['expect']['stop_reasons'] == {'Worker[0]': 'max_turns'}
+    assert replayed.reproduced, replayed.divergences
 
 
 def _roles_module(
@@ -1625,7 +1698,7 @@ def test_a_role_whose_constructor_fails_costs_only_the_replay_document(
 
     assert code == 0 and stdout.rstrip().endswith('done'), stderr
     assert _without_document(tmp_path)
-    assert ('constructor needs a network' in stderr) is (target[0] == '--agent')
+    assert 'constructor needs a network' in stderr
 
 
 # --- Ctrl-C: a real SIGINT to a CLI in a child process ------------------------------------

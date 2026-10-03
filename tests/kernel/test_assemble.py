@@ -640,3 +640,137 @@ def test_assemble_takes_the_danger_options_by_keyword_only() -> None:
 
     assert parameters['danger_judge'].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters['danger_policy'].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def _frozen(*names: str) -> dict[str, object]:
+    def factory(name: str):
+        def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+            return BaseAgent(
+                AgentOptions(name=name, llm=ScriptedLLM([ScriptedTurn(content='ok')])),
+                hooks=hooks,
+                events=events,
+            )
+
+        return build
+
+    return {name: factory(name) for name in names}
+
+
+async def test_frozen_factories_assemble_through_the_same_slot_logic() -> None:
+    topology = Topology(
+        slots=(
+            AgentSlot(
+                name='root',
+                agent='Writer',
+                is_root=True,
+                cardinality='singleton',
+                boot='eager',
+                extra_tools=('Grep',),
+                budget={'turns': 3},
+            ),
+            AgentSlot(name='later', agent='Helper', cardinality='singleton', boot='lazy'),
+        )
+    )
+    runtime = Runtime()
+    try:
+        await runtime.assemble(
+            topology,
+            _frozen('Writer', 'Helper'),  # pyright: ignore[reportArgumentType]
+            tools=_tools(),
+            artifact_kinds={'Writer': ['report', 'chart']},
+        )
+        [info] = await runtime.registry.list()
+        agent = runtime._table.get(info.agent_id)  # pyright: ignore[reportPrivateUsage]
+        assert agent is not None
+        assert list(agent.options.tools) == ['Grep']
+        assert agent.options.max_turns == 3
+        assert info.metadata['artifact_kinds'] == ('report', 'chart')
+        assert await runtime.resolve('later') is None
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ('options', 'anchor'),
+    [
+        ({'models': {'default': ScriptedLLM([])}}, "['models']"),
+        ({'danger_policy': AllowAll()}, "['danger_policy']"),
+        ({'role_policies': {}, 'host': object()}, "['host', 'role_policies']"),
+    ],
+    ids=['models', 'policy', 'two'],
+)
+async def test_frozen_factories_refuse_the_options_only_freezing_uses(
+    options: dict[str, object], anchor: str
+) -> None:
+    topology = Topology(slots=(AgentSlot(name='root', agent='Writer', boot='manual'),))
+    runtime = Runtime()
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.assemble(
+                topology,
+                _frozen('Writer'),  # pyright: ignore[reportArgumentType]
+                tools={},
+                **options,  # pyright: ignore[reportArgumentType]
+            )
+        assert anchor in excinfo.value.received
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_catalog_needs_models_and_takes_no_artifact_kinds() -> None:
+    topology = Topology(slots=(AgentSlot(name='root', agent='Writer', boot='manual'),))
+    runtime = Runtime()
+    try:
+        with pytest.raises(ConfigError) as missing:
+            await runtime.assemble(topology, _catalog('Writer'), tools={})
+        with pytest.raises(ConfigError) as kinds:
+            await runtime.assemble(
+                topology,
+                _catalog('Writer'),
+                tools={},
+                models=_models(),
+                artifact_kinds={'Writer': ['report']},
+            )
+    finally:
+        await runtime.shutdown()
+    assert 'models=None' in missing.value.received
+    assert '只有交冻结工厂时' in kinds.value.next_action
+
+
+@pytest.mark.parametrize(
+    ('kinds', 'anchor'),
+    [
+        ({'Ghost': ['report']}, "'Ghost'"),
+        ({'Writer': 'report'}, "['report']"),
+        ({'Writer': [1]}, '(1,)'),
+        (['report'], 'list'),
+    ],
+    ids=['unknown-role', 'string', 'not-strings', 'not-a-mapping'],
+)
+async def test_artifact_kinds_for_frozen_factories_are_checked(kinds: object, anchor: str) -> None:
+    topology = Topology(slots=(AgentSlot(name='root', agent='Writer', boot='manual'),))
+    runtime = Runtime()
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.assemble(
+                topology,
+                _frozen('Writer'),  # pyright: ignore[reportArgumentType]
+                tools={},
+                artifact_kinds=kinds,  # pyright: ignore[reportArgumentType]
+            )
+        assert anchor in excinfo.value.received + excinfo.value.next_action
+    finally:
+        await runtime.shutdown()
+
+
+def test_a_topology_validates_against_the_names_of_frozen_factories() -> None:
+    topology = Topology(
+        slots=(
+            AgentSlot(name='one', agent='Writer'),
+            AgentSlot(name='two', agent='Ghost'),
+            AgentSlot(name='three', agent='Phantom'),
+        )
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        topology.validate(_frozen('Writer'))
+    assert "['Ghost', 'Phantom']" in excinfo.value.received

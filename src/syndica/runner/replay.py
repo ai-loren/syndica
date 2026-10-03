@@ -577,6 +577,8 @@ class _Replay:
         self._task: asyncio.Task[Any] | None = None
         self._draining: asyncio.Future[None] | None = None
         self._runtime: Runtime | None = None
+        self._slot_tools: dict[str, Tool] = {}
+        self._artifact_kinds: dict[str, tuple[str, ...]] = {}
         self._kills: list[tuple[str, asyncio.Future[None]]] = []
         self._held: set[StableKey] = set()
         self._tracer: _ReplayTracer | None = None
@@ -1161,8 +1163,11 @@ class _Replay:
                 factories[role.name] = self._frozen_factory(
                     role, tools, llm, judge, role_policies.get(role.name, policy)
                 )
+                self._artifact_kinds[role.name] = role.frozen.artifact_kinds
             else:
                 factories[role.name] = self._manifest_factory(role, frozen_catalog[role.name], llm)
+                self._artifact_kinds[role.name] = catalog.get(role.name).artifact_kinds
+        self._slot_tools = dict(tools)
         return factories
 
     def _frozen_factory(
@@ -1642,19 +1647,21 @@ class _Replay:
             return agent_id
         topology = self._document.topology
         assert topology is not None
-        slot_ids: dict[str, str] = {}
-        for slot in topology.slots:
-            if slot.boot == 'eager':
-                slot_ids[slot.name] = await runtime.spawn(
-                    factories[slot.agent], exit_mode=slot.exit_mode, metadata=dict(slot.metadata)
-                )
-        slot = next(slot for slot in topology.slots if slot.name == entry.slot)
-        agent_id = slot_ids.get(slot.name)
+        # 与原始 run 同一段装配：槽的工具、预算、产物种类、lazy / manual 与稳定键都由内核给出。
+        await runtime.assemble(
+            topology, factories, tools=self._slot_tools, artifact_kinds=self._artifact_kinds
+        )
+        slot = cast(str, entry.slot)
+        await runtime.send_to_slot(slot, prompt, trust=trust)
+        agent_id = await runtime.resolve(slot)
         if agent_id is None:
-            agent_id = await runtime.spawn(
-                factories[slot.agent], exit_mode=slot.exit_mode, metadata=dict(slot.metadata)
+            raise ConfigError(
+                expected=f'入口槽 {slot!r} 收下提示词之后有一个 Agent',
+                received='resolve 交回 None',
+                next_action=(
+                    '入口槽要是 singleton 或 keyed；manual 与 on-demand 没有别名，进不了这条路'
+                ),
             )
-        await runtime.send(agent_id, prompt, trust=trust)
         return agent_id
 
     async def _observed(

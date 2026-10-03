@@ -211,6 +211,21 @@ def test_a_v3_document_records_one_policy_per_role():
     }
 
 
+def test_a_frozen_roles_artifact_kinds_are_read_in_version_3_and_point_v2_to_it():
+    document = _document(3, {})
+    document['agents']['Lead']['frozen']['artifact_kinds'] = ['report', 'chart']
+    parsed = parse_scenario_document(document, source='captured.json')
+    assert parsed.roles['Lead'].frozen is not None
+    assert parsed.roles['Lead'].frozen.artifact_kinds == ('report', 'chart')
+
+    older = _document(2, {})
+    del older['host']['danger']['roles']
+    older['agents']['Lead']['frozen']['artifact_kinds'] = ['report']
+    with pytest.raises(ConfigError) as excinfo:
+        parse_scenario_document(older, source='captured.json')
+    assert 'version' in excinfo.value.next_action
+
+
 def test_per_role_policies_in_a_v2_document_point_to_version_3():
     with pytest.raises(ConfigError) as excinfo:
         parse_scenario_document(
@@ -238,9 +253,12 @@ def test_a_malformed_role_policy_is_refused(entry: dict[str, Any], anchor: str):
 
 
 def test_the_capture_writes_version_3_only_when_it_needs_it():
-    assert _document_version({'danger': {'policy': 'allow_all'}}) == 2
-    assert _document_version({}) == 2
-    assert _document_version({'danger': {'roles': {'Lead': {'policy': 'allow_all'}}}}) == 3
+    plain = {'Lead': {'system_prompt': 'x', 'tools': []}}
+    assert _document_version({'danger': {'policy': 'allow_all'}}, plain) == 2
+    assert _document_version({}, plain) == 2
+    assert _document_version({'danger': {'roles': {'Lead': {'policy': 'allow_all'}}}}, plain) == 3
+    kinds = {'Lead': {'system_prompt': 'x', 'tools': [], 'artifact_kinds': ['report']}}
+    assert _document_version({}, kinds) == 3
 
 
 def test_a_policy_type_is_a_protocol_not_a_base_class():

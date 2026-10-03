@@ -560,6 +560,34 @@ def _validated_request(request: RunRequest) -> dict[str, str]:
     return parse_assignments(request.flags)
 
 
+def _assembled_topology(
+    config: CliConfig, request: RunRequest
+) -> tuple[Topology, AgentSlot] | None:
+    """`--topology` 实际装配的那一份（CLI 改写过预算与只读工具之后）与它的根槽；不是拓扑 run 时
+    None。回放文档记的就是这一份：记配置里的原样，回放就按另一套预算与工具跑。"""
+    if request.topology is None:
+        return None
+    topology = config.topologies.get(request.topology)
+    if topology is None:
+        raise _config_error(
+            f'--topology 是配置中的名字之一：{list(config.topologies)!r}',
+            f'收到 {request.topology!r}',
+            '运行 syndica topology list，再逐字使用其中一个名字',
+        )
+    roots = [slot for slot in topology.slots if slot.is_root]
+    if not roots:
+        raise _config_error(
+            f'topology {request.topology!r} 有一个 root 槽',
+            '所有 topology.slots 的 is_root 都是 false',
+            '给要接收 CLI prompt 的 singleton 槽设置 is_root: true',
+        )
+    topology = _with_turn_limit(topology, request.max_turns, config.catalog)
+    if request.no_write:
+        topology = _read_only_topology(topology)
+    root = next(slot for slot in topology.slots if slot.name == roots[0].name)
+    return topology, root
+
+
 def _with_turn_limit(
     topology: Topology,
     max_turns: int | None,
@@ -2304,6 +2332,7 @@ class RuntimeCliHost:
         profile: Callable[[Mapping[str, DangerPolicy]], dict[str, object]],
         policy: DangerPolicy,
         prompt: str,
+        assembled: tuple[Topology, AgentSlot] | None,
     ) -> None:
         """把回放文档里只有宿主知道的部分交给 recorder。回放造不出来的 run 不交（trace 照常记录），
         只在人点名要了 replay / full 时说一句：默认级别下每次 run 都说同一句是噪音。"""
@@ -2312,9 +2341,7 @@ class RuntimeCliHost:
         roles: dict[str, dict[str, object]] = {}
         role_policies: dict[str, DangerPolicy] = {}
         third = third_party(config.modules)
-        if request.topology is not None:
-            reason = '--topology 的 run 还不能捕获（拓扑槽给角色附加的工具与预算，回放重建不出来）'
-        elif third:
+        if third:
             reason = (
                 f'启用了第三方 Module {", ".join(third)}：回放还重建不了第三方 Module，'
                 '它们的代码不能在回放里再跑一遍'
@@ -2340,15 +2367,16 @@ class RuntimeCliHost:
             if explicit:
                 self._warn(f'trace 里不写回放文档：{reason}；trace replay 回放不了这次 run。')
             return
+        entry: dict[str, object] = (
+            {'mode': 'query', 'agent': request.agent or 'Orchestrator'}
+            if assembled is None
+            else {'mode': 'slot', 'slot': assembled[1].name}
+        )
         tracer.describe_run(
             host=profile(role_policies),
             roles=roles,
-            entry={
-                'mode': 'query',
-                'agent': request.agent or 'Orchestrator',
-                'prompt': prompt,
-                'trust': 'trusted',
-            },
+            entry={**entry, 'prompt': prompt, 'trust': 'trusted'},
+            topology=None if assembled is None else assembled[0],
         )
 
     async def _wait_with_pump(
@@ -2430,6 +2458,7 @@ class RuntimeCliHost:
                     config.flags, flags, (item for module in modules for item in module.flags)
                 )
                 untrusted = self._untrusted_output(config, request.trust_module_output)
+                assembled = _assembled_topology(config, request)
                 model_names = _model_names(config)
                 models: Mapping[str, LLM] = {
                     name: self._model_factory(name) for name in model_names
@@ -2489,7 +2518,15 @@ class RuntimeCliHost:
                         )
 
                     self._describe_run(
-                        tracer, request, config, catalog, factories, profile, policy, prompt
+                        tracer,
+                        request,
+                        config,
+                        catalog,
+                        factories,
+                        profile,
+                        policy,
+                        prompt,
+                        assembled,
                     )
                 if logs is not None:
                     # 服务是装配时 setattr 上去的，Runtime 的静态类型里没有这个属性。
@@ -2501,29 +2538,8 @@ class RuntimeCliHost:
                 )
                 failure: BaseException | None = None
                 try:
-                    if request.topology is not None:
-                        topology = config.topologies.get(request.topology)
-                        if topology is None:
-                            raise _config_error(
-                                f'--topology 是配置中的名字之一：{list(config.topologies)!r}',
-                                f'收到 {request.topology!r}',
-                                '运行 syndica topology list，再逐字使用其中一个名字',
-                            )
-                        roots = [slot for slot in topology.slots if slot.is_root]
-                        if not roots:
-                            raise _config_error(
-                                f'topology {request.topology!r} 有一个 root 槽',
-                                '所有 topology.slots 的 is_root 都是 false',
-                                '给要接收 CLI prompt 的 singleton 槽设置 is_root: true',
-                            )
-                        root_slot = roots[0]
-                        topology = _with_turn_limit(
-                            topology,
-                            request.max_turns,
-                            config.catalog,
-                        )
-                        if request.no_write:
-                            topology = _read_only_topology(topology)
+                    if assembled is not None:
+                        topology, root_slot = assembled
                         await runtime.assemble(
                             topology,
                             catalog,

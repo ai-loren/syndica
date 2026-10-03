@@ -453,6 +453,41 @@ def validate_agent_factories(agents: Mapping[str, AgentFactory]) -> None:
             ) from exc
 
 
+def _artifact_kinds(value: object, frozen: Mapping[str, object]) -> dict[str, tuple[str, ...]]:
+    """交冻结工厂时每个角色的产物种类：键是这些工厂里的角色名，值是种类名的 list / tuple。"""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            expected='artifact_kinds 是「角色名 → 产物种类的 list / tuple」的映射',
+            received=f'收到 {type(value).__name__} 类型的 {value!r}',
+            next_action='写成 {"Writer": ["report"]}；没有产物种类就省略这个参数',
+        )
+    kinds: dict[str, tuple[str, ...]] = {}
+    for role, raw in cast('Mapping[object, object]', value).items():
+        if not isinstance(role, str) or role not in frozen:
+            raise ConfigError(
+                expected=f'artifact_kinds 的键是交来的工厂里的角色名：{sorted(frozen)!r}',
+                received=f'收到键 {role!r}',
+                next_action='改成工厂表里的角色名，或删掉这一项',
+            )
+        if isinstance(raw, str | bytes) or not isinstance(raw, Sequence):
+            raise ConfigError(
+                expected=f'artifact_kinds[{role!r}] 是种类名的 list / tuple',
+                received=f'收到 {type(raw).__name__} 类型的 {raw!r}',
+                next_action=f'写成 [{raw!r}]' if isinstance(raw, str) else '写成种类名的列表',
+            )
+        items = tuple(cast('Sequence[object]', raw))
+        if not all(isinstance(item, str) for item in items):
+            raise ConfigError(
+                expected=f'artifact_kinds[{role!r}] 的每一项是字符串',
+                received=f'收到 {items!r}',
+                next_action='把每个种类写成字符串',
+            )
+        kinds[role] = cast('tuple[str, ...]', items)
+    return kinds
+
+
 def _untrusted_output_modules(value: object, installed: Sequence[str]) -> frozenset[str]:
     if isinstance(value, str | bytes | bytearray) or not isinstance(value, Sequence):
         raise ConfigError(
@@ -2876,22 +2911,28 @@ class Runtime:
     async def assemble(
         self,
         topology: Topology,
-        catalog: AgentCatalog,
+        catalog: AgentCatalog | Mapping[str, AgentFactory],
         *,
         tools: Mapping[str, Tool],
-        models: Mapping[str, LLM],
+        models: Mapping[str, LLM] | None = None,
         host: object = None,
         danger_judge: DangerJudge | None = None,
         danger_policy: DangerPolicy | None = None,
         role_policies: Mapping[str, DangerPolicy] | None = None,
+        artifact_kinds: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         """把拓扑装进本 Runtime。这不是 `start`，也不发 Runtime 启动切点。
 
         只 spawn `boot='eager'` 的 singleton。lazy 等 `send_to_slot`，manual 等 `occupy`。
         第二次调用是契约违反：要换形态就新 Runtime。中途 spawn 失败也已经算装过，避免重试把
-        已经起来的 eager 再 spawn 一遍。`danger_judge` / `danger_policy` / `role_policies` 原样交给
-        `AgentCatalog.freeze`：目录冻结出的工厂都用它们，槽上建出的与 `Delegate` 按目录角色派出的
-        Agent 因此都受约束。`Runtime(agents=)` 里目录之外的名字仍是原来的工厂，不受这里的影响。
+        已经起来的 eager 再 spawn 一遍。
+
+        第二个参数是目录，或已经冻结好的工厂（`{角色名: 工厂}`）。交目录时照旧冻结：`models`
+        必填，`danger_judge` / `danger_policy` / `role_policies` 原样交给 `AgentCatalog.freeze`，
+        槽上建出的与 `Delegate` 按目录角色派出的 Agent 因此都受约束。交冻结工厂时不再冻结一次
+        （回放与场景用它：工厂里已经有模型与处置，再给就是两份可能不一致的配置），每个角色的
+        `artifact_kinds` 由调用方给出。两种入参走同一段装配逻辑：绑定、别名、`_SLOT_SPAWN`、
+        实例 metadata。`Runtime(agents=)` 里同名的工厂被替换，别的名字不受影响。
         """
         from syndica.kernel.catalog import AgentCatalog
         from syndica.kernel.topology import Topology
@@ -2907,9 +2948,9 @@ class Runtime:
                 next_action='传入 Topology(slots=...)；不要传裸列表',
             )
         received_catalog = cast(object, catalog)
-        if not isinstance(received_catalog, AgentCatalog):
+        if not isinstance(received_catalog, AgentCatalog | Mapping):
             raise ConfigError(
-                expected='catalog 是 AgentCatalog',
+                expected='catalog 是 AgentCatalog，或「角色名 → 已冻结的工厂」的映射',
                 received=f'收到 {type(received_catalog).__name__} 类型的 {received_catalog!r}',
                 next_action='传入 AgentCatalog；先 load_mapping / register_class 再 assemble',
             )
@@ -2927,15 +2968,47 @@ class Runtime:
                 next_action='传入 {"Read": read_tool} 这样的表。槽上的 extra_tools 按这张表解析',
             )
         tool_table = cast('Mapping[str, Tool]', received_tools)
-        received_topology.validate(received_catalog)
-        frozen = received_catalog.freeze(
-            tool_table,
-            models,
-            host,
-            danger_judge=danger_judge,
-            danger_policy=danger_policy,
-            role_policies=role_policies,
-        )
+        received_topology.validate(cast(object, received_catalog))
+        if isinstance(received_catalog, AgentCatalog):
+            if artifact_kinds is not None:
+                raise ConfigError(
+                    expected='交目录时不给 artifact_kinds：每个角色的清单里已经写着',
+                    received='同时收到 catalog 与 artifact_kinds',
+                    next_action='删掉 artifact_kinds；只有交冻结工厂时才由调用方给出',
+                )
+            if models is None:
+                raise ConfigError(
+                    expected='交目录时给 models：冻结角色要按清单里的模型名取到 LLM',
+                    received='models=None',
+                    next_action='传 models={模型名: LLM}，或改交已经冻结好的工厂',
+                )
+            frozen = received_catalog.freeze(
+                tool_table,
+                models,
+                host,
+                danger_judge=danger_judge,
+                danger_policy=danger_policy,
+                role_policies=role_policies,
+            )
+            kinds = {name: tuple(received_catalog.get(name).artifact_kinds) for name in frozen}
+        else:
+            given = {
+                'models': models,
+                'host': host,
+                'danger_judge': danger_judge,
+                'danger_policy': danger_policy,
+                'role_policies': role_policies,
+            }
+            extra = sorted(name for name, value in given.items() if value is not None)
+            if extra:
+                raise ConfigError(
+                    expected='交冻结工厂时不再给冻结用的参数：工厂里已经有模型与处置',
+                    received=f'同时收到 {extra}',
+                    next_action='删掉这些参数，或改交目录让 assemble 去冻结',
+                )
+            frozen = dict(cast('Mapping[str, AgentFactory]', received_catalog))
+            validate_agent_factories(frozen)
+            kinds = _artifact_kinds(artifact_kinds, frozen)
         for name, factory in frozen.items():
             if name in self._agents:
                 logger.info('catalog 覆盖了 Runtime(agents=) 里同名工厂 %s', name)
@@ -2943,10 +3016,8 @@ class Runtime:
         self._topology_tools = dict(tool_table)
         bindings: dict[str, _TopologyBinding] = {}
         for slot in received_topology.slots:
-            manifest = received_catalog.get(slot.agent)
             bindings[slot.name] = _TopologyBinding(
-                slot=slot,
-                artifact_kinds=tuple(manifest.artifact_kinds),
+                slot=slot, artifact_kinds=kinds.get(slot.agent, ())
             )
         self._topology_bindings = bindings
         self._topology_aliases = {}
