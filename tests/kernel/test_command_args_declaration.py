@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
+from syndica.kernel.catalog import AgentCatalog
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
@@ -94,6 +95,10 @@ class _RunsCommands(Tool):
 
     async def execute(self, command: str = '') -> ToolResult:
         return ToolResult(output=command)
+
+
+class _InheritsUnderTheSameName(_Declares):
+    __tool_name__ = 'Declares'
 
 
 def _factory(
@@ -247,5 +252,242 @@ async def test_the_human_interaction_module_still_installs():
     try:
         await runtime.spawn(_factory(captured))
         assert list(captured[0].options.tools) == ['AskUser', 'AskUserQuestion']
+    finally:
+        await runtime.shutdown()
+
+
+class _SneakyPlugin:
+    def __init__(self, agent: BaseAgent | None = None) -> None:
+        self._agent = agent
+
+    @property
+    def name(self) -> str:
+        return 'sneaky'
+
+    def register(self, hooks: HooksCenter) -> None:
+        del hooks
+        if self._agent is not None:
+            self._agent.install_runtime_tools({'Inherits': _Inherits()})
+
+
+def _installs_from_a_tool_factory(
+    runtime: object, agent: BaseAgent, flags: object
+) -> Mapping[str, Tool]:
+    del runtime, flags
+    agent.install_runtime_tools({'Inherits': _Inherits()})
+    return {}
+
+
+def _writes_the_tool_table_from_a_tool_factory(
+    runtime: object, agent: BaseAgent, flags: object
+) -> Mapping[str, Tool]:
+    del runtime, flags
+    agent.options.tools['Inherits'] = _Inherits()
+    return {}
+
+
+def _installs_from_a_plugin_factory(
+    runtime: object, agent: BaseAgent, flags: object
+) -> _SneakyPlugin:
+    del runtime, flags
+    agent.install_runtime_tools({'Inherits': _Inherits()})
+    return _SneakyPlugin()
+
+
+def _installs_from_a_plugin_register(
+    runtime: object, agent: BaseAgent, flags: object
+) -> _SneakyPlugin:
+    del runtime, flags
+    return _SneakyPlugin(agent)
+
+
+@pytest.mark.parametrize(
+    ('module', 'where'),
+    [
+        (
+            RuntimeModule('sneaky', tool_factories=(_installs_from_a_tool_factory,)),
+            'tool_factories[0]',
+        ),
+        (
+            RuntimeModule('sneaky', tool_factories=(_writes_the_tool_table_from_a_tool_factory,)),
+            'tool_factories[0]',
+        ),
+        (
+            RuntimeModule('sneaky', agent_plugins=(_installs_from_a_plugin_factory,)),
+            'agent_plugins[0]',
+        ),
+        (
+            RuntimeModule('sneaky', agent_plugins=(_installs_from_a_plugin_register,)),
+            "插件 'sneaky' 的 register",
+        ),
+    ],
+    ids=['tool-factory', 'tool-table-write', 'plugin-factory', 'plugin-register'],
+)
+async def test_a_module_installing_a_tool_on_the_agent_directly_is_refused(
+    module: RuntimeModule, where: str
+):
+    captured: list[BaseAgent] = []
+    runtime = Runtime(modules=[module])
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_factory(captured))
+        error = excinfo.value
+        assert "Module 'sneaky' 的工具只经 tool_factories 交回的映射装上" in error.expected
+        assert where in error.received
+        assert "['Inherits']" in error.received
+        assert 'tool_factories 交回的映射里' in error.next_action
+        assert captured[0].options.tools == {}
+        assert await runtime.registry.list() == []
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_module_installing_even_a_declaring_tool_directly_is_refused():
+    def installs(runtime: object, agent: BaseAgent, flags: object) -> Mapping[str, Tool]:
+        del runtime, flags
+        agent.install_runtime_tools({'RunsCommands': _RunsCommands()})
+        return {}
+
+    runtime = Runtime(modules=[RuntimeModule('sneaky', tool_factories=(installs,))])
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_factory([]))
+        assert "['RunsCommands']" in excinfo.value.received
+    finally:
+        await runtime.shutdown()
+
+
+def _class_role(cls: type[BaseAgent], tools: Mapping[str, Tool] | None = None) -> Any:
+    catalog = AgentCatalog()
+    catalog.load_mapping(
+        {
+            'name': 'Planner',
+            'description': '规划范围时用我。',
+            'impl': cls,
+            'tools': list(tools or {}),
+        }
+    )
+    return catalog.freeze(dict(tools or {}), {'default': ScriptedLLM([])})['Planner']
+
+
+class _InstallsInheritedInItsConstructor(BaseAgent):
+    def __init__(self, options: AgentOptions, *, hooks: HooksCenter, events: EventBus) -> None:
+        super().__init__(options, hooks=hooks, events=events)
+        self.install_runtime_tools({'Inherits': _Inherits()})
+
+
+class _ReplacesAHostToolInItsConstructor(BaseAgent):
+    def __init__(self, options: AgentOptions, *, hooks: HooksCenter, events: EventBus) -> None:
+        super().__init__(options, hooks=hooks, events=events)
+        self.install_runtime_tools({'Declares': _InheritsUnderTheSameName()})
+
+
+class _WritesTheSharedTableInItsConstructor(BaseAgent):
+    def __init__(self, options: AgentOptions, *, hooks: HooksCenter, events: EventBus) -> None:
+        options.tools.setdefault('Inherits', _Inherits())
+        super().__init__(options, hooks=hooks, events=events)
+
+
+class _DeclaresInItsConstructor(BaseAgent):
+    def __init__(self, options: AgentOptions, *, hooks: HooksCenter, events: EventBus) -> None:
+        super().__init__(options, hooks=hooks, events=events)
+        self.install_runtime_tools({'RunsCommands': _RunsCommands()})
+
+
+@pytest.mark.parametrize(
+    ('cls', 'tool_name'),
+    [
+        (_InstallsInheritedInItsConstructor, 'Inherits'),
+        (_ReplacesAHostToolInItsConstructor, 'Declares'),
+    ],
+    ids=['added', 'replaced'],
+)
+def test_a_tool_a_class_role_installs_in_its_constructor_must_declare_on_its_own_class(
+    cls: type[BaseAgent], tool_name: str
+):
+    factory = _class_role(cls, {'Declares': _Declares()})
+    with pytest.raises(ConfigError) as excinfo:
+        factory(HooksCenter(), EventBus())
+    assert f'类式角色 {cls.__qualname__} 的构造函数' in excinfo.value.expected
+    assert repr(tool_name) in excinfo.value.expected
+    assert '继承来的声明不算' in excinfo.value.next_action
+
+
+def test_a_class_role_writing_the_shared_table_is_refused_on_every_spawn():
+    factory = _class_role(_WritesTheSharedTableInItsConstructor)
+    for _ in range(2):
+        with pytest.raises(ConfigError) as excinfo:
+            factory(HooksCenter(), EventBus())
+        assert "'Inherits'" in excinfo.value.expected
+
+
+def test_a_class_role_tool_declared_on_its_own_class_passes_the_constructor_check():
+    agent = _class_role(_DeclaresInItsConstructor, {'Declares': _Declares()})(
+        HooksCenter(), EventBus()
+    )
+    assert list(agent.options.tools) == ['Declares', 'RunsCommands']
+
+
+class _ReplacesAModuleTool(BaseAgent):
+    def install_own_tools(self, runtime: object) -> None:
+        del runtime
+        self.install_runtime_tools({'Declares': _InheritsUnderTheSameName()})
+
+
+async def test_a_class_role_replacing_a_tool_under_the_same_name_must_declare_on_its_own_class():
+    captured: list[BaseAgent] = []
+    runtime = Runtime(modules=[_module(_Declares())])
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_factory(captured, cls=_ReplacesAModuleTool))
+        assert '_ReplacesAModuleTool 的 install_own_tools' in excinfo.value.expected
+        assert '_InheritsUnderTheSameName' in excinfo.value.expected
+        assert captured[0].options.tools == {}
+    finally:
+        await runtime.shutdown()
+
+
+class _InstallsThreeOwnTools(BaseAgent):
+    def install_own_tools(self, runtime: object) -> None:
+        del runtime
+        self.install_runtime_tools(
+            {'RunsCommands': _RunsCommands(), 'Declares': _Declares(), 'Inherits': _Inherits()}
+        )
+
+
+async def test_every_tool_a_class_role_installs_is_checked_not_only_the_first():
+    runtime = Runtime()
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_factory([], cls=_InstallsThreeOwnTools))
+        assert "'Inherits'" in excinfo.value.expected
+    finally:
+        await runtime.shutdown()
+
+
+async def test_every_tool_a_module_returns_is_checked_not_only_the_first():
+    def three(*_: object) -> Mapping[str, Tool]:
+        return {'RunsCommands': _RunsCommands(), 'Declares': _Declares(), 'Inherits': _Inherits()}
+
+    runtime = Runtime(modules=[RuntimeModule('extra', tool_factories=(three,))])
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_factory([]))
+        assert "Module 'extra' 的工具 'Inherits'" in excinfo.value.expected
+    finally:
+        await runtime.shutdown()
+
+
+async def test_the_tools_of_every_module_are_checked_not_only_the_first_module():
+    runtime = Runtime(
+        modules=[
+            RuntimeModule('first', tool_factories=(lambda *_: {'Declares': _Declares()},)),
+            RuntimeModule('second', tool_factories=(lambda *_: {'Inherits': _Inherits()},)),
+        ]
+    )
+    try:
+        with pytest.raises(ConfigError) as excinfo:
+            await runtime.spawn(_factory([]))
+        assert "Module 'second' 的工具 'Inherits'" in excinfo.value.expected
     finally:
         await runtime.shutdown()

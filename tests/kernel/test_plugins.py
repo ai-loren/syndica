@@ -517,15 +517,41 @@ _OTHER_TRIGGER_SITES: tuple[str, ...] = ('kernel/agent.py', 'kernel/tool_executo
 _RUNTIME_MODULE = 'kernel/runtime.py'
 
 
-def _kernel_dispatch(node: ast.AST) -> ast.Call | None:
-    """`<接收者>.<属性>._dispatch(...)`：内核切点的触发点（`self._hooks._dispatch` /
-    `self.hooks._dispatch`）。`self._dispatch(...)` 不算——那是 `HooksCenter.trigger` 把扩展切点交给
-    同一条分发路径。"""
-    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-        return None
-    if node.func.attr != '_dispatch' or not isinstance(node.func.value, ast.Attribute):
-        return None
-    return node
+def _trigger_dispatch_calls(tree: ast.Module) -> list[ast.Call]:
+    """`HooksCenter.trigger` 里的 `_dispatch(...)`：扩展切点与独立中心上的内核切点从这里进同一条
+    分发路径，触发的是调用方交来的那一个，不是内核在固定位置的触发点。"""
+    found: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or node.name != 'HooksCenter':
+            continue
+        for member in node.body:
+            if (
+                isinstance(member, ast.AsyncFunctionDef | ast.FunctionDef)
+                and member.name == 'trigger'
+            ):
+                found.extend(
+                    inner
+                    for inner in ast.walk(member)
+                    if isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == '_dispatch'
+                )
+    return found
+
+
+def _kernel_dispatches(tree: ast.Module) -> list[ast.Call]:
+    """所有 `<接收者>._dispatch(...)`，不论接收者怎么写（`hooks = self._hooks; hooks._dispatch(...)`
+    也是一次内核触发），只除去 `HooksCenter.trigger` 里的那两处——按它们在哪里认，不按接收者的
+    形状认。"""
+    excluded = {id(call) for call in _trigger_dispatch_calls(tree)}
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == '_dispatch'
+        and id(node) not in excluded
+    ]
 
 
 def _names_a_kernel_junction(node: ast.expr | None) -> str | None:
@@ -550,9 +576,8 @@ def _junction_trigger_sites() -> tuple[dict[str, set[str]], list[str]]:
     for path in sorted(_PACKAGE.rglob('*.py')):
         relative = path.relative_to(_PACKAGE).as_posix()
         scanned.append(relative)
-        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
-            call = _kernel_dispatch(node)
-            if call is None or not call.args:
+        for call in _kernel_dispatches(ast.parse(path.read_text(encoding='utf-8'))):
+            if not call.args:
                 continue
             name = _names_a_kernel_junction(call.args[0])
             if name is not None:
@@ -565,10 +590,7 @@ def _dispatch_call_counts() -> tuple[int, int]:
     matched = 0
     total = 0
     for path in sorted(_PACKAGE.rglob('*.py')):
-        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
-            call = _kernel_dispatch(node)
-            if call is None:
-                continue
+        for call in _kernel_dispatches(ast.parse(path.read_text(encoding='utf-8'))):
             total += 1
             if _names_a_kernel_junction(call.args[0] if call.args else None) is not None:
                 matched += 1
@@ -618,6 +640,12 @@ def test_the_dispatch_matcher_sees_every_kernel_dispatch_call():
     """
     matched, total = _dispatch_call_counts()
     assert matched == total
+
+
+def test_the_only_dispatches_the_matcher_skips_are_the_two_inside_the_public_trigger():
+    tree = ast.parse((_PACKAGE / 'kernel' / 'hooks' / 'center.py').read_text(encoding='utf-8'))
+    skipped = _trigger_dispatch_calls(tree)
+    assert sorted(ast.unparse(call.args[0]) for call in skipped) == ['junction', 'resolved']
 
 
 def test_no_kernel_junction_goes_through_the_public_trigger():

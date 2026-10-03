@@ -2835,6 +2835,44 @@ def declared_command_args(tool: Tool) -> tuple[str, ...] | None:
     return names
 
 
+_MISSING = object()
+
+
+def require_own_command_args(tool: Tool, name: str, source: str) -> None:
+    """第三方交来的工具必须在**自己的类上**声明 `__tool_command_args__`（M4 D7）。
+
+    在自己的类上，而不是沿继承链找得到：继承一个 `()` 会让日后真会执行东西的子类静默失去危险判定
+    那道闸。实例上不得另有同名属性：判定器读属性时实例优先，类上的声明于是被盖掉。声明的那段解析
+    当场跑一遍，参数名写错在装配时就失败，而不是在第一次调用时让那道闸一句不说地落空。
+    """
+    cls = type(tool)
+    declared = cls.__dict__.get('__tool_command_args__', _MISSING)
+    if not (
+        isinstance(declared, tuple)
+        and all(isinstance(item, str) for item in cast(tuple[object, ...], declared))
+    ):
+        shown = '类上没有自己的声明' if declared is _MISSING else f'类上声明的是 {declared!r}'
+        raise ConfigError(
+            expected=(
+                f'{source} 的工具 {name!r}（{cls.__qualname__}）在自己的类上声明 '
+                '__tool_command_args__，值是参数名字符串的 tuple'
+            ),
+            received=f'{cls.__qualname__} 的{shown}',
+            next_action=(
+                '它不执行任何东西就在类体里写 __tool_command_args__ = ()；'
+                "否则列出会被执行的参数名，如 ('command',)。"
+                '继承来的声明不算：日后真会执行东西的子类会静默失去危险判定那道闸'
+            ),
+        )
+    if '__tool_command_args__' in getattr(tool, '__dict__', {}):
+        raise ConfigError(
+            expected=f'{source} 的工具 {name!r} 只在类上声明 __tool_command_args__',
+            received=f'{cls.__qualname__} 的实例上另有一个同名属性',
+            next_action='删掉实例上的那个：判定器先读实例属性，类上的声明会被它盖掉',
+        )
+    declared_command_args(tool)
+
+
 def _inspected_texts(tool: Tool, args: Mapping[str, Any]) -> tuple[list[str], bool]:
     """这次调用要检查的文本，以及这些文本是不是靠「没声明就全查」猜出来的。
 

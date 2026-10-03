@@ -1,9 +1,12 @@
 """装配期身份（M4 D5）：此刻在跑的是哪一段第三方装配代码。
 
-只在内核枚举的几处设：插件的 `register`（Runtime 插件 = 插件名，Module 插件 = Module 名）、Module 的
-服务工厂、`on_start`、工具工厂与插件工厂（= Module 名）。只用于声明扩展切点时核对 owner 段；运行期的
-触发靠持有句柄，不靠它——环境身份会经子任务、服务调用与并行分发泄漏。`_drive`、收割任务与关机任务
-开头清掉它。
+只在内核枚举的几处设：插件的 `register`（插件 = 插件名，Module 插件 = Module 名）、Module 的服务
+工厂、`on_start`、工具工厂与插件工厂（= Module 名）。只用于声明扩展切点时核对 owner 段；运行期的触发
+靠持有句柄，不靠它。
+
+它随 contextvar 进入装配代码里建的任务（比如服务工厂里 `create_task`），在那些任务里声明切点仍按
+装配期的规则判：只会更严，不会更松。内核自己建的任务（`_drive`、收割、关机）开头清掉它；装配期之外
+跑的 Module 代码（`on_shutdown`、工具的 `execute`）没有装配期身份，按宿主代码的规则声明。
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ class Installer:
     name: str
 
     def describe(self) -> str:
-        return f'Runtime 插件 {self.name!r}' if self.kind == 'plugin' else f'Module {self.name!r}'
+        return f'插件 {self.name!r}' if self.kind == 'plugin' else f'Module {self.name!r}'
 
 
 _INSTALLER: ContextVar[Installer | None] = ContextVar('syndica_installer', default=None)

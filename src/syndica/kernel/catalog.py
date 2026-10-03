@@ -22,7 +22,12 @@ from types import MappingProxyType
 from typing import Literal, cast
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
-from syndica.kernel.danger import DangerJudge, DangerPolicy, validate_danger_options
+from syndica.kernel.danger import (
+    DangerJudge,
+    DangerPolicy,
+    require_own_command_args,
+    validate_danger_options,
+)
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
@@ -286,8 +291,20 @@ class AgentCatalog:
             danger_policy=danger_policy,
         )
 
+        frozen_tools = dict(captured_tools)
+
         def factory(hooks: HooksCenter, events: EventBus) -> BaseAgent:
-            return cls(options, hooks=hooks, events=events)
+            agent = cls(options, hooks=hooks, events=events)
+            if cls is not BaseAgent:
+                # 类式角色的构造函数也能装工具（`impl:` 让第三方的类从配置进来）：与冻结时的那份比，
+                # 新增或换掉的工具同样要在自己的类上声明命令参数。比的是冻结时的拷贝：
+                # 构造函数就地改 `options.tools` 时，共享的那张表跟着变了。
+                for name, tool in agent.options.tools.items():
+                    if frozen_tools.get(name) is not tool:
+                        require_own_command_args(
+                            tool, name, f'类式角色 {cls.__qualname__} 的构造函数'
+                        )
+            return agent
 
         return factory
 

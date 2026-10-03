@@ -236,6 +236,16 @@ def _kernel_junction_triggered(junction: Junction) -> ContractViolation:
     )
 
 
+def _not_a_trigger_target(junction: object) -> ConfigError:
+    return ConfigError(
+        expected='trigger 收声明时交回的 ExtensionJunction（独立的中心上也收内核的 Junction）',
+        received=f'收到 {type(junction).__name__} 类型的 {junction!r}',
+        next_action=(
+            '传 declare_extension_junction 交回的句柄，或 Module 清单 junctions 里的那个对象'
+        ),
+    )
+
+
 def _string_trigger(name: str) -> ContractViolation:
     return ContractViolation(
         expected=f'扩展切点 {name} 用声明时交回的那个 ExtensionJunction 触发',
@@ -376,7 +386,7 @@ class HooksCenter:
         handle = ExtensionJunction(validated, checked)
         self._declared[validated] = (
             handle,
-            '宿主代码' if installer is None else installer.describe(),
+            '装配期之外的代码' if installer is None else installer.describe(),
         )
         return handle
 
@@ -409,7 +419,7 @@ class HooksCenter:
         # setdefault 而非下标：外层声明的扩展切点在本层的表里没有键，而它是合法的注册目标。
         self._hooks.setdefault(resolved, []).append(cb)
 
-    async def trigger(self, junction: ExtensionJunction, **kwargs: Any) -> HookResult:
+    async def trigger(self, junction: ExtensionJunction | Junction, **kwargs: Any) -> HookResult:
         """触发一个扩展切点，返回可拦截链的合并结论（spec §5.4）。
 
         只收声明时交回的那个句柄：字符串谁都拼得出来。从 Runtime 的中心触发只跑 Runtime 级的
@@ -425,11 +435,10 @@ class HooksCenter:
             if self._serves_a_runtime():
                 raise _kernel_junction_triggered(junction)
             return await self._dispatch(junction, **kwargs)
-        if isinstance(junction, str):
-            validated = self._resolved(junction)
-            raise _string_trigger(str(validated))
+        if isinstance(cast(object, junction), str):
+            raise _string_trigger(validated_extension_name(junction))
         if not isinstance(cast(object, junction), ExtensionJunction):
-            raise _not_a_junction(junction)
+            raise _not_a_trigger_target(junction)
         resolved = self._resolved(junction.name)
         declared = self._declared_handle(junction.name)
         if declared is not junction:

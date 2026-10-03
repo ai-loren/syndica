@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable, Mapping
 import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
-from syndica.kernel.errors import ContractViolation
+from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import ExtensionJunction, HookResult, HooksCenter, Junction, JunctionKind
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
@@ -297,3 +297,181 @@ def test_a_root_center_still_takes_runtime_only_junctions():
     center = HooksCenter()
     for junction in (Junction.AGENT_SPAWN, Junction.AGENT_DESPAWN, Junction.RUNTIME_SHUTDOWN):
         center.register(junction, noop)
+
+
+class _InheritsTheDeclaration(_Injected):
+    pass
+
+
+class _OwnToolInheritsTheDeclaration(BaseAgent):
+    def install_own_tools(self, runtime: object) -> None:
+        del runtime
+        self.install_runtime_tools({'InheritsTheDeclaration': _InheritsTheDeclaration()})
+
+
+def _cached(cls: type[BaseAgent], captured: list[BaseAgent]) -> Callable[..., BaseAgent]:
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        if not captured:
+            captured.append(
+                cls(
+                    AgentOptions(name='Worker', llm=ScriptedLLM([ScriptedTurn(content='done')])),
+                    hooks=hooks,
+                    events=events,
+                )
+            )
+        return captured[0]
+
+    return build
+
+
+async def test_a_spawn_refused_after_the_module_plugins_went_in_takes_them_out_again():
+    captured: list[BaseAgent] = []
+    seen: list[str] = []
+
+    def plugin(*_: object) -> _Plugin:
+        return _Plugin(
+            'module-hook',
+            lambda hooks: hooks.register(Junction.PRE_LLM_REQUEST, _recorder(seen, 'module')),
+        )
+
+    runtime = Runtime(modules=[RuntimeModule('hooked', agent_plugins=(plugin,))])
+    try:
+        with pytest.raises(ConfigError):
+            await runtime.spawn(_cached(_OwnToolInheritsTheDeclaration, captured))
+        (agent,) = captured
+        await agent._module_hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
+            Junction.PRE_LLM_REQUEST, ctx=None, request={'messages': []}
+        )
+        assert seen == []
+        assert agent.options.tools == {}
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_failed_spawn_takes_out_the_runtime_hooks_a_module_factory_registered():
+    seen: list[str] = []
+
+    def registers(runtime: Runtime, agent: object, flags: object) -> Mapping[str, Tool]:
+        del agent, flags
+        runtime.hooks.register(Junction.AGENT_DESPAWN, _recorder(seen, 'cleanup'))
+        return {}
+
+    def fails(*_: object) -> Mapping[str, Tool]:
+        raise RuntimeError('boom')
+
+    runtime = Runtime(
+        modules=[
+            RuntimeModule('first', tool_factories=(registers,)),
+            RuntimeModule('second', tool_factories=(fails,)),
+        ]
+    )
+    try:
+        with pytest.raises(RuntimeError):
+            await runtime.spawn(_factory([]))
+        await runtime.hooks._dispatch(Junction.AGENT_DESPAWN, agent_id='a')  # pyright: ignore[reportPrivateUsage]
+        assert seen == []
+    finally:
+        await runtime.shutdown()
+
+
+class _RegistersOnTheRuntimeThenInstallsAnInheritedTool(BaseAgent):
+    seen: list[str] = []
+
+    def install_own_tools(self, runtime: object) -> None:
+        assert isinstance(runtime, Runtime)
+        runtime.hooks.register(Junction.AGENT_DESPAWN, _recorder(self.seen, 'own'))
+        self.install_runtime_tools({'InheritsTheDeclaration': _InheritsTheDeclaration()})
+
+
+async def test_a_failed_spawn_takes_out_the_runtime_hooks_install_own_tools_registered():
+    seen: list[str] = []
+    _RegistersOnTheRuntimeThenInstallsAnInheritedTool.seen = seen
+    runtime = Runtime()
+    try:
+        with pytest.raises(ConfigError):
+            await runtime.spawn(_cached(_RegistersOnTheRuntimeThenInstallsAnInheritedTool, []))
+        await runtime.hooks._dispatch(Junction.AGENT_DESPAWN, agent_id='a')  # pyright: ignore[reportPrivateUsage]
+        assert seen == []
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_runtime_hook_registered_before_the_failed_spawn_stays():
+    seen: list[str] = []
+
+    def fails(*_: object) -> Mapping[str, Tool]:
+        raise RuntimeError('boom')
+
+    runtime = Runtime(modules=[RuntimeModule('failing', tool_factories=(fails,))])
+    runtime.hooks.register(Junction.AGENT_DESPAWN, _recorder(seen, 'host'))
+    try:
+        with pytest.raises(RuntimeError):
+            await runtime.spawn(_factory([]))
+        await runtime.hooks._dispatch(Junction.AGENT_DESPAWN, agent_id='a')  # pyright: ignore[reportPrivateUsage]
+        assert seen == ['host']
+    finally:
+        await runtime.shutdown()
+
+
+def _built_elsewhere() -> BaseAgent:
+    return BaseAgent(
+        AgentOptions(name='Prebuilt', llm=ScriptedLLM([ScriptedTurn(content='done')])),
+        hooks=HooksCenter(),
+        events=EventBus(),
+    )
+
+
+async def test_an_agent_built_elsewhere_gets_the_module_layer_refusals_too():
+    prebuilt = _built_elsewhere()
+
+    def plugin(*_: object) -> _Plugin:
+        return _Plugin(
+            'misplaced', lambda hooks: hooks.register(Junction.AGENT_SPAWN, _recorder([], 'x'))
+        )
+
+    runtime = Runtime(modules=[RuntimeModule('misplaced', agent_plugins=(plugin,))])
+    try:
+        with pytest.raises(ContractViolation) as excinfo:
+            await runtime.spawn(lambda hooks, events: prebuilt)
+        assert 'Module 层' in excinfo.value.expected
+    finally:
+        await runtime.shutdown()
+
+
+async def test_kernel_junctions_cannot_be_triggered_publicly_on_an_agent_built_elsewhere():
+    prebuilt = _built_elsewhere()
+    seen: list[str] = []
+    prebuilt.register_hook(Junction.PRE_TOOL_USE, _recorder(seen, 'local'))
+    runtime = Runtime()
+    try:
+        await runtime.spawn(lambda hooks, events: prebuilt)
+        with pytest.raises(ContractViolation):
+            await prebuilt._hooks.trigger(Junction.PRE_TOOL_USE, args={})  # pyright: ignore[reportPrivateUsage]
+        assert seen == []
+    finally:
+        await runtime.shutdown()
+
+
+async def test_an_agent_built_on_the_runtime_center_itself_is_refused():
+    runtime = Runtime()
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        del hooks
+        return BaseAgent(
+            AgentOptions(name='Worker', llm=ScriptedLLM([ScriptedTurn(content='done')])),
+            hooks=runtime.hooks,
+            events=events,
+        )
+
+    async def noop(**_: object) -> None:
+        return None
+
+    try:
+        with pytest.raises(ContractViolation) as excinfo:
+            await runtime.spawn(build)
+        assert '直接建在 runtime.hooks 上' in excinfo.value.received
+        assert '工厂收到的第一个参数' in excinfo.value.next_action
+        assert await runtime.registry.list() == []
+        runtime.hooks.register(Junction.AGENT_SPAWN, noop)
+    finally:
+        await runtime.shutdown()

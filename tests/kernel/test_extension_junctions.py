@@ -107,7 +107,7 @@ async def test_a_spawned_agents_module_layer_refuses_kernel_junctions():
         await runtime.spawn(_agent_factory(captured))
         module_layer = captured[0]._module_hooks  # pyright: ignore[reportPrivateUsage]
         with pytest.raises(ContractViolation):
-            await module_layer.trigger(Junction.TURN_START)  # pyright: ignore[reportArgumentType]
+            await module_layer.trigger(Junction.TURN_START)
     finally:
         await runtime.shutdown()
 
@@ -119,7 +119,7 @@ async def test_a_host_center_chained_to_a_runtime_refuses_kernel_junctions():
     inner = HooksCenter(outer=runtime.hooks)
     try:
         with pytest.raises(ContractViolation):
-            await inner.trigger(Junction.PRE_TOOL_USE)  # pyright: ignore[reportArgumentType]
+            await inner.trigger(Junction.PRE_TOOL_USE)
         assert seen == []
     finally:
         await runtime.shutdown()
@@ -131,7 +131,7 @@ async def test_a_free_standing_center_triggers_kernel_junctions_for_plugin_tests
     seen: list[str] = []
     inner.register(Junction.PRE_TOOL_USE, _recorder(seen, 'inner'))
     outer.register(Junction.PRE_TOOL_USE, _recorder(seen, 'outer'))
-    await inner.trigger(Junction.PRE_TOOL_USE, args={})  # pyright: ignore[reportArgumentType]
+    await inner.trigger(Junction.PRE_TOOL_USE, args={})
     assert seen == ['inner', 'outer']
 
 
@@ -183,7 +183,7 @@ async def test_a_handle_built_by_someone_else_with_the_same_name_is_refused():
     with pytest.raises(ContractViolation) as excinfo:
         await center.trigger(forged)
     assert '声明时交回的那个句柄' in excinfo.value.expected
-    assert '宿主代码' in excinfo.value.received
+    assert '装配期之外的代码' in excinfo.value.received
     assert '按对象身份比较' in excinfo.value.next_action
     assert seen == []
 
@@ -644,3 +644,34 @@ def test_a_failed_plugin_assembly_takes_back_the_junctions_declared_before_it():
         install_plugins(hooks, [_Plugin('first', declares), _Plugin('second', explodes)])  # pyright: ignore[reportArgumentType]
     assert dict(hooks.extension_junctions()) == {}
     hooks.declare_extension_junction('first:fired', JunctionKind.OBSERVABLE)
+
+
+async def test_triggering_something_that_is_no_junction_points_at_the_declared_handle():
+    with pytest.raises(ConfigError) as excinfo:
+        await HooksCenter().trigger(42)  # pyright: ignore[reportArgumentType]
+    _three_parts(excinfo.value)
+    assert 'int 类型的 42' in excinfo.value.received
+    assert 'declare_extension_junction 交回的句柄' in excinfo.value.next_action
+
+
+async def test_triggering_an_undeclared_name_is_refused_for_being_a_string():
+    with pytest.raises(ContractViolation) as excinfo:
+        await HooksCenter().trigger('audit:never')  # pyright: ignore[reportArgumentType]
+    assert "收到字符串 'audit:never'" in excinfo.value.received
+    assert 'declare_extension_junction 的返回值' in excinfo.value.next_action
+
+
+def test_register_hook_with_an_unhashable_junction_gets_the_centers_three_part_error():
+    agent = BaseAgent(
+        AgentOptions(name='Worker', llm=ScriptedLLM([ScriptedTurn(content='done')])),
+        hooks=HooksCenter(),
+        events=EventBus(),
+    )
+
+    async def noop(**_: object) -> None:
+        return None
+
+    with pytest.raises(ConfigError) as excinfo:
+        agent.register_hook(['x'], noop)  # pyright: ignore[reportArgumentType]
+    _three_parts(excinfo.value)
+    assert "['x']" in excinfo.value.received

@@ -1108,7 +1108,7 @@ async def test_declaring_an_extension_junction_twice_is_refused_even_with_the_sa
     with pytest.raises(ContractViolation) as excinfo:
         center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
     assert '只声明一次' in excinfo.value.expected
-    assert '宿主代码' in excinfo.value.received
+    assert '装配期之外的代码' in excinfo.value.received
     await center.trigger(created, artifact='raw')
     assert calls == ['existing']
 

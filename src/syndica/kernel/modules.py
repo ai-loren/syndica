@@ -16,7 +16,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, TypeAlias, cast
 
 from syndica import __version__
-from syndica.kernel.danger import declared_command_args
+from syndica.kernel.danger import require_own_command_args
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.hooks import HooksCenter
 from syndica.kernel.hooks.installing import installing
@@ -560,37 +560,20 @@ class SafetyModule(RuntimeModule):
         )
 
 
-_MISSING = object()
-
-
-def require_own_command_args(tool: Tool, name: str, source: str) -> None:
-    """第三方交来的工具必须在**自己的类上**声明 `__tool_command_args__`（M4 D7）。
-
-    在自己的类上，而不是沿继承链找得到：继承一个 `()` 会让日后真会执行东西的子类静默失去危险判定
-    那道闸。实例上不得另有同名属性：判定器读属性时实例优先，类上的声明于是被盖掉。声明的那段解析
-    当场跑一遍，参数名写错在装配时就失败，而不是在第一次调用时让那道闸一句不说地落空。
-    """
-    cls = type(tool)
-    declared = cls.__dict__.get('__tool_command_args__', _MISSING)
-    if not (
-        isinstance(declared, tuple)
-        and all(isinstance(item, str) for item in cast(tuple[object, ...], declared))
-    ):
-        shown = '类上没有自己的声明' if declared is _MISSING else f'类上声明的是 {declared!r}'
+def _refuse_direct_installs(
+    agent: BaseAgent, before: Mapping[str, Tool], module: str, where: str
+) -> None:
+    """Module 的工具只经 `tool_factories` 的返回值装上：D7 的声明检查与之后按 Module 认的一切都按
+    那张表来，工厂里直接往 Agent 上装的工具绕过了它们。"""
+    added = sorted(
+        name for name, tool in agent.options.tools.items() if before.get(name) is not tool
+    )
+    if added:
         raise _config(
-            f'{source} 的工具 {name!r}（{cls.__qualname__}）在自己的类上声明 '
-            '__tool_command_args__，值是参数名字符串的 tuple',
-            f'{cls.__qualname__} 的{shown}',
-            '它不执行任何东西就在类体里写 __tool_command_args__ = ()；否则列出会被执行的参数名，'
-            "如 ('command',)。继承来的声明不算：日后真会执行东西的子类会静默失去危险判定那道闸",
+            f'Module {module!r} 的工具只经 tool_factories 交回的映射装上',
+            f'它的 {where} 在调用期间直接往 Agent 上装了 {added}',
+            '把这些工具放进 tool_factories 交回的映射里；直接装的工具绕过了命令参数声明的检查',
         )
-    if '__tool_command_args__' in getattr(tool, '__dict__', {}):
-        raise _config(
-            f'{source} 的工具 {name!r} 只在类上声明 __tool_command_args__',
-            f'{cls.__qualname__} 的实例上另有一个同名属性',
-            '删掉实例上的那个：判定器先读实例属性，类上的声明会被它盖掉',
-        )
-    declared_command_args(tool)
 
 
 def _module_sequence(value: object) -> tuple[RuntimeModule, ...]:
@@ -719,18 +702,22 @@ class _ModulePlugin:
     """冻结一次读到的插件名，同时保留原插件的 register 行为。register 期间的装配期身份是 Module 名，
     不是插件名：Module 的切点写在清单里，它的插件不在 register 里声明。"""
 
-    def __init__(self, name: str, plugin: Plugin, module: str) -> None:
+    def __init__(self, name: str, plugin: Plugin, module: str, agent: BaseAgent) -> None:
         self._name = name
         self._plugin = plugin
         self._module = module
+        self._agent = agent
 
     @property
     def name(self) -> str:
         return self._name
 
     def register(self, hooks: HooksCenter) -> None:
+        before = dict(self._agent.options.tools)
         with installing('module', self._module):
             self._plugin.register(hooks)
+        where = f'插件 {self._name!r} 的 register'
+        _refuse_direct_installs(self._agent, before, self._module, where)
 
 
 class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
@@ -773,8 +760,10 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
         tool_batches: list[tuple[str, dict[str, Tool]]] = []
         for module in self.module_objects:
             for index, factory in enumerate(module.agent_plugins):
+                before = dict(agent.options.tools)
                 with installing('module', module.name):
                     produced = cast(object, factory(runtime, agent, flags))
+                _refuse_direct_installs(agent, before, module.name, f'agent_plugins[{index}]')
                 if inspect.isawaitable(produced):
                     if inspect.iscoroutine(produced):
                         produced.close()
@@ -818,10 +807,14 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
                         '给其中一个插件换名，或只保留一个提供该插件的 Module',
                     )
                 plugin_owners[plugin_name] = module.name
-                plugins.append(_ModulePlugin(plugin_name, cast(Plugin, produced), module.name))
+                plugins.append(
+                    _ModulePlugin(plugin_name, cast(Plugin, produced), module.name, agent)
+                )
             for index, factory in enumerate(module.tool_factories):
+                before = dict(agent.options.tools)
                 with installing('module', module.name):
                     produced = cast(object, factory(runtime, agent, flags))
+                _refuse_direct_installs(agent, before, module.name, f'tool_factories[{index}]')
                 if inspect.isawaitable(produced):
                     if inspect.iscoroutine(produced):
                         produced.close()

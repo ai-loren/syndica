@@ -97,7 +97,6 @@ from syndica.kernel.hooks import (
     Junction,
     JunctionRef,
 )
-from syndica.kernel.hooks.junctions import RUNTIME_ONLY
 from syndica.kernel.ids import assigned_agent_id
 from syndica.kernel.llm import LLM, ContextOverflowError
 from syndica.kernel.plugins import Plugin, install_plugins
@@ -115,18 +114,6 @@ from syndica.kernel.tracing import (
 )
 
 __all__ = ['AgentOptions', 'BaseAgent']
-
-
-def _runtime_only_junction(junction: Junction) -> ContractViolation:
-    return ContractViolation(
-        expected=f'挂在 Agent 局部层的切点由本 Agent 自己触发；{junction.value} 不是其中之一',
-        received=f'收到把 {junction.value} 挂到单个 Agent 上的请求',
-        next_action=(
-            f'改挂到 Runtime 的中心：runtime.hooks.register(Junction.{junction.name}, cb)。'
-            f'{junction.value} 只从那里触发，而外层的 trigger 看不到 Agent 局部层的 hook——'
-            '挂在这里的回调一次都不会跑'
-        ),
-    )
 
 
 @dataclass
@@ -487,11 +474,9 @@ class BaseAgent:
         两层是一条链，因此局部 hook 的 `modified` 会成为插件看到的入参，它的 `skip` 会连插件的
         hook 一起终止。反过来不成立——宿主从 Runtime 的中心触发时看不到这里挂的任何东西。
 
-        `RUNTIME_ONLY` 那三个切点在这一层上响亮失败：正因为外层看不见内层，它们只从 `Runtime` 的
-        中心触发，挂在这里的回调**结构上永不触发**。
+        `RUNTIME_ONLY` 那三个切点在这一层上响亮失败（局部中心自己拒）：正因为外层看不见内层，它们
+        只从 `Runtime` 的中心触发，挂在这里的回调**结构上永不触发**。
         """
-        if junction in RUNTIME_ONLY:
-            raise _runtime_only_junction(junction)
         self._hooks.register(junction, cb)
 
     async def trigger_extension(self, handle: ExtensionJunction, **kwargs: Any) -> HookResult:

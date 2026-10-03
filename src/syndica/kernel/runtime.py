@@ -139,6 +139,7 @@ from syndica.kernel.danger import (
     ConfirmationRequest,
     DangerJudge,
     DangerPolicy,
+    require_own_command_args,
     validate_confirmation_handler,
 )
 from syndica.kernel.errors import ConfigError, ContractViolation
@@ -166,7 +167,6 @@ from syndica.kernel.modules import (
     FlagValue,
     RuntimeModule,
     _RuntimeModuleAssembly,  # pyright: ignore[reportPrivateUsage]
-    require_own_command_args,
 )
 from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker
@@ -451,6 +451,20 @@ def validate_agent_factories(agents: Mapping[str, AgentFactory]) -> None:
             raise _bad_agent_factory(
                 name, factory, f'收到 {factory!r}，它收不下 (hooks, events) 两个位置参数：{exc}'
             ) from exc
+
+
+def _agent_on_the_runtime_center(factory: AgentFactory) -> ContractViolation:
+    return ContractViolation(
+        expected='工厂用 spawn 交给它的 hooks 构造 Agent',
+        received=(
+            f'{getattr(factory, "__qualname__", repr(factory))}'
+            ' 交回的 Agent 直接建在 runtime.hooks 上'
+        ),
+        next_action=(
+            '把工厂收到的第一个参数作为 hooks 传给 Agent；'
+            '要给所有 Agent 挂 hook 就用 Runtime 插件，而不是把 Agent 建在 Runtime 的中心上'
+        ),
+    )
 
 
 def _bad_factory_return(factory: AgentFactory, produced: object) -> ContractViolation:
@@ -1074,7 +1088,6 @@ class Runtime:
         # 下面的 isinstance 就成了 pyright 眼里的死代码。
         module_hooks = HooksCenter(outer=self.hooks)
         module_hooks._serve_one_agent()  # pyright: ignore[reportPrivateUsage]
-        module_hooks._serve_runtime()  # pyright: ignore[reportPrivateUsage]
         token = assigning_agent_id(assigned)
         try:
             produced = cast('object', factory(module_hooks, self.events))
@@ -1083,6 +1096,14 @@ class Runtime:
         if not isinstance(produced, BaseAgent):
             raise _bad_factory_return(factory, produced)
         agent = produced
+        # 工厂交回的 Agent 可能建在别的中心上（在别处建好的实例）：Module 插件照样装进它的 Module
+        # 层，所以那一层同样标成「服务单个 Agent、属于 Runtime」——挂不上只由 Runtime 触发的切点，
+        # 公开入口也触发不了内核切点。建在 Runtime 中心本身上的不能这样标：那会让 Runtime 级也
+        # 挂不上那几个切点，Module 插件也会落到每个 Agent 身上。
+        if agent._module_hooks is self.hooks:  # pyright: ignore[reportPrivateUsage]
+            raise _agent_on_the_runtime_center(factory)
+        agent._module_hooks._serve_one_agent()  # pyright: ignore[reportPrivateUsage]
+        agent._module_hooks._serve_runtime()  # pyright: ignore[reportPrivateUsage]
         agent_id = agent.agent_id
         # 按类型比而不是 isinstance：记录用的源最自然的写法就是继承 RandomIds，它要这条警告。
         if agent_id != assigned and type(self._ids) is not RandomIds:
@@ -1128,6 +1149,9 @@ class Runtime:
             raise _cannot_register_metadata(agent_id, metadata or {}, exc) from exc
         control = ControlBlock()
         gate = BrokerTurnGate(agent_id, self.broker, control)
+        # Module 的工厂与 install_own_tools 拿得到 runtime，可能往 Runtime 级挂 hook：装配失败时一并
+        # 还原。快照取在最后一个 await 之后：装配这段同步执行，还原不会盖掉别人同时挂上的 hook。
+        runtime_hooks = self.hooks._assembly_snapshot()  # pyright: ignore[reportPrivateUsage]
         try:
             role_tools = frozenset(agent.options.tools)
             self._install_orchestration(agent, agent_id)
@@ -1156,6 +1180,7 @@ class Runtime:
             agent._attach_tracing(self._tracing)  # pyright: ignore[reportPrivateUsage]
         except BaseException:
             agent._assembly_restore(assembly_snapshot)  # pyright: ignore[reportPrivateUsage]
+            self.hooks._assembly_restore(runtime_hooks)  # pyright: ignore[reportPrivateUsage]
             raise
         registered = False
         queue_attempted = False

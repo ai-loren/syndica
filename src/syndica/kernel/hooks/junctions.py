@@ -202,9 +202,9 @@ def validated_extension_name(name: object) -> str:
     参数标注为 object 而非 str，理由同 `validated_kind`。
 
     每一种畸形单独报，不交给一条正则：读者要知道自己错在哪一段。四类畸形一律**拒绝而非归一化**
-    （不 strip、不折叠大小写、不切首个分隔符）——切点名计入公开 API，允许两种拼法映射到同一个
-    切点，日后把 `owner` 绑到注册者身份时就没有唯一的规范拼法可比。放宽接受面日后不是破坏性
-    变更，收紧则是，所以现在按最窄的收。
+    （不 strip、不折叠大小写、不切首个分隔符）——切点名计入公开 API，`owner` 段又要与声明者的名字
+    逐字比对（插件名、Module 名），允许两种拼法映射到同一个切点就没有唯一的规范拼法可比。放宽接受面
+    不是破坏性变更，收紧则是，所以按最窄的收。
     """
     if not isinstance(name, str):
         raise _not_an_extension_name(name)
@@ -243,8 +243,8 @@ def validated_extension_name(name: object) -> str:
             expected='扩展切点名的 owner 段与 event 段都非空',
             received=f'收到 {name!r}，owner={owner!r} event={event!r}',
             next_action=(
-                'owner 段写这个切点属于谁（日后按注册者标识校验它，两个扩展才抢不到同一个名字，'
-                '也冒用不了对方的切点名发事件），event 段写发生了什么'
+                'owner 段写这个切点属于谁（在插件里声明时它等于插件名，'
+                'Module 的切点等于 Module 名），event 段写发生了什么'
             ),
         )
     return name
