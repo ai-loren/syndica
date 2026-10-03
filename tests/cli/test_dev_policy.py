@@ -16,6 +16,7 @@ from syndica.cli.main import CliIO, RunRequest
 from syndica.cli.policy import dev_danger_options, dev_guard_judge
 from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
+    AskUser,
     ConfigError,
     ContextBlock,
     DangerJudge,
@@ -348,8 +349,16 @@ async def test_the_guard_judges_every_argument_of_a_tool_that_declared_nothing(
 ) -> None:
     assert await _guarded(tmp_path, _Undeclared(), {'script': 'git push'})
     assert await _guarded(tmp_path, _Shell(), {'command': 'git push'})
-    assert not await _guarded(tmp_path, _Declares(), {'note': 'git push'})
     assert not await _guarded(tmp_path, _Undeclared(), {'script': 'git status'})
+
+
+async def test_only_syndicas_own_tools_are_exempt_by_declaring_nothing_runs(
+    tmp_path: Path,
+) -> None:
+    ours = AskUser(cast(Any, None), 'agent')
+    assert not await _guarded(tmp_path, ours, {'question': 'git push'})
+    assert await _guarded(tmp_path, _Declares(), {'note': 'git push'})
+    assert not await _guarded(tmp_path, _Declares(), {'note': 'git status'})
 
 
 def test_the_guard_judge_knows_only_the_two_never_allowed_families(tmp_path: Path) -> None:

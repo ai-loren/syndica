@@ -307,7 +307,20 @@ confirmation lists such `sys.path` entries so you can see them. Install syndica 
 workspaces agents operate on to avoid this.
 
 `modules:` enables optional modules in the order written; `syndica modules list` shows which ones
-exist and where they come from without importing any of them.
+exist and where they come from without importing any of them. Besides the built-in `retry` and
+`prefix-drift`, it can name a third-party module installed under the `syndica.modules` entry-point
+group. Its entry point is a callable `factory(host: ModuleHost) -> RuntimeModule`; the entry-point
+name must equal the module's name, and its flag keys must start with the module name (`example`
+becomes `example_`) and must not look like secrets. A third-party module runs in-process with
+your full environment, so the confirmation shows it and covers its code when that code lives in
+the workspace; a distribution installed inside the workspace is also checked against its
+`RECORD`. Its tool results, and any result its hooks write for other tools, are marked untrusted;
+`--trust-module-output <name>` on `run` or `chat` lifts that for one module, and a project
+configuration cannot. Runs with a third-party module do not write a replay document yet.
+
+`flags:` overrides flag defaults for the run; `--flag key=value` overrides `flags:`. Both go through
+the same checks against the installed modules' declarations, and a project configuration may only
+tighten: `untrusted_high_risk` accepts only `reject` there.
 
 `danger.roles` gives a role a stricter disposition than the development table every run uses:
 `rules` raises single rules to `confirm` or `block`, and `policy: block_high_risk` blocks every

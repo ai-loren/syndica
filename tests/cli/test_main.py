@@ -41,6 +41,7 @@ class _Host:
         self.trusted: list[tuple[str, str | None]] = []
         self.doctor_verify: list[bool] = []
         self.chat_turn_limits: list[int | None] = []
+        self.chat_trusted_output: list[tuple[str, ...]] = []
         self.chat_traces: list[tuple[str | None, tuple[str, ...]]] = []
         self.traces: list[TraceRequest] = []
 
@@ -64,8 +65,10 @@ class _Host:
         *,
         trace: str | None = None,
         argv: Sequence[str] = (),
+        trusted_output: Sequence[str] = (),
     ) -> str:
         assert config == '.syndica.yaml'
+        self.chat_trusted_output.append(tuple(trusted_output))
         self.chat_turn_limits.append(max_turns)
         self.chat_traces.append((trace, tuple(argv)))
         return 'root-agent-id'
@@ -179,6 +182,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'max_tokens': None,
         'max_wall_clock': None,
         'flags': (),
+        'trust_module_output': (),
         'no_write': False,
         'handoff': False,
         'git_mode': None,
@@ -196,6 +200,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'max_tokens': 4096,
         'max_wall_clock': 30.0,
         'flags': ('retry_enabled=true', 'attempts=3'),
+        'trust_module_output': (),
         'no_write': True,
         'handoff': False,
         'git_mode': None,
@@ -603,6 +608,19 @@ def test_chat_forwards_its_turn_limit_to_the_host() -> None:
     assert host.chat_turn_limits == [4]
 
 
+def test_chat_forwards_the_modules_whose_output_the_user_trusts() -> None:
+    host = _Host()
+
+    code = main(
+        ['chat', '--trust-module-output', 'alpha', '--trust-module-output', 'beta'],
+        host=host,
+        io=CliIO(stdin=StringIO(':quit\n'), stdout=StringIO(), stderr=StringIO()),
+    )
+
+    assert code == 0
+    assert host.chat_trusted_output == [('alpha', 'beta')]
+
+
 def test_module_host_forwards_the_chat_options_and_the_interruption_to_the_runtime_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -610,6 +628,7 @@ def test_module_host_forwards_the_chat_options_and_the_interruption_to_the_runti
     from syndica.__main__ import _LazyHost  # pyright: ignore[reportPrivateUsage]
 
     opened: list[tuple[str, int | None, str | None, tuple[str, ...]]] = []
+    trusted: list[tuple[str, ...]] = []
     closed: list[bool] = []
 
     class RecordingHost:
@@ -623,8 +642,10 @@ def test_module_host_forwards_the_chat_options_and_the_interruption_to_the_runti
             *,
             trace: str | None = None,
             argv: Sequence[str] = (),
+            trusted_output: Sequence[str] = (),
         ) -> str:
             opened.append((config, max_turns, trace, tuple(argv)))
+            trusted.append(tuple(trusted_output))
             return 'root-agent-id'
 
         def close(self, *, interrupted: bool = False) -> None:
@@ -633,11 +654,14 @@ def test_module_host_forwards_the_chat_options_and_the_interruption_to_the_runti
     monkeypatch.setattr(host_module, 'RuntimeCliHost', RecordingHost)
     lazy = _LazyHost(CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()))
 
-    target = lazy.open_chat('.syndica.yaml', 3, trace='full', argv=['chat', '--trace', 'full'])
+    target = lazy.open_chat(
+        '.syndica.yaml', 3, trace='full', argv=['chat', '--trace', 'full'], trusted_output=['x']
+    )
     lazy.close(interrupted=True)
 
     assert target == 'root-agent-id'
     assert opened == [('.syndica.yaml', 3, 'full', ('chat', '--trace', 'full'))]
+    assert trusted == [('x',)]
     assert closed == [True]
 
 

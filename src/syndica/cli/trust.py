@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import functools
 import hashlib
 import importlib.machinery
@@ -92,6 +93,7 @@ class ConfigSnapshot:
     modules: tuple[Discovered, ...]
     digest: str
     path_entries: tuple[str, ...] = ()
+    module_sources: tuple[ImplSource, ...] = ()
 
 
 def _read(path: Path, what: str) -> bytes:
@@ -252,9 +254,21 @@ def read_snapshot(
     for impl in impls:
         lines.append(json.dumps(['impl', impl.index, impl.target, impl.where]))
         lines.extend(json.dumps(['file', name, _sha(data)]) for name, data in impl.files)
+    module_sources: list[ImplSource] = []
     for module in enabled:
         lines.append(
             json.dumps(['module', module.name, module.target, module.distribution, module.version])
+        )
+        source = _impl_source(-1, module.target, workspace)
+        module_sources.append(source)
+        lines.append(json.dumps(['module-code', module.name, source.where]))
+        lines.extend(
+            json.dumps(['module-file', module.name, name, _sha(data)])
+            for name, data in source.files
+        )
+        lines.extend(
+            json.dumps(['module-record', module.name, name, sha])
+            for name, sha in _verified_record(module, workspace)
         )
     digest = _sha('\n'.join(lines).encode('utf-8'))
     return ConfigSnapshot(
@@ -265,6 +279,55 @@ def read_snapshot(
         modules=tuple(enabled),
         digest=digest,
         path_entries=_workspace_path_entries(workspace),
+        module_sources=tuple(module_sources),
+    )
+
+
+def _verified_record(module: Discovered, workspace: Path) -> list[tuple[str, str]]:
+    """装在工作区之内的发行版：每个文件按它的 `RECORD` 核对哈希，交回 (路径, sha256) 进摘要。
+    Agent 写得到工作区里的 `.venv`，第一次确认之前就可能改过那里装好的代码。`__pycache__` 不算：
+    Python import 时就会重写它，算进来摘要每次都变。装在工作区之外的不核对。"""
+    dist = module.dist
+    files = cast('Sequence[object] | None', getattr(dist, 'files', None))
+    locate = getattr(dist, 'locate_file', None)
+    if not files or not callable(locate):
+        return []
+    if not within(Path(cast(str, locate(''))), workspace):
+        return []
+    verified: list[tuple[str, str]] = []
+    for entry in files:
+        shown = str(entry)
+        if '__pycache__' in Path(shown).parts:
+            continue
+        path = Path(cast(str, locate(entry)))
+        data = _read(path, f'发行版 {module.distribution} 的文件')
+        recorded = getattr(entry, 'hash', None)
+        if recorded is not None:
+            mode = str(getattr(recorded, 'mode', ''))
+            try:
+                digest = hashlib.new(mode, data).digest()
+            except ValueError:
+                raise _record_mismatch(
+                    module, shown, f'RECORD 用了认不出的哈希算法 {mode!r}'
+                ) from None
+            actual = base64.urlsafe_b64encode(digest).rstrip(b'=').decode('ascii')
+            if actual != getattr(recorded, 'value', None):
+                raise _record_mismatch(module, shown, '内容与安装时记下的哈希不符')
+        verified.append((shown, _sha(data)))
+    return verified
+
+
+def _record_mismatch(module: Discovered, path: str, why: str) -> ConfigError:
+    return ConfigError(
+        expected=(
+            f'第三方 Module {module.name!r} 的发行版 {module.distribution} {module.version} '
+            '在工作区之内的文件与它的 RECORD 一致'
+        ),
+        received=f'{path}：{why}',
+        next_action=(
+            '它装好之后被改过（工作区里的东西 Agent 都写得到）：重新安装这个发行版再确认；'
+            '把 syndica 与它装在工作区之外更稳妥'
+        ),
     )
 
 
@@ -325,9 +388,9 @@ def describe(snapshot: ConfigSnapshot, config: CliConfig) -> str:
         [
             *config.modules,
             *(
-                f'{module.name} 来自 {module.distribution} {module.version}（{module.target}）；'
-                '能力在信任之后用 syndica modules show 查看'
-                for module in snapshot.modules
+                f'{module.name} 来自 {module.distribution} {module.version}（{module.target}，'
+                f'{source.where}）；能力在信任之后用 syndica modules show 查看'
+                for module, source in zip(snapshot.modules, snapshot.module_sources, strict=True)
             ),
         ],
     )

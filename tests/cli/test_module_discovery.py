@@ -112,9 +112,10 @@ def test_module_rows_put_builtins_first_in_install_order_then_third_parties():
     assert rows[6].source == 'syndica-example-module 1.2.0'
 
 
-def test_only_optional_builtins_can_be_enabled_in_this_version():
+def test_optional_builtins_and_discovered_third_party_modules_can_be_enabled_in_order():
     discovered = discover(_source(_ep('alpha')))
-    assert validated_modules(('prefix-drift', 'retry'), discovered) == ('prefix-drift', 'retry')
+    enabled = ('prefix-drift', 'alpha', 'retry')
+    assert validated_modules(enabled, discovered) == enabled
 
 
 @pytest.mark.parametrize(
@@ -124,7 +125,6 @@ def test_only_optional_builtins_can_be_enabled_in_this_version():
         ('human-interaction', '宿主必装'),
         ('dev', '开发期'),
         ('read-only', '开发期'),
-        ('alpha', '信任确认'),
         ('nowhere', 'syndica modules list'),
         ('retry-x', 'syndica modules list'),
     ],

@@ -76,6 +76,16 @@ def _explained(verdict: DangerVerdict) -> str:
     )
 
 
+def _ours(tool: Tool) -> bool:
+    return type(tool).__module__.partition('.')[0] == 'syndica'
+
+
+def _undeclared(tool: Tool) -> Tool:
+    """同名、但没声明命令参数的替身：判定器只读声明与类名，于是对它按「每个参数都可能被执行」判。"""
+    stand_in = type(type(tool).__name__, (), {'__tool_command_args__': None})
+    return cast(Tool, stand_in())
+
+
 class _Guard:
     def __init__(self, judge: DangerJudge) -> None:
         self._judge = judge
@@ -91,9 +101,13 @@ class _Guard:
         tool = cast(Tool, kwargs['tool'])
         # 与处置闸同一套约定：`()` 声明没有会被执行的参数；没声明（None）按每个参数都会执行来判。
         # 跳过没声明的工具，`untrusted_high_risk=ask` 下它的 git 写命令就从拦下降成问人。
+        # syndica 之外的代码自己声明的 `()` 不认：继承一个 `()` 就能让真会执行命令的工具躲开这道闸。
+        judged = tool
         if tool.__tool_command_args__ == ():
-            return HookResult()
-        verdict = self._judge.judge(tool, cast(Mapping[str, Any], kwargs['args']))
+            if _ours(tool):
+                return HookResult()
+            judged = _undeclared(tool)
+        verdict = self._judge.judge(judged, cast(Mapping[str, Any], kwargs['args']))
         if verdict.level is RiskLevel.NONE:
             return HookResult()
         return HookResult(
@@ -285,7 +299,6 @@ class _Recorder:
         return 'dev-log'
 
     def register(self, hooks: HooksCenter) -> None:
-        hooks.register(Junction.POST_TOOL_USE, self._recorded)
         hooks.register(Junction.AGENT_START, self._began)
         hooks.register(Junction.AGENT_END, self._ended)
         hooks.register(Junction.AGENT_ERROR, self._failed)
@@ -432,7 +445,13 @@ class DevModule(RuntimeModule):
             # 登记在工厂里做：它同步执行，早于这个 Agent 的任务开始；AGENT_SPAWN 不带角色，而且
             # 在子 Agent 已经开始跑之后才触发。
             log.enroll(member.agent_id, role)
-            return _Recorder(log, host, member.agent_id, role, git if role in reviewers else None)
+            recorder = _Recorder(
+                log, host, member.agent_id, role, git if role in reviewers else None
+            )
+            # 记录挂在 Agent 的局部层：它排在整条链最前，后面任何一个 hook 的裸 skip 都截不断它，
+            # 它看到的也是工具自己交回的结果，而不是别人改写过的那一份。
+            member.register_hook(Junction.POST_TOOL_USE, recorder._recorded)  # pyright: ignore[reportPrivateUsage]
+            return recorder
 
         def dev_log(runtime: object, flags: object) -> DevLog:
             del runtime, flags

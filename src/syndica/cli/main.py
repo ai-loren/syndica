@@ -61,6 +61,7 @@ class RunRequest:
     max_tokens: int | None = None
     max_wall_clock: float | None = None
     flags: tuple[str, ...] = ()
+    trust_module_output: tuple[str, ...] = ()
     no_write: bool = False
     handoff: bool = False
     git_mode: str | None = None
@@ -127,6 +128,7 @@ class CliHost(Protocol):
         *,
         trace: str | None = None,
         argv: Sequence[str] = (),
+        trusted_output: Sequence[str] = (),
     ) -> str: ...
 
     def active_agents(self) -> str: ...
@@ -228,6 +230,16 @@ def _parser() -> _ArgumentParser:
     chat = commands.add_parser('chat')
     chat.add_argument('--max-turns', type=_positive_int)
     for command in (run, chat):
+        command.add_argument(
+            '--trust-module-output',
+            action='append',
+            default=[],
+            metavar='MODULE',
+            help=(
+                '把这个第三方 Module 的工具结果当作可信（可重复）；缺省一律标成不可信，'
+                '项目配置放不开这一项'
+            ),
+        )
         command.add_argument(
             '--trace',
             choices=_TRACE_LEVELS,
@@ -404,9 +416,12 @@ def _chat(
     *,
     trace: str | None,
     argv: Sequence[str],
+    trusted_output: Sequence[str] = (),
 ) -> int:
+    # 只在给了 --trust-module-output 时才传这个参数：没有它的宿主实现照样能开 chat。
+    extra = {'trusted_output': tuple(trusted_output)} if trusted_output else {}
     try:
-        target = host.open_chat(config, max_turns, trace=trace, argv=argv)
+        target = host.open_chat(config, max_turns, trace=trace, argv=argv, **extra)
     except Exception as exc:
         return _host_failure(exc, streams)
     while True:
@@ -588,6 +603,7 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
             namespace.max_turns,
             trace=namespace.trace,
             argv=received,
+            trusted_output=namespace.trust_module_output,
         )
     request = RunRequest(
         prompt=' '.join(namespace.prompt),
@@ -600,6 +616,7 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
         max_tokens=namespace.max_tokens,
         max_wall_clock=namespace.max_wall_clock,
         flags=flags,
+        trust_module_output=tuple(namespace.trust_module_output),
         no_write=namespace.no_write,
         handoff=namespace.handoff,
         git_mode=namespace.git_mode,

@@ -39,6 +39,7 @@ from syndica.cli.export import (
     environment_resource,
     environment_target,
 )
+from syndica.cli.flags import parse_assignments, refused, resolved_flags
 from syndica.cli.git_finish import (
     Finish,
     GitInterrupted,
@@ -81,8 +82,10 @@ from syndica.cli.modules import (
     OPTIONAL_BUILTINS,
     EntryPointSource,
     discover,
+    load_module,
     module_rows,
     no_entry_points,
+    third_party,
     validated_modules,
 )
 from syndica.cli.policy import dev_danger_options, role_policies
@@ -132,7 +135,6 @@ from syndica.kernel import (
     ExecResult,
     ExitMode,
     FileTraceStore,
-    FlagDeclaration,
     HookResult,
     HooksCenter,
     HostFacts,
@@ -140,6 +142,7 @@ from syndica.kernel import (
     Junction,
     LocalWorkspace,
     MailboxConfirmationHandler,
+    ModuleHost,
     Portal,
     PrefixDriftModule,
     RetryModule,
@@ -180,8 +183,6 @@ _SHELL = '/bin/sh'
 # 文件只由宿主写。不整个关 `.syndica`：本仓的 Worker 把长输出存进 `.syndica/tmp/` 再读。
 _PRIVATE = ('.syndica/traces', '.syndica/handoffs')
 _INCOMPLETE_TRACE = 'trace（不完整，原因见上面的 ERROR；不要拿它回放）'
-# CLI 拒收的 Flag 取值：`--flag` 报错，`flags show` 不列。
-_REFUSED_FLAG_VALUE = ('untrusted_high_risk', 'allow')
 # `run --no-write` 在清单与槽里留下的工具。白名单而不是去掉几个写工具：以后新增的可写工具默认
 # 进不来。派活与问人的工具不经清单，由 Runtime 与 Module 另装。
 _READ_ONLY_TOOLS = frozenset({'Glob', 'Grep', 'Read'})
@@ -526,85 +527,7 @@ def _config_error(expected: str, received: str, next_action: str) -> ConfigError
     return ConfigError(expected=expected, received=received, next_action=next_action)
 
 
-def _request_flags(
-    assignments: tuple[str, ...],
-    declarations: tuple[FlagDeclaration, ...],
-) -> dict[str, bool | int | str]:
-    declared = {item.key: item for item in declarations}
-    parsed: dict[str, bool | int | str] = {}
-    for index, assignment in enumerate(assignments):
-        key, separator, raw = assignment.partition('=')
-        if not separator or not key:
-            raise _config_error(
-                '每个 --flag 使用非空 key=value',
-                f'第 {index + 1} 项是 {assignment!r}',
-                '改成 --flag key=value；用 flags list 查看可用 key',
-            )
-        declaration = declared.get(key)
-        if declaration is None:
-            raise _config_error(
-                f'--flag key 是已声明项之一：{list(declared)!r}',
-                f'收到未知 key {key!r}',
-                '运行 syndica flags list，再逐字使用其中一个 key',
-            )
-        if key in parsed:
-            raise _config_error(
-                '每个 --flag key 只出现一次',
-                f'key {key!r} 重复',
-                '删除重复项，每个 key 只保留一个值',
-            )
-        default = declaration.default
-        if type(default) is bool:
-            if raw not in {'true', 'false'}:
-                raise _config_error(
-                    f'Flag {key!r} 是 bool，值只能是 true 或 false',
-                    f'收到 {raw!r}',
-                    f'改成 --flag {key}=true 或 --flag {key}=false',
-                )
-            value: bool | int | str = raw == 'true'
-        elif type(default) is int:
-            try:
-                value = int(raw)
-            except ValueError as exc:
-                raise _config_error(
-                    f'Flag {key!r} 是 int',
-                    f'收到 {raw!r}',
-                    f'改成 --flag {key}=<整数>',
-                ) from exc
-        else:
-            value = raw
-        if declaration.choices and value not in declaration.choices:
-            raise _config_error(
-                f'Flag {key!r} 是 {list(declaration.choices)!r} 之一',
-                f'收到 {value!r}',
-                f'改成 --flag {key}=<声明列出的值>',
-            )
-        if (key, value) == _REFUSED_FLAG_VALUE:
-            raise _config_error(
-                'CLI 的 untrusted_high_risk 是 reject 或 ask',
-                '收到 untrusted_high_risk=allow',
-                (
-                    '改用 --flag untrusted_high_risk=ask（每次问你），或省略它（默认 reject）。'
-                    'allow 会让 Agent 读过命令输出之后的每一条高风险命令不经询问就在你的机器上执行'
-                ),
-            )
-        if type(value) is int and declaration.minimum is not None and value < declaration.minimum:
-            raise _config_error(
-                f'Flag {key!r} 大于或等于 {declaration.minimum}',
-                f'收到 {value}',
-                f'提高 --flag {key}=... 的值',
-            )
-        if type(value) is int and declaration.maximum is not None and value > declaration.maximum:
-            raise _config_error(
-                f'Flag {key!r} 小于或等于 {declaration.maximum}',
-                f'收到 {value}',
-                f'降低 --flag {key}=... 的值',
-            )
-        parsed[key] = value
-    return parsed
-
-
-def _validated_request(request: RunRequest) -> dict[str, bool | int | str]:
+def _validated_request(request: RunRequest) -> dict[str, str]:
     unsupported = [
         name
         for name, value in (
@@ -626,8 +549,8 @@ def _validated_request(request: RunRequest) -> dict[str, bool | int | str]:
             f'同时收到 agent={request.agent!r} topology={request.topology!r}',
             '删除其中一个目标参数后重试',
         )
-    declarations = tuple(item for module in _modules() for item in module.flags)
-    return _request_flags(request.flags, declarations)
+    # 取值要等装好 Module（配置里启用了哪些）才对着声明判；这里先挡住形状不对的。
+    return parse_assignments(request.flags)
 
 
 def _with_turn_limit(
@@ -1426,6 +1349,7 @@ class RuntimeCliHost:
                     ('topology', request.topology),
                     ('max_turns', request.max_turns),
                     ('flags', request.flags),
+                    ('trust_module_output', request.trust_module_output),
                     ('trace', request.trace),
                 )
                 if value is not None and value != ()
@@ -1454,9 +1378,37 @@ class RuntimeCliHost:
         finally:
             root.removeHandler(handler)
 
-    def _configured_modules(self, config: CliConfig) -> tuple[RuntimeModule, ...]:
-        names = validated_modules(config.modules, discover(self._entry_points))
-        return tuple(_optional_builtin(name) for name in names)
+    def _configured_modules(
+        self, config: CliConfig, environment: Mapping[str, str]
+    ) -> tuple[RuntimeModule, ...]:
+        """配置里启用的 Module，按写的次序。第三方的在这里才 import：调用方拿到的 config 已经过了
+        信任确认。"""
+        discovered = discover(self._entry_points)
+        names = validated_modules(config.modules, discovered)
+        entries = {entry.name: entry for entry in discovered}
+        redactor = host_redactor(self._environ, config.redaction_rules)
+        host = ModuleHost(
+            workspace_root=self._workspace_root, environment=environment, redactor=redactor
+        )
+        return tuple(
+            _optional_builtin(name)
+            if name in OPTIONAL_BUILTINS
+            else load_module(entries[name], host, redactor)
+            for name in names
+        )
+
+    def _untrusted_output(self, config: CliConfig, trusted: Sequence[str]) -> tuple[str, ...]:
+        """结果要收紧的第三方 Module：启用的第三方 Module 里，用户没在命令行上放开的那些。"""
+        enabled = third_party(config.modules)
+        unknown = [name for name in trusted if name not in enabled]
+        if unknown:
+            raise _config_error(
+                f'--trust-module-output 点名的是启用了的第三方 Module：{list(enabled)!r}',
+                f'收到 {unknown!r}',
+                '照 .syndica.yaml 的 modules 逐字写第三方 Module 的名字；'
+                '内置的 Module 本来就不收紧',
+            )
+        return tuple(name for name in enabled if name not in trusted)
 
     def _inspect_modules(self, request: InspectRequest) -> str:
         config = self._config(request.config)
@@ -1510,7 +1462,7 @@ class RuntimeCliHost:
                     'choices': [
                         choice
                         for choice in declaration.choices
-                        if (declaration.key, choice) != _REFUSED_FLAG_VALUE
+                        if not refused(declaration.key, choice)
                     ],
                     'minimum': declaration.minimum,
                     'maximum': declaration.maximum,
@@ -1592,9 +1544,14 @@ class RuntimeCliHost:
         *,
         trace: str | None = None,
         argv: Sequence[str] = (),
+        trusted_output: Sequence[str] = (),
     ) -> str:
         with self._logging_to_stderr():
-            return self._runner.run(self._open_chat(config, max_turns, trace=trace, argv=argv))
+            return self._runner.run(
+                self._open_chat(
+                    config, max_turns, trace=trace, argv=argv, trusted_output=trusted_output
+                )
+            )
 
     def active_agents(self) -> str:
         return self._runner.run(self._active_agents())
@@ -2125,7 +2082,13 @@ class RuntimeCliHost:
         return f'版本未知：{_how_it_failed(version)}'
 
     async def _open_chat(
-        self, path: str, max_turns: int | None, *, trace: str | None, argv: Sequence[str]
+        self,
+        path: str,
+        max_turns: int | None,
+        *,
+        trace: str | None,
+        argv: Sequence[str],
+        trusted_output: Sequence[str],
     ) -> str:
         config = self._trusted_config(path)
         catalog = _turn_capped(config.catalog, max_turns)
@@ -2156,14 +2119,21 @@ class RuntimeCliHost:
                 danger_policy=policy,
                 role_policies=role_policies(judge, config.danger_roles),
             )
+            modules = _agent_modules(
+                self._workspace_root,
+                self._environ,
+                configured=self._configured_modules(config, environment.values),
+            )
             runtime = Runtime(
                 agents=factories,
                 orchestration=_ORCHESTRATION,
-                modules=_agent_modules(
-                    self._workspace_root, self._environ, configured=self._configured_modules(config)
+                modules=modules,
+                flags=resolved_flags(
+                    config.flags, {}, (item for module in modules for item in module.flags)
                 ),
                 confirmation_handler=MailboxConfirmationHandler(timeout=_CONFIRMATION_TIMEOUT),
                 tracer=recording.recorder,
+                untrusted_output_modules=self._untrusted_output(config, trusted_output),
             )
             subscription = runtime.events.subscribe()
             pump = asyncio.create_task(
@@ -2306,8 +2276,14 @@ class RuntimeCliHost:
         reason: str | None = None
         roles: dict[str, dict[str, object]] = {}
         role_policies: dict[str, DangerPolicy] = {}
+        third = third_party(config.modules)
         if request.topology is not None:
             reason = '--topology 的 run 还不能捕获（拓扑槽给角色附加的工具与预算，回放重建不出来）'
+        elif third:
+            reason = (
+                f'启用了第三方 Module {", ".join(third)}：回放还重建不了第三方 Module，'
+                '它们的代码不能在回放里再跑一遍'
+            )
         else:
             try:
                 roles, role_policies = frozen_roles(catalog, factories, policy)
@@ -2359,7 +2335,7 @@ class RuntimeCliHost:
     async def _run_request(
         self,
         request: RunRequest,
-        flags: Mapping[str, bool | int | str],
+        flags: Mapping[str, str],
         *,
         config: CliConfig | None = None,
         logs: list[DevLog] | None = None,
@@ -2394,7 +2370,7 @@ class RuntimeCliHost:
     async def _run_traced(
         self,
         request: RunRequest,
-        flags: Mapping[str, bool | int | str],
+        flags: Mapping[str, str],
         config: CliConfig,
         tracer: TraceRecorder | None,
         *,
@@ -2408,6 +2384,17 @@ class RuntimeCliHost:
         tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
         try:
             with _CaptureRuntimeErrors() as runtime_errors:
+                # Module 与 Flag 先于模型定下：取值写错要在建任何模型之前就失败。
+                modules = _agent_modules(
+                    self._workspace_root,
+                    self._environ,
+                    tools if request.no_write else None,
+                    configured=self._configured_modules(config, environment.values),
+                )
+                resolved = resolved_flags(
+                    config.flags, flags, (item for module in modules for item in module.flags)
+                )
+                untrusted = self._untrusted_output(config, request.trust_module_output)
                 model_names = _model_names(config)
                 models: Mapping[str, LLM] = {
                     name: self._model_factory(name) for name in model_names
@@ -2439,26 +2426,21 @@ class RuntimeCliHost:
                         danger_policy=policy,
                         role_policies=per_role,
                     )
-                modules = _agent_modules(
-                    self._workspace_root,
-                    self._environ,
-                    tools if request.no_write else None,
-                    configured=self._configured_modules(config),
-                )
                 runtime = Runtime(
                     agents={} if request.topology is not None else factories,
                     orchestration=_ORCHESTRATION,
                     modules=modules,
-                    flags=flags,
+                    flags=resolved,
                     confirmation_handler=MailboxConfirmationHandler(timeout=_CONFIRMATION_TIMEOUT),
                     tracer=tracer,
                     ids=None if tracer is None else tracer.ids,
+                    untrusted_output_modules=untrusted,
                 )
                 if tracer is not None and tracer.level is not TraceLevel.STRUCTURE:
 
                     def profile(roles: Mapping[str, DangerPolicy]) -> dict[str, object]:
                         return host_profile(
-                            flags=flags,
+                            flags=resolved,
                             judge=judge,
                             policy=policy,
                             output_limit=_OUTPUT_LIMIT,
@@ -2581,9 +2563,7 @@ class RuntimeCliHost:
             finally:
                 environment.remove()
 
-    async def _run_handoff(
-        self, request: RunRequest, flags: Mapping[str, bool | int | str]
-    ) -> CliOutcome:
+    async def _run_handoff(self, request: RunRequest, flags: Mapping[str, str]) -> CliOutcome:
         """D13：锁住工作区 → 运行前快照 → run → 复核 → 写交接文件 → git 收尾 → 重写并打印。
         `verify`、`protected`、`pass_env` 都取开始时加载的配置：Agent 中途改 `.syndica.yaml`
         不影响。"""
@@ -2610,7 +2590,7 @@ class RuntimeCliHost:
     async def _handoff(
         self,
         request: RunRequest,
-        flags: Mapping[str, bool | int | str],
+        flags: Mapping[str, str],
         config: CliConfig,
         redactor: Redactor,
         ctrl_c: _CtrlC,

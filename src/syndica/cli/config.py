@@ -48,7 +48,17 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _ROOT_KEYS = frozenset(
-    {'version', 'agents', 'topologies', 'workspace', 'redaction', 'trace', 'danger', 'modules'}
+    {
+        'version',
+        'agents',
+        'topologies',
+        'workspace',
+        'redaction',
+        'trace',
+        'danger',
+        'modules',
+        'flags',
+    }
 )
 _DANGER_KEYS = frozenset({'roles'})
 _ROLE_DANGER_KEYS = frozenset({'rules', 'policy'})
@@ -169,6 +179,7 @@ class CliConfig:
     trace_level: TraceLevel | None = None
     danger_roles: Mapping[str, RoleTightening] = field(default_factory=lambda: MappingProxyType({}))
     modules: tuple[str, ...] = ()
+    flags: Mapping[str, bool | int | str] = field(default_factory=lambda: MappingProxyType({}))
 
 
 def load_config(path: str | Path) -> CliConfig:
@@ -219,7 +230,21 @@ def config_from_text(
         trace_level=_trace(root.get('trace', {})),
         danger_roles=_danger(root.get('danger', {}), catalog),
         modules=_module_names(root.get('modules', ())),
+        flags=_flags(root.get('flags', {})),
     )
+
+
+def _flags(value: object) -> Mapping[str, bool | int | str]:
+    """`flags:` 的原样取值。只查形状：哪些 key 合法、取值对不对，要等装好 Module 才知道。"""
+    entries = _keyed(value, 'flags', None, '`flags: {retry_max_attempts: 3}`')
+    for key, item in entries.items():
+        if isinstance(item, float) or not isinstance(item, bool | int | str):
+            raise _config(
+                f'flags.{key} 是布尔值、整数或字符串',
+                f'收到 {item!r}，类型是 {type(item).__name__}',
+                '照 syndica flags show <key> 的缺省值写；Flag 的取值只有这三种类型',
+            )
+    return MappingProxyType(dict(cast(Mapping[str, bool | int | str], entries)))
 
 
 def _module_names(value: object) -> tuple[str, ...]:

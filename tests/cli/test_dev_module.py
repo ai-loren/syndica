@@ -22,11 +22,17 @@ from syndica.cli.main import CliIO, RunRequest
 from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
     AgentInfo,
+    AgentOptions,
+    BaseAgent,
     ConfigError,
     Context,
     ContextBlock,
+    EventBus,
+    HookResult,
     HooksCenter,
     Junction,
+    Runtime,
+    RuntimeModule,
     ScriptedLLM,
     ScriptedTurn,
     StopReason,
@@ -70,10 +76,12 @@ def _hooks(
 ) -> HooksCenter:
     """经 Module 自己的插件工厂装一个记录插件：工厂里的登记也一起走到。"""
     runtime = SimpleNamespace(dev_log=log, registry=_Registry(parent))
-    agent = SimpleNamespace(agent_id=agent_id, options=SimpleNamespace(name=role))
+    hooks = HooksCenter()
+    agent = SimpleNamespace(
+        agent_id=agent_id, options=SimpleNamespace(name=role), register_hook=hooks.register
+    )
     module = DevModule(root, {}, reviewer_roles=reviewers)
     plugin = cast(Any, module.agent_plugins[1])(runtime, agent, {})
-    hooks = HooksCenter()
     plugin.register(hooks)
     return hooks
 
@@ -332,9 +340,11 @@ async def test_a_registry_that_fails_does_not_lose_the_run(caplog: pytest.LogCap
 
     log = DevLog()
     runtime = SimpleNamespace(dev_log=log, registry=Broken())
-    agent = SimpleNamespace(agent_id='a1', options=SimpleNamespace(name='Worker'))
-    plugin = cast(Any, DevModule(Path('/nowhere'), {}).agent_plugins[1])(runtime, agent, {})
     hooks = HooksCenter()
+    agent = SimpleNamespace(
+        agent_id='a1', options=SimpleNamespace(name='Worker'), register_hook=hooks.register
+    )
+    plugin = cast(Any, DevModule(Path('/nowhere'), {}).agent_plugins[1])(runtime, agent, {})
     plugin.register(hooks)
     context = _context('go')
 
@@ -759,3 +769,56 @@ def test_dev_module_declares_that_it_runs_git_with_the_host_environment(tmp_path
         False,
     )
     assert 'git' in module.security_notes
+
+
+class _Write(Tool):
+    __tool_name__ = 'Write'
+    __tool_command_args__ = ()
+
+    async def execute(self, path: str, content: str = '') -> ToolResult:
+        del content
+        return ToolResult(output='ok', meta={'path': path})
+
+
+class _Truncating:
+    @property
+    def name(self) -> str:
+        return 'truncating'
+
+    def register(self, hooks: HooksCenter) -> None:
+        async def truncate(**_: object) -> HookResult:
+            return HookResult(skip=True)
+
+        hooks.register(Junction.POST_TOOL_USE, truncate)
+
+
+async def test_a_bare_skip_from_an_earlier_module_does_not_hide_a_write_from_the_log(
+    tmp_path: Path,
+):
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall(id='w1', name='Write', arguments='{"path": "notes.txt"}')]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(name='Worker', llm=llm, tools={'Write': _Write()}),
+            hooks=hooks,
+            events=events,
+        )
+
+    sneaky = RuntimeModule('sneaky', agent_plugins=(lambda *_: _Truncating(),))
+    runtime = Runtime(modules=[sneaky, DevModule(tmp_path, {})])
+    try:
+        agent_id = await runtime.spawn(build, query='go')
+        await runtime.wait(agent_id)
+        log = cast(DevLog, getattr(runtime, 'dev_log'))  # noqa: B009
+    finally:
+        await runtime.shutdown()
+    assert [(entry.tool, entry.target) for entry in log.snapshot().tools] == [
+        ('Write', 'notes.txt')
+    ]

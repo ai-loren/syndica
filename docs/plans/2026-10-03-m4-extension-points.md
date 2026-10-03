@@ -380,9 +380,10 @@ M1 的理由仍成立（插件实例难冻结、撑大公开面），而 M4 的�
     回放里不在替身名单上的工具会真的执行（`_KernelTool`，含第三方 Module 的工具，第四轮评审 L5），第三方 Module 又只在
     声明了 `replay_safe` 时才重建（D13）；被放宽的结果在回放里能驱动的只有替身工具、内核工具与这些声明了不做 I/O 的
     工具。项目配置放不开（第二轮评审 High 2：没有开关的保守标记会让一次第三方调用之后的每个高风险调用都被拒）。
-  - 开发期守卫对这些工具不认它们自己声明的 `()`，按「每个字符串参数都可能被执行」判（第二轮评审 M12）。开发期记录器
-    挪到执行器一侧：执行器在结论定下之后、落轨迹之前交出这次调用的记录（私有回调，由 `dev` Module 接上），
-    `POST_TOOL_USE` 上的裸 `skip` 截不断它（第四轮评审 Low：没有可观察的工具后切点，另加公开 `Junction` 会扩公开面）。
+  - 开发期守卫对这些工具不认它们自己声明的 `()`，按「每个字符串参数都可能被执行」判（第二轮评审 M12；实现按类定义在
+    不在 syndica 包里认，`impl:` 角色自己的工具一并收紧）。开发期记录器挪到 Agent 的局部层：它排在整条链最前，后面任何
+    hook 的裸 `skip` 都截不断它，看到的也是工具自己交回的结果（第四轮评审 Low 给的两个选项之一；另一项「执行器一侧的
+    私有回调」要给内核加一个只供 CLI 用的私有入口，而记录器还要往结果里写 `check`，回调做不到）。
 - **第三方 Flag**：键必须以 `<Module 名的下划线写法>_` 开头（`example` → `example_greeting`），像密钥的键名一律拒收
   （「凭证从环境来，不进 Flag」）——Flag 的值会进宿主档案与回放文档。
 - **`modules:` / `flags:`**：`modules:` 是名字列表；`flags:` 与 `--flag` 走**同一个**校验函数，CLI 拒收的取值（如
@@ -600,13 +601,15 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 - 变异：摘要漏掉任一部分（提示词文件、`impl:` 与工作区内的整棵包、Module 的发行版版本）、答后不复查、展示不转义、
   管道输入被当成确认、非交互时放行、确认之前 import 了第三方代码（含找 `impl:` 源文件时）、Agent 的环境里没有
   `SYNDICA_TRUST_STORE`，都必须变红（安全）。
-#### T9b — `modules:` / `flags:` 启用、`modules show`、第三方工具结果的信任（D15）
+#### T9b — `modules:` / `flags:` 启用、第三方工具结果的信任（D15，完成）
 - 入口点 `factory(ModuleHost)`；第三方 Flag 键前缀与像密钥的键名；`flags:` 与 `--flag` 共用一个校验函数、`flags:` 只收
   收紧的取值；`--flag` 改为读完配置之后校验；`FlagDeclaration.description` 拒收控制字符；组装 Module 的 CLI 函数（次序、
   收紧名单、Flag 规则）只有一份；内核执行器收紧第三方工具的结果（`Runtime(untrusted_output_modules=...)`：执行过的
   调用在 `execute` 一返回时收紧，skip 与 `POST_TOOL_USE` 的改写按写下它的 hook 的作者收紧），`--trust-module-output`
   放开；`install_own_tools` 不得替换 Module 的工具；收紧状态进装配快照；开发期守卫不认第三方工具自己声明的 `()`；
-  开发期记录器挪到执行器一侧；启用的第三方 Module 的发行版装在工作区之内时按 `RECORD` 核对。
+  开发期记录器挪到 Agent 的局部层；启用的第三方 Module 的发行版装在工作区之内时按 `RECORD` 核对，它在工作区里的
+  代码与 `impl:` 一样整棵进摘要。启用了第三方 Module 的 run 暂不写回放文档（T14 按 D13 补上重建）；`modules show`
+  看第三方清单与 `flags list/show` 认配置里的 Module 归 T10。
 - 变异（安全）：`flags:` 收下 `untrusted_high_risk=allow` 或 `ask`、第三方工具结果没被标 `UNTRUSTED`（含 `POST_TOOL_USE`
   的插件看到自报的 `TRUSTED`、第三方插件 skip 宿主工具、宿主守卫 skip 第三方工具被误标三种）、名单里的字符串被当成
   字符序列、`install_own_tools` 替换 Module 工具被放过、开发期守卫认了第三方的 `()`、`RECORD` 不核对，都必须变红。
