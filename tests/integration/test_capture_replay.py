@@ -1660,3 +1660,51 @@ def test_a_run_interrupted_by_ctrl_c_replays_to_the_same_place(tmp_path: Path):
         {'kind': 'interrupt', 'waiting': [['tool_call', agent_id, 1, 2, 0]]}
     ]
     assert replayed.reproduced, replayed.divergences
+
+
+def test_a_role_tightened_by_the_project_config_is_recorded_and_replays(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    (tmp_path / '.syndica.yaml').write_text(
+        'version: 1\n'
+        'danger:\n'
+        '  roles:\n'
+        '    Worker: {rules: {shell.path_outside_workspace: block}}\n',
+        encoding='utf-8',
+    )
+    root: list[Step] = [_calls(('c1', 'Bash', {'command': 'cat /etc/hosts'})), _say('done')]
+
+    code, stdout, stderr = _cli(tmp_path, _PerAgent(root, []), ['run', 'go', '--agent', 'Worker'])
+    header, document = _trace(tmp_path)
+    replayed = _replayed(header, document)
+
+    assert code == 0 and stdout.rstrip().endswith('done'), stderr
+    assert document['version'] == 3
+    roles = document['host']['danger']['roles']
+    assert list(roles) == ['Worker']
+    assert roles['Worker']['table']['shell.path_outside_workspace'] == 'block'
+    assert document['host']['danger']['table']['shell.path_outside_workspace'] == 'confirm'
+    [lead] = document['agents']['Worker']['instances']
+    assert [gate['disposition'] for gate in lead['gate']] == ['block']
+    assert replayed.reproduced, replayed.divergences
+
+
+def test_a_read_only_run_keeps_the_role_tightening_of_the_project_config(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    (tmp_path / '.syndica.yaml').write_text(
+        'version: 1\n'
+        'danger:\n'
+        '  roles:\n'
+        '    Worker: {rules: {shell.path_outside_workspace: block}}\n',
+        encoding='utf-8',
+    )
+
+    code, _, stderr = _cli(
+        tmp_path, _PerAgent([_say('done')], []), ['run', 'go', '--agent', 'Worker', '--no-write']
+    )
+    _, document = _trace(tmp_path)
+
+    assert code == 0, stderr
+    roles = document['host']['danger']['roles']
+    assert roles['Worker']['table']['shell.path_outside_workspace'] == 'block'

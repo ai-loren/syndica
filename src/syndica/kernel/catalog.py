@@ -210,13 +210,18 @@ class AgentCatalog:
         *,
         danger_judge: DangerJudge | None = None,
         danger_policy: DangerPolicy | None = None,
+        role_policies: Mapping[str, DangerPolicy] | None = None,
     ) -> Mapping[str, AgentFactory]:
         """插值一次并收成「hooks, events → BaseAgent」工厂。键序与 names() 相同。
 
         `danger_judge` / `danger_policy` 交给每个建出的 Agent，类式角色也一样；`None` 用内核默认。
-        入口先校验：目录里一个角色都没有时不会建任何 `AgentOptions`，错的策略就没有别处能拦下。
+        `role_policies` 里列出的角色用自己的处置（spec §5.6），其余用 `danger_policy`：执行器在
+        Agent 构造时取走处置，所以它在这里、建 `AgentOptions` 时就定下。内核不限制方向，收紧还是放宽
+        由宿主负责。入口先校验：目录里一个角色都没有时不会建任何 `AgentOptions`，错的策略就没有别处
+        能拦下。
         """
         validate_danger_options(danger_judge, danger_policy)
+        per_role = _role_policies(role_policies, tuple(self._order))
         host_facts = _host_facts(host)
         model_table = _model_table(models)
         self._reject_missing_models(model_table)
@@ -229,7 +234,7 @@ class AgentCatalog:
                 models=model_table,
                 host=host_facts,
                 danger_judge=danger_judge,
-                danger_policy=danger_policy,
+                danger_policy=per_role.get(name, danger_policy),
             )
         validate_agent_factories(factories)
         return MappingProxyType(factories)
@@ -414,6 +419,39 @@ def register_tool(table: object, tool: object) -> None:
     if error is not None:
         raise error
     table[key] = tool
+
+
+def _role_policies(value: object, roles: tuple[str, ...]) -> Mapping[str, DangerPolicy]:
+    if value is None:
+        return MappingProxyType({})
+    if isinstance(value, str | bytes) or not isinstance(value, Mapping):
+        raise ConfigError(
+            expected='role_policies 是「角色名 → DangerPolicy」的 Mapping，或 None',
+            received=f'收到 {type(value).__name__} 类型的 {value!r}',
+            next_action='传入 {"Worker": RuleTablePolicy({...})} 这样的表；不按角色区分就省略',
+        )
+    table = cast(Mapping[object, object], value)
+    unknown = sorted(repr(role) for role in table if role not in roles)
+    if unknown:
+        raise ConfigError(
+            expected='role_policies 的键是目录里的角色名',
+            received=f'目录里没有 {", ".join(unknown)}',
+            next_action=f'改成已有的角色名（{list(roles)}），或先把这个角色载入目录',
+        )
+    checked: dict[str, DangerPolicy] = {}
+    for role, policy in table.items():
+        if isinstance(policy, type) or not isinstance(policy, DangerPolicy):
+            raise ConfigError(
+                expected=f'role_policies[{role!r}] 是 DangerPolicy 实例',
+                received=(
+                    f'收到类对象 {policy.__name__} 本身而不是它的实例——少了一对括号'
+                    if isinstance(policy, type)
+                    else f'收到 {type(policy).__name__} 类型的 {policy!r}'
+                ),
+                next_action='传入 RuleTablePolicy({...})、BlockHighRisk() 这样的实例',
+            )
+        checked[cast(str, role)] = policy
+    return MappingProxyType(checked)
 
 
 def resolve_tool_names(names: object, tools: object) -> dict[str, Tool]:

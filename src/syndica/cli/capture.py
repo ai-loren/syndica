@@ -27,7 +27,7 @@ from syndica.kernel.danger import (
     RuleTablePolicy,
 )
 
-__all__ = ['frozen_roles', 'host_profile']
+__all__ = ['frozen_role_policies', 'frozen_roles', 'host_profile']
 
 
 def host_profile(
@@ -42,13 +42,17 @@ def host_profile(
     modules: Sequence[RuntimeModule],
     orchestration: bool,
     confirmation_timeout: float | None,
+    roles: Mapping[str, DangerPolicy] | None = None,
 ) -> dict[str, object]:
+    danger: dict[str, object] = {
+        'rules': [{'id': rule.rule_id, 'params': dict(rule.params)} for rule in judge.rules],
+        **_policy(policy),
+    }
+    if roles:
+        danger['roles'] = {role: _policy(role_policy) for role, role_policy in roles.items()}
     return {
         'flags': dict(flags),
-        'danger': {
-            'rules': [{'id': rule.rule_id, 'params': dict(rule.params)} for rule in judge.rules],
-            **_policy(policy),
-        },
+        'danger': danger,
         'output_limit': output_limit,
         'host_facts': {'os': facts.os, 'platform': facts.platform, 'shell': facts.shell},
         'max_turns': max_turns,
@@ -73,6 +77,19 @@ def _policy(policy: DangerPolicy) -> dict[str, object]:
         return {'policy': 'block_high_risk'}
     kind = type(policy)
     return {'policy': f'{kind.__module__}:{kind.__qualname__}'}
+
+
+def frozen_role_policies(
+    catalog: AgentCatalog, factories: Mapping[str, AgentFactory], default: DangerPolicy
+) -> dict[str, DangerPolicy]:
+    """处置与 `default` 不是同一个对象的那些角色：从冻结出的 Agent 上读，而不是从宿主拼的那张表上
+    读——`--no-write` 重新冻结过，读真正交给 Agent 的那一份才不会记错。"""
+    roles: dict[str, DangerPolicy] = {}
+    for name in catalog.names():
+        policy = factories[name](HooksCenter(), EventBus()).options.danger_policy
+        if policy is not None and policy is not default:
+            roles[name] = policy
+    return roles
 
 
 def frozen_roles(

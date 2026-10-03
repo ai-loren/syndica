@@ -98,6 +98,14 @@ class _Wait:
     answer: dict[str, object] | None = None
 
 
+def _document_version(host: object) -> int:
+    """写得下这份内容的最低版本：没用到 v3 的键就写 2，旧版本的读者照样读得进。"""
+    danger = cast(Mapping[str, object], host).get('danger') if isinstance(host, Mapping) else None
+    if isinstance(danger, Mapping) and 'roles' in cast(Mapping[str, object], danger):
+        return 3
+    return 2
+
+
 class ReplayCapture:
     """回放文档的账本。recorder 在插桩到达时调这里的方法；值在到达的那一刻取走、转成 JSON 值（内核
     之后还会改那些对象）。脱敏在合成文档时逐项做（见 `document`）。"""
@@ -143,7 +151,7 @@ class ReplayCapture:
             'entry': self._jsonable(dict(entry)),
         }
         probe: dict[str, object] = {
-            'version': 2,
+            'version': _document_version(run['host']),
             'name': 'describe_run',
             'host': run['host'],
             'agents': {name: {'frozen': role, 'instances': []} for name, role in frozen.items()},
@@ -520,7 +528,7 @@ class ReplayCapture:
                 action['waiting'] = [key for _, key in waiting]
             host_actions.append(action)
         document: dict[str, object] = {
-            'version': 2,
+            'version': _document_version(run['host']),
             'name': clean(f'trace {trace_id}'),
             'source': clean(
                 {

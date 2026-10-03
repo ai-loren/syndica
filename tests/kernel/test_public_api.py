@@ -340,6 +340,7 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 _PROMISED_VIA_SUBMODULE: dict[str, tuple[str, ...]] = {
     'syndica.kernel.trace': ('ATTRIBUTE_DOMAINS', 'ATTRIBUTE_KINDS', 'TRACE_SCHEMA'),
     'syndica.kernel.scenario_schema': (
+        'DangerPolicySpec',
         'DangerRuleSpec',
         'FrozenRole',
         'GateRecord',
@@ -367,6 +368,7 @@ _WITHHELD: tuple[str, ...] = (
     'BrokerTurnGate',
     'ControlBlock',
     'DEFAULT_MAX_TOOL_CONCURRENCY',
+    'DangerPolicySpec',
     'DangerRuleSpec',
     'Delegate',
     'Edit',
@@ -448,6 +450,7 @@ _WITHHELD: tuple[str, ...] = (
     'parse_mapping',
     'path_outside_workspace_rule',
     'peek_key',
+    'prompt_file',
     'readable_schema',
     'redact_argv',
     'register_tool',

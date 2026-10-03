@@ -423,9 +423,9 @@ class ReplayRunner:
         """同步跑完（回放自己建事件循环）。v1 文档交给 `ScenarioRunner`。给了 `recorder`（还没
         `begin` 的）就把这次回放本身也记下来：在回放的事件循环里 `begin` 与 `finish`，插桩照样转给
         它；它开不了头时记一条 WARNING，回放照常。"""
-        if document.version != 2:
+        if document.version < 2:
             raise ConfigError(
-                expected='ReplayRunner 跑 version: 2 的场景文档',
+                expected='ReplayRunner 跑 version: 2 或 3 的场景文档',
                 received=f'{document.source!r} 是 version: {document.version}',
                 next_action='v1 的手写脚本用 ScenarioRunner().run(load_scenario(path)) 跑',
             )
@@ -1080,18 +1080,19 @@ class _Replay:
 
     # --- host profile ----------------------------------------------------------------------
 
-    def _danger(self) -> tuple[DangerJudge | None, DangerPolicy | None]:
+    def _danger(
+        self,
+    ) -> tuple[DangerJudge | None, DangerPolicy | None, dict[str, DangerPolicy]]:
+        """(判定, 缺省处置, 逐个角色的处置)。角色的处置照宿主档案里那一份重建，不按种类猜。"""
         rules = self._host.danger_rules
         judge = None if rules is None else DangerJudge(tuple(_rule(spec) for spec in rules))
-        table = self._host.danger_table
-        policy: DangerPolicy | None = None
-        if self._host.danger_policy == 'allow_all':
-            policy = AllowAll()
-        elif self._host.danger_policy == 'block_high_risk':
-            policy = BlockHighRisk()
-        elif table is not None:
-            policy = RuleTablePolicy({key: Disposition(value) for key, value in table.items()})
-        return judge, policy
+        policy = _policy_from(self._host.danger_policy, self._host.danger_table)
+        roles: dict[str, DangerPolicy] = {}
+        for role, spec in self._host.danger_roles.items():
+            built = _policy_from(spec.policy, spec.table)
+            if built is not None:
+                roles[role] = built
+        return judge, policy, roles
 
     def _modules(self, llm: _ReplayLLM) -> tuple[tuple[RuntimeModule, ...], tuple[str, ...]]:
         names = self._host.modules
@@ -1119,7 +1120,7 @@ class _Replay:
         return flags, dropped
 
     def _factories(self, tools: Mapping[str, Tool], llm: _ReplayLLM) -> dict[str, AgentFactory]:
-        judge, policy = self._danger()
+        judge, policy, role_policies = self._danger()
         catalog = AgentCatalog()
         register_builtins(catalog)
         source = Path(self._document.source)
@@ -1146,11 +1147,18 @@ class _Replay:
             self._host.host_facts or HostFacts(os='scenario', platform='scenario', shell='/bin/sh'),
             danger_judge=judge,
             danger_policy=policy,
+            role_policies={
+                role: role_policy
+                for role, role_policy in role_policies.items()
+                if role in catalog.names()
+            },
         )
         factories: dict[str, AgentFactory] = {}
         for role in self._document.roles.values():
             if role.frozen is not None:
-                factories[role.name] = self._frozen_factory(role, tools, llm, judge, policy)
+                factories[role.name] = self._frozen_factory(
+                    role, tools, llm, judge, role_policies.get(role.name, policy)
+                )
             else:
                 factories[role.name] = self._manifest_factory(role, frozen_catalog[role.name], llm)
         return factories
@@ -1939,6 +1947,16 @@ def _stand_in(
         },
     )
     return cast(Tool, stand_in(tool, replay, *more))
+
+
+def _policy_from(kind: str | None, table: Mapping[str, str] | None) -> DangerPolicy | None:
+    if kind == 'allow_all':
+        return AllowAll()
+    if kind == 'block_high_risk':
+        return BlockHighRisk()
+    if table is not None:
+        return RuleTablePolicy({key: Disposition(value) for key, value in table.items()})
+    return None
 
 
 def _rule(spec: DangerRuleSpec) -> DangerRule:

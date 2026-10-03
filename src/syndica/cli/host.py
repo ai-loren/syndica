@@ -26,7 +26,7 @@ from types import MappingProxyType
 from typing import Any, TextIO, TypeVar, cast
 
 from syndica import __version__
-from syndica.cli.capture import frozen_roles, host_profile
+from syndica.cli.capture import frozen_role_policies, frozen_roles, host_profile
 from syndica.cli.checks import parse_check
 from syndica.cli.config import CliConfig, load_config
 from syndica.cli.dev_module import DevLog, DevLogSnapshot, DevModule, last_answer
@@ -76,7 +76,7 @@ from syndica.cli.main import (
     RunRequest,
     TraceRequest,
 )
-from syndica.cli.policy import dev_danger_options
+from syndica.cli.policy import dev_danger_options, role_policies
 from syndica.cli.recording import (
     MirroredTraceStore,
     Recording,
@@ -1864,6 +1864,7 @@ class RuntimeCliHost:
                 ),
                 danger_judge=judge,
                 danger_policy=policy,
+                role_policies=role_policies(judge, config.danger_roles),
             )
             git = HostGit(self._workspace_root, self._environ)
             lines = [
@@ -1977,6 +1978,7 @@ class RuntimeCliHost:
                 ),
                 danger_judge=judge,
                 danger_policy=policy,
+                role_policies=role_policies(judge, config.danger_roles),
             )
             runtime = Runtime(
                 agents=factories,
@@ -2236,15 +2238,26 @@ class RuntimeCliHost:
                     shell=_SHELL,
                 )
                 judge, policy = dev_danger_options(self._workspace_root)
+                per_role = role_policies(judge, config.danger_roles)
                 factories = catalog.freeze(
-                    tools, models, facts, danger_judge=judge, danger_policy=policy
+                    tools,
+                    models,
+                    facts,
+                    danger_judge=judge,
+                    danger_policy=policy,
+                    role_policies=per_role,
                 )
                 if request.no_write:
                     # 先按正常 run 冻结了一遍：过滤会把拼错的工具名一起滤掉，只读 run 不该放过
-                    # 正常 run 会拒的配置。
+                    # 正常 run 会拒的配置。按角色的处置随之保留。
                     catalog = _read_only(catalog)
                     factories = catalog.freeze(
-                        tools, models, facts, danger_judge=judge, danger_policy=policy
+                        tools,
+                        models,
+                        facts,
+                        danger_judge=judge,
+                        danger_policy=policy,
+                        role_policies=per_role,
                     )
                 modules = _agent_modules(
                     self._workspace_root, self._environ, tools if request.no_write else None
@@ -2276,6 +2289,7 @@ class RuntimeCliHost:
                             modules=modules,
                             orchestration=_ORCHESTRATION,
                             confirmation_timeout=_CONFIRMATION_TIMEOUT,
+                            roles=frozen_role_policies(catalog, factories, policy),
                         ),
                         prompt,
                     )
@@ -2320,6 +2334,7 @@ class RuntimeCliHost:
                             host=facts,
                             danger_judge=judge,
                             danger_policy=policy,
+                            role_policies=per_role,
                         )
                         delivered = await runtime.send_to_slot(root_slot.name, prompt)
                         if not delivered.ok:

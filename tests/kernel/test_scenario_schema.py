@@ -405,7 +405,7 @@ def test_each_v2_form_is_accepted(path: tuple[Any, ...], value: object):
 
 
 _INVALID: list[tuple[str, tuple[Any, ...], object, str, str, str]] = [
-    ('version', ('version',), 3, '整数 1 或 2', 'version=3', 'version: 2'),
+    ('version', ('version',), 4, '整数 1、2 或 3', 'version=4', 'version: 3'),
     ('source-trace-id', ('source', 'trace_id'), 'XYZ', '32 个小写十六进制', 'XYZ', 'trace list'),
     ('source-config', ('source', 'config_sha256'), 'abc', 'sha256', 'abc', '不要截断'),
     ('source-argv', ('source', 'argv'), [1], '是字符串', '1', '带引号'),
@@ -742,7 +742,7 @@ _INVALID: list[tuple[str, tuple[Any, ...], object, str, str, str]] = [
         '问题过期',
     ),
     ('expect-missing', ('expect',), _DELETE, '必填键', "['expect']", '补齐'),
-    ('version-bool', ('version',), True, '整数 1 或 2', 'True', 'version: 2'),
+    ('version-bool', ('version',), True, '整数 1、2 或 3', 'True', 'version: 2'),
     (
         'payload-suffix',
         ('agents', 'Lead', 'frozen', 'system_prompt'),

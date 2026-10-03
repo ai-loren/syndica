@@ -49,6 +49,7 @@ __all__ = [
     'REPLAYED_TOOLS',
     'RULE_PARAMETERS',
     'SCENARIO_VERSIONS',
+    'DangerPolicySpec',
     'DangerRuleSpec',
     'FrozenRole',
     'GateRecord',
@@ -71,7 +72,7 @@ __all__ = [
     'parse_scenario_document',
 ]
 
-SCENARIO_VERSIONS = (1, 2)
+SCENARIO_VERSIONS = (1, 2, 3)
 # 冻结角色的 `impl` 只认内核内置的类式角色：回放文档可能来自别人的仓库，任意 import 路径等于执行它。
 FROZEN_IMPLS = frozenset({'syndica.kernel.agents.orchestrator:Orchestrator'})
 # 触达外部世界、回放时按记录给出结局的工具；其余（派活、消息、人机）是内核，回放时真跑。捕获只记
@@ -174,6 +175,9 @@ _HOST = frozenset(
     }
 )
 _DANGER = frozenset({'rules', 'table', 'policy'})
+# v3 加上逐个角色的处置（M4 D12）。v2 文档里出现它报「把 version 改成 3」而不是被当成未知键丢掉。
+_V3_DANGER = _DANGER | frozenset({'roles'})
+_ROLE_POLICY = frozenset({'table', 'policy'})
 _POLICIES = ('table', 'allow_all', 'block_high_risk')
 # 这两项是 CLI 一直以来的装配：在它们进宿主档案之前写下的文档都是这样跑的。
 _ORCHESTRATION = True
@@ -379,6 +383,15 @@ class DangerRuleSpec:
 
 
 @dataclass(frozen=True)
+class DangerPolicySpec:
+    """一种处置策略（v3 的 `host.danger.roles.<角色>`）：`policy` 同 `HostProfile.danger_policy`，
+    `table` 只在 `policy == 'table'` 时有。"""
+
+    policy: str
+    table: Mapping[str, str] | None = None
+
+
+@dataclass(frozen=True)
 class HostProfile:
     """宿主档案（v2）：回放据此重建 Runtime 的装配。没写的项是 None / 空；`orchestration` 与
     `confirmation_timeout` 没写时是 CLI 的装配（编排开着、确认等 300 秒）。`danger_policy` 是处置
@@ -396,6 +409,7 @@ class HostProfile:
     modules: tuple[str, ...] | None = None
     orchestration: bool = _ORCHESTRATION
     confirmation_timeout: float | None = _CONFIRMATION_TIMEOUT
+    danger_roles: Mapping[str, DangerPolicySpec] = dataclasses.field(default_factory=_no_entries)
 
 
 @dataclass(frozen=True)
@@ -452,8 +466,9 @@ def _mapping(
     allowed: frozenset[str] | None = None,
     required: frozenset[str] = frozenset(),
     later: frozenset[str] = frozenset(),
+    later_version: int = 2,
 ) -> Mapping[str, object]:
-    """`later` 是 v2 才有的键：在 v1 文档里出现时，下一步指向 `version: 2`。"""
+    """`later` 是更新版本（`later_version`）才有的键：出现时下一步指向那个版本。"""
     if not isinstance(value, Mapping):
         raise _error(
             f'{field} 是 Mapping',
@@ -477,7 +492,8 @@ def _mapping(
                 f'{field} 只含 {sorted(allowed)!r}',
                 f'未知键 {unknown!r}',
                 (
-                    f'{newer!r} 是场景格式 v2 的键：把 version 改成 2，或删掉它们'
+                    f'{newer!r} 是场景格式 v{later_version} 的键：'
+                    f'把 version 改成 {later_version}，或删掉它们'
                     if newer and len(newer) == len(unknown)
                     else '删除未知键；场景字段写错时不能静默忽略'
                 ),
@@ -705,10 +721,10 @@ def _document(raw: object, source: str) -> ScenarioDocument:
     version = root.get('version')
     if type(version) is not int or version not in SCENARIO_VERSIONS:
         raise _error(
-            'scenario.version 是整数 1 或 2',
+            'scenario.version 是整数 1、2 或 3',
             f'收到 version={version!r}，类型是 {type(version).__name__}',
-            '写成 `version: 1`（手写脚本）或 `version: 2`（回放文档）；不要写 true、字符串或'
-            '其他版本',
+            '写成 `version: 1`（手写脚本），或 `version: 2` / `version: 3`（回放文档）；'
+            '不要写 true、字符串或其他版本',
         )
     if version == 1:
         root = _mapping(root, 'scenario', allowed=_V1_ROOT, required=_V1_ROOT, later=_V2_ROOT)
@@ -720,7 +736,7 @@ def _document(raw: object, source: str) -> ScenarioDocument:
     entry = _entry(root['entry'], version)
     _check_entry(entry, topology, roles)
     responses = _responses(root.get('responses', ()), version)
-    host = _host(root['host']) if 'host' in root else None
+    host = _host(root['host'], version) if 'host' in root else None
     host_actions = _host_actions(root.get('host_actions', ()))
     ids = _ids(root.get('ids', ()))
     _check_injected(roles, ids)
@@ -1717,7 +1733,7 @@ def _ids(value: object) -> tuple[tuple[tuple[str | int, ...], str], ...]:
     return tuple(pairs)
 
 
-def _host(value: object) -> HostProfile:
+def _host(value: object, version: int) -> HostProfile:
     data = _mapping(value, 'host', allowed=_HOST)
     flags: dict[str, bool | int | str] = {}
     for key, item in _mapping(data.get('flags', {}), 'host.flags').items():
@@ -1729,8 +1745,17 @@ def _host(value: object) -> HostProfile:
             )
         flags[key] = item
     rules = table = policy = None
+    roles: dict[str, DangerPolicySpec] = {}
     if 'danger' in data:
-        danger = _mapping(data['danger'], 'host.danger', allowed=_DANGER)
+        danger = (
+            _mapping(data['danger'], 'host.danger', allowed=_V3_DANGER)
+            if version >= 3
+            else _mapping(
+                data['danger'], 'host.danger', allowed=_DANGER, later=_V3_DANGER, later_version=3
+            )
+        )
+        if 'roles' in danger:
+            roles = _role_policies(danger['roles'])
         if 'rules' in danger:
             rules = _danger_rules(danger['rules'])
         if 'table' in danger:
@@ -1764,17 +1789,47 @@ def _host(value: object) -> HostProfile:
         confirmation_timeout=_seconds(
             data.get('confirmation_timeout', _CONFIRMATION_TIMEOUT), 'host.confirmation_timeout'
         ),
+        danger_roles=MappingProxyType(roles),
     )
 
 
-def _policy(danger: Mapping[str, object], has_table: bool) -> str | None:
+def _role_policies(value: object) -> dict[str, DangerPolicySpec]:
+    roles: dict[str, DangerPolicySpec] = {}
+    for role, raw in _mapping(value, 'host.danger.roles').items():
+        field = f'host.danger.roles.{role}'
+        entry = _mapping(raw, field, allowed=_ROLE_POLICY)
+        table = (
+            {
+                _rule_id(key): _choice(item, f'{field}.table.{key}', _DISPOSITIONS)
+                for key, item in _mapping(entry['table'], f'{field}.table').items()
+            }
+            if 'table' in entry
+            else None
+        )
+        policy = _policy(entry, table is not None, field=field)
+        if policy is None:
+            raise _error(
+                f'{field} 写明一种处置策略',
+                f'{field} 是空的',
+                '照这个角色实际用的策略写：查表写 table，'
+                '否则写 policy: allow_all / block_high_risk',
+            )
+        roles[role] = DangerPolicySpec(
+            policy=policy, table=None if table is None else MappingProxyType(table)
+        )
+    return roles
+
+
+def _policy(
+    danger: Mapping[str, object], has_table: bool, *, field: str = 'host.danger'
+) -> str | None:
     """处置策略的种类。只写了表的是查表；种类与表必须对得上：查表要有表，别的种类用不上表。"""
     if 'policy' not in danger:
         return 'table' if has_table else None
-    policy = _choice(danger['policy'], 'host.danger.policy', _POLICIES)
+    policy = _choice(danger['policy'], f'{field}.policy', _POLICIES)
     if (policy == 'table') != has_table:
         raise _error(
-            'host.danger.policy 是 table 时有 host.danger.table，是别的种类时没有',
+            f'{field}.policy 是 table 时有 {field}.table，是别的种类时没有',
             f'policy={policy!r}，table {"有" if has_table else "没有"}',
             '照宿主用的策略写：RuleTablePolicy 写 table 与表，AllowAll / BlockHighRisk 不写表',
         )

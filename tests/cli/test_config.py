@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from types import MappingProxyType
+from typing import cast
 
 import pytest
 
@@ -602,3 +604,55 @@ def test_a_malformed_trace_section_is_refused_with_what_to_write(
     assert expected in caught.value.expected
     assert received in caught.value.received
     assert next_action in caught.value.next_action
+
+
+def _one_agent(prompt: str) -> str:
+    return (
+        'version: 1\nagents:\n'
+        f'  - name: Planner\n    description: plans\n    system_prompt: {prompt}\n'
+    )
+
+
+@pytest.mark.parametrize(
+    'prompt', ['docs/agents/planner.md', 'prompts/notes.txt', 'planner.md', 'docs\\x.md']
+)
+def test_a_path_like_prompt_without_a_file_is_warned_about(
+    tmp_path: Path, prompt: str, caplog: pytest.LogCaptureFixture
+):
+    path = _write(tmp_path / '.syndica.yaml', _one_agent(prompt))
+    with caplog.at_level(logging.WARNING):
+        load_config(path)
+    (record,) = [record for record in caplog.records if record.levelno == logging.WARNING]
+    location, shown, origin, suggested = cast(tuple[str, str, str, str], record.args)
+    assert location.endswith('.syndica.yaml#agents[0]')
+    assert shown == suggested == prompt
+    assert origin == str(tmp_path.resolve())
+
+
+@pytest.mark.parametrize('prompt', ['You plan carefully.', 'planner', '"plan: first"'])
+def test_a_prompt_that_does_not_look_like_a_path_is_not_warned_about(
+    tmp_path: Path, prompt: str, caplog: pytest.LogCaptureFixture
+):
+    path = _write(tmp_path / '.syndica.yaml', _one_agent(prompt))
+    with caplog.at_level(logging.WARNING):
+        load_config(path)
+    assert [record for record in caplog.records if record.levelno == logging.WARNING] == []
+
+
+def test_a_path_like_prompt_naming_a_real_file_is_read_without_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    (tmp_path / 'docs').mkdir()
+    (tmp_path / 'docs' / 'planner.md').write_text('You plan.', encoding='utf-8')
+    path = _write(tmp_path / '.syndica.yaml', _one_agent('docs/planner.md'))
+    with caplog.at_level(logging.WARNING):
+        config = load_config(path)
+    assert [record for record in caplog.records if record.levelno == logging.WARNING] == []
+    assert config.catalog.get('Planner').system_prompt == 'You plan.'
+
+
+def test_an_explicit_prompt_file_that_is_missing_fails_the_config_load(tmp_path: Path):
+    path = _write(tmp_path / '.syndica.yaml', _one_agent('{file: docs/missing.md}'))
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    assert '不存在或不是文件' in excinfo.value.received

@@ -6,8 +6,9 @@ must not depend on this module or on PyYAML.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
@@ -17,10 +18,12 @@ from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
 from syndica.cli.environment import HOST_SET_ENV, reopens_git, valid_env_name
+from syndica.cli.policy import STRICTNESS, RoleTightening, dev_table
 from syndica.kernel import (
     AgentCatalog,
     AgentSlot,
     ConfigError,
+    Disposition,
     ExitMode,
     ManifestSource,
     RedactionRule,
@@ -29,11 +32,18 @@ from syndica.kernel import (
     TraceLevel,
     register_builtins,
 )
+from syndica.kernel.manifest import prompt_file
 from syndica.kernel.redaction import looks_secret
 
 __all__ = ['CliConfig', 'WorkspaceConfig', 'load_config']
 
-_ROOT_KEYS = frozenset({'version', 'agents', 'topologies', 'workspace', 'redaction', 'trace'})
+logger = logging.getLogger(__name__)
+
+_ROOT_KEYS = frozenset(
+    {'version', 'agents', 'topologies', 'workspace', 'redaction', 'trace', 'danger'}
+)
+_DANGER_KEYS = frozenset({'roles'})
+_ROLE_DANGER_KEYS = frozenset({'rules', 'policy'})
 _WORKSPACE_KEYS = frozenset({'pass_env', 'verify', 'protected'})
 _REDACTION_KEYS = frozenset({'rules'})
 _TRACE_KEYS = frozenset({'level'})
@@ -149,6 +159,7 @@ class CliConfig:
     workspace: WorkspaceConfig = WorkspaceConfig()
     redaction_rules: tuple[RedactionRule, ...] = ()
     trace_level: TraceLevel | None = None
+    danger_roles: Mapping[str, RoleTightening] = field(default_factory=lambda: MappingProxyType({}))
 
 
 def load_config(path: str | Path) -> CliConfig:
@@ -184,6 +195,100 @@ def load_config(path: str | Path) -> CliConfig:
         workspace=_workspace(root.get('workspace', {})),
         redaction_rules=_redaction(root.get('redaction', {})),
         trace_level=_trace(root.get('trace', {})),
+        danger_roles=_danger(root.get('danger', {}), catalog),
+    )
+
+
+def _danger(value: object, catalog: AgentCatalog) -> Mapping[str, RoleTightening]:
+    """`danger.roles`：项目配置只能收紧开发期的处置（M4 D12）。项目配置是不受信的来源，放宽安全边界
+    要问用户，而 M4 没有用户级配置。"""
+    section = _keyed(value, 'danger', _DANGER_KEYS, '`danger: {roles: {Worker: {...}}}`')
+    roles: dict[str, RoleTightening] = {}
+    names = catalog.names()
+    raw_roles = _keyed(section.get('roles', {}), 'danger.roles', None, '`roles: {Worker: {...}}`')
+    for role, raw in raw_roles.items():
+        if role not in names:
+            raise _config(
+                'danger.roles 的键是已载入的角色名',
+                f'没有角色 {role!r}',
+                f'改成已有的角色名（{list(names)}），或先在 agents 里声明它',
+            )
+        field_name = f'danger.roles.{role}'
+        entry = _keyed(raw, field_name, _ROLE_DANGER_KEYS, '`{rules: {...}}` 或 `{policy: ...}`')
+        if not entry:
+            raise _config(
+                f'{field_name} 至少写 rules 或 policy 之一',
+                f'{field_name} 是空的',
+                '写上要收紧的规则，或 policy: block_high_risk；不收紧就删掉这个角色',
+            )
+        roles[role] = RoleTightening(
+            rules=MappingProxyType(_tightened_rules(entry.get('rules', {}), field_name)),
+            block_high_risk=_role_policy(entry, field_name),
+        )
+    return MappingProxyType(roles)
+
+
+def _keyed(
+    value: object, field_name: str, allowed: frozenset[str] | None, example: str
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise _config(
+            f'{field_name} 是 Mapping',
+            f'收到 {field_name}={value!r}，类型是 {type(value).__name__}',
+            f'写成 {example}',
+        )
+    raw = cast(Mapping[object, object], value)
+    bad = [key for key in raw if not isinstance(key, str)]
+    unknown = [key for key in raw if allowed is not None and key not in allowed]
+    if bad or unknown:
+        raise _config(
+            f'{field_name} 的键是字符串'
+            + ('' if allowed is None else f'，只含 {sorted(allowed)!r}'),
+            f'收到键 {sorted(str(key) for key in [*bad, *unknown])!r}',
+            f'写成 {example}；未识别的配置不能静默忽略',
+        )
+    return cast(Mapping[str, object], raw)
+
+
+def _tightened_rules(value: object, field_name: str) -> dict[str, Disposition]:
+    base = dev_table()
+    choices = {'confirm': Disposition.CONFIRM, 'block': Disposition.BLOCK}
+    rules: dict[str, Disposition] = {}
+    for rule_id, raw in _keyed(value, f'{field_name}.rules', None, '`{规则 ID: block}`').items():
+        if rule_id not in base:
+            raise _config(
+                f'{field_name}.rules 的键是开发期判定器里的规则 ID',
+                f'没有规则 {rule_id!r}',
+                f'改成 {sorted(base)} 之一；规则 ID 拼错时不能静默回落',
+            )
+        if raw == 'allow' or raw not in choices:
+            raise _config(
+                f'{field_name}.rules.{rule_id} 是 confirm 或 block：项目配置只能收紧处置',
+                f'收到 {raw!r}',
+                '写 confirm 或 block；要放开一条规则得由用户在命令行上决定，项目配置做不到',
+            )
+        chosen = choices[cast(str, raw)]
+        if STRICTNESS[chosen] < STRICTNESS[base[rule_id]]:
+            raise _config(
+                f'{field_name}.rules.{rule_id} 只能比开发期的处置更严：项目配置只能收紧处置',
+                f'开发期是 {base[rule_id].value}，收到 {raw!r}',
+                f'写 {base[rule_id].value} 或更严的值，或删掉这一条',
+            )
+        rules[rule_id] = chosen
+    return rules
+
+
+def _role_policy(entry: Mapping[str, object], field_name: str) -> bool:
+    if 'policy' not in entry:
+        return False
+    policy = entry['policy']
+    if policy == 'block_high_risk':
+        return True
+    raise _config(
+        f'{field_name}.policy 是 block_high_risk：项目配置只能收紧处置',
+        f'收到 {policy!r}',
+        ('allow_all 会放开每一条规则，项目配置做不到；' if policy == 'allow_all' else '')
+        + '要逐条收紧就写 rules，要阻断全部高风险就写 block_high_risk',
     )
 
 
@@ -441,14 +546,34 @@ def _load_agents(catalog: AgentCatalog, value: object, file: Path) -> None:
                 )
             if isinstance(name, str):
                 names.append(name)
+        location = f'{str(file)}#agents[{index}]'
+        origin = str(file.parent.resolve())
+        if isinstance(item, Mapping):
+            prompt = cast(Mapping[object, object], item).get('system_prompt')
+            _warn_if_a_path_went_missing(prompt, origin, location)
         catalog.load_mapping(
             cast(object, item),
-            source=ManifestSource(
-                kind='yaml_file',
-                location=f'{str(file)}#agents[{index}]',
-                origin=str(file.parent.resolve()),
-            ),
+            source=ManifestSource(kind='yaml_file', location=location, origin=origin),
         )
+
+
+def _warn_if_a_path_went_missing(prompt: object, origin: str, location: str) -> None:
+    """一个长得像路径、却没有对应文件的字符串会被当成提示词正文原样交给模型，而 run 照常跑完。"""
+    if not isinstance(prompt, str) or not prompt or any(ch.isspace() for ch in prompt):
+        return
+    if not ('/' in prompt or '\\' in prompt or prompt.endswith(('.md', '.txt'))):
+        return
+    if prompt_file(prompt, origin) is not None:
+        return
+    logger.warning(
+        '期望: %s 的 system_prompt %r 是 %s 下的一个文件。'
+        ' 实际: 没有这个文件，它会被当成提示词正文原样交给模型。'
+        ' 下一步: 修正路径，或写成 {file: %s}，路径写错时直接报错；本意就是这段正文就不用管。',
+        location,
+        prompt,
+        origin,
+        prompt,
+    )
 
 
 def _load_topologies(value: object, catalog: AgentCatalog, file: Path) -> dict[str, Topology]:

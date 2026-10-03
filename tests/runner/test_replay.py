@@ -2250,3 +2250,31 @@ def test_a_replay_that_does_not_finish_ends_its_recording_with_how_it_ended(
 
     [header] = asyncio.run(store.traces())
     assert header.status is status
+
+
+def _role_gated(role: str, host: str, recorded: str) -> dict[str, Any]:
+    document = _gated(rules=[{'id': 'shell.recursive_force_remove'}], gate=_BLOCKED)
+    document['version'] = 3
+    document['host']['danger']['table'] = {'shell.recursive_force_remove': host}
+    document['host']['danger']['roles'] = {
+        'Lead': {'policy': 'table', 'table': {'shell.recursive_force_remove': role}}
+    }
+    document['agents']['Lead']['instances'][0]['gate'][0]['disposition'] = recorded
+    return document
+
+
+def test_the_role_policy_in_the_host_profile_decides_that_roles_calls():
+    assert _replay(_role_gated('block', host='confirm', recorded='block')).reproduced
+
+    result = _replay(_role_gated('confirm', host='block', recorded='block'), allow_divergence=True)
+
+    [divergence] = [d for d in result.divergences if d.kind == 'gate']
+    assert "disposition: 记录 'block'，回放 'confirm'" in divergence.detail
+
+
+def test_a_role_without_its_own_policy_keeps_the_hosts_table():
+    document = _role_gated('confirm', host='block', recorded='block')
+    document['host']['danger']['roles'] = {
+        'Helper': document['host']['danger']['roles'].pop('Lead')
+    }
+    assert _replay(document).reproduced

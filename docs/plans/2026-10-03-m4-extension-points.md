@@ -426,8 +426,9 @@ OpenRouter 时）仍只收免费模型；平台没配置时报三件套（点名
 - `AgentCatalog.freeze(..., role_policies=None)`、`Runtime.assemble(..., role_policies=None)`（D12）。
 - `Runtime.assemble(topology, catalog, ...)` 的 `catalog` 另收已冻结的 `Mapping[str, AgentFactory]`（T13；收它时不再
   冻结，`role_policies` 与 `danger_*` 不适用、传了就报错）。
-- 清单 `system_prompt` 另收 `{file: path}`（D11）；清单加载另有一个「不按路径读提示词文件」的入口，供 CLI 交来已经
-  读好的文本（D15 的「只读一次」）。
+- 清单 `system_prompt` 另收 `{file: path}`（D11）；`manifest.prompt_file(value, origin)` 交回清单会读的那个文件
+  （或 None）。CLI 自己读好文本后以字面提示词、不给 origin 交给清单——没有 origin 时内核一律不按路径读，这条入口
+  M1 起就有，不必另开（D15 的「只读一次」）。
 - Module 工具与类式角色自己装的工具必须在自己的类上声明 `__tool_command_args__`（D7）；`AskUser` /
   `AskUserQuestion` 补声明。
 - 扩展切点的触发规则收紧（D5）：此前谁拿到中心谁就能按名字触发任何切点；没有生产代码依赖旧规则。
@@ -517,9 +518,11 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 
 ### 阶段二：清单与策略
 
-#### T6 — 清单 `model` 的平台写法（D10）
-#### T7 — `system_prompt` 的显式文件写法与 CLI 警告（D11）；本仓配置改用显式写法
-#### T8 — 按角色的危险处置（D12），宿主档案与回放随之扩展
+#### T6 — 清单 `model` 的平台写法（D10，完成）
+#### T7 — `system_prompt` 的显式文件写法与 CLI 警告（D11，完成）；本仓配置改用显式写法
+#### T8 — 按角色的危险处置（D12，完成），宿主档案与回放随之扩展
+- 回放文档格式 3 随 T8 落地（`danger.roles` 是第一个 v3 的键）；捕获写「写得下这份内容的最低版本」，没用到 v3 的
+  键就仍写 2，旧版本的读者照样读得进。
 - `HostProfile` 是承诺类型：`modules` 名字列表保留，Module 记录与按角色的处置表都加**新字段**，不改旧字段的形状。
 - 变异：按角色的策略查错角色、回落错策略必须变红（安全）。
 

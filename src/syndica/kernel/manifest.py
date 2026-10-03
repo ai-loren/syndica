@@ -3,8 +3,10 @@
 十个公开字段的名字、顺序、缺省值一经导出就是永久承诺；未知键当场拒绝——丢掉等于
 「我改了为什么没生效」。本模块只解析 Mapping，不读 YAML、不读环境变量。
 
-`system_prompt` 何时当文件读：source 带 origin 目录，且该字符串作为相对路径在目录内
-真的是一个文件。没有 origin，或相对路径不是文件，字符串就是提示词本身。不靠后缀或换行猜测。
+`system_prompt` 何时当文件读：写成 `{file: <相对路径>}` 时一定读，文件不存在或不在 origin 之内
+就报错；写成字符串时，source 带 origin 目录、且该字符串作为相对路径在目录内真的是一个文件才读，否则
+字符串就是提示词本身，不靠后缀或换行猜测。没有 origin 时一律不读文件：宿主已经读好正文、不要内核再
+按路径读一次，就不给 origin（`prompt_file` 告诉宿主该读哪个文件）。
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from typing import Literal, cast
 from syndica.kernel.agent import BaseAgent
 from syndica.kernel.errors import ConfigError
 
-__all__ = ['AgentManifest', 'ManifestSource', 'parse_mapping']
+__all__ = ['AgentManifest', 'ManifestSource', 'parse_mapping', 'prompt_file']
 
 _PUBLIC_FIELDS: tuple[str, ...] = (
     'name',
@@ -296,41 +298,108 @@ def _impl(value: object) -> type[BaseAgent] | str | None:
 
 
 def _system_prompt(value: object, origin: str | None) -> str:
+    path = prompt_file(value, origin)
+    if path is None:
+        return cast(str, value)
+    try:
+        return path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(
+            expected=f'system_prompt 指向的文件 {path} 可读，且是 utf-8 文本',
+            received=f'读失败：{exc}',
+            next_action='修正该文件的权限或编码（utf-8），或改成字面提示词',
+        ) from exc
+
+
+def prompt_file(value: object, origin: str | None) -> Path | None:
+    """`system_prompt` 的这个取值会读哪个文件；字面提示词交回 None。
+
+    宿主要先自己读一遍（算摘要、给人看）时调它，读好的正文再以字面提示词交给清单、不给 origin：
+    两处共用这一条规则，就不会一处当路径、一处当正文。
+    """
+    if isinstance(value, Mapping):
+        return _explicit_prompt_file(cast(Mapping[object, object], value), origin)
     if not isinstance(value, str):
         raise ConfigError(
-            expected='system_prompt 是字符串（字面提示词，或相对 origin 的文件路径）',
+            expected=(
+                'system_prompt 是字符串（字面提示词，或相对 origin 的文件路径），'
+                '或 {file: <相对路径>}'
+            ),
             received=f'system_prompt={value!r}，类型是 {type(value).__name__}',
-            next_action='传入 str；要读文件就把 origin 设成目录，且该相对路径在目录内是一个文件',
+            next_action='写成提示词正文，或写成 {file: docs/agents/x.md} 点名一个文件',
         )
-    return _read_prompt_if_file(value, origin)
+    return _implicit_prompt_file(value, origin)
 
 
-def _read_prompt_if_file(text: str, origin: str | None) -> str:
-    """origin 目录内、相对路径指向真实文件时读内容；否则 text 就是提示词。"""
+def _implicit_prompt_file(text: str, origin: str | None) -> Path | None:
+    """origin 目录内、相对路径指向真实文件时交回它；否则 text 就是提示词。"""
     if origin is None:
-        return text
+        return None
     relative = Path(text)
     if relative.is_absolute() or '..' in relative.parts:
-        return text
+        return None
     base = Path(origin)
     if not base.is_dir():
-        return text
-    candidate = (base / relative).resolve()
+        return None
     try:
+        candidate = (base / relative).resolve()
         rooted = base.resolve()
-    except OSError:
-        return text
+    except (OSError, ValueError):
+        return None
     try:
         candidate.relative_to(rooted)
     except ValueError:
-        return text
-    if not candidate.is_file():
-        return text
-    try:
-        return candidate.read_text(encoding='utf-8')
-    except OSError as exc:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _explicit_prompt_file(table: Mapping[object, object], origin: str | None) -> Path:
+    if set(table) != {'file'} or not isinstance(table.get('file'), str):
         raise ConfigError(
-            expected=f'system_prompt 指向的文件 {candidate} 可读',
-            received=f'读失败：{exc}',
-            next_action='修正 origin 下该相对路径的权限或编码（utf-8），或改成字面提示词',
+            expected='system_prompt 写成映射时只有一个键 file，值是相对路径字符串',
+            received=f'system_prompt={dict(table)!r}',
+            next_action='写成 {file: docs/agents/x.md}；提示词正文直接写成字符串',
+        )
+    shown = cast(str, table['file'])
+    if not shown.strip():
+        raise ConfigError(
+            expected='system_prompt.file 是非空的相对路径',
+            received=f'system_prompt.file={shown!r}',
+            next_action='写上提示词文件相对清单所在目录的路径',
+        )
+    if origin is None:
+        raise ConfigError(
+            expected='system_prompt.file 相对清单所在的目录解析',
+            received='这份清单没有所在目录（从纯 Mapping 载入）',
+            next_action='从文件载入清单，或把提示词正文直接写进 system_prompt',
+        )
+    base = Path(origin)
+    relative = Path(shown)
+    try:
+        rooted = base.resolve()
+        candidate = (base / relative).resolve()
+    except (OSError, ValueError) as exc:
+        raise ConfigError(
+            expected=f'system_prompt.file 是 {origin} 之内的一个文件',
+            received=f'解析 {shown!r} 失败：{exc}',
+            next_action='改成清单所在目录之内的相对路径',
         ) from exc
+    try:
+        candidate.relative_to(rooted)
+    except ValueError:
+        raise ConfigError(
+            expected=f'system_prompt.file 是 {rooted} 之内的一个文件',
+            received=f'{shown!r} 解析到 {candidate}，在它之外',
+            next_action='把提示词文件放进清单所在目录之内，写相对路径；不写绝对路径与 ..',
+        ) from None
+    if relative.is_absolute() or not candidate.is_file():
+        raise ConfigError(
+            expected=f'system_prompt.file 是 {rooted} 之内的一个文件',
+            received=(
+                f'{shown!r} 是绝对路径'
+                if relative.is_absolute()
+                else f'{candidate} 不存在或不是文件'
+            ),
+            next_action='写清单所在目录之内的相对路径，并确认文件存在',
+        )
+    return candidate

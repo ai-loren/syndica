@@ -173,6 +173,15 @@ function calls lack their thought signature, so Syndica returns each signature o
 (base URL and model) that produced it. Function calls answered by another platform are sent to
 Gemini with the placeholder signature Google documents for that case.
 
+A role whose manifest names a model leaves the rotation and calls one platform. Write the model as
+`<platform>:<model>`, where the platform is `gemini`, `openrouter` or `openai` (the generic
+`OPENAI_*` endpoint): `gemini:gemini-3.8-flash`, `openrouter:cohere/north-mini-code:free`,
+`openai:qwen3:8b`. The name is split at its first colon. A name with a `/` or `.` before its first
+colon, such as `cohere/north-mini-code:free`, is a plain model name and goes to OpenRouter when it
+is configured, otherwise to `OPENAI_*`. Any other word before the first colon is an error that
+names the fix, so a tag like `qwen3:8b` has to be written `openai:qwen3:8b`. OpenRouter still
+accepts only free models, whichever way the name reaches it.
+
 A model name written explicitly in a role manifest belongs to a single platform and is not rotated:
 it goes to OpenRouter when OpenRouter is configured, and to the generic `OPENAI_*` endpoint
 otherwise.
@@ -250,11 +259,15 @@ version: 1
 agents:
   - name: Reviewer
     description: Use this agent to review a completed artifact before handoff.
-    system_prompt: You review finished work and report concrete issues first.
-    model: review-model
+    system_prompt: {file: docs/agents/reviewer.md}
+    model: openrouter:cohere/north-mini-code:free
     tools: [Read, Grep, Glob]
     budget:
       turns: 20
+
+danger:
+  roles:
+    Reviewer: {rules: {shell.path_outside_workspace: block}}
 
 topologies:
   review:
@@ -266,6 +279,17 @@ topologies:
         boot: eager
         exit_mode: zombie
 ```
+
+`system_prompt` is either the prompt text or `{file: <path>}`, a file next to the configuration
+(no absolute paths, nothing outside its directory); a missing file is an error. A plain string that
+names an existing file is read as well, so a typo in it would silently become the prompt; the CLI
+warns when a single-word string that looks like a path names no file. `model` takes the
+`<platform>:<model>` form described under Retries and several platforms.
+
+`danger.roles` gives a role a stricter disposition than the development table every run uses:
+`rules` raises single rules to `confirm` or `block`, and `policy: block_high_risk` blocks every
+high-risk rule. A project configuration can only tighten: `allow`, `allow_all`, and anything looser
+than the development table are rejected. Replay rebuilds the same table for each role.
 
 Important current limits:
 
