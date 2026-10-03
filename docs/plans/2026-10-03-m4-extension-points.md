@@ -684,7 +684,9 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 
 ### 收口
 
-#### T15 — 示例第三方 Module 与 E2E
+#### T15 — 示例第三方 Module 与 E2E（完成）
+- 示例只用 `syndica.kernel` 公开的名字；用例经 `importlib.metadata.EntryPoint` 装上（不装进环境），`pyright` 的
+  include 加上 `examples`。
 - `examples/syndica-example-module/`：一个 Flag、一个工具（触发自己的扩展切点）、一个插件（收这个切点并记下）、
   零能力。用例里经可注入的入口点来源装上，不改内核。
 - 四个 E2E 场景（路线图）：装上之后 Agent 有新工具、新 Flag、新 hook；触发自有切点 hook 收得到；不启用时工具、hook、

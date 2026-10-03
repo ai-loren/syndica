@@ -59,7 +59,7 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 quote-style = "single"
 
 [tool.pyright]
-include = ["src", "tests", "scripts"]
+include = ["src", "tests", "scripts", "examples"]
 pythonVersion = "3.11"
 # strict 必须使用顶层路径列表；executionEnvironments 不支持 typeCheckingMode。
 typeCheckingMode = "standard"

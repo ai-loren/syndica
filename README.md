@@ -323,7 +323,9 @@ your full environment, so the confirmation shows it and covers its code when tha
 the workspace; a distribution installed inside the workspace is also checked against its
 `RECORD`. Its tool results, and any result its hooks write for other tools, are marked untrusted;
 `--trust-module-output <name>` on `run` or `chat` lifts that for one module, and a project
-configuration cannot.
+configuration cannot. [examples/syndica-example-module](examples/syndica-example-module) is a
+minimal third-party module to start from: one flag, one tool that triggers the module's own
+extension junction, and one plugin that records what it hears there.
 
 `flags:` overrides flag defaults for the run; `--flag key=value` overrides `flags:`. Both go through
 the same checks against the installed modules' declarations, and a project configuration may only
