@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
+import stat
 import sys
+import types
 from io import StringIO
 from pathlib import Path
 
@@ -24,6 +28,15 @@ from syndica.cli.trust import (
     store_path,
 )
 from syndica.kernel import ConfigError, ScriptedLLM, ScriptedTurn
+
+
+@pytest.fixture(autouse=True)
+def _forget_imported_role_packages():
+    """`doctor` 在本进程里 import 工作区的包；留在 `sys.modules` 里，下一条用例的同名包就按那一份
+    （另一个工作区的）去找了。"""
+    yield
+    for name in [name for name in sys.modules if name.split('.')[0] in {'rolepkg', 'edpkg'}]:
+        del sys.modules[name]
 
 
 class _Tty(StringIO):
@@ -413,3 +426,162 @@ def test_pass_env_cannot_hand_the_agent_another_trust_store(tmp_path: Path):
     path.write_text('version: 1\nworkspace:\n  pass_env: [SYNDICA_TRUST_STORE]\n', encoding='utf-8')
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+def test_a_crlf_prompt_file_reaches_the_kernel_as_read_text_would_read_it(tmp_path: Path):
+    workspace = _workspace(
+        tmp_path,
+        'version: 1\nagents:\n  - {name: Kilo, description: k, system_prompt: prompts/kilo.md}\n',
+    )
+    (workspace / 'prompts').mkdir()
+    prompt = workspace / 'prompts' / 'kilo.md'
+    prompt.write_bytes(b'line one\r\nline two\rline three\r\n')
+
+    snapshot = read_snapshot(workspace / '.syndica.yaml', workspace)
+
+    read = config_of(snapshot).catalog.get('Kilo').system_prompt
+    assert read == prompt.read_text(encoding='utf-8') == 'line one\nline two\nline three\n'
+
+
+@pytest.mark.parametrize('name', ['roles.cpython-311-darwin.so', 'sourceless.pyc', 'table.json'])
+def test_every_file_in_an_in_workspace_package_is_part_of_the_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+):
+    workspace = _workspace(tmp_path, _IMPL_CONFIG)
+    _role_package(workspace)
+    monkeypatch.syspath_prepend(str(workspace))
+    before = _digest(workspace)
+    (workspace / 'rolepkg' / name).write_bytes(b'\x7fELF')
+    assert _digest(workspace) != before
+
+
+class _OneSpec:
+    """只认一个名字的 meta-path finder，像可编辑安装装上的那种：`PathFinder` 不知道它的代码在哪。"""
+
+    def __init__(self, name: str, spec: importlib.machinery.ModuleSpec) -> None:
+        self._name = name
+        self._spec = spec
+
+    def find_spec(
+        self, fullname: str, path: object, target: object = None
+    ) -> importlib.machinery.ModuleSpec | None:
+        del path, target
+        return self._spec if fullname == self._name else None
+
+
+_ELSEWHERE_CONFIG = (
+    'version: 1\nagents:\n  - {name: Kilo, description: k, impl: edpkg.roles:Role}\n'
+)
+
+
+def _elsewhere_package(workspace: Path) -> Path:
+    package = workspace / 'elsewhere' / 'edpkg'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_text('', encoding='utf-8')
+    (package / 'roles.py').write_text('VALUE = 1\n', encoding='utf-8')
+    return package
+
+
+def test_code_only_a_meta_path_finder_knows_about_is_still_digested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path, _ELSEWHERE_CONFIG)
+    package = _elsewhere_package(workspace)
+    spec = importlib.util.spec_from_file_location(
+        'edpkg', package / '__init__.py', submodule_search_locations=[str(package)]
+    )
+    assert spec is not None
+    monkeypatch.setattr(sys, 'meta_path', [_OneSpec('edpkg', spec), *sys.meta_path])
+
+    (impl,) = read_snapshot(workspace / '.syndica.yaml', workspace).impls
+
+    assert impl.where.startswith('工作区之内')
+    assert [name for name, _ in impl.files] == ['__init__.py', 'roles.py']
+
+
+def test_an_already_loaded_package_is_digested_from_its_own_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path, _ELSEWHERE_CONFIG)
+    package = _elsewhere_package(workspace)
+    spec = importlib.util.spec_from_file_location(
+        'edpkg', package / '__init__.py', submodule_search_locations=[str(package)]
+    )
+    assert spec is not None
+    monkeypatch.setitem(sys.modules, 'edpkg', importlib.util.module_from_spec(spec))
+
+    (impl,) = read_snapshot(workspace / '.syndica.yaml', workspace).impls
+
+    assert [name for name, _ in impl.files] == ['__init__.py', 'roles.py']
+
+
+def _unpinnable(workspace: Path, kind: str) -> importlib.machinery.ModuleSpec:
+    if kind == 'zip':
+        spec = importlib.machinery.ModuleSpec(
+            'edpkg', None, origin=str(workspace / 'bundle.zip' / 'edpkg' / '__init__.py')
+        )
+        spec.has_location = True
+        return spec
+    if kind == 'namespace':
+        spec = importlib.machinery.ModuleSpec('edpkg', None, is_package=True)
+        spec.submodule_search_locations = [str(_elsewhere_package(workspace))]
+        return spec
+    return importlib.machinery.ModuleSpec(
+        'edpkg', importlib.machinery.SourcelessFileLoader('edpkg', '')
+    )
+
+
+@pytest.mark.parametrize('kind', ['zip', 'namespace', 'custom-loader'])
+def test_code_the_digest_cannot_pin_down_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+):
+    workspace = _workspace(tmp_path, _ELSEWHERE_CONFIG)
+    monkeypatch.setattr(
+        sys, 'meta_path', [_OneSpec('edpkg', _unpinnable(workspace, kind)), *sys.meta_path]
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        read_snapshot(workspace / '.syndica.yaml', workspace)
+    assert "impl: 'edpkg.roles:Role'" in excinfo.value.expected
+    assert '普通的包' in excinfo.value.next_action
+
+
+def test_a_loaded_module_without_a_spec_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = _workspace(tmp_path, _ELSEWHERE_CONFIG)
+    monkeypatch.setitem(sys.modules, 'edpkg', types.ModuleType('edpkg'))
+    with pytest.raises(ConfigError) as excinfo:
+        read_snapshot(workspace / '.syndica.yaml', workspace)
+    assert '没有 __spec__' in excinfo.value.received
+
+
+def test_sys_path_entries_inside_the_workspace_are_shown_but_not_digested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path)
+    before = _digest(workspace)
+    site = workspace / '.venv' / 'lib' / 'site-packages'
+    site.mkdir(parents=True)
+    monkeypatch.setattr(sys, 'path', [str(site), str(tmp_path / 'outside'), *sys.path])
+
+    snapshot = read_snapshot(workspace / '.syndica.yaml', workspace)
+
+    assert snapshot.path_entries == (str(site),)
+    assert str(site) in describe(snapshot, config_of(snapshot))
+    assert snapshot.digest == before
+
+
+def test_trusting_an_in_workspace_impl_uses_a_fresh_private_bytecode_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path, _IMPL_CONFIG)
+    _role_package(workspace)
+    monkeypatch.syspath_prepend(str(workspace))
+    fixed = tmp_path / 'fixed-pycache'
+    monkeypatch.setattr(sys, 'pycache_prefix', str(fixed))
+
+    _run(workspace, _store(tmp_path), ['doctor'], stdin=_Tty('y\n'))
+
+    assert sys.pycache_prefix is not None
+    prefix = Path(sys.pycache_prefix)
+    assert prefix != fixed
+    assert prefix.name.startswith('syndica-pycache-')
+    assert stat.S_IMODE(prefix.stat().st_mode) == 0o700

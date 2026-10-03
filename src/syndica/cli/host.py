@@ -13,7 +13,6 @@ import secrets
 import shlex
 import signal
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
@@ -114,6 +113,7 @@ from syndica.cli.trust import (
     TrustStore,
     config_of,
     describe,
+    private_pycache_prefix,
     read_snapshot,
     within,
 )
@@ -1822,9 +1822,9 @@ class RuntimeCliHost:
         if store.get(snapshot.path) != snapshot.digest:
             self._confirm(snapshot, config)
             store.put(snapshot.path, snapshot.digest)
-        if any(impl.files for impl in snapshot.impls) and sys.pycache_prefix is None:
-            # 工作区里种下的 `.pyc` 会被当成源文件的缓存：字节码改放到工作区之外。
-            sys.pycache_prefix = str(Path(tempfile.gettempdir()) / 'syndica-pycache')
+        if any(impl.files for impl in snapshot.impls):
+            # 工作区里种下的 `.pyc` 会被当成源文件的缓存：字节码改放到本进程新建的目录。
+            sys.pycache_prefix = private_pycache_prefix()
         return config
 
     def _snapshot(self, file: Path) -> ConfigSnapshot:

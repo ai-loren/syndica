@@ -297,7 +297,14 @@ installed elsewhere is named but not covered). Where no terminal is available, r
 configuration and run `syndica config trust --sha256 <digest>` with the digest from the refusal.
 Confirmations live in `$XDG_CONFIG_HOME/syndica/trusted.json` (default `~/.config/syndica/`),
 never inside the workspace; an agent's own `syndica` writes to a store in its scratch directory
-instead. A configuration outside the workspace, passed with `--config`, needs no confirmation.
+by default, which guards against accidental nesting rather than isolating the agent. A
+configuration outside the workspace, passed with `--config`, needs no confirmation.
+
+The confirmation cannot cover code that runs before it. If syndica itself is installed in a
+virtual environment inside the workspace (uv's default `.venv`), an agent can write `.pth` files
+and installed code there that run at the next start, before any question is asked; the
+confirmation lists such `sys.path` entries so you can see them. Install syndica outside the
+workspaces agents operate on to avoid this.
 
 `modules:` enables optional modules in the order written; `syndica modules list` shows which ones
 exist and where they come from without importing any of them.

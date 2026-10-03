@@ -10,13 +10,18 @@
 
 from __future__ import annotations
 
+import atexit
+import functools
 import hashlib
 import importlib.machinery
 import json
 import os
+import shutil
 import sys
+import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol, cast
@@ -37,6 +42,7 @@ __all__ = [
     'TrustStore',
     'config_of',
     'describe',
+    'private_pycache_prefix',
     'read_snapshot',
     'real_trust_gate',
     'store_path',
@@ -76,7 +82,8 @@ class ImplSource:
 
 @dataclass(frozen=True)
 class ConfigSnapshot:
-    """读一遍得到的全部输入，与它们的摘要。"""
+    """读一遍得到的全部输入，与它们的摘要。`path_entries` 是 `sys.path` 里落在工作区之内的条目：
+    只展示、不进摘要——那里的 `.pth` 在任何确认之前就已经跑过了。"""
 
     path: Path
     text: str
@@ -84,6 +91,7 @@ class ConfigSnapshot:
     impls: tuple[ImplSource, ...]
     modules: tuple[Discovered, ...]
     digest: str
+    path_entries: tuple[str, ...] = ()
 
 
 def _read(path: Path, what: str) -> bytes:
@@ -98,14 +106,17 @@ def _read(path: Path, what: str) -> bytes:
 
 
 def _decoded(data: bytes, path: Path, what: str) -> str:
+    """按 `read_text` 的通用换行解码：内核按路径读提示词时就是这样读的，CRLF 的文件交给模型的字节
+    不能因为改由这里读而变——那会让前缀缓存整体失效。"""
     try:
-        return data.decode('utf-8')
+        text = data.decode('utf-8')
     except UnicodeDecodeError as exc:
         raise ConfigError(
             expected=f'{what} {str(path)!r} 是 utf-8 文本',
             received=f'解码失败：{exc}',
             next_action='把文件保存成 utf-8 后重试',
         ) from exc
+    return text.replace('\r\n', '\n').replace('\r', '\n')
 
 
 def _package_files(root: Path) -> Iterator[tuple[str, bytes]]:
@@ -122,19 +133,76 @@ def _package_files(root: Path) -> Iterator[tuple[str, bytes]]:
             yield path.relative_to(root).as_posix(), path.read_bytes()
 
 
-def _impl_source(index: int, target: str, workspace: Path) -> ImplSource:
-    """按 `PathFinder` 找 `impl:` 的顶层包，不 import：`find_spec('a.b')` 会先 import `a`，那是在
-    确认之前跑代码。工作区之内的整棵顶层包进摘要：父包的 `__init__.py` 与它 import 的兄弟模块
-    都会跑。"""
-    top = target.partition(':')[0].split('.')[0]
-    try:
-        spec = importlib.machinery.PathFinder.find_spec(top, sys.path)
-    except (ImportError, ValueError):
-        spec = None
-    if spec is None:
-        return ImplSource(index, target, '找不到（信任之后 import 时会报错）', None)
+def _found_spec(top: str) -> ModuleSpec | None:
+    """按 import 系统自己的次序逐个问 `sys.meta_path` 上的 finder，不 import。只问 `PathFinder` 时，
+    可编辑安装的 finder 认得而它认不出的代码会被当成工作区之外、不进摘要。"""
+    for finder in sys.meta_path:
+        find_spec = getattr(finder, 'find_spec', None)
+        if find_spec is None:
+            continue
+        try:
+            spec = find_spec(top, None)
+        except (ImportError, ValueError):
+            return None
+        if spec is not None:
+            return cast(ModuleSpec, spec)
+    return None
+
+
+_NOT_FROM_FILES: tuple[object, ...] = (
+    importlib.machinery.BuiltinImporter,
+    importlib.machinery.FrozenImporter,
+)
+
+
+def _unpinned(target: str, spec: ModuleSpec | None) -> ConfigError:
+    shown = (
+        '它已经载入，但没有 __spec__'
+        if spec is None
+        else f'import 系统找到的是 origin={spec.origin!r}、loader={type(spec.loader).__name__}'
+    )
+    return ConfigError(
+        expected=f'impl: {target!r} 的代码是文件系统里的普通包或模块文件，信任确认才摘得到它',
+        received=shown,
+        next_action=(
+            '把它做成普通的包（目录里有 __init__.py）或模块文件；'
+            'zip、命名空间包与自定义加载器摘不到'
+        ),
+    )
+
+
+def _spec_root(target: str, spec: ModuleSpec) -> Path | None:
+    """spec 指向的代码在文件系统里的根：包是它唯一的目录，模块是它的文件。None 是内置或冻结的代码。
+    别的一律报错：摘不到的代码放过去，等于不进摘要就跑。"""
+    if not spec.has_location:
+        if cast(object, spec.loader) in _NOT_FROM_FILES:
+            return None
+        raise _unpinned(target, spec)
+    if spec.origin is None or not Path(spec.origin).is_file():
+        raise _unpinned(target, spec)
     locations = list(spec.submodule_search_locations or ())
-    root = Path(locations[0]) if locations else (Path(spec.origin) if spec.origin else None)
+    if not locations:
+        return Path(spec.origin)
+    if len(locations) != 1 or Path(spec.origin).parent != Path(locations[0]):
+        raise _unpinned(target, spec)
+    return Path(locations[0])
+
+
+def _impl_source(index: int, target: str, workspace: Path) -> ImplSource:
+    """找 `impl:` 的顶层包，不 import：`find_spec('a.b')` 会先 import `a`，那是在确认之前跑代码。
+    已经载入的用它自己的 spec（`import_module` 不会再找一遍）。工作区之内的整棵顶层包进摘要：父包的
+    `__init__.py` 与它 import 的兄弟模块都会跑。"""
+    top = target.partition(':')[0].split('.')[0]
+    loaded = sys.modules.get(top)
+    if loaded is not None:
+        spec = cast('ModuleSpec | None', getattr(loaded, '__spec__', None))
+        if spec is None:
+            raise _unpinned(target, None)
+    else:
+        spec = _found_spec(top)
+        if spec is None:
+            return ImplSource(index, target, '找不到（信任之后 import 时会报错）', None)
+    root = _spec_root(target, spec)
     if root is None:
         return ImplSource(index, target, '不是文件里的代码', None)
     if within(root, Path(syndica.__file__).parent):
@@ -196,7 +264,22 @@ def read_snapshot(
         impls=tuple(impls),
         modules=tuple(enabled),
         digest=digest,
+        path_entries=_workspace_path_entries(workspace),
     )
+
+
+def _workspace_path_entries(workspace: Path) -> tuple[str, ...]:
+    entries = (entry or os.getcwd() for entry in sys.path)
+    return tuple(dict.fromkeys(entry for entry in entries if within(Path(entry), workspace)))
+
+
+@functools.cache
+def private_pycache_prefix() -> str:
+    """本进程自己的字节码目录：每个进程新建一个（0700），退出时删掉。固定的目录 Agent 的 Bash 写得
+    进去，而 unchecked-hash 的 `.pyc` 从不与源文件比对，种在那里的就会被当成缓存。"""
+    path = tempfile.mkdtemp(prefix='syndica-pycache-')
+    atexit.register(shutil.rmtree, path, True)
+    return path
 
 
 def config_of(snapshot: ConfigSnapshot) -> CliConfig:
@@ -227,6 +310,11 @@ def describe(snapshot: ConfigSnapshot, config: CliConfig) -> str:
     ]
     lines += _section('提示词文件', [str(path) for path, _ in snapshot.prompts.values()])
     lines += _section('impl', [f'{impl.target}（{impl.where}）' for impl in snapshot.impls])
+    lines += _section(
+        'sys.path 里工作区之内的条目（Agent 写得到；那里的 .pth 在任何确认之前就会运行，'
+        '摘要盖不住）',
+        list(snapshot.path_entries),
+    )
     lines += _section(
         '角色的模型', [f'{name}: {catalog.get(name).model}' for name in catalog.names()]
     )
