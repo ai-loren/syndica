@@ -74,7 +74,14 @@ from syndica.kernel.llm import (
 from syndica.kernel.local_workspace import LocalWorkspace
 from syndica.kernel.manifest import AgentManifest, ManifestSource
 from syndica.kernel.message import DeliveryResult, Message, Trigger
-from syndica.kernel.modules import FlagDeclaration, ModuleHost, RuntimeModule, SafetyModule
+from syndica.kernel.modules import (
+    FlagDeclaration,
+    FlagRow,
+    ModuleHost,
+    RuntimeModule,
+    SafetyModule,
+    flag_reference,
+)
 from syndica.kernel.plugins import Plugin
 from syndica.kernel.prefix_drift import PrefixDriftModule, PrefixDriftRecord, PrefixDriftService
 from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback, TraceStore
@@ -179,6 +186,7 @@ __all__ = [
     'FileTraceStore',
     'Finding',
     'FlagDeclaration',
+    'FlagRow',
     'HookCallback',
     'HookResult',
     'HooksCenter',
@@ -255,6 +263,7 @@ __all__ = [
     'Waiter',
     'Workspace',
     'encode_redacted',
+    'flag_reference',
     'local_tools',
     'orchestration_tools',
     'parse_scenario_document',

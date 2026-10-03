@@ -302,10 +302,17 @@ topologies:
     assert json.loads(agent)['tools'] == ['Read']
     assert topologies == 'review'
     assert json.loads(topology)['slots'][0]['agent'] == 'Specialist'
-    assert flags.splitlines() == ['max_wait_seconds', 'untrusted_high_risk']
+    assert flags.splitlines() == [
+        'max_wait_seconds\tsafety\tint\t0',
+        'untrusted_high_risk\tsafety\tstr\t"reject"',
+    ]
     assert json.loads(flag) == {
         'key': 'untrusted_high_risk',
+        'module': 'safety',
+        'type': 'str',
         'default': 'reject',
+        'effective': 'reject',
+        'source': '缺省',
         'description': '高风险调用可溯源到不可信内容时的处置',
         'choices': ['reject', 'ask'],
         'minimum': None,

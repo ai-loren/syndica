@@ -320,7 +320,10 @@ configuration cannot. Runs with a third-party module do not write a replay docum
 
 `flags:` overrides flag defaults for the run; `--flag key=value` overrides `flags:`. Both go through
 the same checks against the installed modules' declarations, and a project configuration may only
-tighten: `untrusted_high_risk` accepts only `reject` there.
+tighten: `untrusted_high_risk` accepts only `reject` there. The built-in flags are listed in
+[docs/reference/flags.md](docs/reference/flags.md); `syndica flags list` and `syndica flags show
+<key>` show the flags of the modules a configuration installs, with the value in effect and where
+it comes from.
 
 `danger.roles` gives a role a stricter disposition than the development table every run uses:
 `rules` raises single rules to `confirm` or `block`, and `policy: block_high_risk` blocks every

@@ -33,9 +33,11 @@ if TYPE_CHECKING:
 __all__ = [
     'MODULE_CAPABILITIES',
     'FlagDeclaration',
+    'FlagRow',
     'ModuleHost',
     'RuntimeModule',
     'SafetyModule',
+    'flag_reference',
 ]
 
 FlagValue: TypeAlias = bool | int | str
@@ -103,6 +105,15 @@ class FlagDeclaration:
                 'Flag description 是非空字符串',
                 (f'收到 description={description!r}，类型是 {type(description).__name__}'),
                 '写清这个 Flag 控制什么；同一份说明会进入 CLI、设置界面与文档',
+            )
+        unsafe = UNSAFE_TEXT.search(description)
+        position = description.find('\n') if unsafe is None else unsafe.start()
+        if position >= 0:
+            raise _config(
+                'Flag description 是不含控制字符的单行文本',
+                f'description 在第 {position} 个字符处有 {description[position]!r}',
+                '写成一行、删掉这个字符：说明会显示在终端、设置界面与参考文档里，'
+                '控制字符能在终端上伪造显示，换行会拆开文档的表格',
             )
         default = _flag_value(cast(object, self.default), 'default')
         raw_choices = cast(object, self.choices)
@@ -952,6 +963,40 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
             except BaseException as exc:
                 failures.append(exc)
         return failures
+
+
+@dataclass(frozen=True)
+class FlagRow:
+    """一条 Flag 的参考行（M4 D15）：CLI 的 `flags list/show`、参考文档与以后的设置界面用同一份。
+    `kind` 是取值的类型名（`bool` / `int` / `str`）。"""
+
+    key: str
+    module: str
+    kind: str
+    default: FlagValue
+    choices: tuple[FlagValue, ...]
+    minimum: int | None
+    maximum: int | None
+    description: str
+
+
+def flag_reference(modules: Sequence[RuntimeModule]) -> tuple[FlagRow, ...]:
+    """这些 Module 声明的全部 Flag：按 Module 的次序、再按各自声明的次序，不重排——次序就是装配
+    次序。纯函数：不读环境，渲染与取舍（比如宿主拒收的取值）交给调用方。"""
+    return tuple(
+        FlagRow(
+            key=declaration.key,
+            module=module.name,
+            kind=type(declaration.default).__name__,
+            default=declaration.default,
+            choices=declaration.choices,
+            minimum=declaration.minimum,
+            maximum=declaration.maximum,
+            description=declaration.description,
+        )
+        for module in _module_sequence(modules)
+        for declaration in module.flags
+    )
 
 
 @dataclass(frozen=True)

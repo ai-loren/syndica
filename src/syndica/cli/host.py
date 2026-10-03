@@ -39,7 +39,7 @@ from syndica.cli.export import (
     environment_resource,
     environment_target,
 )
-from syndica.cli.flags import parse_assignments, refused, resolved_flags
+from syndica.cli.flags import flag_details, flag_lines, parse_assignments, resolved_flags
 from syndica.cli.git_finish import (
     Finish,
     GitInterrupted,
@@ -160,6 +160,7 @@ from syndica.kernel import (
     TraceLevel,
     TraceRecorder,
     TrustLevel,
+    flag_reference,
     local_tools,
     register_builtins,
 )
@@ -167,7 +168,7 @@ from syndica.kernel.redaction import Redactor
 from syndica.kernel.scenario_schema import FROZEN_IMPLS
 from syndica.kernel.tools import Delegate, Fork, KillAgent, QueryAgent, SendMessage
 
-__all__ = ['RuntimeCliHost']
+__all__ = ['RuntimeCliHost', 'reference_modules']
 
 ModelFactory = Callable[[str], LLM]
 _RUNTIME_LOGGER = 'syndica.kernel.runtime'
@@ -336,6 +337,12 @@ def _agent_modules(
     """
     read_only = () if read_only_tools is None else (_read_only_module(read_only_tools),)
     return (*_modules(), *configured, *read_only, DevModule(workspace_root, environ))
+
+
+def reference_modules() -> tuple[RuntimeModule, ...]:
+    """参考文档的 Flag 来源：宿主必装与可选的内置 Module，按装配次序。不含第三方：参考文档不随
+    谁的环境里装了什么而变。"""
+    return (*_modules(), *(_optional_builtin(name) for name in OPTIONAL_BUILTINS))
 
 
 def _optional_builtin(name: str) -> RuntimeModule:
@@ -1419,15 +1426,71 @@ class RuntimeCliHost:
                 for row in module_rows(config.modules, discovered)
             )
         builtins = {module.name: module for module in self._builtin_modules()}
-        module = builtins.get(cast(str, request.name))
+        name = cast(str, request.name)
+        module = builtins.get(name)
         if module is None:
-            raise _config_error(
-                f'Module 是内置的之一：{sorted(builtins)!r}',
-                f'收到 {request.name!r}',
-                '运行 syndica modules list 查看全部 Module；'
-                '第三方 Module 的清单要等它能被启用之后再看',
-            )
+            entry = next((entry for entry in discovered if entry.name == name), None)
+            if entry is None or entry.problem is not None:
+                raise _config_error(
+                    f'Module 是内置的（{sorted(builtins)!r}）'
+                    '或 modules list 里装得上的第三方 Module',
+                    f'收到 {request.name!r}'
+                    + ('' if entry is None else f'，它装不上：{entry.problem}'),
+                    '运行 syndica modules list 查看全部 Module 与它们的状态',
+                )
+            # 点名要看才 import：这是用户在命令行上的请求，不是配置替它选的代码。
+            module = self._loaded(config, (name,))[0]
         return json.dumps(_manifest(module), ensure_ascii=False, indent=2)
+
+    def _loaded(self, config: CliConfig, names: Sequence[str]) -> tuple[RuntimeModule, ...]:
+        """import 这几个第三方 Module，交给它们一份与 run 相同的白名单环境（用完即删）。"""
+        discovered = {entry.name: entry for entry in discover(self._entry_points)}
+        environment = agent_environment(
+            self._environ, config.workspace.pass_env, workspace_root=self._workspace_root
+        )
+        try:
+            redactor = host_redactor(self._environ, config.redaction_rules)
+            host = ModuleHost(
+                workspace_root=self._workspace_root,
+                environment=environment.values,
+                redactor=redactor,
+            )
+            return tuple(load_module(discovered[name], host, redactor) for name in names)
+        finally:
+            environment.remove()
+
+    def _inspect_flags(self, request: InspectRequest) -> str:
+        """这份配置会装的 Module 声明的 Flag。配置启用了第三方 Module 时先过信任确认：要 import
+        它们才知道它们声明了什么。"""
+        config = self._config(request.config)
+        third = third_party(config.modules)
+        if third:
+            config = self._trusted_config(request.config)
+        loaded = dict(zip(third, self._loaded(config, third), strict=True))
+        modules = (
+            *_modules(),
+            *(
+                _optional_builtin(name) if name in OPTIONAL_BUILTINS else loaded[name]
+                for name in validated_modules(config.modules, discover(self._entry_points))
+            ),
+        )
+        rows = flag_reference(modules)
+        if request.action == 'list':
+            return flag_lines(rows)
+        row = next((row for row in rows if row.key == request.name), None)
+        if row is None:
+            raise _config_error(
+                f'Flag 是这份配置会装的 Module 声明的之一：{[row.key for row in rows]!r}',
+                f'收到 {request.name!r}',
+                '运行 syndica flags list，再逐字使用其中一个 key；第三方 Module 的 Flag 要它在 '
+                'modules 里启用',
+            )
+        resolved = resolved_flags(
+            config.flags, {}, (item for module in modules for item in module.flags)
+        )
+        source = 'flags:' if row.key in resolved else '缺省'
+        effective = resolved.get(row.key, row.default)
+        return json.dumps(flag_details(row, effective, source), ensure_ascii=False, indent=2)
 
     def _builtin_modules(self) -> tuple[RuntimeModule, ...]:
         return (
@@ -1441,35 +1504,7 @@ class RuntimeCliHost:
         if request.resource == 'modules':
             return self._inspect_modules(request)
         if request.resource == 'flags':
-            declarations = tuple(item for module in _modules() for item in module.flags)
-            if request.action == 'list':
-                return '\n'.join(item.key for item in declarations)
-            declaration = next(
-                (item for item in declarations if item.key == request.name),
-                None,
-            )
-            if declaration is None:
-                raise _config_error(
-                    f'Flag 是已声明项之一：{[item.key for item in declarations]!r}',
-                    f'收到 {request.name!r}',
-                    '运行 syndica flags list，再逐字使用其中一个 key',
-                )
-            return json.dumps(
-                {
-                    'key': declaration.key,
-                    'default': declaration.default,
-                    'description': declaration.description,
-                    'choices': [
-                        choice
-                        for choice in declaration.choices
-                        if not refused(declaration.key, choice)
-                    ],
-                    'minimum': declaration.minimum,
-                    'maximum': declaration.maximum,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+            return self._inspect_flags(request)
         config = self._config(request.config)
         if request.resource == 'agents':
             if request.action == 'list':

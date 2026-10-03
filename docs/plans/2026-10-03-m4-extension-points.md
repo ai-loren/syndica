@@ -613,7 +613,13 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 - 变异（安全）：`flags:` 收下 `untrusted_high_risk=allow` 或 `ask`、第三方工具结果没被标 `UNTRUSTED`（含 `POST_TOOL_USE`
   的插件看到自报的 `TRUSTED`、第三方插件 skip 宿主工具、宿主守卫 skip 第三方工具被误标三种）、名单里的字符串被当成
   字符序列、`install_own_tools` 替换 Module 工具被放过、开发期守卫认了第三方的 `()`、`RECORD` 不核对，都必须变红。
-#### T10 — Flag 文档生成器、`flags list/show`、参考文档（D15）
+#### T10 — Flag 文档生成器、`flags list/show`、参考文档（D15，完成）
+- 内核 `flag_reference(modules) -> tuple[FlagRow, ...]`（按 Module 次序、再按声明次序，不重排）；`FlagDeclaration`
+  的说明拒收会改写终端显示的字符与换行。CLI 渲染 `flags list`（key、Module、类型、缺省）、`flags show`（另给生效值与
+  来源）与 `docs/reference/flags.md`（`scripts/gen_flag_reference.py` 生成，用例比对生成器输出与一份独立金标），
+  三处都不把 CLI 拒收的取值列成可选值；`llm_fallbacks` 非空一律拒收（CLI 按名字启用 `retry` 时不给备用模型）。
+- `flags list/show` 在配置启用了第三方 Module 时先过信任确认（要 import 才知道它声明了什么）；`modules show <名字>`
+  对第三方 Module 照点名 import、不过信任确认——那是用户在命令行上点的名，不是配置替它选的代码（可推翻）。
 
 阶段末：对抗评审二（清单、策略与 CLI：安全边界、配置与发现的失败路径）。
 

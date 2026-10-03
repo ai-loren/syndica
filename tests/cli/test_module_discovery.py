@@ -235,9 +235,18 @@ def test_modules_show_prints_a_builtin_manifest(tmp_path: Path):
 
 def test_modules_show_of_a_module_it_does_not_know_says_where_to_look(tmp_path: Path):
     _write(tmp_path, '')
-    code, _, stderr = _cli(tmp_path, ['modules', 'show', 'alpha'], _ep('alpha'))
+    code, _, stderr = _cli(tmp_path, ['modules', 'show', 'nowhere'], _ep('alpha'))
     assert code != 0
     assert 'syndica modules list' in stderr
+
+
+def test_modules_show_of_a_module_that_cannot_be_installed_says_why(tmp_path: Path):
+    _write(tmp_path, '')
+    code, _, stderr = _cli(
+        tmp_path, ['modules', 'show', 'audit'], _ep('audit', 'dist-a'), _ep('audit', 'dist-b')
+    )
+    assert code != 0
+    assert '有歧义' in stderr
 
 
 def test_the_module_command_lists_builtins_from_the_real_entry_point(tmp_path: Path):

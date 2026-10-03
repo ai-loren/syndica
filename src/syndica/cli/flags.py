@@ -8,25 +8,42 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping, Sequence
 
-from syndica.kernel import ConfigError, FlagDeclaration
+from syndica.cli.terminal import one_line
+from syndica.kernel import ConfigError, FlagDeclaration, FlagRow
 
-__all__ = ['FlagValue', 'parse_assignments', 'refused', 'resolved_flags']
+__all__ = [
+    'FlagValue',
+    'flag_details',
+    'flag_lines',
+    'parse_assignments',
+    'refused',
+    'render_reference',
+    'resolved_flags',
+]
 
 FlagValue = bool | int | str
 
-# CLI 拒收的取值：放开它等于让 Agent 读过命令输出之后的每一条高风险命令不经询问就执行。
-_REFUSED: Mapping[str, str] = {'untrusted_high_risk': 'allow'}
 # 项目配置只能收紧的 Flag → 它在配置里能取的值。
 _CONFIG_TIGHTENS: Mapping[str, frozenset[FlagValue]] = {
     'untrusted_high_risk': frozenset({'reject'}),
 }
+# 参考文档的「CLI 的限制」一栏：声明之外、CLI 自己加的约束。
+_CLI_LIMITS: Mapping[str, str] = {
+    'untrusted_high_risk': '不收 allow；项目配置里只收 reject',
+    'llm_fallbacks': '只收空值：按名字启用的 retry 没有备用模型',
+}
 
 
 def refused(key: str, value: FlagValue) -> bool:
-    """CLI 拒收的取值：`--flag` 与 `flags:` 都报错，`flags show` 不把它列成可选值。"""
-    return _REFUSED.get(key) == value
+    """CLI 拒收的取值：`--flag` 与 `flags:` 都报错，`flags show` 与参考文档不把它列成可选值。
+    `untrusted_high_risk=allow` 会让 Agent 读过命令输出之后的每一条高风险命令不经询问就执行；
+    CLI 按名字启用 `retry` 时不给备用模型，`llm_fallbacks` 点名的模型没有人造得出来。"""
+    if key == 'llm_fallbacks':
+        return value != ''
+    return (key, value) == ('untrusted_high_risk', 'allow')
 
 
 def _error(expected: str, received: str, next_action: str) -> ConfigError:
@@ -93,6 +110,12 @@ def _checked(key: str, value: FlagValue, declaration: FlagDeclaration, where: st
             f'{where} 给的是 {value!r}',
             '改成声明列出的值之一',
         )
+    if refused(key, value) and key == 'llm_fallbacks':
+        raise _error(
+            'CLI 的 llm_fallbacks 是空的：按名字启用的 retry 没有备用模型',
+            f'{where} 给的是 {value!r}',
+            '删掉这一项；要换一家模型就把角色的 model 写成 <平台>:<型号>',
+        )
     if refused(key, value):
         raise _error(
             f'CLI 的 {key} 不取 {value!r}',
@@ -150,3 +173,86 @@ def resolved_flags(
                 )
             resolved[key] = value
     return resolved
+
+
+def _shown(value: FlagValue) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _choices(row: FlagRow) -> list[FlagValue]:
+    return [choice for choice in row.choices if not refused(row.key, choice)]
+
+
+def _range(row: FlagRow) -> str:
+    if row.minimum is not None and row.maximum is not None:
+        return f'{row.minimum} 到 {row.maximum}'
+    if row.minimum is not None:
+        return f'≥ {row.minimum}'
+    if row.maximum is not None:
+        return f'≤ {row.maximum}'
+    return ''
+
+
+def flag_lines(rows: Sequence[FlagRow]) -> str:
+    """`flags list`：每行 key、所属 Module、类型、缺省，制表符分隔。第三方写的字符串过
+    `one_line`。"""
+    return '\n'.join(
+        '\t'.join(one_line(part) for part in (row.key, row.module, row.kind, _shown(row.default)))
+        for row in rows
+    )
+
+
+def flag_details(row: FlagRow, effective: FlagValue, source: str) -> dict[str, object]:
+    """`flags show` 的一条：声明加上这份配置下的生效值与它的来源。"""
+    return {
+        'key': row.key,
+        'module': row.module,
+        'type': row.kind,
+        'default': row.default,
+        'effective': effective,
+        'source': source,
+        'description': row.description,
+        'choices': _choices(row),
+        'minimum': row.minimum,
+        'maximum': row.maximum,
+    }
+
+
+def _cell(text: str) -> str:
+    return text.replace('|', '\\|')
+
+
+def render_reference(rows: Sequence[FlagRow]) -> str:
+    """`docs/reference/flags.md` 的全文。只由内置 Module 的声明生成：参考文档不随谁装了什么而变。"""
+    lines = [
+        '# Flag 参考',
+        '',
+        '<!-- 由 scripts/gen_flag_reference.py 从内置 Module 的声明生成；'
+        '改声明之后重新生成，不要手改。 -->',
+        '',
+        '内置 Module 声明的全部 Flag，按 Module 的装配次序、再按各自声明的次序。',
+        '`.syndica.yaml` 的 `flags:` 与命令行的 `--flag key=value` 都按这里的类型与取值校验，',
+        '命令行覆盖配置；项目配置只能收紧。第三方 Module 的 Flag 用 `syndica flags list` 查看',
+        '（要先确认配置）。',
+        '',
+        '| key | Module | 类型 | 缺省 | 取值 | CLI 的限制 | 说明 |',
+        '| --- | --- | --- | --- | --- | --- | --- |',
+    ]
+    for row in rows:
+        choices = ' / '.join(f'`{_shown(choice)}`' for choice in _choices(row))
+        lines.append(
+            '| '
+            + ' | '.join(
+                (
+                    f'`{row.key}`',
+                    f'`{row.module}`',
+                    row.kind,
+                    f'`{_shown(row.default)}`',
+                    choices or _range(row) or '—',
+                    _CLI_LIMITS.get(row.key, '—'),
+                    _cell(row.description),
+                )
+            )
+            + ' |'
+        )
+    return '\n'.join(lines) + '\n'
