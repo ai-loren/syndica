@@ -332,25 +332,25 @@ def prompt_file(value: object, origin: str | None) -> Path | None:
 
 
 def _implicit_prompt_file(text: str, origin: str | None) -> Path | None:
-    """origin 目录内、相对路径指向真实文件时交回它；否则 text 就是提示词。"""
-    if origin is None:
-        return None
-    relative = Path(text)
-    if relative.is_absolute() or '..' in relative.parts:
-        return None
-    base = Path(origin)
-    if not base.is_dir():
+    """origin 目录内、相对路径指向真实文件时交回它；否则 text 就是提示词。
+
+    探测失败一律当正文：一段内联提示词里任何一节超过文件系统的名字上限，`is_file` 就抛
+    `OSError`，而它本来就不是路径。多行的字符串不去碰文件系统。
+    """
+    if origin is None or '\n' in text:
         return None
     try:
+        relative = Path(text)
+        if relative.is_absolute() or '..' in relative.parts:
+            return None
+        base = Path(origin)
+        if not base.is_dir():
+            return None
         candidate = (base / relative).resolve()
-        rooted = base.resolve()
+        candidate.relative_to(base.resolve())
+        return candidate if candidate.is_file() else None
     except (OSError, ValueError):
         return None
-    try:
-        candidate.relative_to(rooted)
-    except ValueError:
-        return None
-    return candidate if candidate.is_file() else None
 
 
 def _explicit_prompt_file(table: Mapping[object, object], origin: str | None) -> Path:
@@ -392,7 +392,15 @@ def _explicit_prompt_file(table: Mapping[object, object], origin: str | None) ->
             received=f'{shown!r} 解析到 {candidate}，在它之外',
             next_action='把提示词文件放进清单所在目录之内，写相对路径；不写绝对路径与 ..',
         ) from None
-    if relative.is_absolute() or not candidate.is_file():
+    try:
+        exists = candidate.is_file()
+    except OSError as exc:
+        raise ConfigError(
+            expected=f'system_prompt.file 是 {rooted} 之内的一个文件',
+            received=f'检查 {shown!r} 失败：{exc}',
+            next_action='改成一个更短、真实存在的相对路径',
+        ) from exc
+    if relative.is_absolute() or not exists:
         raise ConfigError(
             expected=f'system_prompt.file 是 {rooted} 之内的一个文件',
             received=(

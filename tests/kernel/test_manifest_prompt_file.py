@@ -119,3 +119,22 @@ def test_a_system_prompt_of_another_type_is_refused(tmp_path: Path, prompt: obje
     with pytest.raises(ConfigError) as excinfo:
         _load(prompt, tmp_path)
     assert '{file: <相对路径>}' in excinfo.value.expected
+
+
+@pytest.mark.parametrize(
+    'prompt',
+    ['x' * 300, 'You review carefully. ' + 'y' * 300, 'line one\n' + 'z' * 400],
+    ids=['long-word', 'long-sentence', 'multi-line'],
+)
+def test_an_inline_prompt_longer_than_a_file_name_stays_text(tmp_path: Path, prompt: str):
+    assert _load(prompt, tmp_path) == prompt
+    assert prompt_file(prompt, str(tmp_path)) is None
+
+
+def test_an_explicit_file_name_longer_than_the_file_system_allows_is_a_config_error(
+    tmp_path: Path,
+):
+    with pytest.raises(ConfigError) as excinfo:
+        _load({'file': 'p' * 300}, tmp_path)
+    assert "'" + 'p' * 300 + "'" in excinfo.value.received
+    _three_parts(excinfo.value)
