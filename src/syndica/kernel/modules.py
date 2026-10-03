@@ -11,19 +11,32 @@ import keyword
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, TypeAlias, cast
 
+from syndica import __version__
+from syndica.kernel.danger import declared_command_args
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.hooks import HooksCenter
+from syndica.kernel.hooks.installing import installing
+from syndica.kernel.hooks.junctions import MODULE_NAME, ExtensionJunction
 from syndica.kernel.plugins import Plugin
+from syndica.kernel.terminal_text import UNSAFE_TEXT
 from syndica.kernel.tool import Tool, validate_tool_names
 
 if TYPE_CHECKING:
     from syndica.kernel.agent import BaseAgent
+    from syndica.kernel.redaction import Redactor
     from syndica.kernel.runtime import Runtime
 
-__all__ = ['FlagDeclaration', 'RuntimeModule', 'SafetyModule']
+__all__ = [
+    'MODULE_CAPABILITIES',
+    'FlagDeclaration',
+    'ModuleHost',
+    'RuntimeModule',
+    'SafetyModule',
+]
 
 FlagValue: TypeAlias = bool | int | str
 AgentPluginFactory: TypeAlias = Callable[['Runtime', 'BaseAgent', Mapping[str, FlagValue]], Plugin]
@@ -35,6 +48,8 @@ RuntimeStartHook: TypeAlias = Callable[['Runtime', Mapping[str, FlagValue]], Non
 RuntimeShutdownHook: TypeAlias = Callable[['Runtime'], Awaitable[None]]
 
 _FLAG_KEY = re.compile(r'[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z')
+# 第三方能力包声明它要什么（spec §12.4），供人审查。闭集：词表外的词没有人知道该怎么审。
+MODULE_CAPABILITIES: tuple[str, ...] = ('environment', 'filesystem', 'network', 'subprocess')
 
 
 def _config(expected: str, received: str, next_action: str) -> ConfigError:
@@ -231,9 +246,150 @@ def _callbacks(value: object, field: str, *, positional: int) -> tuple[Callable[
     )
 
 
+def _module_name(value: object, field: str) -> str:
+    if not isinstance(value, str) or MODULE_NAME.fullmatch(value) is None:
+        raise _config(
+            f'{field} 是 Module 名的规范拼法：小写字母开头，只含小写字母、数字与单个连字符分段',
+            f'收到 {field}={value!r}，类型是 {type(value).__name__}',
+            '改成 retry、prefix-drift 这样的名字；它同时是扩展切点的 owner 段、入口点名与配置里'
+            '启用它的写法，三处必须是同一个拼法，因此不做任何归一化',
+        )
+    return value
+
+
+def _shown_text(value: object, field: str, *, one_line: bool) -> str:
+    """要拿去给人看的清单字符串：不含会在终端上改写显示的字符。"""
+    if not isinstance(value, str):
+        raise _config(
+            f'RuntimeModule.{field} 是字符串',
+            f'收到 {field}={value!r}，类型是 {type(value).__name__}',
+            f'传 str；没有要说的就省略 {field}',
+        )
+    found = UNSAFE_TEXT.search(value)
+    if found is None and one_line:
+        newline = value.find('\n')
+        if newline >= 0:
+            raise _config(
+                f'RuntimeModule.{field} 只占一行',
+                f'{field} 在第 {newline} 个字符处换行',
+                f'把 {field} 写成一行；详细说明放进 security_notes',
+            )
+    if found is not None:
+        raise _config(
+            f'RuntimeModule.{field} 不含控制字符（C0、C1、双向文字控制字符）',
+            f'{field} 在第 {found.start()} 个字符处有 {found.group()!r}',
+            f'删掉这个字符：{field} 会显示给要决定信不信任这个 Module 的人，'
+            '控制字符能在终端上伪造显示',
+        )
+    return value
+
+
+def _version(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(character.isspace() for character in value)
+        or UNSAFE_TEXT.search(value) is not None
+    ):
+        raise _config(
+            'RuntimeModule.version 是非空、不含空白与控制字符的字符串',
+            f'收到 version={value!r}，类型是 {type(value).__name__}',
+            '写成发行版本号，例如 1.2.0 或 1.0.0rc1；版本只比较是否相等，不做解析',
+        )
+    return value
+
+
+def _capabilities(value: object) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    declared: list[str] = []
+    for index, item in enumerate(_sequence(value, 'capabilities')):
+        if not isinstance(item, str) or item not in MODULE_CAPABILITIES:
+            raise _config(
+                f'capabilities 的每一项是 {list(MODULE_CAPABILITIES)} 之一',
+                f'capabilities[{index}]={item!r}，类型是 {type(item).__name__}',
+                '只写这个 Module 真的需要的能力；什么都不要就写 ()，'
+                '拿不准就省略（按未声明、即拥有全部能力对待）',
+            )
+        if item in declared:
+            raise _config(
+                'capabilities 里每项能力只写一次',
+                f'capabilities[{index}]={item!r} 与前面重复',
+                '删掉重复的那一项',
+            )
+        declared.append(item)
+    return tuple(declared)
+
+
+def _requires(value: object, name: str) -> tuple[str, ...]:
+    required: list[str] = []
+    for index, item in enumerate(_sequence(value, 'requires')):
+        dependency = _module_name(item, f'requires[{index}]')
+        if dependency == name:
+            raise _config(
+                f'Module {name!r} 不依赖自己',
+                f'requires[{index}]={dependency!r} 就是它自己',
+                '删掉这一项',
+            )
+        if dependency in required:
+            raise _config(
+                'requires 里每个依赖只写一次',
+                f'requires[{index}]={dependency!r} 与前面重复',
+                '删掉重复的那一项',
+            )
+        required.append(dependency)
+    return tuple(required)
+
+
+def _junctions(value: object, name: str) -> tuple[ExtensionJunction, ...]:
+    owned: list[ExtensionJunction] = []
+    for index, item in enumerate(_sequence(value, 'junctions')):
+        if not isinstance(item, ExtensionJunction):
+            raise _config(
+                'junctions 的每一项是 ExtensionJunction',
+                f'junctions[{index}]={item!r}，类型是 {type(item).__name__}',
+                f'先构造 ExtensionJunction("{name}:<event>", JunctionKind.<KIND>)，'
+                '再放进 junctions；工具与插件拿同一个对象触发它',
+            )
+        if item.owner != name:
+            raise _config(
+                f'Module {name!r} 拥有的扩展切点 owner 段是 {name!r}',
+                f'junctions[{index}] 是 {item.name!r}，owner 段是 {item.owner!r}',
+                f'改名为 {name}:<event>：Module 名是保留的 owner，别人用不了它，它也不用别人的',
+            )
+        if any(existing.name == item.name for existing in owned):
+            raise _config(
+                'junctions 里每个切点名只出现一次',
+                f'junctions[{index}] 的名字 {item.name!r} 与前面重复',
+                '删掉重复的那一项；一个切点只有一个句柄',
+            )
+        owned.append(item)
+    return tuple(owned)
+
+
+def _replay_safe(value: object) -> bool:
+    if type(value) is not bool:
+        raise _config(
+            'RuntimeModule.replay_safe 是 bool',
+            f'收到 replay_safe={value!r}，类型是 {type(value).__name__}',
+            '传 True 或 False；不确定就省略（缺省 False，回放不会跑这个 Module 的代码）',
+        )
+    return value
+
+
 @dataclass(frozen=True, init=False)
 class RuntimeModule:
-    """一个带 Flag 的自包含 Runtime 能力声明。"""
+    """一个带 Flag 的自包含 Runtime 能力声明。
+
+    清单字段（`version` 起）供人审查与回放判据：`capabilities=None` 是**未声明**，按拥有全部
+    能力对待；`replay_safe=True` 是作者声明它的工具、hook、服务与启停钩子不做 I/O、不读时钟与
+    随机数、不起线程或执行器——回放跑在虚拟时钟上，等一个线程会让事件循环看起来空闲、定时器提前
+    触发。声明错了，回放报分叉。
+
+    装配失败按快照回滚内核持有的状态（hook 中心、服务）；已经 `on_start` 过的 Module 不补偿：
+    `on_shutdown` 是异步的，同步的 Runtime 构造里调不了。第三方在 `on_start` 里起的任务、写的
+    文件不在回滚承诺内，副作用请放进服务的惰性方法里。
+    """
 
     name: str
     flags: tuple[FlagDeclaration, ...]
@@ -242,6 +398,13 @@ class RuntimeModule:
     tool_factories: tuple[AgentToolFactory, ...]
     on_start: RuntimeStartHook | None
     on_shutdown: RuntimeShutdownHook | None
+    version: str
+    description: str
+    capabilities: tuple[str, ...] | None
+    requires: tuple[str, ...]
+    junctions: tuple[ExtensionJunction, ...]
+    replay_safe: bool
+    security_notes: str
 
     def __init__(
         self,
@@ -253,14 +416,15 @@ class RuntimeModule:
         tool_factories: Sequence[AgentToolFactory] = (),
         on_start: RuntimeStartHook | None = None,
         on_shutdown: RuntimeShutdownHook | None = None,
+        version: str = '0.0.0',
+        description: str = '',
+        capabilities: Sequence[str] | None = None,
+        requires: Sequence[str] = (),
+        junctions: Sequence[ExtensionJunction] = (),
+        replay_safe: bool = False,
+        security_notes: str = '',
     ) -> None:
-        raw_name = cast(object, name)
-        if not isinstance(raw_name, str) or not raw_name.strip():
-            raise _config(
-                'Runtime Module.name 是非空字符串',
-                f'收到 name={raw_name!r}，类型是 {type(raw_name).__name__}',
-                '给 Module 一个稳定名字，用于查重与排障',
-            )
+        name = _module_name(cast(object, name), 'RuntimeModule.name')
         raw_flags = _sequence(cast(object, flags), 'flags')
         checked_flags: list[FlagDeclaration] = []
         keys: list[str] = []
@@ -351,6 +515,18 @@ class RuntimeModule:
         object.__setattr__(self, 'tool_factories', checked_tools)
         object.__setattr__(self, 'on_start', on_start)
         object.__setattr__(self, 'on_shutdown', on_shutdown)
+        object.__setattr__(self, 'version', _version(cast(object, version)))
+        shown = _shown_text(cast(object, description), 'description', one_line=True)
+        object.__setattr__(self, 'description', shown)
+        object.__setattr__(self, 'capabilities', _capabilities(cast(object, capabilities)))
+        object.__setattr__(self, 'requires', _requires(cast(object, requires), name))
+        object.__setattr__(self, 'junctions', _junctions(cast(object, junctions), name))
+        object.__setattr__(self, 'replay_safe', _replay_safe(cast(object, replay_safe)))
+        object.__setattr__(
+            self,
+            'security_notes',
+            _shown_text(cast(object, security_notes), 'security_notes', one_line=False),
+        )
 
 
 class SafetyModule(RuntimeModule):
@@ -359,6 +535,14 @@ class SafetyModule(RuntimeModule):
     def __init__(self) -> None:
         super().__init__(
             'safety',
+            version=__version__,
+            description='等待的墙钟上限与不可信高风险调用的处置',
+            capabilities=(),
+            replay_safe=True,
+            security_notes=(
+                'untrusted_high_risk=allow 让可溯源到不可信内容的高风险调用直接执行，'
+                '跳过 spec §12.2 的强制升级。'
+            ),
             flags=(
                 FlagDeclaration(
                     key='max_wait_seconds',
@@ -374,6 +558,39 @@ class SafetyModule(RuntimeModule):
                 ),
             ),
         )
+
+
+_MISSING = object()
+
+
+def require_own_command_args(tool: Tool, name: str, source: str) -> None:
+    """第三方交来的工具必须在**自己的类上**声明 `__tool_command_args__`（M4 D7）。
+
+    在自己的类上，而不是沿继承链找得到：继承一个 `()` 会让日后真会执行东西的子类静默失去危险判定
+    那道闸。实例上不得另有同名属性：判定器读属性时实例优先，类上的声明于是被盖掉。声明的那段解析
+    当场跑一遍，参数名写错在装配时就失败，而不是在第一次调用时让那道闸一句不说地落空。
+    """
+    cls = type(tool)
+    declared = cls.__dict__.get('__tool_command_args__', _MISSING)
+    if not (
+        isinstance(declared, tuple)
+        and all(isinstance(item, str) for item in cast(tuple[object, ...], declared))
+    ):
+        shown = '类上没有自己的声明' if declared is _MISSING else f'类上声明的是 {declared!r}'
+        raise _config(
+            f'{source} 的工具 {name!r}（{cls.__qualname__}）在自己的类上声明 '
+            '__tool_command_args__，值是参数名字符串的 tuple',
+            f'{cls.__qualname__} 的{shown}',
+            '它不执行任何东西就在类体里写 __tool_command_args__ = ()；否则列出会被执行的参数名，'
+            "如 ('command',)。继承来的声明不算：日后真会执行东西的子类会静默失去危险判定那道闸",
+        )
+    if '__tool_command_args__' in getattr(tool, '__dict__', {}):
+        raise _config(
+            f'{source} 的工具 {name!r} 只在类上声明 __tool_command_args__',
+            f'{cls.__qualname__} 的实例上另有一个同名属性',
+            '删掉实例上的那个：判定器先读实例属性，类上的声明会被它盖掉',
+        )
+    declared_command_args(tool)
 
 
 def _module_sequence(value: object) -> tuple[RuntimeModule, ...]:
@@ -402,6 +619,21 @@ def _module_sequence(value: object) -> tuple[RuntimeModule, ...]:
             )
         modules.append(module)
         names.append(module.name)
+    for index, module in enumerate(modules):
+        for dependency in module.requires:
+            if dependency in names[:index]:
+                continue
+            if dependency in names:
+                raise _config(
+                    f'Module {module.name!r} 依赖的 {dependency!r} 排在它前面',
+                    f'modules[{index}]={module.name!r} 排在 {dependency!r} 之前',
+                    f'把 {dependency!r} 挪到 {module.name!r} 前面：依赖的 Module 先装',
+                )
+            raise _config(
+                f'Module {module.name!r} 依赖的 {dependency!r} 也在 modules 里',
+                f'modules 里没有 {dependency!r}（已有 {names}）',
+                f'把 {dependency!r} 加进 modules、放在 {module.name!r} 前面，或去掉这个依赖',
+            )
     return tuple(modules)
 
 
@@ -484,18 +716,21 @@ def _overrides(
 
 
 class _ModulePlugin:
-    """冻结一次读到的插件名，同时保留原插件的 register 行为。"""
+    """冻结一次读到的插件名，同时保留原插件的 register 行为。register 期间的装配期身份是 Module 名，
+    不是插件名：Module 的切点写在清单里，它的插件不在 register 里声明。"""
 
-    def __init__(self, name: str, plugin: Plugin) -> None:
+    def __init__(self, name: str, plugin: Plugin, module: str) -> None:
         self._name = name
         self._plugin = plugin
+        self._module = module
 
     @property
     def name(self) -> str:
         return self._name
 
     def register(self, hooks: HooksCenter) -> None:
-        self._plugin.register(hooks)
+        with installing('module', self._module):
+            self._plugin.register(hooks)
 
 
 class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
@@ -530,14 +765,16 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
         runtime: Runtime,
         agent: BaseAgent,
         flags: Mapping[str, FlagValue],
-    ) -> None:
-        """构造完全部注入物后，一次性装到 Agent 自己的 Module 层。"""
+    ) -> dict[str, str]:
+        """构造完全部注入物后，一次性装到 Agent 自己的 Module 层。交回「工具名 → 装它的 Module
+        名」，之后装上的工具撞名时据此点名对方。"""
         plugins: list[Plugin] = []
         plugin_owners: dict[str, str] = {}
         tool_batches: list[tuple[str, dict[str, Tool]]] = []
         for module in self.module_objects:
             for index, factory in enumerate(module.agent_plugins):
-                produced = cast(object, factory(runtime, agent, flags))
+                with installing('module', module.name):
+                    produced = cast(object, factory(runtime, agent, flags))
                 if inspect.isawaitable(produced):
                     if inspect.iscoroutine(produced):
                         produced.close()
@@ -581,9 +818,10 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
                         '给其中一个插件换名，或只保留一个提供该插件的 Module',
                     )
                 plugin_owners[plugin_name] = module.name
-                plugins.append(_ModulePlugin(plugin_name, cast(Plugin, produced)))
+                plugins.append(_ModulePlugin(plugin_name, cast(Plugin, produced), module.name))
             for index, factory in enumerate(module.tool_factories):
-                produced = cast(object, factory(runtime, agent, flags))
+                with installing('module', module.name):
+                    produced = cast(object, factory(runtime, agent, flags))
                 if inspect.isawaitable(produced):
                     if inspect.iscoroutine(produced):
                         produced.close()
@@ -602,6 +840,8 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
                         '返回 {工具名: Tool}；没有工具时返回空 dict',
                     )
                 validate_tool_names(cast(object, produced))
+                for tool_name, tool in cast(Mapping[str, Tool], produced).items():
+                    require_own_command_args(tool, tool_name, f'Module {module.name!r}')
                 tool_batches.append((module.name, dict(cast(Mapping[str, Tool], produced))))
 
         tools: dict[str, Tool] = {}
@@ -623,6 +863,14 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
         agent._install_module_plugins(plugins)  # pyright: ignore[reportPrivateUsage]
         if tools:
             agent.install_runtime_tools(tools)
+        return owners
+
+    def declare_junctions(self, hooks: HooksCenter) -> None:
+        """按对象声明全部 Module 清单里的切点。Module 名各不相同、切点的 owner 段等于 Module 名，
+        因此这里不会撞名。"""
+        for module in self.module_objects:
+            for handle in module.junctions:
+                hooks._declare_handle(handle)  # pyright: ignore[reportPrivateUsage]
 
     def install(self, runtime: Runtime) -> None:
         services = [
@@ -649,7 +897,8 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
         mounted: list[str] = []
         try:
             for _module, name, factory in services:
-                service = factory(runtime, self.flags)
+                with installing('module', _module.name):
+                    service = factory(runtime, self.flags)
                 if inspect.isawaitable(service):
                     if inspect.iscoroutine(service):
                         service.close()
@@ -666,7 +915,8 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
             for module in self.module_objects:
                 if module.on_start is None:
                     continue
-                returned = module.on_start(runtime, self.flags)
+                with installing('module', module.name):
+                    returned = module.on_start(runtime, self.flags)
                 if returned is not None:
                     if inspect.iscoroutine(returned):
                         returned.close()
@@ -709,3 +959,46 @@ class _RuntimeModuleAssembly:  # pyright: ignore[reportUnusedClass]
             except BaseException as exc:
                 failures.append(exc)
         return failures
+
+
+@dataclass(frozen=True)
+class ModuleHost:
+    """宿主交给第三方 Module 工厂的环境（M4 D15）：入口点是 `factory(host) -> RuntimeModule`。
+
+    **只追加字段，且新字段带默认值**：已发布的 Module 收它作唯一参数，第三方的测试会自己构造它；
+    加一个没有默认值的字段，那些构造就全断了，删字段同理。`environment`
+    是宿主交给 Agent 的那份白名单环境，不是进程的完整环境；Module 与 syndica 同进程，真要读完整
+    环境它也读得到，这份是让守规矩的 Module 不必去碰 `os.environ`。
+    """
+
+    workspace_root: Path
+    environment: Mapping[str, str]
+    redactor: Redactor
+
+    def __post_init__(self) -> None:
+        if not isinstance(cast(object, self.workspace_root), Path):
+            raise _config(
+                'ModuleHost.workspace_root 是 pathlib.Path',
+                f'收到 {type(self.workspace_root).__name__} 类型的 {self.workspace_root!r}',
+                '传 Path(...)；字符串路径在不同调用方之间会按不同的当前目录解析',
+            )
+        raw = cast(object, self.environment)
+        received = type(raw).__name__
+        if not isinstance(raw, Mapping) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in cast(Mapping[object, object], raw).items()
+        ):
+            raise _config(
+                'ModuleHost.environment 是 str 到 str 的 Mapping',
+                f'收到 {received} 类型的值',
+                '传宿主交给 Agent 的那份白名单环境（dict[str, str]）',
+            )
+        object.__setattr__(
+            self, 'environment', MappingProxyType(dict(cast(Mapping[str, str], raw)))
+        )
+        if not callable(getattr(cast(object, self.redactor), 'redact', None)):
+            raise _config(
+                'ModuleHost.redactor 有 redact(value) 方法（内核的 Redactor）',
+                f'收到 {type(self.redactor).__name__} 类型的值，没有可调用的 redact',
+                '传宿主自己用的那个脱敏器：Module 写盘或外发的东西要过同一套规则',
+            )

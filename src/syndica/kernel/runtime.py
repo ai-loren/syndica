@@ -147,6 +147,7 @@ from syndica.kernel.events import (
     _why_copying_failed,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.kernel.hooks import HooksCenter, Junction
+from syndica.kernel.hooks.installing import no_installer
 from syndica.kernel.ids import (
     IdSource,
     RandomIds,
@@ -165,6 +166,7 @@ from syndica.kernel.modules import (
     FlagValue,
     RuntimeModule,
     _RuntimeModuleAssembly,  # pyright: ignore[reportPrivateUsage]
+    require_own_command_args,
 )
 from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker
@@ -908,6 +910,11 @@ class Runtime:
         )
         self.events: EventBus = EventBus()
         self.hooks: HooksCenter = HooksCenter()
+        self.hooks._serve_runtime()  # pyright: ignore[reportPrivateUsage]
+        # Module 清单里的切点先于一切第三方代码（Runtime 插件的 register 是第一段）声明：名字在
+        # 那之前被占住，别人就抢不走。
+        self.hooks._reserve_owners(frozenset(module_assembly.names))  # pyright: ignore[reportPrivateUsage]
+        module_assembly.declare_junctions(self.hooks)
         # 装配在挂 on_missing_queue 之前：一次被拒的装配不该在共享 broker 上留下一条指向构造失败
         # 的 Runtime 的回调。
         self._plugin_names: tuple[str, ...] = install_plugins(
@@ -1066,6 +1073,8 @@ class Runtime:
         # cast 到 object 是因为要挡的正是违反 `AgentFactory` 标注的运行时取值；不擦掉静态类型，
         # 下面的 isinstance 就成了 pyright 眼里的死代码。
         module_hooks = HooksCenter(outer=self.hooks)
+        module_hooks._serve_one_agent()  # pyright: ignore[reportPrivateUsage]
+        module_hooks._serve_runtime()  # pyright: ignore[reportPrivateUsage]
         token = assigning_agent_id(assigned)
         try:
             produced = cast('object', factory(module_hooks, self.events))
@@ -1120,11 +1129,19 @@ class Runtime:
         control = ControlBlock()
         gate = BrokerTurnGate(agent_id, self.broker, control)
         try:
+            role_tools = frozenset(agent.options.tools)
             self._install_orchestration(agent, agent_id)
-            self._module_assembly.install_agent(self, agent, agent_flags)
+            module_tools = self._module_assembly.install_agent(self, agent, agent_flags)
+            self._install_slot_tools(agent, role_tools, module_tools)
             # 旗子只决定其它角色。Orchestrator 在旗子关掉时仍要能派活，所以每个角色都有一次
             # 自己装工具的机会；缺省实现什么都不做。
+            before_own = dict(agent.options.tools)
             agent.install_own_tools(self)
+            for name, tool in agent.options.tools.items():
+                if before_own.get(name) is not tool:
+                    require_own_command_args(
+                        tool, name, f'类式角色 {type(agent).__qualname__} 的 install_own_tools'
+                    )
             agent._configure_runtime_flags(  # pyright: ignore[reportPrivateUsage]
                 agent_flags
             )
@@ -1219,7 +1236,7 @@ class Runtime:
         # 派生边在任务建好之后：put 与 create_task 之间一句别的都不放。终点是它在这里的第一个周期
         # ——工厂交回的可能是一个已经跑过几个周期的 Agent。
         self._tracing.spawned(agent_id, agent._cycle + 1)  # pyright: ignore[reportPrivateUsage]
-        await self.hooks.trigger(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)
+        await self.hooks._dispatch(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)  # pyright: ignore[reportPrivateUsage]
         return agent_id
 
     async def _confirm(self, request: ConfirmationRequest) -> ConfirmationOutcome:
@@ -1294,6 +1311,43 @@ class Runtime:
             raise _orchestration_name_clash(agent.options.name, clashes)
         agent.install_runtime_tools(installed)
 
+    def _install_slot_tools(
+        self, agent: BaseAgent, role_tools: frozenset[str], module_tools: Mapping[str, str]
+    ) -> None:
+        """装槽工厂挂在 Agent 上的 extra_tools：排在编排工具与 Module 工具之后（M4 D2）。
+
+        撞名报错而不是覆盖，理由同 `_install_orchestration`；错误点名对方是谁，因为三方都可能是
+        先装上的那一个，而槽的作者只看得见自己写的那几个名字。
+        """
+        held = agent._held_slot_tools()  # pyright: ignore[reportPrivateUsage]
+        if held is None:
+            return
+        slot, role, tools = held
+        replaced = sorted(name for name in tools if name in role_tools)
+        if replaced:
+            raise ConfigError(
+                expected=f'槽 {slot!r} 的 extra_tools 只并上角色还没有的工具',
+                received=f'这些名字已经在角色 {role!r} 上：{replaced}。增强不得替换',
+                next_action='需要不同行为就定义不同角色；槽不得替换基础工具',
+            )
+        clashes = sorted(name for name in tools if name in agent.options.tools)
+        if clashes:
+            owners = '、'.join(
+                f'{name}（'
+                + (f'Module {module_tools[name]!r} 的工具' if name in module_tools else '编排工具')
+                + '）'
+                for name in clashes
+            )
+            raise ConfigError(
+                expected=f'槽 {slot!r} 的 extra_tools 只并上 Agent 还没有的工具',
+                received=f'装槽工具之前这些名字已经装上：{owners}',
+                next_action=(
+                    '从槽的 extra_tools 里去掉它们：编排工具与 Module 工具每个 Agent 都已经有了；'
+                    '要换一种行为就给 Module 的工具换名，或定义不同角色'
+                ),
+            )
+        agent.install_runtime_tools(tools)
+
     def _carry_truncated_taint(
         self, agent: BaseAgent, fork_from: str, source_trust: TrustLevel
     ) -> None:
@@ -1366,6 +1420,7 @@ class Runtime:
 
     async def _drive(self, agent_id: str, agent: BaseAgent, seed: _Seed | None) -> None:
         _DRIVING_AGENT.set(agent_id)
+        no_installer()
         # `get` 而不是下标：任务是 create_task 排上去的，在它真正跑起来之前 slot 可能已经被摘掉。
         # 那时该静默退出，而不是让一个 KeyError 变成无人认领的任务异常。
         slot = self._slots.get(agent_id)
@@ -2175,7 +2230,7 @@ class Runtime:
                 owner = entering_owner(('despawn', agent_id), {})
                 spans = outside_any_span()
                 try:
-                    await self.hooks.trigger(Junction.AGENT_DESPAWN, agent_id=agent_id)
+                    await self.hooks._dispatch(Junction.AGENT_DESPAWN, agent_id=agent_id)  # pyright: ignore[reportPrivateUsage]
                 finally:
                     back_in_spans(spans)
                     leaving_owner(owner)
@@ -2215,6 +2270,7 @@ class Runtime:
         # hook 在 `_destroy` 里换到它自己的出处。
         becoming_owner(('reap', agent_id), {})
         outside_any_span()
+        no_installer()
         try:
             task = self._table.get_task(agent_id)
             if task is not None:
@@ -2941,26 +2997,18 @@ class Runtime:
         return factory
 
     def _apply_slot_enhance(self, agent: BaseAgent, slot: AgentSlot) -> None:
+        """解析槽的工具、收紧预算。工具只挂在 Agent 上，由 spawn 在 Module 工具之后装：增强留在
+        工厂里，`Fork` 经 `_factory_of` 重新 spawn 时分身才拿到同样的工具与次序。"""
         from syndica.kernel.catalog import resolve_tool_names
 
-        extra: dict[str, Tool] = {}
-        if slot.extra_tools:
-            resolved = resolve_tool_names(slot.extra_tools, self._topology_tools)
-            extra = dict(resolved)
-            clashes = sorted(set(extra) & set(agent.options.tools))
-            if clashes:
-                raise ConfigError(
-                    expected=f'槽 {slot.name!r} 的 extra_tools 只并上角色还没有的工具',
-                    received=f'这些名字已经在角色 {slot.agent!r} 上：{clashes}。增强不得替换',
-                    next_action='需要不同行为就定义不同角色；槽不得替换基础工具',
-                )
         if slot.budget is not None:
             tightened = _tightened_max_turns(
                 agent.options.max_turns, slot.budget['turns'], slot.agent
             )
             agent.options = replace(agent.options, max_turns=tightened)
-        if extra:
-            agent.install_runtime_tools(extra)
+        if slot.extra_tools:
+            resolved = resolve_tool_names(slot.extra_tools, self._topology_tools)
+            agent._hold_slot_tools(slot.name, slot.agent, resolved)  # pyright: ignore[reportPrivateUsage]
 
     def _instance_metadata(self, slot: AgentSlot, kinds: tuple[str, ...]) -> dict[str, Any]:
         owned = copy.deepcopy(dict(slot.metadata))
@@ -3030,6 +3078,7 @@ class Runtime:
         # span 上——谁先叫 shutdown 取决于调度（M3 D10）。
         becoming_owner(('shutdown',), {})
         outside_any_span()
+        no_installer()
         token = _SHUTTING_DOWN.set((*_SHUTTING_DOWN.get(), self))
         try:
             await self._shutdown_body()
@@ -3057,7 +3106,7 @@ class Runtime:
             reapers = list(self._reapers)
             self._reapers.clear()
             await asyncio.gather(*reapers, return_exceptions=True)
-        await self.hooks.trigger(Junction.RUNTIME_SHUTDOWN)
+        await self.hooks._dispatch(Junction.RUNTIME_SHUTDOWN)  # pyright: ignore[reportPrivateUsage]
         failures: list[BaseException] = []
         try:
             failures.extend(await self._module_assembly.shutdown(self))

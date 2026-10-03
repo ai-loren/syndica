@@ -338,7 +338,7 @@ async def _guarded(tmp_path: Path, tool: Tool, args: dict[str, str]) -> bool:
     hooks = HooksCenter()
     guard = cast(Any, DevModule(tmp_path / 'ws', {}).agent_plugins[0])(None, None, {})
     guard.register(hooks)
-    return (await hooks.trigger(Junction.PRE_TOOL_USE, tool=tool, args=args)).skip
+    return (await hooks._dispatch(Junction.PRE_TOOL_USE, tool=tool, args=args)).skip
 
 
 async def test_the_guard_judges_every_argument_of_a_tool_that_declared_nothing(

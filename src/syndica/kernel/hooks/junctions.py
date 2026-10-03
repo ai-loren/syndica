@@ -75,10 +75,20 @@ Agent 已经建好、条目已经摘掉、关机已经开始，没有一处还�
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import TypeAlias
 
-__all__ = ['INTERCEPTABLE', 'Junction', 'JunctionKind', 'JunctionRef', 'OBSERVABLE']
+from syndica.kernel.errors import ConfigError
+
+__all__ = [
+    'ExtensionJunction',
+    'INTERCEPTABLE',
+    'Junction',
+    'JunctionKind',
+    'JunctionRef',
+    'OBSERVABLE',
+]
 
 
 class Junction(Enum):
@@ -141,3 +151,137 @@ class JunctionKind(Enum):
 
 JunctionRef: TypeAlias = Junction | str
 """切点引用：内核枚举成员，或 `<owner>:<event>` 形式的扩展切点名。"""
+
+# Module 名同时是扩展切点的 owner 段、入口点名与配置里启用它的写法：三处必须是同一个拼法。在插件的
+# `register` 里声明切点的插件，名字也要合这个拼法——它的名字就是那些切点的 owner 段。
+MODULE_NAME = re.compile(r'[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z')
+
+RUNTIME_ONLY: frozenset[Junction] = frozenset(
+    {Junction.RUNTIME_SHUTDOWN, Junction.AGENT_SPAWN, Junction.AGENT_DESPAWN}
+)
+"""只从 `Runtime` 的 hook 中心触发的切点：Agent 这一层（局部层与 Module 层）上挂它们等于挂一个永不
+触发的 hook。新增切点若也只由 `Runtime` 触发，要一并进这里，否则宿主会在 Agent 这一层静默挂空。"""
+
+_NAMESPACE_SEPARATOR = ':'
+_KERNEL_JUNCTIONS_BY_VALUE: dict[str, Junction] = {j.value: j for j in Junction}
+
+
+def _not_an_extension_name(name: object) -> ConfigError:
+    return ConfigError(
+        expected="扩展切点名是 '<owner>:<event>' 形式的 str",
+        received=f'收到 {type(name).__name__} 类型的 {name!r}',
+        next_action=(
+            "传字符串（如 'artifact:created'）；内核切点不经这里声明，它们的分类写死在 "
+            'junctions.py 的 INTERCEPTABLE / OBSERVABLE 里'
+        ),
+    )
+
+
+def validated_kind(kind: object) -> JunctionKind:
+    """校验分类是枚举成员。
+
+    参数标注为 object 而非 JunctionKind：要挡的就是违反标注的运行时取值。等价字符串尤其要挡——
+    `'observable'` 与两个成员都不相等，分发时 `is JunctionKind.INTERCEPTABLE` 为假，于是静默按
+    可观察跑，而那正是「吞异常」那一侧。
+    """
+    if not isinstance(kind, JunctionKind):
+        raise ConfigError(
+            expected='kind 是 JunctionKind 成员',
+            received=f'收到 {type(kind).__name__} 类型的 {kind!r}',
+            next_action=(
+                'JunctionKind.INTERCEPTABLE（串行、可改 kwargs、异常上抛）或 '
+                'JunctionKind.OBSERVABLE（并行、丢弃返回值、吞异常）'
+            ),
+        )
+    return kind
+
+
+def validated_extension_name(name: object) -> str:
+    """校验扩展切点名是 `<owner>:<event>`。
+
+    参数标注为 object 而非 str，理由同 `validated_kind`。
+
+    每一种畸形单独报，不交给一条正则：读者要知道自己错在哪一段。四类畸形一律**拒绝而非归一化**
+    （不 strip、不折叠大小写、不切首个分隔符）——切点名计入公开 API，允许两种拼法映射到同一个
+    切点，日后把 `owner` 绑到注册者身份时就没有唯一的规范拼法可比。放宽接受面日后不是破坏性
+    变更，收紧则是，所以现在按最窄的收。
+    """
+    if not isinstance(name, str):
+        raise _not_an_extension_name(name)
+    kernel = _KERNEL_JUNCTIONS_BY_VALUE.get(name)
+    if kernel is not None:
+        raise ConfigError(
+            expected='扩展切点名带命名空间前缀，不得等于某个内核切点的取值',
+            received=f'收到 {name!r}，它就是 Junction.{kernel.name} 的取值',
+            next_action=(
+                f'内核切点请传 Junction.{kernel.name}。字符串与枚举通到同一个切点会让按枚举触发'
+                '时读不到按字符串注册的 hook——那是静默空转，最难查的一种'
+            ),
+        )
+    if any(ch.isspace() for ch in name):
+        raise ConfigError(
+            expected='扩展切点名不含任何空白字符',
+            received=f'收到 {name!r}',
+            next_action=(
+                '去掉空白后重新声明。这里刻意不自动 strip：两种拼法在日志与错误消息里长得一样，'
+                '却是两个互不相干的切点'
+            ),
+        )
+    separators = name.count(_NAMESPACE_SEPARATOR)
+    if separators != 1:
+        raise ConfigError(
+            expected=f'扩展切点名恰好含一个 {_NAMESPACE_SEPARATOR!r} 分隔符',
+            received=f'收到 {name!r}，其中有 {separators} 个 {_NAMESPACE_SEPARATOR!r}',
+            next_action=(
+                "写成 '<owner>:<event>'（如 'artifact:created'）。多级命名空间现在一律拒绝，"
+                '日后放宽不是破坏性变更，现在收下了却再也收不回来'
+            ),
+        )
+    owner, _, event = name.partition(_NAMESPACE_SEPARATOR)
+    if not owner or not event:
+        raise ConfigError(
+            expected='扩展切点名的 owner 段与 event 段都非空',
+            received=f'收到 {name!r}，owner={owner!r} event={event!r}',
+            next_action=(
+                'owner 段写这个切点属于谁（日后按注册者标识校验它，两个扩展才抢不到同一个名字，'
+                '也冒用不了对方的切点名发事件），event 段写发生了什么'
+            ),
+        )
+    return name
+
+
+class ExtensionJunction:
+    """一个扩展切点的句柄（spec §5.4）：声明它的能力拿着它，触发时交回同一个对象。
+
+    **按对象身份比较**：两个同名的句柄不相等。名字谁都拼得出来，持有对象才是声明者的凭据——
+    这挡的是误用与抢名，不是同进程里的恶意代码（它能 import 别人的句柄）。拷贝交回自己，与函数
+    一样：深拷一份装着句柄的配置，不该让句柄换一个身份、从此再也触发不了。
+    """
+
+    __slots__ = ('_kind', '_name')
+
+    def __init__(self, name: str, kind: JunctionKind) -> None:
+        self._name = validated_extension_name(name)
+        self._kind = validated_kind(kind)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def kind(self) -> JunctionKind:
+        return self._kind
+
+    @property
+    def owner(self) -> str:
+        """名字的 owner 段：声明它的那个能力的名字。"""
+        return self._name.partition(_NAMESPACE_SEPARATOR)[0]
+
+    def __copy__(self) -> ExtensionJunction:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> ExtensionJunction:
+        return self
+
+    def __repr__(self) -> str:
+        return f'ExtensionJunction({self._name!r}, JunctionKind.{self._kind.name})'

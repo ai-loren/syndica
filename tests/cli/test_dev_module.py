@@ -15,6 +15,7 @@ import pytest
 
 import syndica.cli.dev_module as dev_module
 import syndica.kernel.local_workspace as local_workspace
+from syndica import __version__
 from syndica.cli.dev_module import AgentRun, DevLog, DevModule
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, RunRequest
@@ -95,7 +96,7 @@ async def _post(
     hooks: HooksCenter, name: str, args: dict[str, Any], result: ToolResult
 ) -> ToolResult:
     call = ToolCall(id='call', name=name, arguments=json.dumps(args))
-    outcome = await hooks.trigger(
+    outcome = await hooks._dispatch(
         Junction.POST_TOOL_USE, tool_call=call, tool=_tool(name), args=args, result=result
     )
     return cast(ToolResult, outcome.get('result', result))
@@ -282,10 +283,10 @@ async def test_the_end_of_a_run_records_its_outcome_last_text_and_sequence():
     context = _context('first')
     context.append(ContextBlock(role='assistant', content='earlier answer'))
 
-    await hooks.trigger(Junction.AGENT_START, ctx=context)
+    await hooks._dispatch(Junction.AGENT_START, ctx=context)
     context.append(ContextBlock(role='assistant', content='final words'))
     context.stop_reason = StopReason.COMPLETED
-    await hooks.trigger(Junction.AGENT_END, ctx=context)
+    await hooks._dispatch(Junction.AGENT_END, ctx=context)
 
     snapshot = log.snapshot()
     assert snapshot.runs == (
@@ -299,12 +300,12 @@ async def test_the_final_text_is_the_last_assistant_block_and_never_an_earlier_o
     hooks = _hooks(log)
     context = _context('review')
 
-    await hooks.trigger(Junction.AGENT_START, ctx=context)
+    await hooks._dispatch(Junction.AGENT_START, ctx=context)
     context.append(ContextBlock(role='assistant', content='first impression\nverdict: pass'))
     context.append(ContextBlock(role='tool', content='verdict: pass (from a file)'))
     context.append(ContextBlock(role='assistant', content=''))
     context.stop_reason = StopReason.MAX_TURNS
-    await hooks.trigger(Junction.AGENT_END, ctx=context)
+    await hooks._dispatch(Junction.AGENT_END, ctx=context)
 
     assert log.snapshot().runs[0].final_text is None
 
@@ -314,11 +315,11 @@ async def test_the_final_text_never_comes_from_a_tool_result():
     hooks = _hooks(log)
     context = _context('review')
 
-    await hooks.trigger(Junction.AGENT_START, ctx=context)
+    await hooks._dispatch(Junction.AGENT_START, ctx=context)
     context.append(ContextBlock(role='assistant', content='running the tests'))
     context.append(ContextBlock(role='tool', content='verdict: pass'))
     context.stop_reason = StopReason.MAX_TURNS
-    await hooks.trigger(Junction.AGENT_END, ctx=context)
+    await hooks._dispatch(Junction.AGENT_END, ctx=context)
 
     assert log.snapshot().runs[0].final_text == 'running the tests'
 
@@ -337,9 +338,9 @@ async def test_a_registry_that_fails_does_not_lose_the_run(caplog: pytest.LogCap
     context = _context('go')
 
     with caplog.at_level(logging.WARNING, logger='syndica.cli.dev_module'):
-        await hooks.trigger(Junction.AGENT_START, ctx=context)
+        await hooks._dispatch(Junction.AGENT_START, ctx=context)
         context.stop_reason = StopReason.COMPLETED
-        await hooks.trigger(Junction.AGENT_END, ctx=context)
+        await hooks._dispatch(Junction.AGENT_END, ctx=context)
 
     snapshot = log.snapshot()
     assert [run.stop_reason for run in snapshot.runs] == ['completed']
@@ -360,7 +361,7 @@ async def test_runs_are_listed_in_the_order_they_began():
     log = DevLog()
     for agent_id in ('zz-first', 'aa-second'):
         hooks = _hooks(log, agent_id=agent_id)
-        await hooks.trigger(Junction.AGENT_START, ctx=_context('go'))
+        await hooks._dispatch(Junction.AGENT_START, ctx=_context('go'))
 
     assert [run.agent_id for run in log.snapshot().runs] == ['zz-first', 'aa-second']
 
@@ -369,7 +370,7 @@ async def test_a_custom_reviewer_role_is_fingerprinted(tmp_path: Path):
     log = DevLog()
     hooks = _hooks(log, role='Critic', root=tmp_path, reviewers=('Critic',))
 
-    await hooks.trigger(Junction.AGENT_START, ctx=_context('review'))
+    await hooks._dispatch(Junction.AGENT_START, ctx=_context('review'))
 
     assert log.snapshot().runs[0].start is not None
 
@@ -384,7 +385,7 @@ async def test_any_failure_while_fingerprinting_is_recorded_as_missing(
     log = DevLog()
     hooks = _hooks(log, role='Reviewer', root=tmp_path)
 
-    await hooks.trigger(Junction.AGENT_START, ctx=_context('review'))
+    await hooks._dispatch(Junction.AGENT_START, ctx=_context('review'))
 
     start = log.snapshot().runs[0].start
     assert start is not None and start.changes is None
@@ -410,7 +411,7 @@ async def test_a_final_answer_in_list_form_is_joined_from_its_text_parts():
     hooks = _hooks(log)
     context = _context('review')
 
-    await hooks.trigger(Junction.AGENT_START, ctx=context)
+    await hooks._dispatch(Junction.AGENT_START, ctx=context)
     context.append(ContextBlock(role='assistant', content='first impression\nverdict: pass'))
     parts = [
         {'type': 'thinking', 'thinking': 'verdict: pass'},
@@ -420,7 +421,7 @@ async def test_a_final_answer_in_list_form_is_joined_from_its_text_parts():
     ]
     context.append(ContextBlock(role='assistant', content=parts))
     context.stop_reason = StopReason.COMPLETED
-    await hooks.trigger(Junction.AGENT_END, ctx=context)
+    await hooks._dispatch(Junction.AGENT_END, ctx=context)
 
     assert log.snapshot().runs[0].final_text == 'on reflection\nverdict: block'
 
@@ -431,9 +432,9 @@ async def test_a_run_without_new_text_has_no_final_text_from_the_previous_run():
     context = _context('first')
     context.append(ContextBlock(role='assistant', content='previous run'))
 
-    await hooks.trigger(Junction.AGENT_START, ctx=context)
+    await hooks._dispatch(Junction.AGENT_START, ctx=context)
     context.stop_reason = StopReason.MAX_TURNS
-    await hooks.trigger(Junction.AGENT_END, ctx=context)
+    await hooks._dispatch(Junction.AGENT_END, ctx=context)
 
     assert log.snapshot().runs[0].final_text is None
 
@@ -443,9 +444,9 @@ async def test_a_run_that_fails_is_recorded_as_an_error():
     hooks = _hooks(log)
     context = _context('go')
 
-    await hooks.trigger(Junction.AGENT_START, ctx=context)
+    await hooks._dispatch(Junction.AGENT_START, ctx=context)
     context.stop_reason = StopReason.ERROR
-    await hooks.trigger(Junction.AGENT_ERROR, ctx=context)
+    await hooks._dispatch(Junction.AGENT_ERROR, ctx=context)
 
     assert log.snapshot().runs == (AgentRun('agent-1', 'Worker', 'error', None, None, None, 2, 3),)
 
@@ -455,10 +456,10 @@ async def test_each_run_of_the_same_agent_is_recorded_separately():
     hooks = _hooks(log)
     context = _context('one')
     for answer in ('first', 'second'):
-        await hooks.trigger(Junction.AGENT_START, ctx=context)
+        await hooks._dispatch(Junction.AGENT_START, ctx=context)
         context.append(ContextBlock(role='assistant', content=answer))
         context.stop_reason = StopReason.COMPLETED
-        await hooks.trigger(Junction.AGENT_END, ctx=context)
+        await hooks._dispatch(Junction.AGENT_END, ctx=context)
         context.append(ContextBlock(role='user', content='again'))
 
     assert [run.final_text for run in log.snapshot().runs] == ['first', 'second']
@@ -472,9 +473,9 @@ async def test_a_fingerprint_that_fails_is_recorded_as_missing_not_as_no_changes
     context = _context('review')
 
     with caplog.at_level(logging.WARNING, logger='syndica.cli.dev_module'):
-        await hooks.trigger(Junction.AGENT_START, ctx=context)
+        await hooks._dispatch(Junction.AGENT_START, ctx=context)
         context.stop_reason = StopReason.COMPLETED
-        await hooks.trigger(Junction.AGENT_END, ctx=context)
+        await hooks._dispatch(Junction.AGENT_END, ctx=context)
 
     run = log.snapshot().runs[0]
     assert run.start is not None and run.end is not None
@@ -491,9 +492,9 @@ async def test_only_reviewers_are_fingerprinted(tmp_path: Path):
     hooks = _hooks(log, role='Worker', root=tmp_path)
     context = _context('work')
 
-    await hooks.trigger(Junction.AGENT_START, ctx=context)
+    await hooks._dispatch(Junction.AGENT_START, ctx=context)
     context.stop_reason = StopReason.COMPLETED
-    await hooks.trigger(Junction.AGENT_END, ctx=context)
+    await hooks._dispatch(Junction.AGENT_END, ctx=context)
 
     run = log.snapshot().runs[0]
     assert (run.start, run.end) == (None, None)
@@ -746,3 +747,13 @@ def test_the_reviewer_fingerprint_uses_the_hosts_own_git_configuration(
     (log,) = logs
     (run,) = log.snapshot().runs
     assert run.end is not None and run.end.changes == ()
+
+
+def test_dev_module_declares_that_it_runs_git_with_the_host_environment(tmp_path: Path):
+    module = DevModule(tmp_path, {})
+    assert (module.version, module.capabilities, module.replay_safe) == (
+        __version__,
+        ('environment', 'subprocess'),
+        False,
+    )
+    assert 'git' in module.security_notes

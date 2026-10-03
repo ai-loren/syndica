@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from syndica import __version__
 from syndica.kernel.agent import BaseAgent
 from syndica.kernel.context import TrustLevel
 from syndica.kernel.errors import ConfigError
@@ -120,7 +121,7 @@ def _answered(request_id: str, result: WaitResult) -> ToolResult:
 
 
 class _HumanTool(Tool):
-    __tool_command_args__ = ()
+    """每个子类自己声明 `__tool_command_args__`，基类不替它声明（M4 D7）。"""
 
     def __init__(self, runtime: _HumanRuntime, agent_id: str) -> None:
         self._runtime = runtime
@@ -155,6 +156,7 @@ class AskUser(_HumanTool):
     """Ask a human for free-form input."""
 
     __tool_name__ = 'AskUser'
+    __tool_command_args__ = ()
 
     async def execute(self, question: str, timeout: float = 300.0) -> ToolResult:
         """等待人类回答一个开放问题。
@@ -172,6 +174,7 @@ class AskUserQuestion(_HumanTool):
     """Ask a human to select one option."""
 
     __tool_name__ = 'AskUserQuestion'
+    __tool_command_args__ = ()
     __tool_schema__ = {
         'name': 'AskUserQuestion',
         'description': '等待人类从明确选项中选择一个。',
@@ -251,4 +254,11 @@ class HumanInteractionModule(RuntimeModule):
     """Install one pair of human-input tools per Agent."""
 
     def __init__(self) -> None:
-        super().__init__('human-interaction', tool_factories=(_human_tools,))
+        super().__init__(
+            'human-interaction',
+            tool_factories=(_human_tools,),
+            version=__version__,
+            description='给每个 Agent 装上向人提问的两个工具',
+            capabilities=(),
+            replay_safe=True,
+        )

@@ -25,6 +25,7 @@ from textwrap import indent
 from types import MappingProxyType
 from typing import Any, TextIO, TypeVar, cast
 
+from syndica import __version__
 from syndica.cli.capture import frozen_roles, host_profile
 from syndica.cli.checks import parse_check
 from syndica.cli.config import CliConfig, load_config
@@ -267,7 +268,14 @@ def _read_only_module(tools: Mapping[str, Tool]) -> RuntimeModule:
         del runtime, agent, flags
         return guard
 
-    return RuntimeModule('read-only', agent_plugins=(plugin,))
+    return RuntimeModule(
+        'read-only',
+        agent_plugins=(plugin,),
+        version=__version__,
+        description='--no-write：只放行只读、派活与问人的工具',
+        capabilities=(),
+        replay_safe=True,
+    )
 
 
 def _agent_modules(

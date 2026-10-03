@@ -89,7 +89,15 @@ from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
 from syndica.kernel.danger import DangerJudge, DangerPolicy, Disposition, validate_danger_options
 from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
-from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction, JunctionRef
+from syndica.kernel.hooks import (
+    ExtensionJunction,
+    HookCallback,
+    HookResult,
+    HooksCenter,
+    Junction,
+    JunctionRef,
+)
+from syndica.kernel.hooks.junctions import RUNTIME_ONLY
 from syndica.kernel.ids import assigned_agent_id
 from syndica.kernel.llm import LLM, ContextOverflowError
 from syndica.kernel.plugins import Plugin, install_plugins
@@ -107,14 +115,6 @@ from syndica.kernel.tracing import (
 )
 
 __all__ = ['AgentOptions', 'BaseAgent']
-
-_RUNTIME_ONLY: frozenset[Junction] = frozenset(
-    {Junction.RUNTIME_SHUTDOWN, Junction.AGENT_SPAWN, Junction.AGENT_DESPAWN}
-)
-"""只从 `Runtime` 的 hook 中心触发的切点：Agent 局部层上挂它们等于挂一个永不触发的 hook。
-
-新增切点若也只由 `Runtime` 触发，要一并进这里，否则宿主会在这一层静默挂空。
-"""
 
 
 def _runtime_only_junction(junction: Junction) -> ContractViolation:
@@ -418,6 +418,7 @@ class BaseAgent:
         # 本 Agent 自己的一层，外层是宿主交来的那个中心。两层合成一条链，本层在前（spec §5.3）。
         self._module_hooks = hooks
         self._hooks = HooksCenter(outer=hooks)
+        self._hooks._serve_one_agent()  # pyright: ignore[reportPrivateUsage]
         self._events = events
         self._executor = ToolExecutor(
             tools=options.tools,
@@ -437,6 +438,8 @@ class BaseAgent:
         # `gate=`：那个参数的类型不在公开面，放在这里就等于给宿主一个写不出标注的入口。
         self._gate: TurnGate = NullTurnGate()
         self._gate_attached = False
+        # 槽的 extra_tools：槽工厂解析好挂在这里，`Runtime.spawn` 在 Module 工具之后装（M4 D2）。
+        self._slot_tools: tuple[str, str, dict[str, Tool]] | None = None
 
     def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
         """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
@@ -477,19 +480,25 @@ class BaseAgent:
     def context(self) -> Context:
         return self._context
 
-    def register_hook(self, junction: JunctionRef, cb: HookCallback) -> None:
+    def register_hook(self, junction: JunctionRef | ExtensionJunction, cb: HookCallback) -> None:
         """给**这一个** Agent 挂一个 hook（spec §5.3 的第一层）。
 
         它先于 Runtime 级插件执行：局部增强要能先看到、先改，跨 Agent 的通用逻辑在它之后收口。
         两层是一条链，因此局部 hook 的 `modified` 会成为插件看到的入参，它的 `skip` 会连插件的
         hook 一起终止。反过来不成立——宿主从 Runtime 的中心触发时看不到这里挂的任何东西。
 
-        `_RUNTIME_ONLY` 那三个切点在这一层上响亮失败：正因为外层看不见内层，它们只从 `Runtime` 的
+        `RUNTIME_ONLY` 那三个切点在这一层上响亮失败：正因为外层看不见内层，它们只从 `Runtime` 的
         中心触发，挂在这里的回调**结构上永不触发**。
         """
-        if junction in _RUNTIME_ONLY:
+        if junction in RUNTIME_ONLY:
             raise _runtime_only_junction(junction)
         self._hooks.register(junction, cb)
+
+    async def trigger_extension(self, handle: ExtensionJunction, **kwargs: Any) -> HookResult:
+        """在这个 Agent 的整条链（局部 → Module 层 → Runtime）上触发一个扩展切点，返回可拦截链的
+        合并结论。只收声明时交回的那个句柄（规则同 `HooksCenter.trigger`）；Module 的工具与插件工厂
+        都收到 `agent`，因此拿得到这里。"""
+        return await self._hooks.trigger(handle, **kwargs)
 
     def _assembly_snapshot(
         self,
@@ -573,6 +582,14 @@ class BaseAgent:
     def _install_module_plugins(self, plugins: Iterable[Plugin]) -> None:
         """把 Module 插件装进 local 与 Runtime 之间的独立一层。"""
         install_plugins(self._module_hooks, tuple(plugins))
+
+    def _hold_slot_tools(self, slot: str, role: str, tools: Mapping[str, Tool]) -> None:
+        """槽工厂把解析好的 extra_tools 交给 spawn 去装：工具定义的次序进请求前缀，槽工具排在
+        Module 工具之后，同一个角色在不同槽里的共同前缀才逐字节相同。"""
+        self._slot_tools = (slot, role, dict(tools))
+
+    def _held_slot_tools(self) -> tuple[str, str, dict[str, Tool]] | None:
+        return self._slot_tools
 
     def _configure_runtime_flags(self, flags: Mapping[str, bool | int | str]) -> None:
         """把已解析的 Runtime Flag 接到构造时已创建的执行器。"""
@@ -676,7 +693,7 @@ class BaseAgent:
             if query is not None:
                 ctx.append(ContextBlock(role='user', content=query, trust=trust))
             await self._emit('agent_start', {})
-            await self._hooks.trigger(Junction.AGENT_START, ctx=ctx)
+            await self._hooks._dispatch(Junction.AGENT_START, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
             # Exception 而非 BaseException：取消既不是正常结束也不是失败，展开的路上不再触发切点、
             # 不再发事件。
             try:
@@ -684,11 +701,11 @@ class BaseAgent:
             except Exception:
                 ctx.stop_reason = StopReason.ERROR
                 span.attributes['stop_reason'] = StopReason.ERROR.value
-                await self._hooks.trigger(Junction.AGENT_ERROR, ctx=ctx)
+                await self._hooks._dispatch(Junction.AGENT_ERROR, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
                 await self._emit('agent_error', {})
                 raise
             span.attributes['stop_reason'] = stop_reason.value
-            await self._hooks.trigger(Junction.AGENT_END, ctx=ctx)
+            await self._hooks._dispatch(Junction.AGENT_END, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
             # 事件 payload 必须是纯数据：枚举成员走不出序列化的 SSE 出口。
             await self._emit('agent_end', {'stop_reason': stop_reason.value})
             return ctx
@@ -735,7 +752,7 @@ class BaseAgent:
         await self._inject(ctx, decision)
 
         await self._emit('turn_start', {'turn': turn})
-        await self._hooks.trigger(Junction.TURN_START, ctx=ctx, turn=turn)
+        await self._hooks._dispatch(Junction.TURN_START, ctx=ctx, turn=turn)  # pyright: ignore[reportPrivateUsage]
 
         response = await self._one_llm_call(ctx, tool_defs)
         if response is None:
@@ -791,13 +808,13 @@ class BaseAgent:
                 )
             )
             self._tracing.consumed(message.id)
-            await self._hooks.trigger(Junction.MESSAGE_INJECTED, ctx=ctx, message=message)
+            await self._hooks._dispatch(Junction.MESSAGE_INJECTED, ctx=ctx, message=message)  # pyright: ignore[reportPrivateUsage]
         for message_id in decision.deferred:
             self._tracing.deferred(message_id)
 
     async def _end_turn(self, ctx: Context, turn: int, message: ContextBlock | None) -> None:
         """turn 的可观测数据在 turn_end 切点之后才冻结，切点自身的耗时也计入（spec §5.1）。"""
-        await self._hooks.trigger(Junction.TURN_END, ctx=ctx, turn=turn, message=message)
+        await self._hooks._dispatch(Junction.TURN_END, ctx=ctx, turn=turn, message=message)  # pyright: ignore[reportPrivateUsage]
         await self._emit('turn_end', {'turn': turn})
 
     async def _one_llm_call(
@@ -819,7 +836,7 @@ class BaseAgent:
             'messages': [system_block, *(_isolated(block) for block in ctx.current_traj)],
             'tools': tool_defs,
         }
-        hooked = await self._hooks.trigger(Junction.PRE_LLM_REQUEST, ctx=ctx, request=request)
+        hooked = await self._hooks._dispatch(Junction.PRE_LLM_REQUEST, ctx=ctx, request=request)  # pyright: ignore[reportPrivateUsage]
         rewritten = hooked.get('request', request)
         if not isinstance(rewritten, dict):
             raise _bad_request(rewritten)
@@ -834,7 +851,7 @@ class BaseAgent:
             if response is None:
                 return None
 
-        post = await self._hooks.trigger(
+        post = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
             Junction.POST_LLM_RESPONSE, ctx=ctx, request=request, response=response
         )
         if post.result is not None:
@@ -856,7 +873,7 @@ class BaseAgent:
                 attempt.observe(reply)
                 return reply
         except ContextOverflowError as exc:
-            outcome = await self._hooks.trigger(
+            outcome = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
                 Junction.CONTEXT_OVERFLOW, ctx=ctx, request=request, error=exc
             )
             # 先拒后认：skip 与 response 同时给出时，认了 skip 就把 response 静默扔了。
@@ -872,7 +889,7 @@ class BaseAgent:
         self, ctx: Context, request: dict[str, Any], error: Exception
     ) -> ContextBlock:
         """向 LLM_FAILURE 要一个替身；无人给出则打上失败标记并上抛 error。"""
-        outcome = await self._hooks.trigger(
+        outcome = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
             Junction.LLM_FAILURE, ctx=ctx, request=request, error=error
         )
         if outcome.skip or outcome.result is not None:

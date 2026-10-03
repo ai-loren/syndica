@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
+from syndica import __version__
 from syndica.kernel.context import ContextBlock
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
@@ -193,6 +194,10 @@ class RetryModule(RuntimeModule):
 
         super().__init__(
             'retry',
+            version=__version__,
+            description='模型调用失败时按退避重试原 LLM，再依次换到 fallback LLM',
+            capabilities=(),
+            replay_safe=True,
             flags=(
                 FlagDeclaration(
                     key='llm_retry_attempts',

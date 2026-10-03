@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
+from syndica import __version__
 from syndica.kernel.context import ContextBlock
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
@@ -259,6 +260,10 @@ class PrefixDriftModule(RuntimeModule):
 
         super().__init__(
             'prefix-drift',
+            version=__version__,
+            description='逐轮比对请求前缀，漂移时报出第一处不同',
+            capabilities=(),
+            replay_safe=True,
             flags=(
                 FlagDeclaration(
                     key='prefix_drift_detection',

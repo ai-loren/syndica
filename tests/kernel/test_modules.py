@@ -161,6 +161,13 @@ def test_runtime_module_field_order_is_public():
         'tool_factories',
         'on_start',
         'on_shutdown',
+        'version',
+        'description',
+        'capabilities',
+        'requires',
+        'junctions',
+        'replay_safe',
+        'security_notes',
     ]
 
 
@@ -177,6 +184,13 @@ def test_runtime_module_constructor_shape_is_public():
         ('tool_factories', 'KEYWORD_ONLY', True),
         ('on_start', 'KEYWORD_ONLY', True),
         ('on_shutdown', 'KEYWORD_ONLY', True),
+        ('version', 'KEYWORD_ONLY', True),
+        ('description', 'KEYWORD_ONLY', True),
+        ('capabilities', 'KEYWORD_ONLY', True),
+        ('requires', 'KEYWORD_ONLY', True),
+        ('junctions', 'KEYWORD_ONLY', True),
+        ('replay_safe', 'KEYWORD_ONLY', True),
+        ('security_notes', 'KEYWORD_ONLY', True),
     ]
     assert RuntimeModule.__init__.__annotations__ == {
         'name': 'str',
@@ -186,6 +200,13 @@ def test_runtime_module_constructor_shape_is_public():
         'tool_factories': 'Sequence[AgentToolFactory]',
         'on_start': 'RuntimeStartHook | None',
         'on_shutdown': 'RuntimeShutdownHook | None',
+        'version': 'str',
+        'description': 'str',
+        'capabilities': 'Sequence[str] | None',
+        'requires': 'Sequence[str]',
+        'junctions': 'Sequence[ExtensionJunction]',
+        'replay_safe': 'bool',
+        'security_notes': 'str',
         'return': 'None',
     }
     assert parameters['flags'].default == ()
@@ -194,6 +215,13 @@ def test_runtime_module_constructor_shape_is_public():
     assert parameters['tool_factories'].default == ()
     assert parameters['on_start'].default is None
     assert parameters['on_shutdown'].default is None
+    assert parameters['version'].default == '0.0.0'
+    assert parameters['description'].default == ''
+    assert parameters['capabilities'].default is None
+    assert parameters['requires'].default == ()
+    assert parameters['junctions'].default == ()
+    assert parameters['replay_safe'].default is False
+    assert parameters['security_notes'].default == ''
 
 
 def test_safety_module_declares_the_two_fixed_flags_exactly():
@@ -428,15 +456,6 @@ def test_runtime_module_snapshots_all_input_containers():
     assert module.tool_factories == ()
     with pytest.raises(TypeError):
         module.services['later'] = _noop  # pyright: ignore[reportIndexIssue]
-
-
-@pytest.mark.parametrize('name', ['', '  ', None])
-def test_runtime_module_name_must_be_a_nonblank_string(name: object):
-    with pytest.raises(ConfigError) as excinfo:
-        RuntimeModule(name)  # pyright: ignore[reportArgumentType]
-    assert 'Module.name' in excinfo.value.expected
-    assert '稳定名字' in excinfo.value.next_action
-    _three_parts(excinfo.value)
 
 
 def test_runtime_module_rejects_duplicate_flag_keys():
@@ -774,7 +793,7 @@ async def test_start_failure_rolls_back_runtime_hooks_and_services():
     assert captured == [runtime, runtime]
     assert not hasattr(runtime, 'first_service')
     assert not hasattr(runtime, 'second_service')
-    await runtime.hooks.trigger(Junction.AGENT_SPAWN, agent_id='a', parent_id=None)
+    await runtime.hooks._dispatch(Junction.AGENT_SPAWN, agent_id='a', parent_id=None)
     assert observed == []
 
 
@@ -1468,7 +1487,7 @@ async def test_second_plugin_register_failure_restores_the_module_hook_layer():
     try:
         with pytest.raises(RuntimeError, match='register failed'):
             await runtime.spawn(_agent_factory(captured))
-        await captured[0]._hooks.trigger(  # pyright: ignore[reportPrivateUsage]
+        await captured[0]._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
             Junction.PRE_LLM_REQUEST,
             request={'messages': []},
         )
@@ -1591,7 +1610,7 @@ async def test_install_own_tools_failure_restores_tools_and_local_hooks():
             await runtime.spawn(build)
         agent = captured[0]
         assert agent.options.tools == {}
-        await agent._hooks.trigger(  # pyright: ignore[reportPrivateUsage]
+        await agent._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
             Junction.PRE_LLM_REQUEST,
             request={'messages': []},
         )

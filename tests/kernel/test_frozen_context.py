@@ -363,7 +363,7 @@ async def test_every_dispatch_that_carries_the_trajectory_freezes_it(junction: J
         return HookResult()
 
     center.register(junction, write)
-    await center.trigger(junction, ctx=ctx)
+    await center._dispatch(junction, ctx=ctx)
     ctx.append(_note('after'))
 
     assert refusals == [f'切点 {junction.value} 分发期间收到一次追加（role=user）']
@@ -372,7 +372,7 @@ async def test_every_dispatch_that_carries_the_trajectory_freezes_it(junction: J
 
 async def test_an_observable_extension_junction_that_carries_the_trajectory_freezes_it():
     center = HooksCenter()
-    center.declare_extension_junction('memory:consolidated', JunctionKind.OBSERVABLE)
+    consolidated = center.declare_extension_junction('memory:consolidated', JunctionKind.OBSERVABLE)
     ctx = Context()
     refusals: list[str] = []
 
@@ -381,7 +381,7 @@ async def test_an_observable_extension_junction_that_carries_the_trajectory_free
         return HookResult()
 
     center.register('memory:consolidated', write)
-    await center.trigger('memory:consolidated', ctx=ctx)
+    await center.trigger(consolidated, ctx=ctx)
 
     assert refusals == ['切点 memory:consolidated 分发期间收到一次追加（role=user）']
 
@@ -404,7 +404,7 @@ async def test_a_slow_observer_is_still_frozen_after_a_fast_one_finished():
 
     center.register(Junction.TURN_END, fast)
     center.register(Junction.TURN_END, slow)
-    await center.trigger(Junction.TURN_END, ctx=ctx)
+    await center._dispatch(Junction.TURN_END, ctx=ctx)
 
     assert refusals == ['切点 turn_end 分发期间收到一次追加（role=user）']
 
@@ -419,13 +419,13 @@ async def test_nested_dispatches_each_freeze_and_all_unwind():
         return HookResult()
 
     async def outer(**kwargs: Any) -> HookResult:
-        await center.trigger(Junction.TURN_START, ctx=ctx, turn=1)
+        await center._dispatch(Junction.TURN_START, ctx=ctx, turn=1)
         _refused(ctx, refusals)
         return HookResult()
 
     center.register(Junction.TURN_END, outer)
     center.register(Junction.TURN_START, inner)
-    await center.trigger(Junction.TURN_END, ctx=ctx, turn=1, message=None)
+    await center._dispatch(Junction.TURN_END, ctx=ctx, turn=1, message=None)
     ctx.append(_note('after'))
 
     assert refusals == [
@@ -446,7 +446,7 @@ async def test_a_cancelled_dispatch_closes_its_window():
     center.register(Junction.TURN_END, stuck)
     with pytest.raises(TimeoutError):
         async with asyncio.timeout(0.01):
-            await center.trigger(Junction.TURN_END, ctx=ctx)
+            await center._dispatch(Junction.TURN_END, ctx=ctx)
     ctx.append(_note('after'))
 
     assert _shape(ctx) == [('user', 'after')]
@@ -493,7 +493,9 @@ async def test_an_observer_cannot_write_the_trajectory_even_when_it_is_alone(
 async def test_a_dispatch_running_in_another_task_does_not_stop_the_agent_writing():
     llm = ScriptedLLM([ScriptedTurn(content='done')])
     runtime = Runtime()
-    runtime.hooks.declare_extension_junction('memory:consolidated', JunctionKind.OBSERVABLE)
+    consolidated = runtime.hooks.declare_extension_junction(
+        'memory:consolidated', JunctionKind.OBSERVABLE
+    )
     side: list[asyncio.Task[HookResult]] = []
     finished_reading = asyncio.Event()
 
@@ -504,7 +506,7 @@ async def test_a_dispatch_running_in_another_task_does_not_stop_the_agent_writin
 
     async def consolidate(**kwargs: Any) -> HookResult:
         ctx = kwargs['ctx']
-        side.append(asyncio.create_task(runtime.hooks.trigger('memory:consolidated', ctx=ctx)))
+        side.append(asyncio.create_task(runtime.hooks.trigger(consolidated, ctx=ctx)))
         return HookResult()
 
     runtime.hooks.register('memory:consolidated', read_slowly)

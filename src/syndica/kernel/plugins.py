@@ -22,6 +22,7 @@ from typing import Protocol, cast
 
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.hooks import HooksCenter
+from syndica.kernel.hooks.installing import installing
 
 __all__ = ['Plugin', 'install_plugins']
 
@@ -149,8 +150,9 @@ def install_plugins(hooks: HooksCenter, plugins: Sequence[Plugin]) -> tuple[str,
         installed.append(name)
     snapshot = hooks._assembly_snapshot()  # pyright: ignore[reportPrivateUsage]
     try:
-        for plugin in checked:
-            plugin.register(hooks)
+        for plugin, name in zip(checked, installed, strict=True):
+            with installing('plugin', name):
+                plugin.register(hooks)
     except BaseException:
         hooks._assembly_restore(snapshot)  # pyright: ignore[reportPrivateUsage]
         raise

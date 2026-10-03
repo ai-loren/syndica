@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
+from syndica import __version__
 from syndica.cli.checks import CheckResult, parse_check
 from syndica.cli.host_git import Change, HostGit
 from syndica.cli.policy import dev_guard_judge
@@ -437,4 +438,12 @@ class DevModule(RuntimeModule):
             del runtime, flags
             return DevLog()
 
-        super().__init__('dev', agent_plugins=(guard, recorder), services={'dev_log': dev_log})
+        super().__init__(
+            'dev',
+            agent_plugins=(guard, recorder),
+            services={'dev_log': dev_log},
+            version=__version__,
+            description='开发期拦截 git 写操作与越界写入，记录每个 Agent 做了什么',
+            capabilities=('environment', 'subprocess'),
+            security_notes='用宿主环境跑 git，取 Reviewer 看到的工作区指纹；不改仓库。',
+        )

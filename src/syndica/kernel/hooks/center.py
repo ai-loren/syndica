@@ -29,21 +29,29 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
-from collections.abc import Awaitable, Callable
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping
+from types import MappingProxyType
+from typing import Any, cast
 
 from syndica.kernel.context import (
     Context,
     _frozen,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.kernel.errors import ConfigError, ContractViolation
+from syndica.kernel.hooks.installing import current_installer
 from syndica.kernel.hooks.junctions import (
     INTERCEPTABLE,
+    MODULE_NAME,
     OBSERVABLE,
+    RUNTIME_ONLY,
+    ExtensionJunction,
     Junction,
     JunctionKind,
     JunctionRef,
+    validated_extension_name,
+    validated_kind,
 )
 from syndica.kernel.hooks.result import HookResult
 
@@ -52,9 +60,6 @@ __all__ = ['HookCallback', 'HooksCenter']
 logger = logging.getLogger(__name__)
 
 HookCallback = Callable[..., Awaitable[HookResult | None]]
-
-_NAMESPACE_SEPARATOR = ':'
-_KERNEL_JUNCTIONS_BY_VALUE: dict[str, Junction] = {j.value: j for j in Junction}
 
 
 def _label(junction: JunctionRef) -> str:
@@ -161,6 +166,136 @@ def _not_a_junction(junction: object) -> ConfigError:
     )
 
 
+def _runtime_only_here(junction: Junction) -> ContractViolation:
+    return ContractViolation(
+        expected=(
+            f'挂在 Agent 这一层（局部层或 Module 层）的切点由这个 Agent 触发；{junction.value} '
+            '不是其中之一'
+        ),
+        received=f'收到把 {junction.value} 挂到服务单个 Agent 的 hook 中心上的请求',
+        next_action=(
+            f'改挂到 Runtime 的中心：Runtime 插件的 register 里挂，或在 Module 的 on_start 里 '
+            f'runtime.hooks.register(Junction.{junction.name}, cb)。{junction.value} 只从那里'
+            '触发，而外层的 trigger 看不到 Agent 这一层的 hook——挂在这里的回调一次都不会跑'
+        ),
+    )
+
+
+def _declared_twice(name: str, declarer: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'扩展切点 {name} 只声明一次：句柄只能有一个持有者',
+        received=f'{name} 已由{declarer}声明',
+        next_action='换一个 owner 段或 event 段；要挂 hook 就直接按名字 register，不必再声明',
+    )
+
+
+def _qualname(cb: object) -> str:
+    return repr(getattr(cb, '__qualname__', cb))
+
+
+def _not_callable(cb: object) -> ConfigError:
+    return ConfigError(
+        expected='cb 是可调用对象：async def 函数，或带 async __call__ 的对象',
+        received=f'收到 {type(cb).__name__} 类型的 {cb!r}',
+        next_action=(
+            '传函数本身而不是它的调用结果：hooks.register(junction, on_event)，不是 on_event()'
+        ),
+    )
+
+
+def _not_awaitable(junction: JunctionRef, cb: object, returned: object) -> ContractViolation:
+    return ContractViolation(
+        expected=f'{_label(junction)} 上的 hook 返回可等待对象（async def）',
+        received=f'{_qualname(cb)} 同步返回了 {type(returned).__name__} 类型的 {returned!r}',
+        next_action='把它改成 async def；切点按 await 收结论，同步函数的返回值没有人等得到',
+    )
+
+
+def _not_a_result(junction: JunctionRef, cb: object, outcome: object) -> ContractViolation:
+    return ContractViolation(
+        expected=f'可拦截切点 {_label(junction)} 上的 hook 返回 HookResult 或 None',
+        received=f'{_qualname(cb)} 返回了 {type(outcome).__name__} 类型的 {outcome!r}',
+        next_action=(
+            '要改参数就 return HookResult(modified={...})，要顶替这次操作就 '
+            'HookResult(skip=True, result=...)，什么都不改就 return None'
+        ),
+    )
+
+
+def _kernel_junction_triggered(junction: Junction) -> ContractViolation:
+    return ContractViolation(
+        expected=(
+            '挂在 Runtime 上的 hook 中心，公开的 trigger 只触发扩展切点；内核切点只由内核在固定位置'
+            '触发'
+        ),
+        received=f'收到 Junction.{junction.name}，而这条装配链上有一层属于 Runtime',
+        next_action=(
+            f'要在 {junction.value} 发生时做事就 register 一个 hook；伪造一次内核切点会让挂在上面的'
+            '策略 hook 对一件没发生的事下结论'
+        ),
+    )
+
+
+def _string_trigger(name: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'扩展切点 {name} 用声明时交回的那个 ExtensionJunction 触发',
+        received=f'收到字符串 {name!r}',
+        next_action=(
+            '字符串谁都拼得出来：用 declare_extension_junction 的返回值，'
+            '或 Module 清单 junctions 里的那个对象触发'
+        ),
+    )
+
+
+def _foreign_handle(handle: ExtensionJunction, declarer: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'触发 {handle.name} 用的就是声明时交回的那个句柄',
+        received=f'{handle.name} 已由{declarer}声明，收到的是另一个同名的 ExtensionJunction',
+        next_action='拿声明者交出的那个对象触发；自己构造一个同名的句柄不算数，句柄按对象身份比较',
+    )
+
+
+def _reserved_owner(name: str, owner: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'{owner!r} 是已装 Module 的名字，它名下的切点只由它的清单声明',
+        received=f'收到声明 {name!r} 的请求',
+        next_action=(
+            f'换一个 owner 段；{owner!r} 名下的切点写在 '
+            f'RuntimeModule({owner!r}, junctions=...) 里，在任何第三方代码跑之前由 Runtime 声明'
+        ),
+    )
+
+
+def _module_declares(name: str, module: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'Module {module!r} 的扩展切点写在它的清单 junctions 里',
+        received=f'Module {module!r} 的代码里调了 declare_extension_junction({name!r})',
+        next_action=(
+            f'把 ExtensionJunction({name!r}, <kind>) 放进 '
+            f'RuntimeModule({module!r}, junctions=...)，工具与插件拿同一个对象触发'
+        ),
+    )
+
+
+def _owner_mismatch(name: str, owner: str, plugin: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'插件 {plugin!r} 在 register 里声明的切点，owner 段是 {plugin!r}',
+        received=f'它声明了 {name!r}，owner 段是 {owner!r}',
+        next_action=f'改名为 {plugin}:<event>：owner 段说明这个切点归谁，只能是声明它的那个插件',
+    )
+
+
+def _plugin_name_not_canonical(plugin: str) -> ContractViolation:
+    return ContractViolation(
+        expected=(
+            '在 register 里声明扩展切点的插件，名字是 Module 名的规范拼法'
+            '（小写字母开头、单个连字符分段）'
+        ),
+        received=f'插件名是 {plugin!r}',
+        next_action='给插件改名为 audit、audit-log 这样的写法：它的名字就是这些切点的 owner 段',
+    )
+
+
 def _not_a_center(outer: object) -> ConfigError:
     return ConfigError(
         expected='outer 是外层装配的那个 HooksCenter，或 None（本层就是最外层）',
@@ -184,90 +319,6 @@ def _validated_outer(outer: object) -> HooksCenter | None:
     return outer
 
 
-def _not_an_extension_name(name: object) -> ConfigError:
-    return ConfigError(
-        expected="扩展切点名是 '<owner>:<event>' 形式的 str",
-        received=f'收到 {type(name).__name__} 类型的 {name!r}',
-        next_action=(
-            "传字符串（如 'artifact:created'）；内核切点不经这里声明，它们的分类写死在 "
-            'junctions.py 的 INTERCEPTABLE / OBSERVABLE 里'
-        ),
-    )
-
-
-def _validated_kind(kind: object) -> JunctionKind:
-    """校验分类是枚举成员。
-
-    参数标注为 object 而非 JunctionKind：要挡的就是违反标注的运行时取值。等价字符串尤其要挡——
-    `'observable'` 与两个成员都不相等，分发时 `is JunctionKind.INTERCEPTABLE` 为假，于是静默按
-    可观察跑，而那正是「吞异常」那一侧。
-    """
-    if not isinstance(kind, JunctionKind):
-        raise ConfigError(
-            expected='kind 是 JunctionKind 成员',
-            received=f'收到 {type(kind).__name__} 类型的 {kind!r}',
-            next_action=(
-                'JunctionKind.INTERCEPTABLE（串行、可改 kwargs、异常上抛）或 '
-                'JunctionKind.OBSERVABLE（并行、丢弃返回值、吞异常）'
-            ),
-        )
-    return kind
-
-
-def _validated_extension_name(name: object) -> str:
-    """校验扩展切点名是 `<owner>:<event>`。
-
-    参数标注为 object 而非 str，理由同 `_validated_kind`。
-
-    每一种畸形单独报，不交给一条正则：读者要知道自己错在哪一段。四类畸形一律**拒绝而非归一化**
-    （不 strip、不折叠大小写、不切首个分隔符）——切点名计入公开 API，允许两种拼法映射到同一个
-    切点，日后把 `owner` 绑到注册者身份时就没有唯一的规范拼法可比。放宽接受面日后不是破坏性
-    变更，收紧则是，所以现在按最窄的收。
-    """
-    if not isinstance(name, str):
-        raise _not_an_extension_name(name)
-    kernel = _KERNEL_JUNCTIONS_BY_VALUE.get(name)
-    if kernel is not None:
-        raise ConfigError(
-            expected='扩展切点名带命名空间前缀，不得等于某个内核切点的取值',
-            received=f'收到 {name!r}，它就是 Junction.{kernel.name} 的取值',
-            next_action=(
-                f'内核切点请传 Junction.{kernel.name}。字符串与枚举通到同一个切点会让按枚举触发'
-                '时读不到按字符串注册的 hook——那是静默空转，最难查的一种'
-            ),
-        )
-    if any(ch.isspace() for ch in name):
-        raise ConfigError(
-            expected='扩展切点名不含任何空白字符',
-            received=f'收到 {name!r}',
-            next_action=(
-                '去掉空白后重新声明。这里刻意不自动 strip：两种拼法在日志与错误消息里长得一样，'
-                '却是两个互不相干的切点'
-            ),
-        )
-    separators = name.count(_NAMESPACE_SEPARATOR)
-    if separators != 1:
-        raise ConfigError(
-            expected=f'扩展切点名恰好含一个 {_NAMESPACE_SEPARATOR!r} 分隔符',
-            received=f'收到 {name!r}，其中有 {separators} 个 {_NAMESPACE_SEPARATOR!r}',
-            next_action=(
-                "写成 '<owner>:<event>'（如 'artifact:created'）。多级命名空间现在一律拒绝，"
-                '日后放宽不是破坏性变更，现在收下了却再也收不回来'
-            ),
-        )
-    owner, _, event = name.partition(_NAMESPACE_SEPARATOR)
-    if not owner or not event:
-        raise ConfigError(
-            expected='扩展切点名的 owner 段与 event 段都非空',
-            received=f'收到 {name!r}，owner={owner!r} event={event!r}',
-            next_action=(
-                'owner 段写这个切点属于谁（日后按注册者标识校验它，两个扩展才抢不到同一个名字，'
-                '也冒用不了对方的切点名发事件），event 段写发生了什么'
-            ),
-        )
-    return name
-
-
 class HooksCenter:
     """切点分发中心。
 
@@ -275,42 +326,72 @@ class HooksCenter:
     因此**声明者必须先加载**——能力 A 声明 `artifact:created`、能力 B 往上挂 hook 时，B 晚于 A。
     反过来会在 B 的 `register` 上响亮失败，而这是对的：往一个没人声明过的切点上挂 hook，要么名字
     拼错了，要么缺了依赖，两者都该当场报出来而不是留一个永不触发的 hook。
+
+    **谁能声明**在装配时判，**谁能触发**靠持有声明时交回的 `ExtensionJunction`：挂 hook 可以按名字
+    （监听不是冒用），触发必须交回那个对象。这是同进程里的约束，挡的是误用与抢名，不是恶意代码——
+    同进程的代码能 import 别人的句柄、改任何东西（spec §12.4）。
     """
 
     def __init__(self, *, outer: HooksCenter | None = None) -> None:
         # 构造时就校验：错配的症状是第一次 trigger 沿链取 hook 时抛一条指着本类内部的
         # AttributeError，而那时调用栈里已经没有写下这个参数的那一行。
         self._hooks: dict[JunctionRef, list[HookCallback]] = {junction: [] for junction in Junction}
-        self._extension_kinds: dict[str, JunctionKind] = {}
+        # 扩展切点名 → (句柄, 声明者)。分类在句柄上：一份状态，还原时不会只还原一半。
+        self._declared: dict[str, tuple[ExtensionJunction, str]] = {}
         self._outer = _validated_outer(outer)
+        self._one_agent = False
+        self._runtime_owned = False
+        self._reserved_owners: frozenset[str] = frozenset()
 
-    def declare_extension_junction(self, name: str, kind: JunctionKind) -> None:
-        """声明一个扩展切点及其分类，之后它才能被 register / trigger。
+    def declare_extension_junction(self, name: str, kind: JunctionKind) -> ExtensionJunction:
+        """声明一个扩展切点及其分类，交回触发它要用的句柄。
 
         分类由**声明者**给出而非由内核推断，也没有默认值：可观察意味着「并行 + 丢弃返回值 +
         吞异常」，让一个策略型 hook（权限、预算）靠遗漏落进去，等于放行未经检查的操作。
 
-        同名同分类重复声明是成功（后置条件已成立）。同名不同分类报 `ContractViolation`：今天还
-        没有注册者标识可比，分类冲突是唯一能观测到的抢名信号，静默让先声明者胜会让后来者的 hook
-        按它没预期的那套语义跑。**冲突沿装配链查**：外层已经声明成另一种分类时同样报错，否则内层
-        那次声明会让同一个名字在两层上有两套执行语义，而 hook 按哪套跑取决于它挂在哪一层。
-        """
-        validated = _validated_extension_name(name)
-        checked = _validated_kind(kind)
-        declared = self._declared_kind(validated)
-        if declared is not None and declared is not checked:
-            raise ContractViolation(
-                expected=f'{validated} 的分类与它已声明的 {declared.value} 一致',
-                received=f'收到把它重新声明为 {checked.value} 的请求',
-                next_action=(
-                    f'{validated} 已被声明为 {declared.value}；换一个 owner 段，'
-                    '或与先声明它的那个能力对齐分类——同一个名字不能有两套执行语义'
-                ),
-            )
-        self._extension_kinds[validated] = checked
+        同一个名字沿装配链只能声明一次，不论分类：句柄只能有一个持有者。已装 Module 的名字是保留
+        的 owner，它名下的切点只由清单声明。在插件的 `register` 里声明时，owner 段必须等于插件名；
+        Module 的代码（服务工厂、`on_start`、工具与插件工厂、Module 插件的 `register`）不在这里
+        声明，切点写进清单。
 
-    def register(self, junction: JunctionRef, cb: HookCallback) -> None:
-        """挂一个 hook。同一切点上按注册先后执行。
+        **冲突只沿「向外」的方向查得到**：外层没有指向内层的引用，一个后声明的外层可以与内层已声明的
+        名字重名。
+        """
+        validated = validated_extension_name(name)
+        checked = validated_kind(kind)
+        owner = validated.partition(':')[0]
+        installer = current_installer()
+        if installer is not None and installer.kind == 'module':
+            raise _module_declares(validated, installer.name)
+        if installer is not None:
+            if MODULE_NAME.fullmatch(installer.name) is None:
+                raise _plugin_name_not_canonical(installer.name)
+            if owner != installer.name:
+                raise _owner_mismatch(validated, owner, installer.name)
+        if self._is_reserved(owner):
+            raise _reserved_owner(validated, owner)
+        declarer = self._declarer_of(validated)
+        if declarer is not None:
+            raise _declared_twice(validated, declarer)
+        handle = ExtensionJunction(validated, checked)
+        self._declared[validated] = (
+            handle,
+            '宿主代码' if installer is None else installer.describe(),
+        )
+        return handle
+
+    def extension_junctions(self) -> Mapping[str, JunctionKind]:
+        """整条装配链上已声明的扩展切点 → 分类，按名字排序的只读映射。"""
+        return MappingProxyType(
+            {
+                name: kind
+                for name in self._declared_names()
+                if (kind := self._declared_kind(name)) is not None
+            }
+        )
+
+    def register(self, junction: JunctionRef | ExtensionJunction, cb: HookCallback) -> None:
+        """挂一个 hook。同一切点上按注册先后执行。扩展切点可以按名字挂，也可以传句柄。
 
         挂到**可观察**切点上时，`cb` 返回的 `HookResult` 会被整个丢弃（见 `trigger`），且每一次
         丢弃都记一条 ERROR。这一点 typing 拦不住（`HookCallback` 对两类切点是同一个类型），因此挂
@@ -318,15 +399,45 @@ class HooksCenter:
 
         挂在本层的 hook**先于**外层的执行，且只有本层的 trigger 看得到它们。
         """
+        if not callable(cb):
+            raise _not_callable(cb)
+        resolved = self._resolved(
+            junction.name if isinstance(junction, ExtensionJunction) else junction
+        )
+        if self._one_agent and resolved in RUNTIME_ONLY:
+            raise _runtime_only_here(resolved)
         # setdefault 而非下标：外层声明的扩展切点在本层的表里没有键，而它是合法的注册目标。
-        self._hooks.setdefault(self._resolved(junction), []).append(cb)
+        self._hooks.setdefault(resolved, []).append(cb)
 
-    async def trigger(self, junction: JunctionRef, **kwargs: Any) -> HookResult:
-        """触发切点，返回可拦截链的合并结论。
+    async def trigger(self, junction: ExtensionJunction, **kwargs: Any) -> HookResult:
+        """触发一个扩展切点，返回可拦截链的合并结论（spec §5.4）。
 
-        扩展切点走这里：spec §5.4 要求内核提供公开的触发接口，而扩展切点由声明它的能力自己触发。
-        刻意不给它单开一个方法——两个方法就是两条分发路径，同一段 hook 代码的语义会取决于它挂在
-        哪一种切点上。
+        只收声明时交回的那个句柄：字符串谁都拼得出来。从 Runtime 的中心触发只跑 Runtime 级的
+        hook（外层看不见内层）；要让一个 Agent 的局部层与 Module 层也跑，用
+        `BaseAgent.trigger_extension`。
+
+        内核切点只由内核在固定位置触发（经私有的 `_dispatch`，与这里是同一条分发路径）：装配链上
+        只要有一层属于 Runtime，这里就拒绝内核切点——伪造一次会让挂在上面的策略 hook 对一件没发生的事
+        下结论。整条链都不属于任何 Runtime 的独立中心照收，第三方靠它给自己的插件写单测。语义见
+        `_dispatch`。
+        """
+        if isinstance(junction, Junction):
+            if self._serves_a_runtime():
+                raise _kernel_junction_triggered(junction)
+            return await self._dispatch(junction, **kwargs)
+        if isinstance(junction, str):
+            validated = self._resolved(junction)
+            raise _string_trigger(str(validated))
+        if not isinstance(cast(object, junction), ExtensionJunction):
+            raise _not_a_junction(junction)
+        resolved = self._resolved(junction.name)
+        declared = self._declared_handle(junction.name)
+        if declared is not junction:
+            raise _foreign_handle(junction, self._declarer_of(junction.name) or '别处')
+        return await self._dispatch(resolved, **kwargs)
+
+    async def _dispatch(self, junction: JunctionRef, **kwargs: Any) -> HookResult:
+        """唯一的分发路径。内核切点由内核在固定位置经这里触发，扩展切点经公开的 `trigger`。
 
         可拦截切点按注册顺序串行：前一个 hook 的 `modified` 并入后续 hook 的 kwargs，返回的
         `modified` 只含被改过的键而非整份 kwargs；`skip=True` 终止后续 hook 并带出它的
@@ -355,10 +466,58 @@ class HooksCenter:
             await self._trigger_parallel(resolved, hooks, **kwargs)
         return HookResult()
 
+    def _serve_one_agent(self) -> None:
+        """本中心服务单个 Agent（局部层或 Module 层）：`RUNTIME_ONLY` 的切点从此挂不上来。"""
+        self._one_agent = True
+
+    def _serve_runtime(self) -> None:
+        """本中心属于一个 Runtime（它自己的中心，或 spawn 给一个 Agent 建的 Module 层）：公开的
+        `trigger` 从此拒绝内核切点，链上更内层的中心也一样。"""
+        self._runtime_owned = True
+
+    def _serves_a_runtime(self) -> bool:
+        if self._runtime_owned:
+            return True
+        return self._outer._serves_a_runtime() if self._outer is not None else False
+
+    def _declare_handle(self, handle: ExtensionJunction) -> None:
+        """按对象声明一个扩展切点：Module 清单里的切点在任何第三方代码跑之前由 Runtime 声明。"""
+        declarer = self._declarer_of(handle.name)
+        if declarer is not None:
+            raise _declared_twice(handle.name, declarer)
+        self._declared[handle.name] = (handle, f'Module {handle.owner!r} 的清单')
+
+    def _reserve_owners(self, owners: frozenset[str]) -> None:
+        """已装 Module 的名字：它们名下的切点只由清单声明。Runtime 在任何第三方代码跑之前设一次。"""
+        self._reserved_owners = owners
+
+    def _is_reserved(self, owner: str) -> bool:
+        if owner in self._reserved_owners:
+            return True
+        return self._outer._is_reserved(owner) if self._outer is not None else False
+
+    def _declaration(self, name: str) -> tuple[ExtensionJunction, str] | None:
+        own = self._declared.get(name)
+        if own is not None:
+            return own
+        return self._outer._declaration(name) if self._outer is not None else None
+
+    def _declared_handle(self, name: str) -> ExtensionJunction | None:
+        declaration = self._declaration(name)
+        return None if declaration is None else declaration[0]
+
+    def _declarer_of(self, name: str) -> str | None:
+        declaration = self._declaration(name)
+        return None if declaration is None else declaration[1]
+
     def _assembly_snapshot(
         self,
-    ) -> tuple[dict[JunctionRef, list[HookCallback]], dict[str, JunctionKind]]:
+    ) -> tuple[
+        dict[JunctionRef, list[HookCallback]],
+        dict[str, tuple[ExtensionJunction, str]],
+    ]:
         """本中心此刻的全部可写状态，供一次失败的装配还原（见 `plugins.install_plugins`）。
+        构造期一次设定的配置（服务单个 Agent、保留的 owner）不在其列：它们早于任何装配。
 
         槽位列表逐个浅拷：还原要换掉列表**内容**，只留住 dict 的话插件 append 上去的回调会活下来。
 
@@ -367,14 +526,18 @@ class HooksCenter:
         """
         return (
             {junction: list(cbs) for junction, cbs in self._hooks.items()},
-            dict(self._extension_kinds),
+            dict(self._declared),
         )
 
     def _assembly_restore(
-        self, snapshot: tuple[dict[JunctionRef, list[HookCallback]], dict[str, JunctionKind]]
+        self,
+        snapshot: tuple[
+            dict[JunctionRef, list[HookCallback]],
+            dict[str, tuple[ExtensionJunction, str]],
+        ],
     ) -> None:
         """还原一份快照。**本中心就此接管它**，同一份快照不得还原两遍。"""
-        self._hooks, self._extension_kinds = snapshot
+        self._hooks, self._declared = snapshot
 
     def _collect(self, junction: JunctionRef) -> list[HookCallback]:
         """这个切点上要跑的整条链：本层在前，外层在后。"""
@@ -392,14 +555,12 @@ class HooksCenter:
         策略 hook 因此落不进吞异常那一侧）；开着的是反方向，症状是同一个回调在两层的 `trigger` 下按
         两套语义跑。
         """
-        own = self._extension_kinds.get(name)
-        if own is not None:
-            return own
-        return self._outer._declared_kind(name) if self._outer is not None else None
+        handle = self._declared_handle(name)
+        return None if handle is None else handle.kind
 
     def _declared_names(self) -> list[str]:
         """整条链上已声明的扩展切点名。它只进错误消息：读者要看的是「我能挂哪些」。"""
-        names = set(self._extension_kinds)
+        names = set(self._declared)
         if self._outer is not None:
             names.update(self._outer._declared_names())
         return sorted(names)
@@ -417,7 +578,7 @@ class HooksCenter:
             return junction
         if not isinstance(junction, str):
             raise _not_a_junction(junction)
-        validated = _validated_extension_name(junction)
+        validated = validated_extension_name(junction)
         if self._declared_kind(validated) is None:
             raise ContractViolation(
                 expected=f'扩展切点 {validated} 在本层或外层已经声明过',
@@ -469,9 +630,14 @@ class HooksCenter:
         history: dict[str, list[Any]] = {}
         current = dict(kwargs)
         for cb in hooks:
-            outcome = await cb(**current)
+            returned = cast(object, cb(**current))
+            if not inspect.isawaitable(returned):
+                raise _not_awaitable(junction, cb, returned)
+            outcome = cast(object, await returned)
             if outcome is None:
                 continue
+            if not isinstance(outcome, HookResult):
+                raise _not_a_result(junction, cb, outcome)
             if outcome.result is not None and not outcome.skip:
                 raise _orphan_result(junction, cb, outcome)
             merged.update(outcome.modified)
@@ -487,8 +653,29 @@ class HooksCenter:
     async def _trigger_parallel(
         self, junction: JunctionRef, hooks: list[HookCallback], **kwargs: Any
     ) -> None:
-        outcomes = await asyncio.gather(*(cb(**kwargs) for cb in hooks), return_exceptions=True)
-        for cb, outcome in zip(hooks, outcomes, strict=True):
+        started: list[HookCallback] = []
+        awaitables: list[Awaitable[object]] = []
+        for cb in hooks:
+            try:
+                returned = cast(object, cb(**kwargs))
+            except Exception:
+                logger.error('observable hook failed at %s', _label(junction), exc_info=True)
+                continue
+            if not inspect.isawaitable(returned):
+                logger.error(
+                    '期望: 挂在可观察切点 %s 上的 hook 返回可等待对象（async def）。'
+                    ' 实际: %s 同步返回了 %s 类型的 %r，这个 hook 什么都没做成。'
+                    ' 下一步: 把它改成 async def。',
+                    _label(junction),
+                    _qualname(cb),
+                    type(returned).__name__,
+                    returned,
+                )
+                continue
+            started.append(cb)
+            awaitables.append(returned)
+        outcomes = await asyncio.gather(*awaitables, return_exceptions=True)
+        for cb, outcome in zip(started, outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 logger.error('observable hook failed at %s', _label(junction), exc_info=outcome)
             elif _carries_intent(outcome):

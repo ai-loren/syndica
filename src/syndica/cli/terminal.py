@@ -7,7 +7,8 @@ import re
 __all__ = ['one_line', 'terminal_safe']
 
 # 除换行与制表符外的 C0、DEL、C1、双向文字控制字符、U+2028 / U+2029，以及落单的代理字符：被
-# `max_tokens` 截断的 emoji 就是一个落单的高位代理，它编码成 UTF-8 时抛错。
+# `max_tokens` 截断的 emoji 就是一个落单的高位代理，它编码成 UTF-8 时抛错。与内核
+# `terminal_text.UNSAFE_TEXT` 逐字相同；`version` 命令不加载内核，所以不从那里 import。
 _UNSAFE = re.compile(
     '[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029'
     '\ud800-\udfff]'

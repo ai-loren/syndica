@@ -118,7 +118,7 @@ async def test_observable_hooks_all_run():
 
     center.register(Junction.TURN_START, first)
     center.register(Junction.TURN_START, second)
-    await center.trigger(Junction.TURN_START, turn=1)
+    await center._dispatch(Junction.TURN_START, turn=1)
     assert sorted(calls) == ['first', 'second']
 
 
@@ -132,7 +132,7 @@ async def test_observable_hooks_run_concurrently():
 
     center.register(Junction.TURN_START, wait_for_the_other)
     center.register(Junction.TURN_START, wait_for_the_other)
-    await asyncio.wait_for(center.trigger(Junction.TURN_START, turn=1), timeout=_TIMEOUT)
+    await asyncio.wait_for(center._dispatch(Junction.TURN_START, turn=1), timeout=_TIMEOUT)
 
 
 def _reported_callback(record: logging.LogRecord) -> object:
@@ -157,7 +157,7 @@ async def test_an_observable_hooks_returned_result_is_discarded_but_leaves_a_dia
 
     center.register(Junction.TURN_START, opinionated)
     center.register(Junction.TURN_START, after)
-    result = await center.trigger(Junction.TURN_START, turn=1)
+    result = await center._dispatch(Junction.TURN_START, turn=1)
     assert sorted(calls) == ['after', 'opinionated']
     assert (result.skip, result.modified, result.result) == (False, {}, None)
     (record,) = caplog.records
@@ -183,7 +183,7 @@ async def test_an_observer_that_answers_the_confirmation_junction_is_told_it_was
         return HookResult(skip=True, result='approved')
 
     center.register(Junction.TOOL_CONFIRMATION_REQUIRED, approve)
-    await center.trigger(Junction.TOOL_CONFIRMATION_REQUIRED, tool_call=None)
+    await center._dispatch(Junction.TOOL_CONFIRMATION_REQUIRED, tool_call=None)
     (record,) = caplog.records
     assert record.levelno == logging.ERROR
     assert record.args == (
@@ -233,7 +233,7 @@ async def test_every_slot_a_discarded_return_could_have_used_is_reported(
         return cast('HookResult | None', outcome)
 
     center.register(Junction.TURN_START, opinionated)
-    await center.trigger(Junction.TURN_START, turn=1)
+    await center._dispatch(Junction.TURN_START, turn=1)
     assert [record.levelno for record in caplog.records] == [logging.ERROR]
 
 
@@ -249,7 +249,7 @@ async def test_an_observable_hook_that_discards_nothing_leaves_no_diagnostic(
         return outcome
 
     center.register(Junction.TURN_START, observer)
-    await center.trigger(Junction.TURN_START, turn=1)
+    await center._dispatch(Junction.TURN_START, turn=1)
     assert caplog.records == []
 
 
@@ -263,7 +263,7 @@ async def test_an_interceptable_hooks_opinion_is_never_reported_as_discarded(
         return HookResult(skip=True, modified={'args': {}}, result='substitute')
 
     center.register(Junction.PRE_TOOL_USE, rewrite)
-    await center.trigger(Junction.PRE_TOOL_USE, args={})
+    await center._dispatch(Junction.PRE_TOOL_USE, args={})
     assert caplog.records == []
 
 
@@ -278,7 +278,7 @@ async def test_the_discarded_return_diagnostic_names_every_junction_the_hook_cou
         return HookResult(skip=True)
 
     center.register(Junction.TURN_START, opinionated)
-    await center.trigger(Junction.TURN_START, turn=1)
+    await center._dispatch(Junction.TURN_START, turn=1)
     (record,) = caplog.records
     message = record.getMessage()
     assert [junction.value for junction in INTERCEPTABLE if junction.value not in message] == []
@@ -332,7 +332,7 @@ async def test_a_discarded_return_is_reported_exactly_when_the_serial_chain_woul
 
     center.register(Junction.PRE_TOOL_USE, cb)
     try:
-        merged = await center.trigger(Junction.PRE_TOOL_USE, args={})
+        merged = await center._dispatch(Junction.PRE_TOOL_USE, args={})
     except Exception:
         # 链读它的槽位时抛出，本身就是一次可观察效果。
         reaches_the_chain = True
@@ -358,7 +358,7 @@ async def test_each_discarding_observable_hook_gets_its_own_diagnostic(
 
     for cb in (first, quiet, second):
         center.register(Junction.TURN_START, cb)
-    await center.trigger(Junction.TURN_START, turn=1)
+    await center._dispatch(Junction.TURN_START, turn=1)
     assert [_reported_callback(record) for record in caplog.records] == [
         'test_each_discarding_observable_hook_gets_its_own_diagnostic.<locals>.first',
         'test_each_discarding_observable_hook_gets_its_own_diagnostic.<locals>.second',
@@ -382,7 +382,7 @@ async def test_an_observable_hook_that_raises_does_not_break_trigger(
 
     center.register(Junction.TURN_START, explodes)
     center.register(Junction.TURN_START, survivor)
-    result = await center.trigger(Junction.TURN_START, turn=1)
+    result = await center._dispatch(Junction.TURN_START, turn=1)
     assert sorted(calls) == ['explodes', 'survivor']
     assert (result.skip, result.modified, result.result) == (False, {}, None)
     (record,) = caplog.records
@@ -413,7 +413,7 @@ async def test_a_sibling_that_awaits_is_waited_for_after_an_observable_hook_rais
         calls.append('survivor')
 
     async def trigger_and_snapshot() -> None:
-        await center.trigger(Junction.TURN_START, turn=1)
+        await center._dispatch(Junction.TURN_START, turn=1)
         finished_when_trigger_returned.extend(calls)
 
     center.register(Junction.TURN_START, explodes)
@@ -441,7 +441,7 @@ async def test_every_failing_observable_hook_is_logged(caplog: pytest.LogCapture
 
     center.register(Junction.TURN_START, explodes_first)
     center.register(Junction.TURN_START, explodes_second)
-    await center.trigger(Junction.TURN_START, turn=1)
+    await center._dispatch(Junction.TURN_START, turn=1)
     assert [record.exc_info[1] for record in caplog.records if record.exc_info] == [
         first_boom,
         second_boom,
@@ -455,7 +455,7 @@ async def test_interceptable_hook_can_modify_kwargs():
         return HookResult(modified={'request': 'rewritten'})
 
     center.register(Junction.PRE_LLM_REQUEST, rewrite)
-    result = await center.trigger(Junction.PRE_LLM_REQUEST, request='original')
+    result = await center._dispatch(Junction.PRE_LLM_REQUEST, request='original')
     assert result.get('request', 'original') == 'rewritten'
 
 
@@ -473,7 +473,7 @@ async def test_modified_kwargs_reach_the_next_hook_alongside_the_untouched_ones(
 
     center.register(Junction.PRE_LLM_REQUEST, first)
     center.register(Junction.PRE_LLM_REQUEST, second)
-    await center.trigger(Junction.PRE_LLM_REQUEST, request='original', model='gpt')
+    await center._dispatch(Junction.PRE_LLM_REQUEST, request='original', model='gpt')
     assert seen == [{'request': 'from-first', 'model': 'gpt'}]
 
 
@@ -485,7 +485,7 @@ async def test_modified_reports_only_the_changed_keys():
         return HookResult(modified={'request': 'rewritten'})
 
     center.register(Junction.PRE_LLM_REQUEST, rewrite)
-    result = await center.trigger(Junction.PRE_LLM_REQUEST, request='original', model='gpt')
+    result = await center._dispatch(Junction.PRE_LLM_REQUEST, request='original', model='gpt')
     assert result.modified == {'request': 'rewritten'}
 
 
@@ -504,7 +504,7 @@ async def test_every_hooks_modification_is_carried_out_of_the_chain():
 
     for cb in (redact, enforce_budget, audit):
         center.register(Junction.PRE_LLM_REQUEST, cb)
-    result = await center.trigger(Junction.PRE_LLM_REQUEST, request='original')
+    result = await center._dispatch(Junction.PRE_LLM_REQUEST, request='original')
     assert result.modified == {'request': 'redacted', 'max_tokens': 100, 'audited': True}
 
 
@@ -526,7 +526,7 @@ async def test_the_returned_modified_holds_the_values_the_chain_actually_applied
 
     for cb in (redact, truncate, reader):
         center.register(Junction.PRE_TOOL_USE, cb)
-    result = await center.trigger(Junction.PRE_TOOL_USE, request='original', tool_call='shell')
+    result = await center._dispatch(Junction.PRE_TOOL_USE, request='original', tool_call='shell')
     assert seen == [{'request': 'truncated', 'tool_call': None}]
     assert result.modified == {'request': 'truncated', 'tool_call': None}
 
@@ -542,7 +542,7 @@ async def test_skip_carries_out_the_modifications_made_before_it_and_its_own():
 
     center.register(Junction.PRE_TOOL_USE, redact)
     center.register(Junction.PRE_TOOL_USE, deny)
-    result = await center.trigger(Junction.PRE_TOOL_USE, request='original')
+    result = await center._dispatch(Junction.PRE_TOOL_USE, request='original')
     assert result.skip is True
     assert result.result == 'denied'
     assert result.modified == {'request': 'redacted', 'audited': True}
@@ -562,7 +562,7 @@ async def test_a_hook_returning_none_at_an_interceptable_junction_changes_nothin
 
     center.register(Junction.PRE_LLM_REQUEST, observer)
     center.register(Junction.PRE_LLM_REQUEST, reader)
-    result = await center.trigger(Junction.PRE_LLM_REQUEST, request='original')
+    result = await center._dispatch(Junction.PRE_LLM_REQUEST, request='original')
     assert seen == ['original']
     assert (result.skip, result.modified, result.result) == (False, {}, None)
 
@@ -581,7 +581,7 @@ async def test_skip_stops_subsequent_interceptable_hooks():
 
     center.register(Junction.PRE_TOOL_USE, blocker)
     center.register(Junction.PRE_TOOL_USE, never)
-    result = await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)
+    result = await center._dispatch(Junction.PRE_TOOL_USE, tool_call=None)
     assert calls == ['blocker']
     assert result.skip is True
     assert result.result == 'substitute'
@@ -604,14 +604,14 @@ async def test_an_interceptable_hook_that_raises_propagates():
     center.register(Junction.PRE_TOOL_USE, explodes)
     center.register(Junction.PRE_TOOL_USE, never)
     with pytest.raises(RuntimeError) as excinfo:
-        await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)
+        await center._dispatch(Junction.PRE_TOOL_USE, tool_call=None)
     assert excinfo.value is boom
     assert calls == ['explodes']
 
 
 async def test_trigger_with_no_hooks_returns_empty_result():
     center = HooksCenter()
-    result = await center.trigger(Junction.TURN_END, turn=1)
+    result = await center._dispatch(Junction.TURN_END, turn=1)
     assert result.skip is False
     assert result.modified == {}
 
@@ -629,8 +629,8 @@ async def test_a_hook_only_runs_at_the_junction_it_was_registered_for():
 
     center.register(Junction.TURN_START, observable)
     center.register(Junction.PRE_TOOL_USE, interceptable)
-    await center.trigger(Junction.TURN_END, turn=1)
-    await center.trigger(Junction.POST_TOOL_USE, tool_call=None)
+    await center._dispatch(Junction.TURN_END, turn=1)
+    await center._dispatch(Junction.POST_TOOL_USE, tool_call=None)
     assert calls == []
 
 
@@ -648,9 +648,9 @@ async def test_a_hook_registered_by_an_interceptable_hook_runs_from_the_next_tri
         return HookResult()
 
     center.register(Junction.PRE_TOOL_USE, registrar)
-    await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)
+    await center._dispatch(Junction.PRE_TOOL_USE, tool_call=None)
     assert calls == ['registrar']
-    await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)
+    await center._dispatch(Junction.PRE_TOOL_USE, tool_call=None)
     assert calls == ['registrar', 'registrar', 'latecomer']
 
 
@@ -667,9 +667,9 @@ async def test_a_hook_registered_by_an_observable_hook_runs_from_the_next_trigge
         center.register(Junction.TURN_START, latecomer)
 
     center.register(Junction.TURN_START, registrar)
-    await center.trigger(Junction.TURN_START, turn=1)
+    await center._dispatch(Junction.TURN_START, turn=1)
     assert calls == ['registrar']
-    await center.trigger(Junction.TURN_START, turn=1)
+    await center._dispatch(Junction.TURN_START, turn=1)
     assert sorted(calls) == ['latecomer', 'registrar', 'registrar']
 
 
@@ -701,7 +701,7 @@ async def test_a_result_without_skip_is_rejected_rather_than_dropped():
 
     center.register(Junction.PRE_TOOL_USE, substitute)
     with pytest.raises(ContractViolation) as excinfo:
-        await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)
+        await center._dispatch(Junction.PRE_TOOL_USE, tool_call=None)
     assert Junction.PRE_TOOL_USE.value in excinfo.value.expected
     assert 'substitute' in excinfo.value.received
     assert 'skip=True' in excinfo.value.next_action
@@ -720,7 +720,7 @@ async def test_a_later_hook_giving_an_orphan_result_is_still_caught():
     center.register(Junction.PRE_TOOL_USE, observe)
     center.register(Junction.PRE_TOOL_USE, substitute)
     with pytest.raises(ContractViolation):
-        await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)
+        await center._dispatch(Junction.PRE_TOOL_USE, tool_call=None)
 
 
 async def test_the_chain_reports_every_value_a_key_was_given_not_only_the_last():
@@ -739,7 +739,7 @@ async def test_the_chain_reports_every_value_a_key_was_given_not_only_the_last()
 
     for cb in (first, second, third):
         center.register(Junction.POST_TOOL_USE, cb)
-    outcome = await center.trigger(Junction.POST_TOOL_USE, result='original')
+    outcome = await center._dispatch(Junction.POST_TOOL_USE, result='original')
     assert outcome.modified == {'result': 'loosened', 'args': {}}
     assert outcome.rewrites('result') == ['plain', 'tightened', 'loosened']
     assert outcome.rewrites('args') == [{}]
@@ -760,7 +760,7 @@ async def test_the_rewrites_of_a_skipping_chain_stop_where_the_chain_did():
 
     for cb in (first, denier, never):
         center.register(Junction.PRE_TOOL_USE, cb)
-    outcome = await center.trigger(Junction.PRE_TOOL_USE, tool_call=None)
+    outcome = await center._dispatch(Junction.PRE_TOOL_USE, tool_call=None)
     assert outcome.rewrites('result') == ['tightened', 'denied']
 
 
@@ -773,7 +773,7 @@ async def test_mutating_the_returned_rewrites_cannot_reach_the_record_behind_the
         return HookResult(modified={'result': 'once'})
 
     center.register(Junction.POST_TOOL_USE, rewrite)
-    outcome = await center.trigger(Junction.POST_TOOL_USE, result='original')
+    outcome = await center._dispatch(Junction.POST_TOOL_USE, result='original')
     outcome.rewrites('result').append('injected')
     assert outcome.rewrites('result') == ['once']
     assert outcome.history['result'] == ['once']
@@ -839,14 +839,16 @@ async def test_a_kernel_junction_in_neither_classification_is_rejected_at_trigge
     分类在空 hook 列表检查之前取，所以一个没人挂钩的未归类切点同样要报出来。"""
     monkeypatch.setattr(center_module, 'OBSERVABLE', OBSERVABLE - {Junction.TURN_START})
     with pytest.raises(ContractViolation):
-        await HooksCenter().trigger(Junction.TURN_START, turn=1)
+        await HooksCenter()._dispatch(Junction.TURN_START, turn=1)
 
 
 async def test_an_interceptable_extension_junction_is_serial_and_accumulates_modified():
     """扩展切点与枚举切点共用同一条分发路径：中间件语义必须逐条成立，而不是只有枚举切点才有。
     基数取 3 且顺序既非升序亦非降序，否则排序类变异过不了关。"""
     center = HooksCenter()
-    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    artifact_created = center.declare_extension_junction(
+        'artifact:created', JunctionKind.INTERCEPTABLE
+    )
     seen: list[dict[str, object]] = []
 
     async def redact(**_: object) -> HookResult:
@@ -862,7 +864,7 @@ async def test_an_interceptable_extension_junction_is_serial_and_accumulates_mod
 
     for cb in (redact, stamp, audit):
         center.register('artifact:created', cb)
-    result = await center.trigger('artifact:created', artifact='raw', kind='spreadsheet')
+    result = await center.trigger(artifact_created, artifact='raw', kind='spreadsheet')
     assert seen == [
         {'artifact': 'redacted', 'kind': 'spreadsheet'},
         {'artifact': 'redacted', 'kind': 'spreadsheet', 'version': 2},
@@ -873,7 +875,9 @@ async def test_an_interceptable_extension_junction_is_serial_and_accumulates_mod
 async def test_an_interceptable_extension_junction_reports_every_value_a_key_was_given():
     """只能单向收紧的量（trust）看 last-wins 的结论会漏掉链中间那次收紧。"""
     center = HooksCenter()
-    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    artifact_created = center.declare_extension_junction(
+        'artifact:created', JunctionKind.INTERCEPTABLE
+    )
 
     async def first(**_: object) -> HookResult:
         return HookResult(modified={'trust': 'plain'})
@@ -886,13 +890,15 @@ async def test_an_interceptable_extension_junction_reports_every_value_a_key_was
 
     for cb in (first, second, third):
         center.register('artifact:created', cb)
-    result = await center.trigger('artifact:created', trust='original')
+    result = await center.trigger(artifact_created, trust='original')
     assert result.rewrites('trust') == ['plain', 'tightened', 'loosened']
 
 
 async def test_an_interceptable_extension_junctions_skip_stops_the_chain_and_carries_its_result():
     center = HooksCenter()
-    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    artifact_created = center.declare_extension_junction(
+        'artifact:created', JunctionKind.INTERCEPTABLE
+    )
     calls: list[str] = []
 
     async def deny(**_: object) -> HookResult:
@@ -905,7 +911,7 @@ async def test_an_interceptable_extension_junctions_skip_stops_the_chain_and_car
 
     center.register('artifact:created', deny)
     center.register('artifact:created', never)
-    result = await center.trigger('artifact:created', artifact='raw')
+    result = await center.trigger(artifact_created, artifact='raw')
     assert calls == ['deny']
     assert (result.skip, result.result) == (True, 'denied')
 
@@ -913,7 +919,9 @@ async def test_an_interceptable_extension_junctions_skip_stops_the_chain_and_car
 async def test_an_interceptable_extension_hook_that_raises_propagates():
     """扩展切点上的可拦截 hook 同样是策略；跳过一个失败的策略检查等于放行未经检查的操作。"""
     center = HooksCenter()
-    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    artifact_created = center.declare_extension_junction(
+        'artifact:created', JunctionKind.INTERCEPTABLE
+    )
     boom = RuntimeError('artifact policy blew up')
 
     async def explodes(**_: object) -> HookResult:
@@ -921,28 +929,30 @@ async def test_an_interceptable_extension_hook_that_raises_propagates():
 
     center.register('artifact:created', explodes)
     with pytest.raises(RuntimeError) as excinfo:
-        await center.trigger('artifact:created', artifact='raw')
+        await center.trigger(artifact_created, artifact='raw')
     assert excinfo.value is boom
 
 
 async def test_an_orphan_result_at_an_extension_junction_is_rejected_rather_than_dropped():
     """`result` 不带 `skip` 哪个切点都读不到，与切点是枚举还是字符串无关。"""
     center = HooksCenter()
-    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    artifact_created = center.declare_extension_junction(
+        'artifact:created', JunctionKind.INTERCEPTABLE
+    )
 
     async def substitute(**_: object) -> HookResult:
         return HookResult(result='substitute')
 
     center.register('artifact:created', substitute)
     with pytest.raises(ContractViolation) as excinfo:
-        await center.trigger('artifact:created', artifact='raw')
+        await center.trigger(artifact_created, artifact='raw')
     assert 'artifact:created' in excinfo.value.expected
 
 
 async def test_an_observable_extension_junction_runs_its_hooks_concurrently():
     """串行执行会卡死在栅栏上；扩展切点声明为可观察就得真拿到并行。"""
     center = HooksCenter()
-    center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+    metrics_sampled = center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
     both_started = asyncio.Barrier(2)
 
     async def wait_for_the_other(**_: object) -> None:
@@ -950,14 +960,14 @@ async def test_an_observable_extension_junction_runs_its_hooks_concurrently():
 
     center.register('metrics:sampled', wait_for_the_other)
     center.register('metrics:sampled', wait_for_the_other)
-    await asyncio.wait_for(center.trigger('metrics:sampled', value=1), timeout=_TIMEOUT)
+    await asyncio.wait_for(center.trigger(metrics_sampled, value=1), timeout=_TIMEOUT)
 
 
 async def test_an_observable_extension_hook_that_raises_does_not_break_trigger(
     caplog: pytest.LogCaptureFixture,
 ):
     center = HooksCenter()
-    center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+    metrics_sampled = center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
     calls: list[str] = []
     boom = RuntimeError('metrics hook blew up')
 
@@ -970,7 +980,7 @@ async def test_an_observable_extension_hook_that_raises_does_not_break_trigger(
 
     center.register('metrics:sampled', explodes)
     center.register('metrics:sampled', survivor)
-    result = await center.trigger('metrics:sampled', value=1)
+    result = await center.trigger(metrics_sampled, value=1)
     assert sorted(calls) == ['explodes', 'survivor']
     assert (result.skip, result.modified, result.result) == (False, {}, None)
     (record,) = caplog.records
@@ -983,13 +993,13 @@ async def test_an_observable_extension_hooks_returned_result_is_discarded_with_a
     caplog: pytest.LogCaptureFixture,
 ):
     center = HooksCenter()
-    center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+    metrics_sampled = center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
 
     async def opinionated(**_: object) -> HookResult:
         return HookResult(skip=True, modified={'value': 99}, result='substitute')
 
     center.register('metrics:sampled', opinionated)
-    result = await center.trigger('metrics:sampled', value=1)
+    result = await center.trigger(metrics_sampled, value=1)
     assert (result.skip, result.modified, result.result) == (False, {}, None)
     (record,) = caplog.records
     assert record.levelno == logging.ERROR
@@ -1005,7 +1015,9 @@ async def test_an_observable_extension_hooks_returned_result_is_discarded_with_a
 
 async def test_a_hook_registered_by_an_interceptable_extension_hook_waits_for_the_next_trigger():
     center = HooksCenter()
-    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    artifact_created = center.declare_extension_junction(
+        'artifact:created', JunctionKind.INTERCEPTABLE
+    )
     calls: list[str] = []
 
     async def latecomer(**_: object) -> HookResult:
@@ -1018,16 +1030,16 @@ async def test_a_hook_registered_by_an_interceptable_extension_hook_waits_for_th
         return HookResult()
 
     center.register('artifact:created', registrar)
-    await center.trigger('artifact:created', artifact='raw')
+    await center.trigger(artifact_created, artifact='raw')
     assert calls == ['registrar']
-    await center.trigger('artifact:created', artifact='raw')
+    await center.trigger(artifact_created, artifact='raw')
     assert calls == ['registrar', 'registrar', 'latecomer']
 
 
 async def test_a_hook_registered_by_an_observable_extension_hook_waits_for_the_next_trigger():
     """两条分发路径在「本轮 hook 集合何时定下」上必须同解，扩展切点也一样。"""
     center = HooksCenter()
-    center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
+    metrics_sampled = center.declare_extension_junction('metrics:sampled', JunctionKind.OBSERVABLE)
     calls: list[str] = []
 
     async def latecomer(**_: object) -> None:
@@ -1038,16 +1050,18 @@ async def test_a_hook_registered_by_an_observable_extension_hook_waits_for_the_n
         center.register('metrics:sampled', latecomer)
 
     center.register('metrics:sampled', registrar)
-    await center.trigger('metrics:sampled', value=1)
+    await center.trigger(metrics_sampled, value=1)
     assert calls == ['registrar']
-    await center.trigger('metrics:sampled', value=1)
+    await center.trigger(metrics_sampled, value=1)
     assert sorted(calls) == ['latecomer', 'registrar', 'registrar']
 
 
 async def test_two_owners_declaring_the_same_event_name_get_two_separate_junctions():
     """owner 段存在的第一个理由：两个扩展不该抢同一个名字，也不该收到对方的事件。"""
     center = HooksCenter()
-    center.declare_extension_junction('syndica-office:created', JunctionKind.OBSERVABLE)
+    syndica_office_created = center.declare_extension_junction(
+        'syndica-office:created', JunctionKind.OBSERVABLE
+    )
     center.declare_extension_junction('syndica-sheets:created', JunctionKind.OBSERVABLE)
     calls: list[str] = []
 
@@ -1059,7 +1073,7 @@ async def test_two_owners_declaring_the_same_event_name_get_two_separate_junctio
 
     center.register('syndica-office:created', office)
     center.register('syndica-sheets:created', sheets)
-    await center.trigger('syndica-office:created', artifact='raw')
+    await center.trigger(syndica_office_created, artifact='raw')
     assert calls == ['office']
 
 
@@ -1076,14 +1090,14 @@ async def test_an_extension_junction_and_a_kernel_junction_do_not_share_hooks():
 
     center.register('metrics:sampled', extension)
     center.register(Junction.TURN_START, kernel)
-    await center.trigger(Junction.TURN_START, turn=1)
+    await center._dispatch(Junction.TURN_START, turn=1)
     assert calls == ['kernel']
 
 
-async def test_declaring_the_same_extension_junction_with_the_same_kind_keeps_its_hooks():
-    """后置条件已成立即成功；但重复声明不得把已挂上的 hook 抹掉。"""
+async def test_declaring_an_extension_junction_twice_is_refused_even_with_the_same_kind():
+    """句柄只能有一个持有者：同名同分类也拒，而被拒的那次不碰已挂上的 hook 与原句柄。"""
     center = HooksCenter()
-    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    created = center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
     calls: list[str] = []
 
     async def existing(**_: object) -> HookResult:
@@ -1091,8 +1105,11 @@ async def test_declaring_the_same_extension_junction_with_the_same_kind_keeps_it
         return HookResult()
 
     center.register('artifact:created', existing)
-    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
-    await center.trigger('artifact:created', artifact='raw')
+    with pytest.raises(ContractViolation) as excinfo:
+        center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    assert '只声明一次' in excinfo.value.expected
+    assert '宿主代码' in excinfo.value.received
+    await center.trigger(created, artifact='raw')
     assert calls == ['existing']
 
 
@@ -1100,7 +1117,7 @@ async def test_redeclaring_an_extension_junction_with_a_different_kind_is_reject
     """今天没有注册者标识可比，分类冲突是唯一能观测到的抢名信号：静默让先声明者胜，会让后来者的
     可拦截 hook 按可观察跑，异常就被吞了。"""
     center = HooksCenter()
-    center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    created = center.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
     with pytest.raises(ContractViolation):
         center.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
 
@@ -1111,7 +1128,7 @@ async def test_redeclaring_an_extension_junction_with_a_different_kind_is_reject
 
     center.register('artifact:created', explodes)
     with pytest.raises(RuntimeError) as excinfo:
-        await center.trigger('artifact:created', artifact='raw')
+        await center.trigger(created, artifact='raw')
     assert excinfo.value is boom
 
 
@@ -1186,7 +1203,7 @@ async def test_a_whitespace_padded_name_does_not_resolve_to_the_declared_one():
 
     center.register('artifact:created', cb)
     with pytest.raises(ConfigError):
-        await center.trigger(' artifact:created', artifact='raw')
+        await center.trigger(' artifact:created', artifact='raw')  # pyright: ignore[reportArgumentType]
     assert calls == []
 
 
@@ -1195,7 +1212,7 @@ async def test_extension_junction_names_are_case_sensitive():
     center = HooksCenter()
     center.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
     with pytest.raises(ContractViolation):
-        await center.trigger('artifact:Created', artifact='raw')
+        await center.trigger('artifact:Created', artifact='raw')  # pyright: ignore[reportArgumentType]
 
 
 def test_declaring_a_kernel_junctions_string_value_as_an_extension_is_rejected():
@@ -1224,7 +1241,7 @@ async def test_triggering_a_kernel_junction_by_its_string_value_neither_fires_no
 
     center.register(Junction.TURN_START, cb)
     with pytest.raises(ConfigError):
-        await center.trigger('turn_start', turn=1)
+        await center.trigger('turn_start', turn=1)  # pyright: ignore[reportArgumentType]
     assert calls == []
 
 
@@ -1242,7 +1259,7 @@ def test_registering_an_undeclared_extension_junction_is_rejected():
 async def test_triggering_an_undeclared_extension_junction_is_rejected():
     center = HooksCenter()
     with pytest.raises(ContractViolation):
-        await center.trigger('artifact:created', artifact='raw')
+        await center.trigger('artifact:created', artifact='raw')  # pyright: ignore[reportArgumentType]
 
 
 def test_extension_junctions_are_not_shared_between_centers():
@@ -1273,7 +1290,7 @@ async def test_the_inner_layers_hooks_run_before_the_outer_ones():
     inner.register(Junction.PRE_TOOL_USE, _appender(log, 'beta'))
     outer.register(Junction.PRE_TOOL_USE, _appender(log, 'alpha'))
     outer.register(Junction.PRE_TOOL_USE, _appender(log, 'gamma'))
-    await inner.trigger(Junction.PRE_TOOL_USE, args={})
+    await inner._dispatch(Junction.PRE_TOOL_USE, args={})
     assert log == ['beta', 'alpha', 'gamma']
 
 
@@ -1286,7 +1303,7 @@ async def test_three_layers_run_from_the_innermost_outwards():
     middle.register(Junction.PRE_TOOL_USE, _appender(log, 'middle'))
     outermost.register(Junction.PRE_TOOL_USE, _appender(log, 'outermost'))
     innermost.register(Junction.PRE_TOOL_USE, _appender(log, 'innermost'))
-    await innermost.trigger(Junction.PRE_TOOL_USE, args={})
+    await innermost._dispatch(Junction.PRE_TOOL_USE, args={})
     assert log == ['innermost', 'middle', 'outermost']
 
 
@@ -1297,7 +1314,7 @@ async def test_the_outer_center_never_sees_the_inner_ones_hooks():
     inner = HooksCenter(outer=outer)
     inner.register(Junction.PRE_TOOL_USE, _appender(log, 'inner'))
     outer.register(Junction.PRE_TOOL_USE, _appender(log, 'outer'))
-    await outer.trigger(Junction.PRE_TOOL_USE, args={})
+    await outer._dispatch(Junction.PRE_TOOL_USE, args={})
     assert log == ['outer']
 
 
@@ -1310,7 +1327,7 @@ async def test_two_inner_centers_sharing_an_outer_do_not_see_each_other():
     first.register(Junction.PRE_TOOL_USE, _appender(log, 'first'))
     second.register(Junction.PRE_TOOL_USE, _appender(log, 'second'))
     outer.register(Junction.PRE_TOOL_USE, _appender(log, 'shared'))
-    await first.trigger(Junction.PRE_TOOL_USE, args={})
+    await first._dispatch(Junction.PRE_TOOL_USE, args={})
     assert log == ['first', 'shared']
 
 
@@ -1329,7 +1346,7 @@ async def test_an_inner_hooks_modification_becomes_the_outer_hooks_input():
 
     inner.register(Junction.PRE_TOOL_USE, rewrite)
     outer.register(Junction.PRE_TOOL_USE, observe)
-    result = await inner.trigger(Junction.PRE_TOOL_USE, args={'command': 'original'})
+    result = await inner._dispatch(Junction.PRE_TOOL_USE, args={'command': 'original'})
     assert seen == [{'command': 'rewritten'}]
     assert result.modified == {'args': {'command': 'rewritten'}}
 
@@ -1346,7 +1363,7 @@ async def test_an_inner_skip_terminates_the_outer_layers_hooks_too():
 
     inner.register(Junction.PRE_TOOL_USE, veto)
     outer.register(Junction.PRE_TOOL_USE, _appender(log, 'outer'))
-    result = await inner.trigger(Junction.PRE_TOOL_USE, args={})
+    result = await inner._dispatch(Junction.PRE_TOOL_USE, args={})
     assert log == ['veto']
     assert (result.skip, result.result) == (True, 'vetoed')
 
@@ -1363,7 +1380,7 @@ async def test_an_outer_skip_carries_out_the_inner_layers_modifications():
 
     inner.register(Junction.PRE_TOOL_USE, redact)
     outer.register(Junction.PRE_TOOL_USE, veto)
-    result = await inner.trigger(Junction.PRE_TOOL_USE, args='original')
+    result = await inner._dispatch(Junction.PRE_TOOL_USE, args='original')
     assert result.skip is True
     assert result.modified == {'args': 'redacted', 'audited': True}
 
@@ -1382,7 +1399,7 @@ async def test_the_chain_records_every_value_a_key_was_given_across_both_layers(
 
     inner.register(Junction.POST_TOOL_USE, tighten)
     outer.register(Junction.POST_TOOL_USE, summarise)
-    result = await inner.trigger(Junction.POST_TOOL_USE, result='original')
+    result = await inner._dispatch(Junction.POST_TOOL_USE, result='original')
     assert result.modified == {'result': 'summarised'}
     assert result.rewrites('result') == ['untrusted', 'summarised']
 
@@ -1397,7 +1414,7 @@ async def test_an_orphan_result_from_an_outer_hook_is_rejected_by_the_inner_trig
 
     outer.register(Junction.PRE_TOOL_USE, substitute)
     with pytest.raises(ContractViolation) as excinfo:
-        await inner.trigger(Junction.PRE_TOOL_USE, args={})
+        await inner._dispatch(Junction.PRE_TOOL_USE, args={})
     assert 'substitute' in excinfo.value.received
 
 
@@ -1412,13 +1429,15 @@ async def test_both_layers_observable_hooks_run_concurrently():
 
     inner.register(Junction.TURN_START, wait_for_the_other)
     outer.register(Junction.TURN_START, wait_for_the_other)
-    await asyncio.wait_for(inner.trigger(Junction.TURN_START, turn=1), timeout=_TIMEOUT)
+    await asyncio.wait_for(inner._dispatch(Junction.TURN_START, turn=1), timeout=_TIMEOUT)
 
 
 async def test_an_extension_junction_declared_on_the_outer_center_can_be_hooked_from_the_inner():
     """分类由声明者给出，而声明在外层——局部注册必须能沿装配链找到它，否则 register 就报错。"""
     outer = HooksCenter()
-    outer.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    artifact_created = outer.declare_extension_junction(
+        'artifact:created', JunctionKind.INTERCEPTABLE
+    )
     inner = HooksCenter(outer=outer)
     log: list[str] = []
 
@@ -1427,14 +1446,16 @@ async def test_an_extension_junction_declared_on_the_outer_center_can_be_hooked_
         return HookResult()
 
     inner.register('artifact:created', local)
-    await inner.trigger('artifact:created', artifact='raw')
+    await inner.trigger(artifact_created, artifact='raw')
     assert log == ['local']
 
 
 async def test_an_extension_junction_declared_on_the_outer_keeps_its_kind_in_the_inner_layer():
     """分类沿链取：内层若按默认或按本层的空表重新推断，可拦截 hook 会按可观察跑，异常被吞掉。"""
     outer = HooksCenter()
-    outer.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    artifact_created = outer.declare_extension_junction(
+        'artifact:created', JunctionKind.INTERCEPTABLE
+    )
     inner = HooksCenter(outer=outer)
     boom = RuntimeError('artifact policy blew up')
 
@@ -1443,7 +1464,7 @@ async def test_an_extension_junction_declared_on_the_outer_keeps_its_kind_in_the
 
     inner.register('artifact:created', explodes)
     with pytest.raises(RuntimeError) as excinfo:
-        await inner.trigger('artifact:created', artifact='raw')
+        await inner.trigger(artifact_created, artifact='raw')
     assert excinfo.value is boom
 
 
@@ -1456,11 +1477,12 @@ def test_redeclaring_an_outer_extension_junction_with_a_different_kind_is_reject
         inner.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
 
 
-def test_redeclaring_an_outer_extension_junction_with_the_same_kind_is_accepted():
+def test_redeclaring_an_outer_extension_junction_with_the_same_kind_is_refused():
     outer = HooksCenter()
     outer.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
     inner = HooksCenter(outer=outer)
-    inner.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
+    with pytest.raises(ContractViolation):
+        inner.declare_extension_junction('artifact:created', JunctionKind.INTERCEPTABLE)
 
 
 def test_the_undeclared_extension_message_lists_the_whole_chains_declarations():

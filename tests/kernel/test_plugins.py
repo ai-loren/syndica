@@ -12,12 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from syndica.kernel import agent as agent_module
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.context import ToolCall
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HookCallback, HookResult, HooksCenter, Junction, JunctionKind
+from syndica.kernel.hooks.junctions import RUNTIME_ONLY
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.plugins import install_plugins
 from syndica.kernel.protocols.broker import MissingQueueCallback
@@ -167,7 +167,7 @@ async def test_a_hook_registered_on_the_agent_is_invisible_from_the_runtime_cent
         log.append('local')
 
     agent.register_hook(Junction.PRE_TOOL_USE, local)
-    await shared.trigger(Junction.PRE_TOOL_USE, args={})
+    await shared._dispatch(Junction.PRE_TOOL_USE, args={})
 
     assert log == []
 
@@ -211,7 +211,7 @@ async def test_plugins_run_in_the_order_they_were_given():
         plugins=[_Recorder('beta', log), _Recorder('alpha', log), _Recorder('gamma', log)]
     )
     assert runtime.plugins == ('beta', 'alpha', 'gamma')
-    await runtime.hooks.trigger(Junction.PRE_TOOL_USE, args={})
+    await runtime.hooks._dispatch(Junction.PRE_TOOL_USE, args={})
     assert log == ['beta', 'alpha', 'gamma']
     await runtime.shutdown()
 
@@ -269,7 +269,7 @@ async def test_a_plugin_whose_register_raises_leaves_no_hook_from_the_plugins_be
             hooks,
             [_Recorder('first', log), _Explodes(), _Recorder('third', log)],  # pyright: ignore[reportArgumentType]
         )
-    await hooks.trigger(Junction.PRE_TOOL_USE, args={})
+    await hooks._dispatch(Junction.PRE_TOOL_USE, args={})
     assert log == []
 
 
@@ -287,7 +287,7 @@ async def test_a_plugin_whose_register_raises_a_base_exception_is_rolled_back_to
 
     with pytest.raises(KeyboardInterrupt):
         install_plugins(hooks, [_Recorder('first', log), _Interrupts()])  # pyright: ignore[reportArgumentType]
-    await hooks.trigger(Junction.PRE_TOOL_USE, args={})
+    await hooks._dispatch(Junction.PRE_TOOL_USE, args={})
     assert log == []
 
 
@@ -300,7 +300,7 @@ def test_a_plugin_whose_register_raises_leaves_no_extension_junction_declared():
         name = 'boom'
 
         def register(self, hooks: HooksCenter) -> None:
-            hooks.declare_extension_junction('cap:event', JunctionKind.OBSERVABLE)
+            hooks.declare_extension_junction('boom:event', JunctionKind.OBSERVABLE)
             raise RuntimeError('third-party register failed')
 
     with pytest.raises(RuntimeError):
@@ -310,14 +310,14 @@ def test_a_plugin_whose_register_raises_leaves_no_extension_junction_declared():
         return None
 
     with pytest.raises(ContractViolation):
-        hooks.register('cap:event', cb)
+        hooks.register('boom:event', cb)
 
 
 async def test_a_failed_assembly_keeps_the_extension_junctions_that_were_already_declared():
     """还原的基准是进来时的样子。把分类表整个清空同样是一次错误的还原，症状更隐蔽：此后往那个切点挂
     hook 会撞上「没声明过」，而声明它的那个能力早就装好了。"""
     hooks = HooksCenter()
-    hooks.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
+    created = hooks.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
     log: list[str] = []
 
     class _Explodes:
@@ -333,7 +333,7 @@ async def test_a_failed_assembly_keeps_the_extension_junctions_that_were_already
         log.append('cb')
 
     hooks.register('artifact:created', cb)
-    await hooks.trigger('artifact:created')
+    await hooks.trigger(created)
     assert log == ['cb']
 
 
@@ -356,7 +356,7 @@ async def test_a_failed_assembly_keeps_the_hooks_that_were_already_on_the_center
 
     with pytest.raises(RuntimeError):
         install_plugins(hooks, [_Explodes()])  # pyright: ignore[reportArgumentType]
-    await hooks.trigger(Junction.PRE_TOOL_USE, args={})
+    await hooks._dispatch(Junction.PRE_TOOL_USE, args={})
     assert log == ['preexisting']
 
 
@@ -475,7 +475,7 @@ def test_a_plugins_argument_that_is_not_a_sequence_is_refused(plugins: object):
 async def test_an_agent_can_hook_an_extension_junction_declared_on_the_runtime():
     """分类由声明者给出，声明在外层——局部注册必须能沿装配链找到它，否则 register 就会报错。"""
     shared = HooksCenter()
-    shared.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
+    created = shared.declare_extension_junction('artifact:created', JunctionKind.OBSERVABLE)
     agent = _agent(shared)
     seen: list[str] = []
 
@@ -483,7 +483,7 @@ async def test_an_agent_can_hook_an_extension_junction_declared_on_the_runtime()
         seen.append('local')
 
     agent.register_hook('artifact:created', local)
-    await shared.trigger('artifact:created')
+    await shared.trigger(created)
 
     assert seen == []
 
@@ -500,9 +500,9 @@ async def test_registering_on_an_undeclared_extension_junction_still_fails_loudl
 
 
 def test_exactly_three_junctions_are_out_of_reach_from_the_agent_local_layer():
-    """这张表决定 `register_hook` 拒谁。多一个就把宿主真能用的切点挡掉，少一个就放回一个永不触发的
+    """这张表决定 Agent 这一层拒谁。多一个就把宿主真能用的切点挡掉，少一个就放回一个永不触发的
     hook。"""
-    assert {junction.value for junction in agent_module._RUNTIME_ONLY} == {  # pyright: ignore[reportPrivateUsage]
+    assert {junction.value for junction in RUNTIME_ONLY} == {
         'runtime_shutdown',
         'agent_spawn',
         'agent_despawn',
@@ -511,17 +511,38 @@ def test_exactly_three_junctions_are_out_of_reach_from_the_agent_local_layer():
 
 _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica'
 # 除 `runtime.py` 之外的触发点所在的文件。守卫必须证明自己看过它们：把扫描范围收窄到只剩
-# `runtime.py`，「只在 runtime 里触发」这个集合仍然逐字等于 `_RUNTIME_ONLY`、全绿，而此后某个
+# `runtime.py`，「只在 runtime 里触发」这个集合仍然逐字等于 `RUNTIME_ONLY`、全绿，而此后某个
 # 切点在别处多出一个触发点它再也看不见——那正是本守卫唯一要抓的漂移。
 _OTHER_TRIGGER_SITES: tuple[str, ...] = ('kernel/agent.py', 'kernel/tool_executor.py')
 _RUNTIME_MODULE = 'kernel/runtime.py'
 
 
+def _kernel_dispatch(node: ast.AST) -> ast.Call | None:
+    """`<接收者>.<属性>._dispatch(...)`：内核切点的触发点（`self._hooks._dispatch` /
+    `self.hooks._dispatch`）。`self._dispatch(...)` 不算——那是 `HooksCenter.trigger` 把扩展切点交给
+    同一条分发路径。"""
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return None
+    if node.func.attr != '_dispatch' or not isinstance(node.func.value, ast.Attribute):
+        return None
+    return node
+
+
+def _names_a_kernel_junction(node: ast.expr | None) -> str | None:
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == 'Junction'
+    ):
+        return node.attr
+    return None
+
+
 def _junction_trigger_sites() -> tuple[dict[str, set[str]], list[str]]:
     """({切点名: 触发它的文件集合}, 本次真的扫过的文件)。
 
-    只认 `....trigger(Junction.X, ...)`：`_RUNTIME_ONLY` 说的是「谁触发它」，而 `Junction.X`
-    本身在别处还会作为分类表、参数化清单出现。尤其 `agent.py` 里那张表自己就是一串 `Junction.X`
+    只认 `...._dispatch(Junction.X, ...)`：`RUNTIME_ONLY` 说的是「谁触发它」，而 `Junction.X`
+    本身在别处还会作为分类表、参数化清单出现。尤其 `junctions.py` 里那张表自己就是一串 `Junction.X`
     ——把它们也收进来，期望值就由被测对象自己推导出来了。
     """
     sites: dict[str, set[str]] = {}
@@ -530,39 +551,43 @@ def _junction_trigger_sites() -> tuple[dict[str, set[str]], list[str]]:
         relative = path.relative_to(_PACKAGE).as_posix()
         scanned.append(relative)
         for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            call = _kernel_dispatch(node)
+            if call is None or not call.args:
                 continue
-            if node.func.attr != 'trigger' or not node.args:
-                continue
-            first = node.args[0]
-            if (
-                isinstance(first, ast.Attribute)
-                and isinstance(first.value, ast.Name)
-                and first.value.id == 'Junction'
-            ):
-                sites.setdefault(first.attr, set()).add(relative)
+            name = _names_a_kernel_junction(call.args[0])
+            if name is not None:
+                sites.setdefault(name, set()).add(relative)
     return sites, scanned
 
 
-def _trigger_call_counts() -> tuple[int, int]:
-    """(匹配器认出来的次数, 包里所有 `....trigger(` 调用次数)。"""
+def _dispatch_call_counts() -> tuple[int, int]:
+    """(匹配器认出来的次数, 包里所有内核分发调用的次数)。"""
     matched = 0
     total = 0
     for path in sorted(_PACKAGE.rglob('*.py')):
         for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-                continue
-            if node.func.attr != 'trigger':
+            call = _kernel_dispatch(node)
+            if call is None:
                 continue
             total += 1
-            first = node.args[0] if node.args else None
-            if (
-                isinstance(first, ast.Attribute)
-                and isinstance(first.value, ast.Name)
-                and first.value.id == 'Junction'
-            ):
+            if _names_a_kernel_junction(call.args[0] if call.args else None) is not None:
                 matched += 1
     return matched, total
+
+
+def _public_triggers_of_kernel_junctions() -> list[str]:
+    """包里 `....trigger(Junction.X, ...)` 的调用点。公开入口拒绝内核切点：这样写的每一处都会抛。"""
+    found: list[str] = []
+    for path in sorted(_PACKAGE.rglob('*.py')):
+        relative = path.relative_to(_PACKAGE).as_posix()
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != 'trigger' or not node.args:
+                continue
+            if _names_a_kernel_junction(node.args[0]) is not None:
+                found.append(f'{relative}:{node.lineno}')
+    return found
 
 
 def _package_python_files() -> set[str]:
@@ -583,16 +608,26 @@ def test_the_trigger_site_scan_really_covers_the_whole_package():
     assert set(scanned) == _package_python_files()
 
 
-def test_the_trigger_matcher_sees_every_trigger_call():
-    """匹配器只认 `....trigger(Junction.X, ...)`。`trigger(junction, ...)`、别名属性、
-    `trigger(junction=Junction.X)` 都是一次真实触发，而匹配器看不见它们——主断言把「只在
-    runtime 里触发」的集合跟 `_RUNTIME_ONLY` 对上，漏掉这些调用点等于把一个非 Runtime 触发
+def test_the_dispatch_matcher_sees_every_kernel_dispatch_call():
+    """匹配器只认 `...._dispatch(Junction.X, ...)`。`_dispatch(junction, ...)`、别名属性、
+    `_dispatch(junction=Junction.X)` 都是一次真实触发，而匹配器看不见它们——主断言把「只在
+    runtime 里触发」的集合跟 `RUNTIME_ONLY` 对上，漏掉这些调用点等于把一个非 Runtime 触发
     的切点静默算进那张表。
 
-    两边必须相等：每一次 `.trigger(` 调用要么被认出来，要么改匹配器。
+    两边必须相等：每一次内核分发调用要么被认出来，要么改匹配器。
     """
-    matched, total = _trigger_call_counts()
+    matched, total = _dispatch_call_counts()
     assert matched == total
+
+
+def test_no_kernel_junction_goes_through_the_public_trigger():
+    assert _public_triggers_of_kernel_junctions() == []
+
+
+def test_the_dispatch_scan_sees_the_trigger_sites_outside_the_runtime():
+    sites, _ = _junction_trigger_sites()
+    triggering = {file for files in sites.values() for file in files}
+    assert set(_OTHER_TRIGGER_SITES) <= triggering
 
 
 def test_every_junction_has_a_trigger_site():
@@ -611,10 +646,7 @@ def test_the_runtime_only_table_matches_where_those_junctions_are_actually_trigg
     triggered_only_by_the_runtime = {
         name for name, files in sites.items() if files == {_RUNTIME_MODULE}
     }
-    assert {
-        junction.name
-        for junction in agent_module._RUNTIME_ONLY  # pyright: ignore[reportPrivateUsage]
-    } == triggered_only_by_the_runtime
+    assert {junction.name for junction in RUNTIME_ONLY} == triggered_only_by_the_runtime
 
 
 @pytest.mark.parametrize(
@@ -640,7 +672,7 @@ def test_a_junction_only_the_runtime_triggers_is_refused_on_a_single_agent(junct
     assert agent._hooks._collect(junction) == []  # pyright: ignore[reportPrivateUsage]
 
 
-# 差集按字面枚举那三个，**不**从 `_RUNTIME_ONLY` 派生：派生的话，往那张表里多塞一个切点会让本清单
+# 差集按字面枚举那三个，**不**从 `RUNTIME_ONLY` 派生：派生的话，往那张表里多塞一个切点会让本清单
 # 跟着缩水，于是「多挡了一个」这个变异恒不被抓。
 _HOOKABLE_ON_AN_AGENT: list[Junction] = sorted(
     set(Junction) - {Junction.RUNTIME_SHUTDOWN, Junction.AGENT_SPAWN, Junction.AGENT_DESPAWN},

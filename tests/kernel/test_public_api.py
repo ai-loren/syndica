@@ -67,6 +67,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'EventBus',
     'ExecResult',
     'ExitMode',
+    'ExtensionJunction',
     'FileTraceStore',
     'Finding',
     'FlagDeclaration',
@@ -91,6 +92,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'Message',
     'MessageBroker',
     'MissingQueueCallback',
+    'ModuleHost',
     'NO_RULE_MATCHED',
     'NullTracer',
     'Orchestrator',
@@ -200,7 +202,9 @@ _RUNTIME_SURFACE: tuple[str, ...] = (
     'wait_for',
 )
 # `BaseAgent` 的公开面。`kernel.__all__` 只导出类名这一个字符串，对类上新增的方法完全无感——
-# 一次「顺手加个公开方法」因此在这里之外没有任何东西会变红。
+# 一次「顺手加个公开方法」因此在这里之外没有任何东西会变红。`trigger_extension` 是 M4 D6 给 Module
+# 的工具与插件在一个 Agent 的整条链上触发扩展切点的入口；名字带 `_extension`，不与类式角色自己的
+# `trigger` 撞名。
 _BASE_AGENT_SURFACE: tuple[str, ...] = (
     'agent_id',
     'context',
@@ -210,6 +214,7 @@ _BASE_AGENT_SURFACE: tuple[str, ...] = (
     'options',
     'register_hook',
     'run',
+    'trigger_extension',
 )
 # `TraceRecorder` 的公开面：宿主的生命周期（begin / finish / complete / dropped / trace_id /
 # level）、捕获回放文档的三个入口（describe_run / ids / interrupted）加 `Tracer` 协议的七个方法。
@@ -374,9 +379,11 @@ _WITHHELD: tuple[str, ...] = (
     'HostAction',
     'HostProfile',
     'INTERCEPTABLE',
+    'Installer',
     'KillAgent',
     'KillBash',
     'LocalAgentTable',
+    'MODULE_CAPABILITIES',
     'NewerTraceSchema',
     'NullTurnGate',
     'OBSERVABLE',
@@ -411,6 +418,7 @@ _WITHHELD: tuple[str, ...] = (
     'ToolOutcome',
     'TurnGate',
     'TurnGateDecision',
+    'UNSAFE_TEXT',
     'Unreplayable',
     'Write',
     'arguments_digest',
@@ -419,6 +427,7 @@ _WITHHELD: tuple[str, ...] = (
     'back_in_spans',
     'becoming_owner',
     'correlation_of',
+    'current_installer',
     'current_llm_call',
     'current_span_id',
     'current_tool_call',
@@ -428,11 +437,13 @@ _WITHHELD: tuple[str, ...] = (
     'entering_tool_call',
     'git_state_change_rule',
     'install_plugins',
+    'installing',
     'leaving_owner',
     'leaving_tool_call',
     'llm_attempt',
     'looks_secret',
     'next_key',
+    'no_installer',
     'outside_any_span',
     'parse_mapping',
     'path_outside_workspace_rule',
@@ -845,6 +856,15 @@ _PLAN3_PROMISED: tuple[str, ...] = (
 
 def test_promised_names_include_catalog_topology_and_orchestrator():
     missing = [name for name in _PLAN3_PROMISED if name not in kernel.__all__]
+    assert missing == []
+
+
+# M4 公开契约一节点名的名字：第三方 Module 的作者照着它们写代码。
+_M4_PROMISED: tuple[str, ...] = ('ExtensionJunction', 'ModuleHost', 'RuntimeModule')
+
+
+def test_promised_names_include_the_module_manifest_and_junction_handles():
+    missing = [name for name in _M4_PROMISED if name not in kernel.__all__]
     assert missing == []
 
 

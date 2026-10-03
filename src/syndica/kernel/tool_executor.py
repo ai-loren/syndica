@@ -1034,7 +1034,7 @@ class ToolExecutor:
         # 决定要不要重算溯源的依据。只包最初这一份就够——一旦链上有人声明过改写，重取已经触发，
         # 此后再有人就地改也改不掉那个结论。
         handed = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', args)
-        pre = await self._hooks.trigger(
+        pre = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
             Junction.PRE_TOOL_USE, tool_call=call, tool=tool, args=handed
         )
         if pre.skip:
@@ -1104,7 +1104,7 @@ class ToolExecutor:
             if traced is not None:
                 traced[1].attributes.update(_recorded_exit(result.meta))
 
-            post = await self._hooks.trigger(
+            post = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
                 Junction.POST_TOOL_USE, tool_call=call, tool=tool, args=args, result=result
             )
             if post.result is not None:
@@ -1166,7 +1166,7 @@ class ToolExecutor:
             observed_args = (
                 args if request is None else cast('dict[str, Any]', json.loads(request.arguments))
             )
-            await self._hooks.trigger(
+            await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
                 Junction.TOOL_CONFIRMATION_REQUIRED,
                 tool_call=replace(call),
                 tool=tool,

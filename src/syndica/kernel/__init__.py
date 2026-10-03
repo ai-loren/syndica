@@ -54,6 +54,7 @@ from syndica.kernel.errors import (
 )
 from syndica.kernel.events import Event, EventBus, Subscription
 from syndica.kernel.hooks import (
+    ExtensionJunction,
     HookCallback,
     HookResult,
     HooksCenter,
@@ -73,7 +74,7 @@ from syndica.kernel.llm import (
 from syndica.kernel.local_workspace import LocalWorkspace
 from syndica.kernel.manifest import AgentManifest, ManifestSource
 from syndica.kernel.message import DeliveryResult, Message, Trigger
-from syndica.kernel.modules import FlagDeclaration, RuntimeModule, SafetyModule
+from syndica.kernel.modules import FlagDeclaration, ModuleHost, RuntimeModule, SafetyModule
 from syndica.kernel.plugins import Plugin
 from syndica.kernel.prefix_drift import PrefixDriftModule, PrefixDriftRecord, PrefixDriftService
 from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback, TraceStore
@@ -174,6 +175,7 @@ __all__ = [
     'EventBus',
     'ExecResult',
     'ExitMode',
+    'ExtensionJunction',
     'FileTraceStore',
     'Finding',
     'FlagDeclaration',
@@ -198,6 +200,7 @@ __all__ = [
     'Message',
     'MessageBroker',
     'MissingQueueCallback',
+    'ModuleHost',
     'NO_RULE_MATCHED',
     'NullTracer',
     'Orchestrator',

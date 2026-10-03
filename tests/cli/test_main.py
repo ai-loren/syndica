@@ -115,6 +115,15 @@ print(json.dumps({'code': code, 'loaded': loaded}))
     assert completed.stderr == ''
 
 
+def test_cli_escapes_exactly_the_characters_the_kernel_refuses_to_show() -> None:
+    from syndica.cli import terminal
+    from syndica.kernel.terminal_text import UNSAFE_TEXT
+
+    unsafe = terminal._UNSAFE  # pyright: ignore[reportPrivateUsage]
+    assert unsafe.pattern == UNSAFE_TEXT.pattern
+    assert unsafe.flags == UNSAFE_TEXT.flags
+
+
 def test_default_and_explicit_run_share_one_request_shape() -> None:
     host = _Host()
     implicit_out = StringIO()

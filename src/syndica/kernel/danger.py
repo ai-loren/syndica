@@ -2785,7 +2785,7 @@ def _readable_as_text(value: object) -> bool:
     )
 
 
-def _declared_command_args(tool: Tool) -> tuple[str, ...] | None:
+def declared_command_args(tool: Tool) -> tuple[str, ...] | None:
     """取出并校验 `__tool_command_args__`。
 
     声明的名字必须是 `execute` 收得到的参数名：名字写错时那条声明落在一个永远不存在的 key 上，
@@ -2841,7 +2841,7 @@ def _inspected_texts(tool: Tool, args: Mapping[str, Any]) -> tuple[list[str], bo
     第二项决定结论里要不要带上那句怎么改的提示：**猜出来的那条路会对写文本的工具误报**，而修法
     是一行声明，把它写进结论就把一次莫名的阻断变成一次可自助修复的配置问题。
     """
-    declared = _declared_command_args(tool)
+    declared = declared_command_args(tool)
     if declared is None:
         # 未声明的工具不为「读不出文本的值」报错：它本来就是「不知道哪些参数会被执行」，在它每一个
         # int 参数上抛异常会让整批工具用不了；换来的是这条路上的保证弱于声明过的那条，差别写在

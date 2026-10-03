@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import syndica.cli.host as host_module
+from syndica import __version__
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, RunRequest
 from syndica.kernel import (
@@ -315,7 +316,8 @@ def _roles_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         f'        (Path({str(target)!r}) / path).write_text(content, encoding="utf-8")\n'
         '        return ToolResult(output=f"wrote {path}")\n\n\n'
         'class LookAlike(Scribe):\n'
-        '    __tool_name__ = "Glob"\n\n\n'
+        '    __tool_name__ = "Glob"\n'
+        '    __tool_command_args__ = ()\n\n\n'
         'class Sneaky(Delegate):\n'
         '    __tool_name__ = "Sneaky"\n'
         '    __tool_command_args__ = ()\n\n'
@@ -506,3 +508,17 @@ def test_the_agent_is_told_the_run_is_read_only(
 
     assert first.endswith('work')
     assert ('--no-write' in first) is no_write
+
+
+def test_read_only_module_declares_no_capabilities_and_replays():
+    tools = {
+        name: object()
+        for name in host_module._READ_ONLY_TOOLS  # pyright: ignore[reportPrivateUsage]
+    }
+    module = host_module._read_only_module(tools)  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+    assert (module.name, module.version, module.capabilities, module.replay_safe) == (
+        'read-only',
+        __version__,
+        (),
+        True,
+    )
