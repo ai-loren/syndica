@@ -237,8 +237,10 @@ M1 的理由仍成立（插件实例难冻结、撑大公开面），而 M4 的�
 东西的子类静默失去那道闸（D-34）。`AskUser` /
 `AskUserQuestion` 补上自己的声明。类式角色在 `install_own_tools` 里装的工具同样检查（`impl:` 让第三方类式角色从
 `.syndica.yaml` 就能进来）：spawn 比对它装之前与之后的工具表，按对象身份比（同名换了一个对象也查），新增与换掉的
-逐个查。宿主经 `assemble(tools=)` 交来的工具
-不在此列（宿主的责任）。
+逐个查；类式角色的构造函数装的工具同样查（目录冻结出的工厂比对构造前后，阶段一评审 H1）。Module 的工具只经
+`tool_factories` 交回的映射装上：工厂与插件 `register` 期间直接往 Agent 上装（`install_runtime_tools` 或直接写
+`options.tools`）一律拒绝，否则那个工具既不过这道检查、也不知道属于谁（阶段一评审 H1、第四轮评审 N2）。宿主经
+`assemble(tools=)` 交来的工具不在此列（宿主的责任）。
 
 ### D8 回调的校验
 
@@ -260,8 +262,12 @@ M1 的理由仍成立（插件实例难冻结、撑大公开面），而 M4 的�
 `openrouter`、`openai`，小写、无空白），否则报三件套（`Gemini:x`、` gemini:x`、`gemni:x` 都在这里失败；`qwen3:8b`
 这类 Ollama 标签报出「改写成 `openai:qwen3:8b`」）。第一个 `:` 之前有 `/` 或 `.` 的（`cohere/north-mini-code:free`、
 `openrouter/free`）是模型名，照旧走 OpenRouter 或 `OPENAI_*`。这样以后加平台不会改变任何已有字符串的含义（未知前缀
-此刻就是错误，不会被悄悄当成模型名）。带平台的名字只走那一家，不进轮换；OpenRouter（含 `OPENAI_BASE_URL` 指向
-OpenRouter 时）仍只收免费模型；平台没配置时报三件套（点名要设的环境变量）。每个角色的平台与模型进信任确认的展示
+此刻就是错误，不会被悄悄当成模型名）。只收 ASCII（全角冒号与长得像拉丁字母的别的字母会让前缀检查认不出平台名，
+阶段二评审 M1）；冒号后紧跟型号，前后带空白即拒；`<平台>:default` 是那一家在环境里配置的缺省型号。带平台的名字只走
+那一家，不进轮换；OpenRouter（含 `OPENAI_BASE_URL` 指向 OpenRouter 时）仍只收免费模型；平台没配置时报三件套（点名要设
+的环境变量）。清单来自项目配置，而通用的 `OPENAI_*` 端点可能付费：`openai:<型号>`、以及没配 OpenRouter 时落到
+`OPENAI_*` 的不带前缀的名字，只在用户自己的环境选了它时才走（`SYNDICA_LLM_ORDER` 里列了 `openai`，或两家免费平台
+都没配置），否则报三件套（阶段二评审 M1）。每个角色的平台与模型进信任确认的展示
 （项目配置选的模型可能在付费端点上，人要看得见）。顺手修掉 OpenRouter 免费门禁的错误来源：清单写的名字被拒时，
 错误说的是「清单的 model」而不是 `OPENROUTER_MODEL`。
 
@@ -311,7 +317,8 @@ OpenRouter 时）仍只收免费模型；平台没配置时报三件套（点名
   Runtime 级挂作用于每个 Agent 的 hook（`PrefixDriftModule` 就是），服务能被别的 Module 的工具调用，跳过它们会静默
   分叉（第二轮评审 M7）。
 - `replay_safe` 的含义写进 docstring：不做 I/O、不读时钟与随机数、不起线程或执行器（回放跑在虚拟时钟上，等线程会让
-  事件循环看起来空闲、定时器提前触发）。作者声明错了，回放报分叉，不会静默。
+  事件循环看起来空闲、定时器提前触发）；读 `ModuleHost.environment` 的工厂在回放里会分叉（回放交空环境，第四轮评审
+  L3）。作者声明错了，回放报分叉，不会静默。
 - 回放文档的格式升到 3（`SCENARIO_VERSIONS = (1, 2, 3)`）：`module_records`、`danger.roles`、冻结角色的
   `artifact_kinds` 只在 3 里出现；读者接受 1 到 3（第二轮评审 M6：键集是闭集，不升版本旧读者会让人「删掉未知的键」）。
 
@@ -351,19 +358,31 @@ OpenRouter 时）仍只收免费模型；平台没配置时报三件套（点名
   已发布的 Module（评审 H5：零参数的工厂以后再也加不了东西）。入口点名必须等于它交回的 Module 的名字。
 - **第三方 Module 的边界写清**：它们与 syndica 同进程、拿得到用户的完整环境、能绕过工具层与开发期守卫（`AGENTS.md`
   硬约束 #7、#9 管不到它们），信任确认与文档如实说。第三方 Module 的工具交回的结果一律标 `UNTRUSTED`（同 §12.2 对
-  第三方 Skill 的处理）。做法：**内核执行器按工具名收紧**——不包工具（第二轮评审 High 1：包一层会让 D7 看见包装
-  类），也不靠 hook（第三轮评审 High 1：Runtime 级 hook 排在最后，更早的 hook 一个裸 `skip` 就截断它，`PRE_TOOL_USE`
-  的 skip 路径根本到不了它，回放的替身工具身份也对不上）。宿主把要收紧的 Module 名交给 Runtime（内核 API 增量
-  `Runtime(untrusted_output_modules=...)`）；`install_agent` 已经知道每个工具来自哪个 Module，执行器在 hook 结论合并
-  之后、以及 `PRE_TOOL_USE` 的 skip 路径上，把这些工具名的结果收紧成 `UNTRUSTED`（参数校验失败的结果同样收紧）。
-  工具名在回放的替身上不变，宿主档案记下这份名单，回放照它重建。Module 装配期间（工具工厂、插件工厂、服务、
-  `on_start` 里）经 `install_runtime_tools` 装上的工具记在那个 Module 名下：同样收紧、同样过 D7 与开发期守卫、
-  同样进 `module.tools`。spawn 之后再装上的工具算宿主的（同进程的代码能留住 Agent 的引用，挡不住，写进风险）。
-  放开它的开关只在用户级：`run` / `chat` 的 `--trust-module-output <name>`（可重复），宿主档案记下，回放照它重建
-  （回放的工具是替身，放宽的记录造不成真实副作用）；项目配置放不开（第二轮评审 High 2：没有开关的保守标记会让一次
-  第三方调用之后的每个高风险调用都被拒）。开发期守卫对这些工具不认它们自己声明的 `()`，按「每个字符串参数都可能被
-  执行」判（第二轮评审 M12）；开发期记录器挪到不会被截断的位置（可观察切点或执行器自己的记录，T9b 定）——
-  `POST_TOOL_USE` 上的裸 `skip` 会截断排在后面的 hook。
+  第三方 Skill 的处理）。做法：**内核执行器收紧，收紧点按结果是谁写的定**——不包工具（第二轮评审 High 1：包一层会让
+  D7 看见包装类），也不靠 hook（第三轮评审 High 1：Runtime 级 hook 排在最后，更早的 hook 一个裸 `skip` 就截断它）。
+  宿主把要收紧的 Module 名交给 Runtime（内核 API 增量 `Runtime(untrusted_output_modules=...)`，按 `_module_sequence`
+  的规矩校验：字符串不当成字符序列，名单里的名字必须是已装的 Module——认不出的名字什么都不收紧，等于静默放开）。
+  - **执行过的调用**：工具的 `execute` 一返回、在记 trace 与 `POST_TOOL_USE` 之前，出自被收紧 Module 的工具的结果
+    收紧成 `UNTRUSTED`，之后的改写经 `_strictest` 只会更严（第四轮评审 N1：在 hook 结论合并之后才收紧太晚，
+    `POST_TOOL_USE` 上的插件与 trace 看到的是工具自报的 `TRUSTED`）。参数校验失败的结果同样收紧。
+  - **没执行的调用与改写按作者判**：`PRE_TOOL_USE` 的 skip 与 `POST_TOOL_USE` 的改写写下的文本出自某个 hook，
+    `register` 时记下回调的装配期身份，私有的 `_dispatch` 交回是谁 skip / 改写的；作者是被收紧的 Module 时，不论是
+    哪个工具的调用都收紧。宿主自己的守卫（`dev`、`--no-write`）写下的跳过文本不收紧（第四轮评审 N1：按工具名两头都错
+    ——第三方插件能替宿主的 `Bash` 答一段缓存的输出、带着缺省的 `TRUSTED`，宿主守卫跳过第三方调用时又会把一次没执行
+    的调用标成不可信、污染整份轨迹，而唯一的开关会连真实输出一起放开）。收紧后的信任记进 trace，回放的
+    `skip_recorded` 照它重建。
+  - **归属只来自 `tool_factories` 交回的映射**：工具工厂、插件工厂与插件 `register` 期间直接往 Agent 上装工具
+    （`install_runtime_tools` 或直接写 `options.tools`）一律拒绝（阶段一评审 H1 已实现），所以不靠继承来的装配期身份
+    归属（第四轮评审 N2：从装配窗口里起的任务继承身份，按身份归属会把编排、槽与角色自己的工具算到 Module 头上）。
+    `install_own_tools` 不得替换 Module 的工具（同名换了对象即拒）。执行器的收紧状态进装配快照，spawn 失败时一并还原。
+    spawn 之后再装上的工具算宿主的（同进程的代码能留住 Agent 的引用，挡不住，写进风险）。
+  - 放开它的开关只在用户级：`run` / `chat` 的 `--trust-module-output <name>`（可重复），宿主档案记下，回放照它重建。
+    回放里不在替身名单上的工具会真的执行（`_KernelTool`，含第三方 Module 的工具，第四轮评审 L5），第三方 Module 又只在
+    声明了 `replay_safe` 时才重建（D13）；被放宽的结果在回放里能驱动的只有替身工具、内核工具与这些声明了不做 I/O 的
+    工具。项目配置放不开（第二轮评审 High 2：没有开关的保守标记会让一次第三方调用之后的每个高风险调用都被拒）。
+  - 开发期守卫对这些工具不认它们自己声明的 `()`，按「每个字符串参数都可能被执行」判（第二轮评审 M12）。开发期记录器
+    挪到执行器一侧：执行器在结论定下之后、落轨迹之前交出这次调用的记录（私有回调，由 `dev` Module 接上），
+    `POST_TOOL_USE` 上的裸 `skip` 截不断它（第四轮评审 Low：没有可观察的工具后切点，另加公开 `Junction` 会扩公开面）。
 - **第三方 Flag**：键必须以 `<Module 名的下划线写法>_` 开头（`example` → `example_greeting`），像密钥的键名一律拒收
   （「凭证从环境来，不进 Flag」）——Flag 的值会进宿主档案与回放文档。
 - **`modules:` / `flags:`**：`modules:` 是名字列表；`flags:` 与 `--flag` 走**同一个**校验函数，CLI 拒收的取值（如
@@ -389,20 +408,30 @@ OpenRouter 时）仍只收免费模型；平台没配置时报三件套（点名
     时；`run`、`chat`、`doctor`，以及启用了第三方 Module 时的 `flags` 与 `modules show`。只解析不执行的命令（`agents`、
     `topology`）不要；`load_config` 本身不 import 任何东西（不碰入口点与 `impl:`）。
   - 摘要盖住实际会被加载的东西：配置文件的字节；每个被引用的提示词文件（隐式路径与 `{file:}`）的路径与字节；每个
-    `impl:` 目标的字符串，以及它在**工作区之内**时整棵顶层包的源文件（Agent 改得到它们，第二轮评审 M11、第三轮
-    评审 M2：只摘一个文件盖不住父包的 `__init__.py` 与它 import 的兄弟模块）；每个启用的第三方 Module 的入口点
-    目标、发行版名与版本。找 `impl:` 的源文件用 `importlib.machinery.PathFinder` 逐段找，不 import（`find_spec('a.b')`
-    会先 import `a`，那是在确认之前跑代码）；import 工作区里的代码之前把 `sys.pycache_prefix` 指到工作区之外（Agent
-    种下的 `.pyc` 会被当成源文件的缓存）。正在运行的 syndica 自己的包不摘（宿主进程本来就在跑那份代码）。工作区之外
-    的 `impl:` 代码与发行版的内容（含可编辑安装）不进摘要，展示里如实写「信任它就是信任那份代码」。
+    `impl:` 目标的字符串，以及它在**工作区之内**时整棵顶层包里的**每一个文件**（Agent 改得到它们，第二轮评审
+    M11、第三轮评审 M2：只摘一个文件盖不住父包的 `__init__.py` 与它 import 的兄弟模块；第四轮评审 N3：Python 先于
+    `.py` 加载同名的扩展模块，也加载没有源文件的 `.pyc`，只摘源文件盖不住它们）；每个启用的第三方 Module 的入口点
+    目标、发行版名与版本。找 `impl:` 的位置按 import 系统自己的次序逐段问 `sys.meta_path` 上的 finder（子段用父包
+    spec 的 `submodule_search_locations`），不 import（`find_spec('a.b')` 会先 import `a`，那是在确认之前跑代码）；
+    `sys.modules` 里已有的、finder 认不出的、origin 不是普通文件的（命名空间包、zip、自定义 loader）一律拒绝，不当成
+    「工作区之外」放过去（第四轮评审 N3：只问 `PathFinder` 时，可编辑安装的 finder 认得而它认不出的代码会被当成工作区
+    之外、不进摘要）。import 工作区里的代码之前把 `sys.pycache_prefix` 指到本进程新建的 0700 临时目录（Agent 种下的
+    `.pyc` 会被当成源文件的缓存；固定的目录 Agent 的 Bash 写得进去，而 unchecked-hash 的 `.pyc` 从不与源文件比对）。
+    正在运行的 syndica 自己的包不摘（宿主进程本来就在跑那份代码）。工作区之外的 `impl:` 代码与发行版的内容（含可编辑
+    安装）不进摘要，展示里如实写「信任它就是信任那份代码」。`sys.path` 里落在工作区之内的条目（工作区里的 `.venv`、
+    脚本所在目录）在展示里逐条写出：Agent 写得到它们，那里的 `.pth` 在任何闸之前、带着完整环境运行，工作区内 `impl:`
+    包 import 的其它顶层模块也不在摘要里——这些摘要盖不住，只能如实说（写进风险）。启用的第三方 Module 的发行版装在
+    工作区之内时，按它的 `RECORD` 核对每个文件的哈希并把 `RECORD` 进摘要，核对不过就拒绝（T9b）。
   - 只读一次：提示词文件由 CLI 自己解析与读取（隐式路径与 `{file:}` 都在 CLI 这一侧认），读出的文本内联交给内核的清单
     加载，并告诉内核不要再按路径读（内核 API 增量，第二轮评审 High 3：否则内核在摘要之后再读一次文件）；读出的字节
-    同时用于算摘要、解析与展示；人答完之后重读一遍再比，变了就中止并要求重跑（AGENTS.md：检查与动作之间隔着一次问人，
-    要再查一次）。
+    同时用于算摘要、解析与展示；解码与 `read_text` 一致（通用换行：`\r\n`、`\r` 都成 `\n`），否则 CRLF 的提示词
+    文件交给模型的字节与此前不同，前缀缓存整体失效（第四轮评审 Low）；人答完之后重读一遍再比，变了就中止并要求重跑
+    （AGENTS.md：检查与动作之间隔着一次问人，要再查一次）。
   - **确认之前不 import 任何第三方代码**（第二轮评审 B1）：展示只用元数据——启用的 Module 的入口点目标、发行版名与
     版本；能力要 import 才知道，展示里写明「能力在信任之后用 `syndica modules show <name>` 查看」。另外展示
     `workspace.verify`、`pass_env`、每个角色的平台与模型、`impl:` 目标、提示词文件；单行字段过 `one_line`、多行字段逐行
-    过它（`terminal_safe` 保留换行，多行配置值能伪造出一行假的确认，第二轮评审 H1 残留）。
+    过它并加固定的缩进前缀（`terminal_safe` 保留换行，多行配置值能伪造出一行顶格的假确认，第二轮评审 H1 残留、第三轮
+    评审 M10）。
   - 确认的提示与回答走 stderr（不混进 run 的答案，stdout 被重定向时也看得见，第二轮评审 M14）。
   - 只认人：答案必须来自交互终端（stdin 与 stderr 都是 TTY，管道里的 `yes` 不算）；非交互时拒绝并给出下一步
     `syndica config trust --sha256 <摘要>`（摘要从拒绝消息里抄，等于人读过）。开发期守卫**不另加规则**：Agent
@@ -410,7 +439,8 @@ OpenRouter 时）仍只收免费模型；平台没配置时报三件套（点名
     已有的 `shell.path_outside_workspace` 要人确认（实现时的裁决：一条只靠文本匹配的新规则挡不住
     `python -m syndica` 与 `python -c`，加了只多一张要维护的表）。TTY 判定同样是尽力而为（`script` 之类的 pty 包装能
     同时伪造 stdin 与 stderr，第三轮评审 M5），真正的隔离在 M5：宿主在 Agent 的环境里设 `SYNDICA_TRUST_STORE`
-    指向这次 run 的临时目录，`pass_env` 拒收这个名字——Agent 里嵌套起来的 syndica 写的是那份，碰不到用户的信任存储。
+    指向这次 run 的临时目录，`pass_env` 拒收这个名字——Agent 里嵌套起来的 syndica 缺省写的是那份。这只防无意的
+    嵌套，不是隔离：`HOME` 照常透传，`env -u SYNDICA_TRUST_STORE` 就回到用户的存储（第四轮评审 M5）。
   - 存储：`$XDG_CONFIG_HOME/syndica/trusted.json`（缺省 `~/.config/syndica/`），按配置文件的绝对路径记摘要；存储在
     工作区之内时拒绝使用；原子写入（临时文件 + rename），读不出按「未信任」处理；写入点登记进 CLI 的写入点守卫。
   - 宿主收一个**必填**的信任闸参数（第二轮评审 M8：可选参数等于缺省放行，而 `RuntimeCliHost` 是导出的类）：组合根
@@ -559,9 +589,12 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 - `.syndica.yaml` 的 `modules:` 在这里解析，只启用内置的（`retry`、`prefix-drift`）；第三方名字在 T9b 落地之前报
   「启用第三方 Module 要先有信任确认」（第三轮评审 M4：`modules list` 的状态与 T11 的摘要都要读它）。
 - 变异（安全）：`modules list` 触发 import 必须变红。
-#### T11 — 项目配置的信任确认（D15，完成）
-- 摘要的每一部分、只读一次与答后复查、终端转义、只认 TTY、`config trust --sha256`、开发期守卫拦下 `config trust`、
-  存储不在工作区内、原子写入。
+#### T11 — 项目配置的信任确认（D15，完成；第四轮评审 N3 的修补另起一次提交）
+- 摘要的每一部分、只读一次与答后复查、终端转义、只认 TTY、`config trust --sha256`、存储不在工作区内、原子写入。
+  开发期守卫不另加拦 `config trust` 的规则（裁决见 D15「只认人」）。
+- 修补（第四轮评审 N3 与 Low）：按 `sys.meta_path` 找 `impl:`、认不出就拒；整棵包的每个文件进摘要；每个进程新建
+  0700 的 `pycache_prefix`；`sys.path` 里的工作区条目进展示；提示词按通用换行解码（CRLF 用例）。变异：只问
+  `PathFinder`、只摘 `.py`、固定的 `pycache_prefix`、不展示工作区里的 `sys.path` 条目、按字节原样解码，都必须变红。
 - `config` 进命令表；`--config` 的字面缺省改为自动发现；提示与回答走 stderr；信任闸是宿主的必填参数。
 - Agent 的环境里设 `SYNDICA_TRUST_STORE`，`pass_env` 拒收它。
 - 变异：摘要漏掉任一部分（提示词文件、`impl:` 与工作区内的整棵包、Module 的发行版版本）、答后不复查、展示不转义、
@@ -570,11 +603,13 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
 #### T9b — `modules:` / `flags:` 启用、`modules show`、第三方工具结果的信任（D15）
 - 入口点 `factory(ModuleHost)`；第三方 Flag 键前缀与像密钥的键名；`flags:` 与 `--flag` 共用一个校验函数、`flags:` 只收
   收紧的取值；`--flag` 改为读完配置之后校验；`FlagDeclaration.description` 拒收控制字符；组装 Module 的 CLI 函数（次序、
-  收紧名单、Flag 规则）只有一份；内核执行器按工具名收紧第三方工具的结果（`Runtime(untrusted_output_modules=...)`，
-  含 skip 路径与装配期经 `install_runtime_tools` 装上的工具），`--trust-module-output` 放开；开发期守卫不认第三方工具
-  自己声明的 `()`；开发期记录器不会被裸 `skip` 截断。
-- 变异（安全）：`flags:` 收下 `untrusted_high_risk=allow` 或 `ask`、第三方工具结果没被标 `UNTRUSTED`（含被更早的 hook
-  截断、走 skip 路径、装配期另装的工具三种）、开发期守卫认了第三方的 `()`，都必须变红。
+  收紧名单、Flag 规则）只有一份；内核执行器收紧第三方工具的结果（`Runtime(untrusted_output_modules=...)`：执行过的
+  调用在 `execute` 一返回时收紧，skip 与 `POST_TOOL_USE` 的改写按写下它的 hook 的作者收紧），`--trust-module-output`
+  放开；`install_own_tools` 不得替换 Module 的工具；收紧状态进装配快照；开发期守卫不认第三方工具自己声明的 `()`；
+  开发期记录器挪到执行器一侧；启用的第三方 Module 的发行版装在工作区之内时按 `RECORD` 核对。
+- 变异（安全）：`flags:` 收下 `untrusted_high_risk=allow` 或 `ask`、第三方工具结果没被标 `UNTRUSTED`（含 `POST_TOOL_USE`
+  的插件看到自报的 `TRUSTED`、第三方插件 skip 宿主工具、宿主守卫 skip 第三方工具被误标三种）、名单里的字符串被当成
+  字符序列、`install_own_tools` 替换 Module 工具被放过、开发期守卫认了第三方的 `()`、`RECORD` 不核对，都必须变红。
 #### T10 — Flag 文档生成器、`flags list/show`、参考文档（D15）
 
 阶段末：对抗评审二（清单、策略与 CLI：安全边界、配置与发现的失败路径）。
@@ -680,6 +715,18 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
   5 条部分解）逐条修进本文：第三方工具结果的收紧挪进内核执行器、按工具名（High 1）；内联提示词探测路径时崩溃（M1，
   已修进 T7 的代码）；工作区内 `impl:` 的摘要只盖一个文件（M2）；回放的检查次序（M3）；`modules:` 的解析挪进 T9a
   （M4）；Agent 能替自己确认信任（M5）；以及九条 Low。
+- 2026-10-03 阶段一、二的对抗评审（阶段一：0 Blocking、1 High、3 Medium、6 Low；阶段二：0 Blocking、1 High、
+  3 Medium、6 Low）修进代码：D7 只盖住四条装工具的路里的两条——工厂与插件 `register` 期间直接装工具改为拒绝、类式角色
+  的构造函数装的工具同样查；同名替换、多个工具、多个 Module 的检查补上用例；spawn 失败时一并还原 Runtime 级的 hook；
+  建在别处的 Agent 的 Module 层同样标成「服务单个 Agent、属于 Runtime」，建在 Runtime 中心本身上的直接拒绝（评审
+  原建议一律拒绝建在别处的 Agent，那会推翻 spawn 已承诺的「留着自己的 id」行为，改为标记）；按角色的策略记录让任何一个
+  构造失败的角色挡掉整个 run——改为在 try 里、每个角色只建一次；`openai:` 让项目配置把角色送到可能付费的端点——
+  改为要用户自己的环境选了它；以及提示词的符号链接、按角色收紧在拓扑与 chat 里的落地、回放的角色名检查。
+- 2026-10-03 第四轮评审（只核对修订部分：0 Blocking、0 High、3 Medium、6 Low）修进本文：收紧点挪到 `execute` 一返回
+  之时，skip 与改写按 hook 的作者判（N1）；归属只来自交回的映射、`install_own_tools` 不得替换 Module 工具（N2，直接
+  装工具的拒绝已随阶段一评审实现）；信任摘要按 import 系统自己的次序找代码、摘整棵包的每个文件、每个进程新的
+  `pycache_prefix`、工作区里的 `sys.path` 条目如实展示、工作区内发行版按 `RECORD` 核对（N3）；以及名单校验、CRLF、
+  开发期记录器的位置、多行展示的缩进、信任存储那句措辞、`replay_safe` 与环境、回放会真的执行 Module 工具。
 
 ## 风险与遗留（开工前登记）
 
@@ -701,5 +748,8 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
   <摘要>`，或用工作区之外的 `--config`（工作区之内的显式 `--config` 同样要确认）。
 - **spawn 之后装上的工具不收紧。** 第三方代码能留住 Agent 的引用、在 spawn 之后再装工具，那些工具按宿主的算，结果
   不收紧、不过 D7。同进程的代码挡不住这一条，真正的边界是 M5 的沙箱。
+- **工作区里的 `sys.path` 条目在任何闸之前运行。** syndica 装在工作区里的 `.venv`（uv 的缺省）时，Agent 写得到那里的
+  `.pth` 与已装的代码，下一次启动就在信任确认之前、带着完整环境运行；工作区内 `impl:` 包 import 的其它顶层模块也不在
+  摘要里。摘要盖不住这些，信任展示逐条列出这样的条目；把 syndica 装在工作区之外才真正避开。
 - **参数校验失败的结果里带着工具自己的参数说明。** 第三方工具的说明是一条注入通道，溯源看不见它；它们的结果按上面的
   规则收紧，其余的说明文本（工具清单里的描述）照常进请求。
