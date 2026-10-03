@@ -499,8 +499,9 @@ the same slot logic and enters through the root slot, so slot tools, budgets and
 the original run. A run with a third-party module is replayable only if that module declares
 `replay_safe` or runs no code of its own (flags only). Replay rebuilds such a module only when the
 workspace's trusted `.syndica.yaml` enables it and the installed distribution has the recorded
-name and version; it checks all three before importing anything, and names the module and the
-reason when it does not rebuild it.
+name and version; it checks all three before importing anything. When it cannot rebuild one,
+`trace replay` exits 2 and names the module and the reason: replaying without code the original
+run ran would not be the same run.
 
 - `syndica trace list` lists traces newest first (UTC time, id, status, agents, spans, size,
   command; a replay's own trace says which trace it replayed).

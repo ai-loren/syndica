@@ -862,14 +862,22 @@ def _frozen(value: object, field: str, version: int) -> FrozenRole:
             '回放文档里的 impl 不 import 任意路径；别的类式角色在回放里用不了，改成声明式重新捕获',
         )
     description = data.get('description')
+    turns = data.get('max_turns')
+    if version < 3 and turns == 0 and not isinstance(turns, bool):
+        raise _error(
+            f'{field}.max_turns 在 version {version} 的文档里是不小于 1 的整数'
+            '（0 从 version 3 起才收）',
+            '收到 0',
+            '把文档的 version 改成 3：拓扑槽的预算把角色压到一轮都不跑时，捕获写下的就是 version 3',
+        )
     return FrozenRole(
         system_prompt=_text(data['system_prompt'], f'{field}.system_prompt'),
         tools=tools,
-        # 0 合法：拓扑槽的预算可以把一个角色压到一轮都不跑。
+        # 0 合法（version 3 起）：拓扑槽的预算可以把一个角色压到一轮都不跑。
         max_turns=(
             None
-            if data.get('max_turns') is None
-            else _integer(data['max_turns'], f'{field}.max_turns', minimum=0)
+            if turns is None
+            else _integer(turns, f'{field}.max_turns', minimum=0 if version >= 3 else 1)
         ),
         impl=impl,
         model=_nonblank(data.get('model', 'default'), f'{field}.model'),
@@ -1575,6 +1583,15 @@ def _check_entry(
                 'entry.slot 是 topology.slots 中的槽名',
                 f'收到 {entry.slot!r}；现有槽为 {names!r}',
                 '把 entry.slot 改成现有槽名',
+            )
+        target = next(slot for slot in topology.slots if slot.name == entry.slot)
+        if target.cardinality == 'on-demand' or target.boot == 'manual':
+            raise _error(
+                'entry.slot 是 singleton 或 keyed、boot 为 eager 或 lazy 的槽（入口按槽名投递，'
+                'lazy 的槽在第一次寻址时创建）',
+                f'槽 {entry.slot!r} 是 cardinality={target.cardinality!r} boot={target.boot!r}',
+                '把入口槽改成 eager 或 lazy 的 singleton / keyed 槽；'
+                'manual 与 on-demand 的槽由入口 Agent 在运行中占用',
             )
     elif entry.agent not in roles:
         raise _error(

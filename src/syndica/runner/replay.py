@@ -135,13 +135,30 @@ from syndica.kernel.tracing import NullTracer, current_llm_call, span_id_of
 from syndica.runner.replay_broker import GIVE_UP, Plan, ScheduledBroker
 from syndica.runner.scenario import ScenarioEvent, ScenarioResult
 
-__all__ = ['Divergence', 'ModuleRebuilder', 'ReplayResult', 'ReplayRunner']
+__all__ = ['Divergence', 'ModuleRebuilder', 'ModulesNotRebuilt', 'ReplayResult', 'ReplayRunner']
 
 logger = logging.getLogger(__name__)
 
 # 第三方 Module 的重建：交回重建好的 Module，或一句为什么不重建。判据（信任、启用、版本、
 # replay_safe）在宿主一侧，runner 不依赖 CLI，由组合根注入（M4 D13）。
 ModuleRebuilder = Callable[[ModuleRecord, ModuleHost], RuntimeModule | str]
+
+
+class ModulesNotRebuilt(SyndicaError):
+    """文档记着的第三方 Module 在这里重建不了，或重建的 Module 依赖的 Module 没重建：原因在当前
+    环境（信任、启用、装着的版本），不在文档里，重新记录一次修不好它。"""
+
+
+def _not_rebuilt(name: str, why: str, next_action: str) -> ModulesNotRebuilt:
+    return ModulesNotRebuilt(
+        expected=(
+            f'回放重建这份文档记着的第三方 Module {name!r}（它的代码在原始 run 里跑过，'
+            '回放里不跑就不是同一次 run）'
+        ),
+        received=f'没有重建 {name!r}：{why}',
+        next_action=next_action,
+    )
+
 
 # `host.no_write` 下放行的工具：只读的三件、派活与消息、问人。
 _READ_ONLY_TOOLS = frozenset(
@@ -1108,9 +1125,10 @@ class _Replay:
     def _modules(
         self, llm: _ReplayLLM, root: Path
     ) -> tuple[tuple[RuntimeModule, ...], tuple[str, ...]]:
-        """重建得出的 Module 与没重建的那些（第三方的带上原因）。内置的按名字重建；第三方的交给
-        注入的判据，交给它的 `ModuleHost` 是回放的工作区根、空环境（回放不跑真命令）与回放的
-        脱敏器。"""
+        """重建得出的 Module 与没重建的宿主 Module（`dev`、`read-only`：它们的作用已经在记录里）。
+        内置的按名字重建；第三方的交给注入的判据，交给它的 `ModuleHost` 是回放的工作区根、空环境
+        （回放不跑真命令）与回放的脱敏器。第三方的重建不了，这次回放就不是同一次 run：它的代码在
+        原始 run 里跑过，抛 `ModulesNotRebuilt`，而不是少它一个接着跑、再把差别报成分叉。"""
         names = self._host.modules
         if names is None:
             return (SafetyModule(), HumanInteractionModule()), ()
@@ -1132,8 +1150,15 @@ class _Replay:
             record = records.get(name)
             if builder is not None:
                 built.append(builder())
-            elif record is None or rebuild is None:
+            elif record is None:
                 unrebuilt.append(name)
+            elif rebuild is None:
+                raise _not_rebuilt(
+                    name,
+                    '这次回放没有重建第三方 Module 的判据',
+                    '经 syndica trace replay 回放（它按当前工作区判要不要重建）；'
+                    '以库的方式回放时给 ReplayRunner(modules=...)',
+                )
             else:
                 host = ModuleHost(
                     workspace_root=root,
@@ -1142,14 +1167,17 @@ class _Replay:
                 )
                 outcome = rebuild(record, host)
                 if isinstance(outcome, str):
-                    unrebuilt.append(f'{name}（{outcome}）')
-                else:
-                    built.append(outcome)
+                    raise _not_rebuilt(
+                        name,
+                        outcome,
+                        '照这条原因修好当前工作区再回放；修不好就换一个不用它的 trace',
+                    )
+                built.append(outcome)
         rebuilt = {module.name for module in built}
         for module in built:
             missing = [required for required in module.requires if required not in rebuilt]
             if missing:
-                raise ConfigError(
+                raise ModulesNotRebuilt(
                     expected=f'回放重建的 Module {module.name!r} 依赖的 Module 也都重建了',
                     received=f'没重建 {missing!r}',
                     next_action=(

@@ -347,7 +347,15 @@ def test_a_v1_document_reads_as_before_with_slot_entry_and_ordered_responses():
 @pytest.mark.parametrize(
     ('path', 'value'),
     [
-        (('topology',), {'slots': [{'name': 'lead', 'agent': 'Lead', 'cardinality': 'on-demand'}]}),
+        (
+            ('topology',),
+            {
+                'slots': [
+                    {'name': 'lead', 'agent': 'Lead', 'cardinality': 'singleton'},
+                    {'name': 'helper', 'agent': 'Lead', 'cardinality': 'on-demand'},
+                ]
+            },
+        ),
         (('entry',), {'mode': 'send', 'agent': 'Lead', 'prompt': {'payload': '2' * 64}}),
         ((*_TURN, 'content'), [{'type': 'text', 'text': 'hi'}]),
         (
@@ -499,7 +507,15 @@ _INVALID: list[tuple[str, tuple[Any, ...], object, str, str, str]] = [
         'short',
         '不要截断',
     ),
-    ('frozen-turns', ('agents', 'Lead', 'frozen', 'max_turns'), -1, '不小于 0', '-1', '更大的整数'),
+    ('frozen-turns', ('agents', 'Lead', 'frozen', 'max_turns'), -1, '不小于 1', '-1', '更大的整数'),
+    (
+        'frozen-zero-turns',
+        ('agents', 'Lead', 'frozen', 'max_turns'),
+        0,
+        '0 从 version 3',
+        '0',
+        'version 改成 3',
+    ),
     ('frozen-tools', ('agents', 'Lead', 'frozen', 'tools'), _DELETE, '必填键', "['tools']", '补齐'),
     ('key-empty', (*_INSTANCE, 'key'), [], '稳定键', '[]', "['host', 'spawn', 0]"),
     ('key-bool', (*_INSTANCE, 'key'), ['host', True], '字符串或整数', 'True', '不是整数'),
@@ -1714,3 +1730,61 @@ def test_v1_error_kinds_name_the_classes_the_kernel_actually_raises():
             ('runtime_error', RuntimeError),
         )
     }
+
+
+@pytest.mark.parametrize(
+    'slot',
+    [
+        {'name': 'lead', 'agent': 'Lead', 'cardinality': 'on-demand'},
+        {'name': 'lead', 'agent': 'Lead', 'boot': 'manual'},
+    ],
+    ids=['on-demand', 'manual'],
+)
+def test_an_entry_slot_the_runner_cannot_address_by_name_is_refused_when_parsed(
+    slot: dict[str, object],
+):
+    document = _with(_v2(), ('topology',), {'slots': [slot]})
+    document['entry'] = {'slot': 'lead', 'prompt': 'go'}
+
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(document, source='captured.json')
+
+    assert 'boot 为 eager 或 lazy' in caught.value.expected
+    assert "槽 'lead'" in caught.value.received
+    assert '入口 Agent 在运行中占用' in caught.value.next_action
+
+
+def test_version_3_adds_exactly_these_keys_so_extending_it_needs_a_new_version():
+    from syndica.kernel import scenario_schema as schema
+
+    assert sorted(schema._V3_HOST - schema._HOST) == [  # pyright: ignore[reportPrivateUsage]
+        'module_records',
+        'untrusted_output_modules',
+    ]
+    assert sorted(schema._V3_FROZEN - schema._FROZEN) == ['artifact_kinds']  # pyright: ignore[reportPrivateUsage]
+    assert sorted(schema._V3_DANGER - schema._DANGER) == ['roles']  # pyright: ignore[reportPrivateUsage]
+    assert sorted(schema._HOST) == [  # pyright: ignore[reportPrivateUsage]
+        'confirmation_timeout',
+        'danger',
+        'flags',
+        'host_facts',
+        'max_turns',
+        'modules',
+        'no_write',
+        'orchestration',
+        'output_limit',
+    ]
+    assert sorted(schema._FROZEN) == [  # pyright: ignore[reportPrivateUsage]
+        'description',
+        'impl',
+        'max_turns',
+        'model',
+        'system_prompt',
+        'tools',
+    ]
+    assert sorted(schema._MODULE_RECORD) == [  # pyright: ignore[reportPrivateUsage]
+        'distribution',
+        'distribution_version',
+        'module_version',
+        'name',
+    ]

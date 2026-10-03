@@ -470,6 +470,14 @@ class TraceRecorder:
                         '传 dict，例如 entry={"mode": "query", "agent": "Lead", "prompt": "…"}'
                     ),
                 )
+        if topology is not None and not isinstance(cast(object, topology), Topology):
+            raise ConfigError(
+                expected='describe_run 的 topology 是 Topology（宿主实际装配的那一份），或省略',
+                received=f'收到 {type(topology).__name__}',
+                next_action=(
+                    '传交给 Runtime.assemble 的同一个 Topology 对象，而不是配置里的映射或拓扑名'
+                ),
+            )
         for role, value in roles.items():
             if not isinstance(cast(object, role), str) or not isinstance(
                 cast(object, value), Mapping

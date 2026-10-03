@@ -675,6 +675,11 @@ distribution_version?}`）、`danger.roles`（逐个角色的实际处置表）�
   跑的代码又没声明 `replay_safe` 就不写回放文档（只声明 Flag 的不挡）；脱敏会改掉 Module 名或发行版的同样不写。
 - 回放的判据在 `cli/replay_modules.py`，由组合根注入 `ReplayRunner(modules=)`；重建的 Module 依赖的 Module 没重建
   时回放拒绝开始；被收紧的名单照档案重建（只对重建了的 Module）。
+- 阶段四评审的修补：回放文档 v3 的键与取值到此冻结（没有哪个发布带过 v3；此前阶段二、三的 `main` 写下的 v3 读不进
+  此后的键），用例逐项钉住 v3 比 v2 多出的键，再扩就得升 v4。拓扑 run 与 `max_turns: 0` 的角色写 v3（v2 的读者读得进
+  却回放不出、或会叫人改成 1）；v2 里 `max_turns: 0` 报「改成 version 3」。槽 `extra_tools` 被脱敏改掉、装配拓扑或寻址
+  入口槽时就失败的 run 不写回放文档；入口槽是 manual 或 on-demand 的场景在解析时就拒。回放重建遇到工作区之内的信任
+  存储一律不重建；依赖没重建的报错保留自己的下一步（`ModulesNotRebuilt`），不再被换成「重新记录」。
 - `replay_safe`、已安装发行版名字版本一致、当前配置受信任（被动查）且启用了它，才重建；否则有可跑代码的第三方
   Module 让 run 判 `Unreplayable`。宿主档案加 `module_records`；回放文档格式升到 3。
 - 变异：读文档里的声明而不是已安装的那一份、版本不比、`replay_safe=False` 也重建、不查信任、只有 `on_start` 的

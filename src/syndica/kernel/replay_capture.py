@@ -99,8 +99,11 @@ class _Wait:
     answer: dict[str, object] | None = None
 
 
-def _document_version(host: object, roles: object) -> int:
-    """写得下这份内容的最低版本：没用到 v3 的键就写 2，旧版本的读者照样读得进。"""
+def _document_version(host: object, roles: object, topology: object = None) -> int:
+    """写得下这份内容的最低版本：没用到 v3 的键与取值就写 2，旧版本的读者照样读得进。拓扑 run
+    的槽入口在 v2 的读者那里是另一种进法（直接建角色、不经槽），读得进却回放不出，所以也写 3。"""
+    if topology is not None:
+        return 3
     profile: Mapping[str, object] = (
         cast(Mapping[str, object], host) if isinstance(host, Mapping) else {}
     )
@@ -110,8 +113,12 @@ def _document_version(host: object, roles: object) -> int:
     if 'module_records' in profile or 'untrusted_output_modules' in profile:
         return 3
     frozen = cast(Mapping[str, object], roles).values() if isinstance(roles, Mapping) else ()
-    if any(isinstance(role, Mapping) and 'artifact_kinds' in role for role in frozen):
-        return 3
+    for role in frozen:
+        if not isinstance(role, Mapping):
+            continue
+        body = cast(Mapping[str, object], role)
+        if 'artifact_kinds' in body or body.get('max_turns') == 0:
+            return 3
     return 2
 
 
@@ -184,7 +191,7 @@ class ReplayCapture:
         if topology is not None:
             run['topology'] = self._jsonable(_topology_document(topology))
         probe: dict[str, object] = {
-            'version': _document_version(run['host'], frozen),
+            'version': _document_version(run['host'], frozen, run.get('topology')),
             'name': 'describe_run',
             'host': run['host'],
             'agents': {name: {'frozen': role, 'instances': []} for name, role in frozen.items()},
@@ -464,7 +471,7 @@ class ReplayCapture:
         run = self._run
         assert run is not None
         roles = cast(dict[str, dict[str, object]], run['roles'])
-        self._refuse_unreplayable(roles, run)
+        self._refuse_unreplayable(roles, run, status)
         identifiers = {trace_id, *self.ids.issued.values(), *self._digests}
 
         def clean(value: object) -> object:
@@ -563,7 +570,7 @@ class ReplayCapture:
                 action['waiting'] = [key for _, key in waiting]
             host_actions.append(action)
         document: dict[str, object] = {
-            'version': _document_version(run['host'], run['roles']),
+            'version': _document_version(run['host'], run['roles'], run.get('topology')),
             'name': clean(f'trace {trace_id}'),
             'source': clean(
                 {
@@ -600,8 +607,33 @@ class ReplayCapture:
         }
         return document, identifiers
 
+    def _refuse_redacted_slot_tools(self, run: Mapping[str, object]) -> None:
+        """拓扑槽附加的工具同样按名字找：名字被脱敏换掉，回放装配时找不到它。"""
+        topology = run.get('topology')
+        if not isinstance(topology, Mapping):
+            return
+        slots = cast(Mapping[str, object], topology).get('slots')
+        for slot in cast(list[object], slots if isinstance(slots, list) else []):
+            if not isinstance(slot, Mapping):
+                continue
+            body = cast(Mapping[str, object], slot)
+            tools = body.get('extra_tools')
+            for index, tool in enumerate(
+                cast(list[object], tools if isinstance(tools, list) else [])
+            ):
+                if isinstance(tool, str) and str(self._redactor.redact(tool)) != tool:
+                    shown = self._redactor.redact(str(body.get('name')))
+                    raise Unreplayable(
+                        expected='脱敏规则不认得工具名（回放按名字找工具）',
+                        received=f'槽 {shown!r} 的 extra_tools 第 {index} 项被一条脱敏规则换掉了',
+                        next_action='收窄那条用户规则，别让它认得工具名；这个 trace 不写回放文档',
+                    )
+
     def _refuse_unreplayable(
-        self, roles: Mapping[str, Mapping[str, object]], run: Mapping[str, object]
+        self,
+        roles: Mapping[str, Mapping[str, object]],
+        run: Mapping[str, object],
+        status: SpanStatus,
     ) -> None:
         """回放造不出来的 run：写不出一份回放得了的文档，抛 `Unreplayable` 说清是哪一类。"""
         if self.ids.reused:
@@ -636,9 +668,19 @@ class ReplayCapture:
                         received=f'角色 {name!r} 的工具表第 {index} 项被一条脱敏规则换掉了',
                         next_action='收窄那条用户规则，别让它认得工具名；这个 trace 不写回放文档',
                     )
+        self._refuse_redacted_slot_tools(run)
         entry = cast(Mapping[str, object], run['entry'])
         allowed = 1 if entry.get('mode') in ('send', 'slot') else 0
         sent = [key for key in self.ids.issued if key[:2] == ('host', 'message')]
+        if entry.get('mode') == 'slot' and not sent and status is not SpanStatus.CANCELLED:
+            raise Unreplayable(
+                expected='拓扑 run 的入口消息送到了入口槽（回放按同一份拓扑装配、再送这一条）',
+                received='这次 run 在装配拓扑或寻址入口槽时就失败了，入口消息没有送出',
+                next_action=(
+                    '先修好拓扑（槽的工具、预算与引用的工具），再跑一次；'
+                    '这类失败回放不出来，这个 trace 不写回放文档'
+                ),
+            )
         if len(sent) > allowed:
             raise Unreplayable(
                 expected='run 开始之后宿主不再自己给 Agent 发消息（回放只重放入口那一条）',

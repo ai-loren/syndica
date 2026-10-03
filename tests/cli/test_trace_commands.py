@@ -424,11 +424,11 @@ def _refused_by_the_replay(root: Path) -> str:
         (_no_document(('chat',), TraceLevel.STRUCTURE), '用 `syndica run` 跑同样的需求'),
         (
             _no_document(('run', '--topology', 'dev', 'go'), TraceLevel.REPLAY),
-            '用 --agent <角色> 单独跑那个角色',
+            'stderr 上的那条 WARNING',
         ),
         (
             _no_document(('run', '--topology=dev', 'go'), TraceLevel.STRUCTURE),
-            '用 --agent <角色> 单独跑那个角色',
+            '用 --trace replay 重新跑一次',
         ),
         (_no_document(('run', 'go'), TraceLevel.REPLAY), 'stderr 上的那条 WARNING'),
     ],

@@ -39,6 +39,7 @@ from syndica.kernel import (
     SyndicaError,
     ToolCall,
     TraceHeader,
+    TrustLevel,
     parse_scenario_document,
 )
 from syndica.kernel.tracing import current_llm_call
@@ -1874,3 +1875,190 @@ def test_builtin_modules_enabled_by_the_project_config_install_in_order_and_repl
         'dev',
     ]
     assert replayed.reproduced, replayed.divergences
+
+
+def test_a_captured_topology_run_is_written_as_version_3(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(_slot_topology(2), encoding='utf-8')
+
+    _cli(
+        tmp_path,
+        _PerAgent([_say('done')]),
+        ['--config', str(config), 'run', 'go', '--topology', 'solo'],
+    )
+    _, document = _trace(tmp_path)
+
+    assert document['version'] == 3
+
+
+def test_a_role_allowed_no_turns_is_captured_as_version_3_and_replays(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(
+        'version: 1\nagents:\n  - name: Worker\n    description: 写报告\n    tools: [Read]\n'
+        '    budget: {turns: 0}\n',
+        encoding='utf-8',
+    )
+
+    _cli(
+        tmp_path,
+        _PerAgent([_say('done')]),
+        ['--config', str(config), 'run', 'go', '--agent', 'Worker'],
+    )
+    header, document = _trace(tmp_path)
+
+    assert document['version'] == 3
+    assert document['agents']['Worker']['frozen']['max_turns'] == 0
+    replayed = _replayed(header, document)
+    assert replayed.reproduced, replayed.divergences
+
+
+def test_a_slot_tool_a_user_rule_rewrites_costs_the_document_and_names_the_slot(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(
+        "version: 1\nredaction:\n  rules:\n    - {id: custom.tool, pattern: 'KillBash'}\n"
+        'agents:\n  - name: Worker\n    description: 写报告\n    tools: [Read]\n'
+        'topologies:\n  solo:\n    slots:\n      - name: root\n        agent: Worker\n'
+        '        is_root: true\n        cardinality: singleton\n        boot: eager\n'
+        '        extra_tools: [KillBash]\n',
+        encoding='utf-8',
+    )
+
+    code, _, stderr = _cli(
+        tmp_path,
+        _PerAgent([_say('done')]),
+        ['--config', str(config), 'run', 'go', '--topology', 'solo', '--trace', 'replay'],
+    )
+
+    assert code == 0, stderr
+    assert _without_document(tmp_path)
+    assert "槽 'root' 的 extra_tools 第 0 项" in stderr
+
+
+def test_a_topology_run_that_fails_while_assembling_writes_no_document(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(
+        'version: 1\nagents:\n  - name: Worker\n    description: 写报告\n    tools: [Read]\n'
+        'topologies:\n  solo:\n    slots:\n      - name: root\n        agent: Worker\n'
+        '        is_root: true\n        cardinality: singleton\n        boot: eager\n'
+        '        extra_tools: [Read]\n',
+        encoding='utf-8',
+    )
+
+    code, _, stderr = _cli(
+        tmp_path,
+        _PerAgent([_say('done')]),
+        ['--config', str(config), 'run', 'go', '--topology', 'solo', '--trace', 'replay'],
+    )
+
+    assert code != 0
+    assert _without_document(tmp_path)
+    assert '入口消息没有送出' in stderr
+
+
+_THREE_SLOTS = """version: 1
+topologies:
+  team:
+    slots:
+      - name: root
+        agent: Worker
+        is_root: true
+        cardinality: singleton
+        boot: eager
+      - name: helper
+        agent: Explorer
+        cardinality: keyed
+        key_field: topic
+        boot: lazy
+        exit_mode: exit
+        metadata: {team: research}
+      - name: reviewer
+        agent: Planner
+        cardinality: on-demand
+        boot: manual
+        exit_mode: idle
+        metadata: {tier: 2}
+"""
+
+
+def test_every_field_of_every_slot_is_captured(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(_THREE_SLOTS, encoding='utf-8')
+
+    code, _, stderr = _cli(
+        tmp_path,
+        _PerAgent([_say('done')]),
+        ['--config', str(config), 'run', 'go', '--topology', 'team'],
+    )
+    header, document = _trace(tmp_path)
+
+    assert code == 0, stderr
+    assert [{key: slot[key] for key in sorted(slot)} for slot in document['topology']['slots']] == [
+        {
+            'agent': 'Worker',
+            'boot': 'eager',
+            'budget': None,
+            'cardinality': 'singleton',
+            'exit_mode': 'zombie',
+            'extra_tools': [],
+            'is_root': True,
+            'key_field': None,
+            'metadata': {},
+            'name': 'root',
+        },
+        {
+            'agent': 'Explorer',
+            'boot': 'lazy',
+            'budget': None,
+            'cardinality': 'keyed',
+            'exit_mode': 'exit',
+            'extra_tools': [],
+            'is_root': False,
+            'key_field': 'topic',
+            'metadata': {'team': 'research'},
+            'name': 'helper',
+        },
+        {
+            'agent': 'Planner',
+            'boot': 'manual',
+            'budget': None,
+            'cardinality': 'on-demand',
+            'exit_mode': 'idle',
+            'extra_tools': [],
+            'is_root': False,
+            'key_field': None,
+            'metadata': {'tier': 2},
+            'name': 'reviewer',
+        },
+    ]
+    replayed = _replayed(header, document)
+    assert replayed.reproduced, replayed.divergences
+
+
+def test_a_slot_entry_marked_untrusted_is_delivered_untrusted_in_the_replay(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    config = tmp_path / 'syndica.yaml'
+    config.write_text(_slot_topology(2), encoding='utf-8')
+    _cli(
+        tmp_path,
+        _PerAgent([_say('done')]),
+        ['--config', str(config), 'run', 'go', '--topology', 'solo'],
+    )
+    header, document = _trace(tmp_path)
+    document['entry']['trust'] = 'untrusted'
+
+    replayed = _replayed(header, document)
+
+    [trajectory] = replayed.trajectories.values()
+    [entry] = [block for block in trajectory if block.role == 'user']
+    assert entry.trust is TrustLevel.UNTRUSTED

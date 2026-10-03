@@ -1498,8 +1498,8 @@ class RuntimeCliHost:
         changed = sorted({value for value in named if redactor.redact(value) != value})
         if changed:
             return (
-                f'脱敏规则会改掉 Module 的名字或发行版 {changed!r}：回放认不出该重建哪一个'
-                '（收窄认得它们的那条用户规则）'
+                f'脱敏规则会改掉 Module 的名字或发行版 {redactor.redact(repr(changed))}：'
+                '回放认不出该重建哪一个（收窄认得它们的那条用户规则）'
             )
         return None
 

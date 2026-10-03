@@ -2363,3 +2363,22 @@ async def test_a_plain_result_is_recorded_as_trusted_and_a_reply_that_is_not_a_b
         'kind': 'reply',
         'value': {'odd': ['reply']},
     }
+
+
+@pytest.mark.parametrize(
+    'topology', [{'slots': []}, 'solo', [object()]], ids=['mapping', 'name', 'list']
+)
+def test_describe_run_refuses_a_topology_that_is_not_a_topology(topology: object):
+    recorder = TraceRecorder(InMemoryTraceStore(), RuleRedactor())
+
+    with pytest.raises(ConfigError) as excinfo:
+        recorder.describe_run(
+            host={},
+            roles={'Lead': {'system_prompt': 'p', 'tools': []}},
+            entry={'mode': 'query', 'agent': 'Lead', 'prompt': 'go'},
+            topology=topology,  # pyright: ignore[reportArgumentType]
+        )
+
+    assert 'Topology' in excinfo.value.expected
+    assert type(topology).__name__ in excinfo.value.received
+    assert 'Runtime.assemble' in excinfo.value.next_action

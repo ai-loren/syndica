@@ -99,7 +99,7 @@ def render_show(header: TraceHeader, spans: Sequence[Span], edges: Sequence[Caus
         *_timeline(agents, labels, origin),
         '',
         'Module：',
-        *_modules(spans, labels),
+        *_modules(spans, labels, header.schema),
     ]
     return '\n'.join(sections)
 
@@ -109,7 +109,7 @@ def _names(value: object) -> str:
     return '、'.join(one_line(item) for item in listed if isinstance(item, str)) or '无'
 
 
-def _modules(spans: Sequence[Span], labels: Mapping[str, str]) -> list[str]:
+def _modules(spans: Sequence[Span], labels: Mapping[str, str], schema: str) -> list[str]:
     """每个 Agent 从哪个 Module 拿到哪些工具与插件，以及扩展切点各被触发了几次。"""
     by_agent: dict[str, list[str]] = {}
     triggered: dict[str, int] = {}
@@ -127,9 +127,13 @@ def _modules(spans: Sequence[Span], labels: Mapping[str, str]) -> list[str]:
             f'工具 {_names(span.attributes.get("module.tools"))}；'
             f'插件 {_names(span.attributes.get("module.plugins"))}'
         )
-    if not by_agent:
-        return ['  （没有记下：/1 的 trace 不记 Module）']
     lines: list[str] = []
+    if not by_agent:
+        lines.append(
+            '  （没有记下：/1 的 trace 不记 Module）'
+            if schema == 'syndica.trace/1'
+            else '  （这次 run 没有装 Module）'
+        )
     for agent_id, entries in by_agent.items():
         lines.append(f'  {labels.get(agent_id, _short(agent_id))}')
         lines.extend(entries)

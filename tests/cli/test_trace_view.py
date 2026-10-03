@@ -650,3 +650,28 @@ def test_a_module_name_that_could_forge_a_line_is_escaped():
     text = render_show(_header(), spans, [])
 
     assert '\nforged line' not in text
+
+
+@pytest.mark.parametrize(
+    ('schema', 'said'),
+    [('syndica.trace/1', '/1 的 trace 不记 Module'), ('syndica.trace/2', '这次 run 没有装 Module')],
+)
+def test_a_trace_without_module_spans_says_why_and_still_counts_junctions(schema: str, said: str):
+    tool = dataclasses.replace(
+        _tool(_LEAD, 0, 'Record', 1, 2),
+        events=(
+            SpanEvent(
+                name='junction.triggered',
+                time_ns=_ORIGIN + 1 * _S,
+                attributes={'junction.name': 'host:checkpoint'},
+            ),
+        ),
+    )
+    spans = [_agent(_LEAD, 'Orchestrator', 0, 5), tool]
+
+    section = _section(
+        render_show(dataclasses.replace(_header(), schema=schema), spans, []), 'Module：'
+    )
+
+    assert said in section[0]
+    assert any('扩展切点：host:checkpoint ×1' in line for line in section)

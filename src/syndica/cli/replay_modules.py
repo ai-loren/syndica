@@ -20,6 +20,7 @@ from syndica.cli.trust import (
     private_pycache_prefix,
     read_snapshot,
     store_path,
+    within,
 )
 from syndica.kernel import ConfigError, ModuleHost, RuntimeModule
 from syndica.kernel.scenario_schema import ModuleRecord
@@ -39,6 +40,11 @@ def module_rebuilder(
         trusted = store_path(environ)
         if trusted is None or not config_file.is_file():
             return f'这个工作区没有受信任的 .syndica.yaml：{_TRUST}'
+        if within(trusted, workspace_root):
+            return (
+                f'信任存储 {trusted} 在工作区之内，Agent 改得到它：'
+                '把 XDG_CONFIG_HOME 或 SYNDICA_TRUST_STORE 指到工作区之外再回放'
+            )
         discovered = discover(entry_points)
         try:
             snapshot = read_snapshot(config_file, workspace_root, discovered)

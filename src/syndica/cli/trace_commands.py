@@ -331,18 +331,14 @@ def _why_no_document(header: TraceHeader) -> tuple[str, str]:
             '没有：chat 最多记到 structure，不写回放文档',
             '要回放就用 `syndica run` 跑同样的需求（默认记到 replay）',
         )
-    if any(arg == '--topology' or arg.startswith('--topology=') for arg in argv):
-        return (
-            '没有：--topology 的 run 不写回放文档（回放重建不出拓扑槽给角色附加的东西）',
-            '要回放就用 --agent <角色> 单独跑那个角色',
-        )
     if header.level is TraceLevel.STRUCTURE:
         return (
             '没有：它按 structure 记的',
             '用 --trace replay 重新跑一次这条命令，再回放新的那个 trace',
         )
     return (
-        '没有：这次 run 写不出回放文档（原因是那次 run 结束时 stderr 上的那条 WARNING）',
+        '没有：这次 run 写不出回放文档（原因是那次 run 结束时 stderr 上的那条 WARNING，比如装了'
+        '有会跑的代码、又没声明 replay_safe 的第三方 Module）',
         '那类 run 回放不出来；结构照常记下了，用 syndica trace show 看它',
     )
 
