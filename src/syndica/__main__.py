@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import sys
 from collections.abc import Sequence
@@ -38,6 +39,11 @@ _GEMINI_FOREIGN_TOOL_CALL_EXTRA = {
     'google': {'thought_signature': 'skip_thought_signature_validator'}
 }
 _ORDER_ENV = 'SYNDICA_LLM_ORDER'
+# 清单 model 的 `<平台>:<型号>`：第一个 `:` 之前形如一个名字（没有 `/` 与 `.`）时它就是平台
+# 前缀，且只能是这三个之一。命名空间是封闭的：未知前缀此刻就报错，以后加平台不会改变任何已有字符串
+# 的含义。
+_PLATFORMS = ('gemini', 'openrouter', 'openai')
+_PLATFORM_PREFIX = re.compile(r'\s*[A-Za-z][A-Za-z0-9_-]*\s*:')
 # 不设 SYNDICA_LLM_ORDER 时进轮换的平台及顺序。通用的 OPENAI_* 端点不在其中：它可能是付费端点，
 # 只在这两家都没配置时单独使用，或在 SYNDICA_LLM_ORDER 里被显式点名。
 _DEFAULT_RING = ('gemini', 'openrouter')
@@ -55,8 +61,10 @@ def _free_openrouter_model(value: str | None, *, source: str) -> str:
     if value != _OPENROUTER_DEFAULT_MODEL and not value.endswith(':free'):
         raise ConfigError(
             expected='OpenRouter 只使用 openrouter/free 或以 :free 结尾的免费模型',
-            received=f'收到模型 {value!r}',
-            next_action='改成 openrouter/free，或从 OpenRouter 免费模型列表选择一个 :free 模型',
+            received=f'{source} 是 {value!r}',
+            next_action=(
+                f'把 {source} 改成 openrouter/free，或从 OpenRouter 免费模型列表选择一个 :free 模型'
+            ),
         )
     return value
 
@@ -137,7 +145,7 @@ def _ring_order() -> tuple[str, ...]:
     return names
 
 
-def _gemini_model() -> LLM:
+def _gemini_model(name: str) -> LLM:
     from syndica.backends.llm_openai import OpenAICompatible
     from syndica.kernel import ConfigError, LLMConfig
 
@@ -151,7 +159,11 @@ def _gemini_model() -> LLM:
     return OpenAICompatible(
         LLMConfig(
             provider='openai-compatible',
-            model=os.environ.get('GEMINI_MODEL', '').strip() or _GEMINI_DEFAULT_MODEL,
+            model=(
+                os.environ.get('GEMINI_MODEL', '').strip() or _GEMINI_DEFAULT_MODEL
+                if name == 'default'
+                else name
+            ),
             client_args={
                 'base_url': _GEMINI_BASE_URL,
                 'api_key': api_key,
@@ -161,17 +173,57 @@ def _gemini_model() -> LLM:
     )
 
 
+def _platform_and_model(name: str) -> tuple[str | None, str]:
+    """清单的 model → (平台, 型号)；没有平台前缀时平台是 None。按**第一个** `:` 切。"""
+    from syndica.kernel import ConfigError
+
+    if _PLATFORM_PREFIX.match(name) is None:
+        return None, name
+    prefix, _, model = name.partition(':')
+    if prefix not in _PLATFORMS:
+        canonical = prefix.strip().lower()
+        fix = (
+            f'改成 {canonical}:{model}'
+            if canonical in _PLATFORMS
+            else (
+                f'它若是带标签的模型名（如 Ollama 的 qwen3:8b），写成 openai:{name}，'
+                f'经 OPENAI_BASE_URL 调用；平台名写错了就改成 {list(_PLATFORMS)} 之一'
+            )
+        )
+        raise ConfigError(
+            expected=f'清单 model 的平台前缀是 {list(_PLATFORMS)} 之一，小写、不带空白',
+            received=f'收到 model={name!r}，前缀是 {prefix!r}',
+            next_action=fix,
+        )
+    if not model.strip():
+        raise ConfigError(
+            expected=f'清单 model 写成 {prefix}:<型号>，型号非空',
+            received=f'收到 model={name!r}',
+            next_action=(
+                f'在冒号后面写上 {prefix} 平台上的型号；用平台的缺省型号就把 model 写成 default'
+            ),
+        )
+    return prefix, model
+
+
 def _configured_model(name: str) -> LLM:
     """角色清单里的模型名 → LLM。
 
     交出去的总是 `ModelRouter`：失败的平台按退避重试，配了多个平台时还会换平台。`default` 由已
-    配置的平台按顺序组成轮换；显式的模型名属于某一家平台，仍按原规则走 OpenRouter（配置了的话）
-    或 `OPENAI_*`，不进轮换。
+    配置的平台按顺序组成轮换；`<平台>:<型号>` 只走那一家；没有平台前缀的模型名仍按原规则走
+    OpenRouter（配置了的话）或 `OPENAI_*`。后两种都不进轮换。
     """
     from syndica.backends.llm_openai import recoverable, retry_after
     from syndica.backends.llm_router import ModelRouter
 
-    if name != 'default':
+    platform, model = _platform_and_model(name)
+    if platform == 'gemini':
+        members = [('gemini', _gemini_model(model))]
+    elif platform == 'openrouter':
+        members = [('openrouter', _openrouter_model(model))]
+    elif platform == 'openai':
+        members = [('openai', _openai_model(model))]
+    elif name != 'default':
         explicit = (
             ('openrouter', _openrouter_model(name))
             if _openrouter_configured()
@@ -180,7 +232,7 @@ def _configured_model(name: str) -> LLM:
         members = [explicit]
     else:
         builders = {
-            'gemini': _gemini_model,
+            'gemini': lambda: _gemini_model('default'),
             'openrouter': lambda: _openrouter_model('default'),
             'openai': lambda: _openai_model('default'),
         }
@@ -205,7 +257,7 @@ def _openrouter_model(name: str) -> LLM:
             if name == 'default'
             else name
         ),
-        source='OPENROUTER_MODEL',
+        source='OPENROUTER_MODEL' if name == 'default' else '清单的 model',
     )
     return OpenAICompatible(
         LLMConfig(
@@ -231,8 +283,8 @@ def _openai_model(name: str) -> LLM:
             '用 Gemini 或 OpenRouter 就改设 GEMINI_API_KEY 或 OPENROUTER_API_KEY'
             if name == 'default'
             else (
-                f'或设置 OPENROUTER_API_KEY 让 {name!r} 走 OpenRouter；Gemini 只服务 model 为 '
-                'default 的角色，要用它就把清单的 model 改回 default、用 GEMINI_MODEL 选型号'
+                f'或设置 OPENROUTER_API_KEY 让 {name!r} 走 OpenRouter；'
+                f'要用 Gemini 就把清单的 model 写成 gemini:{name}'
             )
         )
         raise ConfigError(
@@ -249,7 +301,9 @@ def _openai_model(name: str) -> LLM:
             next_action='设置 OPENAI_MODEL；清单显式 model 字段不使用这个默认值',
         )
     if _is_openrouter_url(base_url):
-        model = _free_openrouter_model(model, source='OPENAI_MODEL')
+        model = _free_openrouter_model(
+            model, source='OPENAI_MODEL' if name == 'default' else '清单的 model'
+        )
     client_args: dict[str, object] = {'base_url': base_url}
     api_key = os.environ.get('OPENAI_API_KEY')
     if api_key:

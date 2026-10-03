@@ -943,7 +943,7 @@ def test_with_no_platform_configured_the_error_offers_every_platform(
     assert 'OPENROUTER_API_KEY' in next_action
 
 
-def test_an_explicit_model_name_is_never_sent_to_gemini_and_the_error_says_so(
+def test_an_unprefixed_model_name_is_never_sent_to_gemini_and_the_error_says_how(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from syndica.__main__ import _configured_model
@@ -957,8 +957,7 @@ def test_an_explicit_model_name_is_never_sent_to_gemini_and_the_error_says_so(
     next_action = caught.value.next_action
     assert 'GEMINI_API_KEY' not in next_action
     assert 'OPENROUTER_API_KEY' in next_action
-    assert 'default' in next_action
-    assert 'GEMINI_MODEL' in next_action
+    assert 'gemini:gemini-3.8-pro' in next_action
 
 
 def test_module_entrypoint_doctor_builds_a_two_platform_ring_without_network(

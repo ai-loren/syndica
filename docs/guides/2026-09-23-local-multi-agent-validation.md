@@ -421,8 +421,9 @@ uv run python -m syndica trace prune --keep 50
 
 - OpenRouter 免费模型每天有额度限制。`free-models-per-day` 429 是外部额度耗尽，不是 Syndica 逻辑
   错误。Gemini 免费档同样按型号限额。
-- 轮换只覆盖清单里 `model` 为 `default` 的角色（内置角色都是）。显式写了模型名的角色只走 OpenRouter
-  或 `OPENAI_*`，一次 run 里也只能用一个 Gemini 型号；「平台 + 型号」的写法归里程碑 4。
+- 轮换只覆盖清单里 `model` 为 `default` 的角色（内置角色都是）。显式写了模型名的角色只走一家：
+  `gemini:<型号>`、`openrouter:<型号>`、`openai:<型号>` 点名平台；不带平台前缀的模型名仍走 OpenRouter（配置了
+  的话）或 `OPENAI_*`。
 - 免费模型质量和工具调用能力不稳定；同一个 prompt 可能有时不触发 Delegate。
 - M1 没有跨进程 session 持久化；`chat` 里的活动 Agent 只存在于当前 CLI 进程。
 - M1 没有 Web UI / HTTP server / SSE server；当前体验入口是 CLI 和 L2 scenario runner。
