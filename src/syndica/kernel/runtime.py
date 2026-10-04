@@ -1476,6 +1476,10 @@ class Runtime:
             raise refusal
         if self._workspace is not None:
             self._workspace.adopt(agent_id, parent_id)
+            router = self._workspace
+            agent._executor._configure_file_trust(  # pyright: ignore[reportPrivateUsage]
+                lambda path: router.file_trust(path, None)
+            )
         if isolation != 'shared':
             assert self._workspace is not None
             # 同步建副本：最后一道守卫与 create_task 之间仍然没有挂起点。

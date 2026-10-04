@@ -137,6 +137,8 @@ from syndica.kernel.danger import (
     RiskLevel,
     _escalated,  # pyright: ignore[reportPrivateUsage]
     disposition_of,
+    executed_scripts,
+    untrusted_script_verdict,
     validate_danger_options,
 )
 from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
@@ -689,6 +691,7 @@ class ToolExecutor:
         self._policy: DangerPolicy = policy if policy is not None else BlockHighRisk()
         self._max_concurrency = max_concurrency
         self._outcome_observers: list[ToolOutcomeObserver] = []
+        self._file_trust: Callable[[str], TrustLevel] | None = None
         self._untrusted_high_risk = Disposition.BLOCK
         self._confirmation_agent_id: str | None = None
         self._confirmation: ConfirmationCallback | None = None
@@ -757,6 +760,30 @@ class ToolExecutor:
             and installer.name in self._untrusted_modules
             for installer in installers
         )
+
+    def _configure_file_trust(self, file_trust: Callable[[str], TrustLevel]) -> None:
+        """工作区里一个文件此刻可信吗（Runtime 交进来的是路由的文件污点）。有了它，执行一个不可信
+        的本地脚本的调用按 `exec.untrusted_script` 判（M5 D11）。"""
+        self._file_trust = file_trust
+
+    def _untrusted_scripts(self, tool: Tool, args: Mapping[str, Any]) -> list[str]:
+        """这次调用会执行的、工作区里不可信的脚本。只看工作区内的相对路径：`/usr/bin/x` 与 `../x`
+        不是工作区的内容，文件污点对它们答不出「可信」，按不可信算就会让每一次写全路径的调用升级。"""
+        if self._file_trust is None:
+            return []
+        declared = cast(object, getattr(tool, '__tool_command_args__', None))
+        names = list(args) if declared is None else list(cast(tuple[str, ...], declared))
+        found: list[str] = []
+        for name in names:
+            value = args.get(name)
+            if not isinstance(value, str):
+                continue
+            for script in executed_scripts(value):
+                if script.startswith('/') or script.split('/')[0] == '..':
+                    continue
+                if self._file_trust(script) is TrustLevel.UNTRUSTED and script not in found:
+                    found.append(script)
+        return found
 
     def _observe_outcomes(self, observer: ToolOutcomeObserver) -> None:
         if not callable(observer):
@@ -1288,6 +1315,13 @@ class ToolExecutor:
             verdict = self._judge.judge(tool, args)
         except Exception as exc:
             raise _JudgeFailure(exc) from exc
+        scripts = self._untrusted_scripts(tool, args)
+        if scripts:
+            # 执行的脚本就是这次调用的输入：它不可信，这次调用就可溯源到不可信内容，HIGH 时走强制
+            # 升级（宿主策略说了 AllowAll 也一样）。
+            provenance = TrustLevel.UNTRUSTED
+            if verdict.level is not RiskLevel.HIGH:
+                verdict = untrusted_script_verdict(scripts)
         request_for_policy = DangerRequest(verdict=verdict, call=call, provenance=provenance)
         disposition = disposition_of(
             self._policy,

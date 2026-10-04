@@ -88,6 +88,7 @@ RULE_PARAMETERS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         'shell.privilege_escalation': frozenset(),
         'shell.remote_script_execution': frozenset(),
+        'shell.download_then_execute': frozenset(),
         'shell.recursive_force_remove': frozenset(),
         'shell.raw_device_write': frozenset(),
         'shell.git_state_change': frozenset(),

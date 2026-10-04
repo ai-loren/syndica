@@ -356,6 +356,7 @@ def test_the_depth_limit_is_checked_by_every_rule_family():
     assert [rule.rule_id for rule in _EVERY_RULE] == [
         'shell.privilege_escalation',
         'shell.remote_script_execution',
+        'shell.download_then_execute',
         'shell.recursive_force_remove',
         'shell.raw_device_write',
         'shell.git_state_change',

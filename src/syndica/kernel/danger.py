@@ -1810,6 +1810,112 @@ def _writes_a_raw_device(command: str) -> bool:
     return False
 
 
+def executed_scripts(command: str) -> tuple[str, ...]:
+    """这条命令会当脚本执行的本地文件，规范化之后按出现顺序去重：解释器读的脚本文件、`source` /
+    `.` 的操作数、写成路径的程序词（`./run.sh`、`bin/x`）。程序词本身是解释器时只算它读的脚本
+    （`/usr/bin/python3 x.py` 是 `x.py`）。
+
+    给溯源用（M5 D11）：认不出的不列——变量、命令替换、通配、认不出选项的解释器。漏掉的那部分由
+    一个 Agent 之内的窗口上界兜着，这里多列一个就是多一次升级。
+    """
+    found: dict[str, None] = {}
+    segments, _ = _parse(command)
+    for _, tokens in segments:
+        for index in _program_candidates(tokens):
+            word = tokens[index]
+            name = _basename(word)
+            script: str | None = None
+            if name in ('.', 'source'):
+                script = _first_operand(tokens, index + 1)
+            elif (interpreter := _interpreter(word)) is not None:
+                kind, operand = _script_source(interpreter, tokens[index + 1 :])
+                script = operand if kind == 'file' and not _is_stdin_file(operand) else None
+            elif '/' in word:
+                script = word
+            if script and _is_literal(script):
+                found[posixpath.normpath(script)] = None
+    return tuple(found)
+
+
+def _is_literal(word: str) -> bool:
+    return not any(
+        mark in word for mark in ('$', '`', '*', '?', '[', _DOWNLOADED, _DOWNLOADED_FILE)
+    )
+
+
+def _download_outputs(name: str, arguments: Sequence[str]) -> set[str]:
+    """下载器把内容写进的文件：显式的输出选项，或者（`curl -O`、不带 `-O` 的 wget / aria2c）URL
+    的最后一段。认不出的形状不列。"""
+    short, long = ('O', ('output-document',)) if name == 'wget' else ('o', ('output', 'out'))
+    outputs: set[str] = set()
+    remote_name = name in ('wget', 'aria2c')
+    urls = [argument for argument in arguments if '://' in argument]
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
+        index += 1
+        if word.startswith('--'):
+            option, attached, value = word[2:].partition('=')
+            if option in long:
+                if attached:
+                    outputs.add(value)
+                elif index < len(arguments):
+                    outputs.add(arguments[index])
+                    index += 1
+                remote_name = False
+            elif option == 'remote-name':
+                remote_name = True
+            continue
+        if word.startswith('-') and len(word) > 1:
+            cluster = word[1:]
+            if name == 'curl' and 'O' in cluster:
+                remote_name = True
+            if short in cluster:
+                rest = cluster[cluster.index(short) + 1 :]
+                if rest:
+                    outputs.add(rest)
+                elif index < len(arguments):
+                    outputs.add(arguments[index])
+                    index += 1
+                remote_name = False
+    if remote_name:
+        for url in urls:
+            last = url.split('://', 1)[1].split('?', 1)[0].rstrip('/').rpartition('/')[2]
+            outputs.add(last or 'index.html')
+    return {posixpath.normpath(output) for output in outputs if output and _is_literal(output)}
+
+
+def _downloads_then_executes(command: str) -> bool:
+    """同一条命令里先把下载写进一个文件、再把这个文件当脚本执行（`curl -o f …; sh f`）。命令里有
+    下载器时，每个重定向的目标都按「可能装着下载来的内容」算——目标不挂在段上，分不出是谁写的。"""
+    segments, targets = _parse(command)
+    if _too_deep(segments):
+        return True
+    downloaded: set[str] = set()
+    for _, tokens in segments:
+        for index in _program_candidates(tokens):
+            name = _basename(tokens[index])
+            if name in _DOWNLOADERS:
+                downloaded |= _download_outputs(name, tokens[index + 1 :])
+                downloaded |= {
+                    posixpath.normpath(target) for target in targets if _is_literal(target)
+                }
+    return bool(downloaded) and any(script in downloaded for script in executed_scripts(command))
+
+
+def untrusted_script_verdict(scripts: Sequence[str]) -> DangerVerdict:
+    """`exec.untrusted_script`：这次调用执行的本地脚本不可信——命令写的、外部改的，或读过不可信
+    内容之后写的（M5 D11）。由执行器按文件污点组合出来：判定本身不读文件，这条也只拿结论当输入。"""
+    return DangerVerdict(
+        rule_id='exec.untrusted_script',
+        level=RiskLevel.HIGH,
+        reason=(
+            f'这次调用执行的脚本 {", ".join(scripts)} 不可信（命令写的、外部改的，或读过不可信'
+            '内容之后写的），执行它等于执行一份没人看过的代码'
+        ),
+    )
+
+
 DEFAULT_RULES: tuple[DangerRule, ...] = (
     DangerRule(
         rule_id='shell.privilege_escalation',
@@ -1822,6 +1928,12 @@ DEFAULT_RULES: tuple[DangerRule, ...] = (
         level=RiskLevel.HIGH,
         reason='这次调用把网络下载的内容直接交给解释器执行，执行前没有任何人看过它的内容',
         matches=_runs_downloaded_content,
+    ),
+    DangerRule(
+        rule_id='shell.download_then_execute',
+        level=RiskLevel.HIGH,
+        reason='这次调用先把网络下载的内容写进文件，再在同一条命令里执行它，执行前没有任何人看过',
+        matches=_downloads_then_executes,
     ),
     DangerRule(
         rule_id='shell.recursive_force_remove',

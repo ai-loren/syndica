@@ -99,7 +99,7 @@ deferred items」。
 | B-05 | 异常链不过 copy / pickle | 接受 | 与标准库行为一致 |
 | B-06 | `ConfigError` 被借来表达调用方误用 | M12 | v1.0 冻结公开 API 时统一错误分类 |
 | B-07 | 关联 ID 是扁平命名空间 | 接受 | 已裁决不加前缀，理由在 `wait_for` docstring |
-| B-08 | 危险规则不认经中间工具执行、落盘后再执行 | M5 T9 | 与安全矩阵、溯源链同期 |
+| B-08 | 危险规则不认经中间工具执行、落盘后再执行 | 已修 | M5 T9：同一条命令里下载到文件再执行它的是 `shell.download_then_execute`；跨调用执行工作区里不可信的脚本按 `exec.untrusted_script` 判（文件污点 × `executed_scripts`），走强制升级 |
 | B-09 | 未声明 `__tool_command_args__` 的非文本参数被静默跳过 | 已修 | M4 D7：Module 的工具与类式角色自己装的工具必须在自己的类上声明，登记表已关闭 |
 | B-10 | 未声明工具的文本参数被散文误报 | 已修 | 同 B-09 |
 | B-11 | `DangerRequest` 不可哈希 | 接受 | 同 B-04 |
