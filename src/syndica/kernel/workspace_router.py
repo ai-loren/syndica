@@ -12,11 +12,14 @@ import logging
 import posixpath
 from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Protocol, cast
 
+from syndica.kernel.context import TrustLevel, call_trust, strictest_trust
 from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.file_taint import FileTaint
 from syndica.kernel.isolation import ISOLATIONS, IsolatedCopy, LocalIsolator, MergeReport
+from syndica.kernel.tracing import current_span_id
 from syndica.kernel.versions import VersionStore
 from syndica.kernel.workspace import (
     ANY,
@@ -55,6 +58,7 @@ class WorkspaceRouter:
         *,
         versions: VersionStore | None = None,
         isolator: LocalIsolator | None = None,
+        taint: FileTaint | None = None,
     ) -> None:
         self._root = root
         self._assigned: dict[str, Workspace] = {}
@@ -62,6 +66,51 @@ class WorkspaceRouter:
         self._versions = versions
         self._isolator = isolator
         self._copies: dict[str, IsolatedCopy] = {}
+        self._taint = taint
+        self._copy_taints: dict[str, FileTaint] = {}
+        # （工作区, 路径, 版本）→ 写下它的那次工具调用的 span：读到它时连一条 artifact 边。
+        self._writers: dict[tuple[int, str, str], str] = {}
+        self._tracing: _ArtifactTracing | None = None
+
+    def _attach_tracing(self, tracing: _ArtifactTracing) -> None:
+        self._tracing = tracing
+
+    def file_trust(self, path: str, version: str | None) -> TrustLevel:
+        """此刻在驱动的 Agent 的工作区里，`path` 内容是 `version`（None 时按此刻的内容）可信吗。
+        没有文件污点时一律可信（与没有路由时相同）。"""
+        taint = self._taint_of(self._target())
+        return TrustLevel.TRUSTED if taint is None else taint.trust_of(path, version)
+
+    def _taint_of(self, workspace: Workspace) -> FileTaint | None:
+        if workspace is self._root:
+            return self._taint
+        for agent_id, copy in self._copies.items():
+            if copy.workspace is workspace:
+                return self._copy_taints.get(agent_id)
+        return None
+
+    def _wrote(self, workspace: Workspace, path: str, version: str) -> None:
+        """一次经路由的写落了：版本记成这次调用的溯源结论（宿主代码写的按可信），并记下写它的
+        span。"""
+        relative = self._key(workspace, path)[1]
+        taint = self._taint_of(workspace)
+        if taint is not None:
+            taint.wrote(relative, version, call_trust() or TrustLevel.TRUSTED)
+        span = current_span_id()
+        if span is not None:
+            self._writers[(id(workspace), relative, version)] = span
+
+    def _read(self, workspace: Workspace, path: str, version: str) -> None:
+        if self._tracing is None:
+            return
+        relative = self._key(workspace, path)[1]
+        taint = self._taint_of(workspace)
+        trust = TrustLevel.TRUSTED if taint is None else taint.trust_of(relative, version)
+        writer = self._writers.get((id(workspace), relative, version))
+        if writer is not None:
+            self._tracing.artifact(writer, relative, version, trust.value)
+        elif taint is not None:
+            self._tracing.provenance(taint.source_of(relative, version), trust.value)
 
     @property
     def can_isolate(self) -> bool:
@@ -95,6 +144,12 @@ class WorkspaceRouter:
         copy = self._isolator.isolate(Path(self._root.root), agent_id, isolation)
         self._copies[agent_id] = copy
         self._assigned[agent_id] = copy.workspace
+        if self._taint is not None:
+            # 副本里的每个文件带着父那边此刻的可信度：从副本读到一份不可信的文件，仍是不可信的。
+            copied = FileTaint(copy.location, baseline=False)
+            for path, version in copy.base.items():
+                copied.wrote(path, version, self._taint.trust_of(path, version))
+            self._copy_taints[agent_id] = copied
         return copy
 
     def isolated(self, agent_id: str) -> IsolatedCopy | None:
@@ -110,11 +165,23 @@ class WorkspaceRouter:
                 received='它没有（没隔离过，或已经合并、丢弃）',
                 next_action='只对用 isolation=worktree / snapshot 起来、还没合并的 Agent 合并',
             )
-        report = await self._isolator.merge(
-            copy,
-            self._root.portal(),
-            lambda path, data: self._record(self._root, path, data, producer=agent_id),
+        copied = self._copy_taints.get(agent_id)
+        before = (
+            {}
+            if self._taint is None
+            else {path: self._taint.trust_of(path, None) for path in copy.changed()}
         )
+
+        def written(target: str, data: bytes | None, source: str, mixed: bool) -> None:
+            self._record(self._root, target, data, producer=agent_id)
+            if data is None or self._taint is None:
+                return
+            trust = TrustLevel.UNTRUSTED if copied is None else copied.trust_of(source, None)
+            if mixed:
+                trust = strictest_trust(trust, before.get(source, TrustLevel.UNTRUSTED))
+            self._taint.wrote(target, _version(data), trust)
+
+        report = await self._isolator.merge(copy, self._root.portal(), written)
         await self._drop_copy(agent_id, unmerged_ok=True)
         return report
 
@@ -131,8 +198,12 @@ class WorkspaceRouter:
     async def _drop_copy(self, agent_id: str, *, unmerged_ok: bool) -> None:
         copy = self._copies.pop(agent_id, None)
         self._assigned.pop(agent_id, None)
+        self._copy_taints.pop(agent_id, None)
         if copy is None:
             return
+        self._writers = {
+            key: span for key, span in self._writers.items() if key[0] != id(copy.workspace)
+        }
         if not unmerged_ok:
             lost = copy.changed()
             if lost:
@@ -163,9 +234,13 @@ class WorkspaceRouter:
                 next_action='构造路由时传入 versions，或在 .syndica.yaml 里打开 workspace.versions',
             )
         data = self._versions.content(path, version)
+        trust = TrustLevel.TRUSTED if self._taint is None else self._taint.trust_of(path, version)
         written = await self._root.portal().write_bytes(path, data)
         self._seen[self._key(self._root, path)] = written
         self._record(self._root, path, data)
+        if self._taint is not None:
+            # 回滚写回的内容可信与否取决于那个版本当初是怎么来的，不取决于谁调了 restore。
+            self._taint.wrote(path, written, trust)
         return written
 
     def _record(
@@ -231,6 +306,7 @@ class WorkspaceRouter:
         version = _version(data)
         self._seen[key] = version
         self._record(workspace, path, data)
+        self._wrote(workspace, path, version)
         return version
 
     async def read_text(self, path: str, *, offset: int, limit: int) -> str:
@@ -250,6 +326,7 @@ class WorkspaceRouter:
             self._seen[key] = None if current is None else current.version
             raise
         self._seen[key] = version
+        self._read(workspace, path, version)
         return text, version
 
     async def read_bytes(self, path: str) -> bytes:
@@ -294,6 +371,7 @@ class WorkspaceRouter:
         # 撞上别人紧接着的写）；算出来的与后端交回的版本对不上，就说明改的不是这一份，不记。
         text = data.decode('utf-8', errors='surrogateescape')
         edited = text.replace(old, new, 1).encode('utf-8', errors='surrogateescape')
+        self._wrote(workspace, path, version)
         if _version(edited) == version:
             self._record(workspace, path, edited)
         elif self._versions is not None and workspace is self._root:
@@ -362,3 +440,12 @@ class WorkspaceRouter:
         for copy in list(self._copies.values()):
             await copy.workspace.close()
         await self._root.portal().close()
+
+
+class _ArtifactTracing(Protocol):
+    """Runtime 的插桩里路由用到的那两样：读到工具写下的版本连一条边，读到基线或外部的版本在读的
+    span 上标出处。"""
+
+    def artifact(self, writer: str, path: str, version: str, trust: str) -> None: ...
+
+    def provenance(self, source: str, trust: str) -> None: ...

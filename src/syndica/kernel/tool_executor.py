@@ -115,6 +115,7 @@ from types import MappingProxyType
 from typing import Any, cast
 
 from syndica.kernel.context import (
+    _CALL_TRUST,  # pyright: ignore[reportPrivateUsage]
     Context,
     ContextBlock,
     ToolCall,
@@ -1129,6 +1130,9 @@ class ToolExecutor:
             # 掉静态类型，下面的 isinstance 就成了 pyright 眼里的死代码。
             outcome = 'ok'
             owner = self._tool_owners.get(call.name)
+            trust_token = _CALL_TRUST.set(
+                TrustLevel.UNTRUSTED if call.name in self._untrusted_tools else provenance
+            )
             try:
                 with acting_as(None if owner is None else Installer('module', owner)):
                     returned = cast(object, await tool.execute(**args))
@@ -1147,6 +1151,8 @@ class ToolExecutor:
                     returned = self._floored(call, returned)
                 if traced is not None and isinstance(returned, ToolResult):
                     self._tracing.tool_result(traced[1], returned, None, arguments=args)
+            finally:
+                _CALL_TRUST.reset(trust_token)
             if not isinstance(returned, ToolResult):
                 raise _bad_tool_return(call, tool, returned)
             result = returned

@@ -10,12 +10,13 @@ from __future__ import annotations
 import math
 import posixpath
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import cast
 
 from syndica.kernel.context import ArtifactRef, TrustLevel
 from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.file_taint import TaintAware
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.workspace import ExecResult, Portal, WriteConflict
 
@@ -75,6 +76,16 @@ def _artifact(path: str, version: str) -> ArtifactRef:
         version=version,
         producer=driving_agent() or 'host',
     )
+
+
+def _files_trust(portal: Portal, paths: Iterable[str]) -> TrustLevel:
+    """列出来的这些文件里最严的那个（文件名也是数据：不可信的写入建出来的文件，名字同样不可信）。"""
+    if not isinstance(portal, TaintAware):
+        return TrustLevel.TRUSTED
+    for path in dict.fromkeys(paths):
+        if portal.file_trust(path, None) is TrustLevel.UNTRUSTED:
+            return TrustLevel.UNTRUSTED
+    return TrustLevel.TRUSTED
 
 
 def _conflicted(conflict: WriteConflict) -> ToolResult:
@@ -240,10 +251,15 @@ class Read(Tool):
         limit: 最多返回的行数，默认 2000
         """
         try:
-            text = await self._portal.read_text(path, offset=offset, limit=limit)
+            text, version = await self._portal.read_versioned(path, offset=offset, limit=limit)
         except ConfigError as exc:
             return _told(exc)
-        return ToolResult(output=text)
+        trust = (
+            self._portal.file_trust(path, version)
+            if isinstance(self._portal, TaintAware)
+            else TrustLevel.TRUSTED
+        )
+        return ToolResult(output=text, trust=trust)
 
 
 class Write(Tool):
@@ -320,7 +336,10 @@ class Glob(Tool):
             paths = await self._portal.glob_paths(pattern)
         except ConfigError as exc:
             return _told(exc)
-        return ToolResult(output=_listed(paths, self._output_limit, '缩小 pattern 再找。'))
+        return ToolResult(
+            output=_listed(paths, self._output_limit, '缩小 pattern 再找。'),
+            trust=_files_trust(self._portal, paths),
+        )
 
 
 class Grep(Tool):
@@ -344,7 +363,10 @@ class Grep(Tool):
             hits = await self._portal.grep_text(pattern, path)
         except ConfigError as exc:
             return _told(exc)
-        return ToolResult(output=_listed(hits, self._output_limit, '缩小 pattern 或 path 再搜。'))
+        return ToolResult(
+            output=_listed(hits, self._output_limit, '缩小 pattern 或 path 再搜。'),
+            trust=_files_trust(self._portal, (hit.split(':', 1)[0] for hit in hits)),
+        )
 
 
 class Bash(Tool):

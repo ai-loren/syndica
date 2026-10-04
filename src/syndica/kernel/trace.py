@@ -44,7 +44,7 @@ __all__ = [
     'verbatim_attribute',
 ]
 
-TRACE_SCHEMA = 'syndica.trace/2'
+TRACE_SCHEMA = 'syndica.trace/3'
 _SCHEMA_VERSION = re.compile(r'syndica\.trace/([1-9][0-9]{0,8})')
 
 
@@ -57,7 +57,8 @@ def readable_schema(schema: object) -> None:
     `ContractViolation`。读 trace 的一方在读任何别的字段之前先问它：新版本的头可能连字段都不一样。
 
     更旧的版本照样读：闭集只增不减，旧 trace 里的每个字段新读者都认得（`/2` 加了 Module 的 span
-    属性与扩展切点事件）。按相等判的话，升一次版本就让此前的每一个 trace 报「删掉它」。
+    属性与扩展切点事件，`/3` 加了产物边的属性与读到的文件的出处）。按相等判的话，升一次版本就让
+    此前的每一个 trace 报「删掉它」。
     """
     if schema == TRACE_SCHEMA:
         return
@@ -170,6 +171,11 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'module.plugins': 'str[]',
         'module.flags': 'str[]',
         'junction.name': 'str',
+        'artifact.path': 'str',
+        'artifact.version': 'str',
+        'artifact.trust': 'str',
+        'provenance.source': 'str',
+        'provenance.trust': 'str',
     }
 )
 
@@ -207,6 +213,9 @@ ATTRIBUTE_DOMAINS: Mapping[str, frozenset[str]] = MappingProxyType(
         ),
         'wait.kind': frozenset({'agent', 'human'}),
         'wait.outcome': frozenset({'answered', 'timeout', 'preempted', 'aborted'}),
+        'artifact.trust': frozenset({'trusted', 'untrusted'}),
+        'provenance.source': frozenset({'baseline', 'tool', 'external'}),
+        'provenance.trust': frozenset({'trusted', 'untrusted'}),
     }
 )
 
@@ -214,7 +223,14 @@ ATTRIBUTE_DOMAINS: Mapping[str, frozenset[str]] = MappingProxyType(
 # 取值一起原样记、原样导出：脱敏规则（尤其是用户规则）可能认得一段十六进制或一个词，id 与引用
 # 换成占位符就断了，闭集取值换成占位符则整个 span 校验不过、写不出去。
 _IDENTIFIER_ATTRIBUTES = frozenset(
-    {'agent.id', 'child.agent_id', 'message.id', 'message.to', 'llm.request_digest'}
+    {
+        'agent.id',
+        'child.agent_id',
+        'message.id',
+        'message.to',
+        'llm.request_digest',
+        'artifact.version',
+    }
 )
 
 
@@ -410,8 +426,9 @@ class Span:
 
 @dataclass(frozen=True)
 class CausalityEdge:
-    """两个 span 之间的因果：派生（`spawn` 里发出，带 `child.agent_id`）或消息（发送时的
-    span → 接收方消费它的那一轮，带 `message.id`）。"""
+    """两个 span 之间的因果：派生（`spawn` 里发出，带 `child.agent_id`）、消息（发送时的
+    span → 接收方消费它的那一轮，带 `message.id`）或产物（写下一个文件版本的工具调用 → 读到它的
+    工具调用，带 `artifact.path` / `artifact.version` / `artifact.trust`）。"""
 
     kind: EdgeKind
     source_span_id: str

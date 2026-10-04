@@ -37,6 +37,8 @@ _MAX_FILES = 5000
 _MAX_BYTES = 200 * 1024 * 1024
 _MERGE_TIMEOUT = 30.0
 
+Written = Callable[[str, bytes | None, str, bool], None]
+
 
 @dataclass(frozen=True)
 class MergeConflict:
@@ -193,11 +195,11 @@ class LocalIsolator:
         self,
         copy: IsolatedCopy,
         parent: Portal,
-        written: Callable[[str, bytes | None], None],
+        written: Written,
     ) -> MergeReport:
         """把 `copy` 相对基线的改动逐文件写回 `parent`。每次写回都带着读到的父版本做前提：合并期间
-        父那边又被改过，这个文件就算冲突，不覆盖。`written(path, data)` 在每次写回之后调（删除时
-        `data` 是 None）。"""
+        父那边又被改过，这个文件就算冲突，不覆盖。每次写回之后调 `written(写到哪, 内容, 出自副本里
+        的哪个文件, 是否混了父的内容)`；删除时内容是 None。"""
         now = _versions_under(copy.location)
         merged: list[str] = []
         conflicts: list[MergeConflict] = []
@@ -241,15 +243,15 @@ class LocalIsolator:
         path: str,
         child: str | None,
         ours: str | None,
-        written: Callable[[str, bytes | None], None],
+        written: Written,
     ) -> None:
         if child is None:
             await parent.remove(path, expected=ours)
-            written(path, None)
+            written(path, None, path, False)
             return
         data = (copy.location / path).read_bytes()
         await parent.write_bytes(path, data, expected=ours)
-        written(path, data)
+        written(path, data, path, False)
 
     async def _both_changed(
         self,
@@ -259,7 +261,7 @@ class LocalIsolator:
         base: str | None,
         child: str | None,
         ours: str | None,
-        written: Callable[[str, bytes | None], None],
+        written: Written,
     ) -> str | None:
         """两边都改过时尝试三方合并，合成了交回 None，否则交回冲突的原因。"""
         if base is None or child is None or ours is None:
@@ -274,7 +276,7 @@ class LocalIsolator:
         if result is None:
             return '两边改了同一处，三方合并合不干净'
         await parent.write_bytes(path, result, expected=ours)
-        written(path, result)
+        written(path, result, path, True)
         return None
 
     async def _kept(
@@ -284,7 +286,7 @@ class LocalIsolator:
         path: str,
         child: str | None,
         reason: str,
-        written: Callable[[str, bytes | None], None],
+        written: Written,
     ) -> MergeConflict:
         if child is None:
             return MergeConflict(path=path, reason=f'{reason}；子 Agent 删掉了它')
@@ -294,7 +296,7 @@ class LocalIsolator:
             await parent.write_bytes(side, data, expected=None)
         except WriteConflict:
             return MergeConflict(path=path, reason=f'{reason}；{side} 已存在，没有另存')
-        written(side, data)
+        written(side, data, path, False)
         return MergeConflict(path=path, reason=reason, theirs=side)
 
     async def _merge_file(self, base: bytes, ours: bytes, theirs: bytes) -> bytes | None:

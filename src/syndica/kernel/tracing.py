@@ -415,6 +415,30 @@ class _Tracing:
         )
         self.call('add_edge', lambda tracer: tracer.add_edge(edge))
 
+    def artifact(self, writer: str, path: str, version: str, trust: str) -> None:
+        """产物边：写下这个文件版本的那次工具调用的 span → 此刻读到它的 span（M5 D13）。"""
+        target = self._current()
+        if target is None or target.span_id == writer:
+            return
+        edge = CausalityEdge(
+            kind=EdgeKind.ARTIFACT,
+            source_span_id=writer,
+            target_span_id=target.span_id,
+            attributes={
+                'artifact.path': path,
+                'artifact.version': version,
+                'artifact.trust': trust,
+            },
+        )
+        self.call('add_edge', lambda tracer: tracer.add_edge(edge))
+
+    def provenance(self, source: str, trust: str) -> None:
+        """读到的版本不是这次 run 里哪次工具调用写的（基线或外部改的）：标在读它的 span 上。"""
+        span = self._current()
+        if span is None or span.ended:
+            return
+        span.attributes.update({'provenance.source': source, 'provenance.trust': trust})
+
     def sending(self, message_id: str, receiver: str) -> None:
         """记下这条消息从哪个 span 发出。在投递之前记：会挂起的 broker 下，收件人可能在 publish
         返回之前就已经消费了它。"""

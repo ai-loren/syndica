@@ -1005,6 +1005,8 @@ class Runtime:
         # 插桩（M3 D2）：交给这里管的每个 Agent 与执行器。不在工具调用、也没有属主时发起的等待按
         # 宿主的第几次取 span 的结构键。
         self._tracing = _Tracing(checked_tracer)
+        if self._workspace is not None:
+            self._workspace._attach_tracing(self._tracing)  # pyright: ignore[reportPrivateUsage]
         self._host_waits = 0
         module_assembly = _RuntimeModuleAssembly(modules, flags)
         # 第三方 Module 的输出一律当作不可信（spec §12.2 对第三方 Skill 的同一条处理）：它们的工具

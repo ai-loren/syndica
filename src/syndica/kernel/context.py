@@ -107,6 +107,16 @@ class Context:
         self._blocks.append(block)
 
 
+# 此刻在跑的这次工具调用的溯源结论（执行器在 `tool.execute` 期间设）。工具写下的文件版本记成它：
+# 读过不可信内容之后写的文件，此后被读到时仍是不可信的（spec §12.2 第 2 条）。不在工具调用里是
+# None。
+_CALL_TRUST: ContextVar[TrustLevel | None] = ContextVar('syndica_call_trust', default=None)
+
+
+def call_trust() -> TrustLevel | None:
+    return _CALL_TRUST.get()
+
+
 # 此刻所在的窗口：（哪份轨迹，哪个窗口）。窗口里跑的代码与它起的任务（任务建在窗口里，继承这份值）
 # 不许往那份轨迹里追加。放在 contextvar 里而不是 Context 上：别的任务开的窗口不该冻结 Agent 自己的
 # 循环，轨迹的拷贝也不该带着一个早已结束的窗口。

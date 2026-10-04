@@ -69,6 +69,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'ExitMode',
     'ExtensionJunction',
     'FileStat',
+    'FileTaint',
     'FileTraceStore',
     'Finding',
     'FlagDeclaration',
@@ -361,6 +362,7 @@ _PROMISED_VIA_SUBMODULE: dict[str, tuple[str, ...]] = {
     'syndica.kernel.trace': ('ATTRIBUTE_DOMAINS', 'ATTRIBUTE_KINDS', 'TRACE_SCHEMA'),
     'syndica.kernel.workspace': ('ANY', 'Expected'),
     'syndica.kernel.isolation': ('IsolatedCopy',),
+    'syndica.kernel.file_taint': ('TaintAware',),
     'syndica.kernel.scenario_schema': (
         'DangerPolicySpec',
         'DangerRuleSpec',
@@ -443,6 +445,7 @@ _WITHHELD: tuple[str, ...] = (
     'SendMessage',
     'SkippedCall',
     'TRACE_SCHEMA',
+    'TaintAware',
     'Terminal',
     'Text',
     'ToolCallKey',

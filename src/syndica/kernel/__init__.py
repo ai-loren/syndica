@@ -53,6 +53,7 @@ from syndica.kernel.errors import (
     ToolFatalError,
 )
 from syndica.kernel.events import Event, EventBus, Subscription
+from syndica.kernel.file_taint import FileTaint
 from syndica.kernel.hooks import (
     ExtensionJunction,
     HookCallback,
@@ -196,6 +197,7 @@ __all__ = [
     'ExitMode',
     'ExtensionJunction',
     'FileStat',
+    'FileTaint',
     'FileTraceStore',
     'Finding',
     'FlagDeclaration',

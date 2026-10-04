@@ -116,7 +116,7 @@ def test_the_enum_values_are_the_schema():
         'REPLAY': 'replay',
         'FULL': 'full',
     }
-    assert TRACE_SCHEMA == 'syndica.trace/2'
+    assert TRACE_SCHEMA == 'syndica.trace/3'
 
 
 def test_the_attribute_set_is_exactly_the_schema():
@@ -164,6 +164,11 @@ def test_the_attribute_set_is_exactly_the_schema():
         'module.plugins': 'str[]',
         'module.flags': 'str[]',
         'junction.name': 'str',
+        'artifact.path': 'str',
+        'artifact.version': 'str',
+        'artifact.trust': 'str',
+        'provenance.source': 'str',
+        'provenance.trust': 'str',
     }
 
 
@@ -175,6 +180,9 @@ def test_the_attributes_with_a_fixed_set_of_values_follow_the_kernel_enums():
     assert ATTRIBUTE_DOMAINS['wait.outcome'] == {member.value for member in WaitState}
     assert ATTRIBUTE_DOMAINS['danger.risk'] == {member.value for member in RiskLevel}
     assert ATTRIBUTE_DOMAINS['danger.provenance'] == {member.value for member in TrustLevel}
+    assert ATTRIBUTE_DOMAINS['artifact.trust'] == {member.value for member in TrustLevel}
+    assert ATTRIBUTE_DOMAINS['provenance.trust'] == {member.value for member in TrustLevel}
+    assert ATTRIBUTE_DOMAINS['provenance.source'] == {'baseline', 'tool', 'external'}
     assert ATTRIBUTE_DOMAINS['danger.disposition'] == {member.value for member in Disposition}
     assert ATTRIBUTE_DOMAINS['wait.kind'] == {'agent', 'human'}
     assert ATTRIBUTE_DOMAINS['danger.decided_by'] == {'flag', 'policy'}
@@ -426,7 +434,7 @@ def test_a_malformed_header_is_refused(changes: dict[str, Any]):
         _header(**changes)
 
 
-@pytest.mark.parametrize('schema', ['syndica.trace/3', 'syndica.trace/10'])
+@pytest.mark.parametrize('schema', ['syndica.trace/4', 'syndica.trace/10'])
 def test_a_header_from_a_newer_version_says_so_and_that_it_is_not_broken(schema: str):
     with pytest.raises(NewerTraceSchema) as caught:
         _header(schema=schema)
