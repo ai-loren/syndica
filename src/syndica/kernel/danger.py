@@ -2125,6 +2125,8 @@ _GIT_FLAGS = frozenset(
 )
 _GIT_ASSIGNMENT = re.compile(r'\AGIT_[A-Za-z0-9_]*\+?=')
 _GLOB = frozenset('*?[')
+# `.syndica` 下由宿主写、Agent 不该改的那几个子目录：版本层、trace、交接文件、两种隔离副本。
+_HOST_RECORDS = ('vcs', 'traces', 'handoffs', 'worktrees', 'snapshots')
 
 
 def _opens_files_with_a_command(arguments: Sequence[str]) -> bool:
@@ -2165,22 +2167,34 @@ def _git_changes_state(tokens: Sequence[str], index: int) -> bool:
 
 
 def _names_git_dir(path: str) -> bool:
-    """路径的某一段是 `.git`（不分大小写），或是一个会展开出 `.git` 的通配段（`.git*`、`.*`）。
+    """路径的某一段是 `.git`，或是 `.syndica` 本身、或它下面宿主的记录（`_HOST_RECORDS`：版本层、
+    trace、交接文件、隔离副本）。不分大小写；会展开出它们的通配段同样算（`.git*`、`.*`、
+    `.syndica/v*`）。
 
-    通配段只在以 `.` 或 `[` 开头时才可能匹配 `.git`：shell 的 `*` 不匹配开头的点，`rm -rf *`
-    碰不到 `.git`。
+    以点开头的名字只在通配段以 `.` 或 `[` 开头时才可能被匹配：shell 的 `*` 不匹配开头的点，
+    `rm -rf *` 碰不到 `.git`。`.syndica` 下的其余子目录（`.syndica/tmp`）不算，它们留给命令用；
+    判 `.syndica` 之前先按字面消掉 `..`，`.syndica/tmp/../vcs` 照样命中。
     """
-    for part in path.split('/'):
-        folded = part.casefold()
-        if folded == '.git':
-            return True
-        if (
-            folded[:1] in ('.', '[')
-            and not _GLOB.isdisjoint(folded)
-            and fnmatch.fnmatchcase('.git', folded)
-        ):
+    if any(_may_name(part.casefold(), '.git') for part in path.split('/')):
+        return True
+    parts = posixpath.normpath(path).split('/')
+    for index, part in enumerate(parts):
+        if not _may_name(part.casefold(), '.syndica'):
+            continue
+        rest = parts[index + 1 :]
+        if not rest or any(_may_name(rest[0].casefold(), name) for name in _HOST_RECORDS):
             return True
     return False
+
+
+def _may_name(folded: str, name: str) -> bool:
+    if folded == name:
+        return True
+    if _GLOB.isdisjoint(folded):
+        return False
+    if name.startswith('.') and folded[:1] not in ('.', '['):
+        return False
+    return fnmatch.fnmatchcase(name, folded)
 
 
 def _changes_git_state(command: str) -> bool:
@@ -2628,8 +2642,10 @@ def git_state_change_rule() -> DangerRule:
     命中：git 的子命令不在只读集合里（`git-push` 这类带连字符的可执行文件同样按子命令算）；
     `-c`、`--config-env`、`--exec-path`、`--git-dir`、`--work-tree`、`--bare` 与认不出的全局选项；
     `grep` 用 `-O` / `--open-files-in-pager` 执行命令；`GIT_` 开头的环境赋值（任何位置，`export`
-    也算）；任何实参、`=` 之后的值、紧贴短选项的取值（`-o.git/x`）或重定向目标里有一段是 `.git`
-    （不分大小写，含会展开出它的通配）。git 按命令词槽与启动器展开出来的程序找（`setsid git push`、
+    也算）；任何实参、`=` 之后的值、紧贴短选项的取值（`-o.git/x`）或重定向目标里有一段是 `.git`，
+    或指向 `.syndica` 本身与它下面宿主的记录（版本层 `vcs`、`traces`、`handoffs`、`worktrees`、
+    `snapshots`）——版本层是 git 格式，另外几样是宿主的记录与隔离副本（不分大小写，含会展开出
+    它们的通配；`.syndica/tmp` 不算）。git 按命令词槽与启动器展开出来的程序找（`setsid git push`、
     `uv run --with rich git push`、`{ git push; }`、双引号里的 `$(git push)`），转手执行的命令里
     同样找（`sh -c 'git push'`、`eval`、`xargs git add`、`find … -exec git add {} +`）。
 
@@ -2645,8 +2661,8 @@ def git_state_change_rule() -> DangerRule:
         rule_id='shell.git_state_change',
         level=RiskLevel.HIGH,
         reason=(
-            '这次调用会改变 git 状态（提交、推送、改引用或配置、写 .git/，或换一份 git 配置执行）；'
-            '提交与推送由宿主在复核之后执行'
+            '这次调用会改变 git 状态或宿主的记录（提交、推送、改引用或配置、写 .git/ 或 '
+            '.syndica 里的版本层与记录，或换一份 git 配置执行）；提交与推送由宿主在复核之后执行'
         ),
         matches=_changes_git_state,
     )

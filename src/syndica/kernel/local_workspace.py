@@ -196,19 +196,19 @@ class LocalWorkspace:
             )
         return '\n'.join(lines[start : start + limit]), version
 
-    async def write_text(self, path: str, content: str, *, expected: Expected = ANY) -> None:
-        self._write(path, content.encode('utf-8'), expected)
+    async def write_text(self, path: str, content: str, *, expected: Expected = ANY) -> str:
+        return self._write(path, content.encode('utf-8'), expected)
 
-    async def write_bytes(self, path: str, data: bytes, *, expected: Expected = ANY) -> None:
+    async def write_bytes(self, path: str, data: bytes, *, expected: Expected = ANY) -> str:
         if not isinstance(cast(object, data), bytes | bytearray):
             raise ConfigError(
                 expected='data 是 bytes',
                 received=f'data 的类型是 {type(data).__name__}',
                 next_action='写文本用 write_text；写二进制先编码成 bytes',
             )
-        self._write(path, bytes(data), expected)
+        return self._write(path, bytes(data), expected)
 
-    async def edit_text(self, path: str, old: str, new: str, *, expected: Expected = ANY) -> None:
+    async def edit_text(self, path: str, old: str, new: str, *, expected: Expected = ANY) -> str:
         if old == '':
             raise ConfigError(
                 expected='old 是文件里出现恰好一次的非空片段',
@@ -233,7 +233,9 @@ class LocalWorkspace:
                 received=f'出现了 {count} 次',
                 next_action='把 old 收窄到唯一的一段，或先读出文件再改',
             )
-        real.write_bytes(text.replace(old, new, 1).encode('utf-8'))
+        written = text.replace(old, new, 1).encode('utf-8')
+        real.write_bytes(written)
+        return _version(written)
 
     async def read_bytes(self, path: str) -> bytes:
         real = self._inside(path)
@@ -285,7 +287,7 @@ class LocalWorkspace:
         version, size = _file_version(real)
         return FileStat(version=version, size=size)
 
-    def _write(self, path: str, data: bytes, expected: Expected) -> None:
+    def _write(self, path: str, data: bytes, expected: Expected) -> str:
         """写入的全部检查与写本身之间没有挂起点：同一个事件循环里并发的两次带前提的写，后到的那个
         一定看见先到的那个写下的版本。"""
         real = self._writable(path)
@@ -301,6 +303,7 @@ class LocalWorkspace:
         self._must_stay(parent)
         parent.mkdir(parents=True, exist_ok=True)
         real.write_bytes(data)
+        return _version(data)
 
     async def glob_paths(self, pattern: str) -> tuple[str, ...]:
         if pattern.strip() == '':

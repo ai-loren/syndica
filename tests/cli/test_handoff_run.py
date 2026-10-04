@@ -887,7 +887,8 @@ def test_the_file_tools_cannot_read_what_the_host_keeps_for_itself(tmp_path: Pat
 
 def test_a_handoff_path_the_agent_blocked_with_a_file_still_prints_the_handoff(tmp_path: Path):
     root = _workspace(tmp_path)
-    block = 'mkdir -p .syndica && echo x > .syndica/handoffs'
+    # 经变量拼出路径：危险规则认得出字面的 `.syndica/handoffs` 并拦下，变量是它声明过的盲区。
+    block = 'd=.syndic; d="${d}a"; mkdir -p "$d" && echo x > "$d/handoffs"'
     llm = ScriptedLLM(
         [
             ScriptedTurn(tool_calls=[_call('b', 'Bash', command=block)]),

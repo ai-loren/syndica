@@ -147,6 +147,8 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'Trigger',
     'TrustLevel',
     'UserInput',
+    'VersionEntry',
+    'VersionStore',
     'WaitResult',
     'WaitState',
     'Waiter',

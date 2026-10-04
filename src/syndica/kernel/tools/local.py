@@ -8,11 +8,12 @@
 from __future__ import annotations
 
 import math
+import posixpath
 import re
 from collections.abc import Sequence
 from typing import cast
 
-from syndica.kernel.context import TrustLevel
+from syndica.kernel.context import ArtifactRef, TrustLevel
 from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.tool import Tool, ToolResult
@@ -38,6 +39,42 @@ _HEAD_SHARE: float = 0.2
 
 def _told(exc: ConfigError) -> ToolResult:
     return ToolResult(output=exc.message)
+
+
+# 只按扩展名粗分；格式语义（预览、语义 diff、校验）归 M7 的产物处理器。
+_KINDS: dict[str, tuple[str, str]] = {
+    '.md': ('document', 'text/markdown'),
+    '.txt': ('document', 'text/plain'),
+    '.html': ('document', 'text/html'),
+    '.csv': ('spreadsheet', 'text/csv'),
+    '.tsv': ('spreadsheet', 'text/tab-separated-values'),
+    '.json': ('data', 'application/json'),
+    '.yaml': ('data', 'application/yaml'),
+    '.yml': ('data', 'application/yaml'),
+    '.toml': ('data', 'application/toml'),
+    '.py': ('code', 'text/x-python'),
+    '.js': ('code', 'text/javascript'),
+    '.ts': ('code', 'text/x-typescript'),
+    '.sh': ('code', 'text/x-shellscript'),
+    '.svg': ('diagram', 'image/svg+xml'),
+    '.mmd': ('diagram', 'text/vnd.mermaid'),
+}
+
+
+def _artifact(path: str, version: str) -> ArtifactRef:
+    """`id` 由规范化的路径派生：同一个文件的各个版本是同一个产物，与谁写的无关（spec §7.2）。"""
+    normal = posixpath.normpath(path)
+    kind, mime = _KINDS.get(
+        posixpath.splitext(normal)[1].lower(), ('file', 'application/octet-stream')
+    )
+    return ArtifactRef(
+        id=f'file:{normal}',
+        path=normal,
+        kind=kind,
+        mime=mime,
+        version=version,
+        producer=driving_agent() or 'host',
+    )
 
 
 def _conflicted(conflict: WriteConflict) -> ToolResult:
@@ -224,13 +261,15 @@ class Write(Tool):
         content: 写入的全文
         """
         try:
-            await self._portal.write_text(path, content)
+            version = await self._portal.write_text(path, content)
         except ConfigError as exc:
             return _told(exc)
         except WriteConflict as conflict:
             return _conflicted(conflict)
         # `meta['path']` 只在写成了时有：开发期记录靠它分辨写成的与被拒的（被拒的文字也是一段话）。
-        return ToolResult(output=f'已写入 {path}', meta={'path': path})
+        return ToolResult(
+            output=f'已写入 {path}', meta={'path': path}, artifacts=[_artifact(path, version)]
+        )
 
 
 class Edit(Tool):
@@ -249,12 +288,16 @@ class Edit(Tool):
         new_string: 替换后的文本
         """
         try:
-            await self._portal.edit_text(path, old_string, new_string)
+            version = await self._portal.edit_text(path, old_string, new_string)
         except ConfigError as exc:
             return _told(exc)
         except WriteConflict as conflict:
             return _conflicted(conflict)
-        return ToolResult(output=f'已替换 {path} 中的一处文本', meta={'path': path})
+        return ToolResult(
+            output=f'已替换 {path} 中的一处文本',
+            meta={'path': path},
+            artifacts=[_artifact(path, version)],
+        )
 
 
 class Glob(Tool):

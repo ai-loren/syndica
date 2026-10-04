@@ -89,6 +89,19 @@ class WorkspaceContract(ContractSuite):
         assert stat is not None
         assert (stat.version, stat.size) == (_digest(b'alpha\nbravo'), len(b'alpha\nbravo'))
 
+    async def test_each_write_hands_back_the_version_it_wrote(self, workspace: Workspace) -> None:
+        portal = workspace.portal()
+
+        written = await portal.write_text('a.txt', 'alpha')
+        edited = await portal.edit_text('a.txt', 'alpha', 'bravo')
+        stored = await portal.write_bytes('b.bin', b'\x00\x01')
+
+        assert (written, edited, stored) == (
+            _digest(b'alpha'),
+            _digest(b'bravo'),
+            _digest(b'\x00\x01'),
+        )
+
     async def test_a_missing_file_has_no_stat(self, workspace: Workspace) -> None:
         assert await workspace.portal().stat('absent.txt') is None
 
@@ -155,7 +168,9 @@ class WorkspaceContract(ContractSuite):
             return_exceptions=True,
         )
         winners = [
-            text for text, outcome in zip(contents, outcomes, strict=True) if outcome is None
+            text
+            for text, outcome in zip(contents, outcomes, strict=True)
+            if not isinstance(outcome, BaseException)
         ]
         losers = [outcome for outcome in outcomes if isinstance(outcome, WriteConflict)]
         assert len(winners) == 1, f'期望恰好一个写入成功，实际 {outcomes!r}'
@@ -430,7 +445,7 @@ class WorkspaceContract(ContractSuite):
 
 
 def _one_winner(action: str, outcomes: Sequence[object]) -> None:
-    winners = [outcome for outcome in outcomes if outcome is None]
+    winners = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
     losers = [outcome for outcome in outcomes if isinstance(outcome, WriteConflict)]
     assert (len(winners), len(losers)) == (1, 2), (
         f'期望三次带同一个版本前提的 {action} 恰好一次成功、两次 WriteConflict，实际 {outcomes!r}。'

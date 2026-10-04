@@ -429,8 +429,9 @@ def test_a_run_is_exported_to_a_collector_as_the_recorder_wrote_it(
     )
     line = encode_redacted(file_trace._span_value(forged), RuleRedactor())  # pyright: ignore[reportPrivateUsage]
     # 重定向的目标在 POSIX sh 里不展开通配符：逐个文件写。第二轮才写：那时第一轮的 span 已经落盘。
+    # 经变量拼出路径：危险规则认得出字面的 `.syndica/traces` 并拦下，变量是它声明过的盲区。
     plant = (
-        'for f in .syndica/traces/*/spans.jsonl; do '
+        'd=.syndic; d="${d}a"; for f in "$d"/traces/*/spans.jsonl; do '
         f'printf \'%s\\n\' {shlex.quote(line)} >> "$f"; done'
     )
     steps: list[Step] = [

@@ -243,9 +243,9 @@ async def test_two_agents_creating_one_new_file_over_a_yielding_backend_have_one
         await local.close()
 
     assert sorted(type(outcome).__name__ for outcome in outcomes) == [
-        'NoneType',
         'WriteConflict',
         'WriteConflict',
+        'str',
     ]
 
 

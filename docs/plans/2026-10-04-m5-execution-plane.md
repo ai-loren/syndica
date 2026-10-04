@@ -135,6 +135,9 @@ B-15、B-18、D-40、D-62、D-63、D-64；`AGENTS.md`。
   Python 读写；历史、diff（difflib 的统一 diff）、回滚、隔离的物化都在 Python 里。**内核从不对 `.syndica/vcs` 调
   git**，于是那里的任何文件都没法让宿主执行代码。它与 git 兼容：用户可以 `git --git-dir=.syndica/vcs log` 去看；文档写明
   它的 `config` Agent 写得到，在那里跑 git 之前先看一眼。
+- 版本层是一份会活过文件本身的记录（用户删了文件，历史里还在），所以对象正文与提交消息落盘之前先过
+  Redactor（AGENTS.md #8）。脱过敏的版本存的不是原文：历史里标明、按版本取不回来、不能回滚（回滚会把占位符
+  写进文件），spec「脱敏与可回放冲突时选安全」；路径本身像密钥的写入不记（路径照原样进 tree 对象）。
 - 用户目录有没有 `.git` 都一样对待：不建 `.git`、不提交到用户的历史、不改用户的索引与分支（spec §6.3「不得干扰其历史与
   分支」，AGENTS.md #9）。与 spec「目标目录不是 git 仓库则自动初始化」的字面不同：初始化的是版本层，不是用户的仓库。
 - 三方文本合并（D6）：有 git 时调 `git merge-file -p`，但在工作区之外新建的空临时目录里、对三个临时文件、没有仓库
@@ -157,10 +160,11 @@ B-15、B-18、D-40、D-62、D-63、D-64；`AGENTS.md`。
 ### D6 隔离：共享（缺省）/ worktree / 快照；合并逐文件三方比较
 
 - `IsolationStrategy` 协议：`isolate(parent, name) -> IsolatedWorkspace`；`IsolatedWorkspace.merge() -> MergeReport`
-  与 `discard()`。三种实现：共享（交回父本身）、worktree（父此刻的树记成版本层的一个检查点，再由内核把它物化到
-  `.syndica/worktrees/<name>`：对象共享、零克隆，不调 `git worktree`）、快照（把父的树拷到
-  `.syndica/snapshots/<name>`）。两种隔离的差别在合并：worktree 有 git 时用 `git merge-file`，快照只做保守合并。没有
-  git 时请求 worktree 退回快照（spec：快照是 worktree 的降级路径），报告里写明。
+  与 `discard()`。三种实现：共享（交回父本身）、worktree（把父此刻的工作文件拷到 `.syndica/worktrees/<name>`，
+  基线另存一份给三方合并用，不调 `git worktree`）、快照（拷到 `.syndica/snapshots/<name>`，只记基线的版本号）。
+  副本从父的工作文件拷而不从版本层物化：版本层存的是脱过敏的内容，从它物化会把占位符写进子 Agent 的文件、
+  再随合并写回父。两种隔离的差别在合并：worktree 有 git 时用 `git merge-file`，快照只做保守合并。没有 git 时
+  请求 worktree 退回快照（spec：快照是 worktree 的降级路径），报告里写明。
 - 合并：对子相对基线改过的每个文件——父没改过就用子的；两边都改了，worktree 调 D4 那样隔离的 `git merge-file` 三方
   合并，干净就用合并结果，有冲突标记就把这个文件列进冲突、父的那份不动；快照两边都改就是冲突。删除同理。逐文件
   而不是 `merge-tree`：老版本 git 也能跑，快照也能用同一套判据。合并写回父工作区的每个文件带着子 Agent 那份的
@@ -298,7 +302,7 @@ D7。`LocalWorkspace` 的六件套与契约套件的伪终端部分；取消、�
 
 ### 阶段二：版本层与隔离
 
-#### T5 — 版本层
+#### T5 — 版本层（完成，见决策日志）
 
 D4、D5。Python 写的 git 格式对象库（用户用 git 读得出来，由一条用例在有 git 时核对）、记录 / 历史 / diff / 回滚；
 `Write` / `Edit` 交回 `ArtifactRef`。一条用例在 `.syndica/vcs/config` 里写进过滤器、fsmonitor 与 `include.path`、在

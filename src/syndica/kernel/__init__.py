@@ -133,6 +133,7 @@ from syndica.kernel.trace import (
 )
 from syndica.kernel.trace_recorder import TraceRecorder
 from syndica.kernel.tracing import NullTracer, Tracer
+from syndica.kernel.versions import VersionEntry, VersionStore
 from syndica.kernel.waiting import (
     Confirmation,
     Reply,
@@ -272,6 +273,8 @@ __all__ = [
     'Trigger',
     'TrustLevel',
     'UserInput',
+    'VersionEntry',
+    'VersionStore',
     'WaitResult',
     'WaitState',
     'Waiter',

@@ -370,6 +370,64 @@ def test_a_neighbour_of_dot_git_is_not_dot_git(command: str):
     assert not _git(command)
 
 
+@pytest.mark.parametrize(
+    'command',
+    [
+        'echo x > .syndica/vcs/config',
+        'cp t.jsonl .syndica/traces/run.jsonl',
+        'printf x >> .syndica/handoffs/h.md',
+        'touch .syndica/worktrees/child/a.py',
+        'rm -rf .syndica/snapshots',
+        'rm -rf .syndica',
+        'echo x > .SYNDICA/VCS/HEAD',
+        'rm -rf .syndica/v*',
+        'rm -rf .syndica/*',
+        'rm -rf .syn*',
+        'echo x > .syndica/tmp/../vcs/config',
+        f'mv x {_ROOT}/.syndica/vcs/objects',
+    ],
+    ids=[
+        'version_layer',
+        'traces',
+        'handoffs',
+        'worktrees',
+        'snapshots',
+        'the_whole_directory',
+        'any_letter_case',
+        'glob_on_the_record_name',
+        'glob_over_every_record',
+        'glob_on_the_directory_name',
+        'dot_dot_back_into_a_record',
+        'absolute_path',
+    ],
+)
+def test_anything_that_reaches_into_the_host_records_changes_state(command: str):
+    assert _git(command)
+
+
+@pytest.mark.parametrize(
+    'command',
+    [
+        'python .syndica/tmp/run.py',
+        'echo x > .syndica/tmp/notes.txt',
+        'ls .syndica/tmp',
+        'cat syndica/vcs.md',
+        'cat .syndica.yaml',
+        'echo vcs > notes.txt',
+    ],
+    ids=[
+        'scratch_script',
+        'scratch_write',
+        'scratch_listing',
+        'neighbour_without_the_dot',
+        'project_config_file',
+        'record_name_as_plain_text',
+    ],
+)
+def test_the_scratch_directory_and_neighbours_of_the_host_records_stay_usable(command: str):
+    assert not _git(command)
+
+
 _EVERY_WRAPPER = (
     'builtin',
     'chrt',

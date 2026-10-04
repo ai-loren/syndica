@@ -61,8 +61,12 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
         'write_bytes',
         'write_bytes',
     ),
-    # 工作区路由把 Agent 文件工具的写转给它所在的那个工作区，内容就是工具交下来的。
-    'kernel/workspace_router.py': ('write_bytes', 'write_text'),
+    # 工作区路由把 Agent 文件工具的写转给它所在的那个工作区，内容就是工具交下来的；回滚写回的是
+    # 版本层里一份没脱过敏的原文（脱过敏的版本取不回来），也就是早先某次工具写下的内容。
+    'kernel/workspace_router.py': ('write_bytes', 'write_bytes', 'write_text'),
+    # 版本层：对象是 zlib(头 + 正文)，正文与提交消息在同一个方法里先过了 Redactor（守卫看不穿
+    # 压缩）；两处 write_text 写的是引用：`HEAD` 的固定内容与一个提交号。
+    'kernel/versions.py': ('write_bytes', 'write_text', 'write_text'),
     # Agent 自己的终端：写进伪终端主端的是 Agent 经 Terminal 交下来的输入，子进程的输出接在从端上。
     'kernel/local_pty.py': ('os.write', 'subprocess stderr', 'subprocess stdout'),
     # `write_all` 里那一处把短写接着写完的 `os.write`：写进去的内容在调用 `write_all` 的地方按内容

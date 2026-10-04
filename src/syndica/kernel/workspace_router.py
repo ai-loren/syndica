@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import posixpath
 from collections.abc import Awaitable, Callable
 from pathlib import PurePosixPath
@@ -15,6 +16,7 @@ from typing import cast
 
 from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.versions import VersionStore
 from syndica.kernel.workspace import (
     ANY,
     ExecResult,
@@ -28,6 +30,8 @@ from syndica.kernel.workspace import (
 )
 
 __all__ = ['WorkspaceRouter']
+
+logger = logging.getLogger(__name__)
 
 _Seen = tuple[str | None, str]
 
@@ -44,14 +48,49 @@ class WorkspaceRouter:
     Agent 的驱动任务里）共用一份记录。
     """
 
-    def __init__(self, root: Workspace) -> None:
+    def __init__(self, root: Workspace, *, versions: VersionStore | None = None) -> None:
         self._root = root
         self._assigned: dict[str, Workspace] = {}
         self._seen: dict[_Seen, str | None] = {}
+        self._versions = versions
 
     @property
     def root(self) -> str:
         return self._root.root
+
+    @property
+    def versions(self) -> VersionStore | None:
+        """版本层；没打开时是 None。只记根工作区上经路由的写入：隔离副本里的写在合并回来时才记。"""
+        return self._versions
+
+    async def restore(self, path: str, version: str) -> str:
+        """把根工作区里的 `path` 写回版本层里的 `version`，不带版本前提（这是宿主明确要的覆盖）。
+        写回本身记一个新版本，交回它。"""
+        if self._versions is None:
+            raise ConfigError(
+                expected='路由打开了版本层（WorkspaceRouter(..., versions=VersionStore(...))）',
+                received='这个路由没有版本层',
+                next_action='构造路由时传入 versions，或在 .syndica.yaml 里打开 workspace.versions',
+            )
+        data = self._versions.content(path, version)
+        written = await self._root.portal().write_bytes(path, data)
+        self._seen[self._key(self._root, path)] = written
+        self._record(self._root, path, data)
+        return written
+
+    def _record(self, workspace: Workspace, path: str, data: bytes | None) -> None:
+        if self._versions is None or workspace is not self._root:
+            return
+        relative = self._key(workspace, path)[1]
+        producer = driving_agent() or 'host'
+        try:
+            if data is None:
+                self._versions.record_removal(relative, producer=producer)
+            else:
+                self._versions.record(relative, data, producer=producer)
+        except (OSError, ConfigError) as exc:
+            # 写已经落了，不能因为没记下版本就报写失败；没记下的这一版不能回滚，必须留下证据。
+            logger.error('版本层没有记下 %s 的这次改动（%s）：这一版不能回滚', relative, exc)
 
     def portal(self) -> Portal:
         return self
@@ -89,15 +128,18 @@ class WorkspaceRouter:
         path: str,
         data: bytes,
         expected: Expected,
-        write: Callable[[Portal, Expected], Awaitable[None]],
-    ) -> None:
+        write: Callable[[Portal, Expected], Awaitable[str]],
+    ) -> str:
         workspace = self._target()
         portal = workspace.portal()
         key = self._key(workspace, path)
         if expected is ANY:
             expected = await self._precondition(portal, path, key)
         await write(portal, expected)
-        self._seen[key] = _version(data)
+        version = _version(data)
+        self._seen[key] = version
+        self._record(workspace, path, data)
+        return version
 
     async def read_text(self, path: str, *, offset: int, limit: int) -> str:
         text, _ = await self.read_versioned(path, offset=offset, limit=limit)
@@ -124,29 +166,29 @@ class WorkspaceRouter:
         self._seen[self._key(workspace, path)] = _version(data)
         return data
 
-    async def write_text(self, path: str, content: str, *, expected: Expected = ANY) -> None:
-        await self._write(
+    async def write_text(self, path: str, content: str, *, expected: Expected = ANY) -> str:
+        return await self._write(
             path,
             content.encode('utf-8'),
             expected,
             lambda portal, given: portal.write_text(path, content, expected=given),
         )
 
-    async def write_bytes(self, path: str, data: bytes, *, expected: Expected = ANY) -> None:
+    async def write_bytes(self, path: str, data: bytes, *, expected: Expected = ANY) -> str:
         if not isinstance(cast(object, data), bytes | bytearray):
             raise ConfigError(
                 expected='data 是 bytes',
                 received=f'data 的类型是 {type(data).__name__}',
                 next_action='写文本用 write_text；写二进制先编码成 bytes',
             )
-        await self._write(
+        return await self._write(
             path,
             bytes(data),
             expected,
             lambda portal, given: portal.write_bytes(path, data, expected=given),
         )
 
-    async def edit_text(self, path: str, old: str, new: str, *, expected: Expected = ANY) -> None:
+    async def edit_text(self, path: str, old: str, new: str, *, expected: Expected = ANY) -> str:
         workspace = self._target()
         portal = workspace.portal()
         key = self._key(workspace, path)
@@ -155,15 +197,24 @@ class WorkspaceRouter:
             # 没读过就按此刻的内容改：`old` 恰好出现一次本身就是对内容的前提。
             expected = self._seen[key] if key in self._seen else _version(data)
         read_before = key in self._seen
-        await portal.edit_text(path, old, new, expected=expected)
+        version = await portal.edit_text(path, old, new, expected=expected)
+        # 后端按同一个版本前提改的就是 `data` 时，改完的内容能在这里算出来，不必再读一次（再读会
+        # 撞上别人紧接着的写）；算出来的与后端交回的版本对不上，就说明改的不是这一份，不记。
+        text = data.decode('utf-8', errors='surrogateescape')
+        edited = text.replace(old, new, 1).encode('utf-8', errors='surrogateescape')
+        if _version(edited) == version:
+            self._record(workspace, path, edited)
+        elif self._versions is not None and workspace is self._root:
+            logger.error(
+                '版本层没有记下 %s 的这次 Edit：改的不是读到的那一份，这一版不能回滚', path
+            )
         if read_before and expected == _version(data):
-            # 后端按同一个版本前提改的就是 `data`，新版本于是能在这里算出来，不必再读一次（再读会
-            # 撞上别人紧接着的写）。
-            self._seen[key] = _version(data.decode('utf-8').replace(old, new, 1).encode('utf-8'))
+            self._seen[key] = version
         else:
             # 没读过就改：`old` 恰好出现一次只证明它见过那一段，没见过文件的其余部分。记成看过，
             # 接下来的一次整篇覆盖就会盖掉它没看过的内容。
             self._seen.pop(key, None)
+        return version
 
     async def remove(self, path: str, *, expected: Expected = ANY) -> None:
         workspace = self._target()
@@ -173,6 +224,7 @@ class WorkspaceRouter:
             expected = await self._precondition(portal, path, key)
         await portal.remove(path, expected=expected)
         self._seen[key] = None
+        self._record(workspace, path, None)
 
     async def stat(self, path: str) -> FileStat | None:
         return await self._target().portal().stat(path)

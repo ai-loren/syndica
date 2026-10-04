@@ -55,13 +55,18 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _LEADS = {
-    'shell.git_state_change': '这条命令会改变 git 状态（提交、推送、改引用或配置、写 .git/）。',
+    'shell.git_state_change': (
+        '这条命令会改变 git 状态或宿主的记录（提交、推送、改引用或配置、写 .git/ 或 .syndica 里的'
+        '版本层与记录）。'
+    ),
     'shell.workspace_root_removal': '这条命令会删掉整个工作区根目录，或根下的全部内容。',
 }
 _ALTERNATIVES = (
     '换个做法继续：\n'
     '- 看 git 状态用只读子命令：git status、git diff、git log、git show；\n'
     '- 列文件、搜内容时要排除 .git，用 Glob / Grep 工具或 git ls-files，命令里不要写 .git 路径；\n'
+    '- 临时文件放 .syndica/tmp，'
+    '不要碰 .syndica 下的 vcs、traces、handoffs、worktrees、snapshots；\n'
     '- 清理生成物时删具体的目录（如 rm -r build），不要删 .、* 或上级目录；\n'
     '- 改完就在最终回答里写清改了什么，提交与推送由宿主在复核之后执行。'
 )
