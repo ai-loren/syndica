@@ -149,7 +149,8 @@ B-15、B-18、D-40、D-62、D-63、D-64；`AGENTS.md`。
 - 版本层：`record(path, data) -> version`、`history(path)`、`content(path, version)`、`diff(path, a, b)`、
   `restore(path, version)`、`checkpoint() -> 整棵树的版本`（给隔离用）。
 - `Write` / `Edit` 写成后由路由记一个版本，结果的 `artifacts` 带 `ArtifactRef(path=…, version=…, producer=<agent>,
-  is_deliverable=False)`；`kind` / `mime` 先按扩展名粗分，格式语义归 M7 的处理器。
+  is_deliverable=False)`；`kind` / `mime` 先按扩展名粗分，格式语义归 M7 的处理器。`artifact_id` 由工作区内的
+  规范化相对路径派生（同一个文件的各个版本是同一个产物的不同版本，spec §7.1），不随写入者变。
 - diff：文本给统一 diff；二进制只说大小变化，格式感知的 diff 归 M7。
 - 回滚经路由写回、本身也记一个新版本；它是宿主与工具都能用的公开方法，不另加模型工具（M7 的产物工具再决定）。
 
@@ -163,7 +164,8 @@ B-15、B-18、D-40、D-62、D-63、D-64；`AGENTS.md`。
 - 合并：对子相对基线改过的每个文件——父没改过就用子的；两边都改了，worktree 调 D4 那样隔离的 `git merge-file` 三方
   合并，干净就用合并结果，有冲突标记就把这个文件列进冲突、父的那份不动；快照两边都改就是冲突。删除同理。逐文件
   而不是 `merge-tree`：老版本 git 也能跑，快照也能用同一套判据。合并写回父工作区的每个文件带着子 Agent 那份的
-  文件污点（D9）。
+  文件污点（D9）。写回是条件写：前提是合并开始时读到的父版本，合并期间父那边又被改过就把这个文件列进冲突，
+  不覆盖（共享工作区里别的 Agent 照常在写）。
 - 入口：`Runtime.spawn(..., isolation=...)`、`Delegate` / `Fork` 的 `isolation` 参数（缺省 `shared`）。`Delegate` /
   `Fork` 在子 Agent 这次工作结束后自动合并，合并报告进结果；宿主经 `Runtime.merge_isolated` / `discard_isolated`
   自己决定。隔离语义以发起分叉的源 Agent 的工作区为基准（spec §6.4）。
@@ -306,7 +308,10 @@ D4、D5。Python 写的 git 格式对象库（用户用 git 读得出来，由�
 #### T6 — 隔离与合并
 
 D6。三种策略、逐文件合并、冲突报告、`spawn` / `Delegate` / `Fork` 的 `isolation`、隔离状态注入历史。
-共享写入冲突、worktree 合并冲突、快照 fallback 各有单测。
+共享写入冲突、worktree 合并冲突、快照 fallback 各有单测。路由按 Agent 的分配在 Agent 释放（`despawn`、合并、
+丢弃）时一并回收，连同它在路由与 `BashOutput` / `Terminal` 里按 Agent 记的偏移与看过的版本；驱动任务里另起的
+任务继承 `_DRIVING_AGENT`（B-23），于是它们的调用也路由到那个 Agent 的隔离副本——用例钉住，并写进 `spawn` 的
+docstring。合并写回的条件写由一条「合并期间父被改」的用例钉住。
 
 ### 阶段三：溯源与危险规则
 
@@ -354,3 +359,15 @@ D11、D12。规则表每个新成员各有一条用例；安全矩阵全格；`{
 - 2026-10-04：计划评审的 Blocking（B1：私有 git 目录躲过现有三道防线，宿主对它调 git 等于在危险闸之外执行 Agent
   写下的代码）并进 D4——版本层不再调 git，对象由内核用 Python 写；文件污点的基线从版本层挪到 D9 的 stat 指纹；
   `workspace.versions` 于是不再关系安全判据。阶段一（T1–T4 与 B-13 / B-14）已推送（`cea34f5`）。
+- 2026-10-04：计划评审的 Agent 中途被停，结论按它留下的笔记补全（其余 High / Medium）：`Terminal` 不在回放的桩
+  名单里（已修，回放照记录交回）；Bash 写文件绕过乐观并发（接受：shell 写什么只有沙箱后端看得到，记进路线图
+  的遗留项）；D6 合并写回要条件写、`ArtifactRef` 的 id 要有派生规则、隔离下释放的 Agent 与它派生的任务怎么路由
+  （三条并进 D5 / D6 / T6）。最重的一条是「同一个 Agent 之内的命令输出能不能按它真实读到的内容收窄溯源」——
+  用户裁决推到后端：M5 只交 `Workspace` / `Portal` 协议与契约套件，Bash / Terminal 的输出照旧一律不可信；
+  AGENTS.md 与 spec 决策 #94 改成「真正的边界是沙箱化的 Workspace 后端」；收窄随沙箱后端落地，登记进路线图。
+- 2026-10-04：阶段一对抗评审的修复并进同一次提交：`Terminal` 的 `input` 不收控制字符（含制表与转义序列）、
+  一行必须在一次 send 里交完、`ctrl-c` 附带一个 Ctrl-U（忽略 SIGINT 的程序也丢掉半行）、`ctrl-z` 不清半行；读
+  与版本出自同一次读（`Portal.read_versioned`）、没读过的 Edit 不记成看过、读不出来的文件也算看过；伪终端按
+  Agent 限 8 个会话、杀会话时连后代的进程组一起收、会话有控制终端、历史不落盘；`BashOutput` 在命令结束后让
+  `meta` 带全部输出（开发期记录按它判测试结果）；契约补三方并发、kill 后进程真的不在、`since` 逐字、组长先死、
+  作业控制、Ctrl-C。macOS 无论是否 `TIOCSCTTY` 都给会话控制终端，那条启动器的变异只有 Linux 杀得掉。

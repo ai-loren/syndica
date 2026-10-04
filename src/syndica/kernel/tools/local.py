@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Sequence
 from typing import cast
 
@@ -121,11 +122,20 @@ def _listed(items: Sequence[str], limit: int | None, narrow: str) -> list[str]:
 
 
 def _reported(
-    result: ExecResult, limit: int | None, *, meta: dict[str, object], note: str = ''
+    result: ExecResult,
+    limit: int | None,
+    *,
+    meta: dict[str, object],
+    note: str = '',
+    complete: ExecResult | None = None,
 ) -> ToolResult:
-    """把一次命令的结果交给模型。`meta` 里的两条流就是展示出来的那两条（可能已截断）。"""
+    """把一次命令的结果交给模型。`meta` 里的两条流是展示出来的那两条（可能已截断）；给了 `complete`
+    时是它的两条：命令跑完之后读 meta 的人（开发期记录按输出判定测试结果）要的是全部输出，而不是
+    这一次的增量。"""
     stdout, stdout_cut = _clipped(result.stdout, limit)
     stderr, stderr_cut = _clipped(result.stderr, limit)
+    meta_stdout = stdout if complete is None else _clipped(complete.stdout, limit)[0]
+    meta_stderr = stderr if complete is None else _clipped(complete.stderr, limit)[0]
     truncated = result.truncated or stdout_cut or stderr_cut
     shown = (
         f'{note}'
@@ -144,8 +154,8 @@ def _reported(
             'running': result.running,
             'truncated': truncated,
             'timed_out': result.timed_out,
-            'stdout': stdout,
-            'stderr': stderr,
+            'stdout': meta_stdout,
+            'stderr': meta_stderr,
         },
         trust=TrustLevel.UNTRUSTED,
     )
@@ -369,11 +379,16 @@ class BashOutput(Tool):
         since = (0, 0) if full else self._read.get(key, (0, 0))
         try:
             result = await self._portal.poll(handle, since=since)
+            complete = (
+                await self._portal.poll(handle) if since != (0, 0) and not result.running else None
+            )
         except ConfigError as exc:
             return _told(exc)
         self._read[key] = (result.stdout_end, result.stderr_end)
         note = '下面只是你上次查询之后的新输出；要从头看传 full=true。\n' if since != (0, 0) else ''
-        return _reported(result, self._output_limit, meta={'handle': handle}, note=note)
+        return _reported(
+            result, self._output_limit, meta={'handle': handle}, note=note, complete=complete
+        )
 
 
 class KillBash(Tool):
@@ -397,10 +412,24 @@ class KillBash(Tool):
 
 
 _TERMINAL_ACTIONS = ('create', 'send', 'capture', 'resize', 'kill', 'status')
+# 能单独发的按键。行编辑键（Ctrl-W、退格、方向键）刻意不在这里：终端会按它们改写正在输入的那一行，
+# 危险判定读到的文字于是不是 shell 真正执行的那一行。ctrl-c 后面紧跟一个 Ctrl-U：忽略 SIGINT 的程序
+# 收到中断不会丢掉 readline 里那半行，Ctrl-U 不管信号怎么处理都把它清掉（光标只可能在行尾，
+# 因为挪光标的键都不收），本工具于是能在 ctrl-c 之后把半行记成空的。
+_TERMINAL_KEYS = {'ctrl-c': '\x03\x15', 'ctrl-d': '\x04', 'ctrl-z': '\x1a'}
+# input 里不收的字符：除换行、回车之外的 C0、DEL 与 C1。它们会被终端的行规程或行编辑器当成编辑或
+# 补全指令（`\x15git push` 执行的是 `git push`，`gi<TAB> push` 被补成什么判定看不见）。
+_LINE_EDITING = re.compile('[\x00-\x09\x0b\x0c\x0e-\x1f\x7f-\x9f]')
 
 
 class Terminal(Tool):
-    """在伪终端里运行交互式程序（spec §6.5）。"""
+    """在伪终端里运行交互式程序（spec §6.5）。
+
+    危险判定读的是 `command` 与 `input` 的原文，所以本工具保证终端真正交给程序的每一行都完整地
+    出现在某一次调用的 `input` 里：`input` 不收控制字符（行编辑与补全）；一次带回车的 send 之前，
+    终端里不能还留着上一次 send 没回车的半行（否则提交的是「半行 + 这次的文字」，两半分别被判定过，
+    合起来没被判定过）。半行按会话记，不按 Agent：终端的行缓冲只有一份。
+    """
 
     __tool_name__ = 'Terminal'
     # `create` 的命令与 `send` 写进终端的文字都会被 shell 或终端里的程序执行。
@@ -411,6 +440,7 @@ class Terminal(Tool):
         self._output_limit = _valid_output_limit(output_limit)
         # 每个 Agent 对每个会话看到了哪里，理由同 BashOutput。
         self._shown: dict[tuple[str | None, str], int] = {}
+        self._pending: dict[str, str] = {}
 
     async def execute(
         self,
@@ -418,18 +448,21 @@ class Terminal(Tool):
         command: str = '',
         handle: str = '',
         input: str = '',  # noqa: A002
+        key: str = '',
         wait: float = 2.0,
         cols: int = 120,
         rows: int = 40,
     ) -> ToolResult:
         """在伪终端里运行需要终端的交互式程序（REPL、等你输入的提示、按键驱动的程序）。
         只是跑一条命令、看它的输出，用 Bash。终端是输出流，不是渲染后的屏幕：颜色与光标控制已去掉。
-        action: create 用 command 起一个会话，交回 handle 与最初的输出；send 把 input 写进会话再
-        交回之后的新输出；capture 交回上次之后的新输出；resize 把窗口改成 cols 列 rows 行；
+        action: create 用 command 起一个会话，交回 handle 与最初的输出；send 把 input 或 key 写进
+        会话再交回之后的新输出；capture 交回上次之后的新输出；resize 把窗口改成 cols 列 rows 行；
         kill 结束会话；status 只看状态
         command: create 时运行的 shell 命令
         handle: create 交回的会话句柄，create 以外的动作都要
-        input: send 写进终端的文字；回车写 \\n，Ctrl-C 写 \\u0003，Ctrl-D 写 \\u0004
+        input: send 写进终端的文字，回车写 \\n；不能含制表等控制字符。一行要在一次 send 里交完
+        key: send 时单独发的一个键：ctrl-c（中断，并清掉没回车的半行）、ctrl-d（结束输入）、
+        ctrl-z（挂起，不清半行）
         wait: create、send、capture 之后最多等多少秒新输出，默认 2；到点没有新输出就交回空的
         cols: create 与 resize 的窗口列数，默认 120
         rows: create 与 resize 的窗口行数，默认 40
@@ -444,14 +477,20 @@ class Terminal(Tool):
         try:
             if action == 'create':
                 handle = await self._portal.pty_create(command, cwd='.', cols=cols, rows=rows)
+                self._pending[handle] = ''
             elif action == 'send':
-                await self._portal.pty_send(handle, input)
+                refused = self._refused(handle, input, key)
+                if refused is not None:
+                    return refused
+                await self._portal.pty_send(handle, _TERMINAL_KEYS[key] if key else input)
+                self._remember(handle, input, key)
             elif action == 'resize':
                 await self._portal.pty_resize(handle, cols=cols, rows=rows)
             elif action == 'kill':
                 await self._portal.pty_kill(handle)
-                for key in [key for key in self._shown if key[1] == handle]:
-                    del self._shown[key]
+                for seen in [seen for seen in self._shown if seen[1] == handle]:
+                    del self._shown[seen]
+                self._pending.pop(handle, None)
                 return ToolResult(
                     output=f'已结束终端会话，handle={handle}', meta={'handle': handle}
                 )
@@ -467,7 +506,6 @@ class Terminal(Tool):
                         'running': status.running,
                         'exit_code': status.exit_code,
                     },
-                    trust=TrustLevel.UNTRUSTED,
                 )
             captured = await self._portal.pty_capture(
                 handle, since=self._shown.get((driving_agent(), handle), 0), wait=wait
@@ -491,6 +529,65 @@ class Terminal(Tool):
             },
             trust=TrustLevel.UNTRUSTED,
         )
+
+    def _refused(self, handle: str, text: str, key: str) -> ToolResult | None:
+        pending = self._pending.get(handle, '')
+        if key:
+            if key not in _TERMINAL_KEYS:
+                return ToolResult(
+                    output=(
+                        f'期望: key 是 {" / ".join(_TERMINAL_KEYS)} 之一。实际: {key!r}。'
+                        ' 下一步: 文字与回车放进 input；'
+                        '改正在输入的一行时先 key=ctrl-c 清掉再整行重发。'
+                    )
+                )
+            if text:
+                return ToolResult(
+                    output=(
+                        '期望: key 单独发。实际: 同一次 send 里还带了 input。'
+                        ' 下一步: 分成两次 send，先发文字、再发按键（或反过来）。'
+                    )
+                )
+            if key == 'ctrl-d' and pending:
+                return ToolResult(
+                    output=(
+                        f'期望: 发 ctrl-d 时终端里没有没回车的半行。实际: 还留着 {pending!r}，'
+                        'ctrl-d 会把它当成一整行交给程序。'
+                        ' 下一步: 先 key=ctrl-c 清掉它，或者把整行补完重新发。'
+                    )
+                )
+            return None
+        found = _LINE_EDITING.search(text)
+        if found is not None:
+            return ToolResult(
+                output=(
+                    f'期望: input 只含文字、空格与换行。实际: 第 {found.start() + 1} 个字符是'
+                    f'控制字符 U+{ord(found.group()):04X}，终端会把它当成编辑或补全指令。'
+                    ' 下一步: 回车写 \\n，缩进用空格；中断、结束输入、挂起用 key；'
+                    '要改正在输入的一行，先 key=ctrl-c 清掉再整行重发。'
+                )
+            )
+        if pending and ('\n' in text or '\r' in text):
+            return ToolResult(
+                output=(
+                    '期望: 一行在一次 send 里交完。'
+                    f'实际: 终端里还留着上一次没回车的半行 {pending!r}，'
+                    '这次的回车会把它和这次的文字拼成一行提交。'
+                    ' 下一步: 先 key=ctrl-c 清掉那半行，再把整行放进一次 send。'
+                )
+            )
+        return None
+
+    def _remember(self, handle: str, text: str, key: str) -> None:
+        if key == 'ctrl-c':
+            self._pending[handle] = ''
+            return
+        if key:
+            # ctrl-z 不清：交互式 shell 在提示符下忽略挂起，readline 里那半行原样留着。
+            return
+        end = max(text.rfind('\n'), text.rfind('\r'))
+        pending = self._pending.get(handle, '')
+        self._pending[handle] = text[end + 1 :] if end >= 0 else pending + text
 
 
 def local_tools(portal: Portal, *, output_limit: int | None = None) -> dict[str, Tool]:

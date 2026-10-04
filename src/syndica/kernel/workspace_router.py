@@ -11,6 +11,7 @@ import hashlib
 import posixpath
 from collections.abc import Awaitable, Callable
 from pathlib import PurePosixPath
+from typing import cast
 
 from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
@@ -99,18 +100,23 @@ class WorkspaceRouter:
         self._seen[key] = _version(data)
 
     async def read_text(self, path: str, *, offset: int, limit: int) -> str:
+        text, _ = await self.read_versioned(path, offset=offset, limit=limit)
+        return text
+
+    async def read_versioned(self, path: str, *, offset: int, limit: int) -> tuple[str, str]:
         workspace = self._target()
         portal = workspace.portal()
-        before = await self._quiet_stat(portal, path)
-        text = await portal.read_text(path, offset=offset, limit=limit)
-        after = await self._quiet_stat(portal, path)
         key = self._key(workspace, path)
-        # 读的前后版本一致才算看到了它：中间有人写过时记下来的版本不是读到的那份。
-        if before is not None and after is not None and before.version == after.version:
-            self._seen[key] = after.version
-        else:
-            self._seen.pop(key, None)
-        return text
+        try:
+            text, version = await portal.read_versioned(path, offset=offset, limit=limit)
+        except ConfigError:
+            # 读不出来也算看过：文件不在了就记「看到它不存在」，读不了（太大、不是 utf-8）就记
+            # 它此刻的版本。否则冲突消息里「先读它」那一步永远做不成，这个文件此后只有 Bash 写得动。
+            current = await self._quiet_stat(portal, path)
+            self._seen[key] = None if current is None else current.version
+            raise
+        self._seen[key] = version
+        return text, version
 
     async def read_bytes(self, path: str) -> bytes:
         workspace = self._target()
@@ -127,6 +133,12 @@ class WorkspaceRouter:
         )
 
     async def write_bytes(self, path: str, data: bytes, *, expected: Expected = ANY) -> None:
+        if not isinstance(cast(object, data), bytes | bytearray):
+            raise ConfigError(
+                expected='data 是 bytes',
+                received=f'data 的类型是 {type(data).__name__}',
+                next_action='写文本用 write_text；写二进制先编码成 bytes',
+            )
         await self._write(
             path,
             bytes(data),
@@ -142,12 +154,15 @@ class WorkspaceRouter:
         if expected is ANY:
             # 没读过就按此刻的内容改：`old` 恰好出现一次本身就是对内容的前提。
             expected = self._seen[key] if key in self._seen else _version(data)
+        read_before = key in self._seen
         await portal.edit_text(path, old, new, expected=expected)
-        if expected == _version(data):
+        if read_before and expected == _version(data):
             # 后端按同一个版本前提改的就是 `data`，新版本于是能在这里算出来，不必再读一次（再读会
             # 撞上别人紧接着的写）。
             self._seen[key] = _version(data.decode('utf-8').replace(old, new, 1).encode('utf-8'))
         else:
+            # 没读过就改：`old` 恰好出现一次只证明它见过那一段，没见过文件的其余部分。记成看过，
+            # 接下来的一次整篇覆盖就会盖掉它没看过的内容。
             self._seen.pop(key, None)
 
     async def remove(self, path: str, *, expected: Expected = ANY) -> None:

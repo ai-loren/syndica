@@ -9,9 +9,11 @@ from pathlib import Path
 
 import pytest
 
+from syndica.kernel.driving import _DRIVING_AGENT  # pyright: ignore[reportPrivateUsage]
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.local_pty import _plain  # pyright: ignore[reportPrivateUsage]
 from syndica.kernel.local_workspace import LocalWorkspace
+from syndica.kernel.workspace import Portal
 
 
 @pytest.fixture
@@ -59,6 +61,93 @@ async def test_a_ninth_session_is_refused_until_one_is_killed(root: Path) -> Non
         await portal.pty_kill(await portal.pty_create('true', cwd='.'))
     finally:
         await workspace.close()
+
+
+async def _created_as(portal: Portal, agent: str) -> str:
+    async def driven() -> str:
+        _DRIVING_AGENT.set(agent)
+        return await portal.pty_create('sleep 300', cwd='.')
+
+    return await asyncio.create_task(driven())
+
+
+async def test_one_agent_at_its_cap_does_not_stop_another_from_opening_a_session(
+    root: Path,
+) -> None:
+    workspace = LocalWorkspace(str(root), shell='/bin/sh', env={})
+    portal = workspace.portal()
+    try:
+        for _ in range(8):
+            await _created_as(portal, 'alpha')
+        with pytest.raises(ConfigError):
+            await _created_as(portal, 'alpha')
+        assert await _created_as(portal, 'bravo')
+    finally:
+        await workspace.close()
+
+
+async def test_the_workspace_wide_cap_holds_across_agents(root: Path) -> None:
+    workspace = LocalWorkspace(str(root), shell='/bin/sh', env={})
+    portal = workspace.portal()
+    try:
+        for agent in ('alpha', 'bravo', 'charlie', 'delta'):
+            for _ in range(8):
+                await _created_as(portal, agent)
+        with pytest.raises(ConfigError) as refused:
+            await _created_as(portal, 'echo')
+        assert '32' in refused.value.expected
+        assert '你开着 0 个' in refused.value.received
+    finally:
+        await workspace.close()
+
+
+async def test_a_session_has_a_controlling_terminal_and_keeps_no_shell_history(
+    root: Path,
+) -> None:
+    workspace = LocalWorkspace(str(root), shell='/bin/sh', env={'HISTFILE': '/home/x/.hist'})
+    try:
+        handle = await workspace.pty_create(
+            ': < /dev/tty && echo "ctty-yes"; echo "hist:$HISTFILE"', cwd='.'
+        )
+        captured = await workspace.pty_capture(handle, since=0, wait=2)
+        for _ in range(100):
+            if 'hist:' in captured.text:
+                break
+            await asyncio.sleep(0.02)
+            captured = await workspace.pty_capture(handle, since=0)
+    finally:
+        await workspace.close()
+
+    assert 'ctty-yes' in captured.text
+    assert 'hist:/dev/null' in captured.text
+
+
+async def test_a_running_session_holds_back_an_escape_sequence_split_across_reads(
+    root: Path,
+) -> None:
+    workspace = LocalWorkspace(str(root), shell='/bin/sh', env={})
+    try:
+        handle = await workspace.pty_create(
+            "printf 'a\\033[3'; while [ ! -f go ]; do sleep 0.02; done; printf '1mred'", cwd='.'
+        )
+        first = await workspace.pty_capture(handle, since=0, wait=2)
+        for _ in range(100):
+            if first.text == 'a':
+                break
+            await asyncio.sleep(0.02)
+            first = await workspace.pty_capture(handle, since=0)
+        (root / 'go').write_text('')
+        rest = await workspace.pty_capture(handle, since=first.end, wait=2)
+        for _ in range(100):
+            if 'red' in rest.text:
+                break
+            await asyncio.sleep(0.02)
+            rest = await workspace.pty_capture(handle, since=first.end)
+    finally:
+        await workspace.close()
+
+    assert first.text == 'a'
+    assert rest.text == 'red'
 
 
 @pytest.mark.parametrize(

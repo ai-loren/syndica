@@ -99,6 +99,29 @@ def _bash_run(output: str = 'a\nb', trust: str = 'untrusted') -> dict[str, Any]:
     )
 
 
+def test_a_recorded_terminal_session_is_answered_from_the_record_not_run_again(tmp_path: Path):
+    document = _doc(
+        _lead(
+            _turn(
+                1,
+                tool_calls=[_call('c1', 'Terminal', action='create', command='touch terminal-ran')],
+            ),
+            _turn(2, content='done'),
+            tool_results=[
+                {'call': [1, 1, 0], 'output': 'handle: h1\nrunning: true', 'trust': 'untrusted'}
+            ],
+            gate=[_allowed(1, 1, 0)],
+            tools=('Terminal',),
+        ),
+        expect={'final_output': {'Lead[0]': 'done'}, 'stop_reasons': {'Lead[0]': 'completed'}},
+    )
+
+    result = _replay(document, workspace_root=tmp_path)
+
+    assert result.reproduced
+    assert not (tmp_path / 'terminal-ran').exists()
+
+
 def _replay(
     document: dict[str, Any], *, workspace_root: Path | None = None, **options: Any
 ) -> ReplayResult:

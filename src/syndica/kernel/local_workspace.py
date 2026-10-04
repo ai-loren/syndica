@@ -45,7 +45,7 @@ _MAX_BYTES: int = 64 * 1024 * 1024
 _PIPE_GRACE: float = 1.0
 # 发出 SIGKILL 之后等进程退出、管道关闭的上限。逃出进程组的进程（`setsid`、`setpgid`，如 GNU
 # `timeout` 不带 `--foreground`、bash 的 `set -m`）可以一直占着管道，过了这个上限就交回已经收到的
-# 输出、关掉读端。它们逃出了进程组，这里杀不到，真正的边界是 M5 的沙箱。
+# 输出、关掉读端。它们逃出了进程组，这里杀不到，真正的边界是沙箱化的 Workspace 后端。
 _KILL_GRACE: float = 1.0
 _CHUNK: int = 64 * 1024
 # 每条流在内核里最多留的字节：开头一段加结尾一段，中间丢掉。后台的 `yes` 两秒就能写出 GB 级输出，
@@ -147,6 +147,14 @@ class LocalWorkspace:
         return self
 
     async def read_text(self, path: str, *, offset: int, limit: int) -> str:
+        text, _ = self._read_lines(path, offset=offset, limit=limit)
+        return text
+
+    async def read_versioned(self, path: str, *, offset: int, limit: int) -> tuple[str, str]:
+        return self._read_lines(path, offset=offset, limit=limit)
+
+    def _read_lines(self, path: str, *, offset: int, limit: int) -> tuple[str, str]:
+        """(那几行, 读到的那份内容的版本)：版本出自同一次读，读与取版本之间不会插进别人的写。"""
         if offset < 1:
             raise ConfigError(
                 expected='offset 是从 1 开始的行号',
@@ -174,17 +182,19 @@ class LocalWorkspace:
                 received=f'文件有 {size} 字节',
                 next_action='换一个不超过 1 MiB 的文件',
             )
-        lines = _read_utf8(real, path).splitlines()
+        data = real.read_bytes()
+        version = _version(data)
+        lines = _utf8(data, path).splitlines()
         start = offset - 1
         if start >= len(lines):
             if len(lines) == 0 and offset == 1:
-                return ''
+                return '', version
             raise ConfigError(
                 expected=f'offset 不超过文件行数 {len(lines)}',
                 received=f'offset={offset}',
                 next_action='把 offset 调到实际行数以内',
             )
-        return '\n'.join(lines[start : start + limit])
+        return '\n'.join(lines[start : start + limit]), version
 
     async def write_text(self, path: str, content: str, *, expected: Expected = ANY) -> None:
         self._write(path, content.encode('utf-8'), expected)
@@ -258,7 +268,7 @@ class LocalWorkspace:
                 next_action='先确认路径；目录不经 remove 删除',
             )
         if expected is not ANY:
-            _check_expected(path, expected, _version(real.read_bytes()))
+            _check_expected(path, expected, _file_version(real)[0])
         real.unlink()
 
     async def stat(self, path: str) -> FileStat | None:
@@ -272,8 +282,8 @@ class LocalWorkspace:
                 received=f'path={path!r} 存在但不是文件',
                 next_action='stat 只给文件版本；目录没有版本',
             )
-        data = real.read_bytes()
-        return FileStat(version=_version(data), size=len(data))
+        version, size = _file_version(real)
+        return FileStat(version=version, size=size)
 
     def _write(self, path: str, data: bytes, expected: Expected) -> None:
         """写入的全部检查与写本身之间没有挂起点：同一个事件循环里并发的两次带前提的写，后到的那个
@@ -286,7 +296,7 @@ class LocalWorkspace:
                 next_action='改用文件路径',
             )
         if expected is not ANY:
-            _check_expected(path, expected, _version(real.read_bytes()) if real.is_file() else None)
+            _check_expected(path, expected, _file_version(real)[0] if real.is_file() else None)
         parent = real.parent
         self._must_stay(parent)
         parent.mkdir(parents=True, exist_ok=True)
@@ -679,8 +689,15 @@ class LocalWorkspace:
             ) from None
 
 
-def _read_utf8(path: Path, received: str) -> str:
-    return _utf8(path.read_bytes(), received)
+def _file_version(path: Path) -> tuple[str, int]:
+    """(版本, 字节数)，按块读：工作区里可以有几个 GB 的数据集，整篇读进内存再哈希会撑死宿主进程。"""
+    digest = hashlib.sha256()
+    size = 0
+    with path.open('rb') as stream:
+        while chunk := stream.read(_CHUNK):
+            digest.update(chunk)
+            size += len(chunk)
+    return f'sha256:{digest.hexdigest()}', size
 
 
 def _utf8(data: bytes, received: str) -> str:

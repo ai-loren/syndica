@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 
 from syndica.kernel.contracts.base import ContractSuite
 from syndica.kernel.errors import SyndicaError
@@ -231,11 +231,77 @@ class WorkspaceContract(ContractSuite):
         result = await workspace.portal().run('sleep 5', timeout=0.2, cwd='.')
         assert (result.timed_out, result.exit_code, result.running) == (True, None, False)
 
-    async def test_kill_stops_a_background_command(self, workspace: Workspace) -> None:
+    async def test_kill_stops_a_background_command_and_its_process_is_gone(
+        self, workspace: Workspace
+    ) -> None:
         portal = workspace.portal()
-        handle = await portal.start('sleep 30', cwd='.')
+        handle = await portal.start('echo $$ > shell.pid; sleep 300', cwd='.')
+        pid = await _pid_written(portal, 'shell.pid')
         await portal.kill(handle)
         assert (await portal.poll(handle)).running is False
+        assert await _gone(portal, pid), f'期望 kill 之后进程 {pid} 不在了，实际还在'
+
+    async def test_three_concurrent_edits_on_one_version_have_one_winner(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        await portal.write_text('shared.txt', 'delta alpha charlie')
+        base = await portal.stat('shared.txt')
+        assert base is not None
+        outcomes = await asyncio.gather(
+            portal.edit_text('shared.txt', 'delta', 'D', expected=base.version),
+            portal.edit_text('shared.txt', 'alpha', 'A', expected=base.version),
+            portal.edit_text('shared.txt', 'charlie', 'C', expected=base.version),
+            return_exceptions=True,
+        )
+        _one_winner('edit_text', outcomes)
+        text = await portal.read_text('shared.txt', offset=1, limit=5)
+        assert sum(word in text for word in ('delta', 'alpha', 'charlie')) == 2
+
+    async def test_three_concurrent_byte_writes_on_one_version_have_one_winner(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        await portal.write_bytes('shared.bin', b'base')
+        base = await portal.stat('shared.bin')
+        assert base is not None
+        outcomes = await asyncio.gather(
+            portal.write_bytes('shared.bin', b'delta', expected=base.version),
+            portal.write_bytes('shared.bin', b'alpha', expected=base.version),
+            portal.write_bytes('shared.bin', b'charlie', expected=base.version),
+            return_exceptions=True,
+        )
+        _one_winner('write_bytes', outcomes)
+
+    async def test_three_concurrent_removes_on_one_version_have_one_winner(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        await portal.write_text('doomed.txt', 'bye')
+        base = await portal.stat('doomed.txt')
+        assert base is not None
+        outcomes = await asyncio.gather(
+            portal.remove('doomed.txt', expected=base.version),
+            portal.remove('doomed.txt', expected=base.version),
+            portal.remove('doomed.txt', expected=base.version),
+            return_exceptions=True,
+        )
+        assert [outcome for outcome in outcomes if outcome is None] == [None], (
+            f'期望恰好一次删除成功，实际 {outcomes!r}'
+        )
+        assert await portal.stat('doomed.txt') is None
+
+    async def test_three_concurrent_creates_of_one_new_file_have_one_winner(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        outcomes = await asyncio.gather(
+            portal.write_text('fresh.txt', 'delta', expected=None),
+            portal.write_text('fresh.txt', 'alpha', expected=None),
+            portal.write_text('fresh.txt', 'charlie', expected=None),
+            return_exceptions=True,
+        )
+        _one_winner('write_text(expected=None)', outcomes)
 
     async def test_process_operations_are_refused_after_close(self, workspace: Workspace) -> None:
         portal = workspace.portal()
@@ -253,7 +319,10 @@ class WorkspaceContract(ContractSuite):
         first = await _captured(portal, handle, 'tty-yes', since=0)
         await portal.pty_send(handle, 'hello\n')
         later = await _captured(portal, handle, 'got:hello', since=first.end)
-        assert '\x1b' not in later.text and '\r' not in later.text
+        assert later.text == 'hello\ngot:hello\n', (
+            f'期望 since 之后只有这次输入的回显与回答，实际 {later.text!r}：'
+            'pty_capture 没按 since 截。'
+        )
         status = await _settled_terminal(portal, handle)
         assert (status.running, status.exit_code) == (False, 0)
         await portal.pty_kill(handle)
@@ -304,15 +373,9 @@ class WorkspaceContract(ContractSuite):
     ) -> None:
         portal = workspace.portal()
         handle = await portal.pty_create('sleep 300 & echo $! > child.pid; sleep 300', cwd='.')
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _SETTLE_SECONDS
-        while await portal.stat('child.pid') is None:
-            assert loop.time() < deadline, '期望会话在宽限内写出子进程号'
-            await asyncio.sleep(0.02)
-        pid = (await portal.read_text('child.pid', offset=1, limit=1)).strip()
+        pid = await _pid_written(portal, 'child.pid')
         await portal.pty_kill(handle)
-        probe = await portal.run(f'kill -0 {pid} 2>/dev/null', timeout=5, cwd='.')
-        assert probe.exit_code != 0, f'期望 kill 之后会话里的子进程 {pid} 不在了，实际还在'
+        assert await _gone(portal, pid), f'期望 kill 之后会话里的子进程 {pid} 不在了，实际还在'
         await _rejects('kill 之后的 pty_send', lambda: portal.pty_send(handle, 'x\n'))
 
     async def test_killing_a_terminal_that_ignores_term_and_hup_still_leaves_nothing_behind(
@@ -322,15 +385,40 @@ class WorkspaceContract(ContractSuite):
         handle = await portal.pty_create(
             "trap '' TERM HUP; sleep 300 & echo $! > stubborn.pid; sleep 300", cwd='.'
         )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _SETTLE_SECONDS
-        while await portal.stat('stubborn.pid') is None:
-            assert loop.time() < deadline, '期望会话在宽限内写出子进程号'
-            await asyncio.sleep(0.02)
-        pid = (await portal.read_text('stubborn.pid', offset=1, limit=1)).strip()
+        pid = await _pid_written(portal, 'stubborn.pid')
         await portal.pty_kill(handle)
-        probe = await portal.run(f'kill -0 {pid} 2>/dev/null', timeout=5, cwd='.')
-        assert probe.exit_code != 0, f'期望忽略 SIGTERM 的子进程 {pid} 也被收掉，实际还在'
+        assert await _gone(portal, pid), f'期望忽略 SIGTERM 的子进程 {pid} 也被收掉，实际还在'
+
+    async def test_killing_a_terminal_whose_leader_dies_first_still_ends_its_child(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        handle = await portal.pty_create(
+            "(trap '' TERM HUP; sleep 300) & echo $! > child.pid; sleep 300", cwd='.'
+        )
+        pid = await _pid_written(portal, 'child.pid')
+        await portal.pty_kill(handle)
+        assert await _gone(portal, pid), f'期望组长先死之后子进程 {pid} 也被收掉，实际还在'
+
+    async def test_killing_a_terminal_ends_jobs_in_their_own_process_groups(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        handle = await portal.pty_create('set -m; sleep 300 & echo $! > job.pid; wait', cwd='.')
+        pid = await _pid_written(portal, 'job.pid')
+        await portal.pty_kill(handle)
+        assert await _gone(portal, pid), f'期望作业控制下的后台作业 {pid} 也被收掉，实际还在'
+
+    async def test_ctrl_c_interrupts_the_program_in_the_foreground(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        handle = await portal.pty_create('echo started; sleep 300', cwd='.')
+        await _captured(portal, handle, 'started', since=0)
+        await portal.pty_send(handle, '\x03')
+        status = await _settled_terminal(portal, handle)
+        assert status.running is False
+        await portal.pty_kill(handle)
 
     async def test_sending_to_a_finished_terminal_is_refused(self, workspace: Workspace) -> None:
         portal = workspace.portal()
@@ -339,6 +427,35 @@ class WorkspaceContract(ContractSuite):
         assert (status.running, status.exit_code) == (False, 3)
         await _rejects('结束之后的 pty_send', lambda: portal.pty_send(handle, 'x\n'))
         await portal.pty_kill(handle)
+
+
+def _one_winner(action: str, outcomes: Sequence[object]) -> None:
+    winners = [outcome for outcome in outcomes if outcome is None]
+    losers = [outcome for outcome in outcomes if isinstance(outcome, WriteConflict)]
+    assert (len(winners), len(losers)) == (1, 2), (
+        f'期望三次带同一个版本前提的 {action} 恰好一次成功、两次 WriteConflict，实际 {outcomes!r}。'
+        ' 检查与写之间有让出时，必须用原子的写（条件写、锁或事务）。'
+    )
+
+
+async def _pid_written(portal: Portal, name: str) -> str:
+    """等命令把进程号写进文件：文件先被 `>` 建出来、内容稍后才到，读到空串就再等。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _SETTLE_SECONDS
+    while True:
+        if await portal.stat(name) is not None:
+            pid = (await portal.read_text(name, offset=1, limit=1)).strip()
+            if pid.isdigit():
+                return pid
+        assert loop.time() < deadline, f'期望命令在 {_SETTLE_SECONDS} 秒内把进程号写进 {name}'
+        await asyncio.sleep(0.02)
+
+
+async def _gone(portal: Portal, pid: str) -> bool:
+    """进程不在了：查不到它，或它只剩一个僵尸（没有 init 回收孤儿的容器里僵尸会一直留着）。"""
+    probe = await portal.run(f'ps -o stat= -p {pid} 2>/dev/null', timeout=5, cwd='.')
+    state = probe.stdout.strip()
+    return state == '' or state.startswith('Z')
 
 
 async def _captured(portal: Portal, handle: str, needle: str, *, since: int) -> PtyCapture:

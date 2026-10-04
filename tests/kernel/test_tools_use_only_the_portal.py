@@ -14,10 +14,24 @@ import syndica.kernel.tools as tools_package
 
 _TOOLS_DIR = Path(tools_package.__file__).parent
 _FORBIDDEN_MODULES = frozenset(
-    {'importlib', 'io', 'os', 'pathlib', 'pty', 'shutil', 'socket', 'subprocess', 'tempfile'}
+    {
+        'builtins',
+        'importlib',
+        'io',
+        'os',
+        'pathlib',
+        'pty',
+        'shutil',
+        'socket',
+        'subprocess',
+        'sys',
+        'tempfile',
+    }
 )
 _FORBIDDEN_NAMES = frozenset({'open', '__import__', 'exec', 'eval'})
-_FORBIDDEN_ATTRIBUTES = frozenset({'create_subprocess_exec', 'create_subprocess_shell'})
+_FORBIDDEN_ATTRIBUTES = frozenset(
+    {'create_subprocess_exec', 'create_subprocess_shell', 'subprocess_exec', 'subprocess_shell'}
+)
 
 
 def _scanned() -> list[Path]:
@@ -68,14 +82,20 @@ def test_the_guard_flags_a_tool_that_opens_a_file_itself(tmp_path: Path):
     sample.write_text(
         'import subprocess\n'
         'from os import path\n'
+        'import builtins\n'
+        'from sys import modules\n'
         'def f(loop):\n'
         '    open("x")\n'
+        '    loop.subprocess_shell\n'
         '    return loop.create_subprocess_exec\n',
         encoding='utf-8',
     )
     assert {item.split(' ', 1)[1] for item in _violations(sample)} == {
         'import subprocess',
         'from os import ...',
+        'import builtins',
+        'from sys import ...',
         'open',
+        '.subprocess_shell',
         '.create_subprocess_exec',
     }

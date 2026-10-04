@@ -80,6 +80,7 @@ FROZEN_IMPLS = frozenset({'syndica.kernel.agents.orchestrator:Orchestrator'})
 # 它们的结局，回放只替换它们：两边认的是同一份名单。
 REPLAYED_TOOLS = frozenset(
     {'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillBash', 'QueryAgent'}
+    | {'Terminal'}
 )
 # 回放重建得出的危险规则与它们的参数：只有工作区根的两条带参数，`root` 是字面值、`real` 是记录时
 # 解析出的路径（回放不在自己的机器上重新解析符号链接）。

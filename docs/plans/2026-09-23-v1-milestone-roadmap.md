@@ -129,6 +129,12 @@ deferred items」。
 | M-6 | spec 写 `send(..., message)`，实现是 `content` | M12 | API 冻结时按实现改写 spec §4.2 的签名 |
 | M-7 | spec 写 `AgentInfo.type`，实现是 `agent_type` | M12 | 同 M-6（spec §4.3） |
 | M-8 | `WaitState.ABORTED` 的 docstring 缺 D-26 契约 | 已修 | 登记表已关闭 |
+| M5 后续 | `Bash` / `Terminal` 的输出一律不可信，不按命令真实读到的内容收窄溯源 | 沙箱后端 | 用户裁决（2026-10-04）：真正的边界是沙箱化的 Workspace 后端；只有后端知道一条命令读了什么，收窄随它落地 |
+| M5 后续 | `Bash` 写文件绕过乐观并发（版本前提只在 `Write` / `Edit` / 删除上） | 接受 | shell 写了什么只有沙箱后端看得到；下一次 `Write` 照样按版本冲突，文件污点把 shell 写的版本记成不可信 |
+| M5 后续 | 交互式 shell 的历史展开（`!!`）能把一条经人确认过的命令再跑一次而不再问 | 沙箱后端 | `Terminal` 的文本闸挡失手不挡蓄意；授权仅放行当次调用要靠后端隔离兑现 |
+| M5 后续 | 后台跑的只有进程，没有通用的后台工具 | M8 | 长程任务需要它（M5 计划「不做」） |
+| M5 后续 | 拓扑槽的隔离 | M8 | 常驻的槽没有自然的合并时刻；隔离只经 `spawn` / `Delegate` / `Fork` |
+| M5 后续 | 会话拿控制终端的启动器只能在 Linux 上被证明（macOS 不论有没有 `TIOCSCTTY` 都给控制终端） | M12 | CI 恢复后在 Linux 上跑那条变异 |
 | 卫生 | 基础 CI：每次 push 跑与本地一致的门禁 | M2 | 自举开始改代码之前先有自动门禁 |
 | 卫生 | CHANGELOG、PyPI 预发布、版本策略、issue 模板 | M12 | 发布准备 |
 | 卫生 | `.env.example` | 不做 | key 文件不该放在 Agent 操作的工作区里，`Read` / `Grep` 读得到它 |

@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import pytest
 
 from syndica.kernel.driving import _DRIVING_AGENT  # pyright: ignore[reportPrivateUsage]
+from syndica.kernel.errors import ConfigError
 from syndica.kernel.local_workspace import LocalWorkspace
 from syndica.kernel.tools.local import Edit, Read, Write
-from syndica.kernel.workspace import WriteConflict
+from syndica.kernel.workspace import Workspace, WriteConflict
 from syndica.kernel.workspace_router import WorkspaceRouter
 
 T = TypeVar('T')
@@ -31,6 +33,10 @@ async def router(tmp_path: Path) -> AsyncIterator[WorkspaceRouter]:
     routed = WorkspaceRouter(LocalWorkspace(str(tmp_path), shell='/bin/sh', env={}))
     yield routed
     await routed.close()
+
+
+def _digest(data: bytes) -> str:
+    return f'sha256:{hashlib.sha256(data).hexdigest()}'
 
 
 async def _conflict(call: Callable[[], Awaitable[object]]) -> WriteConflict:
@@ -125,25 +131,122 @@ async def test_an_edit_without_a_prior_read_applies_to_the_current_content(
     assert (tmp_path / 'notes.md').read_text() == 'alpha BRAVO'
 
 
-async def test_a_read_that_raced_a_write_is_not_recorded_as_seen(
+async def test_a_write_racing_the_read_leaves_the_version_that_was_read_on_record(
     router: WorkspaceRouter, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / 'notes.md').write_text('before')
-    real_read = LocalWorkspace.read_text
+    real_read = LocalWorkspace.read_versioned
 
-    async def read_then_someone_writes(self: LocalWorkspace, path: str, **kwargs: int) -> str:
-        text = await real_read(self, path, **kwargs)
+    async def read_then_someone_writes(
+        self: LocalWorkspace, path: str, **kwargs: int
+    ) -> tuple[str, str]:
+        answer = await real_read(self, path, **kwargs)
         (tmp_path / 'notes.md').write_text('written while the agent was reading')
-        return text
+        return answer
 
-    monkeypatch.setattr(LocalWorkspace, 'read_text', read_then_someone_writes)
+    monkeypatch.setattr(LocalWorkspace, 'read_versioned', read_then_someone_writes)
     seen = await _as('alpha', lambda: router.read_text('notes.md', offset=1, limit=5))
-    monkeypatch.setattr(LocalWorkspace, 'read_text', real_read)
+    monkeypatch.setattr(LocalWorkspace, 'read_versioned', real_read)
 
     conflict = await _conflict(lambda: _as('alpha', lambda: router.write_text('notes.md', 'x')))
 
     assert seen == 'before'
+    assert (conflict.unread, conflict.expected) == (False, _digest(b'before'))
+    assert (tmp_path / 'notes.md').read_text() == 'written while the agent was reading'
+
+
+async def test_an_edit_without_a_read_does_not_count_as_having_read_the_file(
+    router: WorkspaceRouter, tmp_path: Path
+) -> None:
+    (tmp_path / 'notes.md').write_text('title\nbody nobody read')
+
+    await _as('alpha', lambda: router.edit_text('notes.md', 'title', 'Title'))
+    conflict = await _conflict(lambda: _as('alpha', lambda: router.write_text('notes.md', 'x')))
+
     assert conflict.unread is True
+    assert (tmp_path / 'notes.md').read_text() == 'Title\nbody nobody read'
+
+
+async def test_an_edit_after_a_read_keeps_the_file_on_record_as_seen(
+    router: WorkspaceRouter, tmp_path: Path
+) -> None:
+    (tmp_path / 'notes.md').write_text('title\nbody')
+
+    await _as('alpha', lambda: router.read_text('notes.md', offset=1, limit=5))
+    await _as('alpha', lambda: router.edit_text('notes.md', 'title', 'Title'))
+    await _as('alpha', lambda: router.write_text('notes.md', 'rewritten'))
+
+    assert (tmp_path / 'notes.md').read_text() == 'rewritten'
+
+
+async def test_a_read_refused_for_its_encoding_still_lets_the_agent_overwrite_the_file(
+    router: WorkspaceRouter, tmp_path: Path
+) -> None:
+    (tmp_path / 'blob.txt').write_bytes(b'\xff\xfe not utf-8')
+
+    with pytest.raises(ConfigError):
+        await _as('alpha', lambda: router.read_text('blob.txt', offset=1, limit=5))
+    await _as('alpha', lambda: router.write_text('blob.txt', 'replaced'))
+
+    assert (tmp_path / 'blob.txt').read_text() == 'replaced'
+
+
+async def test_a_read_that_found_nothing_makes_a_file_created_since_a_conflict(
+    router: WorkspaceRouter, tmp_path: Path
+) -> None:
+    with pytest.raises(ConfigError):
+        await _as('alpha', lambda: router.read_text('later.md', offset=1, limit=5))
+    (tmp_path / 'later.md').write_text('someone else got here first')
+
+    conflict = await _conflict(lambda: _as('alpha', lambda: router.write_text('later.md', 'x')))
+
+    assert (conflict.unread, conflict.expected) == (False, None)
+    assert (tmp_path / 'later.md').read_text() == 'someone else got here first'
+
+
+class _Yielding:
+    """每次调用之前先让出一次的后端：远端后端的每一步都隔着一次往返。"""
+
+    def __init__(self, inner: LocalWorkspace) -> None:
+        self._inner = inner
+
+    @property
+    def root(self) -> str:
+        return self._inner.root
+
+    def portal(self) -> _Yielding:
+        return self
+
+    def __getattr__(self, name: str) -> Callable[..., Awaitable[object]]:
+        method = getattr(self._inner, name)
+
+        async def yielding(*args: object, **kwargs: object) -> object:
+            await asyncio.sleep(0)
+            return await method(*args, **kwargs)
+
+        return yielding
+
+
+async def test_two_agents_creating_one_new_file_over_a_yielding_backend_have_one_winner(
+    tmp_path: Path,
+) -> None:
+    local = LocalWorkspace(str(tmp_path), shell='/bin/sh', env={})
+    router = WorkspaceRouter(cast(Workspace, _Yielding(local)))
+    try:
+        outcomes = await asyncio.gather(
+            _as('alpha', lambda: router.write_text('fresh.md', 'alpha')),
+            _as('bravo', lambda: router.write_text('fresh.md', 'bravo')),
+            _as('charlie', lambda: router.write_text('fresh.md', 'charlie')),
+            return_exceptions=True,
+        )
+    finally:
+        await local.close()
+
+    assert sorted(type(outcome).__name__ for outcome in outcomes) == [
+        'NoneType',
+        'WriteConflict',
+        'WriteConflict',
+    ]
 
 
 async def test_removing_an_unread_file_is_a_conflict_and_a_read_one_goes(

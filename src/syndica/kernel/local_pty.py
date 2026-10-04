@@ -1,10 +1,9 @@
 """本地伪终端会话（spec §6.5）。`LocalWorkspace` 的 `pty_*` 方法都落在这里。
 
-会话的从端是子进程的三条流。它会不会成为控制终端取决于平台：`subprocess` 不在 fork 与 exec 之间
-调 `TIOCSCTTY`（只有多线程下不安全的 `preexec_fn` 能做），macOS 上会话首进程仍然拿到了它，Linux 上
-拿不到。拿不到时打开 `/dev/tty` 的程序（`getpass`、`ssh` 的口令）读不到它，内核也不会在窗口大小
-变化时通知进程组，所以 `resize` 自己发 `SIGWINCH`。读 stdin 的程序（REPL、`read`、提示输入）在
-两边都照常工作。只支持 POSIX。
+会话的从端是子进程的三条流，并且是它的控制终端：`subprocess` 不在 fork 与 exec 之间调 `TIOCSCTTY`
+（只有多线程下不安全的 `preexec_fn` 能做），所以会话先经一个只做这一件事的小启动器再 exec 到 shell。
+没有控制终端时 Ctrl-C 找不到前台进程组、打开 `/dev/tty` 的程序读不到它。`resize` 仍然自己发
+`SIGWINCH`：拿不到控制终端的平台上内核不会通知。只支持 POSIX。
 """
 
 from __future__ import annotations
@@ -16,38 +15,54 @@ import os
 import re
 import signal
 import struct
+import sys
 import termios
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
-from syndica.kernel.terminal_text import utf8_prefix_length
+from syndica.kernel.terminal_text import UNSAFE_TEXT, utf8_prefix_length
 from syndica.kernel.workspace import PtyCapture, PtyStatus
 
 __all__ = ['PtySessions']
 
-# 一个工作区同时开着的会话数上限：每个会话占一对 fd 与一棵进程树。
-_MAX_SESSIONS: int = 8
+# 一个 Agent 同时开着的会话数上限，以及整个工作区的上限：每个会话占一对 fd 与一棵进程树；只有整个
+# 工作区一个上限时，一个 Agent 就能占满它，别的 Agent 连该结束谁都不知道。
+_MAX_PER_AGENT: int = 8
+_MAX_SESSIONS: int = 32
 # 每个会话在内核里最多留的字节：开头一段加结尾一段，与命令输出同一个思路。
 _KEEP_HEAD: int = 64 * 1024
 _KEEP_TAIL: int = 448 * 1024
-# kill 先发 SIGTERM，宽限这么久再 SIGKILL：交互式程序常常要收尾（写历史、恢复终端设置）。
+# kill 先发 SIGHUP 与 SIGTERM，宽限这么久再 SIGKILL：交互式程序常常要收尾（写历史、恢复终端设置）。
 _TERM_GRACE: float = 0.5
 _KILL_GRACE: float = 1.0
 _CHUNK: int = 64 * 1024
 _MAX_WAIT: float = 60.0
+_PS = ('/bin/ps', '/usr/bin/ps')
+# 启动器：让伪终端成为这个新会话的控制终端，然后 exec 到 shell。拿不到时照常起 shell。
+_CONTROLLING_TTY = (
+    'import fcntl, os, sys, termios\n'
+    'try:\n'
+    '    fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n'
+    'except OSError:\n'
+    '    pass\n'
+    'os.execv(sys.argv[1], sys.argv[1:])\n'
+)
 
 # 去掉的控制序列：CSI（颜色、光标）、OSC（标题、超链接）、其余 ESC 序列（中间字节加一个终止字节，
 # 如 `ESC =`、`ESC ( B`）；再去掉除换行与制表之外的 C0 控制符。交给模型的是文字，不是给终端画屏的
-# 指令。
+# 指令。之后再按 `UNSAFE_TEXT` 去掉 C1 与双向文字控制符。
 _CONTROL = re.compile(
     r'\x1b\[[0-?]*[ -/]*[@-~]'
     r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'
     r'|\x1b[ -/]*[0-~]'
     r'|[\x00-\x08\x0b-\x1f\x7f]'
 )
+# 还没收完的 ESC 序列：还在跑的会话里它留到下一次，不然参数会作为文字漏出去（`ESC[3` | `1m`）。
+_OPEN_ESCAPE = re.compile(rb'\x1b(?:\[[0-?]*[ -/]*|\][^\x07\x1b]{0,512}|[ -/]*)$')
 
 
 @dataclass(eq=False)
@@ -56,6 +71,7 @@ class _Session:
     master: int
     cols: int
     rows: int
+    owner: str | None
     head: bytearray = field(default_factory=bytearray)
     tail: bytearray = field(default_factory=bytearray)
     dropped: int = 0
@@ -80,10 +96,10 @@ class _Session:
 
     def since(self, offset: int, *, settled: bool) -> tuple[str, bool, int]:
         """(`offset` 之后的输出去掉控制序列之后的文字, 这一段里是否有被丢弃的字节,
-        交出的部分结束在哪)。还在跑的会话末尾不完整的 utf-8 字符留到下一次。"""
+        交出的部分结束在哪)。还在跑的会话末尾不完整的字符与控制序列留到下一次。"""
         if not self.dropped:
             data = bytes(self.head + self.tail)[offset:]
-            keep = len(data) if settled else utf8_prefix_length(data)
+            keep = len(data) if settled else _complete(data)
             return _plain(data[:keep]), False, max(offset, offset + keep)
         head_end = len(self.head)
         tail_start = head_end + self.dropped
@@ -95,14 +111,20 @@ class _Session:
             parts.append(f'\n…[这个会话中间 {lost} 个字节的输出没有保留]…\n')
         tail_from = max(0, offset - tail_start)
         data = bytes(self.tail[tail_from:])
-        keep = len(data) if settled else utf8_prefix_length(data)
+        keep = len(data) if settled else _complete(data)
         parts.append(_plain(data[:keep]))
         return ''.join(parts), bool(lost), max(offset, tail_start + tail_from + keep)
 
 
+def _complete(data: bytes) -> int:
+    keep = utf8_prefix_length(data)
+    unfinished = _OPEN_ESCAPE.search(data[:keep])
+    return keep if unfinished is None else unfinished.start()
+
+
 def _plain(data: bytes) -> str:
     text = data.decode('utf-8', errors='replace').replace('\r\n', '\n')
-    return _CONTROL.sub('', text)
+    return UNSAFE_TEXT.sub('', _CONTROL.sub('', text))
 
 
 def _size(cols: object, rows: object) -> tuple[int, int]:
@@ -125,27 +147,98 @@ def _signal_group(pid: int, signum: int) -> None:
         os.killpg(pid, signum)
 
 
+def _signal_process(pid: int, signum: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signum)
+
+
+async def _descendants(leader: int, program: str | None) -> set[tuple[int, int]]:
+    """leader 此刻的全部后代（进程号, 进程组号）。交互式 shell 开着作业控制，每个 `cmd &` 都在
+    自己的进程组里，只杀会话首进程的组杀不到它们；leader 一死它们就过继给 init，再也找不回来，
+    所以要在发信号之前取。没有 `ps`（`program` 为 None）时交回空集，退回只杀会话首进程的组。"""
+    if program is None:
+        return set()
+    try:
+        listing = await asyncio.create_subprocess_exec(
+            program,
+            '-A',
+            '-o',
+            'pid=,ppid=,pgid=',
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env={},
+        )
+        output, _ = await listing.communicate()
+    except OSError:
+        return set()
+    children: dict[int, list[tuple[int, int]]] = {}
+    for line in output.decode('ascii', errors='replace').splitlines():
+        fields = line.split()
+        if len(fields) == 3 and all(item.isdigit() for item in fields):
+            pid, parent, group = (int(item) for item in fields)
+            children.setdefault(parent, []).append((pid, group))
+    found: set[tuple[int, int]] = set()
+    pending = [leader]
+    while pending:
+        for pid, group in children.get(pending.pop(), []):
+            if (pid, group) not in found:
+                found.add((pid, group))
+                pending.append(pid)
+    return found
+
+
 class PtySessions:
     """一个工作区的全部伪终端会话。"""
 
     def __init__(self, *, shell: str, env: dict[str, str]) -> None:
         self._shell = shell
-        self._env = env
+        # 交互式 shell 会读写用户 HOME 下的历史文件：会话里敲过的命令不该落进宿主用户的历史。
+        self._env = {**env, 'HISTFILE': '/dev/null'}
         self._sessions: dict[str, _Session] = {}
+        self._ps = next((path for path in _PS if os.path.exists(path)), None)
 
     async def create(self, command: str, *, cwd: Path, cols: int, rows: int) -> str:
         cols, rows = _size(cols, rows)
-        if len(self._sessions) >= _MAX_SESSIONS:
+        owner = driving_agent()
+        mine = sorted(
+            handle for handle, session in self._sessions.items() if session.owner == owner
+        )
+        if len(mine) >= _MAX_PER_AGENT or len(self._sessions) >= _MAX_SESSIONS:
             raise ConfigError(
-                expected=f'同时开着的终端会话不超过 {_MAX_SESSIONS} 个',
-                received=f'已经有 {len(self._sessions)} 个',
-                next_action='先用 Terminal 的 kill 结束不再需要的会话，再开新的',
+                expected=(
+                    f'每个 Agent 同时开着的终端会话不超过 {_MAX_PER_AGENT} 个，'
+                    f'整个工作区不超过 {_MAX_SESSIONS} 个'
+                ),
+                received=f'你开着 {len(mine)} 个，工作区一共 {len(self._sessions)} 个',
+                next_action=(
+                    '先用 Terminal 的 kill 结束不再需要的会话'
+                    f'（你开着的：{", ".join(mine) or "无"}），再开新的'
+                ),
             )
+        spawning = asyncio.ensure_future(self._spawn(command, cwd=cwd, cols=cols, rows=rows))
+        try:
+            process, master = await asyncio.shield(spawning)
+        except BaseException:
+            spawning.add_done_callback(_abandon)
+            raise
+        session = _Session(process=process, master=master, cols=cols, rows=rows, owner=owner)
+        handle = uuid.uuid4().hex
+        self._sessions[handle] = session
+        asyncio.get_running_loop().add_reader(master, self._readable, session)
+        return handle
+
+    async def _spawn(
+        self, command: str, *, cwd: Path, cols: int, rows: int
+    ) -> tuple[asyncio.subprocess.Process, int]:
+        """拉起会话。取消不会打断拉起本身：进程一旦起来就一定有人收拾它（见 `create`）。"""
+        launcher = (sys.executable, '-c', _CONTROLLING_TTY) if sys.executable else ()
         master, slave = os.openpty()
         try:
             _set_window(slave, cols, rows)
             os.set_blocking(master, False)
             process = await asyncio.create_subprocess_exec(
+                *launcher,
                 self._shell,
                 '-c',
                 command,
@@ -167,11 +260,7 @@ class PtySessions:
             raise
         finally:
             os.close(slave)
-        session = _Session(process=process, master=master, cols=cols, rows=rows)
-        handle = uuid.uuid4().hex
-        self._sessions[handle] = session
-        asyncio.get_running_loop().add_reader(master, self._readable, session)
-        return handle
+        return process, master
 
     def _readable(self, session: _Session) -> None:
         try:
@@ -195,11 +284,7 @@ class PtySessions:
     def _session(self, handle: str) -> _Session:
         session = self._sessions.get(handle)
         if session is None:
-            raise ConfigError(
-                expected='handle 是本工作区 Terminal create 交回的会话句柄',
-                received=f'收到未知 handle={handle!r}（可能已经 kill 掉了）',
-                next_action='用 create 交回的 handle；会话 kill 之后要重新 create',
-            )
+            raise _unknown(handle)
         return session
 
     async def send(self, handle: str, data: str) -> None:
@@ -273,9 +358,12 @@ class PtySessions:
         )
 
     async def kill(self, handle: str) -> None:
-        session = self._session(handle)
+        # 先摘掉再收拾：并发的第二次 kill 或 close 拿不到它，于是同一个会话只被收拾一次——第二次
+        # 关 fd 关的可能已经是别人刚打开的同号 fd，第二次按组号发 SIGKILL 杀的可能已经是别人的组。
+        session = self._sessions.pop(handle, None)
+        if session is None:
+            raise _unknown(handle)
         await self._terminate(session)
-        del self._sessions[handle]
 
     async def close(self) -> None:
         sessions = list(self._sessions.values())
@@ -285,18 +373,42 @@ class PtySessions:
 
     async def _terminate(self, session: _Session) -> None:
         process = session.process
+        family = await _descendants(process.pid, self._ps)
+        groups = {process.pid} | {group for _, group in family}
         if process.returncode is None:
-            _signal_group(process.pid, signal.SIGTERM)
-            try:
+            # SIGHUP 在先：交互式 shell 会把它转给自己的作业，程序也借它收尾。
+            for group in groups:
+                _signal_group(group, signal.SIGHUP)
+                _signal_group(group, signal.SIGTERM)
+            with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(_TERM_GRACE):
                     await process.wait()
-            except TimeoutError:
-                pass
-        # 组长退出了组里也可能还有进程（`cmd &`）：无条件杀整个组，与命令执行同一个判据。
-        _signal_group(process.pid, signal.SIGKILL)
+        # 组长退出了组里也可能还有进程：无条件杀每一个组与每一个后代，与命令执行同一个判据。
+        for group in groups:
+            _signal_group(group, signal.SIGKILL)
+        for pid, _ in family:
+            _signal_process(pid, signal.SIGKILL)
         with contextlib.suppress(TimeoutError):
             async with asyncio.timeout(_KILL_GRACE):
                 await process.wait()
         self._stop_reading(session)
         with contextlib.suppress(OSError):
             os.close(session.master)
+
+
+def _unknown(handle: str) -> ConfigError:
+    return ConfigError(
+        expected='handle 是本工作区 Terminal create 交回的会话句柄',
+        received=f'收到未知 handle={handle!r}（可能已经 kill 掉了）',
+        next_action='用 create 交回的 handle；会话 kill 之后要重新 create',
+    )
+
+
+def _abandon(spawning: asyncio.Future[tuple[asyncio.subprocess.Process, int]]) -> None:
+    """拉起途中被取消的会话：拉起一完成就杀掉它的组并关掉主端。"""
+    if spawning.cancelled() or spawning.exception() is not None:
+        return
+    process, master = spawning.result()
+    _signal_group(process.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        os.close(master)

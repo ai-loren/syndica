@@ -464,8 +464,9 @@ pattern would block every commit. Patterns run inside the host process like the 
 - File tools (Read, Write, Edit, and Glob or Grep pointed at them) cannot reach `.syndica/traces`
   or `.syndica/handoffs`, in any letter case or through a symlink. Traces hold tool output that was
   marked untrusted, and reading it back with a file tool would make it trusted; handoff files are
-  the host's to write. Commands still reach both; the real boundary is the sandbox planned for
-  Milestone 5. The rest of `.syndica/`, such as `.syndica/tmp/`, stays usable.
+  the host's to write. Commands still reach both; the real boundary is a sandboxed workspace
+  backend (the kernel defines the `Workspace` / `Portal` protocol and its contract suite; the
+  sandbox is a backend). The rest of `.syndica/`, such as `.syndica/tmp/`, stays usable.
 - A command that touches a path outside the workspace asks you while the agent has not yet read any
   command output. After that, the trajectory counts as untrusted and such commands are rejected;
   `--flag untrusted_high_risk=ask` asks instead. `untrusted_high_risk=allow` is refused.
@@ -521,8 +522,8 @@ persuaded to evade them: code it writes or runs (`python -c`, a script, `ssh`, a
 verifies) can read any file your user can
 read, reach the network, read the host process's environment and your login keychain, and use
 credential files under `HOME` (`~/.netrc`, `~/.npmrc`). Processes that call `setsid` escape process
-group cleanup. The real boundary is the sandbox planned for Milestone 5; until then, use development
-mode only on trusted input such as your own repository and prompts.
+group cleanup. The real boundary is a sandboxed workspace backend; with the local workspace, use
+development mode only on trusted input such as your own repository and prompts.
 
 ## Observability
 
@@ -590,7 +591,7 @@ kernel `Redactor` first: secret-looking values from the host environment, built-
 formats (private keys, `Authorization` headers, URL user info, common token formats, secret-named
 assignments), and your own `redaction.rules`. Each match becomes `[REDACTED:<rule id>]`. The
 agent's file tools cannot read or write `.syndica/traces` or `.syndica/handoffs`; its shell can,
-until the sandbox of milestone 5.
+unless the workspace backend sandboxes it.
 
 ## CLI Reference
 

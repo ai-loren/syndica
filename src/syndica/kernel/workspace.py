@@ -100,9 +100,10 @@ class WriteConflict(Exception):
         self.unread = unread
         if unread:
             message = (
-                f'期望: 覆盖 {path} 之前读过它。实际: 它已经存在（版本 {current}），'
-                '而你还没读过它，写下去就会盖掉你没看过的内容。'
-                ' 下一步: 先用 Read 读它，在最新的内容上再写；或者写到一个新路径。'
+                f'期望: 改动 {path}（覆盖或删除）之前读过它。实际: 它已经存在（版本 {current}），'
+                '而你还没读过它，改下去就会丢掉你没看过的内容。'
+                ' 下一步: 先用 Read 读它（读不出来的大文件或二进制文件，Read 一次也算看过），'
+                '在最新的内容上再改；或者写到一个新路径。'
             )
         else:
             wanted = '不存在' if expected is None else f'版本是 {expected}'
@@ -122,6 +123,11 @@ class Portal(Protocol):
     """
 
     async def read_text(self, path: str, *, offset: int, limit: int) -> str: ...
+
+    async def read_versioned(self, path: str, *, offset: int, limit: int) -> tuple[str, str]:
+        """`read_text` 加上读到的那份内容的版本。两者出自同一次读：分两步（先 `stat` 再读）
+        时中间插进来的一次写，会让调用方以为自己看过它没看过的内容。"""
+        ...
 
     async def write_text(self, path: str, content: str, *, expected: Expected = ANY) -> None: ...
 

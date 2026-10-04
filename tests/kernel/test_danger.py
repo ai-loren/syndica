@@ -509,8 +509,20 @@ def test_a_wrapped_lookup_of_a_dangerous_name_is_not_running_it(command: str):
 
 @pytest.mark.parametrize(
     'command',
-    ['command sudo ls', 'command -p sudo ls', 'time sudo ls', 'command -pv sudo'],
-    ids=['plain_command', 'command_p', 'time', 'unrecognised_cluster'],
+    [
+        'command sudo ls',
+        'command -p sudo ls',
+        'time sudo ls',
+        'command -pv sudo',
+        'command sudo grep -v x /etc/shadow',
+    ],
+    ids=[
+        'plain_command',
+        'command_p',
+        'time',
+        'unrecognised_cluster',
+        'describing_flag_belongs_to_the_wrapped_program',
+    ],
 )
 def test_a_wrapper_that_runs_or_may_run_the_program_still_counts_it(command: str):
     assert _judge(command).rule_id == 'shell.privilege_escalation'
