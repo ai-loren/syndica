@@ -735,7 +735,10 @@ def test_a_failed_copy_leaves_nothing_behind(
         _isolator(tmp_path).isolate(root, 'alpha', 'worktree')
 
     monkeypatch.setattr(Path, 'read_bytes', real)
-    assert sorted(path.name for path in (root / '.syndica').rglob('*')) in ([], ['worktrees'])
+    assert sorted(path.name for path in (root / '.syndica').rglob('*')) in (
+        [],
+        ['.gitignore', 'worktrees'],
+    )
 
 
 def test_isolating_an_id_again_does_not_stack_on_a_stale_copy(root: Path, tmp_path: Path) -> None:
@@ -883,3 +886,18 @@ async def test_the_three_way_write_back_keeps_its_precondition_across_the_merge(
 
     assert [conflict.path for conflict in report.conflicts] == ['notes.md']
     assert (root / 'notes.md').read_text() == 'changed during the merge\n'
+
+
+def test_a_symlinked_copy_directory_is_refused_and_nothing_is_copied_outside(
+    root: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / 'elsewhere'
+    outside.mkdir()
+    (root / '.syndica').mkdir()
+    (root / '.syndica' / 'snapshots').symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ConfigError) as refused:
+        _isolator(tmp_path, git=None).isolate(root, 'alpha', 'snapshot')
+
+    assert '符号链接' in refused.value.received
+    assert list(outside.iterdir()) == []

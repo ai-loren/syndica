@@ -70,9 +70,15 @@ class VersionStore:
     def location(self) -> Path:
         return self._dir
 
+    def _checked(self) -> None:
+        """`.syndica` 与 `.syndica/vcs` 必须是工作区里的真目录：任何一级是符号链接，对象就写到了
+        工作区之外，或写进一个别人随时换得掉的地方。"""
+        _require_real_directories(self._root, (self._dir.parent, self._dir))
+
     def record(self, path: str, data: bytes, *, producer: str) -> VersionEntry | None:
         """记下 `path` 此刻的内容。超过大小上限、或路径本身像密钥（路径照原样进 tree 对象，没法
         脱敏）时不记、交回 None 并记一条警告。"""
+        self._checked()
         relative = self._relative(path)
         if self._redactor.redact(relative) != relative:
             logger.warning('版本层没有记下这个文件：它的路径像是含有密钥，这一版不能回滚')
@@ -114,6 +120,7 @@ class VersionStore:
 
     def record_removal(self, path: str, *, producer: str) -> VersionEntry | None:
         """记下 `path` 被删掉了。版本层里本来就没有它时什么也不记，交回 None。"""
+        self._checked()
         relative = self._relative(path)
         head = self._head()
         if head is None or self._blob_at(self._read_commit(head).tree, relative) is None:
@@ -130,6 +137,7 @@ class VersionStore:
 
     def history(self, path: str) -> list[VersionEntry]:
         """`path` 的每一次变化，新的在前。"""
+        self._checked()
         relative = self._relative(path)
         entries: list[VersionEntry] = []
         cursor = self._head()
@@ -152,6 +160,7 @@ class VersionStore:
 
     def content(self, path: str, version: str) -> bytes:
         """`path` 在 `version` 时的原文。"""
+        self._checked()
         relative = self._relative(path)
         for entry in self.history(relative):
             if entry.version == version:
@@ -372,6 +381,8 @@ class VersionStore:
         if not head.exists():
             (self._dir / 'refs' / 'tags').mkdir(parents=True, exist_ok=True)
             head.write_text(f'ref: {_REF}\n', encoding='ascii')
+            # 版本层在用户的工作区里：不让它出现在 `git status` 里，也不被宿主的自动提交带走。
+            (self._dir / '.gitignore').write_text('*\n', encoding='ascii')
         ref = self._dir / _REF
         temporary = ref.with_name(f'.syndica.{os.getpid()}.tmp')
         temporary.write_text(f'{commit}\n', encoding='ascii')
@@ -428,6 +439,16 @@ class _Lock:
         if self._fd is not None:
             os.close(self._fd)
         self._path.unlink(missing_ok=True)
+
+
+def _require_real_directories(root: Path, folders: tuple[Path, ...]) -> None:
+    for folder in folders:
+        if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+            raise ConfigError(
+                expected=f'{folder.relative_to(root)} 是工作区里的真目录',
+                received='它是符号链接，或者不是目录',
+                next_action=f'删掉 {folder}；宿主会在下一次用到时重建它',
+            )
 
 
 def _version(data: bytes) -> str:

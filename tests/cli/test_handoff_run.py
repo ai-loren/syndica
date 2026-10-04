@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -88,7 +89,7 @@ def _config(
         '  - name: Lead',
         '    description: leads',
         '    system_prompt: lead.md',
-        '    tools: [Write, Edit, Bash]',
+        '    tools: [Read, Write, Edit, Bash]',
         '    subagents: [Reviewer]',
     ]
     if workspace:
@@ -415,7 +416,10 @@ def test_a_file_changed_before_the_run_and_again_during_it_is_called_out(tmp_pat
     llm = ScriptedLLM(
         [
             ScriptedTurn(
-                tool_calls=[_call('w', 'Write', path='src/keep.py', content='KEEP = 3\n')]
+                tool_calls=[
+                    _call('r', 'Read', path='src/keep.py'),
+                    _call('w', 'Write', path='src/keep.py', content='KEEP = 3\n'),
+                ]
             ),
             ScriptedTurn(content='done'),
         ]
@@ -1221,7 +1225,9 @@ def test_the_config_loaded_at_the_start_is_the_one_used_for_verify_and_protected
         [
             ScriptedTurn(
                 tool_calls=[
+                    _call('rc', 'Read', path='.syndica.yaml'),
                     _call('c', 'Write', path='.syndica.yaml', content=forged),
+                    _call('rk', 'Read', path='src/keep.py'),
                     _call('k', 'Write', path='src/keep.py', content='KEEP = 9\n'),
                 ]
             ),
@@ -1241,7 +1247,10 @@ def test_a_human_edit_the_agent_reverted_is_called_out(tmp_path: Path):
     llm = ScriptedLLM(
         [
             ScriptedTurn(
-                tool_calls=[_call('w', 'Write', path='src/keep.py', content='KEEP = 1\n')]
+                tool_calls=[
+                    _call('r', 'Read', path='src/keep.py'),
+                    _call('w', 'Write', path='src/keep.py', content='KEEP = 1\n'),
+                ]
             ),
             ScriptedTurn(content='done'),
         ]
@@ -1551,3 +1560,82 @@ def test_a_handoff_whose_trace_lost_records_says_the_trace_is_incomplete(tmp_pat
     [directory] = llm.locked
     assert f'`.syndica/traces/{directory.name}`\n\n不完整：有记录没写进去' in document
     assert len([line for line in run.stderr.splitlines() if line.startswith('期望: trace ')]) == 1
+
+
+def _versions_config(tmp_path: Path, versions: bool) -> Path:
+    path = _config(tmp_path)
+    path.write_text(
+        path.read_text(encoding='utf-8') + f'workspace: {{"versions": {str(versions).lower()}}}\n',
+        encoding='utf-8',
+    )
+    return path
+
+
+def test_a_run_records_its_writes_in_the_version_layer_and_keeps_it_out_of_git(tmp_path: Path):
+    from syndica.kernel.redaction import RuleRedactor
+    from syndica.kernel.versions import VersionStore
+
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, _reviewed(), config=_versions_config(tmp_path, True), root=root)
+
+    history = VersionStore(root, redactor=RuleRedactor()).history('src/new.py')
+    assert run.code == 0
+    assert [entry.version for entry in history] == [
+        'sha256:' + hashlib.sha256(b'NEW = 1\n').hexdigest()
+    ]
+    assert (root / '.syndica' / 'vcs' / '.gitignore').read_text(encoding='utf-8') == '*\n'
+
+
+def test_versions_off_leaves_no_version_layer(tmp_path: Path):
+    root = _workspace(tmp_path)
+
+    run = _run(tmp_path, _reviewed(), config=_versions_config(tmp_path, False), root=root)
+
+    assert run.code == 0
+    assert (root / 'src' / 'new.py').exists()
+    assert not (root / '.syndica' / 'vcs').exists()
+
+
+def test_the_file_tools_cannot_reach_the_version_layer(tmp_path: Path):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    _call('w', 'Write', path='.syndica/vcs/refs/heads/syndica', content='forged\n')
+                ]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    _run(tmp_path, llm, config=_versions_config(tmp_path, True), root=root)
+
+    ref = root / '.syndica' / 'vcs' / 'refs' / 'heads' / 'syndica'
+    assert not ref.exists() or ref.read_text(encoding='utf-8') != 'forged\n'
+
+
+def test_a_script_a_command_wrote_earlier_in_the_run_is_not_run_by_a_later_command(
+    tmp_path: Path,
+):
+    root = _workspace(tmp_path)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    _call('p', 'Bash', command='printf "echo planted-ran\\n" > planted.sh'),
+                ]
+            ),
+            ScriptedTurn(tool_calls=[_call('s', 'Bash', command='sh planted.sh')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    _run(tmp_path, llm, config=_versions_config(tmp_path, True), root=root)
+
+    [_, _, request] = llm.calls[:3]
+    ran = request[-1].content
+    assert isinstance(ran, str)
+    assert 'planted-ran' not in ran
+    assert 'planted.sh' in ran

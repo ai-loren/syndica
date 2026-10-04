@@ -62,7 +62,7 @@ _ROOT_KEYS = frozenset(
 )
 _DANGER_KEYS = frozenset({'roles'})
 _ROLE_DANGER_KEYS = frozenset({'rules', 'policy'})
-_WORKSPACE_KEYS = frozenset({'pass_env', 'verify', 'protected'})
+_WORKSPACE_KEYS = frozenset({'pass_env', 'verify', 'protected', 'versions'})
 _REDACTION_KEYS = frozenset({'rules'})
 _TRACE_KEYS = frozenset({'level'})
 _RULE_KEYS = frozenset({'id', 'pattern'})
@@ -152,15 +152,17 @@ _UniqueSafeLoader.add_constructor(
 
 @dataclass(frozen=True)
 class WorkspaceConfig:
-    """`.syndica.yaml` 的 `workspace:` 段。三项都可省略。
+    """`.syndica.yaml` 的 `workspace:` 段。四项都可省略。
 
     `pass_env` 是固定白名单之外再交给 Agent 的环境变量名；`verify` 是宿主复核与 `doctor --verify`
-    逐条运行的命令；`protected` 是改了就不自动提交的相对路径 glob。
+    逐条运行的命令；`protected` 是改了就不自动提交的相对路径 glob；`versions` 打开版本层与隔离
+    （缺省打开；关掉时没有版本、没有隔离，文件污点照旧，不放松任何安全判据）。
     """
 
     pass_env: tuple[str, ...] = ()
     verify: tuple[str, ...] = ()
     protected: tuple[str, ...] = ()
+    versions: bool = True
 
 
 @dataclass(frozen=True)
@@ -433,7 +435,7 @@ def _redaction(value: object) -> tuple[RedactionRule, ...]:
 def _workspace(value: object) -> WorkspaceConfig:
     if not isinstance(value, Mapping):
         raise _config(
-            'workspace 是只含 pass_env / verify / protected 的 Mapping',
+            'workspace 是只含 pass_env / verify / protected / versions 的 Mapping',
             f'收到 workspace={value!r}，类型是 {type(value).__name__}',
             '写成 `workspace: {verify: [...]}`；不需要就省略整段',
         )
@@ -497,10 +499,18 @@ def _workspace(value: object) -> WorkspaceConfig:
                 f'收到 {pattern!r}',
                 '改成相对路径，例如 pyproject.toml 或 scripts/**',
             )
+    versions = fields.get('versions', True)
+    if not isinstance(versions, bool):
+        raise _config(
+            'workspace.versions 是 true 或 false',
+            f'收到 {versions!r}，类型是 {type(versions).__name__}',
+            '写成 `versions: false` 关掉版本层与隔离；要打开就省略它',
+        )
     return WorkspaceConfig(
         pass_env=pass_env,
         verify=_strings(fields.get('verify', ()), 'workspace.verify'),
         protected=protected,
+        versions=versions,
     )
 
 

@@ -712,3 +712,23 @@ def test_an_explicit_prompt_file_that_is_missing_fails_the_config_load(tmp_path:
     with pytest.raises(ConfigError) as excinfo:
         load_config(path)
     assert '不存在或不是文件' in excinfo.value.received
+
+
+@pytest.mark.parametrize(('text', 'expected'), [('', True), ('versions: false\n', False)])
+def test_workspace_versions_defaults_on_and_can_be_turned_off(
+    tmp_path: Path, text: str, expected: bool
+) -> None:
+    body = 'version: 1\n' + (f'workspace:\n  {text}' if text else '')
+    config = load_config(_write(tmp_path / '.syndica.yml', body))
+
+    assert config.workspace.versions is expected
+
+
+@pytest.mark.parametrize('value', ['"no"', '0', '[]'], ids=['string', 'number', 'list'])
+def test_workspace_versions_that_is_not_a_boolean_is_refused(tmp_path: Path, value: str) -> None:
+    path = _write(tmp_path / '.syndica.yml', f'version: 1\nworkspace:\n  versions: {value}\n')
+
+    with pytest.raises(ConfigError) as refused:
+        load_config(path)
+
+    assert 'workspace.versions' in refused.value.expected

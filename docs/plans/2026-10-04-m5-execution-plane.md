@@ -339,7 +339,7 @@ D11、D12。规则表每个新成员各有一条用例；安全矩阵全格；`{
 
 ### 阶段四：接线与收口
 
-#### T10 — CLI 接线
+#### T10 — CLI 接线（完成，见决策日志）
 
 `workspace.versions`、私有目录、`Terminal` 进工具表（`--no-write` 的白名单不变）、路由交给 Runtime、回放
 （桩照记录交回结果与 `trust`；版本层在回放的临时工作区里同样打开）。
@@ -414,3 +414,9 @@ D11、D12。规则表每个新成员各有一条用例；安全矩阵全格；`{
   提到 HIGH（`exec.untrusted_script`）、溯源记成不可信，于是走强制升级、`AllowAll` 也拦。只看工作区内的相对
   路径：`/usr/bin/x` 不是工作区的内容，按不可信算会让每一条写全路径的命令升级。安全矩阵按自己的表算期望，
   54 格逐格断言处置、有没有问人与低风险放行的记录。
+- 2026-10-05：T10 的 CLI 接线：run / chat / doctor 共用的 `_open_workspace` 交回路由（文件污点总开；
+  `workspace.versions` 缺省打开版本层与隔离，git 由宿主按自己的 PATH 找、临时目录由宿主给），run 与 chat 的
+  Runtime 拿到它；`.syndica/vcs`、`worktrees`、`snapshots` 进文件工具的私有目录，`.syndica/.gitignore` 在打开时
+  补上。接线让「没读过就覆盖是冲突」第一次落到 CLI 上：只给了 Write 没给 Read 的角色改不了已有文件，冲突
+  消息于是写明「没有 Read 就用 Edit」；几条 CLI 用例的脚本改成先读再写。回放照旧：文件工具在回放里是桩，
+  版本层与它无关。

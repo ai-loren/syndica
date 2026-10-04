@@ -23,6 +23,7 @@ from typing import Final
 
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.local_workspace import LocalWorkspace
+from syndica.kernel.versions import _require_real_directories  # pyright: ignore[reportPrivateUsage]
 from syndica.kernel.workspace import Portal, WriteConflict
 
 __all__ = ['ISOLATIONS', 'IsolatedCopy', 'LocalIsolator', 'MergeConflict', 'MergeReport']
@@ -197,7 +198,14 @@ class LocalIsolator:
             if folder is not None
         ]
         base: dict[str, str] = {}
+        ignore = location.parent / '.gitignore'
+        # 任何一级是符号链接，副本就拷到了工作区之外，合并时又从那里读回来。
+        _require_real_directories(root, (root / '.syndica', location.parent))
         try:
+            location.parent.mkdir(parents=True, exist_ok=True)
+            if not ignore.exists():
+                # 副本在用户的工作区里：不让它们出现在 `git status` 里，也不被宿主的自动提交带走。
+                ignore.write_text('*\n', encoding='ascii')
             for _, scratch in building:
                 shutil.rmtree(scratch, ignore_errors=True)
                 scratch.mkdir(parents=True)

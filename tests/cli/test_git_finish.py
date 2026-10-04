@@ -60,6 +60,11 @@ def _write(path: str, content: str = 'NEW = 1\n', call_id: str = 'w') -> ToolCal
     return _call(call_id, 'Write', path=path, content=content)
 
 
+def _overwrite(path: str, content: str) -> tuple[ToolCall, ToolCall]:
+    """覆盖一个已存在的文件：先读再写，没读过就覆盖是冲突（M5 D2）。"""
+    return _call('r', 'Read', path=path), _write(path, content)
+
+
 def _env(tmp_path: Path) -> dict[str, str]:
     home = tmp_path / 'home'
     (home / 'hooks').mkdir(parents=True, exist_ok=True)
@@ -148,7 +153,7 @@ def _config(tmp_path: Path, verify: Sequence[str] | None, protected: list[str] |
         '  - name: Lead',
         '    description: leads',
         '    system_prompt: lead.md',
-        '    tools: [Write, Edit, Bash]',
+        '    tools: [Read, Write, Edit, Bash]',
         '    subagents: [Reviewer]',
     ]
     if workspace:
@@ -1577,7 +1582,7 @@ def test_a_file_changed_before_the_run_and_again_is_not_offered_anything(tmp_pat
     root = _repository(tmp_path)
     (root / 'src' / 'keep.py').write_text('KEEP = 2\n', encoding='utf-8')
 
-    run = _run(tmp_path, _script(_write('src/keep.py', 'KEEP = 3\n')), root=root, stdin='2\n')
+    run = _run(tmp_path, _script(*_overwrite('src/keep.py', 'KEEP = 3\n')), root=root, stdin='2\n')
 
     assert run.git == 'not_offered'
     assert '- 有运行前就改过、这次又被改的文件' in run.stdout
@@ -1587,7 +1592,7 @@ def test_a_file_ignored_before_the_run_showing_up_is_not_offered_anything(tmp_pa
     root = _repository(tmp_path)
     (root / '.env').write_text('LOCAL=1\n', encoding='utf-8')
 
-    run = _run(tmp_path, _script(_write('.gitignore', '# nothing\n')), root=root, stdin='2\n')
+    run = _run(tmp_path, _script(*_overwrite('.gitignore', '# nothing\n')), root=root, stdin='2\n')
 
     assert run.git == 'not_offered'
     assert '- 运行前被忽略的文件出现在改动里：.env' in run.stdout
@@ -1717,7 +1722,9 @@ def test_odd_file_names_are_committed_as_themselves_and_nothing_runs(tmp_path: P
 def test_a_protected_path_change_is_listed_and_left_to_the_human(tmp_path: Path):
     root = _repository(tmp_path)
 
-    run = _run(tmp_path, _script(_write('.gitignore', '.env\n*.log\n')), root=root, stdin='2\n')
+    run = _run(
+        tmp_path, _script(*_overwrite('.gitignore', '.env\n*.log\n')), root=root, stdin='2\n'
+    )
 
     assert run.matter['protected_changed'] == '[".gitignore"]'
     assert '！！受保护路径有改动' in run.stderr
@@ -1731,7 +1738,9 @@ def test_a_protected_path_change_makes_git_mode_exit_3(tmp_path: Path, mode: str
     root = _repository(tmp_path)
     head = _head(root, tmp_path)
 
-    run = _run(tmp_path, _script(_write('.gitignore', '.env\n*.log\n')), root=root, git_mode=mode)
+    run = _run(
+        tmp_path, _script(*_overwrite('.gitignore', '.env\n*.log\n')), root=root, git_mode=mode
+    )
 
     assert (run.code, run.git) == (3, 'not_offered')
     assert f'`--git-mode {mode}` 没有执行：受保护路径有改动' in run.stdout
@@ -2103,9 +2112,9 @@ def test_a_husky_style_hook_that_runs_worktree_code_gets_no_host_secrets(tmp_pat
     _git(root, tmp_path, 'push', '-q')
     _git(root, tmp_path, 'config', 'core.hooksPath', '.husky/_')
     leak = tmp_path / 'leak'
-    edit = _write('.husky/pre-commit', f'echo "token=$SERVICE_TOKEN" > {leak}\n')
+    edit = _overwrite('.husky/pre-commit', f'echo "token=$SERVICE_TOKEN" > {leak}\n')
 
-    run = _run(tmp_path, _script(edit), root=root, git_mode='commit')
+    run = _run(tmp_path, _script(*edit), root=root, git_mode='commit')
 
     assert run.git == 'committed'
     assert leak.read_text(encoding='utf-8') == 'token=\n'
@@ -2201,7 +2210,9 @@ def test_an_included_config_file_changed_during_the_run_blocks_the_finish(tmp_pa
     _git(tmp_path, tmp_path, 'init', '-q', '--bare', str(evil))
     content = f'[url "{evil}"]\n\tpushInsteadOf = {tmp_path / "remote.git"}\n'
 
-    run = _run(tmp_path, _script(_write('shared.gitconfig', content)), root=root, git_mode='push')
+    run = _run(
+        tmp_path, _script(*_overwrite('shared.gitconfig', content)), root=root, git_mode='push'
+    )
 
     assert (run.code, run.git) == (3, 'not_offered')
     assert 'git 配置（`git config --list` 的结果）' in run.stdout

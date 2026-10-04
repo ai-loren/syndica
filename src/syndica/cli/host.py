@@ -11,8 +11,10 @@ import platform
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -137,12 +139,14 @@ from syndica.kernel import (
     DangerPolicy,
     ExecResult,
     ExitMode,
+    FileTaint,
     FileTraceStore,
     HookResult,
     HooksCenter,
     HostFacts,
     HumanInteractionModule,
     Junction,
+    LocalIsolator,
     LocalWorkspace,
     MailboxConfirmationHandler,
     ModuleHost,
@@ -163,6 +167,8 @@ from syndica.kernel import (
     TraceLevel,
     TraceRecorder,
     TrustLevel,
+    VersionStore,
+    WorkspaceRouter,
     flag_reference,
     local_tools,
     register_builtins,
@@ -185,7 +191,13 @@ _CONFIRMATION_TIMEOUT = 300.0
 _SHELL = '/bin/sh'
 # 文件工具碰不到的目录：trace 里存着此前标成不可信的工具输出，经 Read 读回来就成了可信内容；交接
 # 文件只由宿主写。不整个关 `.syndica`：本仓的 Worker 把长输出存进 `.syndica/tmp/` 再读。
-_PRIVATE = ('.syndica/traces', '.syndica/handoffs')
+_PRIVATE = (
+    '.syndica/traces',
+    '.syndica/handoffs',
+    '.syndica/vcs',
+    '.syndica/worktrees',
+    '.syndica/snapshots',
+)
 _INCOMPLETE_TRACE = 'trace（不完整，原因见上面的 ERROR；不要拿它回放）'
 # `run --no-write` 在清单与槽里留下的工具。白名单而不是去掉几个写工具：以后新增的可写工具默认
 # 进不来。派活与问人的工具不经清单，由 Runtime 与 Module 另装。
@@ -1195,7 +1207,7 @@ class _PendingExport:
 class _ChatSession:
     config: str
     runtime: Runtime
-    workspace: LocalWorkspace
+    workspace: WorkspaceRouter
     environment: AgentEnvironment
     agent_id: str
     subscription: Subscription
@@ -2031,22 +2043,43 @@ class RuntimeCliHost:
         store.put(snapshot.path, snapshot.digest)
         return f'已信任 {one_line(str(snapshot.path))}（摘要 {snapshot.digest}）'
 
-    def _open_workspace(self, config: CliConfig) -> tuple[LocalWorkspace, AgentEnvironment]:
-        """run、chat、doctor 共用的入口：Agent 在哪条路径上都拿到同一份环境。"""
+    def _open_workspace(self, config: CliConfig) -> tuple[WorkspaceRouter, AgentEnvironment]:
+        """run、chat、doctor 共用的入口：Agent 在哪条路径上都拿到同一份环境与同一个路由。
+
+        路由总带着文件污点（打开这一刻取基线）；`workspace.versions` 打开时（缺省）再接版本层与
+        隔离。git 与临时目录由宿主找好交给内核：内核不读 PATH 与 TMPDIR。"""
         environment = agent_environment(
             self._environ, config.workspace.pass_env, workspace_root=self._workspace_root
         )
         try:
-            workspace = LocalWorkspace(
+            local = LocalWorkspace(
                 str(self._workspace_root),
                 shell=_SHELL,
                 env=environment.values,
                 private=_PRIVATE,
             )
+            taint = FileTaint(self._workspace_root)
+            if not config.workspace.versions:
+                return WorkspaceRouter(local, taint=taint), environment
+            git = shutil.which('git', path=self._environ.get('PATH'))
+            router = WorkspaceRouter(
+                local,
+                versions=VersionStore(
+                    self._workspace_root,
+                    redactor=host_redactor(self._environ, config.redaction_rules),
+                ),
+                isolator=LocalIsolator(
+                    shell=_SHELL,
+                    env=environment.values,
+                    git=git,
+                    scratch=tempfile.gettempdir() if git else None,
+                ),
+                taint=taint,
+            )
         except BaseException:
             environment.remove()
             raise
-        return workspace, environment
+        return router, environment
 
     def _prompt(self, text: str) -> None:
         """问人的提示。问题、选项与确认参数来自模型：转义之后才进终端。"""
@@ -2311,6 +2344,7 @@ class RuntimeCliHost:
                 confirmation_handler=MailboxConfirmationHandler(timeout=_CONFIRMATION_TIMEOUT),
                 tracer=recording.recorder,
                 untrusted_output_modules=self._untrusted_output(config, trusted_output),
+                workspace=workspace,
             )
             subscription = runtime.events.subscribe()
             pump = asyncio.create_task(
@@ -2609,6 +2643,7 @@ class RuntimeCliHost:
                     tracer=tracer,
                     ids=None if tracer is None else tracer.ids,
                     untrusted_output_modules=untrusted,
+                    workspace=workspace,
                 )
                 if tracer is not None and tracer.level is not TraceLevel.STRUCTURE:
                     records = self._module_records(modules, config)

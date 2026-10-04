@@ -324,3 +324,23 @@ def test_a_lock_left_by_a_process_that_is_gone_is_reclaimed(store: VersionStore)
 
     assert entry is not None
     assert not lock.exists()
+
+
+@pytest.mark.parametrize('linked', ['.syndica', '.syndica/vcs'])
+def test_a_symlinked_store_directory_is_refused_and_nothing_lands_outside(
+    tmp_path: Path, linked: str
+) -> None:
+    root = tmp_path / 'ws'
+    outside = tmp_path / 'elsewhere'
+    root.mkdir()
+    outside.mkdir()
+    link = root / linked
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    store = VersionStore(root, redactor=RuleRedactor())
+
+    with pytest.raises(ConfigError) as refused:
+        store.record('notes.md', b'x', producer='alpha')
+
+    assert '符号链接' in refused.value.received
+    assert list(outside.iterdir()) == []

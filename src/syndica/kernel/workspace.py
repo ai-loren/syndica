@@ -103,7 +103,7 @@ class WriteConflict(Exception):
                 f'期望: 改动 {path}（覆盖或删除）之前读过它。实际: 它已经存在（版本 {current}），'
                 '而你还没读过它，改下去就会丢掉你没看过的内容。'
                 ' 下一步: 先用 Read 读它（读不出来的大文件或二进制文件，Read 一次也算看过），'
-                '在最新的内容上再改；或者写到一个新路径。'
+                '在最新的内容上再改；没有 Read 就用 Edit 只改要改的那一段；或者写到一个新路径。'
             )
         else:
             wanted = '不存在' if expected is None else f'版本是 {expected}'
