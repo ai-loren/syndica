@@ -94,10 +94,19 @@ _NO_WATCH: Watch = MappingProxyType({})
 
 
 def _watch_all(kwargs: Mapping[str, Any]) -> Watch:
-    """盯住交给扩展切点的每个参数。可拦截 hook 能就地改一个可变参数（`kwargs['box']['x'] = ...`），
-    那既不走 `modified` 也不走 `skip`：不盯，被收紧的 Module 这么写进去的东西就既不带不可信标记、
-    也不进 `EXTENSION_TAINT`（评审 F5）。投影用 deepcopy 拷一份现在的值，前后不同即记作改过。"""
-    return MappingProxyType({name: copy.deepcopy for name in kwargs})
+    """盯住交给扩展切点里值语义可比的参数（dict / list / 带 `__eq__` 的 dataclass 等）。可拦截 hook
+    能就地改可变参数（`kwargs['box']['x'] = ...`），既不走 `modified` 也不走 `skip`：不盯，被收紧的
+    Module 这么写进去的东西就既不带不可信标记、也不进 `EXTENSION_TAINT`（评审 F5）。只盯值可比的：没
+    值相等的普通对象（含 `Lock`、`Event`）deepcopy 出来必然 `!=` 原对象，会把每个 hook 记成改过它——
+    一个只是旁观这个切点的被收紧 Module 会因此把结果误标成不可信、而宿主关不掉（评审 C4）。盯不住的
+    当看不见。投影用 deepcopy 拷一份现在的值，前后不同即记作改过。"""
+    return MappingProxyType(
+        {
+            name: copy.deepcopy
+            for name, value in kwargs.items()
+            if type(value).__eq__ is not object.__eq__
+        }
+    )
 
 
 _Snapshot = tuple[

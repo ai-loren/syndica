@@ -434,3 +434,14 @@ D11、D12。规则表每个新成员各有一条用例；安全矩阵全格；`{
   F11 收紧 broker 代理只转交协议方法（去掉 `__getattr__`，第三方多出来的投递入口不再透出，`copy` 也不再递归）；
   F12 把扩展切点的污点格子也铺到 PRE / POST hook 分发。F10 的 6 条存活变异逐条补了用例（含工具抛异常按声明仍
   收紧、`restore` 的信任、`position != index` 的兄弟判据、观察者改不动参数、dedup 摘除、两条 Blocking 的洗白）。
+- 2026-10-04：收口对抗评审（0 Blocking / 4 High / 3 Medium / 4 Low）修进同一次提交。C6：写入身份下界在
+  `tool.execute` 内被跳过，被收紧 Module 的 hook 在可信工具执行窗口里写的文件记成可信——改成 `call_trust` 与
+  下界取更严。C2：F1 的修复把叶子符号链接也 `resolve()` 了，打开后新建、指向基线文件的链接名字经 `Glob` 洗白——
+  把名字信任（列表，看叶子是不是基线符号链接）与内容信任（Read / 脚本，跟链接）分开，基线符号链接按 `lstat`
+  指纹记。C1：`effective_cwd` 按程序词位置找 cd（认出赋值 / `if` / 花括号后面的持续 cd），对子壳与管道左侧的
+  不持续 cd 交回 None 不折。C4：`_watch_all` 只盯值可比的参数，旁观切点的被收紧 Module 不再把结果误标不可信。
+  C5：补 `grep_text` 的契约用例（含冒号路径）。C7：`Tool.__tool_session_cwd__`，会话式工具（`Terminal`）的相对
+  脚本放弃解析、只判绝对工作区内脚本。C8：只跳过精确的 `{}` 占位符，`sh planted.s{h,}` 照判。C11：`content` 按
+  内容哈希复核两次读之间的篡改。C3（回放重不出 `exec.untrusted_script` 门）要回放文档 v4、登记为后续；C9 / C10
+  登记为遗留。8 条收口变异全部杀死；免费模型（Gemini）在开了版本层与污点的临时工作区里跑通 Write/Edit/Read，
+  版本层记两版、trace 的 artifact 边把 Read 连回 Write。

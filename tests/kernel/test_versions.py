@@ -30,6 +30,28 @@ def store(tmp_path: Path) -> VersionStore:
     return VersionStore(tmp_path, redactor=RuleRedactor(secrets=[_SECRET]))
 
 
+def test_content_rejects_an_object_tampered_between_the_two_reads(
+    store: VersionStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # history() 先哈希得到版本、content() 再读一次对象：两次之间对象被换掉（Bash 能写进 vcs），
+    # content() 按内容复核、对不上就拒，不交出被改过的字节（评审 C11）。把 history 固定成改动前的结果，
+    # 模拟它读完之后对象才被换掉这个窗口。
+    entry = store.record('a.txt', b'original content', producer='tester')
+    assert entry is not None and entry.version is not None
+    blobs = [
+        path
+        for path in (store.location / 'objects').rglob('*')
+        if path.is_file() and zlib.decompress(path.read_bytes()).startswith(b'blob ')
+    ]
+    [blob_path] = blobs
+    other = b'tampered'
+    blob_path.write_bytes(zlib.compress(b'blob %d\x00%s' % (len(other), other)))
+    monkeypatch.setattr(store, 'history', lambda _path: (entry,))
+
+    with pytest.raises(ConfigError):
+        store.content('a.txt', entry.version)
+
+
 def _stored_bytes(store: VersionStore) -> list[bytes]:
     return [
         zlib.decompress(path.read_bytes())

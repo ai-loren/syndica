@@ -79,11 +79,12 @@ def _artifact(path: str, version: str) -> ArtifactRef:
 
 
 def _files_trust(portal: Portal, paths: Iterable[str]) -> TrustLevel:
-    """列出来的这些文件里最严的那个（文件名也是数据：不可信的写入建出来的文件，名字同样不可信）。"""
+    """列出来的这些路径里最严的那个（文件名也是数据：不可信的写入建出来的文件、或打开后新建的符号
+    链接，名字同样不可信——哪怕链接指向一个基线文件）。"""
     if not isinstance(portal, TaintAware):
         return TrustLevel.TRUSTED
     for path in dict.fromkeys(paths):
-        if portal.file_trust(path, None) is TrustLevel.UNTRUSTED:
+        if portal.name_trust(path) is TrustLevel.UNTRUSTED:
             return TrustLevel.UNTRUSTED
     return TrustLevel.TRUSTED
 
@@ -509,6 +510,8 @@ class Terminal(Tool):
     __tool_name__ = 'Terminal'
     # `create` 的命令与 `send` 写进终端的文字都会被 shell 或终端里的程序执行。
     __tool_command_args__ = ('command', 'input')
+    # 伪终端跨 send 保持 cwd：上一次 send 的 cd 留到下一次，危险判定认不出此刻的 cwd（评审 C7）。
+    __tool_session_cwd__ = True
     __tool_external_input__ = True
 
     def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:

@@ -21,6 +21,7 @@ from syndica.kernel.contracts.base import ContractSuite
 from syndica.kernel.errors import SyndicaError
 from syndica.kernel.workspace import (
     ExecResult,
+    GrepHit,
     Portal,
     PtyCapture,
     PtyStatus,
@@ -104,6 +105,20 @@ class WorkspaceContract(ContractSuite):
 
     async def test_a_missing_file_has_no_stat(self, workspace: Workspace) -> None:
         assert await workspace.portal().stat('absent.txt') is None
+
+    async def test_grep_hands_back_structured_hits_keyed_on_the_path(
+        self, workspace: Workspace
+    ) -> None:
+        # grep_text 交回结构化的 GrepHit，不是展示字符串：信任按 hit.path 算，而文件名里可以有冒号，
+        # 从 "path:line:text" 里切路径会落到别的文件上、借它的信任（评审 C2 / C5）。
+        portal = workspace.portal()
+        await portal.write_text('a:b.txt', 'needle here\nplain')
+        hits = await portal.grep_text('needle', '.')
+        assert [type(hit) for hit in hits] == [GrepHit]
+        [hit] = hits
+        assert (hit.path, hit.line) == ('a:b.txt', 1)
+        assert 'needle' in hit.text
+        assert str(hit) == 'a:b.txt:1:needle here'
 
     async def test_the_version_follows_the_content_not_the_write(
         self, workspace: Workspace

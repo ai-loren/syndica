@@ -170,6 +170,10 @@ class Tool(ABC):
     # 结果或抛出的异常里。`None` 是没声明，按「会」算：它抛出的异常文字整份当不可信，同段兄弟被
     # hook 改写参数时也把它算作可能的不可信来源。`False` 时它的异常文字只按这次调用的溯源结论算。
     __tool_external_input__: ClassVar[bool | None] = None
+    # 这个工具的命令是不是跑在一个跨调用保持 cwd 的会话里（`Terminal` 的伪终端：上一次 send 的 `cd`
+    # 会留到下一次）。为真时危险判定认不出它此刻的 cwd，对 `__tool_command_args__` 里的相对脚本放弃
+    # 解析（不升级），绝对的工作区内脚本照判（C7）。缺省 `False`：命令每次从给定 cwd 起（`Bash`）。
+    __tool_session_cwd__: ClassVar[bool] = False
 
     @property
     def name(self) -> str:

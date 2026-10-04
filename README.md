@@ -39,7 +39,7 @@ Milestone 1 provides a working local multi-agent kernel:
 - Declarative topology assembly with singleton, keyed, and on-demand slots.
 - Runtime orchestration tools: `Delegate`, `Fork`, `SendMessage`, `QueryAgent`, `KillAgent`.
 - Local execution tools: `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`, `BashOutput`,
-  `KillBash`.
+  `KillBash`, `Terminal`.
 - Human-in-the-loop tools: `AskUser`, `AskUserQuestion`, plus one-shot confirmation for dangerous
   tool calls.
 - CLI surface and YAML L2 scenario runner.
@@ -72,6 +72,28 @@ Milestone 3 records every run as a trace and makes it replayable (see [Observabi
   outbound point in the package.
 
 Milestone 3 audit: [`docs/audits/2026-10-02-m3-final-audit.md`](docs/audits/2026-10-02-m3-final-audit.md).
+
+Milestone 4 completes the extension surface: three-layer assembly (host plugins, Runtime Modules,
+per-agent hooks), Flag declarations, and namespace junctions a capability can declare and trigger.
+
+Milestone 4 audit: [`docs/audits/2026-10-03-m4-final-audit.md`](docs/audits/2026-10-03-m4-final-audit.md).
+
+Milestone 5 completes the execution plane and adds untrusted-content tracking:
+
+- The full `Workspace` / `Portal` protocol with a contract suite any backend must pass, plus the
+  pseudo-terminal `Terminal` tool for programs that need a TTY.
+- A version layer written in pure Python under `.syndica/vcs` (git object format, but git is never
+  run on it): every `Write`/`Edit` records a version and becomes a tracked artifact; blobs are
+  redacted before they touch disk, and a redacted version is not restorable.
+- Per-agent workspace isolation for `spawn`/`Delegate`/`Fork` (`worktree` and `snapshot`), with a
+  per-file merge back into the parent; conflicts are returned, never silently overwritten.
+- Optimistic concurrency in the shared workspace: overwriting a file you never read is a conflict.
+- File taint and an artifact-provenance graph: content a command changed, an external edit, or a
+  read after untrusted content reads back as untrusted, and running an untrusted local script forces
+  the danger escalation even under an allow-all policy. The real isolation boundary is a sandboxed
+  workspace backend; command output itself stays untrusted.
+
+Milestone 5 audit: [`docs/audits/2026-10-04-m5-final-audit.md`](docs/audits/2026-10-04-m5-final-audit.md).
 
 ## Install From Source
 
@@ -729,7 +751,7 @@ The v1.0 roadmap has 12 internal milestones:
 | 2 | Self-bootstrapping | Done |
 | 3 | Observability + redaction | Done |
 | 4 | Complete extension system | Done |
-| 5 | Complete execution layer + provenance | Planned |
+| 5 | Complete execution layer + provenance | Done |
 | 6 | State: sessions, compression, memory | Planned |
 | 7 | Artifacts and acceptance | Planned |
 | 8 | Long-horizon task control | Planned |

@@ -1882,22 +1882,31 @@ def _stdin_fed(
 
 
 def effective_cwd(command: str, base: str) -> str | None:
-    """命令里那些相对脚本该相对哪个目录解析：从工具给的 `base`（`Bash` 的 `cwd`）出发，折进开头
-    单独一个 `cd DIR` / `pushd DIR`。命令里还有别的改目录的段（多个 cd、变量目录），逐条脚本到底在
-    哪个目录下就不可靠了，交回 None：宁可这一条不升级（有一个 Agent 之内的窗口上界兜着），也不要
-    拿错目录去判成可信、或拿错目录把基线脚本误判成不可信（评审 F3 的绕过与 F7 的误报同源）。"""
+    """命令里那些相对脚本该相对哪个目录解析：从工具给的 `base`（`Bash` 的 `cwd`）出发，折进开头一个
+    会持续到后面的 `cd DIR` / `pushd DIR`（`cd x && …`、`cd x; …`、`{ cd x; }`、`if cd x; then …`、
+    赋值前缀的 `X=1 cd x` 都持续）。不持续的 cd（子壳 `(cd x)`、管道左侧 `cd x | …`）、多个 cd、
+    `~` / 变量目录、或认不准的，一律交回 None：宁可这一条不升级（有一个 Agent 之内的窗口上界兜着），
+    也不要拿错目录判成可信、或把基线脚本误判成不可信（评审 F3 的绕过、F7 的误报、收口 C1 同源）。"""
     segments, _ = _parse(command)
-    chdirs = [
-        tokens
-        for _, tokens in segments
-        if tokens and _basename(tokens[0]) in ('cd', 'pushd', 'popd')
+    chdir_segments = [
+        index
+        for index, (_, tokens) in enumerate(segments)
+        if any(_basename(tokens[j]) in ('cd', 'pushd', 'popd') for j in _program_candidates(tokens))
     ]
-    if not chdirs:
+    if not chdir_segments:
         return base
-    if len(chdirs) > 1 or not segments or segments[0][1] is not chdirs[0]:
+    if chdir_segments != [0]:
         return None
-    operand = _first_operand(chdirs[0], 1)
-    if operand is None or not _is_literal(operand):
+    piped, tokens = segments[0]
+    # cd 是管道左侧（下一段被它接上）、或开头就是子壳：cd 跑在子壳里，不改外面的 cwd。`_parse` 抹了
+    # 括号、分不清子壳边界，一律保守放弃。花括号组与 `if` 不是子壳，照常折。
+    if piped or (len(segments) > 1 and segments[1][0]) or command.lstrip().startswith('('):
+        return None
+    candidates = _program_candidates(tokens)
+    if not candidates or _basename(tokens[candidates[0]]) not in ('cd', 'pushd'):
+        return None
+    operand = _first_operand(tokens, candidates[0] + 1)
+    if operand is None or not _is_literal(operand) or operand.startswith('~'):
         return None
     return posixpath.normpath(posixpath.join(base, operand))
 

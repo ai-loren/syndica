@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import posixpath
 import stat
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -40,6 +41,8 @@ class TaintAware(Protocol):
 
     def file_trust(self, path: str, version: str | None) -> TrustLevel: ...
 
+    def name_trust(self, path: str) -> TrustLevel: ...
+
 
 class FileTaint:
     """一个本地工作区的文件污点。构造时取基线；`baseline=False` 不取（隔离副本：它的每个文件由
@@ -51,10 +54,31 @@ class FileTaint:
         self._root = Path(root).resolve()
         self._baseline: dict[str, _Fingerprint] = {}
         self._baseline_dirs: set[str] = set()
+        self._baseline_links: dict[str, _Fingerprint] = {}
         self._baseline_hashes: dict[str, str | None] = {}
         self._written: dict[str, dict[str, TrustLevel]] = {}
         if baseline:
             self._scan(max_files)
+
+    def name_trust(self, path: str) -> TrustLevel:
+        """列出来的这个名字可信吗（`Glob` / `Grep` 列路径时按它判）。名字也是数据：打开后新建的符号
+        链接，名字是攻击者选的，哪怕它指向一个基线文件也不可信——Read 读它的内容仍按内容算（可信），
+        这里判的是名字（评审 C2）。路径里非叶子的某一段经过符号链接时保守判不可信。"""
+        lexical = posixpath.normpath(path)
+        full = self._root / path
+        try:
+            is_link = full.is_symlink()
+        except OSError:
+            return TrustLevel.UNTRUSTED
+        if is_link:
+            recorded = self._baseline_links.get(lexical)
+            if recorded is not None and _link_fingerprint(full) == recorded:
+                return TrustLevel.TRUSTED
+            return TrustLevel.UNTRUSTED
+        resolved = self._relative(path)
+        if resolved is None or resolved != lexical:
+            return TrustLevel.UNTRUSTED
+        return self.trust_of(lexical, None)
 
     def trust_of(self, path: str, version: str | None) -> TrustLevel:
         """`path` 内容是 `version` 时可信吗；`version` 为 None 时按它此刻的内容判。"""
@@ -110,6 +134,13 @@ class FileTaint:
 
     def _scan(self, max_files: int) -> None:
         for folder, directories, names in os.walk(self._root):
+            # 符号链接（文件或目录）按名字记进基线：打开时就在的链接名字可信，之后新建的不可信。
+            for entry in (*directories, *names):
+                path = Path(folder) / entry
+                if path.is_symlink():
+                    link = _link_fingerprint(path)
+                    if link is not None:
+                        self._baseline_links[path.relative_to(self._root).as_posix()] = link
             directories[:] = sorted(name for name in directories if name not in _SKIPPED)
             relative_folder = Path(folder).relative_to(self._root).as_posix()
             if relative_folder != '.':
@@ -177,5 +208,16 @@ def _fingerprint(path: Path) -> _Fingerprint | None:
     except OSError:
         return None
     if not stat.S_ISREG(status.st_mode):
+        return None
+    return status.st_ino, status.st_size, status.st_ctime_ns
+
+
+def _link_fingerprint(path: Path) -> _Fingerprint | None:
+    """符号链接自己的 (inode, 大小, ctime)：大小是目标路径的字节数，改指向就变；不是链接是 None。"""
+    try:
+        status = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISLNK(status.st_mode):
         return None
     return status.st_ino, status.st_size, status.st_ctime_ns

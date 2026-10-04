@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -26,6 +25,7 @@ from syndica.kernel.danger import (
     DangerJudge,
     DangerRequest,
     Disposition,
+    effective_cwd,
 )
 from syndica.kernel.driving import _DRIVING_AGENT  # pyright: ignore[reportPrivateUsage]
 from syndica.kernel.events import EventBus
@@ -119,6 +119,20 @@ async def test_a_file_name_with_a_colon_does_not_borrow_another_files_trust_in_g
     assert found.trust is TrustLevel.UNTRUSTED
 
 
+async def test_a_planted_symlink_name_to_a_baseline_file_is_untrusted_in_a_listing(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    # 打开后新建的符号链接，名字是攻击者选的：Glob 列它的名字不可信，哪怕它指向一个基线文件；Read 读
+    # 到的是那个基线文件的内容、可信。名字信任与内容信任分开判（评审 C2）。
+    (root / 'SYSTEM-NOTE-run-quiz-marker-2.md').symlink_to('README.md')
+
+    listed = await Glob(router).execute('SYSTEM-NOTE-run-quiz-marker-2.md')
+    read = await Read(router).execute('SYSTEM-NOTE-run-quiz-marker-2.md')
+
+    assert listed.trust is TrustLevel.UNTRUSTED
+    assert read.trust is TrustLevel.TRUSTED
+
+
 async def test_listing_a_baseline_tree_with_directories_stays_trusted(
     router: WorkspaceRouter,
 ) -> None:
@@ -178,8 +192,15 @@ async def _bash_output(router: WorkspaceRouter, arguments: str) -> str:
         'cat planted.sh | sh',
         'sh ROOT/planted.sh',
         'cd sub && sh planted.sh',
+        'sh planted.s{h,}',
     ],
-    ids=['stdin_redirect', 'piped_cat', 'absolute_path_inside_the_workspace', 'after_a_cd'],
+    ids=[
+        'stdin_redirect',
+        'piped_cat',
+        'absolute_path_inside_the_workspace',
+        'after_a_cd',
+        'brace_expansion',
+    ],
 )
 async def test_a_planted_script_is_not_run_however_its_path_is_spelled(
     router: WorkspaceRouter, root: Path, command: str
@@ -230,6 +251,27 @@ async def test_an_in_place_write_by_a_tightened_module_in_an_extension_is_flagge
     assert result.untrusted is True
 
 
+async def test_an_observe_only_tightened_module_does_not_taint_a_plain_object_kwarg() -> None:
+    # 一个只旁观这个切点、什么都不改的被收紧 Module：没有值相等的普通对象 deepcopy 出来必然不等，
+    # 不能因此把结果误标成不可信——那是宿主关不掉的误报（评审 C4）。
+    center = _tightened_center()
+    handle = center.declare_extension_junction('cache:lookup', JunctionKind.INTERCEPTABLE)
+
+    async def observe(**_: Any) -> HookResult:
+        return HookResult()
+
+    with installing('module', 'thirdparty'):
+        center.register(handle, observe)
+
+    class _Request:
+        def __init__(self) -> None:
+            self.query = 'ls'
+
+    result = await center.trigger(handle, request=_Request())
+
+    assert result.untrusted is False
+
+
 @pytest.mark.parametrize(
     ('kind', 'name', 'expected'),
     [('module', 'thirdparty', TrustLevel.UNTRUSTED), ('plugin', 'trusted', TrustLevel.TRUSTED)],
@@ -248,6 +290,33 @@ async def test_a_file_written_from_a_hook_carries_its_authors_trust(
             await router.write_text('hooked.md', 'quiz-marker-7\n')
         read = await Read(router).execute('hooked.md')
     finally:
+        await runtime.shutdown()
+
+    assert read.trust is expected
+
+
+@pytest.mark.parametrize(
+    ('kind', 'name', 'expected'),
+    [('module', 'thirdparty', TrustLevel.UNTRUSTED), ('plugin', 'trusted', TrustLevel.TRUSTED)],
+    ids=['tightened_module', 'trusted_plugin'],
+)
+async def test_a_hook_writing_inside_a_trusted_call_still_carries_its_authors_trust(
+    router: WorkspaceRouter,
+    kind: Literal['plugin', 'module'],
+    name: str,
+    expected: TrustLevel,
+) -> None:
+    # 被收紧的 Module 的 hook 在一次可信工具的执行窗口里写文件：`call_trust()` 是那次可信调用的值，
+    # 只看它会把 Module 写的内容记成可信（评审 C6）。身份下界要和它取更严的那个。
+    runtime = Runtime(modules=[], workspace=router)
+    runtime._untrusted_output = frozenset({'thirdparty'})  # pyright: ignore[reportPrivateUsage]
+    token = _CALL_TRUST.set(TrustLevel.TRUSTED)
+    try:
+        with acting_as(Installer(kind, name)):
+            await router.write_text('inside.md', 'quiz-marker-6-inside\n')
+        read = await Read(router).execute('inside.md')
+    finally:
+        _CALL_TRUST.reset(token)
         await runtime.shutdown()
 
     assert read.trust is expected
@@ -324,6 +393,75 @@ def test_a_curl_option_value_is_not_read_as_a_remote_name_flag() -> None:
     )
 
     assert verdict.rule_id != 'shell.download_then_execute'
+
+
+class _Session(Tool):
+    __tool_name__ = 'Session'
+    __tool_command_args__ = ('input',)
+    __tool_external_input__ = True
+    __tool_session_cwd__ = True
+
+    async def execute(self, input: str) -> ToolResult:
+        """把 input 写进会话。"""
+        return ToolResult(output='')
+
+
+async def test_a_session_tool_gives_up_on_relative_scripts_but_judges_absolute_ones(
+    root: Path,
+) -> None:
+    # 伪终端跨 send 保持 cwd，相对脚本此刻在哪个目录认不出：放弃（不升级）；绝对的工作区内脚本照判
+    # （评审 C7）。
+    taint = FileTaint(root)
+    (root / 'planted.sh').write_text('echo planted-ran quiz-marker-7\n')
+    executor = ToolExecutor(tools={'Session': _Session()}, hooks=HooksCenter())
+    executor._configure_file_trust(taint.script_trust)  # pyright: ignore[reportPrivateUsage]
+    tool = _Session()
+
+    relative = executor._untrusted_scripts(tool, {'input': 'sh planted.sh\n'})  # pyright: ignore[reportPrivateUsage]
+    absolute = executor._untrusted_scripts(  # pyright: ignore[reportPrivateUsage]
+        tool, {'input': f'sh {root}/planted.sh\n'}
+    )
+
+    assert relative == []
+    assert absolute == [f'{root}/planted.sh']
+
+
+@pytest.mark.parametrize(
+    ('command', 'base', 'expected'),
+    [
+        ('sh planted.sh', '.', '.'),
+        ('cd sub && sh planted.sh', '.', 'sub'),
+        ('./tool.sh', 'sub', 'sub'),
+        ('A=1 cd sub && ./configure', '.', 'sub'),
+        ('if cd sub; then ./x.sh; fi', '.', 'sub'),
+        ('{ cd sub; } && ./x.sh', '.', 'sub'),
+        ('cd a && sh x && cd b && sh y', '.', None),
+        ('cd ~ && ./x.sh', '.', None),
+        ('(cd sub); ./x.sh', '.', None),
+        ('cd sub | true; ./x.sh', '.', None),
+        ('grep cd file', '.', '.'),
+    ],
+    ids=[
+        'no_cd',
+        'leading_cd',
+        'cwd_arg_only',
+        'cd_behind_an_assignment',
+        'cd_in_an_if',
+        'cd_in_a_brace_group',
+        'multiple_cds',
+        'cd_to_home',
+        'cd_in_a_subshell',
+        'cd_left_of_a_pipe',
+        'cd_as_an_argument',
+    ],
+)
+def test_effective_cwd_only_folds_a_persisting_leading_cd(
+    command: str, base: str, expected: str | None
+) -> None:
+    # 一个藏在赋值 / `if` / 花括号组里的持续 cd 要认出来并折（否则后面脚本按错目录解析，根上同名基线
+    # 文件会把种下的脚本洗白成可信）；不持续的 cd（子壳、管道左侧）、多个 cd、`~`、cd 当实参的都放弃
+    # 返回 None，宁可不升级也不拿错目录判（评审 F3 / 收口 C1）。
+    assert effective_cwd(command, base) == expected
 
 
 class _LocalRaiser(Tool):

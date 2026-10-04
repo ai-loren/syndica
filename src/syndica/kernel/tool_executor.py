@@ -792,15 +792,19 @@ class ToolExecutor:
         declared = cast(object, getattr(tool, '__tool_command_args__', None))
         names = list(args) if declared is None else list(cast(tuple[str, ...], declared))
         cwd = args.get('cwd')
+        # 会话式工具（Terminal 的伪终端）跨调用保持 cwd，此刻在哪个目录认不出：相对脚本一律放弃，
+        # 只判绝对的工作区内脚本（评审 C7）。
+        stateful = bool(getattr(tool, '__tool_session_cwd__', False))
         found: list[str] = []
         for name in names:
             value = args.get(name)
             if not isinstance(value, str):
                 continue
-            base = effective_cwd(value, cwd if isinstance(cwd, str) else '.')
+            base = None if stateful else effective_cwd(value, cwd if isinstance(cwd, str) else '.')
             for script in executed_scripts(value):
-                if '{' in script or '}' in script:
-                    # `find . -exec sh {} \;` 的 `{}` 是占位符不是文件，不当成不可信脚本（F7）。
+                if script == '{}':
+                    # `find . -exec sh {} \;` 的 `{}` 是占位符不是文件；别的带花括号的词可能是 brace
+                    # 展开（`planted.s{h,}`）藏着脚本，交给 script_trust 判（非基线即升级，C8）。
                     continue
                 if script.startswith('/'):
                     effective = script

@@ -166,7 +166,17 @@ class VersionStore:
             if entry.version == version:
                 blob = self._blob_at(self._read_commit(entry.commit).tree, relative)
                 assert blob is not None
-                return self._read_object(blob, 'blob')
+                payload = self._read_object(blob, 'blob')
+                # history() 先哈希得到版本，content() 再读一次对象：两次之间对象被换掉（Bash 能写进
+                # .syndica/vcs，只有文件工具被挡在外），交回的就不是这个版本的内容。按内容复核，
+                # 对不上就拒（评审 C11）。
+                if _version(payload) != version:
+                    raise ConfigError(
+                        expected=f'版本 {version} 的对象内容与它的哈希一致',
+                        received=f'{path} 在 {version} 的对象读出来是 {_version(payload)}，对不上',
+                        next_action='版本库这个对象被改过；别用它恢复，查 .syndica/vcs 是否被改写',
+                    )
+                return payload
         raise ConfigError(
             expected=f'版本层里有 {relative} 的版本 {version}',
             received=(

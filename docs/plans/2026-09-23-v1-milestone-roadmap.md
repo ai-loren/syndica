@@ -26,6 +26,15 @@ OpenRouter 兜底，每个平台各自指数退避，spec 决策 #89）。
 什么、切点触发了几次；拓扑 run 与带第三方 Module 的 run 都能离线回放。示例 Module 在仓库副本里用免费模型跑通了
 「装上 → 确认 → 调用 → trace → 离线回放复现」。M4 的提交同样只按本地验证协议验证过。
 
+里程碑 5 已完成（2026-10-04），审计记录见 [`docs/audits/2026-10-04-m5-final-audit.md`](../audits/2026-10-04-m5-final-audit.md)：
+里程碑 1 的最小本地执行被补成完整协议——`Workspace`/`Portal` 全量接口加一套任何后端都要过的契约套件、伪终端与
+`Terminal` 工具；`.syndica/vcs` 下用纯 Python 写 git 对象格式的版本层（从不在它上面跑 git），每次 `Write`/`Edit` 记一个
+版本并成为被跟踪的产物，落盘前先脱敏、脱敏过的版本不可恢复；`spawn`/`Delegate`/`Fork` 的 worktree 与快照隔离带逐文件
+合并（冲突显式返回不静默覆盖）；共享模式下没读过就覆盖是冲突。不可信内容这一半：文件污点与产物溯源图——命令改过的
+文件、外部改动、读过不可信内容之后的写入都读回成不可信，执行工作区里不可信的脚本强制升级（`AllowAll` 也拦）；真正的
+隔离边界是沙箱化的后端，命令输出照旧不可信。三轮对抗评审（阶段一/二/三）加一轮收口评审的发现都已修进提交。M5 的
+提交同样只按本地验证协议验证过。
+
 当前主线约束：
 
 - 不重做 M1，不补 `Runtime.start` / `Junction.RUNTIME_START`。
@@ -74,7 +83,7 @@ uv run pytest -q
 | 2 | 自举 | 已完成 | 只维护回归门禁；CI 在 M12 之前统一补跑 |
 | 3 | 可观测性 + 脱敏收口 | 已完成 | 只维护回归门禁；CI 在 M12 之前统一补跑 |
 | 4 | 扩展点完备 | 已完成 | 只维护回归门禁；CI 在 M12 之前统一补跑 |
-| 5 | 执行面完整化 + 不可信内容 | 未开始 | 下一个：写实现计划；完成 Workspace/Portal 与真实溯源链 |
+| 5 | 执行面完整化 + 不可信内容 | 已完成 | Workspace/Portal 全量接口与契约套件、Python 写的 git 版本层、worktree/快照隔离、共享模式写入冲突、伪终端、文件污点与真实溯源链；审计见 `docs/audits/2026-10-04-m5-final-audit.md` |
 | 6 | 状态 | 未开始 | 会话、压缩、记忆持久化 |
 | 7 | 产物与验收 | 未开始 | Artifact、Rubric、Verifier |
 | 8 | 长程任务 | 未开始 | Budget、Progress、Strategy |
@@ -144,6 +153,9 @@ deferred items」。
 | M5 后续 | 扩展切点在模型侧切点里被触发、结论出自被收紧的 Module 时，那一轮模型请求不收紧（D-64 只做了工具调用那一侧） | M6 | 与上下文压缩同期动模型侧的溯源；`HookResult.untrusted` 已让宿主代码知道这个值不可信 |
 | M5 后续 | `shell.download_then_execute` 纯判定认不出 tee 写文件、`wget -P` 前缀、`mv` / `cp` 改名、`uv run` / `deno run` 等解释器 | 接受 | 真实姿态下这些下载落地的文件都不是基线，执行它由执行器的 `exec.untrusted_script` 兜住；纯判定（无路由的消费者）的这些形状留作后续 |
 | M5 后续 | `exec.untrusted_script` 对命令里有多个 `cd` / 变量目录的脚本放过（`effective_cwd` 折不出目录） | 接受 | 折不出目录时宁可不升级、不拿错目录误判；有一个 Agent 之内的窗口上界兜着，真正的边界是沙箱后端 |
+| M5 后续 | 回放重不出 `exec.untrusted_script` 门（收口 C3）：真实 run 的执行器接了路由会按文件污点升级，回放不接路由（`_untrusted_scripts` 恒空），跑过 Bash 写脚本再执行的 CLI trace 会在门上报分歧 | 后续（回放文档 v4） | 响亮失败（回放报分歧非静默）；正确修法要把执行器的文件信任答案记进回放文档并在回放侧接回，是带版本的有意改动，不在时间紧的收口里赶 |
+| M5 后续 | 同一条命令内先改名再执行（`cp planted.sh ok.sh && sh ok.sh`）、非 `cat` 喂 stdin（`head f｜sh`）危险判定认不出（收口 C9） | 接受 | 真实姿态下执行非基线文件由 `exec.untrusted_script` 兜住；纯判定的这类形状与下载形状同族 |
+| M5 后续 | 大小写不敏感卷上 `readme.md` 对基线 `README.md` 判不可信、`cd ~` 的误报（收口 C10） | 接受 | 安全方向（误报不误放）；`resolve()` 不规范化大小写，信任在 Linux CI 与 macOS 之间可能不同 |
 | 卫生 | 基础 CI：每次 push 跑与本地一致的门禁 | M2 | 自举开始改代码之前先有自动门禁 |
 | 卫生 | CHANGELOG、PyPI 预发布、版本策略、issue 模板 | M12 | 发布准备 |
 | 卫生 | `.env.example` | 不做 | key 文件不该放在 Agent 操作的工作区里，`Read` / `Grep` 读得到它 |

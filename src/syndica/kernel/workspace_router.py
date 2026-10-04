@@ -94,6 +94,12 @@ class WorkspaceRouter:
         taint = self._taint_of(self._target())
         return TrustLevel.TRUSTED if taint is None else taint.trust_of(path, version)
 
+    def name_trust(self, path: str) -> TrustLevel:
+        """列出来的这个路径名可信吗（`Glob` / `Grep` 按它给结果定信任级别）。名字与内容分开判：指向
+        基线文件的新建符号链接，内容可信、名字不可信（评审 C2）。没有文件污点时一律可信。"""
+        taint = self._taint_of(self._target())
+        return TrustLevel.TRUSTED if taint is None else taint.name_trust(path)
+
     def script_trust(self, path: str) -> TrustLevel | None:
         """执行 `path` 这个脚本时它可信吗；不在工作区里（宿主的程序、工作区外的路径）交回 None，
         没有文件污点也交回 None：都不该让执行它的命令升级（评审 F3）。"""
@@ -120,14 +126,15 @@ class WorkspaceRouter:
             self._writers[(id(workspace), relative, version)] = span
 
     def _write_trust(self) -> TrustLevel:
-        """这次写该记成什么信任：工具调用里按那次调用的溯源结论（`call_trust`）；在它之外（hook、
-        `on_start` 与它们起的任务）按正在干活的代码的身份（`_write_floor`）；都没有按可信。"""
-        trust = call_trust()
-        if trust is not None:
-            return trust
-        if self._write_floor is not None:
-            return self._write_floor()
-        return TrustLevel.TRUSTED
+        """这次写该记成什么信任：取「这次工具调用的溯源结论」与「正在干活的代码的身份下界」里更严的
+        那个。身份下界（`_write_floor`）同样要作用在 `tool.execute` 之内——被收紧的 Module 的 hook
+        在一次可信工具的执行窗口里写文件时，`call_trust()` 是那次可信调用的值，只看它就把 Module 的
+        内容记成可信（评审 C6）。可信工具自己的写在 `acting_as(None)` 下身份下界可信，不受影响。"""
+        call = call_trust()
+        floor = self._write_floor() if self._write_floor is not None else TrustLevel.TRUSTED
+        if call is None:
+            return floor
+        return strictest_trust(call, floor)
 
     def _read(self, workspace: Workspace, path: str, version: str) -> None:
         if self._tracing is None:
