@@ -15,8 +15,8 @@
 
 **Architecture:** `Portal` 协议补全（字节读写、删除、`stat` 给出内容版本、带版本前提的写、增量读后台输出、伪终端
 六件套）。内核加一个 `WorkspaceRouter`：工具仍然共享一份，路由按当前 Agent 把调用分到它的工作区（共享的根或它
-自己的隔离副本），并在这一层做乐观并发与文件污点记录。版本层在 `.syndica/vcs`（私有 git 目录，工作树就是工作区）
-或 `.syndica/snapshots`（没有 git 时），从不碰用户自己的 `.git`。隔离策略是协议，内核给共享 / worktree / 快照三种。
+自己的隔离副本），并在这一层做乐观并发与文件污点记录。版本层在 `.syndica/vcs`：git 格式的对象由内核用 Python
+读写，从不对它调 git，也从不碰用户自己的 `.git`。隔离策略是协议，内核给共享 / worktree / 快照三种。
 溯源图记下跨边界的数据流（文件版本、消息、派活、分叉、broker、扩展切点），trace 用已经预留的 `artifact` 边记文件
 版本的读写；一个 Agent 内部的溯源仍然是「产出这次调用的那份请求里的全部块」。
 
@@ -124,24 +124,25 @@ B-15、B-18、D-40、D-62、D-63、D-64；`AGENTS.md`。
 看到的版本、文件污点、隔离的指派都在这一层，后端只管它自己那份目录。`Runtime(workspace=router)` 让 Runtime 能
 给隔离的子 Agent 指派工作区并把文件事件记进溯源图；不给时行为与今天相同（没有隔离可用）。
 
-### D4 版本层在 `.syndica/vcs`，从不碰用户的 `.git`
+### D4 版本层是 git 格式、但不调用 git：对象由内核用 Python 写
 
-- git 可用时：私有 git 目录 `.syndica/vcs`，工作树是工作区，索引与引用都是私有的。用户目录有没有 `.git` 都一样
-  对待：不建 `.git`、不提交到用户的历史、不改用户的索引与分支（spec §6.3「不得干扰其历史与分支」，AGENTS.md #9）。
-  这与 spec「目标目录不是 git 仓库则自动初始化」的字面不同：初始化的是版本层，而不是用户的仓库，两种目录于是走同
-  一条路。
-- 每次 git 调用都在 **Agent 的环境**里跑（宿主给 `LocalWorkspace` 的那份白名单环境），并且
-  `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgsign=false -c gc.auto=0`、
-  `GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_TERMINAL_PROMPT=0`。Agent 能改工作区里的
-  `.gitattributes` 与（经 `Bash`）`.syndica/vcs/config`；版本层的子进程只拿得到 Agent 自己本来就有的能力
-  （AGENTS.md「宿主替 Agent 执行的动作，不能给 Agent 它本来没有的能力」）。
-- 没有 git、或私有仓库初始化失败：退回快照版本层 `.syndica/snapshots`，版本号是单调递增的序号（spec §7.2）。
-- `.syndica.yaml` 的 `workspace.versions: auto | git | snapshot`，缺省 `auto`（有 git 用 git，否则快照）。关掉版本层
-  只在用户级：`run` / `chat` 的 `--no-versions`。关掉时没有版本、没有隔离、文件污点退化成只认工具写入（D9）——它放松
-  了「`Bash` 写下的文件读回来不可信」，所以项目配置写不出来（M4「项目配置只能收紧」）。
-- 打开时取一次基线（git：私有索引 `add -A` + `write-tree`；用户目录本身是 git 仓库时先拷用户的索引、把用户的
-  对象库设成备选，避免重算全部文件；快照：逐文件摘要）。用户的 `.gitignore` 照样生效，`.git/` 与 `.syndica/` 恒排除；
-  快照层跳过超过上限的大文件并在版本记录里写明。
+（计划评审 B1：一个不叫 `.git` 的私有 git 目录躲过了现有的三道防线——文件工具对 `.git` 的拒绝、
+`shell.git_state_change`、宿主对顶层 git 目录的完整性快照——而 `Bash` 一句 `printf >>` 就能改它的 `config`
+（过滤器、fsmonitor、`include.path`）。宿主下一次对它调 git，就在任何危险闸之外执行了 Agent 写下的代码，这是 Agent
+本来没有的能力。）
+
+- `.syndica/vcs` 里是 git 格式的对象与引用（zlib 压缩的松散对象、SHA-1 名字；blob、tree、commit），全部由内核用
+  Python 读写；历史、diff（difflib 的统一 diff）、回滚、隔离的物化都在 Python 里。**内核从不对 `.syndica/vcs` 调
+  git**，于是那里的任何文件都没法让宿主执行代码。它与 git 兼容：用户可以 `git --git-dir=.syndica/vcs log` 去看；文档写明
+  它的 `config` Agent 写得到，在那里跑 git 之前先看一眼。
+- 用户目录有没有 `.git` 都一样对待：不建 `.git`、不提交到用户的历史、不改用户的索引与分支（spec §6.3「不得干扰其历史与
+  分支」，AGENTS.md #9）。与 spec「目标目录不是 git 仓库则自动初始化」的字面不同：初始化的是版本层，不是用户的仓库。
+- 三方文本合并（D6）：有 git 时调 `git merge-file -p`，但在工作区之外新建的空临时目录里、对三个临时文件、没有仓库
+  （`GIT_CEILING_DIRECTORIES` 与工作目录都是那个临时目录）、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、
+  Agent 的环境——它只读那三个文件。没有 git 时退回「两边都改了就是冲突」：这就是 spec 说的快照降级，版本与回滚照常。
+- 危险规则把写进任何一段叫 `.syndica` 的路径算作宿主状态变更（与 `.git` 同级）：版本层与宿主记录的纵深防御。
+- `.syndica.yaml` 的 `workspace.versions: true | false`（缺省 true）。关掉时没有版本、没有隔离；文件污点的基线不靠版本层
+  （D9），所以关掉它不放松任何安全判据，项目配置可以写。
 
 ### D5 每次工具写入记一个版本；`Write` / `Edit` 交回 `ArtifactRef`
 
@@ -155,12 +156,14 @@ B-15、B-18、D-40、D-62、D-63、D-64；`AGENTS.md`。
 ### D6 隔离：共享（缺省）/ worktree / 快照；合并逐文件三方比较
 
 - `IsolationStrategy` 协议：`isolate(parent, name) -> IsolatedWorkspace`；`IsolatedWorkspace.merge() -> MergeReport`
-  与 `discard()`。三种实现：共享（交回父本身）、worktree（私有仓库在父的检查点上 `worktree add --detach`，位置
-  `.syndica/worktrees/<name>`）、快照（把父的树拷到 `.syndica/snapshots/trees/<name>`）。没有 git 时请求
-  worktree 退回快照（spec：快照是 worktree 的降级路径），报告里写明。
-- 合并：对子相对基线改过的每个文件——父没改过就用子的；两边都改了，git 用 `git merge-file` 三方合并，干净就用
-  合并结果，有冲突标记就把这个文件列进冲突、父的那份不动；快照层两边都改就是冲突。删除同理。逐文件而不是
-  `merge-tree`：老版本 git 也能跑，快照层也能用同一套判据。
+  与 `discard()`。三种实现：共享（交回父本身）、worktree（父此刻的树记成版本层的一个检查点，再由内核把它物化到
+  `.syndica/worktrees/<name>`：对象共享、零克隆，不调 `git worktree`）、快照（把父的树拷到
+  `.syndica/snapshots/<name>`）。两种隔离的差别在合并：worktree 有 git 时用 `git merge-file`，快照只做保守合并。没有
+  git 时请求 worktree 退回快照（spec：快照是 worktree 的降级路径），报告里写明。
+- 合并：对子相对基线改过的每个文件——父没改过就用子的；两边都改了，worktree 调 D4 那样隔离的 `git merge-file` 三方
+  合并，干净就用合并结果，有冲突标记就把这个文件列进冲突、父的那份不动；快照两边都改就是冲突。删除同理。逐文件
+  而不是 `merge-tree`：老版本 git 也能跑，快照也能用同一套判据。合并写回父工作区的每个文件带着子 Agent 那份的
+  文件污点（D9）。
 - 入口：`Runtime.spawn(..., isolation=...)`、`Delegate` / `Fork` 的 `isolation` 参数（缺省 `shared`）。`Delegate` /
   `Fork` 在子 Agent 这次工作结束后自动合并，合并报告进结果；宿主经 `Runtime.merge_isolated` / `discard_isolated`
   自己决定。隔离语义以发起分叉的源 Agent 的工作区为基准（spec §6.4）。
@@ -193,7 +196,9 @@ B-15、B-18、D-40、D-62、D-63、D-64；`AGENTS.md`。
   结果取**出现在结果里**的文件的污点里最严的那个（`Grep` 是有匹配行列出的文件，`Glob` 是列出的文件——文件名也是
   数据）。一个版本是 `TRUSTED` 只有两种来路：
   打开时的基线里就是它，或者由一次溯源可信的工具写入写成；其它版本（`Bash` / `Terminal` / 外部改的）一律
-  `UNTRUSTED`。`workspace.versions: off` 时没有基线，没有写入记录的文件按今天的行为算可信，并在文档里写明这个缺口。
+  `UNTRUSTED`。基线是打开工作区时逐文件取的 (inode, 大小, ctime) 指纹（跳过 `.git` 与 `.syndica`），不哈希内容、
+  不靠版本层：ctime 由内核在每次改动时设成当前时间，用户态写不回去，`touch -d` 伪造修改时间骗不过它。文件数超过
+  上限时停下，没扫到的按不可信算，并记一条警告。
 - **精确的执行器标记（B-15）**：工具抛出的异常文字的标记 = 这次调用的溯源结论与这个工具「读不读外部输入」取严。
   `Tool` 加 `__tool_external_input__: ClassVar[bool | None] = None`：`None` 是没声明，按读外部输入算（与
   `__tool_command_args__` 同样取不安全的一侧）；内核的工具逐个声明。非 `ToolResult` 的 hook 替身按作者算（M4 的
@@ -254,7 +259,7 @@ B-15、B-18、D-40、D-62、D-63、D-64；`AGENTS.md`。
 
 ### `.syndica.yaml`
 
-`workspace.versions: auto | git | snapshot`（缺省 `auto`）；关掉版本层只有 `run` / `chat` 的 `--no-versions`。
+`workspace.versions: true | false`（缺省 true）。
 
 ### trace
 
@@ -270,21 +275,21 @@ CLI 的私有目录追加 `.syndica/vcs`、`.syndica/worktrees`、`.syndica/snap
 
 ### 阶段一：执行面核心
 
-#### T1 — Portal 协议补全与契约套件
+#### T1 — Portal 协议补全与契约套件（完成，`1fe969c`）
 
 D1、D14。`LocalWorkspace` 实现新方法（伪终端在 T4）；契约套件先覆盖文件、版本、后台进程；AST 守卫：
 `kernel/tools/` 里不得出现 `open(` / `subprocess` / `os.` 的文件与进程调用。
 
-#### T2 — 路由与乐观并发
+#### T2 — 路由与乐观并发（完成，与 T3 同一次提交 `cea34f5`）
 
 D2、D3。`WorkspaceRouter` 跑契约套件；`Read` / `Write` / `Edit` 接看到的版本；冲突的 `ToolResult`；
 「两个 Agent 先后写同一个文件」「没读过就覆盖」「Bash 改过之后再写」各有用例；变异只打冲突判据。
 
-#### T3 — 后台输出增量读
+#### T3 — 后台输出增量读（完成，`cea34f5`）
 
 D8。按 Agent 与句柄的偏移；两个 Agent 各自的增量互不串线。
 
-#### T4 — 伪终端与 `Terminal`
+#### T4 — 伪终端与 `Terminal`（完成，`cf4a91d`）
 
 D7。`LocalWorkspace` 的六件套与契约套件的伪终端部分；取消、超时、进程退出、resize 的定向用例；kill 之后
 进程组里没有存活进程；危险判定读 `command` 与 `input`。
@@ -293,9 +298,10 @@ D7。`LocalWorkspace` 的六件套与契约套件的伪终端部分；取消、�
 
 #### T5 — 版本层
 
-D4、D5。私有 git 与快照两种实现、`auto` 的退回、基线、记录 / 历史 / diff / 回滚；`Write` / `Edit` 交回
-`ArtifactRef`。git 调用的环境与 `-c` 由一条用例逐项钉住（hooks、fsmonitor、gpg、系统与全局配置），并有一条
-在工作区里放 `.gitattributes` 过滤器与恶意 hook 的用例证明它们不被执行；没有 git 的环境用 `PATH` 里没有 git 模拟。
+D4、D5。Python 写的 git 格式对象库（用户用 git 读得出来，由一条用例在有 git 时核对）、记录 / 历史 / diff / 回滚；
+`Write` / `Edit` 交回 `ArtifactRef`。一条用例在 `.syndica/vcs/config` 里写进过滤器、fsmonitor 与 `include.path`、在
+工作区放 `.gitattributes`，证明版本层的任何操作都不执行它们；隔离合并调 `git merge-file` 时的目录、环境与配置由一条
+用例逐项钉住；没有 git 的环境用 `PATH` 里没有 git 模拟。危险规则对 `.syndica` 路径的新判据每个写法各有一条用例。
 
 #### T6 — 隔离与合并
 
@@ -313,7 +319,8 @@ D9（图、文件污点、基线判据）、D13。查询的独立遍历守卫；
 D9（B-15、B-18、D-40）、D10。变异打：异常标记的组合、兄弟结果的计入、投影比对、broker 收紧、扩展切点收紧、
 结局事件不可跳过。
 
-#### T9 — 危险规则与安全矩阵
+#### T9 — 危险规则与安全矩阵（B-13 / B-14 完成，`a84a889`：wrapper 选项表本来就在，补的是不执行实参的查询类
+程序与 `command -v/-V`；`)` 找到了能区分的自然写法）
 
 D11、D12。规则表每个新成员各有一条用例；安全矩阵全格；`{1, N}` 两档逐块相同。
 
@@ -344,3 +351,6 @@ D11、D12。规则表每个新成员各有一条用例；安全矩阵全格；`{
 - 2026-10-04：用户「把 M5 做完，包括写计划，review 计划，执行计划，同样不要做有过多耗时和等待的事情」。按 M4 的
   授权方式自主完成，四种情况停下来问（改 spec 方向或四条主张、付费服务或重量级依赖、放宽安全边界、动本仓以外的
   东西）。评审与变异的轮数按上面收紧。
+- 2026-10-04：计划评审的 Blocking（B1：私有 git 目录躲过现有三道防线，宿主对它调 git 等于在危险闸之外执行 Agent
+  写下的代码）并进 D4——版本层不再调 git，对象由内核用 Python 写；文件污点的基线从版本层挪到 D9 的 stat 指纹；
+  `workspace.versions` 于是不再关系安全判据。阶段一（T1–T4 与 B-13 / B-14）已推送（`cea34f5`）。
