@@ -37,6 +37,7 @@ from syndica.kernel import (
     Runtime,
     RuntimeModule,
     Tool,
+    ToolCall,
     ToolResult,
     TrustLevel,
 )
@@ -298,6 +299,8 @@ class _Recorder:
         self._parent_known = False
         self._run: int | None = None
         self._start = 0
+        # 记录 hook 已经看过的调用：结局观察者只补记 hook 没机会看的那些（前面的 hook 把链截断了）。
+        self._hooked: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -309,9 +312,19 @@ class _Recorder:
         hooks.register(Junction.AGENT_ERROR, self._failed)
 
     async def _recorded(self, **kwargs: Any) -> HookResult:
+        self._hooked.add(cast(ToolCall, kwargs['tool_call']).id)
         name = cast(Tool, kwargs['tool']).__tool_name__
         args = cast(Mapping[str, Any], kwargs['args'])
         result = cast(ToolResult, kwargs['result'])
+        return self._outcome(name or '', args, result)
+
+    def _observed(self, call: ToolCall, args: Mapping[str, Any], result: ToolResult) -> None:
+        if call.id in self._hooked:
+            self._hooked.discard(call.id)
+            return
+        self._outcome(call.name, args, result)
+
+    def _outcome(self, name: str, args: Mapping[str, Any], result: ToolResult) -> HookResult:
         if name in _WRITERS:
             # 只记写成了的：没写成的 Edit（原文没找到）记进来，之后 Bash 改了同一个文件，改动就会
             # 被当成 Write / Edit 产生的。写成了的结果在 meta 里带着路径。
@@ -454,9 +467,10 @@ class DevModule(RuntimeModule):
                 log, host, member.agent_id, role, git if role in reviewers else None
             )
             # 记录挂在 Agent 的局部层：Module 层与 Runtime 层的 skip 截不断它，它看到的也是工具自己
-            # 交回的结果。在它之前装配的 Module 从工厂里往局部层挂的 POST_TOOL_USE hook 排在它前面，
-            # 那个 hook 的 skip 会让这次调用记不下。
+            # 交回的结果，并给检查类命令的结果标上 `check`。在它之前装配的 Module 从工厂里往局部层
+            # 挂的 POST_TOOL_USE hook 排在它前面、能截断链；结局观察者不经链，补记被截掉的调用。
             member.register_hook(Junction.POST_TOOL_USE, recorder._recorded)  # pyright: ignore[reportPrivateUsage]
+            member.observe_tool_outcomes(recorder._observed)  # pyright: ignore[reportPrivateUsage]
             return recorder
 
         def dev_log(runtime: object, flags: object) -> DevLog:

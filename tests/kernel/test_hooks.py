@@ -793,6 +793,7 @@ def test_hook_result_fields_are_the_positional_contract():
         'modified',
         'result',
         'history',
+        'untrusted',
     ]
 
 

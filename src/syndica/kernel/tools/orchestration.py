@@ -271,6 +271,7 @@ class Delegate(_AgentTool):
     """
 
     __tool_command_args__ = ()
+    __tool_external_input__ = True
 
     async def execute(self, agent: str, query: str, isolation: str = 'shared') -> ToolResult:
         """把一件独立的工作派给一个 Agent 角色，等它做完并取回它的结果。
@@ -321,6 +322,7 @@ class Fork(_AgentTool):
     """
 
     __tool_command_args__ = ()
+    __tool_external_input__ = True
 
     async def execute(self, query: str, isolation: str = 'shared') -> ToolResult:
         """分叉出一个继承了你当前上下文的 Agent，交给它一件延续性的工作，等它做完。
@@ -369,6 +371,7 @@ class SendMessage(_AgentTool):
     """
 
     __tool_command_args__ = ()
+    __tool_external_input__ = False
 
     async def execute(self, agent_id: str, content: str, trigger: str = 'pending') -> ToolResult:
         """给一个**已有的** Agent 发一条消息，不等它回话；它没在跑就把它叫醒。
@@ -424,6 +427,7 @@ class QueryAgent(_AgentTool):
     """
 
     __tool_command_args__ = ()
+    __tool_external_input__ = True
 
     async def execute(self, agent_id: str) -> ToolResult:
         """读一个 Agent 的名字、状态、父与子代数量；**只看不碰**，不会把它叫醒。
@@ -464,6 +468,7 @@ class KillAgent(_AgentTool):
     """
 
     __tool_command_args__ = ()
+    __tool_external_input__ = False
 
     async def execute(self, agent_id: str) -> ToolResult:
         """终止一个**你派出去的** Agent 的事件循环，让它立刻停下手上的活。

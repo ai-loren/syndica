@@ -176,7 +176,7 @@ from syndica.kernel.modules import (
     _RuntimeModuleAssembly,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.kernel.plugins import Plugin, install_plugins
-from syndica.kernel.protocols import AgentRegistry, MessageBroker
+from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tools import orchestration_tools
 from syndica.kernel.trace import AttributeValue, SpanKind
@@ -877,6 +877,51 @@ def _already_shut_down() -> ContractViolation:
     )
 
 
+class _TighteningBroker:
+    """`runtime.broker`：被收紧的 Module 的代码（它的工具、hook 与它们起的任务）经它直接投递的
+    消息，先把 `trust` 收成 UNTRUSTED 再交给真正的 broker（M5 D10，D-63）。`send` 已经按调用方的
+    身份收紧，而 broker 是存储层的公开协议，拿得到 runtime 的代码就能绕过 `send`。标记是消息自己的
+    字段，远程 broker 序列化之后照样在。其余方法原样转交：取消、超时与线性化的契约都在里面那层。"""
+
+    def __init__(self, inner: MessageBroker, untrusted: Callable[[], bool]) -> None:
+        self._inner = inner
+        self._untrusted = untrusted
+
+    async def ensure_queue(self, agent_id: str) -> None:
+        await self._inner.ensure_queue(agent_id)
+
+    async def publish(self, agent_id: str, message: Message) -> DeliveryResult:
+        if self._untrusted() and message.trust is not TrustLevel.UNTRUSTED:
+            message = replace(message, trust=TrustLevel.UNTRUSTED)
+        return await self._inner.publish(agent_id, message)
+
+    async def consume(self, agent_id: str, *, max_n: int = 0) -> list[Message]:
+        return await self._inner.consume(agent_id, max_n=max_n)
+
+    async def wait_for_messages(self, agent_id: str, timeout: float | None) -> bool:  # noqa: ASYNC109
+        return await self._inner.wait_for_messages(agent_id, timeout)
+
+    async def take_by_correlation(
+        self,
+        agent_id: str,
+        correlation_id: str,
+        timeout: float | None,  # noqa: ASYNC109
+    ) -> Message | None:
+        return await self._inner.take_by_correlation(agent_id, correlation_id, timeout)
+
+    async def remove_queue(self, agent_id: str) -> None:
+        await self._inner.remove_queue(agent_id)
+
+    def on_missing_queue(self, cb: MissingQueueCallback) -> None:
+        self._inner.on_missing_queue(cb)
+
+    def off_missing_queue(self, cb: MissingQueueCallback) -> None:
+        self._inner.off_missing_queue(cb)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 def _checked_store(value: object, protocol: type[_StoreT], field: str, constructed: str) -> _StoreT:
     """registry / broker 必须是 Protocol 实例。类对象会通过鸭子检查（方法挂在类上），漏括号
     `Runtime(registry=InMemoryAgentRegistry)` 会把构造推迟到第一次 spawn 的裸 TypeError。
@@ -1019,14 +1064,16 @@ class Runtime:
             if registry is None
             else _checked_store(registry, AgentRegistry, 'registry', 'InMemoryAgentRegistry()')
         )
-        self.broker: MessageBroker = (
+        self.broker: MessageBroker = _TighteningBroker(
             InMemoryMessageBroker()
             if broker is None
-            else _checked_store(broker, MessageBroker, 'broker', 'InMemoryMessageBroker()')
+            else _checked_store(broker, MessageBroker, 'broker', 'InMemoryMessageBroker()'),
+            lambda: self._from_listed_module(TrustLevel.TRUSTED) is TrustLevel.UNTRUSTED,
         )
         self.events: EventBus = EventBus()
         self.hooks: HooksCenter = HooksCenter()
         self.hooks._serve_runtime()  # pyright: ignore[reportPrivateUsage]
+        self.hooks._tighten_modules(self._untrusted_output)  # pyright: ignore[reportPrivateUsage]
         # 扩展切点被触发时记在当前 span 上；在本 Runtime 任何 span 之外触发的不记（没有可挂的
         # 地方）。
         self.hooks._observe_extensions(  # pyright: ignore[reportPrivateUsage]

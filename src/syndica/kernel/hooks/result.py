@@ -21,6 +21,9 @@ class HookResult:
     量必须看后者——链中间一个 hook 把 trust 收紧、后一个 hook 交出带默认 trust 的新值时，结论里
     那次收紧已经不见了（spec §12.2）。
 
+    `untrusted` 同样只出现在 `trigger` 的返回值上：这份结论里有被收紧的 Module 写下的改写或跳过，
+    拿它的值去做事的代码要按不可信对待（结论本身不带作者）。
+
     只有可拦截切点读它：可观察切点上返回的 `HookResult` 被整个丢弃。字段顺序计入公开 API。
     """
 
@@ -28,6 +31,7 @@ class HookResult:
     modified: dict[str, Any] = field(default_factory=dict[str, Any])
     result: Any = None
     history: dict[str, list[Any]] = field(default_factory=dict[str, list[Any]])
+    untrusted: bool = False
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.modified.get(key, default)

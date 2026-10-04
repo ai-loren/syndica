@@ -78,12 +78,46 @@ def _hooks(
     runtime = SimpleNamespace(dev_log=log, registry=_Registry(parent))
     hooks = HooksCenter()
     agent = SimpleNamespace(
-        agent_id=agent_id, options=SimpleNamespace(name=role), register_hook=hooks.register
+        agent_id=agent_id,
+        options=SimpleNamespace(name=role),
+        register_hook=hooks.register,
+        observe_tool_outcomes=_OBSERVERS.append,
     )
     module = DevModule(root, {}, reviewer_roles=reviewers)
     plugin = cast(Any, module.agent_plugins[1])(runtime, agent, {})
     plugin.register(hooks)
     return hooks
+
+
+_OBSERVERS: list[Any] = []
+
+
+async def test_a_call_the_hook_never_saw_is_still_recorded_by_the_outcome_observer():
+    log = DevLog()
+    _OBSERVERS.clear()
+    _hooks(log)
+    [observe] = _OBSERVERS
+
+    observe(
+        ToolCall(id='unseen', name='Write', arguments='{}'),
+        {'path': 'a.md'},
+        ToolResult(output='written', meta={'path': 'a.md'}),
+    )
+
+    assert [(entry.tool, entry.target) for entry in log.snapshot().tools] == [('Write', 'a.md')]
+
+
+async def test_a_call_the_hook_already_recorded_is_not_recorded_again():
+    log = DevLog()
+    _OBSERVERS.clear()
+    hooks = _hooks(log)
+    [observe] = _OBSERVERS
+    result = ToolResult(output='written', meta={'path': 'a.md'})
+
+    await _post(hooks, 'Write', {'path': 'a.md'}, result)
+    observe(ToolCall(id='call', name='Write', arguments='{}'), {'path': 'a.md'}, result)
+
+    assert [(entry.tool, entry.target) for entry in log.snapshot().tools] == [('Write', 'a.md')]
 
 
 def _finished(stdout: str = '', *, handle: str | None = None, **overrides: object) -> ToolResult:
@@ -342,7 +376,10 @@ async def test_a_registry_that_fails_does_not_lose_the_run(caplog: pytest.LogCap
     runtime = SimpleNamespace(dev_log=log, registry=Broken())
     hooks = HooksCenter()
     agent = SimpleNamespace(
-        agent_id='a1', options=SimpleNamespace(name='Worker'), register_hook=hooks.register
+        agent_id='a1',
+        options=SimpleNamespace(name='Worker'),
+        register_hook=hooks.register,
+        observe_tool_outcomes=_OBSERVERS.append,
     )
     plugin = cast(Any, DevModule(Path('/nowhere'), {}).agent_plugins[1])(runtime, agent, {})
     plugin.register(hooks)

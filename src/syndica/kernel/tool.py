@@ -166,6 +166,10 @@ class Tool(ABC):
     #
     # 名字必须是 `execute` 收得到的参数名，否则那条声明静默落空——校验在 `danger` 的判定入口。
     __tool_command_args__: ClassVar[tuple[str, ...] | None] = None
+    # 这个工具会不会把外部的内容（文件、网页、子进程的输出、别的 Agent 写的东西）带进它交回的
+    # 结果或抛出的异常里。`None` 是没声明，按「会」算：它抛出的异常文字整份当不可信，同段兄弟被
+    # hook 改写参数时也把它算作可能的不可信来源。`False` 时它的异常文字只按这次调用的溯源结论算。
+    __tool_external_input__: ClassVar[bool | None] = None
 
     @property
     def name(self) -> str:

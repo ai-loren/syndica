@@ -240,6 +240,7 @@ class Read(Tool):
 
     __tool_name__ = 'Read'
     __tool_command_args__ = ()
+    __tool_external_input__ = True
 
     def __init__(self, portal: Portal) -> None:
         self._portal = portal
@@ -267,6 +268,7 @@ class Write(Tool):
 
     __tool_name__ = 'Write'
     __tool_command_args__ = ()
+    __tool_external_input__ = False
 
     def __init__(self, portal: Portal) -> None:
         self._portal = portal
@@ -293,6 +295,7 @@ class Edit(Tool):
 
     __tool_name__ = 'Edit'
     __tool_command_args__ = ()
+    __tool_external_input__ = False
 
     def __init__(self, portal: Portal) -> None:
         self._portal = portal
@@ -321,6 +324,7 @@ class Glob(Tool):
 
     __tool_name__ = 'Glob'
     __tool_command_args__ = ()
+    __tool_external_input__ = True
 
     def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal
@@ -347,6 +351,7 @@ class Grep(Tool):
 
     __tool_name__ = 'Grep'
     __tool_command_args__ = ()
+    __tool_external_input__ = True
 
     def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal
@@ -374,6 +379,7 @@ class Bash(Tool):
 
     __tool_name__ = 'Bash'
     __tool_command_args__ = ('command',)
+    __tool_external_input__ = True
 
     def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal
@@ -421,6 +427,7 @@ class BashOutput(Tool):
 
     __tool_name__ = 'BashOutput'
     __tool_command_args__ = ()
+    __tool_external_input__ = True
 
     def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal
@@ -461,6 +468,7 @@ class KillBash(Tool):
 
     __tool_name__ = 'KillBash'
     __tool_command_args__ = ()
+    __tool_external_input__ = False
 
     def __init__(self, portal: Portal) -> None:
         self._portal = portal
@@ -499,6 +507,7 @@ class Terminal(Tool):
     __tool_name__ = 'Terminal'
     # `create` 的命令与 `send` 写进终端的文字都会被 shell 或终端里的程序执行。
     __tool_command_args__ = ('command', 'input')
+    __tool_external_input__ = True
 
     def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal

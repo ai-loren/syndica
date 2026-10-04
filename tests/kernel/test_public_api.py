@@ -229,6 +229,7 @@ _BASE_AGENT_SURFACE: tuple[str, ...] = (
     'get_system_prompt',
     'install_own_tools',
     'install_runtime_tools',
+    'observe_tool_outcomes',
     'options',
     'register_hook',
     'run',
@@ -363,6 +364,7 @@ _PROMISED_VIA_SUBMODULE: dict[str, tuple[str, ...]] = {
     'syndica.kernel.workspace': ('ANY', 'Expected'),
     'syndica.kernel.isolation': ('IsolatedCopy',),
     'syndica.kernel.file_taint': ('TaintAware',),
+    'syndica.kernel.tool_executor': ('ToolOutcomeObserver',),
     'syndica.kernel.scenario_schema': (
         'DangerPolicySpec',
         'DangerRuleSpec',
@@ -451,6 +453,7 @@ _WITHHELD: tuple[str, ...] = (
     'ToolCallKey',
     'ToolExecutor',
     'ToolOutcome',
+    'ToolOutcomeObserver',
     'TurnGate',
     'TurnGateDecision',
     'UNSAFE_TEXT',

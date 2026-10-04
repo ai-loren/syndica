@@ -32,7 +32,8 @@ import contextlib
 import inspect
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, cast
 
@@ -61,6 +62,10 @@ __all__ = ['HookCallback', 'HooksCenter']
 logger = logging.getLogger(__name__)
 
 HookCallback = Callable[..., Awaitable[HookResult | None]]
+
+# 执行器在 `tool.execute` 期间放的格子：这段时间里触发的扩展切点，结论出自被收紧的 Module 时把切点名
+# 记进去，执行器据此把这次调用的结果收紧（D-64）。不在工具调用里是 None。
+EXTENSION_TAINT: ContextVar[list[str] | None] = ContextVar('syndica_extension_taint', default=None)
 
 
 @dataclass(frozen=True)
@@ -438,6 +443,7 @@ class HooksCenter:
         self._runtime_owned = False
         self._reserved_owners: frozenset[str] = frozenset()
         self._on_extension: Callable[[str], None] | None = None
+        self._untrusted_modules: frozenset[str] | None = None
 
     def declare_extension_junction(self, name: str, kind: JunctionKind) -> ExtensionJunction:
         """声明一个扩展切点及其分类，交回触发它要用的句柄。
@@ -530,7 +536,39 @@ class HooksCenter:
         declared = self._declared_handle(junction.name)
         if declared is not junction:
             raise _foreign_handle(junction, self._declarer_of(junction.name) or '别处')
-        return await self._dispatch(resolved, **kwargs)
+        result, authors = await self._dispatch_attributed(resolved, **kwargs)
+        if not self._by_untrusted_module(authors):
+            return result
+        # 结论里有被收紧的 Module 写的东西：交回的值带着标记，外层那次工具调用也按不可信收紧
+        # （执行器在 `tool.execute` 期间放了一个格子，切点触发在它里面时把这件事记进去）。
+        cell = EXTENSION_TAINT.get()
+        if cell is not None:
+            cell.append(junction.name)
+        return replace(result, untrusted=True)
+
+    def _by_untrusted_module(self, authors: Authorship) -> bool:
+        names = self._untrusted_names()
+        if not names:
+            return False
+        installers = [
+            authors.skipped_by,
+            *(installer for group in authors.wrote.values() for installer in group),
+            *(installer for group in authors.changed.values() for installer in group),
+        ]
+        return any(
+            installer is not None and installer.kind == 'module' and installer.name in names
+            for installer in installers
+        )
+
+    def _tighten_modules(self, names: frozenset[str]) -> None:
+        """Runtime 在自己的中心上登记被收紧的 Module：链上任何一层触发扩展切点时沿 `outer`
+        找到它。"""
+        self._untrusted_modules = names
+
+    def _untrusted_names(self) -> frozenset[str]:
+        if self._untrusted_modules is not None:
+            return self._untrusted_modules
+        return self._outer._untrusted_names() if self._outer is not None else frozenset()
 
     async def _dispatch(self, junction: JunctionRef, /, **kwargs: Any) -> HookResult:
         """分发一次，只要结论。语义见 `_dispatch_attributed`。"""

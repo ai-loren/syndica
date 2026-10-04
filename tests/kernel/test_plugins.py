@@ -658,7 +658,7 @@ def test_the_only_dispatches_the_matcher_skips_are_the_dispatch_paths_own():
     assert skipped == [
         ('_dispatch', '_dispatch_attributed', 'junction'),
         ('trigger', '_dispatch', 'junction'),
-        ('trigger', '_dispatch', 'resolved'),
+        ('trigger', '_dispatch_attributed', 'resolved'),
     ]
 
 

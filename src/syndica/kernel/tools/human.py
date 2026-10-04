@@ -157,6 +157,7 @@ class AskUser(_HumanTool):
 
     __tool_name__ = 'AskUser'
     __tool_command_args__ = ()
+    __tool_external_input__ = False
 
     async def execute(self, question: str, timeout: float = 300.0) -> ToolResult:
         """等待人类回答一个开放问题。
@@ -175,6 +176,7 @@ class AskUserQuestion(_HumanTool):
 
     __tool_name__ = 'AskUserQuestion'
     __tool_command_args__ = ()
+    __tool_external_input__ = False
     __tool_schema__ = {
         'name': 'AskUserQuestion',
         'description': '等待人类从明确选项中选择一个。',

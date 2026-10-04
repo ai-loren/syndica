@@ -141,6 +141,7 @@ from syndica.kernel.danger import (
 )
 from syndica.kernel.errors import ConfigError, ContractViolation, SyndicaError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction, ReadOnlyKwarg
+from syndica.kernel.hooks.center import EXTENSION_TAINT
 from syndica.kernel.hooks.installing import Installer, acting_as
 from syndica.kernel.ids import ToolCallKey, entering_tool_call, leaving_tool_call, peek_key
 from syndica.kernel.tool import Tool, ToolResult, tool_name_disagreement, validate_tool_names
@@ -151,11 +152,18 @@ from syndica.kernel.tracing import (
     _Tracing,  # pyright: ignore[reportPrivateUsage]
 )
 
-__all__ = ['DEFAULT_MAX_TOOL_CONCURRENCY', 'ToolExecutor', 'validate_max_concurrency']
+__all__ = [
+    'DEFAULT_MAX_TOOL_CONCURRENCY',
+    'ToolExecutor',
+    'ToolOutcomeObserver',
+    'validate_max_concurrency',
+]
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOOL_CONCURRENCY = 4
+
+ToolOutcomeObserver = Callable[[ToolCall, Mapping[str, Any], ToolResult], None]
 
 
 def validate_max_concurrency(value: object, field: str) -> None:
@@ -272,6 +280,32 @@ def _result_content(result: ToolResult) -> object:
     return copy.deepcopy(result.output), list(result.artifacts), result.trust
 
 
+def _args_content(args: Any) -> object:
+    return copy.deepcopy(dict(cast(Mapping[str, Any], args)))
+
+
+def _call_content(call: Any) -> object:
+    observed = cast(ToolCall, call)
+    return observed.id, observed.name, observed.arguments
+
+
+_PRE_WATCH: Mapping[str, Callable[[Any], object]] = MappingProxyType(
+    {'args': _args_content, 'tool_call': _call_content}
+)
+
+
+def _tool_call_mutated(call: ToolCall, authors: Sequence[Installer | None]) -> ContractViolation:
+    who = '、'.join('宿主代码' if author is None else author.describe() for author in authors)
+    return ContractViolation(
+        expected=f'{Junction.PRE_TOOL_USE.value} hook 不改 tool_call（名字、id、参数）',
+        received=f'{who} 就地改了调用 {call.name}（id={call.id}）',
+        next_action=(
+            "要换参数就交回 modified['args']；要换工具就 skip 这次调用并交回替代结果——"
+            '名字与 id 是宿主策略与结果配对的依据，不能改'
+        ),
+    )
+
+
 def _tightened(baseline: TrustLevel, derived: ToolResult) -> ToolResult:
     """把派生结果的 trust 收紧到不松于 baseline。"""
     if baseline is TrustLevel.UNTRUSTED and derived.trust is not baseline:
@@ -349,14 +383,16 @@ def _bad_arguments_result(call: ToolCall, tool: Tool, detail: str) -> ToolResult
     )
 
 
-def _tool_raised_result(call: ToolCall, exc: Exception) -> ToolResult:
+def _tool_raised_result(call: ToolCall, exc: Exception, trust: TrustLevel) -> ToolResult:
+    """`trust` 由调用方按工具会不会带进外部内容算（`_raised_trust`）：异常文字可以整份来自工具读到
+    的外部内容，也可以只是参数的回显。"""
     return ToolResult(
         output=(
             f'期望: {call.name} 正常执行完成。'
             f' 实际: 抛出 {_described(exc)}。'
             ' 下一步: 调整参数后重试，或换用其他方式达成同一目标。'
         ),
-        trust=TrustLevel.UNTRUSTED,
+        trust=trust,
     )
 
 
@@ -652,6 +688,7 @@ class ToolExecutor:
         self._judge = judge if judge is not None else DangerJudge()
         self._policy: DangerPolicy = policy if policy is not None else BlockHighRisk()
         self._max_concurrency = max_concurrency
+        self._outcome_observers: list[ToolOutcomeObserver] = []
         self._untrusted_high_risk = Disposition.BLOCK
         self._confirmation_agent_id: str | None = None
         self._confirmation: ConfirmationCallback | None = None
@@ -720,6 +757,38 @@ class ToolExecutor:
             and installer.name in self._untrusted_modules
             for installer in installers
         )
+
+    def _observe_outcomes(self, observer: ToolOutcomeObserver) -> None:
+        if not callable(observer):
+            raise ConfigError(
+                expected='observer 可调用：observer(调用, 执行的参数, 最终结果)',
+                received=f'收到 {observer!r}，类型是 {type(observer).__name__}',
+                next_action='传入一个同步函数；要等待的工作自己另起任务去做',
+            )
+        self._outcome_observers.append(observer)
+
+    def _report_outcome(self, call: ToolCall, args: Mapping[str, Any], result: ToolResult) -> None:
+        for observer in list(self._outcome_observers):
+            try:
+                observer(call, MappingProxyType(dict(args)), result)
+            except Exception:
+                logger.exception(
+                    '工具结局的观察者 %r 在 %s（id=%s）上抛了异常；这次调用照常收尾',
+                    observer,
+                    call.name,
+                    call.id,
+                )
+
+    def _reads_external(self, call: ToolCall) -> bool:
+        """这次调用的结果或异常里会不会有外部的内容：没声明的、查不到的、被收紧的 Module 的工具都按
+        会算。"""
+        tool = self._tools.get(call.name)
+        if tool is None or call.name in self._untrusted_tools:
+            return True
+        return cast(object, getattr(tool, '__tool_external_input__', None)) is not False
+
+    def _raised_trust(self, call: ToolCall, provenance: TrustLevel) -> TrustLevel:
+        return TrustLevel.UNTRUSTED if self._reads_external(call) else provenance
 
     def _floored(self, call: ToolCall, result: ToolResult) -> ToolResult:
         if call.name in self._untrusted_tools and result.trust is not TrustLevel.UNTRUSTED:
@@ -848,7 +917,7 @@ class ToolExecutor:
                             provenance,
                             execution_gate,
                             confirmation_lock,
-                            has_siblings=False,
+                            siblings_external=False,
                             key=keys[0],
                         )
                     ]
@@ -865,10 +934,14 @@ class ToolExecutor:
                         provenance,
                         execution_gate,
                         confirmation_lock,
-                        has_siblings=True,
+                        siblings_external=any(
+                            self._reads_external(other)
+                            for position, other in enumerate(calls)
+                            if position != index
+                        ),
                         key=key,
                     )
-                    for call, key in zip(calls, keys, strict=True)
+                    for index, (call, key) in enumerate(zip(calls, keys, strict=True))
                 ),
                 return_exceptions=True,
             )
@@ -987,7 +1060,7 @@ class ToolExecutor:
         execution_gate: _ExecutionGate,
         confirmation_lock: asyncio.Lock,
         *,
-        has_siblings: bool,
+        siblings_external: bool,
         key: ToolCallKey | None,
     ) -> ToolResult:
         """在「当前工具调用」与它的 span 里跑一次调用：`PRE_TOOL_USE` 之前设、执行完复位（M3 D10）。
@@ -1007,7 +1080,7 @@ class ToolExecutor:
                 provenance,
                 execution_gate,
                 confirmation_lock,
-                has_siblings=has_siblings,
+                siblings_external=siblings_external,
                 traced=None,
             )
             return result
@@ -1021,7 +1094,7 @@ class ToolExecutor:
                         provenance,
                         execution_gate,
                         confirmation_lock,
-                        has_siblings=has_siblings,
+                        siblings_external=siblings_external,
                         traced=(key, span),
                     )
                 except _JudgeFailure:
@@ -1043,15 +1116,16 @@ class ToolExecutor:
         execution_gate: _ExecutionGate,
         confirmation_lock: asyncio.Lock,
         *,
-        has_siblings: bool,
+        siblings_external: bool,
         traced: tuple[ToolCallKey, _OpenSpan] | None,
     ) -> tuple[ToolResult, str]:
         """跑一次调用，交回结果块与它的结局（trace 的 `tool.outcome`）。`traced` 是这次调用的键与
         它的 span；不记 trace 时是 None。
 
-        `has_siblings` 没有默认值：它决定 hook 改写参数之后这次调用按什么溯源结论过闸，漏传一处
-        就是默认升级在那条路上静默失效，而默认值会把这件事变成静态检查看不见的疏漏。它由
-        `_run_segment` 从决定要不要进 `gather` 的同一个 `len(calls)` 判断算出，两者不可能错位。
+        `siblings_external`（同段兄弟里有会带进外部内容的工具）没有默认值：它决定 hook 改写参数之后
+        这次调用按什么溯源结论过闸，漏传一处就是默认升级在那条路上静默失效，而默认值会把这件事变成
+        静态检查看不见的疏漏。它由 `_run_segment` 按整段的工具声明算出：只看声明、不看兄弟此刻
+        跑没跑完，结论于是不随调度变。
         """
         tool = self._tools.get(call.name)
         if tool is None:
@@ -1079,8 +1153,12 @@ class ToolExecutor:
         # 此后再有人就地改也改不掉那个结论。
         handed = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', args)
         pre, pre_authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
-            Junction.PRE_TOOL_USE, tool_call=call, tool=tool, args=handed
+            Junction.PRE_TOOL_USE, _PRE_WATCH, tool_call=call, tool=tool, args=handed
         )
+        mutated = pre_authors.changed.get('tool_call', ())
+        if mutated:
+            # 宿主策略按 `call.name` 判、结果块按 `call.id` 配对：就地改了它，两者都会被骗过。
+            raise _tool_call_mutated(call, mutated)
         if pre.skip:
             skipped = _skipped_result(call, pre.result)
             if pre.result is not None and self._by_untrusted((pre_authors.skipped_by,)):
@@ -1098,14 +1176,18 @@ class ToolExecutor:
         # `history`，于是「`modified['args']` 有值」与「`rewrites('args')` 为真」同真同假。留着它是
         # 因为那条同源关系不在本文件里——`history` 一旦不再随 `modified` 同步填，`rewrites` 就会漏
         # 掉一次真实改写，而漏掉的后果是溯源不重取。
-        if pre.rewrites('args') or rewritten_args is not handed:
-            # 多元素段里这次重取**结构上就是一次失败的溯源**：hook 能从旁路拿到同段兄弟的产出并
-            # 展开进参数，而兄弟的 block 要等整段跑完才落进轨迹，重取在轨迹里一个字都看不到。
-            # spec §13：溯源失败时按最坏情况处理。少判的方向不可回收——默认升级会静默失效，
-            # §12.2 低风险那一格的记录义务也会一起无声消失。
+        # 只读视图挡不住往嵌套容器里就地写：盯住的投影变了，那个 hook 同样是这份参数的作者。
+        in_place = pre_authors.changed.get('args', ())
+        if pre.rewrites('args') or rewritten_args is not handed or in_place:
+            # 多元素段里，hook 能从旁路拿到同段兄弟的产出并展开进参数，而兄弟的 block 要等整段跑完
+            # 才落进轨迹，重取在轨迹里一个字都看不到。兄弟里有会带进外部内容的工具时，这次重取结构
+            # 上就是一次失败的溯源，按最坏情况处理（spec §13）；兄弟都不带进外部内容时，它们的产出
+            # 只出自可信的参数，流进来也不改变结论。
             provenance = (
                 TrustLevel.UNTRUSTED
-                if has_siblings or self._by_untrusted(pre_authors.wrote.get('args', ()))
+                if siblings_external
+                or self._by_untrusted(pre_authors.wrote.get('args', ()))
+                or self._by_untrusted(in_place)
                 else strictest_trust(provenance, provenance_of(ctx))
             )
         # 拆掉只读视图：闸、工具与 POST 切点拿到的永远是一份普通 dict。留着它，一个 POST hook 的
@@ -1133,6 +1215,8 @@ class ToolExecutor:
             trust_token = _CALL_TRUST.set(
                 TrustLevel.UNTRUSTED if call.name in self._untrusted_tools else provenance
             )
+            extension_taint: list[str] = []
+            taint_token = EXTENSION_TAINT.set(extension_taint)
             try:
                 with acting_as(None if owner is None else Installer('module', owner)):
                     returned = cast(object, await tool.execute(**args))
@@ -1144,7 +1228,7 @@ class ToolExecutor:
             except Exception as exc:
                 if traced is not None:
                     self._tracing.tool_result(traced[1], None, exc, arguments=args)
-                returned = _tool_raised_result(call, exc)
+                returned = _tool_raised_result(call, exc, self._raised_trust(call, provenance))
                 outcome = 'error'
             else:
                 if isinstance(returned, ToolResult):
@@ -1152,7 +1236,10 @@ class ToolExecutor:
                 if traced is not None and isinstance(returned, ToolResult):
                     self._tracing.tool_result(traced[1], returned, None, arguments=args)
             finally:
+                EXTENSION_TAINT.reset(taint_token)
                 _CALL_TRUST.reset(trust_token)
+            if extension_taint and isinstance(returned, ToolResult):
+                returned = replace(returned, trust=TrustLevel.UNTRUSTED)
             if not isinstance(returned, ToolResult):
                 raise _bad_tool_return(call, tool, returned)
             result = returned
@@ -1177,7 +1264,9 @@ class ToolExecutor:
                 or self._by_untrusted(post_authors.changed.get('result', ()))
                 else strictest_trust(handed_trust, _strictest(result, post.rewrites('result')))
             )
-            return _tightened(baseline, rewritten), outcome
+            final = _tightened(baseline, rewritten)
+            self._report_outcome(call, args, final)
+            return final, outcome
 
     async def _gated(
         self,

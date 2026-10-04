@@ -107,6 +107,7 @@ from syndica.kernel.tool_executor import (
     DEFAULT_MAX_TOOL_CONCURRENCY,
     ConfirmationCallback,
     ToolExecutor,
+    ToolOutcomeObserver,
     validate_max_concurrency,
 )
 from syndica.kernel.trace import SpanKind
@@ -480,6 +481,12 @@ class BaseAgent:
         只从 `Runtime` 的中心触发，挂在这里的回调**结构上永不触发**。
         """
         self._hooks.register(junction, cb)
+
+    def observe_tool_outcomes(self, observer: ToolOutcomeObserver) -> None:
+        """每次真正执行过的工具调用收尾时叫 `observer(调用, 执行的参数, 最终结果)`：在所有
+        `POST_TOOL_USE` hook 之后、结果块落进轨迹之前，不经 hook 链，任何 hook 的 `skip` 都截不断
+        它。它只看不改；它抛的异常记一条 ERROR 后照常往下走，坏掉的观察者不能让这次调用失败。"""
+        self._executor._observe_outcomes(observer)  # pyright: ignore[reportPrivateUsage]
 
     async def trigger_extension(self, handle: ExtensionJunction, /, **kwargs: Any) -> HookResult:
         """在这个 Agent 的整条链（局部 → Module 层 → Runtime）上触发一个扩展切点，返回可拦截链的
