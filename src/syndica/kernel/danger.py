@@ -296,7 +296,7 @@ _INERT_PROGRAMS = frozenset(
     {'ack', 'ag', 'basename', 'cat', 'chmod', 'cmp', 'cp', 'cut', 'diff', 'dirname', 'du', 'echo'}
     | {'egrep', 'fgrep', 'file', 'grep', 'head', 'ln', 'ls', 'md5sum', 'mkdir', 'mv', 'printf'}
     | {'readlink', 'realpath', 'rg', 'sha256sum', 'shasum', 'sort', 'stat', 'tail', 'touch', 'tr'}
-    | {'uniq', 'wc'}
+    | {'type', 'uniq', 'wc', 'whereis', 'which'}
 )
 _ESCALATORS = frozenset({'doas', 'pkexec', 'runuser', 'su', 'sudo'})
 _DOWNLOADERS = frozenset({'aria2c', 'curl', 'fetch', 'lwp-request', 'wget'})
@@ -1325,6 +1325,8 @@ def _command_word_slots(tokens: Sequence[str], start: int = 0) -> list[tuple[int
                 break
             following = _wrapped_program(tokens, index)
             if following is not None:
+                if _describes(tokens, index, following):
+                    break
                 program = _basename(tokens[following])
                 if program in _WRAPPERS:
                     index = following
@@ -1858,6 +1860,8 @@ class _Grammar:
     assignments: bool = False
     # `-19` 这样的纯数字选项（`nice -19 cmd`）。
     numeric: bool = False
+    # 让 wrapper 只描述而不执行后面那个程序的开关（`command -v sudo` 只打印 sudo 在哪）。
+    describing: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1899,7 +1903,9 @@ def _skip_options(tokens: Sequence[str], start: int, grammar: _Grammar) -> int |
 _WRAPPER_GRAMMARS: Mapping[str, _Grammar] = MappingProxyType(
     {
         'builtin': _Grammar(),
-        'command': _Grammar(flags=frozenset({'-p', '-v', '-V'})),
+        'command': _Grammar(
+            flags=frozenset({'-p', '-v', '-V'}), describing=frozenset({'-v', '-V'})
+        ),
         'env': _Grammar(
             flags=frozenset({'-', '-0', '-i', '-v', '--debug', '--ignore-environment', '--null'}),
             valued=frozenset({'-C', '-u', '--chdir', '--unset'}),
@@ -1971,6 +1977,15 @@ _LAUNCHERS: Mapping[str, _Launcher] = MappingProxyType(
         'pipx': _Launcher(before=_PIPX_GLOBAL, subcommands=(('run',),), after=_PIPX_RUN),
     }
 )
+
+
+def _describes(tokens: Sequence[str], index: int, following: int) -> bool:
+    """index 上的 wrapper 在它与 following 之间带了只描述、不执行的开关。只在选项全认得出时问：
+    认不出的组合（`command -pv`）照旧按执行算，那个方向的错只是一次误报。"""
+    grammar = _WRAPPER_GRAMMARS.get(_basename(tokens[index]))
+    return grammar is not None and any(
+        token in grammar.describing for token in tokens[index + 1 : following]
+    )
 
 
 def _wrapped_program(tokens: Sequence[str], index: int) -> int | None:
