@@ -91,16 +91,27 @@ class WriteConflict(Exception):
     可恢复的结果交给模型，由模型决定重读合并还是换个地方写。`current` 是 None 时文件此刻不存在。
     """
 
-    def __init__(self, path: str, expected: str | None, current: str | None) -> None:
+    def __init__(
+        self, path: str, expected: str | None, current: str | None, *, unread: bool = False
+    ) -> None:
         self.path = path
         self.expected = expected
         self.current = current
-        wanted = '不存在' if expected is None else f'版本是 {expected}'
-        found = '不存在' if current is None else f'版本是 {current}'
-        super().__init__(
-            f'期望: {path} {wanted}（写入的前提）。实际: 它此刻{found}，在那之后被改过。'
-            ' 下一步: 重新读它，在最新的内容上再改；或者改写到另一个路径。'
-        )
+        self.unread = unread
+        if unread:
+            message = (
+                f'期望: 覆盖 {path} 之前读过它。实际: 它已经存在（版本 {current}），'
+                '而你还没读过它，写下去就会盖掉你没看过的内容。'
+                ' 下一步: 先用 Read 读它，在最新的内容上再写；或者写到一个新路径。'
+            )
+        else:
+            wanted = '不存在' if expected is None else f'版本是 {expected}'
+            found = '不存在' if current is None else f'版本是 {current}'
+            message = (
+                f'期望: {path} {wanted}（写入的前提）。实际: 它此刻{found}，在那之后被改过。'
+                ' 下一步: 重新读它，在最新的内容上再改；或者改写到另一个路径。'
+            )
+        super().__init__(message)
 
 
 class Portal(Protocol):

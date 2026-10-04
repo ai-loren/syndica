@@ -150,6 +150,7 @@ from syndica.kernel.workspace import (
     Workspace,
     WriteConflict,
 )
+from syndica.kernel.workspace_router import WorkspaceRouter
 
 __all__ = [
     'AgentCatalog',
@@ -275,6 +276,7 @@ __all__ = [
     'WaitState',
     'Waiter',
     'Workspace',
+    'WorkspaceRouter',
     'WriteConflict',
     'encode_redacted',
     'flag_reference',

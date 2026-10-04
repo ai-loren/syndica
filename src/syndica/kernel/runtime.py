@@ -142,6 +142,7 @@ from syndica.kernel.danger import (
     require_own_command_args,
     validate_confirmation_handler,
 )
+from syndica.kernel.driving import _DRIVING_AGENT  # pyright: ignore[reportPrivateUsage]
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import (
     EventBus,
@@ -329,8 +330,8 @@ def _observe_shutdown_task(task: asyncio.Task[None]) -> None:
 #
 # **无条件置位是承重的**：`spawn` 从驱动任务内部建子 Agent 的驱动任务，它会继承父写下的值；只靠
 # `default=None` 会让子 Agent 的守卫指着它的父。反过来 `_reap` 不是任何人的事件循环（它刻意跑在
-# 事件循环之外），继承来的值在那里是一句假话，所以它进门先清掉。
-_DRIVING_AGENT: ContextVar[str | None] = ContextVar('syndica_driving_agent', default=None)
+# 事件循环之外），继承来的值在那里是一句假话，所以它进门先清掉。变量本身在 `driving`：工作区路由
+# 也按它分派，而路由不能 import 本模块。
 
 # 本进程的事件循环认得的活状态：从其中任何一个都可以被它转去另一个活状态或 ZOMBIE。不在这里的
 # 就是终态，本进程不得把它带回来。周期边界的 `allowed` 由本元组派生，漏一个就是「某个状态下

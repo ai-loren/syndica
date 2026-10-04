@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import cast
 
 from syndica.kernel.context import TrustLevel
+from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.tool import Tool, ToolResult
-from syndica.kernel.workspace import ExecResult, Portal
+from syndica.kernel.workspace import ExecResult, Portal, WriteConflict
 
 __all__ = [
     'Bash',
@@ -35,6 +37,21 @@ _HEAD_SHARE: float = 0.2
 
 def _told(exc: ConfigError) -> ToolResult:
     return ToolResult(output=exc.message)
+
+
+def _conflicted(conflict: WriteConflict) -> ToolResult:
+    """冲突是可恢复的结果：模型读到它就去重读合并或换个路径，不是一次失败的调用。"""
+    return ToolResult(
+        output=str(conflict),
+        meta={
+            'conflict': {
+                'path': conflict.path,
+                'expected': conflict.expected,
+                'current': conflict.current,
+                'unread': conflict.unread,
+            }
+        },
+    )
 
 
 def _valid_output_limit(value: object) -> int | None:
@@ -200,6 +217,8 @@ class Write(Tool):
             await self._portal.write_text(path, content)
         except ConfigError as exc:
             return _told(exc)
+        except WriteConflict as conflict:
+            return _conflicted(conflict)
         # `meta['path']` 只在写成了时有：开发期记录靠它分辨写成的与被拒的（被拒的文字也是一段话）。
         return ToolResult(output=f'已写入 {path}', meta={'path': path})
 
@@ -223,6 +242,8 @@ class Edit(Tool):
             await self._portal.edit_text(path, old_string, new_string)
         except ConfigError as exc:
             return _told(exc)
+        except WriteConflict as conflict:
+            return _conflicted(conflict)
         return ToolResult(output=f'已替换 {path} 中的一处文本', meta={'path': path})
 
 
@@ -329,16 +350,30 @@ class BashOutput(Tool):
     def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal
         self._output_limit = _valid_output_limit(output_limit)
+        # 每个 Agent 对每个句柄读到了哪里：同一个后台命令被两个 Agent 查询时各自的增量互不串线。
+        self._read: dict[tuple[str | None, str], tuple[int, int]] = {}
 
-    async def execute(self, handle: str) -> ToolResult:
-        """查询后台命令；仍在运行时不等待它结束，交回到目前为止收到的输出。
+    async def execute(self, handle: str, full: bool = False) -> ToolResult:
+        """查询后台命令；仍在运行时不等待它结束。缺省只交回你上次查询之后的新输出。
         handle: Bash 启动后台命令后返回的句柄
+        full: 为 true 时交回到目前为止的全部输出，默认 false
         """
+        if not isinstance(cast(object, full), bool):
+            return ToolResult(
+                output=(
+                    f'期望: full 是 true 或 false。实际: {full!r}。'
+                    ' 下一步: 只看新输出就不传 full；要从头看传 true。'
+                )
+            )
+        key = (driving_agent(), handle)
+        since = (0, 0) if full else self._read.get(key, (0, 0))
         try:
-            result = await self._portal.poll(handle)
+            result = await self._portal.poll(handle, since=since)
         except ConfigError as exc:
             return _told(exc)
-        return _reported(result, self._output_limit, meta={'handle': handle})
+        self._read[key] = (result.stdout_end, result.stderr_end)
+        note = '下面只是你上次查询之后的新输出；要从头看传 full=true。\n' if since != (0, 0) else ''
+        return _reported(result, self._output_limit, meta={'handle': handle}, note=note)
 
 
 class KillBash(Tool):
@@ -374,7 +409,8 @@ class Terminal(Tool):
     def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal
         self._output_limit = _valid_output_limit(output_limit)
-        self._shown: dict[str, int] = {}
+        # 每个 Agent 对每个会话看到了哪里，理由同 BashOutput。
+        self._shown: dict[tuple[str | None, str], int] = {}
 
     async def execute(
         self,
@@ -408,14 +444,14 @@ class Terminal(Tool):
         try:
             if action == 'create':
                 handle = await self._portal.pty_create(command, cwd='.', cols=cols, rows=rows)
-                self._shown[handle] = 0
             elif action == 'send':
                 await self._portal.pty_send(handle, input)
             elif action == 'resize':
                 await self._portal.pty_resize(handle, cols=cols, rows=rows)
             elif action == 'kill':
                 await self._portal.pty_kill(handle)
-                self._shown.pop(handle, None)
+                for key in [key for key in self._shown if key[1] == handle]:
+                    del self._shown[key]
                 return ToolResult(
                     output=f'已结束终端会话，handle={handle}', meta={'handle': handle}
                 )
@@ -434,11 +470,11 @@ class Terminal(Tool):
                     trust=TrustLevel.UNTRUSTED,
                 )
             captured = await self._portal.pty_capture(
-                handle, since=self._shown.get(handle, 0), wait=wait
+                handle, since=self._shown.get((driving_agent(), handle), 0), wait=wait
             )
         except ConfigError as exc:
             return _told(exc)
-        self._shown[handle] = captured.end
+        self._shown[(driving_agent(), handle)] = captured.end
         text, clipped = _clipped(captured.text, self._output_limit)
         return ToolResult(
             output=(
