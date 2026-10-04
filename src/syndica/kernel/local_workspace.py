@@ -29,6 +29,7 @@ from syndica.kernel.workspace import (
     ExecResult,
     Expected,
     FileStat,
+    GrepHit,
     Portal,
     PtyCapture,
     PtyStatus,
@@ -343,7 +344,7 @@ class LocalWorkspace:
         found.sort()
         return tuple(found)
 
-    async def grep_text(self, pattern: str, path: str) -> tuple[str, ...]:
+    async def grep_text(self, pattern: str, path: str) -> tuple[GrepHit, ...]:
         try:
             compiled = re.compile(pattern)
         except re.error as exc:
@@ -355,7 +356,7 @@ class LocalWorkspace:
         start = self._inside('.' if path in ('', '.') else path)
         self._refuse_private(path, start)
         files = _files_under(start, self._root)
-        hits: list[str] = []
+        hits: list[GrepHit] = []
         for file in files:
             if self._private_dir(file.relative_to(self._root).parts):
                 continue
@@ -369,7 +370,7 @@ class LocalWorkspace:
             text = data.decode('utf-8', errors='replace')
             for lineno, line in enumerate(text.splitlines(), start=1):
                 if compiled.search(line):
-                    hits.append(f'{rel}:{lineno}:{line}')
+                    hits.append(GrepHit(rel, lineno, line))
         return tuple(hits)
 
     async def run(self, command: str, *, timeout: float, cwd: str) -> ExecResult:

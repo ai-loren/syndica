@@ -27,6 +27,7 @@ from syndica.kernel.workspace import (
     ExecResult,
     Expected,
     FileStat,
+    GrepHit,
     Portal,
     PtyCapture,
     PtyStatus,
@@ -77,15 +78,27 @@ class WorkspaceRouter:
         # （工作区, 路径, 版本）→ 写下它的那次工具调用的 span：读到它时连一条 artifact 边。
         self._writers: dict[tuple[int, str, str], str] = {}
         self._tracing: _ArtifactTracing | None = None
+        # 不在 `tool.execute` 里（hook、`on_start` 与它们起的任务）发生的写，按正在干活的那段代码的
+        # 身份定信任：没有属主是宿主、按可信算；被收紧的 Module 按不可信（评审 F6）。Runtime 接它。
+        self._write_floor: Callable[[], TrustLevel] | None = None
 
     def _attach_tracing(self, tracing: _ArtifactTracing) -> None:
         self._tracing = tracing
+
+    def _attach_write_floor(self, floor: Callable[[], TrustLevel]) -> None:
+        self._write_floor = floor
 
     def file_trust(self, path: str, version: str | None) -> TrustLevel:
         """此刻在驱动的 Agent 的工作区里，`path` 内容是 `version`（None 时按此刻的内容）可信吗。
         没有文件污点时一律可信（与没有路由时相同）。"""
         taint = self._taint_of(self._target())
         return TrustLevel.TRUSTED if taint is None else taint.trust_of(path, version)
+
+    def script_trust(self, path: str) -> TrustLevel | None:
+        """执行 `path` 这个脚本时它可信吗；不在工作区里（宿主的程序、工作区外的路径）交回 None，
+        没有文件污点也交回 None：都不该让执行它的命令升级（评审 F3）。"""
+        taint = self._taint_of(self._target())
+        return None if taint is None else taint.script_trust(path)
 
     def _taint_of(self, workspace: Workspace) -> FileTaint | None:
         if workspace is self._root:
@@ -101,10 +114,20 @@ class WorkspaceRouter:
         relative = self._key(workspace, path)[1]
         taint = self._taint_of(workspace)
         if taint is not None:
-            taint.wrote(relative, version, call_trust() or TrustLevel.TRUSTED)
+            taint.wrote(relative, version, self._write_trust())
         span = current_span_id()
         if span is not None:
             self._writers[(id(workspace), relative, version)] = span
+
+    def _write_trust(self) -> TrustLevel:
+        """这次写该记成什么信任：工具调用里按那次调用的溯源结论（`call_trust`）；在它之外（hook、
+        `on_start` 与它们起的任务）按正在干活的代码的身份（`_write_floor`）；都没有按可信。"""
+        trust = call_trust()
+        if trust is not None:
+            return trust
+        if self._write_floor is not None:
+            return self._write_floor()
+        return TrustLevel.TRUSTED
 
     def _read(self, workspace: Workspace, path: str, version: str) -> None:
         if self._tracing is None:
@@ -459,7 +482,7 @@ class WorkspaceRouter:
     async def glob_paths(self, pattern: str) -> tuple[str, ...]:
         return await self._target().portal().glob_paths(pattern)
 
-    async def grep_text(self, pattern: str, path: str) -> tuple[str, ...]:
+    async def grep_text(self, pattern: str, path: str) -> tuple[GrepHit, ...]:
         return await self._target().portal().grep_text(pattern, path)
 
     async def run(self, command: str, *, timeout: float, cwd: str) -> ExecResult:

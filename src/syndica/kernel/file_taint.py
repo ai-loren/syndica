@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import posixpath
 import stat
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -51,6 +50,8 @@ class FileTaint:
     ) -> None:
         self._root = Path(root).resolve()
         self._baseline: dict[str, _Fingerprint] = {}
+        self._baseline_dirs: set[str] = set()
+        self._baseline_hashes: dict[str, str | None] = {}
         self._written: dict[str, dict[str, TrustLevel]] = {}
         if baseline:
             self._scan(max_files)
@@ -60,7 +61,13 @@ class FileTaint:
         relative = self._relative(path)
         if relative is None:
             return TrustLevel.UNTRUSTED
-        if self._unchanged(relative):
+        # 基线命中只在问的正是基线那份内容时才算可信：恢复一个旧版本、或经一条换了拼法的路径读到别的
+        # 文件，交进来的 version 与基线内容对不上，不能借基线的可信度洗白（phase-3 评审 F1/F4）。
+        if self._unchanged(relative) and (
+            version is None or version == self._baseline_version(relative)
+        ):
+            return TrustLevel.TRUSTED
+        if version is None and self._is_baseline_dir(relative):
             return TrustLevel.TRUSTED
         known = self._written.get(relative)
         if not known:
@@ -74,11 +81,20 @@ class FileTaint:
     def source_of(self, path: str, version: str) -> str:
         """`baseline`、`tool` 或 `external`：trace 上标这次读到的版本从哪来。"""
         relative = self._relative(path)
-        if relative is not None and self._unchanged(relative):
+        if relative is None:
+            return 'external'
+        if self._unchanged(relative) and version == self._baseline_version(relative):
             return 'baseline'
-        if relative is not None and version in self._written.get(relative, {}):
+        if version in self._written.get(relative, {}):
             return 'tool'
         return 'external'
+
+    def script_trust(self, path: str) -> TrustLevel | None:
+        """执行 `path` 这个脚本时它此刻可信吗。不在工作区里（宿主自己的程序 `/usr/bin/x`、工作区外的
+        `../x`）交回 None：那不是工作区的内容，按不可信算会让每条写全路径的命令升级（评审 F3）。"""
+        if self._relative(path) is None:
+            return None
+        return self.trust_of(path, None)
 
     def wrote(self, path: str, version: str, trust: TrustLevel) -> None:
         """一次经路由的写把 `path` 写成了 `version`，那次调用的溯源结论是 `trust`。同一份内容被写过
@@ -95,6 +111,9 @@ class FileTaint:
     def _scan(self, max_files: int) -> None:
         for folder, directories, names in os.walk(self._root):
             directories[:] = sorted(name for name in directories if name not in _SKIPPED)
+            relative_folder = Path(folder).relative_to(self._root).as_posix()
+            if relative_folder != '.':
+                self._baseline_dirs.add(relative_folder)
             for name in sorted(names):
                 if len(self._baseline) >= max_files:
                     logger.warning(
@@ -113,6 +132,18 @@ class FileTaint:
         recorded = self._baseline.get(relative)
         return recorded is not None and _fingerprint(self._root / relative) == recorded
 
+    def _is_baseline_dir(self, relative: str) -> bool:
+        """打开时就在、此刻仍是目录的那个目录。目录名本身是基线内容，不要因为它没有文件指纹就判不可信
+        （phase-3 评审 F7：`Glob('*')` 把基线目录列出来会整条结果变成不可信）。"""
+        return relative in self._baseline_dirs and (self._root / relative).is_dir()
+
+    def _baseline_version(self, relative: str) -> str | None:
+        """基线内容的版本（哈希）：懒算并缓存。只在 `_unchanged` 成立时调用，此刻文件内容即基线，
+        所以现在哈希出来的就是基线那份；文件一旦动过 `_unchanged` 即为假，这份缓存不会再被读到。"""
+        if relative not in self._baseline_hashes:
+            self._baseline_hashes[relative] = self._current_version(relative)
+        return self._baseline_hashes[relative]
+
     def _current_version(self, relative: str) -> str | None:
         path = self._root / relative
         try:
@@ -127,17 +158,16 @@ class FileTaint:
         return f'sha256:{digest.hexdigest()}'
 
     def _relative(self, path: str) -> str | None:
-        raw = path
-        if posixpath.isabs(raw):
-            absolute = Path(raw)
-            try:
-                raw = (absolute.parent.resolve() / absolute.name).relative_to(self._root).as_posix()
-            except ValueError:
-                return None
-        normal = posixpath.normpath(raw)
-        if normal in ('.', '') or normal.split('/')[0] == '..':
+        # 按后端解析路径的同一方式（`Path.resolve()`）折叠：先跟符号链接、再吃 `..`，否则一条经过
+        # 伪造链接的 `sub/../README.md` 会按字面落到 `README.md` 上，借那个基线文件的可信度洗白
+        # 读到的别处内容（phase-3 评审 F1）。
+        raw = Path(path)
+        candidate = raw if raw.is_absolute() else self._root / raw
+        try:
+            resolved = candidate.resolve()
+            return resolved.relative_to(self._root).as_posix()
+        except (OSError, RuntimeError, ValueError):
             return None
-        return normal
 
 
 def _fingerprint(path: Path) -> _Fingerprint | None:

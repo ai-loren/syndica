@@ -107,6 +107,7 @@ import asyncio
 import copy
 import json
 import logging
+import posixpath
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -137,6 +138,7 @@ from syndica.kernel.danger import (
     RiskLevel,
     _escalated,  # pyright: ignore[reportPrivateUsage]
     disposition_of,
+    effective_cwd,
     executed_scripts,
     untrusted_script_verdict,
     validate_danger_options,
@@ -532,6 +534,21 @@ def _gated_result(call: ToolCall, verdict: DangerVerdict, disposition: Dispositi
     )
 
 
+def _script_changed_result(call: ToolCall, scripts: Sequence[str]) -> ToolResult:
+    """问人的时候脚本还可信，等人点确认的这段时间里它被改成了不可信：批准的是旧内容，不拿它去跑
+    换过的脚本（评审 F8）。拦下来、说清是哪个脚本变了、没有执行。"""
+    changed = '、'.join(scripts)
+    return ToolResult(
+        output=(
+            f'期望: {call.name}（id={call.id}）执行的脚本在等待人工确认期间不被改动。'
+            f' 实际: 批准之后复查发现 {changed} 在这段等待里变成了不可信（被别的命令或外部改写），'
+            '批准针对的是改动之前的内容，本次调用已被拦下，没有执行、也没有产生任何副作用。'
+            ' 下一步: 重新读一遍这些脚本确认内容再决定要不要跑；要跑就重新发起调用，让它按当前内容'
+            '重新判定与确认。'
+        )
+    )
+
+
 def _answered_in_batch(ctx: Context) -> int:
     """末尾那一批已经落了几块结果：最后一个 assistant 块之后的 tool 块数。"""
     count = 0
@@ -691,7 +708,7 @@ class ToolExecutor:
         self._policy: DangerPolicy = policy if policy is not None else BlockHighRisk()
         self._max_concurrency = max_concurrency
         self._outcome_observers: list[ToolOutcomeObserver] = []
-        self._file_trust: Callable[[str], TrustLevel] | None = None
+        self._file_trust: Callable[[str], TrustLevel | None] | None = None
         self._untrusted_high_risk = Disposition.BLOCK
         self._confirmation_agent_id: str | None = None
         self._confirmation: ConfirmationCallback | None = None
@@ -761,28 +778,38 @@ class ToolExecutor:
             for installer in installers
         )
 
-    def _configure_file_trust(self, file_trust: Callable[[str], TrustLevel]) -> None:
-        """工作区里一个文件此刻可信吗（Runtime 交进来的是路由的文件污点）。有了它，执行一个不可信
-        的本地脚本的调用按 `exec.untrusted_script` 判（M5 D11）。"""
+    def _configure_file_trust(self, file_trust: Callable[[str], TrustLevel | None]) -> None:
+        """执行一个脚本时它在不在工作区、可信吗（Runtime 交进来的是路由的 `script_trust`）。工作区外
+        交回 None。有了它，执行不可信本地脚本的调用按 `exec.untrusted_script` 判（M5 D11）。"""
         self._file_trust = file_trust
 
     def _untrusted_scripts(self, tool: Tool, args: Mapping[str, Any]) -> list[str]:
-        """这次调用会执行的、工作区里不可信的脚本。只看工作区内的相对路径：`/usr/bin/x` 与 `../x`
-        不是工作区的内容，文件污点对它们答不出「可信」，按不可信算就会让每一次写全路径的调用升级。"""
+        """这次调用会执行的、工作区里不可信的脚本（规范化之后的路径）。相对脚本按工具的 `cwd` 和命令
+        开头的 `cd` 折算出的目录解析；工作区外的路径由 `script_trust` 交回 None、不升级；`cd` 折不出
+        目录时这一条放过（有窗口上界兜着）。见 `executed_scripts` / `effective_cwd`（评审 F3）。"""
         if self._file_trust is None:
             return []
         declared = cast(object, getattr(tool, '__tool_command_args__', None))
         names = list(args) if declared is None else list(cast(tuple[str, ...], declared))
+        cwd = args.get('cwd')
         found: list[str] = []
         for name in names:
             value = args.get(name)
             if not isinstance(value, str):
                 continue
+            base = effective_cwd(value, cwd if isinstance(cwd, str) else '.')
             for script in executed_scripts(value):
-                if script.startswith('/') or script.split('/')[0] == '..':
+                if '{' in script or '}' in script:
+                    # `find . -exec sh {} \;` 的 `{}` 是占位符不是文件，不当成不可信脚本（F7）。
                     continue
-                if self._file_trust(script) is TrustLevel.UNTRUSTED and script not in found:
-                    found.append(script)
+                if script.startswith('/'):
+                    effective = script
+                elif base is None:
+                    continue
+                else:
+                    effective = posixpath.normpath(posixpath.join(base, script))
+                if self._file_trust(effective) is TrustLevel.UNTRUSTED and effective not in found:
+                    found.append(effective)
         return found
 
     def _observe_outcomes(self, observer: ToolOutcomeObserver) -> None:
@@ -1179,9 +1206,14 @@ class ToolExecutor:
         # 决定要不要重算溯源的依据。只包最初这一份就够——一旦链上有人声明过改写，重取已经触发，
         # 此后再有人就地改也改不掉那个结论。
         handed = ReadOnlyKwarg(Junction.PRE_TOOL_USE, 'args', args)
-        pre, pre_authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
-            Junction.PRE_TOOL_USE, _PRE_WATCH, tool_call=call, tool=tool, args=handed
-        )
+        pre_taint: list[str] = []
+        pre_taint_token = EXTENSION_TAINT.set(pre_taint)
+        try:
+            pre, pre_authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
+                Junction.PRE_TOOL_USE, _PRE_WATCH, tool_call=call, tool=tool, args=handed
+            )
+        finally:
+            EXTENSION_TAINT.reset(pre_taint_token)
         mutated = pre_authors.changed.get('tool_call', ())
         if mutated:
             # 宿主策略按 `call.name` 判、结果块按 `call.id` 配对：就地改了它，两者都会被骗过。
@@ -1210,9 +1242,12 @@ class ToolExecutor:
             # 才落进轨迹，重取在轨迹里一个字都看不到。兄弟里有会带进外部内容的工具时，这次重取结构
             # 上就是一次失败的溯源，按最坏情况处理（spec §13）；兄弟都不带进外部内容时，它们的产出
             # 只出自可信的参数，流进来也不改变结论。
+            # `pre_taint` 非空：有 hook 在 PRE 期间触发了被收紧 Module 的扩展切点、把它的结论拿到
+            # 手，又写了参数——内容过了一层可信 hook 不会变可信（评审 F12）。
             provenance = (
                 TrustLevel.UNTRUSTED
                 if siblings_external
+                or bool(pre_taint)
                 or self._by_untrusted(pre_authors.wrote.get('args', ()))
                 or self._by_untrusted(in_place)
                 else strictest_trust(provenance, provenance_of(ctx))
@@ -1277,17 +1312,30 @@ class ToolExecutor:
             # 那个值算；被收紧的 Module 就地改了内容，同样按它是作者收紧。
             handed_trust = result.trust
             watch = {'result': _result_content} if self._untrusted_modules else {}
-            post, post_authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
-                Junction.POST_TOOL_USE, watch, tool_call=call, tool=tool, args=args, result=result
-            )
+            post_taint: list[str] = []
+            post_taint_token = EXTENSION_TAINT.set(post_taint)
+            try:
+                post, post_authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
+                    Junction.POST_TOOL_USE,
+                    watch,
+                    tool_call=call,
+                    tool=tool,
+                    args=args,
+                    result=result,
+                )
+            finally:
+                EXTENSION_TAINT.reset(post_taint_token)
             if post.result is not None:
                 raise _post_result_slot_rejected(post)
             rewritten = post.get('result', result)
             if not isinstance(rewritten, ToolResult):
                 raise _rewrite_rejected(Junction.POST_TOOL_USE, 'result', ToolResult, rewritten)
+            # `post_taint` 非空且 hook 改写了结果：某个 POST hook 在触发被收紧的扩展切点后把它的结论
+            # 写进了结果，经一层可信 hook 不会变可信（评审 F12）。
             baseline = (
                 TrustLevel.UNTRUSTED
-                if self._by_untrusted(post_authors.wrote.get('result', ()))
+                if (bool(post_taint) and post.rewrites('result'))
+                or self._by_untrusted(post_authors.wrote.get('result', ()))
                 or self._by_untrusted(post_authors.changed.get('result', ()))
                 else strictest_trust(handed_trust, _strictest(result, post.rewrites('result')))
             )
@@ -1370,6 +1418,18 @@ class ToolExecutor:
                 )
                 if outcome is ConfirmationOutcome.APPROVED:
                     execution_args = cast('dict[str, Any]', json.loads(request.arguments))
+                    # 问人与动作之间隔了一次等待：这段里脚本可能被改。批准前还可信、现在不可信的，
+                    # 批准不作数（评审 F8）。
+                    changed = [
+                        s for s in self._untrusted_scripts(tool, execution_args) if s not in scripts
+                    ]
+                    if changed:
+                        return (
+                            _script_changed_result(call, changed),
+                            'blocked',
+                            False,
+                            execution_args,
+                        )
                     return None, 'ok', True, execution_args
                 gated = _confirmation_result(call, verdict, request, outcome)
                 return gated, _CONFIRMATION_OUTCOMES[outcome], False, args

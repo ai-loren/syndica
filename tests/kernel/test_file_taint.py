@@ -143,16 +143,22 @@ async def test_writing_the_same_content_from_a_trusted_call_does_not_launder_it(
     assert result.trust is TrustLevel.UNTRUSTED
 
 
-async def test_a_symlink_present_at_open_still_reads_as_untrusted(root: Path) -> None:
+async def test_a_symlink_carries_the_trust_of_its_real_target(root: Path) -> None:
+    # 路径按后端的方式解析（跟符号链接）之后再判信任：指向基线文件的链接读到的就是那份基线内容，可信；
+    # 指向打开后新写的文件的链接读到的是新内容，不可信。两边都没有洗白的空间（评审 F1）。
     (root / 'link.md').symlink_to('notes.md')
     local = LocalWorkspace(str(root), shell='/bin/sh', env={})
     router = WorkspaceRouter(local, taint=FileTaint(root))
+    (root / 'planted.md').write_text('needle from outside\n')
+    (root / 'evil.md').symlink_to('planted.md')
     try:
-        listed = await Glob(router).execute('link.md')
+        to_baseline = await Glob(router).execute('link.md')
+        to_planted = await Glob(router).execute('evil.md')
     finally:
         await router.close()
 
-    assert listed.trust is TrustLevel.UNTRUSTED
+    assert to_baseline.trust is TrustLevel.TRUSTED
+    assert to_planted.trust is TrustLevel.UNTRUSTED
 
 
 @pytest.mark.skipif(shutil.which('git') is None, reason='需要 git 做三方合并')

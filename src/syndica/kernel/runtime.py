@@ -881,7 +881,8 @@ class _TighteningBroker:
     """`runtime.broker`：被收紧的 Module 的代码（它的工具、hook 与它们起的任务）经它直接投递的
     消息，先把 `trust` 收成 UNTRUSTED 再交给真正的 broker（M5 D10，D-63）。`send` 已经按调用方的
     身份收紧，而 broker 是存储层的公开协议，拿得到 runtime 的代码就能绕过 `send`。标记是消息自己的
-    字段，远程 broker 序列化之后照样在。其余方法原样转交：取消、超时与线性化的契约都在里面那层。"""
+    字段，远程 broker 序列化之后照样在。只转交协议里的方法、不设 `__getattr__`：第三方 broker 多出来
+    的投递入口（`publish_many`、`requeue`）要是被原样透出，收紧就从那条路漏掉了（评审 F11）。"""
 
     def __init__(self, inner: MessageBroker, untrusted: Callable[[], bool]) -> None:
         self._inner = inner
@@ -917,9 +918,6 @@ class _TighteningBroker:
 
     def off_missing_queue(self, cb: MissingQueueCallback) -> None:
         self._inner.off_missing_queue(cb)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
 
 
 def _checked_store(value: object, protocol: type[_StoreT], field: str, constructed: str) -> _StoreT:
@@ -1059,6 +1057,10 @@ class Runtime:
         self._untrusted_output = _untrusted_output_modules(
             untrusted_output_modules, module_assembly.names
         )
+        if self._workspace is not None:
+            self._workspace._attach_write_floor(  # pyright: ignore[reportPrivateUsage]
+                lambda: self._from_listed_module(TrustLevel.TRUSTED)
+            )
         self.registry: AgentRegistry = (
             InMemoryAgentRegistry()
             if registry is None
@@ -1478,7 +1480,7 @@ class Runtime:
             self._workspace.adopt(agent_id, parent_id)
             router = self._workspace
             agent._executor._configure_file_trust(  # pyright: ignore[reportPrivateUsage]
-                lambda path: router.file_trust(path, None)
+                lambda path: router.script_trust(path)
             )
         if isolation != 'shared':
             assert self._workspace is not None

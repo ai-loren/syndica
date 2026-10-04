@@ -142,6 +142,8 @@ deferred items」。
 | M5 后续 | 合并之后被叫醒的子 Agent，上下文里仍写着「在隔离副本里」 | 接受 | 已经进 ZOMBIE 的 Agent 收不到不叫醒它的消息；合并结果提示父 Agent 在叫醒它的消息里说明 |
 | M5 后续 | 合并只合内容，不合可执行位的变化 | M7 | `Portal` 没有改权限的方法；副本保留可执行位，跑得起来 |
 | M5 后续 | 扩展切点在模型侧切点里被触发、结论出自被收紧的 Module 时，那一轮模型请求不收紧（D-64 只做了工具调用那一侧） | M6 | 与上下文压缩同期动模型侧的溯源；`HookResult.untrusted` 已让宿主代码知道这个值不可信 |
+| M5 后续 | `shell.download_then_execute` 纯判定认不出 tee 写文件、`wget -P` 前缀、`mv` / `cp` 改名、`uv run` / `deno run` 等解释器 | 接受 | 真实姿态下这些下载落地的文件都不是基线，执行它由执行器的 `exec.untrusted_script` 兜住；纯判定（无路由的消费者）的这些形状留作后续 |
+| M5 后续 | `exec.untrusted_script` 对命令里有多个 `cd` / 变量目录的脚本放过（`effective_cwd` 折不出目录） | 接受 | 折不出目录时宁可不升级、不拿错目录误判；有一个 Agent 之内的窗口上界兜着，真正的边界是沙箱后端 |
 | 卫生 | 基础 CI：每次 push 跑与本地一致的门禁 | M2 | 自举开始改代码之前先有自动门禁 |
 | 卫生 | CHANGELOG、PyPI 预发布、版本策略、issue 模板 | M12 | 发布准备 |
 | 卫生 | `.env.example` | 不做 | key 文件不该放在 Agent 操作的工作区里，`Read` / `Grep` 读得到它 |

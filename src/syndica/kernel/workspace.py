@@ -15,6 +15,7 @@ __all__ = [
     'ExecResult',
     'Expected',
     'FileStat',
+    'GrepHit',
     'Portal',
     'PtyCapture',
     'PtyStatus',
@@ -59,6 +60,19 @@ class FileStat:
 
     version: str
     size: int
+
+
+@dataclass(frozen=True)
+class GrepHit:
+    """`grep_text` 的一条命中：文件相对路径、行号、整行内容。信任级别按 `path` 算；别从展示文本里把
+    路径切回来——文件名里可以有冒号（`a:b.txt`），切出来会落到另一个文件、借它的可信度（F2）。"""
+
+    path: str
+    line: int
+    text: str
+
+    def __str__(self) -> str:
+        return f'{self.path}:{self.line}:{self.text}'
 
 
 @dataclass(frozen=True)
@@ -151,7 +165,7 @@ class Portal(Protocol):
 
     async def glob_paths(self, pattern: str) -> tuple[str, ...]: ...
 
-    async def grep_text(self, pattern: str, path: str) -> tuple[str, ...]: ...
+    async def grep_text(self, pattern: str, path: str) -> tuple[GrepHit, ...]: ...
 
     async def run(self, command: str, *, timeout: float, cwd: str) -> ExecResult:
         """前台运行；超时返回 `timed_out=True` 的结果，不抛错。"""

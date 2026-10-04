@@ -369,8 +369,10 @@ class Grep(Tool):
         except ConfigError as exc:
             return _told(exc)
         return ToolResult(
-            output=_listed(hits, self._output_limit, '缩小 pattern 或 path 再搜。'),
-            trust=_files_trust(self._portal, (hit.split(':', 1)[0] for hit in hits)),
+            output=_listed(
+                [str(hit) for hit in hits], self._output_limit, '缩小 pattern 或 path 再搜。'
+            ),
+            trust=_files_trust(self._portal, (hit.path for hit in hits)),
         )
 
 

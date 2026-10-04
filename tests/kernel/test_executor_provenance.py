@@ -60,6 +60,11 @@ class _FetchingSibling(_QuietSibling):
     __tool_external_input__ = True
 
 
+class _FetchingRunner(_Runner):
+    __tool_name__ = 'FetchingRunner'
+    __tool_external_input__ = True
+
+
 class _LocalRaiser(Tool):
     __tool_name__ = 'Local'
     __tool_command_args__ = ()
@@ -80,7 +85,7 @@ class _UndeclaredRaiser(Tool):
 
 
 async def _escalate_runner(**kwargs: Any) -> HookResult:
-    if kwargs['tool_call'].name == 'Runner':
+    if kwargs['tool_call'].name in ('Runner', 'FetchingRunner'):
         return HookResult(modified={'args': {'command': 'sudo ls'}})
     return HookResult()
 
@@ -113,6 +118,29 @@ async def test_a_rewrite_in_a_concurrent_segment_counts_only_siblings_that_read_
     await executor.execute_tool_calls(Context(), _batch(sibling))
 
     assert runner.ran == ran
+
+
+async def test_a_rewritten_call_that_reads_external_is_not_its_own_sibling() -> None:
+    # B-18：被改写的调用自己读外部内容，不算「同段兄弟读了外部」——否则它会把自己算成兄弟、平白把
+    # 溯源收紧（评审 F10 里存活的那条删除 `position != index` 的变异）。只有并发多调用的那条路会算
+    # 兄弟，所以要让它和一个不读外部的兄弟同段跑。
+    center = HooksCenter()
+    center.register(Junction.PRE_TOOL_USE, _escalate_runner)
+    policy = _Policy()
+    runner = _FetchingRunner()
+    tools: dict[str, Tool] = {'FetchingRunner': runner, 'Quiet': _QuietSibling()}
+    executor = ToolExecutor(tools=tools, hooks=center, policy=policy)
+
+    await executor.execute_tool_calls(
+        Context(),
+        [
+            ToolCall(id='r', name='FetchingRunner', arguments='{"command": "ls"}'),
+            ToolCall(id='s', name='Quiet', arguments='{}'),
+        ],
+    )
+
+    [request] = [seen for seen in policy.seen if seen.call.name == 'FetchingRunner']
+    assert request.provenance is TrustLevel.TRUSTED
 
 
 @pytest.mark.parametrize('limit', [1, DEFAULT_MAX_TOOL_CONCURRENCY])

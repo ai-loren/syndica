@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import inspect
 import logging
 from collections.abc import Awaitable, Callable, Mapping
@@ -90,6 +91,15 @@ _Authored = tuple[HookCallback, Installer | None]
 _Added = tuple[dict[JunctionRef, list[_Authored]], list[str]]
 Watch = Mapping[str, Callable[[Any], object]]
 _NO_WATCH: Watch = MappingProxyType({})
+
+
+def _watch_all(kwargs: Mapping[str, Any]) -> Watch:
+    """盯住交给扩展切点的每个参数。可拦截 hook 能就地改一个可变参数（`kwargs['box']['x'] = ...`），
+    那既不走 `modified` 也不走 `skip`：不盯，被收紧的 Module 这么写进去的东西就既不带不可信标记、
+    也不进 `EXTENSION_TAINT`（评审 F5）。投影用 deepcopy 拷一份现在的值，前后不同即记作改过。"""
+    return MappingProxyType({name: copy.deepcopy for name in kwargs})
+
+
 _Snapshot = tuple[
     dict[JunctionRef, list[HookCallback]],
     dict[str, tuple[ExtensionJunction, str]],
@@ -536,7 +546,7 @@ class HooksCenter:
         declared = self._declared_handle(junction.name)
         if declared is not junction:
             raise _foreign_handle(junction, self._declarer_of(junction.name) or '别处')
-        result, authors = await self._dispatch_attributed(resolved, **kwargs)
+        result, authors = await self._dispatch_attributed(resolved, _watch_all(kwargs), **kwargs)
         if not self._by_untrusted_module(authors):
             return result
         # 结论里有被收紧的 Module 写的东西：交回的值带着标记，外层那次工具调用也按不可信收紧
@@ -613,8 +623,8 @@ class HooksCenter:
             with _window(resolved, kwargs):
                 return await self._trigger_serial(resolved, chain, watch, **kwargs)
         with _window(resolved, kwargs):
-            await self._trigger_parallel(resolved, chain, **kwargs)
-        return HookResult(), Authorship()
+            authors = await self._trigger_parallel(resolved, chain, watch, **kwargs)
+        return HookResult(), authors
 
     def _observe_extensions(self, observer: Callable[[str], None]) -> None:
         """每次分发扩展切点都叫一次 `observer`（交给它切点名），有没有 hook 都叫。Runtime 把它接在
@@ -858,8 +868,17 @@ class HooksCenter:
         return HookResult(modified=merged, history=history), _authorship(wrote, None, changed)
 
     async def _trigger_parallel(
-        self, junction: JunctionRef, chain: list[_Authored], /, **kwargs: Any
-    ) -> None:
+        self,
+        junction: JunctionRef,
+        chain: list[_Authored],
+        watch: Watch = _NO_WATCH,
+        /,
+        **kwargs: Any,
+    ) -> Authorship:
+        # 可观察切点并行跑、返回值丢弃，但就地改一个可变参数照样流回调用方（评审 F5）。盯住被盯的
+        # 参数：整条链跑完后净变化记进 `changed`，并行没法分到是谁改的，于是记在链上每个属主名下
+        # （保守，安全方向）——有一个被收紧的 Module 在跑且参数变了，就按它写的算。
+        before = {key: _projected(watch[key], kwargs[key]) for key in watch if key in kwargs}
         started: list[HookCallback] = []
         awaitables: list[Awaitable[object]] = []
         for cb, installer in chain:
@@ -888,3 +907,8 @@ class HooksCenter:
                 _report_observable_failure(junction, cb, outcome)
             elif _carries_intent(outcome):
                 _report_discarded_return(junction, cb, outcome)
+        changed: dict[str, list[Installer | None]] = {}
+        for key, snapshot in before.items():
+            if _differs(snapshot, _projected(watch[key], kwargs.get(key))):
+                changed[key] = [installer for _, installer in chain]
+        return _authorship({}, None, changed)

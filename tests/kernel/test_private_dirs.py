@@ -229,7 +229,7 @@ async def test_a_grep_aimed_at_a_private_directory_is_refused(tmp_path: Path, pa
 async def test_a_grep_over_the_hosts_directory_leaves_the_private_ones_out(tmp_path: Path):
     hits = await _workspace(_root(tmp_path)).grep_text('line', '.syndica')
 
-    assert hits == (
+    assert tuple(str(hit) for hit in hits) == (
         '.syndica/other/x.txt:1:other line',
         '.syndica/tmp/out.txt:1:tmp line',
         '.syndica/traces-old/x.txt:1:old line',

@@ -75,6 +75,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'FlagDeclaration',
     'FlagRow',
     'FlagValue',
+    'GrepHit',
     'HookCallback',
     'HookResult',
     'HooksCenter',
@@ -710,10 +711,18 @@ def test_every_exported_name_resolves():
 def test_kernel_exports_workspace_types_and_local_tools():
     from syndica.kernel.local_workspace import LocalWorkspace
     from syndica.kernel.tools.local import local_tools
-    from syndica.kernel.workspace import ExecResult, FileStat, Portal, Workspace, WriteConflict
+    from syndica.kernel.workspace import (
+        ExecResult,
+        FileStat,
+        GrepHit,
+        Portal,
+        Workspace,
+        WriteConflict,
+    )
 
     assert kernel.ExecResult is ExecResult
     assert kernel.FileStat is FileStat
+    assert kernel.GrepHit is GrepHit
     assert kernel.WriteConflict is WriteConflict
     assert kernel.LocalWorkspace is LocalWorkspace
     assert kernel.Portal is Portal

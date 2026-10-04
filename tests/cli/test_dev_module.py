@@ -120,6 +120,29 @@ async def test_a_call_the_hook_already_recorded_is_not_recorded_again():
     assert [(entry.tool, entry.target) for entry in log.snapshot().tools] == [('Write', 'a.md')]
 
 
+async def test_a_reused_call_id_in_a_later_turn_is_recorded_again():
+    # 去重集看过就摘掉：同一个 id 在后一轮被复用、而这一轮 hook 没看到它（链被前面的 hook 截断），
+    # 观察者得照常补记——不摘掉的话这条就被永久当成「已记过」而静默丢掉（评审 F10）。
+    log = DevLog()
+    _OBSERVERS.clear()
+    hooks = _hooks(log)
+    [observe] = _OBSERVERS
+    first = ToolResult(output='written', meta={'path': 'a.md'})
+
+    await _post(hooks, 'Write', {'path': 'a.md'}, first)
+    observe(ToolCall(id='call', name='Write', arguments='{}'), {'path': 'a.md'}, first)
+    observe(
+        ToolCall(id='call', name='Write', arguments='{}'),
+        {'path': 'b.md'},
+        ToolResult(output='written', meta={'path': 'b.md'}),
+    )
+
+    assert [(entry.tool, entry.target) for entry in log.snapshot().tools] == [
+        ('Write', 'a.md'),
+        ('Write', 'b.md'),
+    ]
+
+
 def _finished(stdout: str = '', *, handle: str | None = None, **overrides: object) -> ToolResult:
     """与 Bash / BashOutput 交回的 meta 同形：后台命令的 handle 在最前面。"""
     fields: dict[str, object] = {

@@ -147,6 +147,7 @@ from syndica.kernel.waiting import (
 from syndica.kernel.workspace import (
     ExecResult,
     FileStat,
+    GrepHit,
     Portal,
     PtyCapture,
     PtyStatus,
@@ -203,6 +204,7 @@ __all__ = [
     'FlagDeclaration',
     'FlagRow',
     'FlagValue',
+    'GrepHit',
     'HookCallback',
     'HookResult',
     'HooksCenter',

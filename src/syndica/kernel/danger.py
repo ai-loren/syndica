@@ -300,6 +300,9 @@ _INERT_PROGRAMS = frozenset(
 )
 _ESCALATORS = frozenset({'doas', 'pkexec', 'runuser', 'su', 'sudo'})
 _DOWNLOADERS = frozenset({'aria2c', 'curl', 'fetch', 'lwp-request', 'wget'})
+# curl 的取值短选项（不含 `-o`、`-O`，它们在 `_download_outputs` 里单独处理）：扫 cluster 碰到其一，
+# 剩下的字符是它的取值、不再当选项。只用来挡「取值里的字母被读成 `-O`」（`-XPOST`），不必穷尽全表。
+_CURL_VALUE_SHORT = frozenset('AbcCdDeEFHKmPQrtTuUwxXYyz')
 # 解释器的一个选项怎样影响「脚本从哪来」，见 `_script_source`。
 _FLAG = 'flag'
 # 选项自己交出脚本：取值紧贴时是簇里剩下的部分，否则是下一个词（python 的 `-c` 与 `-m`、perl 的
@@ -623,6 +626,7 @@ def _end_of_redirection(text: str, start: int) -> int:
 
 # 重定向操作符之后那个词的去向，见 `_redirection`。
 _TARGET = 'target'
+_INPUT = 'input'
 _HEREDOC = 'heredoc'
 _HEREDOC_TABS = 'heredoc-tabs'
 _DISCARD = 'discard'
@@ -634,6 +638,10 @@ def _redirection(source: str, index: int, *, thorough: bool) -> tuple[str, int]:
     heredoc 两种模式都认：正文要单独处理，否则正文里一个撇号（`it's`）会被当成开引号，把结束标记
     之后真正的命令一起吞掉。here-string 只在 `thorough` 下丢掉；默认规则要把它当目标，
     `bash <<< "$(curl …)"` 的下载才看得见。
+
+    纯输入重定向（`< f`，不是 `<<`/`<<<`/`<>`/`<&`）另记成 `_INPUT`：源文件会被读进 stdin，一个
+    从 stdin 读脚本的解释器（`sh < f`、`python3 - < f`）执行的就是它（评审 F3）。它仍照旧进
+    `targets`，`_downloads_then_executes` 的行为不变。
     """
     if thorough and source.startswith('<<<', index):
         return _DISCARD, index + 3
@@ -643,6 +651,8 @@ def _redirection(source: str, index: int, *, thorough: bool) -> tuple[str, int]:
         return _HEREDOC_TABS, index + 3
     if source.startswith('<<', index):
         return _HEREDOC, index + 2
+    if source[index] == '<' and source[index + 1 : index + 2] not in ('&', '>'):
+        return _INPUT, _end_of_redirection(source, index)
     return _TARGET, _end_of_redirection(source, index)
 
 
@@ -976,6 +986,7 @@ def _parse(
     offset: int = 0,
     lines: _Lines | None = None,
     handoffs: bool = True,
+    stdin_sources: list[str] | None = None,
 ) -> tuple[list[tuple[bool, tuple[str, ...]]], list[str]]:
     """(段, 整条命令里全部重定向的目标)。
 
@@ -1024,6 +1035,11 @@ def _parse(
             word = ''.join(token)
             if dropping == _TARGET:
                 targets.append(word)
+            elif dropping == _INPUT:
+                # 输入重定向的源：既照旧进 targets，又单独记一份给 `executed_scripts` 认 stdin。
+                targets.append(word)
+                if stdin_sources is not None:
+                    stdin_sources.append(word)
             elif dropping in (_HEREDOC, _HEREDOC_TABS):
                 heredoc = _Heredoc(
                     word.replace('\\', ''), quoted or '\\' in word, dropping == _HEREDOC_TABS
@@ -1812,29 +1828,78 @@ def _writes_a_raw_device(command: str) -> bool:
 
 def executed_scripts(command: str) -> tuple[str, ...]:
     """这条命令会当脚本执行的本地文件，规范化之后按出现顺序去重：解释器读的脚本文件、`source` /
-    `.` 的操作数、写成路径的程序词（`./run.sh`、`bin/x`）。程序词本身是解释器时只算它读的脚本
+    `.` 的操作数、写成路径的程序词（`./run.sh`、`bin/x`）、以及喂给一个从 stdin 读脚本的解释器的
+    文件（`sh < f`、`cat f | sh`）。程序词本身是解释器时只算它读的脚本
     （`/usr/bin/python3 x.py` 是 `x.py`）。
 
     给溯源用（M5 D11）：认不出的不列——变量、命令替换、通配、认不出选项的解释器。漏掉的那部分由
     一个 Agent 之内的窗口上界兜着，这里多列一个就是多一次升级。
     """
     found: dict[str, None] = {}
-    segments, _ = _parse(command)
-    for _, tokens in segments:
+    stdin_sources: list[str] = []
+    segments, _ = _parse(command, stdin_sources=stdin_sources)
+    for position, (piped, tokens) in enumerate(segments):
         for index in _program_candidates(tokens):
             word = tokens[index]
             name = _basename(word)
-            script: str | None = None
+            scripts: list[str] = []
             if name in ('.', 'source'):
-                script = _first_operand(tokens, index + 1)
+                operand = _first_operand(tokens, index + 1)
+                if operand is not None:
+                    scripts.append(operand)
             elif (interpreter := _interpreter(word)) is not None:
                 kind, operand = _script_source(interpreter, tokens[index + 1 :])
-                script = operand if kind == 'file' and not _is_stdin_file(operand) else None
+                if kind == 'file' and not _is_stdin_file(operand):
+                    scripts.append(operand)
+                elif kind == _STDIN:
+                    scripts.extend(_stdin_fed(segments, position, piped, stdin_sources))
             elif '/' in word:
-                script = word
-            if script and _is_literal(script):
-                found[posixpath.normpath(script)] = None
+                scripts.append(word)
+            for script in scripts:
+                if _is_literal(script):
+                    found[posixpath.normpath(script)] = None
     return tuple(found)
+
+
+def _stdin_fed(
+    segments: Sequence[tuple[bool, tuple[str, ...]]],
+    position: int,
+    piped: bool,
+    stdin_sources: Sequence[str],
+) -> list[str]:
+    """一个从 stdin 读脚本的解释器，它的 stdin 从哪来、喂进去的就是被执行的脚本（评审 F3）：被管道
+    接上时上一段的 `cat FILE…` 把这些文件灌进来；没被管道接上时由 `< f` 的输入重定向喂。"""
+    if piped and position > 0:
+        previous = segments[position - 1][1]
+        fed: list[str] = []
+        for index in _program_candidates(previous):
+            if _basename(previous[index]) == 'cat':
+                fed.extend(
+                    operand for operand in previous[index + 1 :] if not operand.startswith('-')
+                )
+        return fed
+    return list(stdin_sources)
+
+
+def effective_cwd(command: str, base: str) -> str | None:
+    """命令里那些相对脚本该相对哪个目录解析：从工具给的 `base`（`Bash` 的 `cwd`）出发，折进开头
+    单独一个 `cd DIR` / `pushd DIR`。命令里还有别的改目录的段（多个 cd、变量目录），逐条脚本到底在
+    哪个目录下就不可靠了，交回 None：宁可这一条不升级（有一个 Agent 之内的窗口上界兜着），也不要
+    拿错目录去判成可信、或拿错目录把基线脚本误判成不可信（评审 F3 的绕过与 F7 的误报同源）。"""
+    segments, _ = _parse(command)
+    chdirs = [
+        tokens
+        for _, tokens in segments
+        if tokens and _basename(tokens[0]) in ('cd', 'pushd', 'popd')
+    ]
+    if not chdirs:
+        return base
+    if len(chdirs) > 1 or not segments or segments[0][1] is not chdirs[0]:
+        return None
+    operand = _first_operand(chdirs[0], 1)
+    if operand is None or not _is_literal(operand):
+        return None
+    return posixpath.normpath(posixpath.join(base, operand))
 
 
 def _is_literal(word: str) -> bool:
@@ -1868,16 +1933,29 @@ def _download_outputs(name: str, arguments: Sequence[str]) -> set[str]:
             continue
         if word.startswith('-') and len(word) > 1:
             cluster = word[1:]
-            if name == 'curl' and 'O' in cluster:
-                remote_name = True
-            if short in cluster:
-                rest = cluster[cluster.index(short) + 1 :]
-                if rest:
-                    outputs.add(rest)
-                elif index < len(arguments):
-                    outputs.add(arguments[index])
-                    index += 1
-                remote_name = False
+            position = 0
+            while position < len(cluster):
+                char = cluster[position]
+                if char == short:
+                    rest = cluster[position + 1 :]
+                    if rest:
+                        outputs.add(rest)
+                    elif index < len(arguments):
+                        outputs.add(arguments[index])
+                        index += 1
+                    remote_name = False
+                    break
+                if name == 'curl' and char == 'O':
+                    remote_name = True
+                    position += 1
+                    continue
+                if char in _CURL_VALUE_SHORT:
+                    # 取值短选项：cluster 剩下的字符是它的取值，不再当选项看——否则 `-XPOST` 里的
+                    # O 会被读成 `-O`，把 URL 最后一段当成下载的输出（评审 F9）。
+                    if position + 1 == len(cluster) and index < len(arguments):
+                        index += 1
+                    break
+                position += 1
     if remote_name:
         for url in urls:
             last = url.split('://', 1)[1].split('?', 1)[0].rstrip('/').rpartition('/')[2]

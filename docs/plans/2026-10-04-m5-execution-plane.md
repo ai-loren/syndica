@@ -420,3 +420,17 @@ D11、D12。规则表每个新成员各有一条用例；安全矩阵全格；`{
   补上。接线让「没读过就覆盖是冲突」第一次落到 CLI 上：只给了 Write 没给 Read 的角色改不了已有文件，冲突
   消息于是写明「没有 Read 就用 Edit」；几条 CLI 用例的脚本改成先读再写。回放照旧：文件工具在回放里是桩，
   版本层与它无关。
+- 2026-10-05：阶段三对抗评审（12 条）修进同一次提交。两条洗白路径（Blocking）与一条同根的高危都出自
+  `FileTaint.trust_of`「先看路径基线、后看版本」：改成基线命中只在问的正是基线那份内容（version 与基线哈希相等）
+  时才算可信，且路径按后端的 `Path.resolve()` 解析再判——经伪造链接的 `sub/../README.md`（F1）、从 grep 展示文本
+  里按冒号切回路径的 `README.md:evil.txt`（F2，改成 `grep_text` 交回结构化的 `GrepHit`）、把旧的不可信版本
+  `restore` 回来时文件还停在基线（F4），三条一起堵上。写入侧两处让被收紧的 Module 造出可信数据：hook 写文件时
+  `call_trust()` 为 None 就按宿主可信（F6，改成 Runtime 注入身份下界）、`trigger` 不盯就地改参数（F5，补 `_watch_all`
+  深拷投影，可观察切点也盯）。`exec.untrusted_script` 的三处绕过：stdin 喂脚本（`sh < f`、`cat f | sh`，`_parse` 另记
+  输入重定向源、`executed_scripts` 认管道与重定向）、工作区内的绝对路径（经 `script_trust` 判工作区成员）、`cd` 改
+  目录（`effective_cwd` 折进开头单独一个 `cd`，折不出就放过）——都在 F3 里堵上，顺带 F7 的两处误报（列基线目录、
+  `cd` 进基线脚本）。F8 批准后复查脚本是否在等待期间被改；F9 修 `-XPOST` 把 `O` 读成 `-O` 的误报（curl 取值短选项
+  遇到即停扫），其余下载形状（tee / wget -P / mv）登记为遗留，真实姿态下由 `exec.untrusted_script` 兜住非基线文件。
+  F11 收紧 broker 代理只转交协议方法（去掉 `__getattr__`，第三方多出来的投递入口不再透出，`copy` 也不再递归）；
+  F12 把扩展切点的污点格子也铺到 PRE / POST hook 分发。F10 的 6 条存活变异逐条补了用例（含工具抛异常按声明仍
+  收紧、`restore` 的信任、`position != index` 的兄弟判据、观察者改不动参数、dedup 摘除、两条 Blocking 的洗白）。
