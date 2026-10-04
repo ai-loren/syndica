@@ -13,12 +13,20 @@ Agent 都以为自己写成了，后写的那个静默盖掉先写的。基数�
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 from collections.abc import Awaitable, Callable
 
 from syndica.kernel.contracts.base import ContractSuite
 from syndica.kernel.errors import SyndicaError
-from syndica.kernel.workspace import ExecResult, Portal, Workspace, WriteConflict
+from syndica.kernel.workspace import (
+    ExecResult,
+    Portal,
+    PtyCapture,
+    PtyStatus,
+    Workspace,
+    WriteConflict,
+)
 
 __all__ = ['WorkspaceContract']
 
@@ -233,3 +241,138 @@ class WorkspaceContract(ContractSuite):
         portal = workspace.portal()
         await portal.close()
         await _rejects('close 之后的 start', lambda: portal.start('true', cwd='.'))
+        await _rejects('close 之后的 pty_create', lambda: portal.pty_create('true', cwd='.'))
+
+    async def test_a_terminal_session_reads_what_is_sent_and_reports_a_tty(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        handle = await portal.pty_create(
+            '[ -t 0 ] && [ -t 1 ] && echo tty-yes; read line; echo "got:$line"', cwd='.'
+        )
+        first = await _captured(portal, handle, 'tty-yes', since=0)
+        await portal.pty_send(handle, 'hello\n')
+        later = await _captured(portal, handle, 'got:hello', since=first.end)
+        assert '\x1b' not in later.text and '\r' not in later.text
+        status = await _settled_terminal(portal, handle)
+        assert (status.running, status.exit_code) == (False, 0)
+        await portal.pty_kill(handle)
+
+    async def test_a_terminal_capture_that_times_out_returns_nothing_instead_of_raising(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        handle = await portal.pty_create('sleep 30', cwd='.')
+        captured = await portal.pty_capture(handle, since=0, wait=0.2)
+        assert (captured.text, captured.running) == ('', True)
+        await portal.pty_kill(handle)
+
+    async def test_cancelling_a_waiting_capture_leaves_the_session_usable(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        handle = await portal.pty_create('read line; echo "after:$line"', cwd='.')
+        waiting = asyncio.ensure_future(portal.pty_capture(handle, since=0, wait=30))
+        await asyncio.sleep(0.05)
+        waiting.cancel()
+        try:
+            await waiting
+        except asyncio.CancelledError:
+            pass
+        await portal.pty_send(handle, 'x\n')
+        await _captured(portal, handle, 'after:x', since=0)
+        await portal.pty_kill(handle)
+
+    async def test_resizing_a_terminal_reaches_the_program(self, workspace: Workspace) -> None:
+        portal = workspace.portal()
+        handle = await portal.pty_create(
+            "trap 'stty size; echo resized' WINCH; echo trap-set; while :; do sleep 0.05; done",
+            cwd='.',
+            cols=80,
+            rows=24,
+        )
+        ready = await _captured(portal, handle, 'trap-set', since=0)
+        await portal.pty_resize(handle, cols=101, rows=33)
+        resized = await _captured(portal, handle, 'resized', since=ready.end)
+        assert '33 101' in resized.text
+        status = await portal.pty_status(handle)
+        assert (status.cols, status.rows) == (101, 33)
+        await portal.pty_kill(handle)
+
+    async def test_killing_a_terminal_leaves_none_of_its_processes_behind(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        handle = await portal.pty_create('sleep 300 & echo $! > child.pid; sleep 300', cwd='.')
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SETTLE_SECONDS
+        while await portal.stat('child.pid') is None:
+            assert loop.time() < deadline, '期望会话在宽限内写出子进程号'
+            await asyncio.sleep(0.02)
+        pid = (await portal.read_text('child.pid', offset=1, limit=1)).strip()
+        await portal.pty_kill(handle)
+        probe = await portal.run(f'kill -0 {pid} 2>/dev/null', timeout=5, cwd='.')
+        assert probe.exit_code != 0, f'期望 kill 之后会话里的子进程 {pid} 不在了，实际还在'
+        await _rejects('kill 之后的 pty_send', lambda: portal.pty_send(handle, 'x\n'))
+
+    async def test_killing_a_terminal_that_ignores_term_and_hup_still_leaves_nothing_behind(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        handle = await portal.pty_create(
+            "trap '' TERM HUP; sleep 300 & echo $! > stubborn.pid; sleep 300", cwd='.'
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SETTLE_SECONDS
+        while await portal.stat('stubborn.pid') is None:
+            assert loop.time() < deadline, '期望会话在宽限内写出子进程号'
+            await asyncio.sleep(0.02)
+        pid = (await portal.read_text('stubborn.pid', offset=1, limit=1)).strip()
+        await portal.pty_kill(handle)
+        probe = await portal.run(f'kill -0 {pid} 2>/dev/null', timeout=5, cwd='.')
+        assert probe.exit_code != 0, f'期望忽略 SIGTERM 的子进程 {pid} 也被收掉，实际还在'
+
+    async def test_sending_to_a_finished_terminal_is_refused(self, workspace: Workspace) -> None:
+        portal = workspace.portal()
+        handle = await portal.pty_create('exit 3', cwd='.')
+        status = await _settled_terminal(portal, handle)
+        assert (status.running, status.exit_code) == (False, 3)
+        await _rejects('结束之后的 pty_send', lambda: portal.pty_send(handle, 'x\n'))
+        await portal.pty_kill(handle)
+
+
+async def _captured(portal: Portal, handle: str, needle: str, *, since: int) -> PtyCapture:
+    """读到 `needle` 为止，交回从 `since` 起的全部文字与最后的 `end`。
+
+    每次从上一次的 `end` 接着读：一直传同一个 `since` 时只要有过一点输出，`wait` 就再也不等，
+    循环变成不让出事件循环的空转，读输出的回调永远轮不到。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _SETTLE_SECONDS
+    seen = ''
+    end = since
+    while True:
+        captured = await portal.pty_capture(handle, since=end, wait=0.2)
+        seen += captured.text
+        end = captured.end
+        if needle in seen:
+            return dataclasses.replace(captured, text=seen)
+        if loop.time() > deadline:
+            raise AssertionError(
+                f'期望终端在 {_SETTLE_SECONDS} 秒内输出 {needle!r}，实际看到 {seen!r}。'
+                ' 检查这个实现的 pty_capture 是否交回 since 之后的全部输出。'
+            )
+        if not captured.text:
+            await asyncio.sleep(0.02)
+
+
+async def _settled_terminal(portal: Portal, handle: str) -> PtyStatus:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _SETTLE_SECONDS
+    while True:
+        status = await portal.pty_status(handle)
+        if not status.running:
+            return status
+        if loop.time() > deadline:
+            raise AssertionError(f'期望终端里的程序在 {_SETTLE_SECONDS} 秒内结束，实际仍在运行')
+        await asyncio.sleep(0.02)

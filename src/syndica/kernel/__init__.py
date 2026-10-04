@@ -141,7 +141,15 @@ from syndica.kernel.waiting import (
     WaitResult,
     WaitState,
 )
-from syndica.kernel.workspace import ExecResult, FileStat, Portal, Workspace, WriteConflict
+from syndica.kernel.workspace import (
+    ExecResult,
+    FileStat,
+    Portal,
+    PtyCapture,
+    PtyStatus,
+    Workspace,
+    WriteConflict,
+)
 
 __all__ = [
     'AgentCatalog',
@@ -224,6 +232,8 @@ __all__ = [
     'PrefixDriftModule',
     'PrefixDriftRecord',
     'PrefixDriftService',
+    'PtyCapture',
+    'PtyStatus',
     'RedactedText',
     'RedactionRule',
     'Redactor',

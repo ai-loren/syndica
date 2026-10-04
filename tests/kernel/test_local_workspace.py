@@ -16,8 +16,8 @@ from syndica.kernel.errors import ConfigError
 from syndica.kernel.local_workspace import (
     LocalWorkspace,
     _Capture,  # pyright: ignore[reportPrivateUsage]
-    _complete_utf8,  # pyright: ignore[reportPrivateUsage]
 )
+from syndica.kernel.terminal_text import utf8_prefix_length
 from syndica.kernel.workspace import ExecResult
 
 
@@ -512,7 +512,7 @@ def test_reading_since_an_offset_counts_the_dropped_middle_in_the_offsets(
     ],
 )
 def test_a_running_stream_holds_back_a_character_cut_in_half(data: bytes, complete: int) -> None:
-    assert _complete_utf8(data) == complete
+    assert utf8_prefix_length(data) == complete
 
 
 async def test_a_running_command_hands_over_a_split_character_whole_on_the_next_poll(

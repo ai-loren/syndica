@@ -1,4 +1,4 @@
-"""本地文件与搜索工具。只调 Portal，不碰磁盘。
+"""本地文件、搜索、命令与终端工具。只调 Portal，不碰磁盘。
 
 模型犯的错（越界、旧串不唯一、文件过大）写进 output，不抛。
 这些工具的文本不是要执行的命令，所以 `__tool_command_args__` 必须是 `()`：
@@ -23,6 +23,7 @@ __all__ = [
     'Grep',
     'KillBash',
     'Read',
+    'Terminal',
     'Write',
     'local_tools',
 ]
@@ -360,11 +361,107 @@ class KillBash(Tool):
         return ToolResult(output=f'已终止后台命令，handle={handle}', meta={'handle': handle})
 
 
+_TERMINAL_ACTIONS = ('create', 'send', 'capture', 'resize', 'kill', 'status')
+
+
+class Terminal(Tool):
+    """在伪终端里运行交互式程序（spec §6.5）。"""
+
+    __tool_name__ = 'Terminal'
+    # `create` 的命令与 `send` 写进终端的文字都会被 shell 或终端里的程序执行。
+    __tool_command_args__ = ('command', 'input')
+
+    def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
+        self._portal = portal
+        self._output_limit = _valid_output_limit(output_limit)
+        self._shown: dict[str, int] = {}
+
+    async def execute(
+        self,
+        action: str,
+        command: str = '',
+        handle: str = '',
+        input: str = '',  # noqa: A002
+        wait: float = 2.0,
+        cols: int = 120,
+        rows: int = 40,
+    ) -> ToolResult:
+        """在伪终端里运行需要终端的交互式程序（REPL、等你输入的提示、按键驱动的程序）。
+        只是跑一条命令、看它的输出，用 Bash。终端是输出流，不是渲染后的屏幕：颜色与光标控制已去掉。
+        action: create 用 command 起一个会话，交回 handle 与最初的输出；send 把 input 写进会话再
+        交回之后的新输出；capture 交回上次之后的新输出；resize 把窗口改成 cols 列 rows 行；
+        kill 结束会话；status 只看状态
+        command: create 时运行的 shell 命令
+        handle: create 交回的会话句柄，create 以外的动作都要
+        input: send 写进终端的文字；回车写 \\n，Ctrl-C 写 \\u0003，Ctrl-D 写 \\u0004
+        wait: create、send、capture 之后最多等多少秒新输出，默认 2；到点没有新输出就交回空的
+        cols: create 与 resize 的窗口列数，默认 120
+        rows: create 与 resize 的窗口行数，默认 40
+        """
+        if action not in _TERMINAL_ACTIONS:
+            return ToolResult(
+                output=(
+                    f'期望: action 是 {" / ".join(_TERMINAL_ACTIONS)} 之一。实际: {action!r}。'
+                    ' 下一步: 先 create 一个会话，再用它交回的 handle 做别的动作。'
+                )
+            )
+        try:
+            if action == 'create':
+                handle = await self._portal.pty_create(command, cwd='.', cols=cols, rows=rows)
+                self._shown[handle] = 0
+            elif action == 'send':
+                await self._portal.pty_send(handle, input)
+            elif action == 'resize':
+                await self._portal.pty_resize(handle, cols=cols, rows=rows)
+            elif action == 'kill':
+                await self._portal.pty_kill(handle)
+                self._shown.pop(handle, None)
+                return ToolResult(
+                    output=f'已结束终端会话，handle={handle}', meta={'handle': handle}
+                )
+            if action in ('resize', 'status'):
+                status = await self._portal.pty_status(handle)
+                return ToolResult(
+                    output=(
+                        f'handle: {handle}\nrunning: {str(status.running).lower()}\n'
+                        f'exit_code: {status.exit_code}\nsize: {status.cols}x{status.rows}'
+                    ),
+                    meta={
+                        'handle': handle,
+                        'running': status.running,
+                        'exit_code': status.exit_code,
+                    },
+                    trust=TrustLevel.UNTRUSTED,
+                )
+            captured = await self._portal.pty_capture(
+                handle, since=self._shown.get(handle, 0), wait=wait
+            )
+        except ConfigError as exc:
+            return _told(exc)
+        self._shown[handle] = captured.end
+        text, clipped = _clipped(captured.text, self._output_limit)
+        return ToolResult(
+            output=(
+                f'handle: {handle}\nrunning: {str(captured.running).lower()}\n'
+                f'exit_code: {captured.exit_code}\n'
+                f'truncated: {str(captured.truncated or clipped).lower()}\n'
+                f'output since last look:\n{text}'
+            ),
+            meta={
+                'handle': handle,
+                'running': captured.running,
+                'exit_code': captured.exit_code,
+                'output': text,
+            },
+            trust=TrustLevel.UNTRUSTED,
+        )
+
+
 def local_tools(portal: Portal, *, output_limit: int | None = None) -> dict[str, Tool]:
     """按固定顺序交出本地工具。后续任务只追加键，不改已有键的相对顺序。
 
-    `output_limit` 是 Bash 与 BashOutput 每条输出流、Glob 与 Grep 每次结果最多展示的字符数，
-    None 是不截断。
+    `output_limit` 是 Bash、BashOutput 与 Terminal 每条输出、Glob 与 Grep 每次结果最多展示的
+    字符数，None 是不截断。
     """
     limit = _valid_output_limit(output_limit)
     read = Read(portal)
@@ -375,6 +472,7 @@ def local_tools(portal: Portal, *, output_limit: int | None = None) -> dict[str,
     bash = Bash(portal, output_limit=limit)
     bash_output = BashOutput(portal, output_limit=limit)
     kill_bash = KillBash(portal)
+    terminal = Terminal(portal, output_limit=limit)
     return {
         read.name: read,
         write.name: write,
@@ -384,4 +482,5 @@ def local_tools(portal: Portal, *, output_limit: int | None = None) -> dict[str,
         bash.name: bash,
         bash_output.name: bash_output,
         kill_bash.name: kill_bash,
+        terminal.name: terminal,
     }

@@ -10,7 +10,17 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Final, Protocol
 
-__all__ = ['ANY', 'Expected', 'ExecResult', 'FileStat', 'Portal', 'Workspace', 'WriteConflict']
+__all__ = [
+    'ANY',
+    'ExecResult',
+    'Expected',
+    'FileStat',
+    'Portal',
+    'PtyCapture',
+    'PtyStatus',
+    'Workspace',
+    'WriteConflict',
+]
 
 
 class _Any(Enum):
@@ -49,6 +59,29 @@ class FileStat:
 
     version: str
     size: int
+
+
+@dataclass(frozen=True)
+class PtyCapture:
+    """一次 `pty_capture` 交回的输出。`text` 去掉了终端控制序列，是输出流而不是渲染后的屏幕；
+    `end` 交回下一次的 `since`；`truncated` 是这一段里有没有内核没保留的字节。"""
+
+    text: str
+    end: int
+    running: bool
+    exit_code: int | None
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class PtyStatus:
+    """会话此刻的状态，不带输出。`end` 是到目前为止收到的字节数。"""
+
+    running: bool
+    exit_code: int | None
+    cols: int
+    rows: int
+    end: int
 
 
 class WriteConflict(Exception):
@@ -111,6 +144,24 @@ class Portal(Protocol):
         ...
 
     async def kill(self, handle: str) -> None: ...
+
+    async def pty_create(self, command: str, *, cwd: str, cols: int = 120, rows: int = 40) -> str:
+        """在伪终端里起一个会话，交回句柄。会话没有总时长上限；`pty_kill` 或 `close` 结束它。"""
+        ...
+
+    async def pty_send(self, handle: str, data: str) -> None: ...
+
+    async def pty_capture(self, handle: str, *, since: int = 0, wait: float = 0.0) -> PtyCapture:
+        """`since` 之后的输出；没有新输出时最多等 `wait` 秒，到点交回空文字而不是抛错。"""
+        ...
+
+    async def pty_resize(self, handle: str, *, cols: int, rows: int) -> None: ...
+
+    async def pty_kill(self, handle: str) -> None:
+        """结束会话的整个进程组并收掉它。之后这个句柄不再可用。"""
+        ...
+
+    async def pty_status(self, handle: str) -> PtyStatus: ...
 
     async def close(self) -> None: ...
 

@@ -22,7 +22,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from syndica.kernel.errors import ConfigError
-from syndica.kernel.workspace import ANY, ExecResult, Expected, FileStat, Portal, WriteConflict
+from syndica.kernel.local_pty import PtySessions
+from syndica.kernel.terminal_text import utf8_prefix_length
+from syndica.kernel.workspace import (
+    ANY,
+    ExecResult,
+    Expected,
+    FileStat,
+    Portal,
+    PtyCapture,
+    PtyStatus,
+    WriteConflict,
+)
 
 __all__ = ['LocalWorkspace']
 
@@ -72,7 +83,7 @@ class _Capture:
         """
         if not self._dropped:
             data = bytes(self._head + self._tail)[since:]
-            keep = len(data) if settled else _complete_utf8(data)
+            keep = len(data) if settled else utf8_prefix_length(data)
             return _decoded(data[:keep]), False, since + keep
         head_end = len(self._head)
         tail_start = head_end + self._dropped
@@ -86,7 +97,7 @@ class _Capture:
             )
         tail_from = max(0, since - tail_start)
         data = bytes(self._tail[tail_from:])
-        keep = len(data) if settled else _complete_utf8(data)
+        keep = len(data) if settled else utf8_prefix_length(data)
         parts.append(_decoded(data[:keep]))
         return ''.join(parts), since < tail_start, tail_start + tail_from + keep
 
@@ -126,6 +137,7 @@ class LocalWorkspace:
         self._process_lock = asyncio.Lock()
         self._closing: asyncio.Task[None] | None = None
         self._closed = False
+        self._terminals = PtySessions(shell=self._shell, env=self._env)
 
     @property
     def root(self) -> str:
@@ -393,6 +405,39 @@ class LocalWorkspace:
         _kill_unsettled(record)
         await asyncio.shield(record.settled)
 
+    async def pty_create(self, command: str, *, cwd: str, cols: int = 120, rows: int = 40) -> str:
+        async with self._process_lock:
+            self._ensure_open()
+            return await self._terminals.create(
+                command, cwd=self._directory(cwd), cols=cols, rows=rows
+            )
+
+    async def pty_send(self, handle: str, data: str) -> None:
+        self._ensure_open()
+        if not isinstance(cast(object, data), str):
+            raise ConfigError(
+                expected='data 是要写进终端的文字',
+                received=f'data 的类型是 {type(data).__name__}',
+                next_action='传 str；换行写 \\n，Ctrl-C 写 \\u0003',
+            )
+        await self._terminals.send(handle, data)
+
+    async def pty_capture(self, handle: str, *, since: int = 0, wait: float = 0.0) -> PtyCapture:
+        self._ensure_open()
+        return await self._terminals.capture(handle, since=since, wait=wait)
+
+    async def pty_resize(self, handle: str, *, cols: int, rows: int) -> None:
+        self._ensure_open()
+        await self._terminals.resize(handle, cols, rows)
+
+    async def pty_kill(self, handle: str) -> None:
+        self._ensure_open()
+        await self._terminals.kill(handle)
+
+    async def pty_status(self, handle: str) -> PtyStatus:
+        self._ensure_open()
+        return self._terminals.status(handle)
+
     async def close(self) -> None:
         if self._closed:
             return
@@ -483,6 +528,7 @@ class LocalWorkspace:
                 _kill_unsettled(record)
             for record in records:
                 await asyncio.shield(record.settled)
+            await self._terminals.close()
         finally:
             self._closed = True
 
@@ -677,20 +723,6 @@ def _offsets(since: object) -> tuple[int, int]:
             next_action='传上一次 poll 结果里的 stdout_end 与 stderr_end；从头看就不传',
         )
     return cast('tuple[int, int]', pair)
-
-
-def _complete_utf8(data: bytes) -> int:
-    """`data` 里到最后一个完整 utf-8 字符为止的长度：末尾半个多字节字符不算。"""
-    end = len(data)
-    for back in range(1, min(4, end) + 1):
-        byte = data[end - back]
-        if byte & 0xC0 == 0x80:
-            continue
-        if byte & 0x80 == 0:
-            return end
-        need = 2 if byte & 0xE0 == 0xC0 else 3 if byte & 0xF0 == 0xE0 else 4
-        return end if back >= need else end - back
-    return end
 
 
 def _positive_timeout(value: object) -> float:

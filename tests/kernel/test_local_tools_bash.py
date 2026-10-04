@@ -227,6 +227,7 @@ def test_local_tools_keys_are_in_canonical_order(root: Path, shell_path: str) ->
         'Bash',
         'BashOutput',
         'KillBash',
+        'Terminal',
     ]
     assert BashOutput.__tool_command_args__ == ()
     assert KillBash.__tool_command_args__ == ()
