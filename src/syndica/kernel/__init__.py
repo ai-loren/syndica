@@ -63,6 +63,7 @@ from syndica.kernel.hooks import (
     JunctionRef,
 )
 from syndica.kernel.ids import IdSource, StableKey
+from syndica.kernel.isolation import LocalIsolator, MergeConflict, MergeReport
 from syndica.kernel.llm import (
     LLM,
     CachePrefixProvider,
@@ -215,9 +216,12 @@ __all__ = [
     'LLM',
     'LLMConfig',
     'LLMResponseError',
+    'LocalIsolator',
     'LocalWorkspace',
     'MailboxConfirmationHandler',
     'ManifestSource',
+    'MergeConflict',
+    'MergeReport',
     'Message',
     'MessageBroker',
     'MissingQueueCallback',

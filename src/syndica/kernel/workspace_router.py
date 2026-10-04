@@ -11,11 +11,12 @@ import hashlib
 import logging
 import posixpath
 from collections.abc import Awaitable, Callable
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import cast
 
 from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.isolation import ISOLATIONS, IsolatedCopy, LocalIsolator, MergeReport
 from syndica.kernel.versions import VersionStore
 from syndica.kernel.workspace import (
     ANY,
@@ -48,11 +49,100 @@ class WorkspaceRouter:
     Agent 的驱动任务里）共用一份记录。
     """
 
-    def __init__(self, root: Workspace, *, versions: VersionStore | None = None) -> None:
+    def __init__(
+        self,
+        root: Workspace,
+        *,
+        versions: VersionStore | None = None,
+        isolator: LocalIsolator | None = None,
+    ) -> None:
         self._root = root
         self._assigned: dict[str, Workspace] = {}
         self._seen: dict[_Seen, str | None] = {}
         self._versions = versions
+        self._isolator = isolator
+        self._copies: dict[str, IsolatedCopy] = {}
+
+    @property
+    def can_isolate(self) -> bool:
+        return self._isolator is not None
+
+    def isolate(self, agent_id: str, isolation: str) -> IsolatedCopy | None:
+        """给 `agent_id` 建隔离副本并把它此后的调用路由过去；`shared` 什么都不做、交回 None。
+
+        同步：副本必须在这个 Agent 的第一个周期之前就位，而 `spawn` 在那之前不能有挂起点。它驱动
+        的任务里另起的任务继承驱动身份，于是同样落在这份副本上。"""
+        if isolation == 'shared':
+            return None
+        if isolation not in ISOLATIONS:
+            raise ConfigError(
+                expected=f'isolation 是 {" / ".join(ISOLATIONS)} 之一',
+                received=f'isolation={isolation!r}',
+                next_action='改成上面三者之一；不要隔离就用 shared',
+            )
+        if self._isolator is None:
+            raise ConfigError(
+                expected='路由带着隔离器（WorkspaceRouter(..., isolator=LocalIsolator(...))）',
+                received=f'这个路由不能隔离，却收到 isolation={isolation!r}',
+                next_action='构造路由时传入 isolator，或者用 isolation=shared',
+            )
+        if agent_id in self._copies:
+            raise ConfigError(
+                expected=f'agent {agent_id} 还没有隔离副本',
+                received='它已经有一份',
+                next_action='先 merge_isolated 或 discard_isolated 那一份',
+            )
+        copy = self._isolator.isolate(Path(self._root.root), agent_id, isolation)
+        self._copies[agent_id] = copy
+        self._assigned[agent_id] = copy.workspace
+        return copy
+
+    def isolated(self, agent_id: str) -> IsolatedCopy | None:
+        return self._copies.get(agent_id)
+
+    async def merge_isolated(self, agent_id: str) -> MergeReport:
+        """把 `agent_id` 的隔离副本逐文件合并回根工作区，然后删掉副本；此后它的调用落在根上。
+        合并写回的每个文件在版本层里记在这个 Agent 名下。"""
+        copy = self._copies.get(agent_id)
+        if copy is None or self._isolator is None:
+            raise ConfigError(
+                expected=f'agent {agent_id} 有一份隔离副本',
+                received='它没有（没隔离过，或已经合并、丢弃）',
+                next_action='只对用 isolation=worktree / snapshot 起来、还没合并的 Agent 合并',
+            )
+        report = await self._isolator.merge(
+            copy,
+            self._root.portal(),
+            lambda path, data: self._record(self._root, path, data, producer=agent_id),
+        )
+        await self._drop_copy(agent_id, unmerged_ok=True)
+        return report
+
+    async def discard_isolated(self, agent_id: str) -> None:
+        """丢掉 `agent_id` 的隔离副本（关掉它在副本里的进程）；没合并的改动会记一条警告。"""
+        await self._drop_copy(agent_id, unmerged_ok=False)
+
+    async def release(self, agent_id: str) -> None:
+        """Agent 不在了：丢掉它的副本，连同它在路由里记下的看过的版本。"""
+        await self._drop_copy(agent_id, unmerged_ok=False)
+        for key in [key for key in self._seen if key[0] == agent_id]:
+            del self._seen[key]
+
+    async def _drop_copy(self, agent_id: str, *, unmerged_ok: bool) -> None:
+        copy = self._copies.pop(agent_id, None)
+        self._assigned.pop(agent_id, None)
+        if copy is None:
+            return
+        if not unmerged_ok:
+            lost = copy.changed()
+            if lost:
+                logger.warning(
+                    'agent %s 的隔离副本没合并就丢掉了，%d 个文件的改动随之丢失：%s',
+                    agent_id,
+                    len(lost),
+                    lost,
+                )
+        await copy.discard()
 
     @property
     def root(self) -> str:
@@ -78,11 +168,13 @@ class WorkspaceRouter:
         self._record(self._root, path, data)
         return written
 
-    def _record(self, workspace: Workspace, path: str, data: bytes | None) -> None:
+    def _record(
+        self, workspace: Workspace, path: str, data: bytes | None, *, producer: str | None = None
+    ) -> None:
         if self._versions is None or workspace is not self._root:
             return
         relative = self._key(workspace, path)[1]
-        producer = driving_agent() or 'host'
+        producer = producer or driving_agent() or 'host'
         try:
             if data is None:
                 self._versions.record_removal(relative, producer=producer)
@@ -266,4 +358,7 @@ class WorkspaceRouter:
         return await self._target().portal().pty_status(handle)
 
     async def close(self) -> None:
+        """关掉根与每份隔离副本里的进程。副本的目录留着：没合并的改动不在关机时替谁丢掉。"""
+        for copy in list(self._copies.values()):
+            await copy.workspace.close()
         await self._root.portal().close()

@@ -498,14 +498,16 @@ class Terminal(Tool):
     ) -> ToolResult:
         """在伪终端里运行需要终端的交互式程序（REPL、等你输入的提示、按键驱动的程序）。
         只是跑一条命令、看它的输出，用 Bash。终端是输出流，不是渲染后的屏幕：颜色与光标控制已去掉。
-        action: create 用 command 起一个会话，交回 handle 与最初的输出；send 把 input 或 key 写进
-        会话再交回之后的新输出；capture 交回上次之后的新输出；resize 把窗口改成 cols 列 rows 行；
-        kill 结束会话；status 只看状态
+        create 用 command 起一个会话，交回 handle 与最初的输出；send 把 input 或 key 写进会话，
+        交回之后的新输出；capture 交回上次之后的新输出；resize 改窗口大小；kill 结束会话；
+        status 只看状态。
+        input 不能含制表等控制字符，一行要在一次 send 里交完；key 是 ctrl-c（中断，并清掉没回车的
+        半行）、ctrl-d（结束输入）或 ctrl-z（挂起，不清半行）。
+        action: create / send / capture / resize / kill / status
         command: create 时运行的 shell 命令
         handle: create 交回的会话句柄，create 以外的动作都要
-        input: send 写进终端的文字，回车写 \\n；不能含制表等控制字符。一行要在一次 send 里交完
-        key: send 时单独发的一个键：ctrl-c（中断，并清掉没回车的半行）、ctrl-d（结束输入）、
-        ctrl-z（挂起，不清半行）
+        input: send 写进终端的文字，回车写 \\n
+        key: send 时单独发的一个键：ctrl-c / ctrl-d / ctrl-z
         wait: create、send、capture 之后最多等多少秒新输出，默认 2；到点没有新输出就交回空的
         cols: create 与 resize 的窗口列数，默认 120
         rows: create 与 resize 的窗口行数，默认 40

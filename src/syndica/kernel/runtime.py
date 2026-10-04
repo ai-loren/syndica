@@ -166,6 +166,7 @@ from syndica.kernel.ids import (
     next_key,
     releasing_agent_id,
 )
+from syndica.kernel.isolation import ISOLATIONS, MergeReport
 from syndica.kernel.local_table import LocalAgentTable
 from syndica.kernel.message import DeliveryResult, Message, Trigger
 from syndica.kernel.modules import (
@@ -187,6 +188,7 @@ from syndica.kernel.tracing import (
     outside_any_span,
 )
 from syndica.kernel.waiting import Reply, Waiter, WaitResult, WaitState, correlation_of
+from syndica.kernel.workspace_router import WorkspaceRouter
 
 if TYPE_CHECKING:
     from syndica.kernel.catalog import AgentCatalog
@@ -976,10 +978,18 @@ class Runtime:
         ids: IdSource | None = None,
         tracer: Tracer | None = None,
         untrusted_output_modules: Sequence[str] = (),
+        workspace: WorkspaceRouter | None = None,
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
         validate_confirmation_handler(confirmation_handler)
+        if workspace is not None and not isinstance(cast(object, workspace), WorkspaceRouter):
+            raise ConfigError(
+                expected='workspace 是 WorkspaceRouter 或省略',
+                received=f'收到 {type(workspace).__name__}',
+                next_action='用 WorkspaceRouter(LocalWorkspace(...)) 包一层再交进来',
+            )
+        self._workspace = workspace
         self._ids: IdSource = RandomIds() if ids is None else _checked_ids(ids)
         checked_tracer = None if tracer is None else _checked_tracer(tracer)
         # 既不在工具调用里、也没有属主的 spawn 与 send 是宿主自己的代码，按宿主的第几次取键；经拓扑
@@ -1078,6 +1088,37 @@ class Runtime:
         self.broker.on_missing_queue(self._on_missing_queue)
 
     @property
+    def workspace(self) -> WorkspaceRouter | None:
+        """构造时交进来的工作区路由；没给时是 None，那时 `spawn` 只能 `isolation='shared'`。"""
+        return self._workspace
+
+    async def merge_isolated(self, agent_id: str) -> MergeReport:
+        """把一个隔离起来的 Agent 的副本逐文件合并回共享工作区并删掉副本（spec §6.4）。它正在跑
+        时拒绝：合并读的是副本此刻的样子，它还在写就会合进去半份。"""
+        router = self._isolating_router('merge_isolated')
+        info = await self.registry.get(agent_id)
+        if info is not None and info.status is AgentStatus.RUNNING:
+            raise ConfigError(
+                expected=f'合并时 agent {agent_id} 已经停下（IDLE / ZOMBIE）',
+                received='它正在跑',
+                next_action='用 wait_for 等它这次工作结束、或先 pause 它，再合并',
+            )
+        return await router.merge_isolated(agent_id)
+
+    async def discard_isolated(self, agent_id: str) -> None:
+        """丢掉一个 Agent 的隔离副本、不合并；此后它的调用落在共享工作区上。"""
+        await self._isolating_router('discard_isolated').discard_isolated(agent_id)
+
+    def _isolating_router(self, operation: str) -> WorkspaceRouter:
+        if self._workspace is None:
+            raise ConfigError(
+                expected=f'{operation} 用在构造时交了 workspace 的 Runtime 上',
+                received='这个 Runtime 没有工作区路由',
+                next_action='Runtime(workspace=WorkspaceRouter(..., isolator=LocalIsolator(...)))',
+            )
+        return self._workspace
+
+    @property
     def plugins(self) -> tuple[str, ...]:
         """已装插件的名字，按装配顺序。
 
@@ -1154,8 +1195,15 @@ class Runtime:
         fork_from: str | None = None,
         metadata: dict[str, Any] | None = None,
         flags: Mapping[str, FlagValue] | None = None,
+        isolation: str = 'shared',
     ) -> str:
         """建一个 Agent 并启动它的事件循环，返回它的 agent_id。
+
+        `isolation` 是 `shared`（缺省，与父共用工作区）、`worktree` 或 `snapshot`：后两者让它在
+        共享工作区的一份拷贝里干活（spec §6.4），需要构造时交了能隔离的 `workspace`。副本在它的
+        第一个周期之前就位，它驱动的任务里另起的任务继承驱动身份、同样落在副本上；「你在副本里」
+        这件事写在 query 的开头（不进 System Prompt）。合并由调用方决定（`merge_isolated`）；
+        `ExitMode.EXIT` 的 Agent 结束即拆除，副本随之丢弃并记一条警告。
 
         `query=None` 就是「起来等消息」（spec §4.7 的 lazy boot）：事件循环直接进 IDLE，第一条
         消息才是它的第一个周期。
@@ -1172,6 +1220,21 @@ class Runtime:
 
         工厂收下本 Runtime 的 hooks 与事件总线：Agent 自己新建一份，宿主注册的切点与订阅就都落空了。
         """
+        if isolation not in ISOLATIONS:
+            raise ConfigError(
+                expected=f'isolation 是 {" / ".join(ISOLATIONS)} 之一',
+                received=f'isolation={isolation!r}',
+                next_action='改成上面三者之一；不要隔离就用 shared',
+            )
+        if isolation != 'shared' and (self._workspace is None or not self._workspace.can_isolate):
+            raise ConfigError(
+                expected=f'isolation={isolation!r} 用在交了能隔离的 workspace 的 Runtime 上',
+                received='这个 Runtime 没有工作区路由，或它的路由没有隔离器',
+                next_action=(
+                    'Runtime(workspace=WorkspaceRouter(..., isolator=LocalIsolator(...)))；'
+                    '或者用 isolation=shared'
+                ),
+            )
         query_trust = self._from_listed_module(query_trust)
         # 取走而不是只读：工厂与 hook 里再 spawn 的 Agent 不是这个槽的，也不该拿这个槽的身份。
         slot_spawn = _SLOT_SPAWN.get()
@@ -1361,6 +1424,23 @@ class Runtime:
                 queue_attempted=True,
             )
             raise refusal
+        if isolation != 'shared':
+            assert self._workspace is not None
+            # 同步建副本：最后一道守卫与 create_task 之间仍然没有挂起点。
+            try:
+                isolated = self._workspace.isolate(agent_id, isolation)
+            except BaseException:
+                await self._rollback_unstarted_spawn(
+                    agent_id,
+                    agent,
+                    assembly_snapshot,
+                    runtime_added,
+                    registered=True,
+                    queue_attempted=True,
+                )
+                raise
+            if isolated is not None and query is not None:
+                query = f'{isolated.fact()}\n\n{query}'
         # put 先于 create_task：put 被拒时还没有任务可泄漏。两者之间没有挂起点，任务因此不会在
         # set_task 之前就跑起来。
         self._table.put(agent_id, agent)
@@ -2402,6 +2482,8 @@ class Runtime:
             await self.registry.unregister(agent_id)
             self._table.pop(agent_id)
             self._slots.pop(agent_id, None)
+            if self._workspace is not None:
+                await self._workspace.release(agent_id)
             if await self._has_traces(agent_id):
                 # 复检而不是相信 `unregister` 的明文契约：这是本方法唯一对外承诺的东西，而剩下
                 # 痕迹时没有第二个执行体会来兑现它。它没消失，所以既不报 `AGENT_DESPAWN`（那会是

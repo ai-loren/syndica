@@ -47,11 +47,13 @@ run 打成 ERROR——而 `QueryAgent` 对同一个目标答的是「一切正�
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from syndica.kernel.agent_types import ExitMode
 from syndica.kernel.context import Context, StopReason, TrustLevel, provenance_of
-from syndica.kernel.errors import ContractViolation
+from syndica.kernel.errors import ConfigError, ContractViolation
+from syndica.kernel.isolation import ISOLATIONS
 from syndica.kernel.message import Trigger
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.waiting import WaitState
@@ -179,12 +181,53 @@ def _interrupted(child_id: str, state: WaitState) -> ToolResult:
     )
 
 
-async def _collected(runtime: Runtime, agent_id: str, child_id: str) -> ToolResult:
-    """等这个子 Agent 干完，把它的终局翻译给模型。`Delegate` 与 `Fork` 的共同出口。"""
+async def _collected(
+    runtime: Runtime, agent_id: str, child_id: str, isolation: str = 'shared'
+) -> ToolResult:
+    """等这个子 Agent 干完，把它的终局翻译给模型。`Delegate` 与 `Fork` 的共同出口。
+
+    隔离起来的子 Agent 停下之后把副本合并回来，合并报告接在结果后面（它列的文件名出自子 Agent，
+    所以跟着结果的溯源结论走）。等待被打断时它可能还在写，不合并。"""
     outcome = await runtime._wait_in_turn(agent_id, child_id)  # pyright: ignore[reportPrivateUsage]
     if outcome.context is None:
         return _interrupted(child_id, outcome.state)
-    return _delivered(child_id, outcome.context)
+    result = _delivered(child_id, outcome.context)
+    if isolation == 'shared':
+        return result
+    try:
+        report = await runtime.merge_isolated(child_id)
+    except ConfigError as exc:
+        summary = (
+            f'期望: 把 agent {child_id} 的隔离副本合并回共享工作区。 实际: {exc.received}。'
+            f' 下一步: 副本还留着，宿主可以调 Runtime.merge_isolated({child_id!r}) 再合并。'
+        )
+        return replace(result, output=f'{result.output}\n\n{summary}')
+    meta = {
+        **result.meta,
+        'merged': list(report.merged),
+        'conflicts': [conflict.path for conflict in report.conflicts],
+    }
+    return replace(result, output=f'{result.output}\n\n{report.summary()}', meta=meta)
+
+
+def _isolation_refused(isolation: str, runtime: Runtime) -> ToolResult | None:
+    if isolation not in ISOLATIONS:
+        return ToolResult(
+            output=(
+                f'期望: isolation 是 {" / ".join(ISOLATIONS)} 之一。 实际: {isolation!r}。'
+                ' 下一步: 不需要隔离就省略它（shared）。'
+            )
+        )
+    workspace = runtime.workspace
+    if isolation != 'shared' and (workspace is None or not workspace.can_isolate):
+        return ToolResult(
+            output=(
+                '期望: 这次运行能给子 Agent 建隔离副本。'
+                f' 实际: 不能，却收到 isolation={isolation!r}。'
+                ' 下一步: 省略 isolation（shared），让它直接在共享工作区里干活。'
+            )
+        )
+    return None
 
 
 class _AgentTool(Tool):
@@ -212,15 +255,21 @@ class Delegate(_AgentTool):
 
     __tool_command_args__ = ()
 
-    async def execute(self, agent: str, query: str) -> ToolResult:
+    async def execute(self, agent: str, query: str, isolation: str = 'shared') -> ToolResult:
         """把一件独立的工作派给一个 Agent 角色，等它做完并取回它的结果。
         它冷启动、**看不到你的上下文**，所以用于需要独立视角的工作。
         已有 Agent 能继续同一工作时用 SendMessage，不要新建；
         要在你自己已有的结论之上并行推进就用 Fork；能直接做完的有界工作不该委派。
         返回的第一行带着它的 agent_id——它做完之后仍然留在注册表里可寻址。
+        isolation 为 worktree 或 snapshot 时它在共享工作区的一份拷贝里改，做完逐文件合并回来，
+        冲突的文件另存成旁边的 .theirs；缺省 shared 直接改共享工作区。
         agent: 角色名
         query: 交给它的完整任务描述，它看不到你的上下文，所以要自带全部前提
+        isolation: shared（缺省）/ worktree / snapshot
         """
+        refused = _isolation_refused(isolation, self._runtime)
+        if refused is not None:
+            return refused
         factory = self._runtime.agent_factory(agent)
         if factory is None:
             return ToolResult(
@@ -243,8 +292,9 @@ class Delegate(_AgentTool):
             # ZOMBIE 而不是 EXIT：EXIT 会让子 Agent 做完即连同条目一起消失，而这次调用交回的
             # 那个 agent_id 就成了悬空引用。
             exit_mode=ExitMode.ZOMBIE,
+            isolation=isolation,
         )
-        return await _collected(self._runtime, self._agent_id, child_id)
+        return await _collected(self._runtime, self._agent_id, child_id, isolation)
 
 
 class Fork(_AgentTool):
@@ -255,15 +305,21 @@ class Fork(_AgentTool):
 
     __tool_command_args__ = ()
 
-    async def execute(self, query: str) -> ToolResult:
+    async def execute(self, query: str, isolation: str = 'shared') -> ToolResult:
         """分叉出一个继承了你当前上下文的 Agent，交给它一件延续性的工作，等它做完。
         用于你已有的结论有价值、需要在此基础上并行推进的场景：
         分身看得到你到此刻为止的轨迹，因此不必重复前提。
         要一个不受你的结论影响的独立视角就用 Delegate；
         已有 Agent 能继续同一工作时用 SendMessage，不要新建。
         返回的第一行带着分身的 agent_id——它做完之后仍然留在注册表里可寻址。
+        isolation 为 worktree 或 snapshot 时分身在共享工作区的一份拷贝里改，做完逐文件合并回来，
+        冲突的文件另存成旁边的 .theirs；缺省 shared 直接改共享工作区。
         query: 交给分身的任务描述；它已经看得到你到此刻为止的轨迹，不必重复前提
+        isolation: shared（缺省）/ worktree / snapshot
         """
+        refused = _isolation_refused(isolation, self._runtime)
+        if refused is not None:
+            return refused
         factory = self._runtime._factory_of(self._agent_id)  # pyright: ignore[reportPrivateUsage]
         if factory is None:
             return ToolResult(
@@ -284,8 +340,9 @@ class Fork(_AgentTool):
             parent_id=self._agent_id,
             exit_mode=ExitMode.ZOMBIE,
             fork_from=self._agent_id,
+            isolation=isolation,
         )
-        return await _collected(self._runtime, self._agent_id, child_id)
+        return await _collected(self._runtime, self._agent_id, child_id, isolation)
 
 
 class SendMessage(_AgentTool):

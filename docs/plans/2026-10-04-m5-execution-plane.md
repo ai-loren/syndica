@@ -169,7 +169,10 @@ B-15、B-18、D-40、D-62、D-63、D-64；`AGENTS.md`。
   合并，干净就用合并结果，有冲突标记就把这个文件列进冲突、父的那份不动；快照两边都改就是冲突。删除同理。逐文件
   而不是 `merge-tree`：老版本 git 也能跑，快照也能用同一套判据。合并写回父工作区的每个文件带着子 Agent 那份的
   文件污点（D9）。写回是条件写：前提是合并开始时读到的父版本，合并期间父那边又被改过就把这个文件列进冲突，
-  不覆盖（共享工作区里别的 Agent 照常在写）。
+  不覆盖（共享工作区里别的 Agent 照常在写）。冲突的文件父那份不动，子 Agent 的那份另存成旁边的
+  `<path>.<agent 前 8 位>.theirs`（条件写：已存在就不另存、报告里写明），模型读得到、合得了。合并之后副本删除，
+  此后被叫醒的子 Agent 直接在共享工作区里干活（报告里写明）；`ExitMode.EXIT` 的隔离 Agent 结束即拆除，副本随之
+  丢弃并记一条警告，列出丢掉的文件。
 - 入口：`Runtime.spawn(..., isolation=...)`、`Delegate` / `Fork` 的 `isolation` 参数（缺省 `shared`）。`Delegate` /
   `Fork` 在子 Agent 这次工作结束后自动合并，合并报告进结果；宿主经 `Runtime.merge_isolated` / `discard_isolated`
   自己决定。隔离语义以发起分叉的源 Agent 的工作区为基准（spec §6.4）。
@@ -258,8 +261,10 @@ B-15、B-18、D-40、D-62、D-63、D-64；`AGENTS.md`。
 
 - `Portal`：D1 的新方法与 `expected` / `since` 参数；`FileStat`、`WriteConflict`、`ANY`、伪终端的结果类型。
 - `ExecResult` 追加 `stdout_end`、`stderr_end`。
-- `VersionStore` 协议与 `GitVersionStore` / `SnapshotVersionStore`；`IsolationStrategy` 与三种实现；`MergeReport`。
-- `WorkspaceRouter`；`Runtime(workspace=...)`、`spawn(..., isolation=...)`、`merge_isolated` / `discard_isolated`。
+- `VersionStore` / `VersionEntry`（Python 写的 git 格式，内容先脱敏）；`LocalIsolator`、`MergeReport`、
+  `MergeConflict`（`IsolatedCopy` 经 `syndica.kernel.isolation` 承诺）；`Portal` 的写交回写下的版本。
+- `WorkspaceRouter(root, versions=, isolator=)`、`restore`；`Runtime(workspace=...)`、`spawn(..., isolation=...)`、
+  `merge_isolated` / `discard_isolated`。
 - `Tool.__tool_external_input__`；`HookResult.untrusted`（追加字段）。
 - `Terminal` 工具；`local_tools` 追加 `Terminal` 键；`BashOutput` 加 `full`；`Delegate` / `Fork` 加 `isolation`。
 
@@ -309,7 +314,7 @@ D4、D5。Python 写的 git 格式对象库（用户用 git 读得出来，由�
 工作区放 `.gitattributes`，证明版本层的任何操作都不执行它们；隔离合并调 `git merge-file` 时的目录、环境与配置由一条
 用例逐项钉住；没有 git 的环境用 `PATH` 里没有 git 模拟。危险规则对 `.syndica` 路径的新判据每个写法各有一条用例。
 
-#### T6 — 隔离与合并
+#### T6 — 隔离与合并（完成，见决策日志）
 
 D6。三种策略、逐文件合并、冲突报告、`spawn` / `Delegate` / `Fork` 的 `isolation`、隔离状态注入历史。
 共享写入冲突、worktree 合并冲突、快照 fallback 各有单测。路由按 Agent 的分配在 Agent 释放（`despawn`、合并、
@@ -375,3 +380,11 @@ D11、D12。规则表每个新成员各有一条用例；安全矩阵全格；`{
   Agent 限 8 个会话、杀会话时连后代的进程组一起收、会话有控制终端、历史不落盘；`BashOutput` 在命令结束后让
   `meta` 带全部输出（开发期记录按它判测试结果）；契约补三方并发、kill 后进程真的不在、`since` 逐字、组长先死、
   作业控制、Ctrl-C。macOS 无论是否 `TIOCSCTTY` 都给会话控制终端，那条启动器的变异只有 Linux 杀得掉。
+- 2026-10-04：T5 的版本层落盘前过 Redactor——计划原文没写，而 AGENTS.md #8 点名「提交」、§12 要求新增持久化
+  路径一律脱敏；代价是含密钥样内容的版本取不回、不能回滚，按 spec「脱敏与可回放冲突时选安全」。由此 D6 的副本
+  改从父的工作文件拷（从版本层物化会把占位符写进子 Agent 再随合并写回）。`LocalIsolator` 的 git 路径与三方合并
+  的临时目录由宿主交进来：内核不读 PATH、不读 `TMPDIR`，而 `git merge-file` 会在工作目录里找仓库，临时目录必须
+  在 Agent 碰不到的地方。
+- 2026-10-04：T6 发现 `Terminal` 的参数说明写成多行，而工具反射「续行不拼接」——模型拿到的 `action` / `key`
+  说明是半句话（T4 起就是这样）。改成参数行只留一句、细节挪进摘要段，并加一道守卫：内置工具的参数描述
+  有续行就红。

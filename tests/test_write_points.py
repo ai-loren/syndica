@@ -64,6 +64,15 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
     # 工作区路由把 Agent 文件工具的写转给它所在的那个工作区，内容就是工具交下来的；回滚写回的是
     # 版本层里一份没脱过敏的原文（脱过敏的版本取不回来），也就是早先某次工具写下的内容。
     'kernel/workspace_router.py': ('write_bytes', 'write_bytes', 'write_text'),
+    # 隔离：拷进副本的是父工作区自己的文件；合并写回父的是子 Agent 文件工具与命令写下的产物（直接
+    # 写回、三方合并的结果、冲突时另存的 .theirs）；三方合并的三个临时文件建在工作区之外、用完即删。
+    'kernel/isolation.py': (
+        'write_bytes',
+        'write_bytes',
+        'write_bytes',
+        'write_bytes',
+        'write_bytes',
+    ),
     # 版本层：对象是 zlib(头 + 正文)，正文与提交消息在同一个方法里先过了 Redactor（守卫看不穿
     # 压缩）；两处 write_text 写的是引用：`HEAD` 的固定内容与一个提交号。
     'kernel/versions.py': ('write_bytes', 'write_text', 'write_text'),

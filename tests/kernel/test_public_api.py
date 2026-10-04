@@ -89,9 +89,12 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'LLM',
     'LLMConfig',
     'LLMResponseError',
+    'LocalIsolator',
     'LocalWorkspace',
     'MailboxConfirmationHandler',
     'ManifestSource',
+    'MergeConflict',
+    'MergeReport',
     'Message',
     'MessageBroker',
     'MissingQueueCallback',
@@ -191,6 +194,7 @@ _RUNTIME_SURFACE: tuple[str, ...] = (
     'assemble',
     'broker',
     'despawn',
+    'discard_isolated',
     'ensure_active',
     'events',
     'flag_declarations',
@@ -198,6 +202,7 @@ _RUNTIME_SURFACE: tuple[str, ...] = (
     'find',
     'hooks',
     'kill',
+    'merge_isolated',
     'modules',
     'occupy',
     'pause',
@@ -211,6 +216,7 @@ _RUNTIME_SURFACE: tuple[str, ...] = (
     'spawn',
     'wait',
     'wait_for',
+    'workspace',
 )
 # `BaseAgent` 的公开面。`kernel.__all__` 只导出类名这一个字符串，对类上新增的方法完全无感——
 # 一次「顺手加个公开方法」因此在这里之外没有任何东西会变红。`trigger_extension` 是 M4 D6 给 Module
@@ -263,6 +269,7 @@ _RUNTIME_INIT: tuple[tuple[str, str, bool], ...] = (
     ('ids', 'KEYWORD_ONLY', True),
     ('tracer', 'KEYWORD_ONLY', True),
     ('untrusted_output_modules', 'KEYWORD_ONLY', True),
+    ('workspace', 'KEYWORD_ONLY', True),
 )
 _RUNTIME_SPAWN: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),
@@ -274,6 +281,7 @@ _RUNTIME_SPAWN: tuple[tuple[str, str, bool], ...] = (
     ('fork_from', 'KEYWORD_ONLY', True),
     ('metadata', 'KEYWORD_ONLY', True),
     ('flags', 'KEYWORD_ONLY', True),
+    ('isolation', 'KEYWORD_ONLY', True),
 )
 _BASE_AGENT_INIT: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),
@@ -352,6 +360,7 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 _PROMISED_VIA_SUBMODULE: dict[str, tuple[str, ...]] = {
     'syndica.kernel.trace': ('ATTRIBUTE_DOMAINS', 'ATTRIBUTE_KINDS', 'TRACE_SCHEMA'),
     'syndica.kernel.workspace': ('ANY', 'Expected'),
+    'syndica.kernel.isolation': ('IsolatedCopy',),
     'syndica.kernel.scenario_schema': (
         'DangerPolicySpec',
         'DangerRuleSpec',
@@ -397,7 +406,9 @@ _WITHHELD: tuple[str, ...] = (
     'HostAction',
     'HostProfile',
     'INTERCEPTABLE',
+    'ISOLATIONS',
     'Installer',
+    'IsolatedCopy',
     'KillAgent',
     'KillBash',
     'LocalAgentTable',
