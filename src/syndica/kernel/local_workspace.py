@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import math
 import os
 import re
@@ -21,12 +22,14 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from syndica.kernel.errors import ConfigError
-from syndica.kernel.workspace import ExecResult, Portal
+from syndica.kernel.workspace import ANY, ExecResult, Expected, FileStat, Portal, WriteConflict
 
 __all__ = ['LocalWorkspace']
 
 # 超过这个大小的文件拒绝整篇读入。模型上下文装不下，拒绝时必须报出实际字节数。
 _MAX_READ_BYTES: int = 1024 * 1024
+# `read_bytes` 的上限：它给版本层与产物处理器用，不进模型上下文，但仍是整篇进内存。
+_MAX_BYTES: int = 64 * 1024 * 1024
 # 命令的 shell 退出之后，最多再等这么久让 `cmd &` 留下的子进程关掉输出管道，然后杀整个进程组。
 _PIPE_GRACE: float = 1.0
 # 发出 SIGKILL 之后等进程退出、管道关闭的上限。逃出进程组的进程（`setsid`、`setpgid`，如 GNU
@@ -61,15 +64,31 @@ class _Capture:
             del self._tail[:excess]
             self._dropped += excess
 
-    def rendered(self) -> tuple[str, bool]:
-        """(解码后的文本, 是否丢过字节)。"""
+    def rendered(self, since: int = 0, *, settled: bool) -> tuple[str, bool, int]:
+        """(`since` 之后的输出解码成的文本, 这一段里是否有被丢弃的字节, 交出的部分结束在哪)。
+
+        偏移按收到的字节数计，丢掉的那一段也算在内，所以前后两次查询之间不会因为丢弃而错位。
+        还在跑的命令末尾不完整的 utf-8 字符留到下一次：拆开解码会在两次输出里各留一个替换符。
+        """
         if not self._dropped:
-            return _decoded(self._head + self._tail), False
-        note = (
-            f'\n…[内核丢弃了这条流中间 {self._dropped} 个字节：每条流最多保留开头 '
-            f'{_CAPTURE_HEAD} 与结尾 {_CAPTURE_TAIL} 字节]…\n'
-        )
-        return _decoded(self._head) + note + _decoded(self._tail), True
+            data = bytes(self._head + self._tail)[since:]
+            keep = len(data) if settled else _complete_utf8(data)
+            return _decoded(data[:keep]), False, since + keep
+        head_end = len(self._head)
+        tail_start = head_end + self._dropped
+        parts: list[str] = []
+        if since < head_end:
+            parts.append(_decoded(self._head[since:]))
+        if since < tail_start:
+            parts.append(
+                f'\n…[内核丢弃了这条流中间 {tail_start - max(since, head_end)} 个字节：每条流最多'
+                f'保留开头 {_CAPTURE_HEAD} 与结尾 {_CAPTURE_TAIL} 字节]…\n'
+            )
+        tail_from = max(0, since - tail_start)
+        data = bytes(self._tail[tail_from:])
+        keep = len(data) if settled else _complete_utf8(data)
+        parts.append(_decoded(data[:keep]))
+        return ''.join(parts), since < tail_start, tail_start + tail_from + keep
 
 
 @dataclass(eq=False)
@@ -155,20 +174,19 @@ class LocalWorkspace:
             )
         return '\n'.join(lines[start : start + limit])
 
-    async def write_text(self, path: str, content: str) -> None:
-        real = self._writable(path)
-        if real.exists() and not real.is_file():
-            raise ConfigError(
-                expected='path 指向根目录内的文件',
-                received=f'path={path!r} 已存在但不是文件',
-                next_action='改用文件路径',
-            )
-        parent = real.parent
-        self._must_stay(parent)
-        parent.mkdir(parents=True, exist_ok=True)
-        real.write_text(content, encoding='utf-8')
+    async def write_text(self, path: str, content: str, *, expected: Expected = ANY) -> None:
+        self._write(path, content.encode('utf-8'), expected)
 
-    async def edit_text(self, path: str, old: str, new: str) -> None:
+    async def write_bytes(self, path: str, data: bytes, *, expected: Expected = ANY) -> None:
+        if not isinstance(cast(object, data), bytes | bytearray):
+            raise ConfigError(
+                expected='data 是 bytes',
+                received=f'data 的类型是 {type(data).__name__}',
+                next_action='写文本用 write_text；写二进制先编码成 bytes',
+            )
+        self._write(path, bytes(data), expected)
+
+    async def edit_text(self, path: str, old: str, new: str, *, expected: Expected = ANY) -> None:
         if old == '':
             raise ConfigError(
                 expected='old 是文件里出现恰好一次的非空片段',
@@ -182,7 +200,10 @@ class LocalWorkspace:
                 received=f'path={path!r} 不是文件',
                 next_action='改用文件路径',
             )
-        text = _read_utf8(real, path)
+        data = real.read_bytes()
+        if expected is not ANY:
+            _check_expected(path, expected, _version(data))
+        text = _utf8(data, path)
         count = text.count(old)
         if count != 1:
             raise ConfigError(
@@ -190,7 +211,74 @@ class LocalWorkspace:
                 received=f'出现了 {count} 次',
                 next_action='把 old 收窄到唯一的一段，或先读出文件再改',
             )
-        real.write_text(text.replace(old, new, 1), encoding='utf-8')
+        real.write_bytes(text.replace(old, new, 1).encode('utf-8'))
+
+    async def read_bytes(self, path: str) -> bytes:
+        real = self._inside(path)
+        self._refuse_private(path, real)
+        if not real.is_file():
+            raise ConfigError(
+                expected='path 指向根目录内的文件',
+                received=f'path={path!r} 不是文件',
+                next_action='改用文件路径',
+            )
+        size = real.stat().st_size
+        if size > _MAX_BYTES:
+            raise ConfigError(
+                expected=f'单文件不超过 {_MAX_BYTES} 字节',
+                received=f'文件有 {size} 字节',
+                next_action='大文件不经 Portal 整篇读入；按需要分段处理',
+            )
+        return real.read_bytes()
+
+    async def remove(self, path: str, *, expected: Expected = ANY) -> None:
+        real = self._writable(path)
+        if (self._root / path).is_symlink():
+            raise ConfigError(
+                expected='remove 只删普通文件',
+                received=f'path={path!r} 是符号链接',
+                next_action='符号链接与它指向的文件是两件东西；要删链接本身请用命令',
+            )
+        if not real.is_file():
+            raise ConfigError(
+                expected='path 指向根目录内已存在的文件',
+                received=f'path={path!r} 不存在或不是文件',
+                next_action='先确认路径；目录不经 remove 删除',
+            )
+        if expected is not ANY:
+            _check_expected(path, expected, _version(real.read_bytes()))
+        real.unlink()
+
+    async def stat(self, path: str) -> FileStat | None:
+        real = self._inside(path)
+        self._refuse_private(path, real)
+        if not real.exists():
+            return None
+        if not real.is_file():
+            raise ConfigError(
+                expected='path 指向根目录内的文件',
+                received=f'path={path!r} 存在但不是文件',
+                next_action='stat 只给文件版本；目录没有版本',
+            )
+        data = real.read_bytes()
+        return FileStat(version=_version(data), size=len(data))
+
+    def _write(self, path: str, data: bytes, expected: Expected) -> None:
+        """写入的全部检查与写本身之间没有挂起点：同一个事件循环里并发的两次带前提的写，后到的那个
+        一定看见先到的那个写下的版本。"""
+        real = self._writable(path)
+        if real.exists() and not real.is_file():
+            raise ConfigError(
+                expected='path 指向根目录内的文件',
+                received=f'path={path!r} 已存在但不是文件',
+                next_action='改用文件路径',
+            )
+        if expected is not ANY:
+            _check_expected(path, expected, _version(real.read_bytes()) if real.is_file() else None)
+        parent = real.parent
+        self._must_stay(parent)
+        parent.mkdir(parents=True, exist_ok=True)
+        real.write_bytes(data)
 
     async def glob_paths(self, pattern: str) -> tuple[str, ...]:
         if pattern.strip() == '':
@@ -281,20 +369,23 @@ class LocalWorkspace:
             self._processes[handle] = record
             return handle
 
-    async def poll(self, handle: str) -> ExecResult:
+    async def poll(self, handle: str, *, since: tuple[int, int] = (0, 0)) -> ExecResult:
         self._ensure_open()
         record = self._record(handle)
+        start_out, start_err = _offsets(since)
         if not record.settled.done():
-            stdout, stdout_dropped = record.stdout.rendered()
-            stderr, stderr_dropped = record.stderr.rendered()
+            stdout, stdout_dropped, stdout_end = record.stdout.rendered(start_out, settled=False)
+            stderr, stderr_dropped, stderr_end = record.stderr.rendered(start_err, settled=False)
             return ExecResult(
                 exit_code=None,
                 stdout=stdout,
                 stderr=stderr,
                 truncated=stdout_dropped or stderr_dropped,
                 running=True,
+                stdout_end=stdout_end,
+                stderr_end=stderr_end,
             )
-        return _result(record, timed_out=record.settled.result())
+        return _result(record, timed_out=record.settled.result(), since=(start_out, start_err))
 
     async def kill(self, handle: str) -> None:
         self._ensure_open()
@@ -543,15 +634,63 @@ class LocalWorkspace:
 
 
 def _read_utf8(path: Path, received: str) -> str:
+    return _utf8(path.read_bytes(), received)
+
+
+def _utf8(data: bytes, received: str) -> str:
     # Read / Edit 只接受 utf-8。解码失败必须是 ConfigError，不能把 UnicodeDecodeError 抛出去。
     try:
-        return path.read_text(encoding='utf-8')
+        return data.decode('utf-8')
     except UnicodeDecodeError as exc:
         raise ConfigError(
             expected='文件是 utf-8 文本',
             received=f'path={received!r} 不是 utf-8',
             next_action='换一个 utf-8 文本文件',
         ) from exc
+
+
+def _version(data: bytes) -> str:
+    return f'sha256:{hashlib.sha256(data).hexdigest()}'
+
+
+def _check_expected(path: str, expected: object, current: str | None) -> None:
+    if expected is ANY:
+        return
+    if expected is not None and not isinstance(expected, str):
+        raise ConfigError(
+            expected='expected 是 ANY、None（要求文件不存在）或一个版本字符串',
+            received=f'expected={expected!r}，类型是 {type(expected).__name__}',
+            next_action='传 stat() 交回的 version；不检查版本就不传',
+        )
+    if expected != current:
+        raise WriteConflict(path, expected, current)
+
+
+def _offsets(since: object) -> tuple[int, int]:
+    pair = cast('tuple[object, ...]', since) if isinstance(since, tuple) else ()
+    if len(pair) != 2 or not all(
+        isinstance(item, int) and not isinstance(item, bool) and item >= 0 for item in pair
+    ):
+        raise ConfigError(
+            expected='since 是 (stdout_end, stderr_end) 两个非负整数',
+            received=f'since={since!r}',
+            next_action='传上一次 poll 结果里的 stdout_end 与 stderr_end；从头看就不传',
+        )
+    return cast('tuple[int, int]', pair)
+
+
+def _complete_utf8(data: bytes) -> int:
+    """`data` 里到最后一个完整 utf-8 字符为止的长度：末尾半个多字节字符不算。"""
+    end = len(data)
+    for back in range(1, min(4, end) + 1):
+        byte = data[end - back]
+        if byte & 0xC0 == 0x80:
+            continue
+        if byte & 0x80 == 0:
+            return end
+        need = 2 if byte & 0xE0 == 0xC0 else 3 if byte & 0xF0 == 0xE0 else 4
+        return end if back >= need else end - back
+    return end
 
 
 def _positive_timeout(value: object) -> float:
@@ -575,9 +714,11 @@ def _decoded(value: bytes | bytearray) -> str:
     return bytes(value).decode('utf-8', errors='replace')
 
 
-def _result(record: _ProcessRecord, *, timed_out: bool) -> ExecResult:
-    stdout, stdout_dropped = record.stdout.rendered()
-    stderr, stderr_dropped = record.stderr.rendered()
+def _result(
+    record: _ProcessRecord, *, timed_out: bool, since: tuple[int, int] = (0, 0)
+) -> ExecResult:
+    stdout, stdout_dropped, stdout_end = record.stdout.rendered(since[0], settled=True)
+    stderr, stderr_dropped, stderr_end = record.stderr.rendered(since[1], settled=True)
     return ExecResult(
         exit_code=None if timed_out else record.process.returncode,
         stdout=stdout,
@@ -585,6 +726,8 @@ def _result(record: _ProcessRecord, *, timed_out: bool) -> ExecResult:
         truncated=stdout_dropped or stderr_dropped,
         running=False,
         timed_out=timed_out,
+        stdout_end=stdout_end,
+        stderr_end=stderr_end,
     )
 
 

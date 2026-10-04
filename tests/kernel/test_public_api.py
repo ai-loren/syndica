@@ -68,6 +68,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'ExecResult',
     'ExitMode',
     'ExtensionJunction',
+    'FileStat',
     'FileTraceStore',
     'Finding',
     'FlagDeclaration',
@@ -148,6 +149,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'WaitState',
     'Waiter',
     'Workspace',
+    'WriteConflict',
     'encode_redacted',
     'flag_reference',
     'local_tools',
@@ -167,6 +169,7 @@ _CONTRACT_EXPORTS: tuple[str, ...] = (
     'UPDATE_PROTECTED_FIELDS',
     'UPDATE_PROTECTED_FIELD_OWNERS',
     'UPDATE_WRITABLE_FIELDS',
+    'WorkspaceContract',
 )
 # `Runtime` 的公开面：**spec §4.2 把它刻意收紧到 11 个方法**，每加一个都是一条永久兼容承诺。
 # 逐字写死，理由同 `_KERNEL_EXPORTS`——这份清单是唯一会因为「顺手加一个公开方法」而变红的东西，
@@ -343,6 +346,7 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # 同样是破坏性变更。它们同时在 `_WITHHELD` 里（那张表说的是「不在 kernel.__all__」）。
 _PROMISED_VIA_SUBMODULE: dict[str, tuple[str, ...]] = {
     'syndica.kernel.trace': ('ATTRIBUTE_DOMAINS', 'ATTRIBUTE_KINDS', 'TRACE_SCHEMA'),
+    'syndica.kernel.workspace': ('ANY', 'Expected'),
     'syndica.kernel.scenario_schema': (
         'DangerPolicySpec',
         'DangerRuleSpec',
@@ -366,6 +370,7 @@ _PROMISED_VIA_SUBMODULE: dict[str, tuple[str, ...]] = {
     ),
 }
 _WITHHELD: tuple[str, ...] = (
+    'ANY',
     'ATTRIBUTE_DOMAINS',
     'ATTRIBUTE_KINDS',
     'Bash',
@@ -377,6 +382,7 @@ _WITHHELD: tuple[str, ...] = (
     'DangerRuleSpec',
     'Delegate',
     'Edit',
+    'Expected',
     'FROZEN_IMPLS',
     'Fork',
     'FrozenRole',
@@ -679,9 +685,11 @@ def test_every_exported_name_resolves():
 def test_kernel_exports_workspace_types_and_local_tools():
     from syndica.kernel.local_workspace import LocalWorkspace
     from syndica.kernel.tools.local import local_tools
-    from syndica.kernel.workspace import ExecResult, Portal, Workspace
+    from syndica.kernel.workspace import ExecResult, FileStat, Portal, Workspace, WriteConflict
 
     assert kernel.ExecResult is ExecResult
+    assert kernel.FileStat is FileStat
+    assert kernel.WriteConflict is WriteConflict
     assert kernel.LocalWorkspace is LocalWorkspace
     assert kernel.Portal is Portal
     assert kernel.Workspace is Workspace

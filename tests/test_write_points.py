@@ -58,8 +58,8 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
         'os.fdopen',
         'subprocess stderr',
         'subprocess stdout',
-        'write_text',
-        'write_text',
+        'write_bytes',
+        'write_bytes',
     ),
     # `write_all` 里那一处把短写接着写完的 `os.write`：写进去的内容在调用 `write_all` 的地方按内容
     # 看，或者由 `write_redacted` 在运行时查过类型。

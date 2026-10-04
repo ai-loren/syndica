@@ -13,7 +13,11 @@ from typing import Any
 import pytest
 
 from syndica.kernel.errors import ConfigError
-from syndica.kernel.local_workspace import LocalWorkspace
+from syndica.kernel.local_workspace import (
+    LocalWorkspace,
+    _Capture,  # pyright: ignore[reportPrivateUsage]
+    _complete_utf8,  # pyright: ignore[reportPrivateUsage]
+)
 from syndica.kernel.workspace import ExecResult
 
 
@@ -153,7 +157,7 @@ def exec_root(tmp_path: Path) -> Path:
     return root
 
 
-def test_exec_result_only_appends_timed_out_and_defaults_it_to_false() -> None:
+def test_exec_result_only_appends_fields_and_defaults_them() -> None:
     assert [field.name for field in dataclasses.fields(ExecResult)] == [
         'exit_code',
         'stdout',
@@ -161,9 +165,11 @@ def test_exec_result_only_appends_timed_out_and_defaults_it_to_false() -> None:
         'truncated',
         'running',
         'timed_out',
+        'stdout_end',
+        'stderr_end',
     ]
     legacy = ExecResult(exit_code=0, stdout='', stderr='', truncated=False, running=False)
-    assert legacy.timed_out is False
+    assert (legacy.timed_out, legacy.stdout_end, legacy.stderr_end) == (False, 0, 0)
 
 
 async def test_a_command_reading_stdin_gets_eof_at_once_even_when_the_host_stdin_stays_open(
@@ -236,6 +242,8 @@ async def test_a_timeout_returns_the_partial_output_instead_of_raising(
         truncated=False,
         running=False,
         timed_out=True,
+        stdout_end=len(b'before'),
+        stderr_end=len(b'warn'),
     )
 
 
@@ -454,6 +462,82 @@ async def test_a_stream_past_the_capture_budget_keeps_its_head_and_tail(
         assert result.stdout.startswith('H' * 10 + '\n…[')
         assert result.stdout.endswith(']…\n' + 'T' * 40)
         assert '150 个字节' in result.stdout
+
+
+@pytest.mark.parametrize(
+    ('since', 'shown', 'truncated'),
+    [
+        (4, 'H' * 6 + '\n…[内核丢弃了这条流中间 150 个字节', True),
+        (60, '\n…[内核丢弃了这条流中间 100 个字节', True),
+        (175, 'T' * 25, False),
+        (200, '', False),
+    ],
+    ids=['from_the_head', 'from_the_dropped_middle', 'from_the_tail', 'from_the_end'],
+)
+def test_reading_since_an_offset_counts_the_dropped_middle_in_the_offsets(
+    monkeypatch: pytest.MonkeyPatch, since: int, shown: str, truncated: bool
+) -> None:
+    monkeypatch.setattr('syndica.kernel.local_workspace._CAPTURE_HEAD', 10)
+    monkeypatch.setattr('syndica.kernel.local_workspace._CAPTURE_TAIL', 40)
+    capture = _Capture()
+    capture.extend(b'H' * 10 + b'm' * 150 + b'T' * 40)
+
+    text, dropped, end = capture.rendered(since, settled=True)
+
+    assert text.startswith(shown) if shown else text == ''
+    assert (dropped, end) == (truncated, 200)
+    if since < 160:
+        assert text.endswith(']…\n' + 'T' * 40)
+
+
+@pytest.mark.parametrize(
+    ('data', 'complete'),
+    [
+        (b'ab', 2),
+        ('aé'.encode(), 3),
+        ('aé'.encode()[:2], 1),
+        ('a中'.encode()[:3], 1),
+        ('a😀'.encode()[:4], 1),
+        ('a😀'.encode(), 5),
+        (b'', 0),
+    ],
+    ids=[
+        'ascii',
+        'two_byte_whole',
+        'two_byte_cut',
+        'three_byte_cut',
+        'four_byte_cut',
+        'four_byte',
+        'empty',
+    ],
+)
+def test_a_running_stream_holds_back_a_character_cut_in_half(data: bytes, complete: int) -> None:
+    assert _complete_utf8(data) == complete
+
+
+async def test_a_running_command_hands_over_a_split_character_whole_on_the_next_poll(
+    exec_root: Path, shell_path: str
+) -> None:
+    workspace = LocalWorkspace(str(exec_root), shell=shell_path, env={})
+    handle = await workspace.start(
+        "printf 'a\\344\\270'; while [ ! -f go ]; do sleep 0.02; done; printf '\\255b'", cwd='.'
+    )
+    first = await workspace.poll(handle)
+    for _ in range(250):
+        if first.stdout == 'a':
+            break
+        await asyncio.sleep(0.02)
+        first = await workspace.poll(handle)
+    (exec_root / 'go').write_text('')
+    for _ in range(250):
+        if not (await workspace.poll(handle)).running:
+            break
+        await asyncio.sleep(0.02)
+    rest = await workspace.poll(handle, since=(first.stdout_end, first.stderr_end))
+    await workspace.close()
+
+    assert (first.stdout, first.stdout_end) == ('a', 1)
+    assert rest.stdout == '中b'
 
 
 async def test_running_out_of_descriptors_is_a_config_error_without_leaking_the_first_pipe(

@@ -141,7 +141,7 @@ from syndica.kernel.waiting import (
     WaitResult,
     WaitState,
 )
-from syndica.kernel.workspace import ExecResult, Portal, Workspace
+from syndica.kernel.workspace import ExecResult, FileStat, Portal, Workspace, WriteConflict
 
 __all__ = [
     'AgentCatalog',
@@ -184,6 +184,7 @@ __all__ = [
     'ExecResult',
     'ExitMode',
     'ExtensionJunction',
+    'FileStat',
     'FileTraceStore',
     'Finding',
     'FlagDeclaration',
@@ -264,6 +265,7 @@ __all__ = [
     'WaitState',
     'Waiter',
     'Workspace',
+    'WriteConflict',
     'encode_redacted',
     'flag_reference',
     'local_tools',
