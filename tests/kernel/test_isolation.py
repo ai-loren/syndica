@@ -585,3 +585,301 @@ async def test_delegate_refuses_an_isolation_it_cannot_give_and_says_what_to_do(
         await runtime.shutdown()
 
     assert anchor in str(refused.output)
+
+
+async def test_a_case_only_rename_in_the_copy_is_a_conflict_and_deletes_nothing(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    copy = router.isolate('alpha', 'snapshot')
+    assert copy is not None
+    os.rename(copy.location / 'notes.md', copy.location / 'NOTES.md')
+
+    report = await router.merge_isolated('alpha')
+
+    assert {conflict.path.casefold() for conflict in report.conflicts} == {'notes.md'}
+    assert report.merged == ()
+    assert (root / 'notes.md').read_text() == 'one\ntwo\nthree\n'
+
+
+async def test_calls_from_an_agent_whose_copy_is_merging_are_refused(
+    router: WorkspaceRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router.isolate('alpha', 'snapshot')
+    await _as('alpha', lambda: router.write_text('fresh.md', 'from alpha'))
+    refusals: list[str] = []
+    isolator = router._isolator  # pyright: ignore[reportPrivateUsage]
+    assert isolator is not None
+    real_merge = isolator.merge
+
+    async def merge_with_a_late_write(*args: Any, **kwargs: Any) -> Any:
+        try:
+            await _as('alpha', lambda: router.write_text('late.md', 'too late'))
+        except ConfigError as exc:
+            refusals.append(exc.received)
+        return await real_merge(*args, **kwargs)
+
+    monkeypatch.setattr(isolator, 'merge', merge_with_a_late_write)
+    report = await router.merge_isolated('alpha')
+
+    assert report.merged == ('fresh.md',)
+    assert len(refusals) == 1 and '正在合并' in refusals[0]
+
+
+async def test_a_change_landing_in_the_copy_after_the_snapshot_is_reported_as_lost(
+    router: WorkspaceRouter, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy = router.isolate('alpha', 'snapshot')
+    assert copy is not None
+    (copy.location / 'fresh.md').write_text('merged')
+    isolator = router._isolator  # pyright: ignore[reportPrivateUsage]
+    assert isolator is not None
+    real_apply = isolator._apply  # pyright: ignore[reportPrivateUsage]
+
+    async def apply_then_something_writes(*args: Any, **kwargs: Any) -> Any:
+        await real_apply(*args, **kwargs)
+        (copy.location / 'stray.md').write_text('written by an escaped process')
+
+    monkeypatch.setattr(isolator, '_apply', apply_then_something_writes)
+    with caplog.at_level(logging.WARNING, logger='syndica.kernel.workspace_router'):
+        await router.merge_isolated('alpha')
+
+    [record] = caplog.records
+    assert record.args == ('alpha', 1, ['stray.md'])
+
+
+async def test_a_taken_side_file_name_moves_to_the_next_one_and_keeps_the_old_file(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    router.isolate('alpha', 'snapshot')
+    await _as('alpha', lambda: router.read_text('notes.md', offset=1, limit=9))
+    await _as('alpha', lambda: router.write_text('notes.md', 'child\n'))
+    (root / 'notes.md').write_text('parent\n')
+    (root / 'notes.md.alpha.theirs').write_text('left over\n')
+
+    report = await router.merge_isolated('alpha')
+
+    [conflict] = report.conflicts
+    assert conflict.theirs == 'notes.md.alpha.2.theirs'
+    assert (root / 'notes.md.alpha.2.theirs').read_text() == 'child\n'
+    assert (root / 'notes.md.alpha.theirs').read_text() == 'left over\n'
+
+
+async def test_a_conflict_whose_child_version_cannot_be_saved_keeps_the_copy(
+    router: WorkspaceRouter, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy = router.isolate('alpha', 'snapshot')
+    assert copy is not None
+    await _as('alpha', lambda: router.read_text('notes.md', offset=1, limit=9))
+    await _as('alpha', lambda: router.write_text('notes.md', 'child\n'))
+    (root / 'notes.md').write_text('parent\n')
+    monkeypatch.setattr(isolation_module, '_SIDE_ATTEMPTS', 1)
+    (root / 'notes.md.alpha.theirs').write_text('left over\n')
+
+    report = await router.merge_isolated('alpha')
+
+    assert report.kept == str(copy.location)
+    assert (copy.location / 'notes.md').read_text() == 'child\n'
+    assert router.isolated('alpha') is copy
+    assert '副本留在' in report.summary()
+
+
+async def test_a_path_that_cannot_be_written_back_is_a_conflict_and_the_rest_still_merge(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    copy = router.isolate('alpha', 'snapshot')
+    assert copy is not None
+    shutil.rmtree(copy.location / 'src')
+    (copy.location / 'src').write_text('now a file\n')
+    (copy.location / 'aa.md').write_text('a')
+    (copy.location / 'zz.md').write_text('z')
+
+    report = await router.merge_isolated('alpha')
+
+    assert report.merged == ('aa.md', 'src/app.py', 'zz.md')
+    [conflict] = report.conflicts
+    assert (conflict.path, conflict.theirs) == ('src', 'src.alpha.theirs')
+    assert (root / 'src.alpha.theirs').read_text() == 'now a file\n'
+    assert (root / 'zz.md').read_text() == 'z'
+
+
+def test_a_git_file_is_not_copied_like_a_git_directory(root: Path, tmp_path: Path) -> None:
+    (root / 'sub').mkdir()
+    (root / 'sub' / '.git').write_text('gitdir: ../.git/modules/sub\n')
+
+    copy = _isolator(tmp_path, git=None).isolate(root, 'alpha', 'snapshot')
+
+    assert 'sub/.git' not in copy.base
+
+
+def test_the_copy_keeps_executable_bits(root: Path, tmp_path: Path) -> None:
+    (root / 'run.sh').write_text('#!/bin/sh\necho ok\n')
+    os.chmod(root / 'run.sh', 0o755)
+
+    copy = _isolator(tmp_path, git=None).isolate(root, 'alpha', 'snapshot')
+
+    assert os.stat(copy.location / 'run.sh').st_mode & 0o777 == 0o755
+
+
+def test_a_failed_copy_leaves_nothing_behind(
+    root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = Path.read_bytes
+
+    def failing(self: Path) -> bytes:
+        if self.name == 'app.py':
+            raise PermissionError('denied')
+        return real(self)
+
+    monkeypatch.setattr(Path, 'read_bytes', failing)
+    with pytest.raises(PermissionError):
+        _isolator(tmp_path).isolate(root, 'alpha', 'worktree')
+
+    monkeypatch.setattr(Path, 'read_bytes', real)
+    assert sorted(path.name for path in (root / '.syndica').rglob('*')) in ([], ['worktrees'])
+
+
+def test_isolating_an_id_again_does_not_stack_on_a_stale_copy(root: Path, tmp_path: Path) -> None:
+    stale = root / '.syndica' / 'snapshots' / 'alpha'
+    stale.mkdir(parents=True)
+    (stale / 'leftover.md').write_text('from an earlier run')
+
+    copy = _isolator(tmp_path, git=None).isolate(root, 'alpha', 'snapshot')
+
+    assert not (copy.location / 'leftover.md').exists()
+    assert copy.changed() == []
+
+
+async def test_a_shared_child_of_an_isolated_agent_works_in_its_parents_copy(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    copy = router.isolate('parent', 'snapshot')
+    assert copy is not None
+    router.adopt('child', 'parent')
+
+    await _as('child', lambda: router.write_text('by-child.md', 'x'))
+
+    assert (copy.location / 'by-child.md').exists()
+    assert not (root / 'by-child.md').exists()
+
+
+async def test_a_nested_copy_is_taken_from_and_merged_into_the_parents_copy(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    outer = router.isolate('parent', 'snapshot')
+    assert outer is not None
+    await _as('parent', lambda: router.write_text('parent-only.md', 'p'))
+    router.adopt('child', 'parent')
+    inner = router.isolate('child', 'snapshot')
+    assert inner is not None
+
+    await _as('child', lambda: router.write_text('child-only.md', 'c'))
+    await router.merge_isolated('child')
+
+    assert 'parent-only.md' in inner.base
+    assert (outer.location / 'child-only.md').read_text() == 'c'
+    assert not (root / 'child-only.md').exists()
+
+
+@pytest.mark.parametrize('status', ['paused', 'waiting', 'aborting'])
+async def test_merging_an_agent_that_is_mid_run_in_any_form_is_refused(
+    router: WorkspaceRouter, status: str
+) -> None:
+    from syndica.kernel.agent_types import AgentStatus
+
+    runtime = Runtime(workspace=router)
+    try:
+        agent_id = await runtime.spawn(
+            _writer(router, 'out.md', 'x'), query='go', isolation='snapshot'
+        )
+        await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+        moved = await runtime.registry.compare_and_set_status(
+            agent_id, expected=AgentStatus.ZOMBIE, new=AgentStatus(status)
+        )
+        assert moved
+
+        with pytest.raises(ConfigError) as refused:
+            await runtime.merge_isolated(agent_id)
+    finally:
+        await runtime.shutdown()
+
+    assert status in refused.value.received
+    assert 'pause' not in refused.value.next_action
+
+
+async def test_spawn_rolls_back_when_the_copy_cannot_be_made(
+    router: WorkspaceRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = Runtime(workspace=router)
+    try:
+        parent = await runtime.spawn(_idle(router), query='go')
+        await asyncio.wait_for(runtime.wait(parent), timeout=_TIMEOUT)
+        monkeypatch.setattr(isolation_module, '_MAX_FILES', 0)
+        with pytest.raises(ConfigError):
+            await runtime.spawn(
+                _writer(router, 'out.md', 'x'),
+                query='go',
+                isolation='snapshot',
+                parent_id=parent,
+            )
+        listed = [info.agent_id for info in await runtime.registry.list()]
+    finally:
+        await runtime.shutdown()
+
+    assert listed == [parent]
+    assert list(router._parents) == []  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_a_process_running_in_the_copy_is_stopped_before_the_merge_reads_it(
+    router: WorkspaceRouter,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copy = router.isolate('alpha', 'snapshot')
+    assert copy is not None
+    (copy.location / 'fresh.md').write_text('merged')
+    await _as(
+        'alpha', lambda: router.start('while :; do echo x >> ticker; sleep 0.01; done', cwd='.')
+    )
+    for _ in range(100):
+        if (copy.location / 'ticker').exists():
+            break
+        await asyncio.sleep(0.02)
+    isolator = router._isolator  # pyright: ignore[reportPrivateUsage]
+    assert isolator is not None
+    real_apply = isolator._apply  # pyright: ignore[reportPrivateUsage]
+
+    async def slow_apply(*args: Any, **kwargs: Any) -> Any:
+        await real_apply(*args, **kwargs)
+        await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(isolator, '_apply', slow_apply)
+    with caplog.at_level(logging.WARNING, logger='syndica.kernel.workspace_router'):
+        await router.merge_isolated('alpha')
+
+    assert caplog.records == []
+
+
+async def test_the_three_way_write_back_keeps_its_precondition_across_the_merge(
+    root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scratch = tmp_path / 'scratch'
+    scratch.mkdir()
+    isolator = LocalIsolator(shell='/bin/sh', env={}, git='/usr/bin/false', scratch=str(scratch))
+    local = LocalWorkspace(str(root), shell='/bin/sh', env={})
+    copy = isolator.isolate(root, 'alpha', 'worktree')
+    (copy.location / 'notes.md').write_text('ONE\ntwo\nthree\n')
+    (root / 'notes.md').write_text('one\ntwo\nTHREE\n')
+
+    async def merge_while_the_parent_changes(*_: bytes) -> bytes:
+        (root / 'notes.md').write_text('changed during the merge\n')
+        return b'ONE\ntwo\nTHREE\n'
+
+    monkeypatch.setattr(isolator, '_merge_file', merge_while_the_parent_changes)
+    try:
+        report = await isolator.merge(copy, local, lambda *_: None)
+    finally:
+        await copy.discard()
+        await local.close()
+
+    assert [conflict.path for conflict in report.conflicts] == ['notes.md']
+    assert (root / 'notes.md').read_text() == 'changed during the merge\n'

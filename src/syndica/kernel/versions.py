@@ -87,6 +87,20 @@ class VersionStore:
             return None
         stored, redacted = self._redacted(data)
         blob = self._write_object('blob', stored)
+        head = self._head()
+        if (
+            not redacted
+            and head is not None
+            and self._blob_at(self._read_commit(head).tree, relative) == blob
+        ):
+            return VersionEntry(
+                path=relative,
+                version=_version(data),
+                producer=producer,
+                redacted=False,
+                removed=False,
+                commit=head,
+            )
         mark = _REDACTED_MARK if redacted else ''
         commit = self._commit(relative, blob, producer=producer, mark=mark)
         return VersionEntry(
@@ -127,7 +141,11 @@ class VersionStore:
                 if commit.parent is None
                 else self._blob_at(self._read_commit(commit.parent).tree, relative)
             )
-            if blob != before:
+            # 每次提交只动一个路径，消息第一行写着它：两份原文不同、脱敏后存成同样字节的改动，
+            # 按 blob 比看不出来，按提交认得出来。
+            touched = commit.message.split('\n', 1)[0].partition(' ')[2] == relative
+            redacted = commit.message.rstrip('\n').endswith(_REDACTED_MARK)
+            if blob != before or (touched and redacted):
                 entries.append(self._entry(relative, cursor, commit, blob))
             cursor = commit.parent
         return entries
@@ -376,16 +394,35 @@ class _Lock:
         for _ in range(_LOCK_ATTEMPTS):
             try:
                 self._fd = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.write(self._fd, str(os.getpid()).encode('ascii'))
                 return
             except FileExistsError:
+                if self._abandoned():
+                    self._path.unlink(missing_ok=True)
+                    continue
                 time.sleep(_LOCK_PAUSE)
         raise ConfigError(
             expected='版本层的引用锁在一秒内放开',
             received=f'{self._path} 一直在',
             next_action=(
-                '另一个进程正在记版本；没有别的 syndica 在跑时，它是上次崩溃留下的，删掉它再试'
+                '另一个进程正在记版本；没有别的 syndica 在跑时，它是一个读不出进程号的残留锁，'
+                '删掉它再试'
             ),
         )
+
+    def _abandoned(self) -> bool:
+        """锁里记的进程已经不在了（崩溃留下的锁）。读不出进程号时不算：可能正在写。"""
+        try:
+            pid = int(self._path.read_text(encoding='ascii').strip())
+        except (OSError, ValueError):
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        return False
 
     def __exit__(self, *_: object) -> None:
         if self._fd is not None:

@@ -1095,15 +1095,16 @@ class Runtime:
         return self._workspace
 
     async def merge_isolated(self, agent_id: str) -> MergeReport:
-        """把一个隔离起来的 Agent 的副本逐文件合并回共享工作区并删掉副本（spec §6.4）。它正在跑
-        时拒绝：合并读的是副本此刻的样子，它还在写就会合进去半份。"""
+        """把一个隔离起来的 Agent 的副本逐文件合并回它拷出来的那个工作区并删掉副本（spec §6.4）。
+        只在它这次工作已经结束（IDLE / ZOMBIE）时合并：暂停、等待、收尾中的 Agent 还在一个周期
+        里，合并之后它余下的写会直接落进共享工作区。合并期间它被叫醒也写不进副本（路由拒绝）。"""
         router = self._isolating_router('merge_isolated')
         info = await self.registry.get(agent_id)
-        if info is not None and info.status is AgentStatus.RUNNING:
+        if info is not None and info.status not in (AgentStatus.IDLE, AgentStatus.ZOMBIE):
             raise ConfigError(
-                expected=f'合并时 agent {agent_id} 已经停下（IDLE / ZOMBIE）',
-                received='它正在跑',
-                next_action='用 wait_for 等它这次工作结束、或先 pause 它，再合并',
+                expected=f'合并时 agent {agent_id} 这次工作已经结束（IDLE / ZOMBIE）',
+                received=f'它此刻是 {info.status.value}',
+                next_action='用 wait_for 等它这次工作结束再合并；暂停它不算结束',
             )
         return await router.merge_isolated(agent_id)
 
@@ -1426,12 +1427,15 @@ class Runtime:
                 queue_attempted=True,
             )
             raise refusal
+        if self._workspace is not None:
+            self._workspace.adopt(agent_id, parent_id)
         if isolation != 'shared':
             assert self._workspace is not None
             # 同步建副本：最后一道守卫与 create_task 之间仍然没有挂起点。
             try:
                 isolated = self._workspace.isolate(agent_id, isolation)
             except BaseException:
+                await self._workspace.release(agent_id)
                 await self._rollback_unstarted_spawn(
                     agent_id,
                     agent,

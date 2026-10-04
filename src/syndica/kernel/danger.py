@@ -2127,6 +2127,9 @@ _GIT_ASSIGNMENT = re.compile(r'\AGIT_[A-Za-z0-9_]*\+?=')
 _GLOB = frozenset('*?[')
 # `.syndica` 下由宿主写、Agent 不该改的那几个子目录：版本层、trace、交接文件、两种隔离副本。
 _HOST_RECORDS = ('vcs', 'traces', 'handoffs', 'worktrees', 'snapshots')
+_BRACE = re.compile(r'\{([^{}]*,[^{}]*)\}')
+_BRACE_ROUNDS = 4
+_BRACE_VARIANTS = 64
 
 
 def _opens_files_with_a_command(arguments: Sequence[str]) -> bool:
@@ -2175,8 +2178,15 @@ def _names_git_dir(path: str) -> bool:
     `rm -rf *` 碰不到 `.git`。`.syndica` 下的其余子目录（`.syndica/tmp`）不算，它们留给命令用；
     判 `.syndica` 之前先按字面消掉 `..`，`.syndica/tmp/../vcs` 照样命中。
     """
-    if any(_may_name(part.casefold(), '.git') for part in path.split('/')):
+    variants = _brace_variants(path)
+    if any(
+        _may_name(part.casefold(), '.git') for variant in variants for part in variant.split('/')
+    ):
         return True
+    return any(_names_host_record(variant) for variant in variants)
+
+
+def _names_host_record(path: str) -> bool:
     parts = posixpath.normpath(path).split('/')
     for index, part in enumerate(parts):
         if not _may_name(part.casefold(), '.syndica'):
@@ -2184,7 +2194,35 @@ def _names_git_dir(path: str) -> bool:
         rest = parts[index + 1 :]
         if not rest or any(_may_name(rest[0].casefold(), name) for name in _HOST_RECORDS):
             return True
-    return False
+    # 先往上走、再进一个记录的名字：命令的 cwd 在 `.syndica/tmp` 或隔离副本（`.syndica/worktrees/
+    # <id>`）里时，`../vcs`、`../../vcs` 就是版本层。路径本身不带 `.syndica`，只能按形状认。
+    climbed = 0
+    while climbed < len(parts) and parts[climbed] == '..':
+        climbed += 1
+    return 0 < climbed < len(parts) and any(
+        _may_name(parts[climbed].casefold(), name) for name in _HOST_RECORDS
+    )
+
+
+def _brace_variants(path: str) -> list[str]:
+    """按 shell 的花括号展开把 `a/{b,c}` 展成 `a/b`、`a/c`（只展开带逗号、不嵌套的那种）。展开数
+    有上限，超出的部分原样保留——判定只会因此多判。"""
+    variants = [path]
+    for _ in range(_BRACE_ROUNDS):
+        expanded: list[str] = []
+        changed = False
+        for variant in variants:
+            match = _BRACE.search(variant)
+            if match is None:
+                expanded.append(variant)
+                continue
+            changed = True
+            head, tail = variant[: match.start()], variant[match.end() :]
+            expanded.extend(f'{head}{choice}{tail}' for choice in match.group(1).split(','))
+        variants = expanded[:_BRACE_VARIANTS]
+        if not changed:
+            break
+    return variants
 
 
 def _may_name(folded: str, name: str) -> bool:
@@ -2645,16 +2683,21 @@ def git_state_change_rule() -> DangerRule:
     也算）；任何实参、`=` 之后的值、紧贴短选项的取值（`-o.git/x`）或重定向目标里有一段是 `.git`，
     或指向 `.syndica` 本身与它下面宿主的记录（版本层 `vcs`、`traces`、`handoffs`、`worktrees`、
     `snapshots`）——版本层是 git 格式，另外几样是宿主的记录与隔离副本（不分大小写，含会展开出
-    它们的通配；`.syndica/tmp` 不算）。git 按命令词槽与启动器展开出来的程序找（`setsid git push`、
+    它们的通配与花括号；`.syndica/tmp` 不算）；先用 `..` 往上走、再进一个记录名字的路径
+    （`../vcs`、`../../vcs`：cwd 在 `.syndica/tmp` 或隔离副本里时它们就是版本层）。git 按命令词槽
+    与启动器展开出来的程序找（`setsid git push`、
     `uv run --with rich git push`、`{ git push; }`、双引号里的 `$(git push)`），转手执行的命令里
     同样找（`sh -c 'git push'`、`eval`、`xargs git add`、`find … -exec git add {} +`）。
 
     已知误报：`find . -path ./.git -prune` 这类只读引用 `.git` 的命令；只读集合之外的只读用法
     （`git branch`、`git stash list`、`git remote -v`、`git config --get`）；`echo GIT_DIR=x`；
     没有选项表、或有认不出的选项的 wrapper（`sudo`、`flock`）之后恰好写着 `git` 的普通实参；结束
-    标记不带引号、喂进管道或交给解释器的 heredoc 正文。
+    标记不带引号、喂进管道或交给解释器的 heredoc 正文；工作区里恰好叫 `vcs`、`traces`、`snapshots`
+    这类名字、又经 `..` 引用到的普通目录；只读地看 `.syndica` 里的记录（`cat`、`ls`、
+    `git --git-dir=.syndica/vcs log`）。
     已知盲区：`python -c "…"`、`make`、脚本文件里的 git；模块开头写明的那几类转手；变量
-    （`$GIT push`）；花括号展开（`{.git,x}`）；名单之外的启动器与 wrapper（`xcrun`、`pdm run`）。
+    （`$GIT push`）；嵌套或不带逗号的花括号；名单之外的启动器与 wrapper（`xcrun`、`pdm run`）；
+    隔离副本里经 `..` 写进兄弟副本（名字是 Agent 的 id，按形状认不出来，边界是沙箱化的后端）。
     反斜杠与 `$'…'` 转义按 shell 的规则消掉（`g\\it push`、`$'\\x67it' push` 都命中）。
     """
     return DangerRule(

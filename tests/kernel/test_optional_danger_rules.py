@@ -385,6 +385,10 @@ def test_a_neighbour_of_dot_git_is_not_dot_git(command: str):
         'rm -rf .syn*',
         'echo x > .syndica/tmp/../vcs/config',
         f'mv x {_ROOT}/.syndica/vcs/objects',
+        'rm -rf ../../vcs/objects',
+        'cd .syndica/tmp && rm -rf ../vcs',
+        'rm -rf .syndica/{vcs,traces}',
+        'rm -rf {.git,build}',
     ],
     ids=[
         'version_layer',
@@ -399,6 +403,10 @@ def test_a_neighbour_of_dot_git_is_not_dot_git(command: str):
         'glob_on_the_directory_name',
         'dot_dot_back_into_a_record',
         'absolute_path',
+        'climbing_out_of_an_isolated_copy',
+        'climbing_out_of_the_scratch_directory',
+        'brace_expansion_of_records',
+        'brace_expansion_of_dot_git',
     ],
 )
 def test_anything_that_reaches_into_the_host_records_changes_state(command: str):
@@ -414,6 +422,8 @@ def test_anything_that_reaches_into_the_host_records_changes_state(command: str)
         'cat syndica/vcs.md',
         'cat .syndica.yaml',
         'echo vcs > notes.txt',
+        'cat ../README.md',
+        'echo {a,b}.txt',
     ],
     ids=[
         'scratch_script',
@@ -422,6 +432,8 @@ def test_anything_that_reaches_into_the_host_records_changes_state(command: str)
         'neighbour_without_the_dot',
         'project_config_file',
         'record_name_as_plain_text',
+        'climbing_to_an_ordinary_file',
+        'brace_expansion_of_ordinary_names',
     ],
 )
 def test_the_scratch_directory_and_neighbours_of_the_host_records_stay_usable(command: str):

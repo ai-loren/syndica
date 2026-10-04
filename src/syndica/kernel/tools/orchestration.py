@@ -190,7 +190,16 @@ async def _collected(
     所以跟着结果的溯源结论走）。等待被打断时它可能还在写，不合并。"""
     outcome = await runtime._wait_in_turn(agent_id, child_id)  # pyright: ignore[reportPrivateUsage]
     if outcome.context is None:
-        return _interrupted(child_id, outcome.state)
+        interrupted = _interrupted(child_id, outcome.state)
+        if isolation == 'shared':
+            return interrupted
+        return replace(
+            interrupted,
+            output=(
+                f'{interrupted.output} 它的隔离副本还留着、没有合并：'
+                f'等它停下之后由宿主调 Runtime.merge_isolated({child_id!r}) 合并。'
+            ),
+        )
     result = _delivered(child_id, outcome.context)
     if isolation == 'shared':
         return result
@@ -207,7 +216,15 @@ async def _collected(
         'merged': list(report.merged),
         'conflicts': [conflict.path for conflict in report.conflicts],
     }
-    return replace(result, output=f'{result.output}\n\n{report.summary()}', meta=meta)
+    revived = (
+        ''
+        if report.kept
+        else (
+            f'\n再用 SendMessage 叫醒 {child_id} 时它直接改共享工作区、不再在副本里，'
+            '它的上下文里还写着「在副本里」：在消息里告诉它这一点；要隔离就重新 Delegate。'
+        )
+    )
+    return replace(result, output=f'{result.output}\n\n{report.summary()}{revived}', meta=meta)
 
 
 def _isolation_refused(isolation: str, runtime: Runtime) -> ToolResult | None:

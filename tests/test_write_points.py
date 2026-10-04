@@ -74,8 +74,9 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
         'write_bytes',
     ),
     # 版本层：对象是 zlib(头 + 正文)，正文与提交消息在同一个方法里先过了 Redactor（守卫看不穿
-    # 压缩）；两处 write_text 写的是引用：`HEAD` 的固定内容与一个提交号。
-    'kernel/versions.py': ('write_bytes', 'write_text', 'write_text'),
+    # 压缩）；两处 write_text 写的是引用：`HEAD` 的固定内容与一个提交号；os.write 往锁文件里写
+    # 本进程的进程号。
+    'kernel/versions.py': ('os.write', 'write_bytes', 'write_text', 'write_text'),
     # Agent 自己的终端：写进伪终端主端的是 Agent 经 Terminal 交下来的输入，子进程的输出接在从端上。
     'kernel/local_pty.py': ('os.write', 'subprocess stderr', 'subprocess stdout'),
     # `write_all` 里那一处把短写接着写完的 `os.write`：写进去的内容在调用 `write_all` 的地方按内容

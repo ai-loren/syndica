@@ -11,6 +11,7 @@ import hashlib
 import logging
 import posixpath
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import Protocol, cast
 
@@ -66,6 +67,11 @@ class WorkspaceRouter:
         self._versions = versions
         self._isolator = isolator
         self._copies: dict[str, IsolatedCopy] = {}
+        # 谁派生了谁：没有自己副本的 Agent 落在最近一个有副本的祖先那里，隔离于是可以嵌套。
+        self._parents: dict[str, str] = {}
+        # 每份副本是从哪个工作区拷的（根，或父的副本），合并就回到哪里。
+        self._bases: dict[str, Workspace] = {}
+        self._merging: set[str] = set()
         self._taint = taint
         self._copy_taints: dict[str, FileTaint] = {}
         # （工作区, 路径, 版本）→ 写下它的那次工具调用的 span：读到它时连一条 artifact 边。
@@ -141,16 +147,25 @@ class WorkspaceRouter:
                 received='它已经有一份',
                 next_action='先 merge_isolated 或 discard_isolated 那一份',
             )
-        copy = self._isolator.isolate(Path(self._root.root), agent_id, isolation)
+        base = self._workspace_of(self._parents.get(agent_id))
+        copy = self._isolator.isolate(Path(base.root), agent_id, isolation)
         self._copies[agent_id] = copy
+        self._bases[agent_id] = base
         self._assigned[agent_id] = copy.workspace
-        if self._taint is not None:
+        base_taint = self._taint_of(base)
+        if base_taint is not None:
             # 副本里的每个文件带着父那边此刻的可信度：从副本读到一份不可信的文件，仍是不可信的。
             copied = FileTaint(copy.location, baseline=False)
             for path, version in copy.base.items():
-                copied.wrote(path, version, self._taint.trust_of(path, version))
+                copied.wrote(path, version, base_taint.trust_of(path, version))
             self._copy_taints[agent_id] = copied
         return copy
+
+    def adopt(self, agent_id: str, parent_id: str | None) -> None:
+        """记下 `agent_id` 由 `parent_id` 派生：它没有自己的副本时，落在父（或更上面的祖先）的副本
+        里，而不是直接写共享工作区。"""
+        if parent_id is not None:
+            self._parents[agent_id] = parent_id
 
     def isolated(self, agent_id: str) -> IsolatedCopy | None:
         return self._copies.get(agent_id)
@@ -165,23 +180,43 @@ class WorkspaceRouter:
                 received='它没有（没隔离过，或已经合并、丢弃）',
                 next_action='只对用 isolation=worktree / snapshot 起来、还没合并的 Agent 合并',
             )
+        base = self._bases.get(agent_id, self._root)
+        base_taint = self._taint_of(base)
         copied = self._copy_taints.get(agent_id)
-        before = (
-            {}
-            if self._taint is None
-            else {path: self._taint.trust_of(path, None) for path in copy.changed()}
-        )
 
         def written(target: str, data: bytes | None, source: str, mixed: bool) -> None:
-            self._record(self._root, target, data, producer=agent_id)
-            if data is None or self._taint is None:
+            self._record(base, target, data, producer=agent_id)
+            if data is None or base_taint is None:
                 return
             trust = TrustLevel.UNTRUSTED if copied is None else copied.trust_of(source, None)
             if mixed:
                 trust = strictest_trust(trust, before.get(source, TrustLevel.UNTRUSTED))
-            self._taint.wrote(target, _version(data), trust)
+            base_taint.wrote(target, _version(data), trust)
 
-        report = await self._isolator.merge(copy, self._root.portal(), written)
+        # 合并期间这个 Agent（与落在它副本里的后代）的调用一律被拒，副本里的进程先关掉：合并读的
+        # 是副本此刻的样子，之后再落进副本的改动会随副本一起被删。
+        self._merging.add(agent_id)
+        try:
+            await copy.workspace.close()
+            before = (
+                {}
+                if base_taint is None
+                else {path: base_taint.trust_of(path, None) for path in copy.changed()}
+            )
+            report = await self._isolator.merge(copy, base.portal(), written)
+            late = copy.changed_since_merge()
+        finally:
+            self._merging.discard(agent_id)
+        if late:
+            logger.warning(
+                'agent %s 的隔离副本在合并开始之后又改了 %d 个文件，这些改动没有合并：%s',
+                agent_id,
+                len(late),
+                late,
+            )
+        if report.unsaved:
+            # 有冲突的文件子 Agent 那份没能另存：删掉副本就是丢掉它唯一的一份。
+            return replace(report, kept=str(copy.location))
         await self._drop_copy(agent_id, unmerged_ok=True)
         return report
 
@@ -190,8 +225,9 @@ class WorkspaceRouter:
         await self._drop_copy(agent_id, unmerged_ok=False)
 
     async def release(self, agent_id: str) -> None:
-        """Agent 不在了：丢掉它的副本，连同它在路由里记下的看过的版本。"""
+        """Agent 不在了：丢掉它的副本，连同它在路由里记下的看过的版本与父子关系。"""
         await self._drop_copy(agent_id, unmerged_ok=False)
+        self._parents.pop(agent_id, None)
         for key in [key for key in self._seen if key[0] == agent_id]:
             del self._seen[key]
 
@@ -199,6 +235,7 @@ class WorkspaceRouter:
         copy = self._copies.pop(agent_id, None)
         self._assigned.pop(agent_id, None)
         self._copy_taints.pop(agent_id, None)
+        self._bases.pop(agent_id, None)
         if copy is None:
             return
         self._writers = {
@@ -263,9 +300,24 @@ class WorkspaceRouter:
         return self
 
     def _target(self) -> Workspace:
-        agent = driving_agent()
-        assigned = None if agent is None else self._assigned.get(agent)
-        return self._root if assigned is None else assigned
+        return self._workspace_of(driving_agent())
+
+    def _workspace_of(self, agent: str | None) -> Workspace:
+        """沿父链找最近一个有副本的 Agent；都没有就是根。"""
+        visited: set[str] = set()
+        while agent is not None and agent not in visited:
+            visited.add(agent)
+            if agent in self._merging:
+                raise ConfigError(
+                    expected=f'agent {agent} 的隔离副本不在合并中',
+                    received='它正在合并回去，这期间副本里的读写一律被拒',
+                    next_action='等这次合并结束再试；合并之后改动直接落在它合并到的那个工作区',
+                )
+            assigned = self._assigned.get(agent)
+            if assigned is not None:
+                return assigned
+            agent = self._parents.get(agent)
+        return self._root
 
     def _key(self, workspace: Workspace, path: str) -> _Seen:
         raw = PurePosixPath(path)
@@ -302,10 +354,15 @@ class WorkspaceRouter:
         key = self._key(workspace, path)
         if expected is ANY:
             expected = await self._precondition(portal, path, key)
-        await write(portal, expected)
-        version = _version(data)
+        returned = cast(object, await write(portal, expected))
+        version = returned if isinstance(returned, str) else _version(data)
         self._seen[key] = version
-        self._record(workspace, path, data)
+        if version == _version(data):
+            self._record(workspace, path, data)
+        elif self._versions is not None and workspace is self._root:
+            # 后端写下的不是交给它的那几个字节（规范化了换行或编码）：记 `data` 会让版本层
+            # 与文件对不上。
+            logger.error('版本层没有记下 %s 的这次写：后端写下的内容与交给它的不同', path)
         self._wrote(workspace, path, version)
         return version
 

@@ -36,6 +36,7 @@ _SKIPPED = frozenset({'.git', '.syndica'})
 _MAX_FILES = 5000
 _MAX_BYTES = 200 * 1024 * 1024
 _MERGE_TIMEOUT = 30.0
+_SIDE_ATTEMPTS = 20
 
 Written = Callable[[str, bytes | None, str, bool], None]
 
@@ -45,6 +46,7 @@ class MergeConflict:
     path: str
     reason: str
     theirs: str | None = None
+    removed: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,9 +59,22 @@ class MergeReport:
     merged: tuple[str, ...]
     conflicts: tuple[MergeConflict, ...]
     note: str = ''
+    kept: str | None = None
+
+    @property
+    def unsaved(self) -> bool:
+        """有冲突的文件子 Agent 那份没能另存：这时副本不能删。"""
+        return any(conflict.theirs is None and not conflict.removed for conflict in self.conflicts)
 
     def summary(self) -> str:
-        lines = [f'隔离副本（{self.strategy}）已合并回共享工作区并删除。']
+        lines = (
+            [
+                f'隔离副本（{self.strategy}）合并了一部分；有的冲突文件没能另存，'
+                f'副本留在 {self.kept}。'
+            ]
+            if self.kept
+            else [f'隔离副本（{self.strategy}）已合并回共享工作区并删除。']
+        )
         if self.note:
             lines.append(self.note)
         lines.append(
@@ -97,6 +112,7 @@ class IsolatedCopy:
         self.base = base
         self.workspace = workspace
         self.note = note
+        self.merged_from: dict[str, str] | None = None
 
     def fact(self) -> str:
         """注入子 Agent 历史的环境事实（不进 System Prompt：它随 Agent 而变）。"""
@@ -111,10 +127,13 @@ class IsolatedCopy:
 
     def changed(self) -> list[str]:
         """相对基线改过（含新建、删除）的文件。"""
-        now = _versions_under(self.location)
-        return sorted(
-            path for path in set(self.base) | set(now) if now.get(path) != self.base.get(path)
-        )
+        return _differences(self.base, _versions_under(self.location))
+
+    def changed_since_merge(self) -> list[str]:
+        """合并取快照之后副本里又变了的文件；没合并过时是空的。"""
+        if self.merged_from is None:
+            return []
+        return _differences(self.merged_from, _versions_under(self.location))
 
     async def discard(self) -> None:
         await self.workspace.close()
@@ -170,16 +189,35 @@ class LocalIsolator:
         files = _working_files(root)
         location = root / '.syndica' / f'{strategy}s' / agent_id
         base_dir = location.with_name(f'{agent_id}.base') if strategy == 'worktree' else None
+        # 先在旁边建好再整个换进来：拷到一半失败时不留半份副本，同一个 id 再隔离一次时也不会
+        # 叠在旧副本上（旧副本里多出来的文件会被当成子 Agent 新建的合并回去）。
+        building = [
+            (folder, folder.with_name(f'.{folder.name}.building'))
+            for folder in (location, base_dir)
+            if folder is not None
+        ]
         base: dict[str, str] = {}
-        for relative in files:
-            data = (root / relative).read_bytes()
-            base[relative] = _version(data)
-            for folder in (location, base_dir):
-                if folder is not None:
-                    target = folder / relative
+        try:
+            for _, scratch in building:
+                shutil.rmtree(scratch, ignore_errors=True)
+                scratch.mkdir(parents=True)
+            for relative in files:
+                source = root / relative
+                data = source.read_bytes()
+                mode = source.stat().st_mode & 0o777
+                base[relative] = _version(data)
+                for _, scratch in building:
+                    target = scratch / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)
-        location.mkdir(parents=True, exist_ok=True)
+                    os.chmod(target, mode)
+            for folder, scratch in building:
+                shutil.rmtree(folder, ignore_errors=True)
+                os.replace(scratch, folder)
+        except BaseException:
+            for _, scratch in building:
+                shutil.rmtree(scratch, ignore_errors=True)
+            raise
         workspace = LocalWorkspace(str(location), shell=self._shell, env=self._env)
         return IsolatedCopy(
             agent_id=agent_id,
@@ -201,15 +239,23 @@ class LocalIsolator:
         父那边又被改过，这个文件就算冲突，不覆盖。每次写回之后调 `written(写到哪, 内容, 出自副本里
         的哪个文件, 是否混了父的内容)`；删除时内容是 None。"""
         now = _versions_under(copy.location)
+        copy.merged_from = now
         merged: list[str] = []
         conflicts: list[MergeConflict] = []
+        renamed = _case_renames(copy.base, now)
         for path in sorted(set(copy.base) | set(now)):
             base, child = copy.base.get(path), now.get(path)
             if child == base:
                 continue
-            current = await parent.stat(path)
-            ours = None if current is None else current.version
+            if path.casefold() in renamed:
+                # 只改了大小写的改名：大小写不敏感的文件系统上，新名字与旧名字是同一个文件，
+                # 当成「新建一个、删掉一个」会把唯一的那份删掉。
+                reason = '只改了大小写的改名，不自动合并'
+                conflicts.append(await self._kept(copy, parent, path, child, reason, written))
+                continue
             try:
+                current = await parent.stat(path)
+                ours = None if current is None else current.version
                 if ours == child:
                     merged.append(path)
                 elif ours == base:
@@ -227,6 +273,11 @@ class LocalIsolator:
                         )
             except WriteConflict:
                 reason = '合并期间共享工作区里的这个文件又被改过'
+                conflicts.append(await self._kept(copy, parent, path, child, reason, written))
+            except (ConfigError, OSError) as exc:
+                # 一个写不回去的路径（目录与文件互换、被拒的路径）不能让其余的文件跟着停下：
+                # 停在半路的合并再也合不完，每次重试都撞在同一处。
+                reason = f'写不回共享工作区（{_cause(exc)}）'
                 conflicts.append(await self._kept(copy, parent, path, child, reason, written))
         return MergeReport(
             agent_id=copy.agent_id,
@@ -289,15 +340,20 @@ class LocalIsolator:
         written: Written,
     ) -> MergeConflict:
         if child is None:
-            return MergeConflict(path=path, reason=f'{reason}；子 Agent 删掉了它')
-        side = f'{path}.{copy.agent_id[:8]}.theirs'
+            return MergeConflict(path=path, reason=f'{reason}；子 Agent 删掉了它', removed=True)
         data = (copy.location / path).read_bytes()
-        try:
-            await parent.write_bytes(side, data, expected=None)
-        except WriteConflict:
-            return MergeConflict(path=path, reason=f'{reason}；{side} 已存在，没有另存')
-        written(side, data, path, False)
-        return MergeConflict(path=path, reason=reason, theirs=side)
+        for attempt in range(1, _SIDE_ATTEMPTS + 1):
+            suffix = '' if attempt == 1 else f'.{attempt}'
+            side = f'{path}.{copy.agent_id}{suffix}.theirs'
+            try:
+                await parent.write_bytes(side, data, expected=None)
+            except WriteConflict:
+                continue
+            except (ConfigError, OSError) as exc:
+                return MergeConflict(path=path, reason=f'{reason}；另存失败（{_cause(exc)}）')
+            written(side, data, path, False)
+            return MergeConflict(path=path, reason=reason, theirs=side)
+        return MergeConflict(path=path, reason=f'{reason}；另存的名字都被占了')
 
     async def _merge_file(self, base: bytes, ours: bytes, theirs: bytes) -> bytes | None:
         """`git merge-file -p` 的结果；有冲突、不是文本或 git 失败时交回 None。"""
@@ -355,7 +411,7 @@ def _working_files(root: Path) -> list[str]:
         directories[:] = sorted(name for name in directories if name not in _SKIPPED)
         for name in sorted(names):
             path = Path(folder) / name
-            if path.is_symlink() or not path.is_file():
+            if name in _SKIPPED or path.is_symlink() or not path.is_file():
                 continue
             files.append(path.relative_to(root).as_posix())
             total += path.stat().st_size
@@ -369,6 +425,27 @@ def _working_files(root: Path) -> list[str]:
                     next_action='这件工作用 isolation=shared；或者把依赖与数据集挪出工作区',
                 )
     return files
+
+
+def _differences(before: Mapping[str, str], after: Mapping[str, str]) -> list[str]:
+    return sorted(path for path in set(before) | set(after) if after.get(path) != before.get(path))
+
+
+def _case_renames(base: Mapping[str, str], now: Mapping[str, str]) -> frozenset[str]:
+    """大小写折叠后撞在一起、且其中有一个是新建或删除的那些名字（折叠后的形式）。两个都一直在
+    的（大小写敏感的文件系统上真的是两个文件）照常各自合并。"""
+    spellings: dict[str, set[str]] = {}
+    for path in set(base) | set(now):
+        spellings.setdefault(path.casefold(), set()).add(path)
+    return frozenset(
+        folded
+        for folded, names in spellings.items()
+        if len(names) > 1 and any((name in base) != (name in now) for name in names)
+    )
+
+
+def _cause(exc: BaseException) -> str:
+    return exc.message if isinstance(exc, ConfigError) else f'{type(exc).__name__}: {exc}'
 
 
 def _versions_under(location: Path) -> dict[str, str]:

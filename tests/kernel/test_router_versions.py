@@ -7,7 +7,7 @@ import hashlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import pytest
 
@@ -182,3 +182,34 @@ async def test_an_unknown_extension_is_a_plain_file(router: WorkspaceRouter) -> 
         'file',
         'application/octet-stream',
     )
+
+
+class _Normalising(LocalWorkspace):
+    """把换行规范化之后再写的后端：写下的字节与交给它的不同。"""
+
+    async def write_text(self, path: str, content: str, **kwargs: Any) -> str:
+        return await super().write_text(path, content.replace('\r\n', '\n'), **kwargs)
+
+    async def edit_text(self, path: str, old: str, new: str, **kwargs: Any) -> str:
+        return await super().edit_text(path, old, new.replace('\r\n', '\n'), **kwargs)
+
+
+async def test_a_backend_that_writes_other_bytes_is_not_recorded_and_says_so(
+    tmp_path: Path, versions: VersionStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    local = _Normalising(str(tmp_path), shell='/bin/sh', env={})
+    router = WorkspaceRouter(local, versions=versions)
+    try:
+        with caplog.at_level(logging.ERROR, logger='syndica.kernel.workspace_router'):
+            written = await router.write_text('crlf.txt', 'a\r\nb\r\n')
+            await router.read_text('crlf.txt', offset=1, limit=5)
+            await router.edit_text('crlf.txt', 'b', 'c\r\nd')
+    finally:
+        await local.close()
+
+    assert written == _digest(b'a\nb\n')
+    assert versions.history('crlf.txt') == []
+    assert [record.args[0] for record in caplog.records if isinstance(record.args, tuple)] == [
+        'crlf.txt',
+        'crlf.txt',
+    ]

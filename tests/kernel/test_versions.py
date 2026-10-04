@@ -276,3 +276,51 @@ def test_git_reads_the_store_as_an_ordinary_repository(store: VersionStore, tmp_
         'bravo b.txt',
         'alpha docs/a.md',
     ]
+
+
+def test_tree_entries_follow_gits_order_with_directories_sorting_as_name_slash(
+    store: VersionStore,
+) -> None:
+    for path in ('a0', 'a/z.txt', 'a.txt', 'a-b'):
+        store.record(path, path.encode(), producer='alpha')
+
+    head = store._head()  # pyright: ignore[reportPrivateUsage]
+    assert head is not None
+    tree = store._read_commit(head).tree  # pyright: ignore[reportPrivateUsage]
+
+    assert list(store._read_tree(tree)) == ['a-b', 'a.txt', 'a', 'a0']  # pyright: ignore[reportPrivateUsage]
+
+
+def test_removing_the_last_file_of_a_directory_prunes_the_empty_trees(store: VersionStore) -> None:
+    store.record('top.md', b'top', producer='alpha')
+    store.record('b/d/e.txt', b'e', producer='alpha')
+    store.record_removal('b/d/e.txt', producer='alpha')
+
+    head = store._head()  # pyright: ignore[reportPrivateUsage]
+    assert head is not None
+    tree = store._read_commit(head).tree  # pyright: ignore[reportPrivateUsage]
+
+    assert list(store._read_tree(tree)) == ['top.md']  # pyright: ignore[reportPrivateUsage]
+
+
+def test_two_secrets_that_redact_to_the_same_bytes_are_still_two_history_entries(
+    tmp_path: Path,
+) -> None:
+    redacting = VersionStore(tmp_path, redactor=RuleRedactor(secrets=[_SECRET, 'quiz-other-7']))
+    redacting.record('cfg.env', f'key={_SECRET}\n'.encode(), producer='alpha')
+    redacting.record('cfg.env', b'key=quiz-other-7\n', producer='bravo')
+
+    assert [entry.producer for entry in redacting.history('cfg.env')] == ['bravo', 'alpha']
+
+
+def test_a_lock_left_by_a_process_that_is_gone_is_reclaimed(store: VersionStore) -> None:
+    gone = subprocess.Popen(['/bin/sh', '-c', 'exit 0'])
+    gone.wait()
+    lock = store.location / 'refs' / 'heads' / 'syndica.lock'
+    lock.parent.mkdir(parents=True)
+    lock.write_text(str(gone.pid))
+
+    entry = store.record('notes.md', b'x', producer='alpha')
+
+    assert entry is not None
+    assert not lock.exists()
