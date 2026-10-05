@@ -149,6 +149,12 @@ from syndica.kernel.events import (
     EventBus,
     _why_copying_failed,  # pyright: ignore[reportPrivateUsage]
 )
+from syndica.kernel.history_blocks import (
+    IDEMPOTENCY_KEY,
+    HistoryKind,
+    has_block,
+    signed_block,
+)
 from syndica.kernel.hooks import HooksCenter, Junction
 from syndica.kernel.hooks.installing import (
     Installer,
@@ -2306,7 +2312,7 @@ class Runtime:
             )
 
     async def ensure_active(self, agent_id: str) -> bool:
-        """唯一的激活入口：复活 ZOMBIE、重开事件循环（spec §4.2）。
+        """唯一的激活入口：复活 ZOMBIE、重开事件循环、从落盘会话恢复（spec §4.2）。
 
         复活、重开、从落盘会话恢复、恢复子会话在语义上是同一件事，不该暴露成四个方法让用户猜。
 
@@ -2315,11 +2321,20 @@ class Runtime:
         实例、它正在收尾、状态转换被拒。注册表里没有它不记——那与 `find` 答 None 是同一个正常
         答案，而且「这个 Agent 不归我」正是回调链上设计好的一支，记下来只会让每一次转手都报错。
         """
+        return await self._ensure_active(agent_id, resume_from_store=True)
+
+    async def _ensure_active(self, agent_id: str, *, resume_from_store: bool) -> bool:
+        """`ensure_active` 的内核：`resume_from_store` 决定注册表里没有它时要不要从落盘会话恢复。
+
+        显式 `ensure_active`（恢复入口）为真；`_on_missing_queue`（send 懒激活）为假——一条发给只剩
+        落盘会话的 id 的散落消息不该把整份会话重建起来，恢复是 CLI 显式发起的动作。于是 send 那条路
+        对只在磁盘上的会话一次 store 都不碰（Resume contract）。
+        """
         if self._closed:
             return False
         info = await self.registry.get(agent_id)
         if info is None:
-            return False
+            return await self._resume_from_store(agent_id) if resume_from_store else False
         slot = self._slots.get(agent_id)
         agent = self._table.get(agent_id)
         if slot is None or agent is None:
@@ -2377,6 +2392,82 @@ class Runtime:
         self._table.set_task(agent_id, revived)
         return True
 
+    async def _resume_from_store(self, sid: str) -> bool:
+        """落盘会话恢复（spec §4.2 / §15）：Agent 不在注册表、而 SessionStore 里有它时，从记录重建。
+
+        复用 spawn 的全部装配 / 回滚 / 并发收口——工厂包一层把 id 定成 sid（Agent 的 id 取自
+        `assigning_agent_id`，spawn 以 `agent.agent_id` 为准），构造时种回轨迹与 turn 计数。按
+        `SessionMeta.agent` 从已登记的角色工厂解析，缺了给三件套错误。安全相关 flags 用当前模块值、
+        不采信快照（P22）；model / tools 与快照不一致记 warning、按当前值续跑（接受一次缓存失配）。
+        """
+        store = self._sessions
+        if store is None or not await store.exists(sid):
+            return False
+        record = await store.load(sid)
+        if record is None:
+            return False
+        factory = self._agents.get(record.meta.agent)
+        if factory is None:
+            logger.error(
+                '期望: 恢复会话 %s 时角色 %r 在已登记的角色工厂里。'
+                ' 实际: 这个 Runtime 没登记这个角色——它由另一套配置写下，或角色被改名 / 删掉。'
+                ' 下一步: 用 Runtime(agents=...) 或 assemble 登记同名角色再恢复。',
+                sid,
+                record.meta.agent,
+            )
+            return False
+        # 整份轨迹的溯源在截断之前取：末尾未配对的批次被 `_forkable_prefix` 截掉时可能连那份轨迹里
+        # 唯一的不可信标记一起截掉，于是把溯源结论挂到 resume_note 上，恢复后 provenance 不被洗白。
+        full = Context()
+        for block in record.content:
+            full.append(block)
+        carried = provenance_of(full)
+        seeded = _forkable_prefix(record.content)
+        note = signed_block(
+            HistoryKind.RESUME_NOTE,
+            '（恢复）从落盘会话续跑：上一段进程里的子 Agent 已随进程结束失效，'
+            '别再向它们的 id 发消息。',
+            key=f'resume:{sid}:{record.meta.turns}',
+            trust=carried,
+        )
+        turn = record.meta.turns
+
+        def resume_factory(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+            token = assigning_agent_id(sid)
+            try:
+                agent = factory(hooks, events)
+            finally:
+                releasing_agent_id(token)
+            for block in seeded:
+                agent.context.append(block)
+            if not has_block(agent.context.current_traj, note.extra[IDEMPOTENCY_KEY]):
+                agent.context.append(note)
+            agent._current_turn = turn  # pyright: ignore[reportPrivateUsage]
+            return agent
+
+        resumed_id = await self.spawn(resume_factory, exit_mode=ExitMode.IDLE)
+        await self.registry.update(resumed_id, session_id=sid)
+        self._warn_on_prefix_drift(resumed_id, record)
+        return True
+
+    def _warn_on_prefix_drift(self, agent_id: str, record: SessionRecord) -> None:
+        """恢复按当前角色配置续跑；model / tools 与快照（为缓存连续性而存）不一致时记一条 warning。
+        不比 SP：快照里的 SP 已脱敏，与活的 SP 无法逐字比。"""
+        agent = self._table.get(agent_id)
+        if agent is None:
+            return
+        drift: list[str] = []
+        if agent.options.llm.config.model != record.model:
+            drift.append(f'model {record.model!r} -> {agent.options.llm.config.model!r}')
+        if list(agent.options.tools) != record.tools:
+            drift.append(f'tools {record.tools} -> {list(agent.options.tools)}')
+        if drift:
+            logger.warning(
+                '会话 %s 恢复：前缀快照与当前角色配置不一致（%s）；'
+                '按当前值续跑，这次恢复缓存不命中。',                agent_id,
+                '; '.join(drift),
+            )
+
     def _has_live_driver(self, agent_id: str) -> bool:
         task = self._table.get_task(agent_id)
         return task is not None and not task.done()
@@ -2392,7 +2483,7 @@ class Runtime:
             return False
         if self._has_live_driver(agent_id):
             return False
-        return await self.ensure_active(agent_id)
+        return await self._ensure_active(agent_id, resume_from_store=False)
 
     async def pause(self, agent_id: str, *, recursive: bool = False) -> None:
         """挂起：让它在下一个轮的边界上停下来（spec §5.1 第 2 步），注册表转成 PAUSED。
