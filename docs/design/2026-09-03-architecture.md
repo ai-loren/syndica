@@ -486,6 +486,7 @@ class HookResult:
 | 工具确认 | `tool_confirmation_required` | — |
 | LLM | `pre_llm_request` `post_llm_response` `context_overflow` `llm_failure` | 是 |
 | 消息 | `message_injected` | — |
+| 产物 | `artifact_registered`（产物登记 / 变更后由内核触发，L1 验收挂它，§7.4 / §7.5） | — |
 | 背景工具 | `background_tool_completed` `tool_moved_to_background` | — |
 
 `runtime_start` 不进入内核切点：`Runtime.__init__` 是同步构造，当前没有可等待 hook 的启动阶段。

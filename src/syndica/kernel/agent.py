@@ -108,6 +108,7 @@ from syndica.kernel.hooks.installing import Installer
 from syndica.kernel.ids import assigned_agent_id
 from syndica.kernel.llm import LLM, ContextOverflowError
 from syndica.kernel.plugins import Plugin, install_plugins
+from syndica.kernel.protocols.artifact import ArtifactStore
 from syndica.kernel.tool import Tool, validate_tool_names
 from syndica.kernel.tool_executor import (
     DEFAULT_MAX_TOOL_CONCURRENCY,
@@ -450,6 +451,9 @@ class BaseAgent:
         # 与正常轮（正数）撞键、又能被录制 / 回放按（agent, turn, attempt）定位。计数跨周期单调，
         # 录制与回放走同一条路、号一致（spec §8.8 / §8.9 的一次性调用；回放 aux_calls 槽）。
         self._aux_calls = 0
+        # 产物索引（可选）：由 Runtime 经 `_attach_artifact_store` 装上。每批工具跑完后内核把工具
+        # 回报的 `ToolResult.artifacts` 登记进去、再触发 ARTIFACT_REGISTERED（§7.4）；没装就不登记。
+        self._artifact_store: ArtifactStore | None = None
 
     def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
         """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
@@ -684,6 +688,10 @@ class BaseAgent:
     def _attach_recall(self, recall: Callable[[Context], Awaitable[None]]) -> None:
         """装上记忆召回（记忆 Module 的 agent 插件调）。cycle 起点内核调它注入长期记忆（§8.9）。"""
         self._recall = recall
+
+    def _attach_artifact_store(self, store: ArtifactStore) -> None:
+        """装上产物索引（Runtime 调）。每批工具跑完后内核往它登记工具回报的产物（§7.4）。"""
+        self._artifact_store = store
 
     async def _aux_llm_call(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
         """一次性辅助模型调用（压缩摘要 / 记忆整理）：走录制的同一条路（`llm_call` 作用域 +
@@ -930,11 +938,27 @@ class BaseAgent:
             await self._end_turn(ctx, turn, response)
             return StopReason.COMPLETED
 
+        pre = len(ctx.current_traj)
         await self._executor.execute_tool_calls(
             ctx, response.tool_calls, origin=(self.agent_id, self._cycle, turn)
         )
+        await self._register_new_artifacts(ctx, pre)
         await self._end_turn(ctx, turn, response)
         return None
+
+    async def _register_new_artifacts(self, ctx: Context, pre: int) -> None:
+        """这一批工具跑完后，把工具回报的产物登记进索引、逐个触发 ARTIFACT_REGISTERED（§7.4 隐式
+        追踪，内核做、不依赖验收 Module）。在执行器窗口之外、不写轨迹：切点是 OBSERVABLE，L1 验收
+        挂它读产物。没装产物索引（宿主没给）就什么都不做。"""
+        store = self._artifact_store
+        if store is None:
+            return
+        for block in ctx.current_traj[pre:]:
+            for ref in block.artifacts:
+                await store.register(ref)
+                await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
+                    Junction.ARTIFACT_REGISTERED, ctx=ctx, artifact=ref
+                )
 
     async def _inject(self, ctx: Context, decision: TurnGateDecision) -> None:
         """把门交来的消息追加成 user block，逐条触发 MESSAGE_INJECTED。

@@ -109,6 +109,7 @@ class Junction(Enum):
     POST_LLM_RESPONSE = 'post_llm_response'
     CONTEXT_OVERFLOW = 'context_overflow'
     LLM_FAILURE = 'llm_failure'
+    ARTIFACT_REGISTERED = 'artifact_registered'
 
 
 INTERCEPTABLE: frozenset[Junction] = frozenset(
@@ -134,6 +135,7 @@ OBSERVABLE: frozenset[Junction] = frozenset(
         Junction.TURN_END,
         Junction.MESSAGE_INJECTED,
         Junction.TOOL_CONFIRMATION_REQUIRED,
+        Junction.ARTIFACT_REGISTERED,
     }
 )
 

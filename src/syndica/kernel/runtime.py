@@ -184,6 +184,7 @@ from syndica.kernel.modules import (
 )
 from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback
+from syndica.kernel.protocols.artifact import ArtifactStore
 from syndica.kernel.protocols.session import SessionStore
 from syndica.kernel.redaction import Redactor, RuleRedactor
 from syndica.kernel.session_redaction import redacted_record
@@ -1035,6 +1036,7 @@ class Runtime:
         workspace: WorkspaceRouter | None = None,
         sessions: SessionStore | None = None,
         redactor: Redactor | None = None,
+        artifacts: ArtifactStore | None = None,
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
@@ -1057,6 +1059,8 @@ class Runtime:
             )
         self._workspace = workspace
         self._sessions = sessions
+        # 产物索引（可选）：宿主给了就由内核在工具写出产物后登记并触发 ARTIFACT_REGISTERED（§7.4）。
+        self._artifacts = artifacts
         # 落盘前过脱敏（spec §12）：给了 sessions 就必须给 redactor（上面已校验）。
         # 这里的 RuleRedactor() 只在没配 sessions 时占位，不会被用到（那条路 _sessions 为空）。
         self._redactor: Redactor = redactor if redactor is not None else RuleRedactor()
@@ -1447,6 +1451,8 @@ class Runtime:
                 self._carry_truncated_taint(agent, fork_from, source_trust)
             agent._attach_gate(gate)  # pyright: ignore[reportPrivateUsage]
             agent._attach_tracing(self._tracing)  # pyright: ignore[reportPrivateUsage]
+            if self._artifacts is not None:
+                agent._attach_artifact_store(self._artifacts)  # pyright: ignore[reportPrivateUsage]
         except BaseException:
             agent._assembly_restore(assembly_snapshot)  # pyright: ignore[reportPrivateUsage]
             self.hooks._assembly_restore(runtime_hooks)  # pyright: ignore[reportPrivateUsage]
