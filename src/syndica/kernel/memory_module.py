@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, cast
 
 from syndica import __version__
-from syndica.kernel.context import Context, TrustLevel, call_trust, strictest_trust
+from syndica.kernel.context import Context, ContextBlock, TrustLevel, call_trust, strictest_trust
 from syndica.kernel.errors import ContractViolation
 from syndica.kernel.history_blocks import HistoryKind, has_block, signed_block
 from syndica.kernel.hooks import HooksCenter
@@ -91,17 +91,28 @@ class _RememberTool(Tool):
         return ToolResult(output=f'已记住（{scope}）。')
 
     async def _maybe_consolidate(self, scope: MemoryScope, workspace: str | None) -> None:
-        """短期累积到阈值就整理成一段长期记忆（规则型折叠：无 LLM）。乐观并发：版本被别人抢先就跳，
-        下次再整理（spec §6.4 / §8.9）。"""
+        """短期累积到阈值就用一次性调用把它们整理成一段结构化长期记忆（spec §8.9；经 `_aux_llm_call`
+        走录制 / 回放同一条路）。乐观并发：版本被别人抢先就跳，下次再整理。整理出的那段信任取被整理
+        各条里最严的（不可信内容整理出来仍不可信，§12.2）。"""
         record = await self._store.read(scope, workspace)
         through = record.through_seq if record is not None else 0
         version = record.version if record is not None else 0
         fresh = await self._store.entries(scope, workspace, after_seq=through)
         if len(fresh) < self._consolidate_after:
             return
+        rendered = '\n'.join(f'- {entry.text}' for entry in fresh)
+        reply = await self._agent._aux_llm_call(  # pyright: ignore[reportPrivateUsage]
+            [
+                ContextBlock(
+                    role='system',
+                    content='把以下零散记录整理成一段简洁的长期记忆，保留约定、偏好与踩过的坑。',
+                ),
+                ContextBlock(role='user', content=rendered),
+            ]
+        )
         folded = MemorySection(
             heading=f'整理 seq {fresh[0].seq}–{fresh[-1].seq}',
-            text=' '.join(entry.text for entry in fresh),
+            text=str(reply.content or ''),
             trust=_merged_trust(entry.trust for entry in fresh),
         )
         existing = list(record.sections) if record is not None else []

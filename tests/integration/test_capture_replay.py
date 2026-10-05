@@ -1853,6 +1853,36 @@ def test_a_read_only_run_keeps_the_role_tightening_of_the_project_config(
     assert roles['Worker']['table']['shell.path_outside_workspace'] == 'block'
 
 
+def test_memory_consolidation_aux_call_degrades_replay_gracefully(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    # LLM 记忆整理是一次性辅助调用（负 turn 号的 llm_call，不在任何一轮里）。完整的 aux_calls 回放槽
+    # 是 v4 的事（spec §11.3，推迟）；此刻它**优雅降级**：run 照常完成、结构照常记录，只是不写回放
+    # 文档（记一条 warning），而不是让回放崩。
+    (tmp_path / '.syndica.yaml').write_text(
+        'version: 1\nmodules: [memory]\nflags:\n  memory_consolidate_after: 1\n',
+        encoding='utf-8',
+    )
+    root: list[Step] = [
+        _calls(('m1', 'Remember', {'text': '用 tab 缩进'})),
+        _say('长期记忆：用 tab 缩进'),  # 整理那次辅助调用的回复
+        _say('done'),
+    ]
+
+    code, stdout, stderr = _cli(tmp_path, _PerAgent(root, []), ['run', 'go', '--agent', 'Worker'])
+
+    assert code == 0 and stdout.rstrip().endswith('done'), stderr
+    store = FileTraceStore(tmp_path / '.syndica' / 'traces')
+
+    async def read() -> tuple[int, str | None]:
+        traces = await store.traces()
+        return len(traces), await store.replay(traces[0].trace_id)
+
+    count, replay_doc = asyncio.run(read())
+    assert count == 1  # 结构照常记录
+    assert replay_doc is None  # 一次性调用让它不写回放文档（优雅降级，非崩溃）
+
+
 def test_builtin_modules_enabled_by_the_project_config_install_in_order_and_replay(
     tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
 ):

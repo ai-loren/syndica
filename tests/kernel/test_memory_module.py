@@ -97,7 +97,9 @@ async def test_remember_consolidates_short_term_at_the_threshold() -> None:
         flags={'memory_consolidate_after': 2},
     )
     try:
-        agent_id = await _spawn(runtime)
+        # 跑的那一轮用掉 'ok'；第二条 Remember 触发整理，整理用一次性调用，用掉 '整理后的记忆'。
+        llm = ScriptedLLM([ScriptedTurn(content='ok'), ScriptedTurn(content='整理后的记忆')])
+        agent_id = await runtime.spawn(_factory(llm), query='t')
         await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
         remember = _agent_of(runtime, agent_id).options.tools['Remember']
         await remember.execute(text='踩坑一')
@@ -106,7 +108,7 @@ async def test_remember_consolidates_short_term_at_the_threshold() -> None:
         record = await store.read(MemoryScope.WORKSPACE, '/w')
         assert record is not None
         assert record.through_seq == 2  # 两条都整理进去了
-        assert '踩坑一' in record.sections[0].text and '踩坑二' in record.sections[0].text
+        assert record.sections[0].text == '整理后的记忆'  # LLM 整理出的长期记忆
     finally:
         await runtime.shutdown()
 

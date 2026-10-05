@@ -446,6 +446,10 @@ class BaseAgent:
         self._recall: Callable[[Context], Awaitable[None]] | None = None
         # 当前周期的那条输入（query 或第一条注入）：本周期的 Goal 代理，压缩时必须活着（评审 M2）。
         self._cycle_anchor: ContextBlock | None = None
+        # 一次性辅助调用（压缩摘要、记忆整理）计数：每次用一个**负** turn 号开 llm_call 作用域，既不
+        # 与正常轮（正数）撞键、又能被录制 / 回放按（agent, turn, attempt）定位。计数跨周期单调，
+        # 录制与回放走同一条路、号一致（spec §8.8 / §8.9 的一次性调用；回放 aux_calls 槽）。
+        self._aux_calls = 0
 
     def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
         """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
@@ -680,6 +684,18 @@ class BaseAgent:
     def _attach_recall(self, recall: Callable[[Context], Awaitable[None]]) -> None:
         """装上记忆召回（记忆 Module 的 agent 插件调）。cycle 起点内核调它注入长期记忆（§8.9）。"""
         self._recall = recall
+
+    async def _aux_llm_call(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        """一次性辅助模型调用（压缩摘要 / 记忆整理）：走录制 / 回放的同一条路（`llm_call` 作用域 +
+        `llm_attempt`），用负 turn 号定位，不进轨迹、不与正常轮撞键。回放下 `_ReplayLLM` 按这个键取
+        记录的回复——否则一次性调用会让回放发散（spec §11.3 的 aux_calls）。"""
+        self._aux_calls += 1
+        request = {'messages': messages, **kwargs}
+        with self._tracing.llm_call(self.agent_id, -self._aux_calls):
+            with llm_attempt(self.options.llm, request) as attempt:
+                reply = await self.options.llm.create(messages, **kwargs)
+                attempt.observe(reply)
+                return reply
 
     async def _maybe_compact(self, ctx: Context, *, trigger: str, force: bool = False) -> bool:
         """turn 边界 / 超限兜底的内核压缩步骤。交回是否真压了。

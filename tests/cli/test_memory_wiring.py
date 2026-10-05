@@ -42,6 +42,8 @@ def test_enabling_memory_persists_a_remembered_fact_across_the_cli(tmp_path: Pat
                     ToolCall(id='c1', name='Remember', arguments='{"text": "用 tab 缩进"}')
                 ]
             ),
+            # Remember 触发整理（阈值 1），整理用一次性调用——它排在这一轮工具执行期间，先于下一轮。
+            ScriptedTurn(content='长期记忆：用 tab 缩进'),
             ScriptedTurn(content='done'),
         ]
     )
@@ -52,7 +54,7 @@ def test_enabling_memory_persists_a_remembered_fact_across_the_cli(tmp_path: Pat
 
     longs = list((tmp_path / '.syndica' / 'memory').glob('*/long.json'))
     assert longs, '记忆没有落盘：memory Module 没接进 host，或 Remember 工具没装上'
-    assert '用 tab 缩进' in longs[0].read_text(encoding='utf-8')
+    assert '长期记忆：用 tab 缩进' in longs[0].read_text(encoding='utf-8')
 
 
 def test_enabling_compaction_runs_without_error(tmp_path: Path) -> None:
