@@ -105,7 +105,10 @@ def _default_summarize(agent: BaseAgent) -> Summarize:
             [
                 ContextBlock(
                     role='system',
-                    content='概括以下对话历史，保留关键约束、已定决策与未完成事项，去掉冗余的执行细节。',
+                    content=(
+                        '概括以下对话历史：只保留其中明确出现的关键约束、已定决策与未完成事项，'
+                        '去掉冗余执行细节，不要补充历史里没有的内容。'
+                    ),
                 ),
                 ContextBlock(role='user', content=rendered),
             ]

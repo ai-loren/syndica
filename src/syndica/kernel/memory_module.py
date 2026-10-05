@@ -105,7 +105,10 @@ class _RememberTool(Tool):
             [
                 ContextBlock(
                     role='system',
-                    content='把以下零散记录整理成一段简洁的长期记忆，保留约定、偏好与踩过的坑。',
+                    content=(
+                        '把以下零散记录整理成一段简洁的长期记忆：只保留记录里明确写出的事实'
+                        '（约定、偏好、踩过的坑），不要补充记录里没有的细节、数值或建议。'
+                    ),
                 ),
                 ContextBlock(role='user', content=rendered),
             ]
