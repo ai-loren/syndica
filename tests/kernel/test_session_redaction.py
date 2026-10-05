@@ -83,6 +83,32 @@ def test_redacted_content_only_redacts_leaves() -> None:
     assert _SECRET not in str(wrapped.content[0].content)
 
 
+def test_nested_multimodal_text_is_redacted_but_base64_is_kept() -> None:
+    # 深层文本（tool_result.content[].text、image_url.url 的 userinfo）也脱；base64 图片数据原样留。
+    blob = 'iVBORw0KGgo' + _SECRET + 'AAAA'
+    block = ContextBlock(
+        role='tool',
+        content=[
+            {'type': 'text', 'text': f'saw {_SECRET}'},
+            {'type': 'tool_result', 'content': [{'type': 'text', 'text': f'deep {_SECRET}'}]},
+            {'type': 'image_url', 'image_url': {'url': f'https://u:{_SECRET}@h/x.png'}},
+            {
+                'type': 'image',
+                'source': {'type': 'base64', 'media_type': 'image/png', 'data': blob},
+            },
+        ],
+    )
+    wrapped = redacted_content([block], _redactor())
+    parts = wrapped.content[0].content
+    assert isinstance(parts, list)
+    assert _SECRET not in str(parts[0])
+    assert _SECRET not in str(parts[1])  # 嵌套一层的 text
+    assert _SECRET not in str(parts[2])  # image_url.url 的 userinfo
+    source = parts[3]['source']  # type: ignore[index]
+    assert source['data'] == blob  # base64 原样保留
+    assert source['type'] == 'base64'
+
+
 def test_the_wrappers_reject_direct_construction() -> None:
     with pytest.raises(ContractViolation):
         RedactedSessionRecord(_record())

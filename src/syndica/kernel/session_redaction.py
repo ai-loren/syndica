@@ -60,24 +60,22 @@ class RedactedContent:
         self.content = content
 
 
+_BINARY_KEYS = frozenset({'data'})
+
+
 def _redact_text(value: object, redactor: Redactor) -> object:
-    """块内容的一个叶子：字符串脱敏；多模态部件里只脱 `text`，图片 / base64 原样留。"""
+    """块内容的叶子脱敏：递归进列表与字典，逐个字符串叶子脱敏。嵌套 `tool_result.content[].text`、
+    `image_url.url` 的 userinfo 也脱；`data` 键下 base64 原样留（脱敏会匹配一段密钥样式改坏它）；
+    字典的键是结构、不脱。"""
     if isinstance(value, str):
         return redactor.redact(value)
     if isinstance(value, list):
-        out: list[object] = []
-        for raw in cast('list[object]', value):
-            if isinstance(raw, str):
-                out.append(redactor.redact(raw))
-            elif isinstance(raw, dict):
-                item = cast('dict[str, object]', raw)
-                text = item.get('text')
-                out.append(
-                    {**item, 'text': redactor.redact(text)} if isinstance(text, str) else item
-                )
-            else:
-                out.append(raw)
-        return out
+        return [_redact_text(item, redactor) for item in cast('list[object]', value)]
+    if isinstance(value, dict):
+        return {
+            key: (val if key in _BINARY_KEYS else _redact_text(val, redactor))
+            for key, val in cast('dict[str, object]', value).items()
+        }
     return value
 
 
