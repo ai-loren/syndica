@@ -109,6 +109,7 @@ from syndica.kernel.hooks import (
     Junction,
     JunctionRef,
 )
+from syndica.kernel.hooks.center import EXTENSION_TAINT
 from syndica.kernel.hooks.installing import Installer
 from syndica.kernel.ids import assigned_agent_id
 from syndica.kernel.llm import LLM, ContextOverflowError
@@ -1154,6 +1155,22 @@ class BaseAgent:
             return await self._one_llm_exchange(ctx, tool_defs)
 
     async def _one_llm_exchange(
+        self, ctx: Context, tool_defs: list[dict[str, Any]]
+    ) -> ContextBlock | None:
+        """模型侧切点里触发的扩展切点，结论出自被收紧的 Module 时（D-64 模型侧），这一轮的
+        assistant block 同样标成不可信：hook 是宿主的，拿去拼请求的值却是那个 Module 写的。格子每次
+        调用新开一个，子 Agent 的任务继承上下文时不会写进父 Agent 那次工具调用的格子。"""
+        cell: list[str] = []
+        token = EXTENSION_TAINT.set(cell)
+        try:
+            reviewed = await self._llm_exchange(ctx, tool_defs)
+        finally:
+            EXTENSION_TAINT.reset(token)
+        if reviewed is not None and cell and reviewed.trust is not TrustLevel.UNTRUSTED:
+            return replace(reviewed, trust=TrustLevel.UNTRUSTED)
+        return reviewed
+
+    async def _llm_exchange(
         self, ctx: Context, tool_defs: list[dict[str, Any]]
     ) -> ContextBlock | None:
         system_block = ContextBlock(role='system', content=self.get_system_prompt())

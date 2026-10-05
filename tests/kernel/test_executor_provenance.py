@@ -402,3 +402,41 @@ async def test_a_tightened_module_publishing_straight_to_the_broker_lands_untrus
         ('m1', TrustLevel.UNTRUSTED),
         ('m2', TrustLevel.TRUSTED),
     ]
+
+
+@pytest.mark.parametrize(
+    ('author', 'untrusted'),
+    [(('module', 'thirdparty'), True), (('plugin', 'trusted-plugin'), False)],
+    ids=['tightened_module', 'trusted_plugin'],
+)
+async def test_a_model_request_built_from_a_tightened_extension_conclusion_is_untrusted(
+    author: tuple[Literal['plugin', 'module'], str], untrusted: bool
+) -> None:
+    # D-64 模型侧：hook 是宿主的，拼进请求的值却出自被收紧的 Module——这一轮的回复同样不可信。
+    from syndica.kernel.agent import AgentOptions, BaseAgent
+    from syndica.kernel.events import EventBus
+    from syndica.kernel.hooks import Junction
+    from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
+
+    center, handle = _extension_center(author)
+
+    async def enrich(**kwargs: Any) -> HookResult:
+        found = await center.trigger(handle, value=None)
+        request = dict(kwargs['request'])
+        retrieved = ContextBlock(role='user', content=str(found.get('value')))
+        request['messages'] = [*request['messages'], retrieved]
+        return HookResult(modified={'request': request})
+
+    hooks = HooksCenter()
+    hooks.register(Junction.PRE_LLM_REQUEST, enrich)
+    llm = ScriptedLLM([ScriptedTurn(content='answer')])
+    agent = BaseAgent(
+        AgentOptions(name='W', llm=llm, tools={}, system_prompt='SP'),
+        hooks=hooks,
+        events=EventBus(),
+    )
+
+    ctx = await agent.run('go')
+
+    [reply] = [block for block in ctx.current_traj if block.role == 'assistant']
+    assert (reply.trust is TrustLevel.UNTRUSTED) == untrusted
