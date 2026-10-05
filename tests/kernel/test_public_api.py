@@ -413,6 +413,7 @@ _WITHHELD: tuple[str, ...] = (
     'CompactionResult',
     'CompactionStrategy',
     'CompactionController',
+    'CompactionModule',
     'PruningCompaction',
     'RuleBasedCompaction',
     'SummaryCompaction',
