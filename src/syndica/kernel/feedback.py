@@ -78,7 +78,8 @@ async def propose_feedback_rubric(
     )
     if verify_anchors(anchors, sources):
         logger.warning(
-            '期望: 反馈的锚点能重新打开。 实际: %s 层的反馈 %s 锚不回来源。 下一步: 不提议这一条。',
+            '期望: 反馈的锚点能重新打开。 实际: Agent %s 收到的反馈 %s 锚不回来源。 '
+            '下一步: 不提议这一条。',
             scope,
             rubric_id,
         )

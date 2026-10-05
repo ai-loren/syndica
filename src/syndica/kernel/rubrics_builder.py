@@ -75,7 +75,7 @@ async def project_rubrics(
         candidates = _parse(result.reply, trust)
     except Exception as exc:
         logger.warning(
-            '期望: RubricsBuilder 投出 Rubric。 实际: %s 层投影失败（%s）。 '
+            '期望: RubricsBuilder 投出 Rubric。 实际: Agent %s 的 Goal 投影失败（%s）。 '
             '下一步: 退役旧的投影条，本次验收落 unverified。',
             scope,
             type(exc).__name__,
@@ -91,7 +91,7 @@ async def project_rubrics(
         kept.append(rubric)
     if dropped:
         logger.warning(
-            '期望: 每条 Rubric 锚回 Goal。 实际: %s 层 %d 条锚点不可重新打开、已丢弃。 '
+            '期望: 每条 Rubric 锚回 Goal。 实际: Agent %s 的 %d 条锚点不可重新打开、已丢弃。 '
             '下一步: 这些是发明的需求，不进验收；查 Goal 与任务输入是否对得上。',
             scope,
             dropped,

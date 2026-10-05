@@ -182,6 +182,7 @@ from syndica.kernel.modules import (
     FlagValue,
     RuntimeModule,
     _RuntimeModuleAssembly,  # pyright: ignore[reportPrivateUsage]
+    _stricter_safety_flags,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback
@@ -809,6 +810,25 @@ def _resumed_status(slot: _Slot) -> AgentStatus:
     if slot.waiter is not None:
         return AgentStatus.WAITING
     return AgentStatus.RUNNING if slot.control.in_run else AgentStatus.IDLE
+
+
+_STALE_LISTED = 20
+
+
+def _stale_listing(blocks: Sequence[ContextBlock], sid: str) -> str:
+    """恢复提示里点名的失效 Agent：编排工具的结果在 `tool_meta['agent_id']` 记着它们，按首次出现的
+    次序、去掉会话自己；点名才让模型认得出哪些 id 不能再发。太多时只列前 20 个。"""
+    seen: dict[str, None] = {}
+    for block in blocks:
+        meta = block.extra.get('tool_meta')
+        target = cast('dict[str, object]', meta).get('agent_id') if isinstance(meta, dict) else None
+        if isinstance(target, str) and target and target != sid:
+            seen.setdefault(target, None)
+    if not seen:
+        return ''
+    names = list(seen)
+    more = ' 等' if len(names) > _STALE_LISTED else ''
+    return f'（{"、".join(names[:_STALE_LISTED])}{more}）'
 
 
 def _wait_ceiling(flags: Mapping[str, FlagValue]) -> float | None:
@@ -2413,11 +2433,11 @@ class Runtime:
     async def _resume_from_store(self, sid: str) -> bool:
         """落盘会话恢复（spec §4.2 / §15）：Agent 不在注册表、而 SessionStore 里有它时，从记录重建。
 
-        复用 spawn 的全部装配 / 回滚 / 并发收口——工厂包一层把 id 定成 sid（Agent 的 id 取自
-        `assigning_agent_id`，spawn 以 `agent.agent_id` 为准），构造时种回轨迹与 turn 计数。按
-        `SessionMeta.agent` 从已登记的角色工厂解析，缺了给三件套错误。安全相关 flags 用当前模块值、
-        不采信快照（P22）；model / tools 与快照不一致记 warning、按当前值续跑（接受一次缓存失配）。
-        """
+        复用 spawn 的全部装配 / 回滚 / 并发收口——工厂包一层把 id 定成 sid（Agent 的 id 取
+        自 `assigning_agent_id`，spawn 以 `agent.agent_id` 为准），构造时种回轨迹与 turn 计数。
+        按 `SessionMeta.agent` 从已登记的角色工厂解析，缺了给三件套错误。安全相关 flags 取「当前或更
+        严」：快照里更严的值作为这个 Agent 的覆盖值并记 warning（换一份更松的配置续跑不能放松会
+        话）；model / tools 与快照不一致记 warning、按当前值续跑（接受一次缓存失配）。"""
         store = self._sessions
         if store is None:
             return False
@@ -2456,9 +2476,10 @@ class Runtime:
         # 作用发生过」，模型会重放非幂等操作。原样种回，`_repair_interrupted_batch` 把未配对调用
         # 补成「副作用未知」、保住已返回的结果（评审 H4）。
         seeded = list(record.content)
+        stale = _stale_listing(record.content, sid) or ' '
         note = signed_block(
             HistoryKind.RESUME_NOTE,
-            '（恢复）从落盘会话续跑：上一段进程里的子 Agent 已随进程结束失效，'
+            f'（恢复）从落盘会话续跑：上一段进程里的子 Agent{stale}已随进程结束失效，'
             '别再向它们的 id 发消息。',
             key=f'resume:{sid}:{record.meta.turns}',
             trust=carried,
@@ -2481,8 +2502,19 @@ class Runtime:
         if self._closed:
             # 上面隔着 store 的 await，并发的 shutdown 可能插进来；此刻 spawn 会抛，而这是个问句。
             return False
+        kept = _stricter_safety_flags(record.flags, self.flags)
+        for key, value in kept.items():
+            logger.warning(
+                '恢复会话 %s：%s 沿用会话里更严的 %r（当前配置是 %r）。要放松就开一个新会话。',
+                sid,
+                key,
+                value,
+                self.flags.get(key),
+            )
         try:
-            resumed_id = await self.spawn(resume_factory, exit_mode=ExitMode.ZOMBIE, session=True)
+            resumed_id = await self.spawn(
+                resume_factory, exit_mode=ExitMode.ZOMBIE, session=True, flags=kept or None
+            )
         except Exception:
             logger.exception('期望: 恢复会话 %s 时能起驱动任务。 实际: spawn 抛异常。', sid)
             return False

@@ -75,10 +75,20 @@ def test_an_empty_deliverable_is_sent_back_through_the_cli(tmp_path: Path) -> No
             ScriptedTurn(content='done again'),
         ]
     )
-    code, stdout, stderr = _cli(tmp_path, llm, _run(_config(tmp_path)))
+    config = _config(tmp_path)
+    code, stdout, stderr = _cli(tmp_path, llm, _run(config))
     assert code == 0, stderr
     assert stdout == 'done again\n'
-    assert (tmp_path / '.syndica' / 'artifacts').is_dir()
+
+    code, listed, stderr = _cli(
+        tmp_path, ScriptedLLM([]), ['--config', config, 'artifacts', 'list']
+    )
+    assert code == 0, stderr
+    assert listed.startswith('file:report.md\t交付物\tdocument\t') and '2 个版本' in listed
+    show = ['--config', config, 'artifacts', 'show', 'file:report.md']
+    code, shown, stderr = _cli(tmp_path, ScriptedLLM([]), show)
+    assert code == 0, stderr
+    assert [line.split('.')[0].strip() for line in shown.splitlines()[1:]] == ['1', '2']
 
 
 def test_the_final_verdict_is_reported_on_stderr(tmp_path: Path) -> None:
@@ -169,3 +179,18 @@ def test_chat_tells_the_human_about_a_feedback_proposal(tmp_path: Path) -> None:
     assert code == 0, stderr
     assert '提议的验收标准 fb:' in stderr
     assert 'syndica sessions activate' in stderr
+
+
+def test_artifacts_without_an_index_says_how_to_get_one(tmp_path: Path) -> None:
+    config = tmp_path / '.syndica.yaml'
+    config.write_text('version: 1\n', encoding='utf-8')
+    argv = ['--config', str(config), 'artifacts', 'list']
+    code, _, stderr = _cli(tmp_path, ScriptedLLM([]), argv)
+    assert code != 0 and 'acceptance' in stderr
+
+
+def test_showing_an_unknown_artifact_points_at_the_list(tmp_path: Path) -> None:
+    (tmp_path / '.syndica' / 'artifacts').mkdir(parents=True)
+    argv = ['--config', _config(tmp_path), 'artifacts', 'show', 'file:nope.md']
+    code, _, stderr = _cli(tmp_path, ScriptedLLM([]), argv)
+    assert code != 0 and 'artifacts list' in stderr

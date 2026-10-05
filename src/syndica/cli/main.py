@@ -19,6 +19,7 @@ __all__ = [
     'CliIO',
     'CliOutcome',
     'InspectRequest',
+    'MemoryRequest',
     'RunRequest',
     'TraceRequest',
     'main',
@@ -33,8 +34,10 @@ _COMMANDS = frozenset(
         'agents',
         'topology',
         'sessions',
+        'memory',
         'flags',
         'modules',
+        'artifacts',
         'config',
         'doctor',
         'version',
@@ -85,7 +88,7 @@ class CliOutcome:
 class InspectRequest:
     """One list/show request for a declarative CLI resource."""
 
-    resource: Literal['agents', 'topology', 'flags', 'modules']
+    resource: Literal['agents', 'topology', 'flags', 'modules', 'artifacts']
     action: Literal['list', 'show']
     name: str | None
     config: str = '.syndica.yaml'
@@ -103,6 +106,19 @@ class TraceRequest:
     keep: int = PRUNE_KEEP
     names: tuple[str, ...] = ()
     otlp: str | None = None
+    config: str = '.syndica.yaml'
+    argv: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MemoryRequest:
+    """`syndica memory list | forget <n> | forget --pending`，`--global` 换到全局那一层。`index` 是
+    `list` 打出的段号（从 1 起）；`pending` 丢掉还没整理进长期记忆的短期记录。"""
+
+    action: Literal['list', 'forget']
+    global_scope: bool = False
+    index: int | None = None
+    pending: bool = False
     config: str = '.syndica.yaml'
     argv: tuple[str, ...] = ()
 
@@ -156,6 +172,8 @@ class CliHost(Protocol):
     def trace(self, request: TraceRequest) -> str | CliOutcome: ...
 
     def sessions(self, request: SessionsRequest) -> str | CliOutcome: ...
+
+    def memory(self, request: MemoryRequest) -> str | CliOutcome: ...
 
 
 class _ParserExit(Exception):
@@ -275,7 +293,7 @@ def _parser() -> _ArgumentParser:
                 '.syndica.yaml 的 trace.level），full 再记完整请求；chat 最高 structure'
             ),
         )
-    for resource in ('agents', 'topology', 'flags', 'modules'):
+    for resource in ('agents', 'topology', 'flags', 'modules', 'artifacts'):
         noun = commands.add_parser(resource)
         actions = noun.add_subparsers(dest='action', required=True)
         actions.add_parser('list')
@@ -292,6 +310,21 @@ def _parser() -> _ArgumentParser:
     )
     activate.add_argument('name')
     activate.add_argument('rubric')
+    memory = commands.add_parser('memory')
+    memory_actions = memory.add_subparsers(dest='action', required=True)
+    listed = memory_actions.add_parser('list', help='列出长期记忆的各段与还没整理的短期记录')
+    forget = memory_actions.add_parser(
+        'forget', help='忘掉长期记忆的第 n 段，或用 --pending 丢掉还没整理的短期记录'
+    )
+    forget.add_argument('index', nargs='?', type=_positive_int)
+    forget.add_argument('--pending', action='store_true')
+    for memory_action in (listed, forget):
+        memory_action.add_argument(
+            '--global',
+            dest='global_scope',
+            action='store_true',
+            help='全局那一层（缺省是本工作区）',
+        )
     config = commands.add_parser('config')
     config_actions = config.add_subparsers(dest='action', required=True)
     trust = config_actions.add_parser('trust')
@@ -602,6 +635,32 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
     if namespace.command == 'version':
         _write(streams.stdout, f'syndica {__version__}')
         return 0
+    if namespace.command == 'memory':
+        if host is None:
+            _write(
+                streams.stderr,
+                '期望: memory 有可用的 Runtime host\n'
+                '实际: 当前入口没有注入 host\n'
+                '下一步: 通过 console composition root 创建 host 后重试',
+            )
+            return 2
+        if namespace.action == 'forget' and (namespace.index is None) == (not namespace.pending):
+            _write(
+                streams.stderr,
+                '期望: memory forget 后跟 memory list 打出的段号，或 --pending（二选一）\n'
+                f'实际: 段号 {namespace.index!r}，--pending {namespace.pending}\n'
+                '下一步: 先 syndica memory list 看段号，再 syndica memory forget <n>',
+            )
+            return 2
+        memory_request = MemoryRequest(
+            action=namespace.action,
+            global_scope=namespace.global_scope,
+            index=getattr(namespace, 'index', None),
+            pending=getattr(namespace, 'pending', False),
+            config=namespace.config,
+            argv=tuple(received),
+        )
+        return _host_call(lambda: host.memory(memory_request), streams)
     if namespace.command == 'sessions':
         if host is None:
             _write(
@@ -638,9 +697,11 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
             '下一步: 通过 console composition root 创建 host 后重试',
         )
         return 2
-    if namespace.command in {'agents', 'topology', 'flags', 'modules'}:
+    if namespace.command in {'agents', 'topology', 'flags', 'modules', 'artifacts'}:
         request = InspectRequest(
-            resource=cast(Literal['agents', 'topology', 'flags', 'modules'], namespace.command),
+            resource=cast(
+                Literal['agents', 'topology', 'flags', 'modules', 'artifacts'], namespace.command
+            ),
             action=namespace.action,
             name=getattr(namespace, 'name', None),
             config=namespace.config,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import cast
 
 import pytest
 
@@ -162,3 +163,100 @@ async def _until_turn(runtime: Runtime, sid: str, target: int) -> None:
         if agent is not None and agent._current_turn >= target:  # pyright: ignore[reportPrivateUsage]
             return
         await asyncio.sleep(0.01)
+
+
+def _flagged(flags: dict[str, bool | int | str]) -> SessionRecord:
+    record = _seed_record('sess-flags')
+    record.flags = dict(flags)
+    return record
+
+
+async def test_a_stricter_recorded_safety_flag_survives_a_looser_config(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 换一份更松的配置续跑，不能放松一份当初在更严设置下开始的会话（M6 P28-M7）。
+    from syndica.kernel.modules import SafetyModule
+
+    store = await _store_with(_flagged({'untrusted_high_risk': 'reject', 'max_wait_seconds': 30}))
+    runtime = Runtime(
+        agents={'Worker': _worker_factory()},
+        sessions=store,
+        redactor=_REDACTOR,
+        modules=[SafetyModule()],
+        flags={'untrusted_high_risk': 'ask', 'max_wait_seconds': 0},
+    )
+    with caplog.at_level(logging.WARNING):
+        assert await runtime.ensure_active('sess-flags') is True
+    info = await runtime.find('sess-flags')
+    assert info is not None
+    assert (info.flags['untrusted_high_risk'], info.flags['max_wait_seconds']) == ('reject', 30)
+    kept = [r.args for r in caplog.records if '更严' in str(r.msg)]
+    assert sorted(str(cast(tuple[object, ...], args)[1]) for args in kept) == [
+        'max_wait_seconds',
+        'untrusted_high_risk',
+    ]
+    await runtime.shutdown()
+
+
+async def test_a_looser_recorded_safety_flag_does_not_loosen_the_current_config() -> None:
+    from syndica.kernel.modules import SafetyModule
+
+    store = await _store_with(_flagged({'untrusted_high_risk': 'ask', 'max_wait_seconds': 60}))
+    runtime = Runtime(
+        agents={'Worker': _worker_factory()},
+        sessions=store,
+        redactor=_REDACTOR,
+        modules=[SafetyModule()],
+        flags={'untrusted_high_risk': 'reject', 'max_wait_seconds': 20},
+    )
+    assert await runtime.ensure_active('sess-flags') is True
+    info = await runtime.find('sess-flags')
+    assert info is not None
+    assert (info.flags['untrusted_high_risk'], info.flags['max_wait_seconds']) == ('reject', 20)
+    await runtime.shutdown()
+
+
+async def test_recorded_safety_flags_do_not_block_a_runtime_without_the_safety_module() -> None:
+    store = await _store_with(_flagged({'untrusted_high_risk': 'reject', 'max_wait_seconds': 30}))
+    runtime = Runtime(agents={'Worker': _worker_factory()}, sessions=store, redactor=_REDACTOR)
+    assert await runtime.ensure_active('sess-flags') is True
+    await runtime.shutdown()
+
+
+async def test_the_resume_note_names_the_agents_that_did_not_survive() -> None:
+    # 只说「子 Agent 失效了」认不出是哪些 id：点名它们，模型才知道哪些 id 不能再发。
+    content = [
+        ContextBlock(role='user', content='earlier turn'),
+        ContextBlock(
+            role='tool',
+            tool_call_id='d1',
+            content='done',
+            extra={'tool_meta': {'agent_id': 'child-a'}},
+        ),
+        ContextBlock(
+            role='tool',
+            tool_call_id='d2',
+            content='sent',
+            extra={'tool_meta': {'agent_id': 'child-b'}},
+        ),
+        ContextBlock(
+            role='tool',
+            tool_call_id='self',
+            content='to myself',
+            extra={'tool_meta': {'agent_id': 'sess-kids'}},
+        ),
+        ContextBlock(
+            role='tool',
+            tool_call_id='d3',
+            content='again',
+            extra={'tool_meta': {'agent_id': 'child-a'}},
+        ),
+    ]
+    store = await _store_with(_seed_record('sess-kids', content=content))
+    runtime = Runtime(agents={'Worker': _worker_factory()}, sessions=store, redactor=_REDACTOR)
+    assert await runtime.ensure_active('sess-kids') is True
+    agent = runtime._table.get('sess-kids')  # pyright: ignore[reportPrivateUsage]
+    assert agent is not None
+    [note] = [b for b in agent.context.current_traj if '恢复' in str(b.content)]
+    assert '（child-a、child-b）' in str(note.content)
+    await runtime.shutdown()

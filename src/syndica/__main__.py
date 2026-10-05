@@ -16,6 +16,7 @@ from syndica.cli.main import (
     CliIO,
     CliOutcome,
     InspectRequest,
+    MemoryRequest,
     RunRequest,
     SessionsRequest,
     TraceRequest,
@@ -472,6 +473,9 @@ class _LazyHost:
 
     def sessions(self, request: SessionsRequest) -> str | CliOutcome:
         return self._get().sessions(request)
+
+    def memory(self, request: MemoryRequest) -> str | CliOutcome:
+        return self._get().memory(request)
 
     def close(self, *, interrupted: bool = False) -> None:
         if self._host is not None:

@@ -19,6 +19,7 @@ from syndica.cli.main import (
     PRUNE_KEEP,
     CliIO,
     InspectRequest,
+    MemoryRequest,
     RunRequest,
     SessionsRequest,
     TraceRequest,
@@ -55,6 +56,7 @@ class _Host:
         self.traces: list[TraceRequest] = []
         self.sessions_requests: list[SessionsRequest] = []
         self.chat_resumes: list[str | None] = []
+        self.memory_requests: list[MemoryRequest] = []
 
     def run_request(self, request: RunRequest) -> str:
         self.requests.append(request)
@@ -89,6 +91,10 @@ class _Host:
     def sessions(self, request: SessionsRequest) -> str:
         self.sessions_requests.append(request)
         return f'sessions:{request.action}:{request.name or ""}'
+
+    def memory(self, request: MemoryRequest) -> str:
+        self.memory_requests.append(request)
+        return f'memory:{request.action}'
 
     def trust_config(self, config: str, sha256: str | None) -> str:
         self.trusted.append((config, sha256))
@@ -1179,3 +1185,16 @@ def test_module_host_forwards_the_goal_to_the_runtime_host(monkeypatch: pytest.M
     lazy.open_chat('.syndica.yaml', goal='ship the report')
     lazy.close()
     assert goals == ['ship the report']
+
+
+def test_memory_routes_list_and_forget_with_the_global_switch() -> None:
+    host = _Host()
+    io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO())
+    assert main(['memory', 'list', '--global'], host=host, io=io) == 0
+    assert main(['memory', 'forget', '2'], host=host, io=io) == 0
+    assert main(['memory', 'forget', '--pending'], host=host, io=io) == 0
+    assert [(r.action, r.global_scope, r.index, r.pending) for r in host.memory_requests] == [
+        ('list', True, None, False),
+        ('forget', False, 2, False),
+        ('forget', False, None, True),
+    ]

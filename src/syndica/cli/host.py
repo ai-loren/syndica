@@ -81,6 +81,7 @@ from syndica.cli.main import (
     CliIO,
     CliOutcome,
     InspectRequest,
+    MemoryRequest,
     RunRequest,
     SessionsRequest,
     TraceRequest,
@@ -186,11 +187,14 @@ from syndica.kernel.acceptance import RubricStatus, Verdict, VerdictStatus
 from syndica.kernel.acceptance_module import AcceptanceModule
 from syndica.kernel.compaction_module import CompactionModule
 from syndica.kernel.memory_module import MemoryModule
+from syndica.kernel.memory_redaction import redacted_memory_sections
+from syndica.kernel.memory_types import MemoryScope
 from syndica.kernel.redaction import Redactor
 from syndica.kernel.scenario_schema import FROZEN_IMPLS
 from syndica.kernel.stores.file_artifact import FileArtifactStore
 from syndica.kernel.stores.file_memory import FileMemoryStore
 from syndica.kernel.stores.file_rubric import FileRubricStore
+from syndica.kernel.stores.memory_memory import MemoryConflict
 from syndica.kernel.tools import Delegate, Fork, KillAgent, QueryAgent, SendMessage
 
 __all__ = ['RuntimeCliHost', 'reference_modules']
@@ -704,6 +708,77 @@ async def _session_activate(store: FileRubricStore, sid: str, rubric_id: str) ->
         )
     await store.activate(sid, rubric_id)
     return f'已生效：{_rubric_line(rubric_id)}。此后每一次验收都按它查'
+
+
+async def _memory_list(store: FileMemoryStore, scope: MemoryScope, workspace: str | None) -> str:
+    """`memory list`：长期记忆的各段（召回注入的就是它们）与还没整理的短期记录。文字是模型写的，
+    转义、截短后再打印。"""
+    record = await store.read(scope, workspace)
+    pending = await store.entries(
+        scope, workspace, after_seq=record.through_seq if record is not None else 0
+    )
+    lines = [f'{scope.value} 层长期记忆（每个会话开头注入）：']
+    sections = record.sections if record is not None else []
+    for position, section in enumerate(sections, start=1):
+        lines.append(
+            f'  {position}. [{section.trust.value}] {_rubric_line(section.heading)}：'
+            f'{_rubric_line(section.text)[:160]}'
+        )
+    if not sections:
+        lines.append('  （没有）')
+    untrusted = sum(1 for entry in pending if entry.trust is TrustLevel.UNTRUSTED)
+    lines.append(f'还没整理的短期记录 {len(pending)} 条（不可信 {untrusted} 条）')
+    if sections or pending:
+        lines.append(
+            '忘掉一段：syndica memory forget <段号>；丢掉短期记录：syndica memory forget --pending'
+        )
+    return '\n'.join(lines)
+
+
+async def _memory_forget(
+    store: FileMemoryStore,
+    scope: MemoryScope,
+    workspace: str | None,
+    request: MemoryRequest,
+    redactor: Redactor,
+) -> str:
+    """`memory forget`：不可信的记忆一旦整理进长期层，就进了此后每个会话；这是人撤回它的入口
+    （M6 收口评审 M4）。按读到的版本重写（乐观并发）：这期间又被整理过就报冲突、不覆盖。"""
+    record = await store.read(scope, workspace)
+    sections = list(record.sections) if record is not None else []
+    through = record.through_seq if record is not None else 0
+    version = record.version if record is not None else 0
+    if request.pending:
+        pending = await store.entries(scope, workspace, after_seq=through)
+        if not pending:
+            return '没有还没整理的短期记录'
+        kept, through, done = (
+            sections,
+            pending[-1].seq,
+            f'丢掉了 {len(pending)} 条还没整理的短期记录',
+        )
+    else:
+        index = request.index
+        if index is None or not 1 <= index <= len(sections):
+            raise _config_error(
+                f'memory forget 的段号是 memory list 里的一个（1 到 {len(sections)}）',
+                f'收到 {index!r}',
+                '先 syndica memory list 看段号',
+            )
+        kept = [section for position, section in enumerate(sections, 1) if position != index]
+        done = f'忘掉了第 {index} 段：{_rubric_line(sections[index - 1].heading)}'
+    try:
+        await store.consolidate(
+            redacted_memory_sections(scope, workspace, kept, through, redactor),
+            expected_version=version,
+        )
+    except MemoryConflict:
+        raise _config_error(
+            '记忆在读与写之间没有被别人整理过',
+            '一个正在跑的会话刚刚又整理了一次',
+            '重新 syndica memory list 看段号，再忘一次',
+        ) from None
+    return done
 
 
 def _verdict_line(verdict: Verdict) -> str:
@@ -1459,6 +1534,18 @@ class RuntimeCliHost:
                 return self._runner.run(_session_activate(rubrics, name, request.rubric))
             raise AssertionError(f'sessions {request.action} 不该路由到 host.sessions')
 
+    def memory(self, request: MemoryRequest) -> str | CliOutcome:
+        """`syndica memory list | forget`：读 / 改 `.syndica/memory`。CLI 的工作区层以工作区根为键，
+        与 `memory` Module 写下的那一层是同一个。"""
+        with self._logging_to_stderr():
+            store = FileMemoryStore(memory_root(self._workspace_root))
+            scope = MemoryScope.GLOBAL if request.global_scope else MemoryScope.WORKSPACE
+            workspace = None if request.global_scope else str(self._workspace_root)
+            if request.action == 'list':
+                return self._runner.run(_memory_list(store, scope, workspace))
+            redactor = host_redactor(self._environ, self._config(request.config).redaction_rules)
+            return self._runner.run(_memory_forget(store, scope, workspace, request, redactor))
+
     def _trace_export(self, request: TraceRequest, store: FileTraceStore) -> CliOutcome:
         """`--otlp` 给的端点不带环境里的头；没给时用环境里的端点与头（与 run 结束时的导出同一套
         规则）。"""
@@ -1684,6 +1771,46 @@ class RuntimeCliHost:
             )
         return _optional_builtin(name)
 
+    async def _inspect_artifacts(self, request: InspectRequest) -> str:
+        """`artifacts list | show <id>`：工作区的产物索引（§7.4）。路径与 producer 是 Agent 选的，
+        转义后再打印。"""
+        root = artifact_root(self._workspace_root)
+        if not root.is_dir():
+            raise _config_error(
+                '这个工作区有产物索引（.syndica/artifacts）',
+                '还没有：只有装了 acceptance 的 run 才登记产物',
+                '在配置的 modules 里启用 acceptance 再跑一次',
+            )
+        store = FileArtifactStore(root)
+        if request.action == 'list':
+            lines: list[str] = []
+            for ref in await store.list():
+                versions = await store.versions_of(ref.id)
+                role = '交付物' if ref.is_deliverable else '中间产物'
+                lines.append(
+                    f'{_rubric_line(ref.id)}\t{role}\t{_rubric_line(ref.kind)}\t'
+                    f'{ref.version[:19]}\t{len(versions)} 个版本\t{_rubric_line(ref.producer)}'
+                )
+            return '\n'.join(lines) if lines else '（还没有登记过产物）'
+        name = request.name
+        if name is None:
+            raise AssertionError('artifacts show 没有 name')
+        versions = await store.versions_of(name)
+        if not versions:
+            raise _config_error(
+                f'artifacts show 指向一个登记过的产物 id（{_rubric_line(name)!r}）',
+                '索引里没有它',
+                '用 syndica artifacts list 看有哪些 id（形如 file:report.md）',
+            )
+        current = await store.get(name)
+        role = '交付物' if current is not None and current.is_deliverable else '中间产物'
+        lines = [f'{_rubric_line(name)}  {role}  {_rubric_line(versions[-1].path)}']
+        lines.extend(
+            f'  {position}. {ref.version}  {_rubric_line(ref.producer)}'
+            for position, ref in enumerate(versions, start=1)
+        )
+        return '\n'.join(lines)
+
     def _artifact_index(self, modules: Sequence[RuntimeModule]) -> FileArtifactStore | None:
         """装了验收 Module 才建产物索引：L1 靠登记触发，交付物标记也存在这里；别的 run 没有读者。"""
         if not any(module.name == 'acceptance' for module in modules):
@@ -1866,6 +1993,8 @@ class RuntimeCliHost:
         )
 
     def inspect(self, request: InspectRequest) -> str:
+        if request.resource == 'artifacts':
+            return self._runner.run(self._inspect_artifacts(request))
         if request.resource == 'modules':
             return self._inspect_modules(request)
         if request.resource == 'flags':

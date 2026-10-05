@@ -560,6 +560,33 @@ class RuntimeModule:
         )
 
 
+# 从严到松。恢复会话时比较快照与当前配置用（`_stricter_safety_flags`）。
+_HIGH_RISK_STRICTNESS = ('reject', 'ask', 'allow')
+
+
+def _stricter_safety_flags(  # pyright: ignore[reportUnusedFunction]
+    recorded: Mapping[str, FlagValue], current: Mapping[str, FlagValue]
+) -> dict[str, FlagValue]:
+    """快照里比当前更严的安全 Flag（恢复会话时作为这个 Agent 的覆盖值）：换一份更松的配置续跑，不能
+    放松一份当初在更严的设置下开始的会话。当前没声明的 key 不收（这个 Runtime 没装 safety 时照常恢
+    复）。
+
+    `max_wait_seconds` 的 0 是不限制，所以任何正数都比 0 严、正数之间越小越严。"""
+    overrides: dict[str, FlagValue] = {}
+    old, now = recorded.get('untrusted_high_risk'), current.get('untrusted_high_risk')
+    if (
+        old in _HIGH_RISK_STRICTNESS
+        and now in _HIGH_RISK_STRICTNESS
+        and _HIGH_RISK_STRICTNESS.index(cast(str, old))
+        < _HIGH_RISK_STRICTNESS.index(cast(str, now))
+    ):
+        overrides['untrusted_high_risk'] = old
+    waited, waits = recorded.get('max_wait_seconds'), current.get('max_wait_seconds')
+    if type(waited) is int and type(waits) is int and waited > 0 and (waits == 0 or waited < waits):
+        overrides['max_wait_seconds'] = waited
+    return overrides
+
+
 class SafetyModule(RuntimeModule):
     """等待墙钟与不可信高风险处置的 Flag 声明。"""
 
