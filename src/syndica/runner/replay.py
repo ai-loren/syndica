@@ -100,6 +100,7 @@ from syndica.kernel import (
     local_tools,
     register_builtins,
 )
+from syndica.kernel.compaction_module import CompactionModule
 from syndica.kernel.context import ArtifactRef
 from syndica.kernel.danger import (
     AllowAll,
@@ -113,6 +114,7 @@ from syndica.kernel.danger import (
 )
 from syndica.kernel.errors import ContractViolation
 from syndica.kernel.ids import StableKey, current_tool_call
+from syndica.kernel.memory_module import MemoryModule
 from syndica.kernel.redaction import Redactor, RuleRedactor
 from syndica.kernel.scenario_schema import (
     REPLAYED_TOOLS,
@@ -153,6 +155,8 @@ def _builtin_modules(llm: _ReplayLLM, fallbacks: str) -> dict[str, Callable[[], 
             {name.strip(): llm for name in fallbacks.split(',') if name.strip()}
         ),
         'prefix-drift': PrefixDriftModule,
+        'compaction': CompactionModule,
+        'memory': MemoryModule,
     }
 
 

@@ -35,6 +35,7 @@ __all__ = [
     'front_matter',
     'lock_workspace',
     'marker_verdict',
+    'memory_root',
     'path_key',
     'protected_matcher',
     'quoted',
@@ -55,6 +56,7 @@ _OWN = '.syndica'
 _HANDOFFS = 'handoffs'
 _TRACES = 'traces'
 _SESSIONS = 'sessions'
+_MEMORY = 'memory'
 # 公开契约里的标记行语法，逐行整行匹配（`\s` 按契约，含 `\r`、NBSP 与全角空格：只认空格与制表符
 # 时，CRLF 结尾的 `verdict: block` 不算数，后面一行 `verdict: pass` 就成了唯一的标记）。
 # 值按 ASCII 不分大小写：Unicode 的大小写折叠会让 `paſſ`（U+017F）也匹配上，front matter 就不再是
@@ -349,6 +351,13 @@ def session_root(root: Path) -> Path:
     `sessions` 这一级由 `FileSessionStore` 自己以 `O_NOFOLLOW` 打开。"""
     _checked_directory(root, root / _OWN)
     return root / _OWN / _SESSIONS
+
+
+def memory_root(root: Path) -> Path:
+    """`.syndica/memory` 该在的位置，缺了不建（与 `session_root` 同理）。`memory` 这一级由
+    `FileMemoryStore` 自己以 `O_NOFOLLOW` 打开。"""
+    _checked_directory(root, root / _OWN)
+    return root / _OWN / _MEMORY
 
 
 def write_handoff(root: Path, name: str, text: str, redactor: Redactor) -> Path:

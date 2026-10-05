@@ -61,6 +61,7 @@ from syndica.cli.handoff import (
     exit_code_of,
     front_matter,
     lock_workspace,
+    memory_root,
     path_key,
     protected_matcher,
     render,
@@ -179,8 +180,11 @@ from syndica.kernel import (
     local_tools,
     register_builtins,
 )
+from syndica.kernel.compaction_module import CompactionModule
+from syndica.kernel.memory_module import MemoryModule
 from syndica.kernel.redaction import Redactor
 from syndica.kernel.scenario_schema import FROZEN_IMPLS
+from syndica.kernel.stores.file_memory import FileMemoryStore
 from syndica.kernel.tools import Delegate, Fork, KillAgent, QueryAgent, SendMessage
 
 __all__ = ['RuntimeCliHost', 'reference_modules']
@@ -393,8 +397,16 @@ def reference_modules() -> tuple[RuntimeModule, ...]:
 
 
 def _optional_builtin(name: str) -> RuntimeModule:
-    """按名字启用的内置 Module。`retry` 没有备用模型：CLI 不给 fallbacks。"""
-    return RetryModule({}) if name == 'retry' else PrefixDriftModule()
+    """按名字启用的内置 Module。`retry` 没有备用模型：CLI 不给 fallbacks。记忆这里用默认（内存
+    store、无工作区），只供 `flags list` / 参考文档读声明；真正跑时 `_configured_modules` 换成带
+    工作区与 FileMemoryStore 的那一份。"""
+    if name == 'retry':
+        return RetryModule({})
+    if name == 'compaction':
+        return CompactionModule()
+    if name == 'memory':
+        return MemoryModule()
+    return PrefixDriftModule()
 
 
 def _model_names(config: CliConfig) -> tuple[str, ...]:
@@ -1562,11 +1574,22 @@ class RuntimeCliHost:
             workspace_root=self._workspace_root, environment=environment, redactor=redactor
         )
         return tuple(
-            _optional_builtin(name)
+            self._builtin_module(name, redactor)
             if name in OPTIONAL_BUILTINS
             else load_module(entries[name], host, redactor)
             for name in names
         )
+
+    def _builtin_module(self, name: str, redactor: Redactor) -> RuntimeModule:
+        """可选内置 Module 的「跑时」那一份：记忆要带工作区与 FileMemoryStore（跨会话持久化），其余
+        与参考文档那份相同。记忆的脱敏器用宿主这份（含用户规则），落盘前逐叶脱敏。"""
+        if name == 'memory':
+            return MemoryModule(
+                workspace=str(self._workspace_root),
+                store=FileMemoryStore(memory_root(self._workspace_root)),
+                redactor=redactor,
+            )
+        return _optional_builtin(name)
 
     def _module_records(
         self, modules: Sequence[RuntimeModule], config: CliConfig

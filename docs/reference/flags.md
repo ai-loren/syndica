@@ -15,3 +15,9 @@
 | `llm_retry_backoff_ms` | `retry` | int | `0` | 0 到 60000 | — | 每次重试或故障转移调用前等待的毫秒数 |
 | `llm_fallbacks` | `retry` | str | `""` | — | 只收空值：按名字启用的 retry 没有备用模型 | 按顺序各尝试一次的 fallback LLM 名称，使用逗号分隔 |
 | `prefix_drift_detection` | `prefix-drift` | bool | `true` | — | — | 逐轮检测模型请求的缓存前缀是否被改写 |
+| `compaction_strategy` | `compaction` | str | `"off"` | `"off"` / `"rule_based"` / `"pruning"` / `"summary"` | — | 压缩策略：off / rule_based / pruning / summary |
+| `compaction_threshold_percent` | `compaction` | int | `80` | 1 到 99 | — | 占用率到上下文窗口的百分之几时提前触发压缩 |
+| `compaction_target_percent` | `compaction` | int | `50` | 1 到 99 | — | 压缩压到上下文窗口的百分之几（必须小于触发阈值，迟滞才成立） |
+| `compaction_context_tokens` | `compaction` | int | `128000` | ≥ 1 | — | 模型不报上下文窗口时，按多少 token 估算窗口大小 |
+| `memory_recall` | `memory` | bool | `true` | — | — | cycle 起点是否把长期记忆注入历史 |
+| `memory_consolidate_after` | `memory` | int | `50` | ≥ 1 | — | 短期记忆累积多少条后整理成一段长期记忆 |

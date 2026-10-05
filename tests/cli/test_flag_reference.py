@@ -50,6 +50,12 @@ def test_the_reference_document_matches_an_independent_golden():
         '`llm_retry_backoff_ms`',
         '`llm_fallbacks`',
         '`prefix_drift_detection`',
+        '`compaction_strategy`',
+        '`compaction_threshold_percent`',
+        '`compaction_target_percent`',
+        '`compaction_context_tokens`',
+        '`memory_recall`',
+        '`memory_consolidate_after`',
     ]
     by_key = {row[0]: row for row in rows}
     assert by_key['`untrusted_high_risk`'] == [
@@ -68,6 +74,8 @@ def test_the_reference_document_matches_an_independent_golden():
         '—',
         '只收空值：按名字启用的 retry 没有备用模型',
     ]
+    assert by_key['`compaction_strategy`'][1:4] == ['`compaction`', 'str', '`"off"`']
+    assert by_key['`memory_consolidate_after`'][1:4] == ['`memory`', 'int', '`50`']
 
 
 def _module(name: str, *keys: str) -> RuntimeModule:
