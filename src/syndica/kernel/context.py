@@ -106,6 +106,11 @@ class Context:
             )
         self._blocks.append(block)
 
+    def _replace_traj(self, blocks: Sequence[ContextBlock]) -> None:
+        """整段重写轨迹（压缩走的内核接口，spec §8.8）。**不是 append**：压缩改历史，不逐块追加
+        （那会插进一次调用与它结果之间、被 provider 拒），也不让 hook 就地改。只内核压缩步骤调。"""
+        self._blocks[:] = list(blocks)
+
 
 # 此刻在跑的这次工具调用的溯源结论（执行器在 `tool.execute` 期间设）。工具写下的文件版本记成它：
 # 读过不可信内容之后写的文件，此后被读到时仍是不可信的（spec §12.2 第 2 条）。不在工具调用里是

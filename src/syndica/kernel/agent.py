@@ -78,6 +78,11 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
+from syndica.kernel.compaction import (
+    CompactionController,
+    apply_compaction,
+    traj_tokens,
+)
 from syndica.kernel.context import (
     Context,
     ContextBlock,
@@ -430,6 +435,9 @@ class BaseAgent:
         self._gate_attached = False
         # 槽的 extra_tools：槽工厂解析好挂在这里，`Runtime.spawn` 在 Module 工具之后装（M4 D2）。
         self._slot_tools: tuple[str, str, dict[str, Tool]] | None = None
+        # 压缩控制器（可选）：由压缩 Module 的 agent 插件经 `_attach_compaction` 装上。turn 边界与
+        # 超限兜底时内核调它；没装就没有压缩（spec §8.8）。
+        self._compaction: CompactionController | None = None
 
     def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
         """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
@@ -656,6 +664,59 @@ class BaseAgent:
         self._gate = gate
         self._gate_attached = True
 
+    def _attach_compaction(self, controller: CompactionController) -> None:
+        """装上压缩控制器（压缩 Module 的 agent 插件调）。turn 边界与超限兜底由内核调它，改写轨迹
+        走内核接口（spec §8.8）——Module 不直接碰 `Context`。"""
+        self._compaction = controller
+
+    async def _maybe_compact(self, ctx: Context, *, trigger: str, force: bool = False) -> bool:
+        """turn 边界 / 超限兜底的内核压缩步骤。交回是否真压了。
+
+        改写只在这里发生、走 `Context._replace_traj`（不经 append、不让 hook 就地改，spec §8.8）。
+        五条不变量与信任单调由 `apply_compaction` 兜底，策略洗不白。压缩点记入 trace 与事件，否则
+        「这一轮为什么突然变贵」会被误判成前缀漂移缺陷（spec §8.8）。
+        """
+        controller = self._compaction
+        if controller is None:
+            return False
+        before = ctx.current_traj
+        tokens_before = traj_tokens(before)
+        if not force and not controller.should_compact(tokens_before):
+            return False
+        request = controller.build_request(before)
+        result = await controller.strategy.compact(request)
+        final = apply_compaction(request, result)
+        if final == before:
+            controller.settle(tokens_now=tokens_before, changed=False)
+            return False
+        ctx._replace_traj(final)  # pyright: ignore[reportPrivateUsage]
+        tokens_after = traj_tokens(final)
+        self._tracing.event(
+            'compaction',
+            {
+                'trigger': trigger,
+                'blocks_before': len(before),
+                'blocks_after': len(final),
+                'tokens_before': tokens_before,
+                'tokens_after': tokens_after,
+                'note': result.note,
+            },
+        )
+        await self._emit(
+            'compaction',
+            {
+                'trigger': trigger,
+                'blocks_before': len(before),
+                'blocks_after': len(final),
+                'tokens_before': tokens_before,
+                'tokens_after': tokens_after,
+            },
+        )
+        controller.settle(tokens_now=tokens_after, changed=True)
+        if controller.on_compacted is not None:
+            controller.on_compacted()
+        return True
+
     def get_system_prompt(self) -> str:
         """必须逐轮返回字节一致的结果：SP 变一个字节，该会话此后所有请求缓存全失效。"""
         return self.options.system_prompt
@@ -748,6 +809,9 @@ class BaseAgent:
                 stop_reason = await self._one_turn(ctx, turn, decision, tool_defs)
             if stop_reason is not None:
                 return stop_reason
+            # turn 边界的内核压缩步骤：阈值提前触发（主路径）或 Agent 主动要求（spec §8.8）。在 turn
+            # span 之外、下一轮 before_turn 之前——压缩不属于任何一轮、也不该与门抢邮箱。
+            await self._maybe_compact(ctx, trigger='threshold')
         ctx.stop_reason = StopReason.MAX_TURNS
         return StopReason.MAX_TURNS
 
@@ -916,6 +980,10 @@ class BaseAgent:
                 attempt.observe(reply)
                 return reply, False
         except ContextOverflowError as exc:
+            # 超限兜底（spec §8.8 第二条触发路径）：先让内核压缩步骤压一把，压下去了就本轮不产出、
+            # 下一轮用压缩后的轨迹重试——走在 hook 之前，因为改写只能由内核做（§8.8）。
+            if await self._maybe_compact(ctx, trigger='overflow', force=True):
+                return None
             outcome = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
                 Junction.CONTEXT_OVERFLOW, ctx=ctx, request=request, error=exc
             )

@@ -137,7 +137,7 @@ def _exchange(tag: str, *, size: int = 40) -> list[ContextBlock]:
 
 async def test_rule_based_keeps_recent_turns_and_drops_old_under_budget() -> None:
     blocks = [*_exchange('a'), *_exchange('b'), *_exchange('c'), *_exchange('d')]
-    request = CompactionRequest(blocks=blocks, budget_tokens=30)
+    request = CompactionRequest(blocks=blocks, budget_tokens=48)
     result = await RuleBasedCompaction(min_keep_turns=2).compact(request)
     kept_text = ' '.join(str(b.content) for b in result.kept)
     assert 'ask-a' not in kept_text and 'ask-b' not in kept_text
@@ -217,7 +217,7 @@ async def test_summary_folds_early_content_into_one_signed_block() -> None:
     assert seen and seen[0] > 0  # 摘要器真的被喂了早期内容
     digest = next(b for b in result.kept if kind_of(b) is HistoryKind.COMPACTION)
     assert 'EARLY-DIGEST' in str(digest.content)
-    assert 'ask-c' in ' '.join(str(b.content) for b in result.kept)  # 最近一轮留着
+    assert 'ans-c' in ' '.join(str(b.content) for b in result.kept)  # 最近一轮留着
     apply_compaction(request, result)
 
 

@@ -30,10 +30,11 @@ from syndica.kernel.context import (
     provenance_of,
     strictest_trust,
 )
-from syndica.kernel.errors import ContractViolation
+from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.history_blocks import HistoryKind, kind_of, signed_block
 
 __all__ = [
+    'CompactionController',
     'CompactionRequest',
     'CompactionResult',
     'CompactionStrategy',
@@ -41,6 +42,7 @@ __all__ = [
     'RuleBasedCompaction',
     'SummaryCompaction',
     'apply_compaction',
+    'traj_tokens',
 ]
 
 # 摘要型压缩的一次性调用句柄：内核给，关缓存写入、记 replay（见阶段五 aux_calls 槽）。
@@ -167,13 +169,20 @@ def _estimate_tokens(block: ContextBlock) -> int:
     return (size + 3) // 4
 
 
-def _exchange_bounds(blocks: Sequence[ContextBlock]) -> list[tuple[int, int]]:
-    """把轨迹切成「交流」：每个真实 user 消息（非内核署名历史块）起一段，到下一个这样的消息前。
-    署名块（env_fact / memory / 恢复提示 / 压缩标记）不另起段，归前一段——它们不是对话轮次。"""
+def _turn_bounds(blocks: Sequence[ContextBlock]) -> list[tuple[int, int]]:
+    """把轨迹切成「轮」：每个 assistant 回复起一段（它的 tool 结果归这一段），每条真实 user 消息也起
+    一段。署名块（env_fact / memory / 恢复提示 / 压缩标记）不另起段。这样单条 query 里的多轮工具调用
+    也分得开——否则整段只有一条 user 消息、算作一轮，规则型压缩压不动。"""
     if not blocks:
         return []
     starts = sorted(
-        {0} | {i for i, b in enumerate(blocks) if b.role == 'user' and kind_of(b) is None}
+        {0}
+        | {
+            index
+            for index, block in enumerate(blocks)
+            if block.role == 'assistant'
+            or (block.role == 'user' and kind_of(block) is None)
+        }
     )
     return [
         (start, starts[index + 1] if index + 1 < len(starts) else len(blocks))
@@ -242,7 +251,7 @@ def _materialize(
 
 
 def _floor_start(blocks: Sequence[ContextBlock], min_keep_turns: int) -> int:
-    exchanges = _exchange_bounds(blocks)
+    exchanges = _turn_bounds(blocks)
     if not exchanges:
         return 0
     return exchanges[max(0, len(exchanges) - min_keep_turns)][0]
@@ -261,7 +270,7 @@ class RuleBasedCompaction:
         protected = request.protected
         floor_from = _floor_start(blocks, self._min_keep_turns)
         keep: set[int] = set(protected) | set(range(floor_from, len(blocks)))
-        for start, end in reversed(_exchange_bounds(blocks)):
+        for start, end in reversed(_turn_bounds(blocks)):
             if start >= floor_from:
                 continue
             trial = keep | set(range(start, end))
@@ -337,3 +346,94 @@ class SummaryCompaction:
         return CompactionResult(
             kept=kept, dropped=dropped, note=f'摘要型压缩：{len(dropped)} 块早期内容摘成 1 块'
         )
+
+
+# ---- 触发策略（spec §8.8：三条触发路径）----
+
+
+def traj_tokens(blocks: Sequence[ContextBlock]) -> int:
+    """整段轨迹的确定性 token 估算——阈值触发与预算都用它，同一把尺子。"""
+    return sum(_estimate_tokens(block) for block in blocks)
+
+
+def _protected_indices(blocks: Sequence[ContextBlock]) -> frozenset[int]:
+    """压缩必须原样留的块（spec §8.8 不变量 3/4，P17 用「任务消息 + 当前轮」做 Goal 代理）：
+
+    - 已注入的环境事实（`ENV_FACT`）与恢复提示（`RESUME_NOTE`，它携带整份溯源）；
+    - 第一条真实 user 消息（任务 / Goal 代理）；
+    - 最后一条真实 user 消息（当前这一轮的输入）。
+
+    刻意不硬保整条当前轮：超限兜底时要能压掉它，否则兜底对「当前轮自己撑爆」无能为力。
+    """
+    protected: set[int] = {
+        index
+        for index, block in enumerate(blocks)
+        if kind_of(block) in (HistoryKind.ENV_FACT, HistoryKind.RESUME_NOTE)
+    }
+    user_turns = [
+        index for index, block in enumerate(blocks)
+        if block.role == 'user' and kind_of(block) is None
+    ]
+    if user_turns:
+        protected.add(user_turns[0])
+        protected.add(user_turns[-1])
+    return frozenset(protected)
+
+
+@dataclass
+class CompactionController:
+    """一个 Agent 的压缩策略与触发配置。纯配置 + 迟滞 / 退避判定，不碰 Agent——改写由内核在 turn
+    边界调（spec §8.8：改写走内核接口）。
+
+    迟滞：`target_tokens < threshold_tokens`，压到 target 以下，下一轮就不会立刻再触发。
+    退避：一次压缩压不到阈值以下时记下当时的占用，占用不再增长就不反复空压（P18）。
+    """
+
+    strategy: CompactionStrategy
+    threshold_tokens: int
+    target_tokens: int
+    summarize: Summarize | None = None
+    on_compacted: Callable[[], None] | None = None
+    _requested: bool = field(default=False, init=False)
+    _stuck_at: int | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.threshold_tokens < 1 or self.target_tokens < 1:
+            raise ConfigError(
+                expected='compaction 的 threshold_tokens 与 target_tokens 都是正整数',
+                received=f'threshold={self.threshold_tokens!r} target={self.target_tokens!r}',
+                next_action='给正的 token 预算；百分比在 Module 里换算成 token 再传进来',
+            )
+        if self.target_tokens >= self.threshold_tokens:
+            raise ConfigError(
+                expected='compaction 的 target_tokens 严格小于 threshold_tokens（迟滞才成立）',
+                received=f'target={self.target_tokens} >= threshold={self.threshold_tokens}',
+                next_action='把目标占用调到阈值以下；否则压完仍在阈值上、每轮都重触发',
+            )
+
+    def request(self) -> None:
+        """Agent 主动要求下一次 turn 边界压缩（`Compact` 工具走这条，只置位）。"""
+        self._requested = True
+
+    def should_compact(self, tokens: int) -> bool:
+        if self._requested:
+            return True
+        if tokens <= self.threshold_tokens:
+            return False
+        if self._stuck_at is not None and tokens <= self._stuck_at:
+            return False
+        return True
+
+    def build_request(self, blocks: Sequence[ContextBlock]) -> CompactionRequest:
+        return CompactionRequest(
+            blocks=list(blocks),
+            budget_tokens=self.target_tokens,
+            protected=_protected_indices(blocks),
+            summarize=self.summarize,
+        )
+
+    def settle(self, *, tokens_now: int, changed: bool) -> None:
+        """一次 turn 边界压缩之后更新迟滞 / 退避状态。`changed=False`（策略压不动）也要记，
+        免得每一轮都重试一次空压。"""
+        self._requested = False
+        self._stuck_at = None if changed and tokens_now <= self.threshold_tokens else tokens_now
