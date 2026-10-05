@@ -284,6 +284,8 @@ _RUNTIME_INIT: tuple[tuple[str, str, bool], ...] = (
     ('tracer', 'KEYWORD_ONLY', True),
     ('untrusted_output_modules', 'KEYWORD_ONLY', True),
     ('workspace', 'KEYWORD_ONLY', True),
+    ('sessions', 'KEYWORD_ONLY', True),
+    ('redactor', 'KEYWORD_ONLY', True),
 )
 _RUNTIME_SPAWN: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),

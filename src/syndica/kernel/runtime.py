@@ -114,6 +114,7 @@ import copy
 import inspect
 import json
 import logging
+import time
 import weakref
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
@@ -177,6 +178,10 @@ from syndica.kernel.modules import (
 )
 from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback
+from syndica.kernel.protocols.session import SessionStore
+from syndica.kernel.redaction import Redactor, RuleRedactor
+from syndica.kernel.session_redaction import redacted_record
+from syndica.kernel.session_types import SessionMeta, SessionRecord, SessionStatus
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tools import orchestration_tools
 from syndica.kernel.trace import AttributeValue, SpanKind
@@ -1022,6 +1027,8 @@ class Runtime:
         tracer: Tracer | None = None,
         untrusted_output_modules: Sequence[str] = (),
         workspace: WorkspaceRouter | None = None,
+        sessions: SessionStore | None = None,
+        redactor: Redactor | None = None,
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
@@ -1033,6 +1040,10 @@ class Runtime:
                 next_action='用 WorkspaceRouter(LocalWorkspace(...)) 包一层再交进来',
             )
         self._workspace = workspace
+        self._sessions = sessions
+        # 存盘在落盘前过脱敏（spec §12 的收口）：Runtime 持宿主那份 Redactor。没交时退回只认内建
+        # 规则的 RuleRedactor——内建规则仍挡常见密钥，宿主自定义的规则要显式交进来才生效。
+        self._redactor: Redactor = redactor if redactor is not None else RuleRedactor()
         self._ids: IdSource = RandomIds() if ids is None else _checked_ids(ids)
         checked_tracer = None if tracer is None else _checked_tracer(tracer)
         # 既不在工具调用里、也没有属主的 spawn 与 send 是宿主自己的代码，按宿主的第几次取键；经拓扑
@@ -1944,6 +1955,9 @@ class Runtime:
         await self.broker.remove_queue(agent_id)
         # 邮箱里那些随队列一起没了，不会再被消费；暂存在控制块里的随唤醒注入，留着它们的来源。
         self._tracing.forget_receiver(agent_id, keep=slot.control.deferred_ids())
+        # 周期收尾存一次会话（spec §15）：轨迹此刻成对、工具段已闭合，是恢复要续上的那个干净点。
+        # 排在拆树之前，EXIT 的 Agent 也留下最后一份；存盘失败记 ERROR 不抛，不让收尾崩在存盘上。
+        await self._checkpoint(agent_id)
         if slot.exit_mode is ExitMode.EXIT:
             await self._destroy_tree(agent_id, operation='exit')
             return
@@ -2025,6 +2039,79 @@ class Runtime:
             if ended is not None:
                 return ended
         return agent.context
+
+    async def _checkpoint_all_sessions(self) -> None:
+        """关机前把所有会话根 Agent 各存一次。`_checkpoint` 自带 `session_id` 为空就跳过的判定，
+        因此这里对表里每个 Agent 都调一遍；root-only 下至多一个会话根，开销可忽略。"""
+        if self._sessions is None:
+            return
+        for agent_id in list(self._table.agent_ids()):
+            await self._checkpoint(agent_id)
+
+    async def _checkpoint(self, agent_id: str) -> None:
+        """把一个会话根 Agent 的当前轨迹存进 SessionStore（spec §15 的会话持久化）。
+
+        **内部调用，不挂 observable 钩子**：存盘失败是宿主要知道的运维事件，而钩子机制会把回调
+        抛的异常整个丢弃（见 hooks.center 文档）。因此失败在这里记 ERROR 并发一条事件，既不静默
+        吞、也不往上抛——收尾路径崩在存盘上会连累同一棵树里别的 Agent 的拆除。
+
+        只存 `session_id` 非空的 Agent（宿主把它标成会话根，约定 sid = session_id）；没配
+        SessionStore 时直接返回。落盘前过 Runtime 持的 Redactor（spec §12 的落盘收口）。
+        """
+        store = self._sessions
+        if store is None:
+            return
+        agent = self._table.get(agent_id)
+        if agent is None:
+            return
+        info = await self.registry.get(agent_id)
+        if info is None or info.session_id is None:
+            return
+        try:
+            record = await self._session_record(store, info.session_id, agent, info)
+            await store.save(info.session_id, redacted_record(record, self._redactor))
+        except Exception:
+            logger.exception(
+                '期望: 会话 %s 在周期收尾时存盘成功。'
+                ' 实际: SessionStore.save 抛了异常，这一次的轨迹没有落盘。'
+                ' 下一步: 看后端是否可写（磁盘满 / 权限 / 远端不可达）；这次存盘丢了，恢复会回到'
+                '上一个存过的点，在途的改动不受影响。',
+                info.session_id,
+            )
+            self._tracing.event(
+                'session.checkpoint_failed',
+                {'session.id': info.session_id, 'agent.id': agent_id},
+            )
+
+    async def _session_record(
+        self, store: SessionStore, sid: str, agent: BaseAgent, info: AgentInfo
+    ) -> SessionRecord:
+        """从一个存活 Agent 与它的登记信息拼一份 SessionRecord。
+
+        `created_at` / `title` / `archived` / `last_trace` 从已存的元数据接着用：`save` 覆盖整条
+        记录，不接住这几个由更早的存盘或一次 archive 定下的字段，每次收尾就会把它们清掉。
+        """
+        existing = await store.load_meta(sid)
+        now = time.time()
+        meta = SessionMeta(
+            sid=sid,
+            title=existing.title if existing is not None else '',
+            agent=info.name,
+            status=SessionStatus.ACTIVE,
+            turns=agent._current_turn,  # pyright: ignore[reportPrivateUsage]
+            archived=existing.archived if existing is not None else 0,
+            last_trace=existing.last_trace if existing is not None else None,
+            created_at=existing.created_at if existing is not None else now,
+            updated_at=now,
+        )
+        return SessionRecord(
+            meta=meta,
+            content=agent.context.current_traj,
+            system_prompt=agent.get_system_prompt(),
+            model=agent.options.llm.config.model,
+            tools=list(agent.options.tools),
+            flags=dict(info.flags),
+        )
 
     async def _wait_in_turn(self, agent_id: str, target_id: str) -> _InTurnWaitResult:
         """代表一个正在干活的 Agent 等另一个 Agent 的事件循环结束（供编排工具使用）。
@@ -3476,6 +3563,10 @@ class Runtime:
         # 置位在 gather 之前：与本次关机并发的 spawn 既赶不上取消名单、事件又发不出去。
         self._closed = True
         self.broker.off_missing_queue(self._on_missing_queue)
+        # 取消驱动任务之前存一次会话（spec §15 的 shutdown/SIGINT 存盘）：取消后非取消路径的 _finish
+        # 不再跑，而此刻 Agent 还活着、轨迹读得到。还在一轮中间的 Agent 存下的尾部可能有未配对的
+        # 工具调用，恢复按既有的未配对批次修复截掉。
+        await self._checkpoint_all_sessions()
         tasks = [
             task
             for agent_id in self._table.agent_ids()
