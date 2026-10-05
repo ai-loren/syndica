@@ -66,6 +66,7 @@ from syndica.cli.handoff import (
     render,
     reviewer_verdict,
     rewrite_handoff,
+    session_root,
     status_of,
     trace_directory,
     trace_root,
@@ -78,6 +79,7 @@ from syndica.cli.main import (
     CliOutcome,
     InspectRequest,
     RunRequest,
+    SessionsRequest,
     TraceRequest,
 )
 from syndica.cli.modules import (
@@ -139,6 +141,7 @@ from syndica.kernel import (
     DangerPolicy,
     ExecResult,
     ExitMode,
+    FileSessionStore,
     FileTaint,
     FileTraceStore,
     HookResult,
@@ -156,6 +159,8 @@ from syndica.kernel import (
     Runtime,
     RuntimeModule,
     SafetyModule,
+    SessionMeta,
+    SessionStore,
     SpanStatus,
     StopReason,
     Subscription,
@@ -573,6 +578,62 @@ def _after_message(context: Context, message_id: str | None) -> int:
 
 def _config_error(expected: str, received: str, next_action: str) -> ConfigError:
     return ConfigError(expected=expected, received=received, next_action=next_action)
+
+
+def _session_time(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=UTC).strftime('%Y-%m-%d %H:%M:%SZ')
+
+
+def _session_absent(sid: str) -> ConfigError:
+    return _config_error(
+        f'会话 {sid} 在 .syndica/sessions 里',
+        '没有这个会话',
+        '用 sessions list 看现有会话 id（id 就是根 Agent 的 id）',
+    )
+
+
+def _session_row(meta: SessionMeta) -> str:
+    title = meta.title or '(无标题)'
+    return (
+        f'{_session_time(meta.updated_at)}  {meta.sid}  {meta.status.value}  '
+        f'{meta.agent}  turns={meta.turns}  {title}'
+    )
+
+
+async def _sessions_list(store: SessionStore) -> str:
+    metas = await store.list_metas()
+    if not metas:
+        return '（没有会话）'
+    return '\n'.join(_session_row(meta) for meta in metas)
+
+
+async def _sessions_show(store: SessionStore, sid: str) -> str:
+    record = await store.load(sid)
+    if record is None:
+        raise _session_absent(sid)
+    meta = record.meta
+    lines = [
+        f'会话 {meta.sid}',
+        f'  agent:   {meta.agent}',
+        f'  状态:    {meta.status.value}',
+        f'  轮数:    {meta.turns}',
+        f'  model:   {record.model}',
+        f'  tools:   {", ".join(record.tools)}',
+        f'  创建:    {_session_time(meta.created_at)}',
+        f'  更新:    {_session_time(meta.updated_at)}',
+        f'  归档数:  {meta.archived}',
+        f'  块数:    {len(record.content)}',
+    ]
+    if meta.title:
+        lines.insert(1, f'  标题:    {meta.title}')
+    return '\n'.join(lines)
+
+
+async def _sessions_rm(store: SessionStore, sid: str) -> str:
+    if not await store.exists(sid):
+        raise _session_absent(sid)
+    await store.delete(sid)
+    return f'已删除会话 {sid}'
 
 
 def _validated_request(request: RunRequest) -> dict[str, str]:
@@ -1276,6 +1337,22 @@ class RuntimeCliHost:
                 return self._trace_export(request, store)
             return self._trace_replay(request, store)
 
+    def sessions(self, request: SessionsRequest) -> str | CliOutcome:
+        """`syndica sessions list/show/rm`：读 / 删 `.syndica/sessions`。目录是 Agent 改得到的，告警
+        转义后进 stderr。`resume` 不走这里——它是交互 chat，由 main 路由进 `_chat`。"""
+        with self._logging_to_stderr():
+            store = FileSessionStore(session_root(self._workspace_root))
+            if request.action == 'list':
+                return self._runner.run(_sessions_list(store))
+            name = request.name
+            if name is None:
+                raise AssertionError('sessions show/rm 没有 name')
+            if request.action == 'show':
+                return self._runner.run(_sessions_show(store, name))
+            if request.action == 'rm':
+                return self._runner.run(_sessions_rm(store, name))
+            raise AssertionError(f'sessions {request.action} 不该路由到 host.sessions')
+
     def _trace_export(self, request: TraceRequest, store: FileTraceStore) -> CliOutcome:
         """`--otlp` 给的端点不带环境里的头；没给时用环境里的端点与头（与 run 结束时的导出同一套
         规则）。"""
@@ -1725,11 +1802,17 @@ class RuntimeCliHost:
         trace: str | None = None,
         argv: Sequence[str] = (),
         trusted_output: Sequence[str] = (),
+        resume: str | None = None,
     ) -> str:
         with self._logging_to_stderr():
             return self._runner.run(
                 self._open_chat(
-                    config, max_turns, trace=trace, argv=argv, trusted_output=trusted_output
+                    config,
+                    max_turns,
+                    trace=trace,
+                    argv=argv,
+                    trusted_output=trusted_output,
+                    resume=resume,
                 )
             )
 
@@ -2299,6 +2382,7 @@ class RuntimeCliHost:
         trace: str | None,
         argv: Sequence[str],
         trusted_output: Sequence[str],
+        resume: str | None = None,
     ) -> str:
         config = self._trusted_config(path)
         catalog = _turn_capped(config.catalog, max_turns)
@@ -2334,6 +2418,9 @@ class RuntimeCliHost:
                 self._environ,
                 configured=self._configured_modules(config, environment.values),
             )
+            # 会话是落盘的 run 产物，和 trace 一样受「关了录制就不往磁盘写」约束。但 resume 是显式续
+            # 一份已存的会话，无论录制开没开都要有 SessionStore 才读得到、续得上。
+            want_sessions = recording.recorder is not None or resume is not None
             runtime = Runtime(
                 agents=factories,
                 orchestration=_ORCHESTRATION,
@@ -2345,17 +2432,32 @@ class RuntimeCliHost:
                 tracer=recording.recorder,
                 untrusted_output_modules=self._untrusted_output(config, trusted_output),
                 workspace=workspace,
+                sessions=(
+                    FileSessionStore(session_root(self._workspace_root)) if want_sessions else None
+                ),
+                redactor=redactor if want_sessions else None,
             )
             subscription = runtime.events.subscribe()
             pump = asyncio.create_task(
                 self._event_pump(runtime, subscription),
                 name='cli-chat-human-events',
             )
-            factory = runtime.agent_factory('Orchestrator')
-            if factory is None:
-                catalog.get('Orchestrator')
-                raise AssertionError('catalog.get returned without an Orchestrator runtime factory')
-            agent_id = await runtime.spawn(factory, exit_mode=ExitMode.ZOMBIE)
+            if resume is not None:
+                if not await runtime.ensure_active(resume):
+                    raise _config_error(
+                        'sessions resume 指向 .syndica/sessions 里已存在的会话',
+                        f'收到 session={resume!r}；没有这个会话、或它的角色没登记',
+                        '用 sessions list 看现有会话 id；id 是根 Agent 的 id',
+                    )
+                agent_id = resume
+            else:
+                factory = runtime.agent_factory('Orchestrator')
+                if factory is None:
+                    catalog.get('Orchestrator')
+                    raise AssertionError(
+                        'catalog.get returned without an Orchestrator runtime factory'
+                    )
+                agent_id = await runtime.spawn(factory, exit_mode=ExitMode.ZOMBIE, session=True)
             self._sessions[agent_id] = _ChatSession(
                 config=path,
                 runtime=runtime,
@@ -2433,8 +2535,9 @@ class RuntimeCliHost:
             return answer
         raise _config_error(
             'run --session 指向当前 chat 进程里的活动 Agent',
-            (f'收到 session={target!r}；当前进程没有该目标，且里程碑 1 没有 SessionStore'),
-            '在 chat 中先输入 :agents 查看当前目标；跨进程恢复留到里程碑 6',
+            f'收到 session={target!r}；当前进程没有这个活动目标',
+            '跨进程续跑一份落盘会话用 `sessions resume <id>`（交互）；'
+            '在 chat 里先输入 :agents 看当前进程的活动目标',
         )
 
     async def _active_agents(self) -> str:
@@ -2644,6 +2747,16 @@ class RuntimeCliHost:
                     ids=None if tracer is None else tracer.ids,
                     untrusted_output_modules=untrusted,
                     workspace=workspace,
+                    sessions=(
+                        FileSessionStore(session_root(self._workspace_root))
+                        if tracer is not None
+                        else None
+                    ),
+                    redactor=(
+                        host_redactor(self._environ, config.redaction_rules)
+                        if tracer is not None
+                        else None
+                    ),
                 )
                 if tracer is not None and tracer.level is not TraceLevel.STRUCTURE:
                     records = self._module_records(modules, config)
@@ -2721,6 +2834,7 @@ class RuntimeCliHost:
                             factory,
                             query=prompt,
                             exit_mode=ExitMode.ZOMBIE,
+                            session=True,
                         )
                     context = await self._wait_with_pump(runtime, agent_id, pump)
                     if stops is not None:

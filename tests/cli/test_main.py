@@ -14,7 +14,15 @@ from pathlib import Path
 
 import pytest
 
-from syndica.cli.main import PRUNE_KEEP, CliIO, InspectRequest, RunRequest, TraceRequest, main
+from syndica.cli.main import (
+    PRUNE_KEEP,
+    CliIO,
+    InspectRequest,
+    RunRequest,
+    SessionsRequest,
+    TraceRequest,
+    main,
+)
 
 REPO_ROOT = Path(__file__).parents[2]
 _MODEL_ENV = {
@@ -44,6 +52,8 @@ class _Host:
         self.chat_trusted_output: list[tuple[str, ...]] = []
         self.chat_traces: list[tuple[str | None, tuple[str, ...]]] = []
         self.traces: list[TraceRequest] = []
+        self.sessions_requests: list[SessionsRequest] = []
+        self.chat_resumes: list[str | None] = []
 
     def run_request(self, request: RunRequest) -> str:
         self.requests.append(request)
@@ -66,12 +76,18 @@ class _Host:
         trace: str | None = None,
         argv: Sequence[str] = (),
         trusted_output: Sequence[str] = (),
+        resume: str | None = None,
     ) -> str:
         assert config == '.syndica.yaml'
         self.chat_trusted_output.append(tuple(trusted_output))
         self.chat_turn_limits.append(max_turns)
         self.chat_traces.append((trace, tuple(argv)))
+        self.chat_resumes.append(resume)
         return 'root-agent-id'
+
+    def sessions(self, request: SessionsRequest) -> str:
+        self.sessions_requests.append(request)
+        return f'sessions:{request.action}:{request.name or ""}'
 
     def trust_config(self, config: str, sha256: str | None) -> str:
         self.trusted.append((config, sha256))
@@ -359,22 +375,40 @@ def test_doctor_verify_routes_the_flag() -> None:
     assert host.doctor_verify == [True]
 
 
-@pytest.mark.parametrize('verb', ['list', 'show', 'resume', 'rm'])
-def test_session_commands_fail_with_the_milestone_boundary(verb: str) -> None:
+@pytest.mark.parametrize('verb', ['list', 'show', 'rm'])
+def test_session_commands_dispatch_to_the_host(verb: str) -> None:
     argv = ['sessions', verb]
     if verb != 'list':
         argv.append('session-1')
-    stderr = StringIO()
+    host = _Host()
+    stdout = StringIO()
 
     code = main(
         argv,
-        host=_Host(),
-        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=stderr),
+        host=host,
+        io=CliIO(stdin=StringIO(), stdout=stdout, stderr=StringIO()),
     )
 
-    assert code == 2
-    assert 'SessionStore' in stderr.getvalue()
-    assert '里程碑 6' in stderr.getvalue()
+    assert code == 0
+    assert [(r.action, r.name) for r in host.sessions_requests] == [
+        (verb, None if verb == 'list' else 'session-1')
+    ]
+    assert f'sessions:{verb}' in stdout.getvalue()
+
+
+def test_sessions_resume_enters_the_interactive_chat_loop() -> None:
+    host = _Host()
+
+    code = main(
+        ['sessions', 'resume', 'session-1'],
+        host=host,
+        io=CliIO(stdin=StringIO(''), stdout=StringIO(), stderr=StringIO()),
+    )
+
+    assert code == 0
+    # resume 不走 host.sessions，而是续进交互 chat（open_chat 带 resume）。
+    assert host.sessions_requests == []
+    assert host.chat_resumes == ['session-1']
 
 
 @pytest.mark.parametrize(

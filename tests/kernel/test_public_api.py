@@ -298,6 +298,7 @@ _RUNTIME_SPAWN: tuple[tuple[str, str, bool], ...] = (
     ('metadata', 'KEYWORD_ONLY', True),
     ('flags', 'KEYWORD_ONLY', True),
     ('isolation', 'KEYWORD_ONLY', True),
+    ('session', 'KEYWORD_ONLY', True),
 )
 _BASE_AGENT_INIT: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),

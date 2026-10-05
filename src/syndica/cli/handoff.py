@@ -54,6 +54,7 @@ BUILTIN_PROTECTED = ('**/.gitignore', '**/.gitattributes')
 _OWN = '.syndica'
 _HANDOFFS = 'handoffs'
 _TRACES = 'traces'
+_SESSIONS = 'sessions'
 # 公开契约里的标记行语法，逐行整行匹配（`\s` 按契约，含 `\r`、NBSP 与全角空格：只认空格与制表符
 # 时，CRLF 结尾的 `verdict: block` 不算数，后面一行 `verdict: pass` 就成了唯一的标记）。
 # 值按 ASCII 不分大小写：Unicode 的大小写折叠会让 `paſſ`（U+017F）也匹配上，front matter 就不再是
@@ -341,6 +342,13 @@ def trace_root(root: Path) -> Path:
     `.syndica` 已有时照样核对；`traces` 这一级由 store 自己以 `O_NOFOLLOW` 打开，管不到上一级。"""
     _checked_directory(root, root / _OWN)
     return root / _OWN / _TRACES
+
+
+def session_root(root: Path) -> Path:
+    """`.syndica/sessions` 该在的位置，缺了不建（与 `trace_root` 同理）：只读命令不往工作区写东西。
+    `sessions` 这一级由 `FileSessionStore` 自己以 `O_NOFOLLOW` 打开。"""
+    _checked_directory(root, root / _OWN)
+    return root / _OWN / _SESSIONS
 
 
 def write_handoff(root: Path, name: str, text: str, redactor: Redactor) -> Path:

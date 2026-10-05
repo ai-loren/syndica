@@ -8,7 +8,7 @@ import sys
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
-from typing import Literal, NoReturn, Protocol, TextIO, cast
+from typing import Any, Literal, NoReturn, Protocol, TextIO, cast
 
 from syndica import __version__
 from syndica.cli.terminal import terminal_safe
@@ -104,6 +104,17 @@ class TraceRequest:
 
 
 @dataclass(frozen=True)
+class SessionsRequest:
+    """`syndica sessions ...`：`list`、`show <sid>`、`resume <sid>`、`rm <sid>`。`name` 是会话 id
+    （根 Agent id），`list` 不用它。"""
+
+    action: Literal['list', 'show', 'resume', 'rm']
+    name: str | None = None
+    config: str = '.syndica.yaml'
+    argv: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class CliIO:
     """Text streams owned by the embedding console process."""
 
@@ -129,6 +140,7 @@ class CliHost(Protocol):
         trace: str | None = None,
         argv: Sequence[str] = (),
         trusted_output: Sequence[str] = (),
+        resume: str | None = None,
     ) -> str: ...
 
     def active_agents(self) -> str: ...
@@ -136,6 +148,8 @@ class CliHost(Protocol):
     def trust_config(self, config: str, sha256: str | None) -> str: ...
 
     def trace(self, request: TraceRequest) -> str | CliOutcome: ...
+
+    def sessions(self, request: SessionsRequest) -> str | CliOutcome: ...
 
 
 class _ParserExit(Exception):
@@ -432,11 +446,12 @@ def _chat(
     trace: str | None,
     argv: Sequence[str],
     trusted_output: Sequence[str] = (),
+    resume: str | None = None,
 ) -> int:
     # 只在给了 --trust-module-output 时才传这个参数：没有它的宿主实现照样能开 chat。
-    extra = {'trusted_output': tuple(trusted_output)} if trusted_output else {}
+    extra: dict[str, Any] = {'trusted_output': tuple(trusted_output)} if trusted_output else {}
     try:
-        target = host.open_chat(config, max_turns, trace=trace, argv=argv, **extra)
+        target = host.open_chat(config, max_turns, trace=trace, argv=argv, resume=resume, **extra)
     except Exception as exc:
         return _host_failure(exc, streams)
     while True:
@@ -567,13 +582,32 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
         _write(streams.stdout, f'syndica {__version__}')
         return 0
     if namespace.command == 'sessions':
-        _write(
-            streams.stderr,
-            '期望: sessions 命令有可用的 SessionStore\n'
-            '实际: 里程碑 1 不提供跨进程会话持久化\n'
-            '下一步: 等里程碑 6 接入 SessionStore 后再使用 sessions list/show/resume/rm',
+        if host is None:
+            _write(
+                streams.stderr,
+                '期望: sessions 有可用的 Runtime host\n'
+                '实际: 当前入口没有注入 host\n'
+                '下一步: 通过 console composition root 创建 host 后重试',
+            )
+            return 2
+        if namespace.action == 'resume':
+            # resume 是续一份落盘会话的交互 chat，走与 chat 同一个循环（读 stdin、逐条发、打印）。
+            return _chat(
+                host,
+                namespace.config,
+                streams,
+                None,
+                trace=None,
+                argv=received,
+                resume=namespace.name,
+            )
+        sessions_request = SessionsRequest(
+            action=namespace.action,
+            name=getattr(namespace, 'name', None),
+            config=namespace.config,
+            argv=tuple(received),
         )
-        return 2
+        return _host_call(lambda: host.sessions(sessions_request), streams)
     if host is None:
         _write(
             streams.stderr,

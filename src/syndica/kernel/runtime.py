@@ -1275,6 +1275,7 @@ class Runtime:
         metadata: dict[str, Any] | None = None,
         flags: Mapping[str, FlagValue] | None = None,
         isolation: str = 'shared',
+        session: bool = False,
     ) -> str:
         """建一个 Agent 并启动它的事件循环，返回它的 agent_id。
 
@@ -1298,6 +1299,10 @@ class Runtime:
         本方法返回之后就不存在于任何地方了，宿主无从得知，下游也无从补救。
 
         工厂收下本 Runtime 的 hooks 与事件总线：Agent 自己新建一份，宿主注册的切点与订阅就都落空了。
+
+        `session=True` 把它标成会话根（`AgentInfo.session_id = agent_id`，在注册那一刻写下、早于驱动
+        任务起跑，不与第一个周期抢）：配了 `sessions` 的 Runtime 会在周期收尾 / 关机时把它存盘。只给
+        宿主开一次会话的根 Agent 用；子 Agent 不是会话（root-only，spec §15）。
         """
         if isolation not in ISOLATIONS:
             raise ConfigError(
@@ -1458,6 +1463,7 @@ class Runtime:
                     name=agent.options.name,
                     agent_type=type(agent).__name__,
                     parent_id=parent_id,
+                    session_id=agent_id if session else None,
                     metadata=owned_metadata,
                     flags=dict(agent_flags),
                 )
@@ -2445,8 +2451,7 @@ class Runtime:
             agent._current_turn = turn  # pyright: ignore[reportPrivateUsage]
             return agent
 
-        resumed_id = await self.spawn(resume_factory, exit_mode=ExitMode.IDLE)
-        await self.registry.update(resumed_id, session_id=sid)
+        resumed_id = await self.spawn(resume_factory, exit_mode=ExitMode.ZOMBIE, session=True)
         self._warn_on_prefix_drift(resumed_id, record)
         return True
 
