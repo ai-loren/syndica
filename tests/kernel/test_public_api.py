@@ -417,6 +417,7 @@ _WITHHELD: tuple[str, ...] = (
     'InMemoryMemoryStore',
     'MemoryConflict',
     'MemoryEntry',
+    'MemoryModule',
     'MemoryRecord',
     'MemoryScope',
     'MemorySection',

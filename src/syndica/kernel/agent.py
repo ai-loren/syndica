@@ -75,7 +75,7 @@ import copy
 import itertools
 import logging
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
@@ -441,6 +441,9 @@ class BaseAgent:
         # 压缩控制器（可选）：由压缩 Module 的 agent 插件经 `_attach_compaction` 装上。turn 边界与
         # 超限兜底时内核调它；没装就没有压缩（spec §8.8）。
         self._compaction: CompactionController | None = None
+        # 记忆召回（可选）：由记忆 Module 经 `_attach_recall` 装上。cycle 起点内核调它注入长期记忆
+        # （进历史不进 SP、幂等缓存，spec §8.9）；没装就不注入。
+        self._recall: Callable[[Context], Awaitable[None]] | None = None
         # 当前周期的那条输入（query 或第一条注入）：本周期的 Goal 代理，压缩时必须活着（评审 M2）。
         self._cycle_anchor: ContextBlock | None = None
 
@@ -674,6 +677,10 @@ class BaseAgent:
         走内核接口（spec §8.8）——Module 不直接碰 `Context`。"""
         self._compaction = controller
 
+    def _attach_recall(self, recall: Callable[[Context], Awaitable[None]]) -> None:
+        """装上记忆召回（记忆 Module 的 agent 插件调）。cycle 起点内核调它注入长期记忆（§8.9）。"""
+        self._recall = recall
+
     async def _maybe_compact(self, ctx: Context, *, trigger: str, force: bool = False) -> bool:
         """turn 边界 / 超限兜底的内核压缩步骤。交回是否真压了。
 
@@ -806,6 +813,10 @@ class BaseAgent:
             self._executor._trace_interrupted(  # pyright: ignore[reportPrivateUsage]
                 (self.agent_id, self._cycle, self._current_turn), repaired
             )
+            # 记忆召回在查询注入之前：长期记忆是本次任务的背景（spec §8.9）。幂等缓存由召回自己用
+            # `has_block` 做——只在新会话 / 压缩掉之后重载，不每轮重拉（否则前缀逐轮变、缓存失效）。
+            if self._recall is not None:
+                await self._recall(ctx)
             if query is not None:
                 anchor = ContextBlock(role='user', content=query, trust=trust)
                 ctx.append(anchor)
