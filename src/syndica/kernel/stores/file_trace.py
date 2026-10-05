@@ -28,7 +28,6 @@ trace 读回来时校验不过。
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import logging
@@ -49,7 +48,33 @@ from syndica.kernel.redaction import (
     RedactionRule,
     RuleRedactor,
     encode_redacted,
-    write_redacted,
+)
+from syndica.kernel.stores.guarded_io import (
+    append_line as _append_line,
+)
+from syndica.kernel.stores.guarded_io import (
+    not_a_file as _not_a_file,
+)
+from syndica.kernel.stores.guarded_io import (
+    open_directory as _open_directory,
+)
+from syndica.kernel.stores.guarded_io import (
+    open_file as _open_file,
+)
+from syndica.kernel.stores.guarded_io import (
+    opened as _opened,
+)
+from syndica.kernel.stores.guarded_io import (
+    read_bytes as _read_bytes,
+)
+from syndica.kernel.stores.guarded_io import (
+    read_text as _read_text,
+)
+from syndica.kernel.stores.guarded_io import (
+    sync_directory as _sync_directory,
+)
+from syndica.kernel.stores.guarded_io import (
+    write_new as _write_new,
 )
 from syndica.kernel.trace import (
     AttributeValue,
@@ -761,82 +786,6 @@ def _decoded(build: Any, value: Mapping[str, Any], where: str) -> Any:
         raise _corrupt(where, f'读不成记录：{type(error).__name__}: {error}') from None
 
 
-def _not_a_directory(where: str, error: OSError) -> ContractViolation:
-    return ContractViolation(
-        expected=f'{where} 是一个真目录',
-        received=f'打不开它：{type(error).__name__}: {error}（是符号链接、普通文件，或没有权限）',
-        next_action='删掉或挪开它再记录：trace 不写到符号链接指向的地方',
-    )
-
-
-def _open_directory(name: str | os.PathLike[str], parent: int | None, where: str) -> int:
-    try:
-        return os.open(name, _DIRECTORY, dir_fd=parent)
-    except FileNotFoundError:
-        raise
-    except OSError as error:
-        raise _not_a_directory(where, error) from error
-
-
-@contextmanager
-def _opened(name: str, parent: int) -> Generator[int, None, None]:
-    descriptor = _open_directory(name, parent, name)
-    try:
-        yield descriptor
-    finally:
-        os.close(descriptor)
-
-
-def _not_a_file(name: str, why: str) -> ContractViolation:
-    return ContractViolation(
-        expected=f'trace 目录里的 {name} 是这个 store 建的、只有一个硬链接的普通文件',
-        received=why,
-        next_action='这个 trace 被人动过，已经不可信：删掉它所在的目录，重新记录',
-    )
-
-
-def _open_file(name: str, flags: int, directory: int, *, write: bool) -> tuple[int, int]:
-    """按名字打开 trace 目录里的一个文件，交回描述符与大小。`O_NONBLOCK`：换成 FIFO 的文件读着不会
-    挂住（写着打不开、报 ENXIO）；打开之后核对是普通文件，要写的还得只有一个硬链接——硬链接进来的
-    外部文件按名字看就在 trace 目录里。"""
-    try:
-        descriptor = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
-    except (FileNotFoundError, FileExistsError):
-        raise
-    except OSError as error:
-        if error.errno in (errno.ELOOP, errno.ENOTDIR, errno.EISDIR, errno.ENXIO):
-            raise _not_a_file(
-                name,
-                f'打不开它：{type(error).__name__}: {error}（是符号链接、FIFO 或别的类型的文件）',
-            ) from error
-        raise
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise _not_a_file(name, '它不是普通文件（FIFO、设备或目录）')
-        if write and info.st_nlink != 1:
-            raise _not_a_file(name, f'它有 {info.st_nlink} 个硬链接，可能指向 trace 目录之外的文件')
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return descriptor, info.st_size
-
-
-def _write_new(directory: int, name: str, text: RedactedText) -> None:
-    """建一个新文件写进去（0600）；已经存在时报 `FileExistsError`，是符号链接也一样。写失败时删掉
-    半截文件：留着它，重试会撞上 `O_EXCL`，读回时 sha256 也对不上。"""
-    descriptor, _ = _open_file(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, directory, write=True)
-    try:
-        try:
-            write_redacted(descriptor, text)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except BaseException:
-        os.unlink(name, dir_fd=directory)
-        raise
-
-
 def _synced(trace: int) -> None:
     """把追加写的两个文件、payload 目录与 trace 目录落到盘上（payload 与回放文档建的时候已经落
     过）。"""
@@ -855,71 +804,6 @@ def _synced(trace: int) -> None:
     except FileNotFoundError:
         pass
     _sync_directory(trace)
-
-
-def _sync_directory(descriptor: int) -> None:
-    """目录里新建与改名的条目落到盘上。有的文件系统不收对目录的 fsync（EINVAL）：那里做不到，
-    照常往下。"""
-    try:
-        os.fsync(descriptor)
-    except OSError as error:
-        if error.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF):
-            raise
-
-
-def _append_line(directory: int, name: str, text: RedactedText) -> None:
-    descriptor, _ = _open_file(name, os.O_WRONLY | os.O_APPEND | os.O_CREAT, directory, write=True)
-    try:
-        write_redacted(descriptor, text, newline=True)
-    finally:
-        os.close(descriptor)
-
-
-def _read_bytes(
-    directory: int, name: str, where: str, limit: int, *, growing: bool = False
-) -> bytes:
-    """整个文件读回；比 `limit` 大的不读（打开时看大小，读的时候它变大了也停下）。`growing` 的
-    文件随 run 变长（span、边、回放文档），超过上限不说明它被改过。"""
-    descriptor, size = _open_file(name, os.O_RDONLY, directory, write=False)
-    chunks: list[bytes] = []
-    try:
-        if size > limit:
-            raise (_too_large if growing else _over)(where, f'有 {size} 字节', limit)
-        total = 0
-        while chunk := os.read(descriptor, 1 << 16):
-            total += len(chunk)
-            if total > limit:
-                raise (_too_large if growing else _over)(
-                    where, f'读的时候它变大了，读到超过 {limit} 字节', limit
-                )
-            chunks.append(chunk)
-    finally:
-        os.close(descriptor)
-    return b''.join(chunks)
-
-
-def _read_text(directory: int, name: str, where: str, limit: int, *, growing: bool = False) -> str:
-    """整个文件按 UTF-8 读回，上限同 `_read_bytes`。"""
-    try:
-        return _read_bytes(directory, name, where, limit, growing=growing).decode('utf-8')
-    except UnicodeDecodeError as error:
-        raise _corrupt(where, f'不是 UTF-8：{error}') from None
-
-
-def _over(where: str, received: str, limit: int) -> ContractViolation:
-    return _corrupt(where, f'{received}，超过这种文件的上限 {limit}')
-
-
-def _too_large(where: str, received: str, limit: int) -> ContractViolation:
-    """写入不设上限，长跑的 trace 可以真的长到这么大：这不是「被改过」。"""
-    return ContractViolation(
-        expected=f'{where} 不超过读回的上限 {limit} 字节',
-        received=received,
-        next_action=(
-            '这个 trace 大到读不回来：被人灌大的就删掉它所在的目录；'
-            '真的是一次长跑，文件还在，直接看'
-        ),
-    )
 
 
 def _read_header(directory: int, where: str) -> TraceHeader:

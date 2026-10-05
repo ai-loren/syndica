@@ -31,7 +31,7 @@ from syndica.kernel import (
     TraceRecorder,
 )
 from syndica.kernel.redaction import RuleRedactor, encode_redacted
-from syndica.kernel.stores import file_trace
+from syndica.kernel.stores import file_trace, guarded_io
 from syndica.kernel.stores.file_trace import FileTraceStore
 from syndica.kernel.trace import (
     PayloadRef,
@@ -238,19 +238,19 @@ async def test_a_write_that_fails_halfway_leaves_no_file_so_a_retry_succeeds(
 ):
     store, directory = await _begun(tmp_path)
     text = encode_redacted('tool output', RuleRedactor())
-    original = file_trace.write_redacted
+    original = guarded_io.write_redacted
 
     def torn(fd: int, value: Any, *, newline: bool = False) -> None:
         os.write(fd, b'"tool')
         raise OSError(28, 'No space left on device')
 
-    monkeypatch.setattr(file_trace, 'write_redacted', torn)
+    monkeypatch.setattr(guarded_io, 'write_redacted', torn)
     with pytest.raises(OSError):
         await store.put_payload(_TRACE, text)
     with pytest.raises(OSError):
         await store.put_replay(_TRACE, text)
     leftovers = sorted(path.name for path in directory.rglob('*') if path.is_file())
-    monkeypatch.setattr(file_trace, 'write_redacted', original)
+    monkeypatch.setattr(guarded_io, 'write_redacted', original)
     ref = await store.put_payload(_TRACE, text)
     await store.put_replay(_TRACE, text)
 

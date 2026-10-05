@@ -117,6 +117,7 @@ from syndica.kernel.session_redaction import (
 )
 from syndica.kernel.session_types import SessionMeta, SessionRecord, SessionStatus
 from syndica.kernel.stores import (
+    FileSessionStore,
     FileTraceStore,
     InMemoryAgentRegistry,
     InMemoryMessageBroker,
@@ -211,6 +212,7 @@ __all__ = [
     'ExecResult',
     'ExitMode',
     'ExtensionJunction',
+    'FileSessionStore',
     'FileStat',
     'FileTaint',
     'FileTraceStore',
