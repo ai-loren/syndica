@@ -11,10 +11,11 @@ import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.context import ToolCall
+from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
-from syndica.kernel.redaction import Finding
+from syndica.kernel.redaction import Finding, RuleRedactor
 from syndica.kernel.runtime import AgentFactory, Runtime
 from syndica.kernel.session_redaction import RedactedSessionRecord, redacted_record
 from syndica.kernel.session_types import SessionMeta, SessionRecord, SessionStatus
@@ -23,6 +24,8 @@ from syndica.kernel.tool import Tool, ToolResult
 
 _TIMEOUT = 1.0
 _SYSTEM_PROMPT = 'You are a worker.'
+# 给了 sessions= 就必须给 redactor=（F4）：落盘前要脱敏，内核不读环境、默认脱敏器认不出宿主密钥值。
+_REDACTOR = RuleRedactor()
 # 三个工具，注册顺序既非升序（Alpha/Block/Charlie）亦非降序（Charlie/Block/Alpha），反转后同样两者
 # 都不是：工具名按序逐字进请求前缀（spec §5.2），n<3 或顺序恰好有序时「保持顺序」与排序 / 反转同解。
 _TOOL_ORDER = ['Block', 'Alpha', 'Charlie']
@@ -123,7 +126,7 @@ async def _run_blocked_session(
 
 async def test_checkpoint_saves_root_session_at_cycle_end() -> None:
     store = InMemorySessionStore()
-    runtime = Runtime(sessions=store)
+    runtime = Runtime(sessions=store, redactor=_REDACTOR)
     agent_id = await _run_blocked_session(runtime)
 
     record = await store.load(agent_id)
@@ -142,7 +145,7 @@ async def test_checkpoint_saves_root_session_at_cycle_end() -> None:
 
 async def test_agent_without_session_id_is_not_checkpointed() -> None:
     store = InMemorySessionStore()
-    runtime = Runtime(sessions=store)
+    runtime = Runtime(sessions=store, redactor=_REDACTOR)
     agent_id = await _run_blocked_session(runtime, mark_session=False)
 
     assert await store.exists(agent_id) is False
@@ -152,18 +155,46 @@ async def test_agent_without_session_id_is_not_checkpointed() -> None:
 
 async def test_checkpoint_runs_on_shutdown_while_running() -> None:
     store = InMemorySessionStore()
-    runtime = Runtime(sessions=store)
+    runtime = Runtime(sessions=store, redactor=_REDACTOR)
     blocker = _Block()
     agent_id = await runtime.spawn(_blocking_factory(blocker), query='go')
     await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
     await runtime.registry.update(agent_id, session_id=agent_id)
-    # 不放行：Agent 还卡在工具里。shutdown 在取消驱动任务之前存盘（SIGINT 情形），不靠被取消的收尾。
+    # 不放行：Agent 还卡在工具里。shutdown 取消 + gather 之后存盘（SIGINT 情形），读的是终态（F9）。
     await runtime.shutdown()
 
     assert await store.exists(agent_id) is True
     record = await store.load(agent_id)
     assert record is not None
     assert record.meta.sid == agent_id
+
+
+async def test_two_session_roots_do_not_cross() -> None:
+    # 多 Agent 框架：sid = session_id（不是 agent_id），两个会话根互不串线。一个「只存第一个」或「把
+    # 一个 Agent 的轨迹存到另一个 sid 下」的变异，单 Agent 用例无感（评审 F15）。
+    store = InMemorySessionStore()
+    runtime = Runtime(sessions=store, redactor=_REDACTOR)
+    blocker_a, blocker_b = _Block(), _Block()
+    a = await runtime.spawn(_blocking_factory(blocker_a, content='alpha'), query='go')
+    b = await runtime.spawn(_blocking_factory(blocker_b, content='bravo'), query='go')
+    await asyncio.wait_for(blocker_a.entered.wait(), _TIMEOUT)
+    await asyncio.wait_for(blocker_b.entered.wait(), _TIMEOUT)
+    await runtime.registry.update(a, session_id='sess-A')
+    await runtime.registry.update(b, session_id='sess-B')
+    blocker_a.release.set()
+    blocker_b.release.set()
+    await runtime.wait(a)
+    await runtime.wait(b)
+
+    rec_a = await store.load('sess-A')
+    rec_b = await store.load('sess-B')
+    assert rec_a is not None and rec_b is not None
+    assert any(block.content == 'alpha' for block in rec_a.content)
+    assert any(block.content == 'bravo' for block in rec_b.content)
+    # sid 是 session_id，不是 agent_id：按 agent_id 取不到。
+    assert await store.exists(a) is False
+    assert await store.exists(b) is False
+    await runtime.shutdown()
 
 
 async def test_runtime_without_session_store_is_a_noop() -> None:
@@ -190,7 +221,7 @@ async def test_checkpoint_routes_content_through_the_runtime_redactor() -> None:
 
 async def test_checkpoint_preserves_created_at_title_and_archived() -> None:
     store = InMemorySessionStore()
-    runtime = Runtime(sessions=store)
+    runtime = Runtime(sessions=store, redactor=_REDACTOR)
     blocker = _Block()
     agent_id = await runtime.spawn(_blocking_factory(blocker), query='go')
     await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
@@ -219,16 +250,27 @@ async def test_checkpoint_preserves_created_at_title_and_archived() -> None:
     await runtime.shutdown()
 
 
-async def test_checkpoint_failure_is_logged_not_raised(
+async def test_sessions_without_a_redactor_is_refused() -> None:
+    # F4：给了 sessions= 却忘了 redactor=，会话会以「只认格式、认不出宿主密钥值」落盘——拒绝构造。
+    with pytest.raises(ConfigError, match='redactor'):
+        Runtime(sessions=InMemorySessionStore())
+
+
+async def test_checkpoint_failure_is_logged_with_phase_not_raised(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     store = _FailingStore()
-    runtime = Runtime(sessions=store)
+    runtime = Runtime(sessions=store, redactor=_REDACTOR)
     with caplog.at_level(logging.ERROR):
         agent_id = await _run_blocked_session(runtime)
 
-    # 存盘抛异常不该连累收尾：Agent 照常跑完一个周期（进了 ZOMBIE），错误记成 ERROR 带会话 id。
+    # 存盘抛异常不连累收尾：Agent 照常跑完一个周期（进了 ZOMBIE）。错误记 ERROR，带会话 id、失败
+    # 阶段（save）与异常类型名——别把一切都误报成「磁盘满」（F8）。
     assert await runtime.find(agent_id) is not None
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert any(agent_id in record.getMessage() for record in errors)
+    matched = [r for r in errors if agent_id in r.getMessage()]
+    assert matched
+    message = matched[-1].getMessage()
+    assert 'save' in message
+    assert 'RuntimeError' in message
     await runtime.shutdown()

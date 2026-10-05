@@ -40,6 +40,13 @@ class InMemorySessionStore:
         self._records[sid] = copy.deepcopy(inner)
 
     async def archive(self, sid: str, record: RedactedSessionRecord) -> int:
+        inner = record.record
+        if inner.meta.sid != sid:
+            raise ContractViolation(
+                expected=f'record.meta.sid 与 archive 的 sid 一致（都是 {sid!r}）',
+                received=f'record.meta.sid={inner.meta.sid!r}，与 {sid!r} 不符',
+                next_action='它们指同一会话；对齐两者，否则归档按一个 id 存、按另一个 id 找不回',
+            )
         history = self._archives.setdefault(sid, [])
         seq = (history[-1].meta.archived if history else 0) + 1
         snapshot = copy.deepcopy(record.record)

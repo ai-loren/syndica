@@ -134,6 +134,12 @@ class FileSessionStore:
 
     async def archive(self, sid: str, record: RedactedSessionRecord) -> int:
         _valid_sid(sid)
+        if record.record.meta.sid != sid:
+            raise ContractViolation(
+                expected=f'record.meta.sid 与 archive 的 sid 一致（都是 {sid!r}）',
+                received=f'record.meta.sid={record.record.meta.sid!r}，与 {sid!r} 不符',
+                next_action='它们指同一会话；对齐两者，否则归档按一个 id 存、按另一个 id 找不回',
+            )
         with self._created_session(sid) as session:
             seq = self._next_seq(session, sid)
             snapshot = record_to_json(record.record)

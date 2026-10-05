@@ -1033,6 +1033,16 @@ class Runtime:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
         validate_confirmation_handler(confirmation_handler)
+        if sessions is not None and redactor is None:
+            raise ConfigError(
+                expected='给了 sessions= 就要一并给 redactor=（会话落盘前要脱敏，spec §12）',
+                received='sessions= 非空而 redactor=None',
+                next_action=(
+                    '传与 TraceRecorder 相同的那个 Redactor（如 '
+                    'RuleRedactor(secrets=..., rules=...)）：内核不读环境，默认脱敏器认不出宿主的'
+                    '密钥值，忘了传等于把密钥原样写进会话文件'
+                ),
+            )
         if workspace is not None and not isinstance(cast(object, workspace), WorkspaceRouter):
             raise ConfigError(
                 expected='workspace 是 WorkspaceRouter 或省略',
@@ -1041,8 +1051,8 @@ class Runtime:
             )
         self._workspace = workspace
         self._sessions = sessions
-        # 存盘在落盘前过脱敏（spec §12 的收口）：Runtime 持宿主那份 Redactor。没交时退回只认内建
-        # 规则的 RuleRedactor——内建规则仍挡常见密钥，宿主自定义的规则要显式交进来才生效。
+        # 落盘前过脱敏（spec §12）：给了 sessions 就必须给 redactor（上面已校验）。
+        # 这里的 RuleRedactor() 只在没配 sessions 时占位，不会被用到（那条路 _sessions 为空）。
         self._redactor: Redactor = redactor if redactor is not None else RuleRedactor()
         self._ids: IdSource = RandomIds() if ids is None else _checked_ids(ids)
         checked_tracer = None if tracer is None else _checked_tracer(tracer)
@@ -2067,20 +2077,36 @@ class Runtime:
         info = await self.registry.get(agent_id)
         if info is None or info.session_id is None:
             return
+        sid = info.session_id
+        phase = 'build'
         try:
-            record = await self._session_record(store, info.session_id, agent, info)
-            await store.save(info.session_id, redacted_record(record, self._redactor))
-        except Exception:
-            logger.exception(
+            record = await self._session_record(store, sid, agent, info)
+            phase = 'redact'
+            redacted = redacted_record(record, self._redactor)
+            phase = 'save'
+            await store.save(sid, redacted)
+        except Exception as error:
+            # 分阶段报：说清哪一步（拼记录 / 脱敏 / 落盘）失败、异常类型，别把 AttributeError 或坏
+            # extra 一律误报成「磁盘满」（F8）。记录与事件都不静默吞，也不连累收尾。
+            logger.error(
                 '期望: 会话 %s 在周期收尾时存盘成功。'
-                ' 实际: SessionStore.save 抛了异常，这一次的轨迹没有落盘。'
-                ' 下一步: 看后端是否可写（磁盘满 / 权限 / 远端不可达）；这次存盘丢了，恢复会回到'
-                '上一个存过的点，在途的改动不受影响。',
-                info.session_id,
+                ' 实际: %s 阶段抛了 %s：%s。'
+                ' 下一步: save 阶段查后端是否可写（磁盘满 / 权限 / 远端不可达）；build / redact'
+                '阶段多半是数据或代码问题（坏 extra、脱敏命中结构字段）。这次丢了、恢复回到上个存过'
+                '的点，在途改动不受影响。',
+                sid,
+                phase,
+                type(error).__name__,
+                error,
             )
             self._tracing.event(
                 'session.checkpoint_failed',
-                {'session.id': info.session_id, 'agent.id': agent_id},
+                {
+                    'session.id': sid,
+                    'agent.id': agent_id,
+                    'phase': phase,
+                    'error': type(error).__name__,
+                },
             )
 
     async def _session_record(
@@ -3563,10 +3589,6 @@ class Runtime:
         # 置位在 gather 之前：与本次关机并发的 spawn 既赶不上取消名单、事件又发不出去。
         self._closed = True
         self.broker.off_missing_queue(self._on_missing_queue)
-        # 取消驱动任务之前存一次会话（spec §15 的 shutdown/SIGINT 存盘）：取消后非取消路径的 _finish
-        # 不再跑，而此刻 Agent 还活着、轨迹读得到。还在一轮中间的 Agent 存下的尾部可能有未配对的
-        # 工具调用，恢复按既有的未配对批次修复截掉。
-        await self._checkpoint_all_sessions()
         tasks = [
             task
             for agent_id in self._table.agent_ids()
@@ -3583,6 +3605,10 @@ class Runtime:
             reapers = list(self._reapers)
             self._reapers.clear()
             await asyncio.gather(*reapers, return_exceptions=True)
+        # 存盘排在取消 + gather 之后（spec §15 shutdown/SIGINT 存盘，F9）：此刻驱动都已停、取消路径
+        # 的 _finish 不存盘，而 Agent 仍在实例表、轨迹已终态——读的是最终状态，不与在跑的驱动抢读，
+        # 异步 store 也不会把半途快照盖掉干净那份。
+        await self._checkpoint_all_sessions()
         await self.hooks._dispatch(Junction.RUNTIME_SHUTDOWN)  # pyright: ignore[reportPrivateUsage]
         failures: list[BaseException] = []
         try:

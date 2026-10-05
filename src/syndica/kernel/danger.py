@@ -2324,8 +2324,9 @@ _GIT_FLAGS = frozenset(
 )
 _GIT_ASSIGNMENT = re.compile(r'\AGIT_[A-Za-z0-9_]*\+?=')
 _GLOB = frozenset('*?[')
-# `.syndica` 下由宿主写、Agent 不该改的那几个子目录：版本层、trace、交接文件、两种隔离副本。
-_HOST_RECORDS = ('vcs', 'traces', 'handoffs', 'worktrees', 'snapshots')
+# `.syndica` 下由宿主写、Agent 不该改的那几个子目录：版本层、trace、交接文件、两种隔离副本、会话与
+# 记忆（后两者存着 trust 标记，Agent 改它们能洗白 provenance / 注入特权消息，评审 F11）。
+_HOST_RECORDS = ('vcs', 'traces', 'handoffs', 'worktrees', 'snapshots', 'sessions', 'memory')
 _BRACE = re.compile(r'\{([^{}]*,[^{}]*)\}')
 _BRACE_ROUNDS = 4
 _BRACE_VARIANTS = 64
