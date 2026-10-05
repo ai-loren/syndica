@@ -416,6 +416,7 @@ _WITHHELD: tuple[str, ...] = (
     'CompactionStrategy',
     'CompactionController',
     'CompactionModule',
+    'AcceptanceModule',
     'InMemoryMemoryStore',
     'MemoryConflict',
     'MemoryEntry',

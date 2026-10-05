@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from syndica.kernel.acceptance import Anchor, AnchorSource, Goal, Rubric, RubricKind
 from syndica.kernel.acceptance_inject import (
     goal_block,
@@ -124,7 +126,8 @@ def _agent(script: list[ScriptedTurn]) -> BaseAgent:
     return BaseAgent(options, hooks=HooksCenter(), events=EventBus())
 
 
-async def test_the_seam_injects_goal_and_rubrics_before_the_query() -> None:
+async def test_the_seam_injects_after_the_task_and_before_the_first_model_call() -> None:
+    # Goal 可能就是这条任务本身，所以注入在任务进轨迹之后；第一轮模型调用就看得到投影结果。
     agent = _agent([ScriptedTurn(content='done')])
     goal = Goal(intent='ship a report', anchors=_ANCHOR)
     rubrics = [_rubric('R1')]
@@ -136,12 +139,13 @@ async def test_the_seam_injects_goal_and_rubrics_before_the_query() -> None:
             ctx.append(rubric_block(rubrics))
 
     agent._attach_rubrics(inject)  # pyright: ignore[reportPrivateUsage]
-    ctx = await agent.run('do the work')
-    kinds = [kind_of(b) for b in ctx.current_traj]
+    await agent.run('do the work')
+    first_request = cast('ScriptedLLM', agent.options.llm).calls[0]
+    kinds = [kind_of(b) for b in first_request]
     query_at = next(
-        i for i, b in enumerate(ctx.current_traj) if b.role == 'user' and kind_of(b) is None
+        i for i, b in enumerate(first_request) if b.role == 'user' and kind_of(b) is None
     )
-    assert kinds.index(HistoryKind.GOAL) < query_at and kinds.index(HistoryKind.RUBRIC) < query_at
+    assert query_at < kinds.index(HistoryKind.GOAL) < kinds.index(HistoryKind.RUBRIC)
 
 
 async def test_the_seam_is_idempotent_across_cycles() -> None:

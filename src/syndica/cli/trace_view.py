@@ -39,9 +39,19 @@ class _Agent:
     end_ns: int
     cycles: int = 0
     stop_reason: str | None = None
+    verdict: str | None = None
     children: list[str] = field(default_factory=list[str])
     # 没有一个收了尾的工作周期：还在跑，或者 run 被强行打断（开着的 span 没写下来）。
     unfinished: bool = False
+
+
+def _verdict_of(attributes: Mapping[str, object]) -> str | None:
+    """最后一个工作周期的验收裁决：`pass` / `partial` / `block`，`unverified` 带上原因。"""
+    status = attributes.get('verdict.status')
+    if not isinstance(status, str):
+        return None
+    cause = attributes.get('verdict.unverified_cause')
+    return one_line(f'{status}（{cause}）' if isinstance(cause, str) else status)
 
 
 def render_list(rows: Sequence[TraceRow], *, unreadable: int = 0) -> str:
@@ -179,6 +189,7 @@ def _agents(spans: Sequence[Span], edges: Sequence[CausalityEdge]) -> dict[str, 
         # 最后一个工作周期的原因：被取消的周期没有原因，沿用前一个会把被切断的 Agent 报成做完了。
         reason = span.attributes.get('stop_reason')
         agent.stop_reason = reason if isinstance(reason, str) else None
+        agent.verdict = _verdict_of(span.attributes)
     for span in sorted(spans, key=lambda item: item.start_ns):
         # Module span 在 spawn 提交时就记了：一个还没跑过的 Agent 只有它们，不是一个没结束的 Agent。
         if span.kind is SpanKind.MODULE:
@@ -433,9 +444,10 @@ def _timeline(agents: Mapping[str, _Agent], labels: Mapping[str, str], origin: i
             )
             continue
         ended = '没有说明停下的原因' if agent.stop_reason is None else one_line(agent.stop_reason)
+        verdict = '' if agent.verdict is None else f'  验收 {agent.verdict}'
         lines.append(
             f'  +{_duration(agent.start_ns - origin)} → +{_duration(agent.end_ns - origin)}  '
-            f'{labels[agent.agent_id]}  {agent.cycles} 个工作周期  {ended}'
+            f'{labels[agent.agent_id]}  {agent.cycles} 个工作周期  {ended}{verdict}'
         )
     return lines
 

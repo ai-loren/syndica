@@ -122,7 +122,7 @@ from syndica.kernel.tool_executor import (
     ToolOutcomeObserver,
     validate_max_concurrency,
 )
-from syndica.kernel.trace import SpanKind
+from syndica.kernel.trace import AttributeValue, SpanKind
 from syndica.kernel.tracing import (
     _Tracing,  # pyright: ignore[reportPrivateUsage]
     llm_attempt,
@@ -311,6 +311,16 @@ def _bad_verdict(value: object) -> ContractViolation:
 _FEEDBACK_REASON_CHARS = 500
 
 
+def _verdict_attributes(verdict: Verdict) -> dict[str, AttributeValue]:
+    """终态裁决进 agent span（§7.5）：读 trace 的人不打开轨迹也看得到这次交付验没验过、过没过。"""
+    attributes: dict[str, AttributeValue] = {'verdict.status': verdict.status.value}
+    if verdict.unverified_cause is not None:
+        attributes['verdict.unverified_cause'] = verdict.unverified_cause
+    if verdict.needs_human:
+        attributes['verdict.needs_human'] = list(verdict.needs_human)
+    return attributes
+
+
 def _render_feedback(verdict: Verdict) -> str:
     """打回时追加给 Agent 的反馈块正文：哪几条已证伪、哪几条没能确认、下一步做什么。"""
     unmet = [o.rubric_id for o in verdict.outcomes if o.kind is OutcomeKind.UNMET]
@@ -492,9 +502,10 @@ class BaseAgent:
         # 记忆召回（可选）：由记忆 Module 经 `_attach_recall` 装上。cycle 起点内核调它注入长期记忆
         # （进历史不进 SP、幂等缓存，spec §8.9）；没装就不注入。
         self._recall: Callable[[Context], Awaitable[None]] | None = None
-        # Goal / Rubric 注入（可选）：验收 Module 经 `_attach_rubrics` 装上。cycle 起点、召回与查询
-        # 之前内核调它把 Goal 与生效 Rubric 注入历史（§7.6）；第一轮模型调用因此看得到投影结果。
+        # Goal / Rubric 注入（可选）：验收 Module 经 `_attach_rubrics` 装上，`_one_turn` 在消息注入
+        # 之后调它（§7.6）。`_rubrics_due` 标「这个周期还没调过」。
         self._rubrics: Callable[[Context], Awaitable[None]] | None = None
+        self._rubrics_due = False
         # 当前周期的那条输入（query 或第一条注入）：本周期的 Goal 代理，压缩时必须活着（评审 M2）。
         self._cycle_anchor: ContextBlock | None = None
         # 一次性辅助调用（压缩摘要、记忆整理）计数：每次用一个**负** turn 号开 llm_call 作用域，既不
@@ -743,8 +754,8 @@ class BaseAgent:
         self._recall = recall
 
     def _attach_rubrics(self, inject: Callable[[Context], Awaitable[None]]) -> None:
-        """装上 Goal / Rubric 注入（验收 Module 调）。cycle 起点、召回与查询之前内核调它，
-        把 Goal 与生效 Rubric 注入历史（§7.6）；第一轮模型调用因此看得到投影结果。"""
+        """装上 Goal / Rubric 注入（验收 Module 调）。每个周期的第一轮，内核在消息注入之后、这一轮
+        模型调用之前调它（§7.6）：任务已在轨迹里，第一轮就看得到投影结果。"""
         self._rubrics = inject
 
     def _attach_artifact_store(
@@ -908,9 +919,7 @@ class BaseAgent:
             )
             # 记忆召回在查询注入之前：长期记忆是本次任务的背景（spec §8.9）。幂等缓存由召回自己用
             # `has_block` 做——只在新会话 / 压缩掉之后重载，不每轮重拉（否则前缀逐轮变、缓存失效）。
-            # Goal / Rubric 更靠前：它们是任务的权威与验收框架（§7.6），在记忆与查询之前注入。
-            if self._rubrics is not None:
-                await self._rubrics(ctx)
+            self._rubrics_due = True
             if self._recall is not None:
                 await self._recall(ctx)
             if query is not None:
@@ -930,9 +939,13 @@ class BaseAgent:
                 await self._emit('agent_error', {})
                 raise
             span.attributes['stop_reason'] = stop_reason.value
+            ending: dict[str, object] = {'stop_reason': stop_reason.value}
+            if ctx.verdict is not None:
+                span.attributes.update(_verdict_attributes(ctx.verdict))
+                ending['verdict'] = ctx.verdict.status.value
             await self._hooks._dispatch(Junction.AGENT_END, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
             # 事件 payload 必须是纯数据：枚举成员走不出序列化的 SSE 出口。
-            await self._emit('agent_end', {'stop_reason': stop_reason.value})
+            await self._emit('agent_end', ending)
             return ctx
 
     async def _run_turns(self, ctx: Context) -> StopReason:
@@ -975,6 +988,11 @@ class BaseAgent:
     ) -> StopReason | None:
         """一轮：注入、模型、第 9 步、工具。交回这个周期停下的原因；None 表示接着下一轮。"""
         await self._inject(ctx, decision)
+        # Goal / Rubric 在任务进了轨迹之后、这一轮模型调用之前注入（§7.6）：Goal 可能就是这条任务，
+        # 而第一轮就要看得到投影结果。每个周期只在第一轮调一次，注入器自己幂等。
+        if self._rubrics is not None and self._rubrics_due:
+            self._rubrics_due = False
+            await self._rubrics(ctx)
         # turn 开始就做阈值 / 主动压缩（§8.8 主路径）：注入之后（新输入成了受保护的「当前输入」）、
         # 模型调用之前，消息驱动的 Agent（每轮一次回复、无工具）也会压，而非只靠超限兜底（H3）。
         await self._maybe_compact(ctx, trigger='threshold')
@@ -1034,8 +1052,8 @@ class BaseAgent:
         几个 hook 各给裁决时取**最严**的（链上靠后的 hook 不能把前面的 block 改成 pass，评审 H1），
         记在 `ctx.verdict` 上（终态 = 最后一次，内核从不合成 pass）。任一 hook 要求打回且裁决是
         partial / block 时由**内核**追加署名 VERDICT 反馈块（hook 不能写轨迹）作为下一轮输入；其余照
-        常完成。没人给裁决（没装验收）就直接完成。反馈块的信任取裁决与主轨迹里最严的（评审 B1）。取
-        消照常上抛。"""
+        常完成。这一次没人给裁决就清掉上一次的：裁决说的是**这份**回复，被打回之前那份的结论不能留
+        到改好之后。反馈块的信任取裁决与主轨迹里最严的（评审 B1）。取消照常上抛。"""
         outcome = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
             Junction.COMPLETION_PROPOSED, ctx=ctx, response=response, cycle=self._cycle
         )
@@ -1043,6 +1061,7 @@ class BaseAgent:
             raise _bad_completion_idiom(outcome)
         given = outcome.history.get('verdict', [])
         if not given:
+            ctx.verdict = None
             return False
         for value in given:
             if not isinstance(value, Verdict):

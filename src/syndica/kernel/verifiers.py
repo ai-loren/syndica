@@ -19,7 +19,7 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from syndica.kernel.acceptance import (
@@ -199,6 +199,7 @@ def acceptance_hook(
     block_retries: int,
     max_turns: int,
     timeout: float,
+    format_check: Callable[[], tuple[Sequence[str], Sequence[str]]] | None = None,
 ) -> Callable[..., Awaitable[HookResult]]:
     """造挂在 COMPLETION_PROPOSED 上的 hook（每个主 Agent 一个，闭包绑它的工作区视图与 scope）。
 
@@ -206,13 +207,19 @@ def acceptance_hook(
     → 没做完就以 partial 打回、不跑 L3；做完了 → L3（开着时）出裁决，没有生效的 checkable 条时不跑
     伴生、直接 `unverified`；L3 没开也是 `unverified`（没验结果不能说通过，评审 M1）。打回受三个上限
     各自约束（L2 没做完 / L3 partial / L3 block），计数**每个周期清零**（内核以 `cycle` 传入，评审
-    Medium 2）。验收器与 Rubric 库的任何失败只接 `Exception` → `unverified`、不打回。"""
+    Medium 2）。验收器与 Rubric 库的任何失败只接 `Exception` → `unverified`、不打回。
+
+    `format_check` 交回（交付物的 L1 违规, L1 没能跑的交付物）。有违规就以 partial 零 token 打回、不
+    跑 L2 / L3，与 L2 没做完共用一个上限（两者都是「还没做完」），且与有没有 Goal 无关——格式校验不必
+    知道要求是什么。L1 没能跑的交付物不算零违规：这时 L3 的 pass 降成
+    `unverified`（`format_check_skipped`）。"""
     caps = {'output': output_retries, 'partial': partial_retries, 'block': block_retries}
     counts = dict.fromkeys(caps, 0)
     current: list[object] = [None]
 
     async def hook(**kwargs: Any) -> HookResult:
-        if not output and not outcome:
+        problems, skipped = format_check() if format_check is not None else ((), ())
+        if not output and not outcome and not problems:
             return HookResult()
         ctx = cast('Context', kwargs['ctx'])
         cycle = kwargs.get('cycle')
@@ -224,13 +231,36 @@ def acceptance_hook(
             goal = await store.get_goal(scope)
         except Exception as exc:
             return _verdict_result(_failed([], TrustLevel.UNTRUSTED, exc), None)
-        if goal is None:
+        if problems:
+            verdict, bucket = await _format_verdict(ctx, goal is not None, problems)
+        elif goal is None or (not output and not outcome):
             return HookResult()
-        verdict, bucket = await _judge(ctx)
+        else:
+            verdict, bucket = await _judge(ctx)
+            if skipped and verdict.status is VerdictStatus.PASS:
+                verdict = replace(
+                    verdict,
+                    status=VerdictStatus.UNVERIFIED,
+                    unverified_cause='format_check_skipped',
+                )
         send_back = bucket is not None and counts[bucket] < caps[bucket]
         if send_back and bucket is not None:
             counts[bucket] += 1
         return _verdict_result(verdict, send_back)
+
+    async def _format_verdict(
+        ctx: Context, has_goal: bool, problems: Sequence[str]
+    ) -> tuple[Verdict, str | None]:
+        rubrics: list[Rubric] = []
+        trust = TrustLevel.UNTRUSTED
+        try:
+            trust = provenance_of(ctx)
+            if has_goal:
+                rubrics = await store.rubrics(scope)
+        except Exception as exc:
+            return _failed(rubrics, trust, exc), None
+        reason = '交付物没过格式校验：' + '；'.join(problems)
+        return unfinished_verdict(rubrics, reason=reason, trust=trust), 'output'
 
     async def _judge(ctx: Context) -> tuple[Verdict, str | None]:
         rubrics: list[Rubric] = []

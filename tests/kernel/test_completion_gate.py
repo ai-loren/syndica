@@ -296,3 +296,41 @@ def test_delegate_hands_the_childs_verdict_back_to_the_parent() -> None:
     result = _delivered('child-1', ctx)
     assert result.meta['verdict'] == 'block'
     assert 'block' in result.output
+
+
+async def test_a_later_completion_without_a_verdict_clears_the_earlier_one() -> None:
+    # 裁决说的是这份回复：被打回之前那份的 block 不能留到改好之后。
+    agent, hooks = _agent(2)
+    seen = 0
+
+    async def judge(**_: Any) -> HookResult:
+        nonlocal seen
+        seen += 1
+        if seen == 1:
+            return HookResult(modified={'verdict': _block(), 'send_back': True})
+        return HookResult()
+
+    hooks.register(Junction.COMPLETION_PROPOSED, judge)
+    ctx = await agent.run('go')
+    assert seen == 2
+    assert ctx.verdict is None
+
+
+async def test_agent_end_reports_the_verdict() -> None:
+    bus = EventBus()
+    hooks = HooksCenter()
+    options = AgentOptions(
+        name='Worker', llm=ScriptedLLM([ScriptedTurn(content='done')]), tools={}, system_prompt='SP'
+    )
+    agent = BaseAgent(options, hooks=hooks, events=bus)
+
+    async def judge(**_: Any) -> HookResult:
+        return HookResult(modified={'verdict': _pass()})
+
+    hooks.register(Junction.COMPLETION_PROPOSED, judge)
+    async with bus.subscribe() as events:
+        await agent.run('go')
+        await bus.close()
+        delivered = [event async for event in events]
+    ending = [event for event in delivered if event.kind == 'agent_end']
+    assert ending[0].payload == {'stop_reason': 'completed', 'verdict': 'pass'}

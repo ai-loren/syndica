@@ -393,6 +393,44 @@ async def test_the_span_ids_of_a_run_are_exactly_their_structural_keys():
 # --- the spans of a run ----------------------------------------------------------------------
 
 
+async def test_the_agent_span_carries_the_final_verdict():
+    # 终态裁决进 trace（§7.5）：不打开轨迹也看得到这次交付验没验过、为什么没验。
+    from syndica.kernel.acceptance import (
+        Anchor,
+        AnchorSource,
+        OutcomeKind,
+        Rubric,
+        RubricKind,
+        RubricOutcome,
+        derive_verdict,
+    )
+    from syndica.kernel.hooks import HookResult, Junction
+
+    anchors = (Anchor(AnchorSource.USER_MESSAGE, 'msg:1', 'section four'),)
+    checkable = Rubric(id='R1', statement='s', kind=RubricKind.CHECKABLE, anchors=anchors)
+    judgment = Rubric(id='J1', statement='reads well', kind=RubricKind.JUDGMENT, anchors=anchors)
+    satisfied = {'R1': RubricOutcome('R1', OutcomeKind.SATISFIED, anchors)}
+    verdict = derive_verdict([checkable, judgment], satisfied)
+
+    async def judge(**_: Any) -> HookResult:
+        return HookResult(modified={'verdict': verdict})
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        hooks.register(Junction.COMPLETION_PROPOSED, judge)
+        llm = ScriptedLLM([ScriptedTurn(content='done')])
+        return BaseAgent(AgentOptions(name='Root', llm=llm, tools={}), hooks=hooks, events=events)
+
+    runtime, recorder = _traced()
+    try:
+        agent_id = await _run_one(runtime, build)
+    finally:
+        await runtime.shutdown()
+    attributes = recorder.attributes(span_id_of(SpanKind.AGENT, agent_id, 1))
+    assert attributes['verdict.status'] == 'unverified'
+    assert attributes['verdict.unverified_cause'] == 'needs_human'
+    assert attributes['verdict.needs_human'] == ['J1']
+
+
 async def test_agent_and_turn_spans_carry_role_cycle_turn_and_stop_reason():
     runtime, recorder = _traced()
     llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])

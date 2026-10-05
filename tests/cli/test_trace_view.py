@@ -724,3 +724,25 @@ def test_junction_counts_are_listed_by_name():
     section = _section(render_show(_header(), spans, []), 'Module：')
 
     assert any('扩展切点：alpha:a ×1、mid:b ×2、zulu:c ×1' in line for line in section)
+
+
+def test_the_timeline_shows_the_last_cycles_verdict_and_why_it_is_unverified():
+    first = _agent(_LEAD, 'Lead', 0, 5)
+    first.attributes['verdict.status'] = 'block'
+    last = _agent(_LEAD, 'Lead', 6, 9, cycle=2)
+    last.attributes.update(
+        {'verdict.status': 'unverified', 'verdict.unverified_cause': 'needs_human'}
+    )
+
+    timeline = _section(render_show(_header(), [first, last], []), '时间线：')
+
+    lead = f'Lead {_LEAD[:8]}'
+    assert timeline == [
+        f'  +0 ms → +9.0 s  {lead}  2 个工作周期  completed  验收 unverified（needs_human）'
+    ]
+
+
+def test_an_agent_without_acceptance_shows_no_verdict():
+    timeline = _section(render_show(_header(), [_agent(_LEAD, 'Lead', 0, 5)], []), '时间线：')
+
+    assert '验收' not in timeline[0]
