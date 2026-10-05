@@ -19,6 +19,9 @@ def test_history_kind_name_to_value_map_is_exactly_this() -> None:
         'RESUME_NOTE': 'resume_note',
         'MEMORY': 'memory',
         'COMPACTION': 'compaction',
+        'GOAL': 'goal',
+        'RUBRIC': 'rubric',
+        'VERDICT': 'verdict',
     }
 
 

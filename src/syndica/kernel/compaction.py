@@ -423,27 +423,32 @@ def traj_tokens(blocks: Sequence[ContextBlock]) -> int:
 
 
 def _protected_indices(blocks: Sequence[ContextBlock]) -> frozenset[int]:
-    """压缩必须原样留的块（spec §8.8 不变量 3/4，P17 用「任务消息 + 当前轮」做 Goal 代理）：
+    """压缩必须原样留的块（spec §8.8 不变量 3/4）：
 
     - 已注入的环境事实（`ENV_FACT`）与恢复提示（`RESUME_NOTE`，它携带整份溯源）；
-    - 第一条真实 user 消息（任务 / Goal 代理）；
-    - 最后一条真实 user 消息（当前这一轮的输入）。
+    - Goal 块（`GOAL`，唯一权威）与全部生效 Rubric 块（`RUBRIC`，只有 active 的才注入历史，§7.6）；
+    - 最后一条真实 user 消息（当前这一轮的输入）；
+    - 第一条真实 user 消息（任务 / Goal 代理）——**只在没有 Goal 块时**兜底；有 Goal 块时此代理退役，
+      否则 Goal 块会把真正的任务消息挤出保护集合（M7 评审 B2）。
 
     刻意不硬保整条当前轮：超限兜底时要能压掉它，否则兜底对「当前轮自己撑爆」无能为力。
     """
     protected: set[int] = {
         index
         for index, block in enumerate(blocks)
-        if kind_of(block) in (HistoryKind.ENV_FACT, HistoryKind.RESUME_NOTE)
+        if kind_of(block)
+        in (HistoryKind.ENV_FACT, HistoryKind.RESUME_NOTE, HistoryKind.GOAL, HistoryKind.RUBRIC)
     }
+    has_goal = any(kind_of(block) is HistoryKind.GOAL for block in blocks)
     user_turns = [
         index
         for index, block in enumerate(blocks)
         if block.role == 'user' and kind_of(block) is None
     ]
     if user_turns:
-        protected.add(user_turns[0])
         protected.add(user_turns[-1])
+        if not has_goal:
+            protected.add(user_turns[0])
     return frozenset(protected)
 
 

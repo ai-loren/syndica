@@ -10,11 +10,12 @@ from syndica.kernel.compaction import (
     PruningCompaction,
     RuleBasedCompaction,
     SummaryCompaction,
+    _protected_indices,
     apply_compaction,
 )
 from syndica.kernel.context import ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.errors import ContractViolation
-from syndica.kernel.history_blocks import HistoryKind, kind_of
+from syndica.kernel.history_blocks import HistoryKind, kind_of, signed_block
 
 
 def _call_batch(call_id: str, output: str) -> list[ContextBlock]:
@@ -64,6 +65,29 @@ def test_dropping_a_protected_block_is_refused() -> None:
     result = CompactionResult(kept=[blocks[1]], dropped=[blocks[0]])
     with pytest.raises(ContractViolation, match='protected'):
         apply_compaction(request, result)
+
+
+def test_goal_and_active_rubric_blocks_are_protected_from_compaction() -> None:
+    # Goal 与生效 Rubric 是验收的权威（§7.6 / §8.8）：压缩不得把它们当普通 user 轮摘掉 / 剪掉。
+    goal = signed_block(HistoryKind.GOAL, '交付一份报告', key='goal:1')
+    rubric = signed_block(HistoryKind.RUBRIC, 'R1：必须含第 4 节', key='rubric:1')
+    blocks = [goal, rubric, *_exchange('a'), *_exchange('b'), *_exchange('c')]
+    protected = _protected_indices(blocks)
+    assert blocks.index(goal) in protected
+    assert blocks.index(rubric) in protected
+
+
+def test_a_goal_block_retires_the_first_user_proxy() -> None:
+    # 没有 Goal 块时第一条真实 user 消息是 Goal 代理（受保护）；有了真的 Goal 块，这个代理退役，
+    # 否则 Goal 块会把真正的任务消息挤出保护集合（评审 B2）。最后一条当前输入始终保护。
+    goal = signed_block(HistoryKind.GOAL, '目标', key='goal:1')
+    first_user = ContextBlock(role='user', content='早先任务消息')
+    last_user = ContextBlock(role='user', content='当前输入')
+    blocks = [goal, first_user, ContextBlock(role='assistant', content='x'), last_user]
+    protected = _protected_indices(blocks)
+    assert blocks.index(first_user) not in protected
+    assert blocks.index(last_user) in protected
+    assert blocks.index(goal) in protected
 
 
 def test_a_summary_block_inherits_the_strictest_provenance() -> None:

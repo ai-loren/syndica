@@ -33,6 +33,9 @@ class HistoryKind(Enum):
     RESUME_NOTE = 'resume_note'
     MEMORY = 'memory'
     COMPACTION = 'compaction'
+    GOAL = 'goal'
+    RUBRIC = 'rubric'
+    VERDICT = 'verdict'
 
 
 def signed_block(
