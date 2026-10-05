@@ -196,7 +196,7 @@ topologies:
 @pytest.mark.parametrize(
     ('changes', 'needle'),
     [
-        ({'session': 'old-session'}, 'SessionStore'),
+        ({'session': 'old-session'}, 'sessions list'),
         ({'max_cost': 1.0}, 'max_cost'),
         ({'max_tokens': 100}, 'max_tokens'),
         ({'max_wall_clock': 10.0}, 'max_wall_clock'),

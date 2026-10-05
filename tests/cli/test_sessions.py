@@ -101,3 +101,14 @@ def test_sessions_resume_continues_the_conversation(tmp_path: Path) -> None:
     )
     assert code == 0
     assert 'second answer' in stdout
+
+
+def test_run_session_resumes_one_shot_across_processes(tmp_path: Path) -> None:
+    _cli(tmp_path, _done('first answer'), ['run', 'remember 42', '--agent', 'Worker'])
+    [sid] = _session_ids(tmp_path)
+
+    code, stdout, _ = _cli(
+        tmp_path, _done('resumed answer'), ['run', 'what did I say', '--session', sid]
+    )
+    assert code == 0
+    assert 'resumed answer' in stdout

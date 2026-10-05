@@ -104,6 +104,7 @@ from syndica.cli.recording import (
     trace_source,
 )
 from syndica.cli.redaction import host_redactor
+from syndica.cli.session_lock import ResumeLock, acquire_resume_lock
 from syndica.cli.terminal import one_line, terminal_safe
 from syndica.cli.trace_commands import (
     Replayer,
@@ -1275,6 +1276,8 @@ class _ChatSession:
     pump: asyncio.Task[None]
     recording: Recording
     redactor: Redactor
+    # 恢复锁：续一份落盘会话时持着，挡住另一个进程同时续它；非恢复的会话是 None。close 时解锁。
+    lock: ResumeLock | None = None
     # 最近一轮怎么结束的：chat 在一轮失败时就结束，会话的 trace 以它收尾。
     failure: Exception | None = None
 
@@ -2395,6 +2398,7 @@ class RuntimeCliHost:
         runtime: Runtime | None = None
         subscription: Subscription | None = None
         pump: asyncio.Task[None] | None = None
+        resume_lock: ResumeLock | None = None
         try:
             tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
             models: Mapping[str, LLM] = {
@@ -2443,6 +2447,8 @@ class RuntimeCliHost:
                 name='cli-chat-human-events',
             )
             if resume is not None:
+                # 先加锁再恢复：挡住另一个进程同时续同一份会话（last-writer 会丢一段工作，B-01）。
+                resume_lock = acquire_resume_lock(session_root(self._workspace_root), resume)
                 if not await runtime.ensure_active(resume):
                     raise _config_error(
                         'sessions resume 指向 .syndica/sessions 里已存在的会话',
@@ -2468,10 +2474,13 @@ class RuntimeCliHost:
                 pump=pump,
                 recording=recording,
                 redactor=redactor,
+                lock=resume_lock,
             )
             return agent_id
         except BaseException as exc:
             try:
+                if resume_lock is not None:
+                    resume_lock.release()
                 if runtime is not None:
                     await runtime.shutdown()
                 if pump is not None:
@@ -2533,12 +2542,26 @@ class RuntimeCliHost:
                 raise
             root_session.failure = None
             return answer
-        raise _config_error(
-            'run --session 指向当前 chat 进程里的活动 Agent',
-            f'收到 session={target!r}；当前进程没有这个活动目标',
-            '跨进程续跑一份落盘会话用 `sessions resume <id>`（交互）；'
-            '在 chat 里先输入 :agents 看当前进程的活动目标',
+        # 不在本进程：跨进程续一份落盘会话，非交互地跑一轮。先只查存在性（不建模型、不开工作区）——
+        # session 不存在是一类「无效 run 选项」，要在建任何东西之前失败。存在就 `_open_chat` 续起、
+        # `_run_session` 发一条取答复，close 收尾存盘；装配沿用快照、不接受覆盖（已拒）。
+        store = FileSessionStore(session_root(self._workspace_root))
+        if not await store.exists(target):
+            raise _config_error(
+                'run --session 指向一份存在的会话'
+                '（本进程的活动 Agent，或 .syndica/sessions 里的落盘会话）',
+                f'收到 session={target!r}；两处都没有它',
+                '用 sessions list 看落盘的会话 id；跨进程交互续跑用 sessions resume <id>',
+            )
+        agent_id = await self._open_chat(
+            request.config,
+            None,
+            trace=request.trace,
+            argv=request.argv,
+            trusted_output=(),
+            resume=target,
         )
+        return await self._run_session(self._sessions[agent_id], request.prompt)
 
     async def _active_agents(self) -> str:
         rows: list[str] = []
@@ -2567,6 +2590,8 @@ class RuntimeCliHost:
                 await session.workspace.close()
             finally:
                 session.environment.remove()
+                if session.lock is not None:
+                    session.lock.release()
                 await self._finish_recording(
                     session.recording,
                     KeyboardInterrupt() if interrupted else session.failure,

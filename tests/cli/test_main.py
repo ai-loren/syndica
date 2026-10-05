@@ -677,6 +677,7 @@ def test_module_host_forwards_the_chat_options_and_the_interruption_to_the_runti
             trace: str | None = None,
             argv: Sequence[str] = (),
             trusted_output: Sequence[str] = (),
+            resume: str | None = None,
         ) -> str:
             opened.append((config, max_turns, trace, tuple(argv)))
             trusted.append(tuple(trusted_output))

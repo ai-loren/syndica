@@ -17,6 +17,7 @@ from syndica.cli.main import (
     CliOutcome,
     InspectRequest,
     RunRequest,
+    SessionsRequest,
     TraceRequest,
     main,
 )
@@ -452,16 +453,22 @@ class _LazyHost:
         trace: str | None = None,
         argv: Sequence[str] = (),
         trusted_output: Sequence[str] = (),
+        resume: str | None = None,
     ) -> str:
         # 只在给了 --trust-module-output 时才传：没有这个参数的宿主实现照样能开 chat。
         extra = {'trusted_output': tuple(trusted_output)} if trusted_output else {}
-        return self._get().open_chat(config, max_turns, trace=trace, argv=argv, **extra)
+        return self._get().open_chat(
+            config, max_turns, trace=trace, argv=argv, resume=resume, **extra
+        )
 
     def active_agents(self) -> str:
         return self._get().active_agents()
 
     def trace(self, request: TraceRequest) -> str | CliOutcome:
         return self._get().trace(request)
+
+    def sessions(self, request: SessionsRequest) -> str | CliOutcome:
+        return self._get().sessions(request)
 
     def close(self, *, interrupted: bool = False) -> None:
         if self._host is not None:
