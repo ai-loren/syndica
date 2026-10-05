@@ -98,9 +98,7 @@ class FileMemoryStore:
                 return None
             return self._read_long(key)
 
-    async def consolidate(
-        self, sections: RedactedMemorySections, *, expected_version: int
-    ) -> int:
+    async def consolidate(self, sections: RedactedMemorySections, *, expected_version: int) -> int:
         with self._locked_key(sections.scope, sections.workspace) as key:
             current = self._read_long(key)
             version = current.version if current is not None else 0
@@ -158,9 +156,7 @@ class FileMemoryStore:
                 yield key
 
     @contextmanager
-    def _locked_key(
-        self, scope: MemoryScope, workspace: str | None
-    ) -> Generator[int, None, None]:
+    def _locked_key(self, scope: MemoryScope, workspace: str | None) -> Generator[int, None, None]:
         self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
         name = _keydir(scope, workspace)
         with self._root_fd() as root:
@@ -182,9 +178,7 @@ class FileMemoryStore:
                 finally:
                     os.close(lock)
 
-    def _read_short(
-        self, key: int, scope: MemoryScope, workspace: str | None
-    ) -> list[MemoryEntry]:
+    def _read_short(self, key: int, scope: MemoryScope, workspace: str | None) -> list[MemoryEntry]:
         del scope, workspace
         try:
             text = io.read_text(key, _SHORT, f'{self._root}/{_SHORT}', _LIMIT, growing=True)

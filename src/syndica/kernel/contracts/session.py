@@ -271,8 +271,15 @@ class SessionStoreContract(ContractSuite):
         await store.save('s1', _red(_rich('s1', agent='Planner', workspace='/a', updated_at=300.0)))
         await store.save(
             's2',
-            _red(_rich('s2', agent='Worker', workspace='/b', status=SessionStatus.ARCHIVED,
-                       updated_at=100.0)),
+            _red(
+                _rich(
+                    's2',
+                    agent='Worker',
+                    workspace='/b',
+                    status=SessionStatus.ARCHIVED,
+                    updated_at=100.0,
+                )
+            ),
         )
         await store.save('s3', _red(_rich('s3', agent='Worker', workspace='/a', updated_at=200.0)))
         assert [meta.sid for meta in await store.list_metas()] == ['s1', 's3', 's2']

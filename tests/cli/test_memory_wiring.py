@@ -38,18 +38,14 @@ def test_enabling_memory_persists_a_remembered_fact_across_the_cli(tmp_path: Pat
     llm = ScriptedLLM(
         [
             ScriptedTurn(
-                tool_calls=[
-                    ToolCall(id='c1', name='Remember', arguments='{"text": "用 tab 缩进"}')
-                ]
+                tool_calls=[ToolCall(id='c1', name='Remember', arguments='{"text": "用 tab 缩进"}')]
             ),
             # Remember 触发整理（阈值 1），整理用一次性调用——它排在这一轮工具执行期间，先于下一轮。
             ScriptedTurn(content='长期记忆：用 tab 缩进'),
             ScriptedTurn(content='done'),
         ]
     )
-    code, stderr = _run(
-        tmp_path, llm, ['--config', str(config), 'run', 'go', '--agent', 'Worker']
-    )
+    code, stderr = _run(tmp_path, llm, ['--config', str(config), 'run', 'go', '--agent', 'Worker'])
     assert code == 0, stderr
 
     longs = list((tmp_path / '.syndica' / 'memory').glob('*/long.json'))
@@ -69,7 +65,5 @@ def test_enabling_compaction_runs_without_error(tmp_path: Path) -> None:
         for i in range(3)
     ]
     llm = ScriptedLLM([*calls, ScriptedTurn(content='done')])
-    code, stderr = _run(
-        tmp_path, llm, ['--config', str(config), 'run', 'go', '--agent', 'Worker']
-    )
+    code, stderr = _run(tmp_path, llm, ['--config', str(config), 'run', 'go', '--agent', 'Worker'])
     assert code == 0, stderr

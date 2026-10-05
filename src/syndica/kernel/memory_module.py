@@ -135,9 +135,7 @@ def _merged_trust(levels: Iterable[TrustLevel]) -> TrustLevel:
     return result
 
 
-def _recaller(
-    store: MemoryStore, workspace: str | None
-) -> Callable[[Context], Awaitable[None]]:
+def _recaller(store: MemoryStore, workspace: str | None) -> Callable[[Context], Awaitable[None]]:
     """cycle 起点注入长期记忆：全局一块 + 工作区一块（各自信任取段落最严）。幂等键挡重复——同一份块
     只注入一次，压缩掉或新会话后才重载（spec §8.9）。工人只注入自己工作区那层，看不到别的工作区。"""
 

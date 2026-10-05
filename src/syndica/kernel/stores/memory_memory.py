@@ -46,9 +46,7 @@ class InMemoryMemoryStore:
         record = self._long.get(_key(scope, workspace))
         return copy.deepcopy(record) if record is not None else None
 
-    async def consolidate(
-        self, sections: RedactedMemorySections, *, expected_version: int
-    ) -> int:
+    async def consolidate(self, sections: RedactedMemorySections, *, expected_version: int) -> int:
         key = _key(sections.scope, sections.workspace)
         current = self._long.get(key)
         version = current.version if current is not None else 0

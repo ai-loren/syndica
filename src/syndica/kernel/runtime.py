@@ -2504,7 +2504,8 @@ class Runtime:
         if drift:
             logger.warning(
                 '会话 %s 恢复：前缀快照与当前角色配置不一致（%s）；'
-                '按当前值续跑，这次恢复缓存不命中。',                agent_id,
+                '按当前值续跑，这次恢复缓存不命中。',
+                agent_id,
                 '; '.join(drift),
             )
 

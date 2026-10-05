@@ -136,9 +136,7 @@ class CompactionModule(RuntimeModule):
             )
             threshold = max(1, window * cast(int, flags['compaction_threshold_percent']) // 100)
             target = max(1, window * cast(int, flags['compaction_target_percent']) // 100)
-            summarize = (
-                _default_summarize(agent) if strategy_name == 'summary' else None
-            )
+            summarize = _default_summarize(agent) if strategy_name == 'summary' else None
             controller = CompactionController(
                 strategy=_build_strategy(strategy_name, summarize),
                 threshold_tokens=threshold,
@@ -147,6 +145,7 @@ class CompactionModule(RuntimeModule):
                 on_compacted=_rebaseliner(runtime, agent),
             )
             return _AttachPlugin(agent, controller)
+
         def tool_factory(
             runtime: Runtime,
             agent: BaseAgent,

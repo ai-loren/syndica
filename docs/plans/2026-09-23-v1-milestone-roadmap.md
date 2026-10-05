@@ -84,7 +84,7 @@ uv run pytest -q
 | 3 | 可观测性 + 脱敏收口 | 已完成 | 只维护回归门禁；CI 在 M12 之前统一补跑 |
 | 4 | 扩展点完备 | 已完成 | 只维护回归门禁；CI 在 M12 之前统一补跑 |
 | 5 | 执行面完整化 + 不可信内容 | 已完成 | Workspace/Portal 全量接口与契约套件、Python 写的 git 版本层、worktree/快照隔离、共享模式写入冲突、伪终端、文件污点与真实溯源链；审计见 `docs/audits/2026-10-04-m5-final-audit.md` |
-| 6 | 状态 | 未开始 | 会话、压缩、记忆持久化 |
+| 6 | 状态 | 已完成 | 会话持久化与恢复（根对话）、§8.8 三种基线压缩 + 内核压缩步骤 + 三触发、§8.9 两层两阶段记忆（LLM 整理、根才写全局、不可信不进全局）、接进 CLI；审计见 `docs/audits/2026-10-05-m6-final-audit.md` |
 | 7 | 产物与验收 | 未开始 | Artifact、Rubric、Verifier |
 | 8 | 长程任务 | 未开始 | Budget、Progress、Strategy |
 | 9 | 产品面 | 未开始 | HTTP/SSE/WebSocket + React |
@@ -101,7 +101,7 @@ deferred items」。
 
 | 条目 | 内容 | 归属 | 依据 |
 |---|---|---|---|
-| B-01 | 租约字段只能经无条件 `update` 写 | M6 | 跨进程恢复与孤儿回收要原子写租约 |
+| B-01 | 租约字段只能经无条件 `update` 写 | 已处理（M6） | 跨进程并发改同一会话由 `flock` 会话锁挡住：每个落盘会话的 chat / resume Runtime 全程持锁，`sessions rm` 遇锁拒删（P28 H2/H3）。M6 只持久化根对话（P14），没有跨进程的子树租约归属，所以不需要基于租约的孤儿回收 |
 | B-02 | `ControlBlock.wait_until_parked` 吞取消 | 接受，附触发条件 | 没有生产调用方；出现第一个时先按登记里的正解修 |
 | B-03 | `LLMConfig` 不可哈希 | 接受 | 失败是响亮的；有缓存需求时再加稳定身份 |
 | B-04 | `WaitResult` 成功路径不可哈希 | 接受 | 根因是 `Message` 可变，已写进 docstring |
@@ -121,7 +121,7 @@ deferred items」。
 | B-19 | 段内 hook 写轨迹的顺序取决于调度 | 已修 | M3 D9 修订：轨迹只由内核写，并发窗口与可观察切点分发期间冻结 |
 | B-20 | 连续两个未配对批次留下孤儿 | 接受 | 不可达，且当前症状是响亮失败 |
 | B-21 | `SendMessage` 不限后代，唤醒会烧掉对方不可恢复的轮数 | M8 | 预算树决定这次唤醒记在谁账上 |
-| B-22 | `KillAgent` 的后代遍历是 O(子树) | M6 | Store 契约给「后代」一个单一定义 |
+| B-22 | `KillAgent` 的后代遍历是 O(子树) | M8 | M6 改为只持久化根对话（P14），子树恢复不再依赖「后代」的单一定义；它随 M8 多 Agent 长程任务（子树管理）一起做 |
 | B-23 | `_DRIVING_AGENT` 被第三方任务继承导致保守误拒 | 接受 | asyncio 不暴露 await 链；误拒是安全侧 |
 | D-40 | `ReadOnlyKwarg` 只护顶层 | 已修 | M5 T8：`PRE_TOOL_USE` 盯住 `args` 与 `tool_call` 的投影，嵌套就地写算那个 hook 写的并重取溯源，就地改 `tool_call` 直接拒绝并点名 |
 | D-62 | 开发期记录器可以被更早装配的 Module 的 hook 截掉 | 已修 | M5 T8：`BaseAgent.observe_tool_outcomes` 不经 hook 链，记录器用它补记被截断的调用 |
@@ -150,12 +150,17 @@ deferred items」。
 | M5 后续 | 隔离副本里的命令经 `..` 写进兄弟 Agent 的副本，危险判据按形状认不出（副本名是 Agent 的 id） | 沙箱后端 | 每个隔离的 Agent 需要自己的根；文本规则只按路径形状判 |
 | M5 后续 | 合并之后被叫醒的子 Agent，上下文里仍写着「在隔离副本里」 | 接受 | 已经进 ZOMBIE 的 Agent 收不到不叫醒它的消息；合并结果提示父 Agent 在叫醒它的消息里说明 |
 | M5 后续 | 合并只合内容，不合可执行位的变化 | M7 | `Portal` 没有改权限的方法；副本保留可执行位，跑得起来 |
-| M5 后续 | 扩展切点在模型侧切点里被触发、结论出自被收紧的 Module 时，那一轮模型请求不收紧（D-64 只做了工具调用那一侧） | M6 | 与上下文压缩同期动模型侧的溯源；`HookResult.untrusted` 已让宿主代码知道这个值不可信 |
+| M5 后续 | 扩展切点在模型侧切点里被触发、结论出自被收紧的 Module 时，那一轮模型请求不收紧（D-64 只做了工具调用那一侧） | M7 | M6 的压缩没有依赖它（压缩信任由内核在 `apply_compaction` 里置，与模型侧收紧无关）；剩下的是 D-64 模型请求那一侧，随 M7 的溯源 / 验收一起做。`HookResult.untrusted` 已让宿主代码知道这个值不可信 |
 | M5 后续 | `shell.download_then_execute` 纯判定认不出 tee 写文件、`wget -P` 前缀、`mv` / `cp` 改名、`uv run` / `deno run` 等解释器 | 接受 | 真实姿态下这些下载落地的文件都不是基线，执行它由执行器的 `exec.untrusted_script` 兜住；纯判定（无路由的消费者）的这些形状留作后续 |
 | M5 后续 | `exec.untrusted_script` 对命令里有多个 `cd` / 变量目录的脚本放过（`effective_cwd` 折不出目录） | 接受 | 折不出目录时宁可不升级、不拿错目录误判；有一个 Agent 之内的窗口上界兜着，真正的边界是沙箱后端 |
 | M5 后续 | 回放重不出 `exec.untrusted_script` 门（收口 C3）：真实 run 的执行器接了路由会按文件污点升级，回放不接路由（`_untrusted_scripts` 恒空），跑过 Bash 写脚本再执行的 CLI trace 会在门上报分歧 | 后续（回放文档 v4） | 响亮失败（回放报分歧非静默）；正确修法要把执行器的文件信任答案记进回放文档并在回放侧接回，是带版本的有意改动，不在时间紧的收口里赶 |
 | M5 后续 | 同一条命令内先改名再执行（`cp planted.sh ok.sh && sh ok.sh`）、非 `cat` 喂 stdin（`head f｜sh`）危险判定认不出（收口 C9） | 接受 | 真实姿态下执行非基线文件由 `exec.untrusted_script` 兜住；纯判定的这类形状与下载形状同族 |
 | M5 后续 | 大小写不敏感卷上 `readme.md` 对基线 `README.md` 判不可信、`cd ~` 的误报（收口 C10） | 接受 | 安全方向（误报不误放）；`resolve()` 不规范化大小写，信任在 Linux CI 与 macOS 之间可能不同 |
+| M6 后续 | 一次性辅助调用（摘要压缩、LLM 记忆整理）的完整回放：ReplayCapture 把不在任何一轮里的模型调用当 gap，这类 run 不写回放文档 | 后续（回放文档 v4） | 与 M5 的 C3 同属回放文档 v4 的 aux / 门槽位；此刻优雅降级（结构照常记录、记一条 warning），两类调用都 opt-in |
+| M6 后续 | 压缩前**完整前像**落 `SessionStore.archive`（spec §8.8「压缩前必须留快照」的完整形态） | M8 | 压缩点已进 trace、被丢的不可信内容有 UNTRUSTED 标记兜溯源；完整前像要把会话 store 递进 Agent 的压缩步骤，随 M8 长程任务的回看需求一起做 |
+| M6 后续 | 多 Agent **子树**的持久化与恢复（子 Agent、broker 队列、租约） | M8 | M6 只持久化根对话（计划 P14）；子树恢复与 M8 的多 Agent 长程任务同属一件事 |
+| M6 后续 | `MemoryStore` / `MemoryStoreContract` 进公开面 | M12 | 先私有：`SessionStoreContract` 已发布，记忆契约未发布，第三方记忆后端暂无公开契约可照着自证；v1.0 冻结公开 API 时一起定 |
+| M6 后续 | LLM 记忆整理可能添油加醋（真实运行实测编造了源里没有的细节，且按源条目记为 trusted） | 接受，附缓解 | 整理 / 摘要提示已要求只保留源事实，重跑只剩源事实；彻底消除要验收器比对（M7） |
 | 卫生 | 基础 CI：每次 push 跑与本地一致的门禁 | M2 | 自举开始改代码之前先有自动门禁 |
 | 卫生 | CHANGELOG、PyPI 预发布、版本策略、issue 模板 | M12 | 发布准备 |
 | 卫生 | `.env.example` | 不做 | key 文件不该放在 Agent 操作的工作区里，`Read` / `Grep` 读得到它 |
@@ -564,6 +569,28 @@ ProvenanceGraph
 ---
 
 ## M6 状态
+
+### 完成情况（2026-10-05）
+
+已完成。计划与逐阶段决策见 `docs/plans/2026-10-05-m6-state.md`（P1–P34），审计见
+`docs/audits/2026-10-05-m6-final-audit.md`。
+
+- **会话**：`SessionStore` 协议 + 内存 / 文件实现 + 契约；Runtime 在周期收尾与关机时存盘；`ensure_active` 从记录
+  重建根 Agent（原样种回轨迹，未配对批次由 `_repair_interrupted_batch` 标「副作用未知」）；CLI `sessions list / show /
+  resume / rm` 与 `run --session`；`flock` 会话锁（关 B-01）。
+- **压缩（§8.8）**：规则型 / 剪枝型 / 摘要型三基线；内核压缩步骤（turn 开始的阈值 / 主动触发 + `CONTEXT_OVERFLOW`
+  兜底），五条不变量与信任由 `apply_compaction` 对内核私有快照校验；压缩点进 trace、prefix-drift 重建基线；
+  `CompactionModule`（默认 off）。
+- **记忆（§8.9）**：`MemoryStore` 协议 + 内存 / 文件实现 + 契约；铸造处强制「不可信不进全局」；`Remember` 工具（根才写
+  全局）；阈值触发 **LLM 整理**（只保留源事实）；cycle 起点按幂等键缓存召回；`MemoryModule`（默认 off）。
+- **范围调整**：只持久化**根对话**（P14），取代下面「多 Agent 任务中途停止再恢复」那条 E2E 的子树恢复语义。
+
+推迟（各有归属与理由，见计划 P30 / P33）：
+
+- 压缩前**完整前像**落 `SessionStore.archive`：压缩点已进 trace、丢掉的不可信内容有 UNTRUSTED 标记兜住溯源。
+- 一次性辅助调用（摘要压缩、LLM 记忆整理）的**完整回放**是回放文档 v4 的 aux_calls 槽；此刻这类 run 优雅降级（结构照常
+  记录、不写回放文档并记日志）。两者都是 opt-in。
+- 目标导向型压缩依赖 M7 的 Rubric（原计划如此）。
 
 ### 目标
 

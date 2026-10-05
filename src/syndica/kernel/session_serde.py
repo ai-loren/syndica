@@ -168,8 +168,10 @@ def _block_from(data: object) -> ContextBlock:
     extra = block.get('extra', {})
     if not isinstance(calls, list) or not isinstance(arts, list) or not isinstance(extra, dict):
         raise _corrupt('content block', 'tool_calls / artifacts 必须是数组、extra 必须是对象')
-    trust = TrustLevel.TRUSTED if block.get('trust') == TrustLevel.TRUSTED.value else (
-        TrustLevel.UNTRUSTED
+    trust = (
+        TrustLevel.TRUSTED
+        if block.get('trust') == TrustLevel.TRUSTED.value
+        else (TrustLevel.UNTRUSTED)
     )
     return ContextBlock(
         role=role,

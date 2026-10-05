@@ -627,6 +627,7 @@ async def _sessions_show(store: SessionStore, sid: str) -> str:
     if record is None:
         raise _session_absent(sid)
     meta = record.meta
+
     # Agent 改得到的字段一律转义后再打印（评审 M8）。
     def safe(text: str) -> str:
         return one_line(terminal_safe(text))

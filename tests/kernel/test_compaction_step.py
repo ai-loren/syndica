@@ -106,8 +106,12 @@ async def test_threshold_trigger_compacts_at_the_turn_boundary() -> None:
 async def test_overflow_fallback_compacts_then_retries() -> None:
     bus = EventBus()
     agent = _agent(
-        [_call('c1'), _call('c2'), ScriptedTurn(raises=_overflow()),
-         ScriptedTurn(content='recovered')],
+        [
+            _call('c1'),
+            _call('c2'),
+            ScriptedTurn(raises=_overflow()),
+            ScriptedTurn(content='recovered'),
+        ],
         events=bus,
     )
     spy = _Spy(RuleBasedCompaction(min_keep_turns=1))
@@ -253,9 +257,7 @@ async def test_the_overflow_fallback_terminates_instead_of_looping() -> None:
 async def test_the_task_message_survives_a_real_compaction() -> None:
     agent = _agent([_call('c1'), _call('c2'), _call('c3'), ScriptedTurn(content='done')])
     agent._attach_compaction(  # pyright: ignore[reportPrivateUsage]
-        CompactionController(
-            strategy=PruningCompaction(), threshold_tokens=30, target_tokens=15
-        )
+        CompactionController(strategy=PruningCompaction(), threshold_tokens=30, target_tokens=15)
     )
     ctx = await agent.run('UNIQUE-TASK-MARKER')
     assert any('UNIQUE-TASK-MARKER' in str(b.content) for b in ctx.current_traj)

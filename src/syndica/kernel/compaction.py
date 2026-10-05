@@ -225,8 +225,7 @@ def _turn_bounds(blocks: Sequence[ContextBlock]) -> list[tuple[int, int]]:
         | {
             index
             for index, block in enumerate(blocks)
-            if block.role == 'assistant'
-            or (block.role == 'user' and kind_of(block) is None)
+            if block.role == 'assistant' or (block.role == 'user' and kind_of(block) is None)
         }
     )
     return [
@@ -438,7 +437,8 @@ def _protected_indices(blocks: Sequence[ContextBlock]) -> frozenset[int]:
         if kind_of(block) in (HistoryKind.ENV_FACT, HistoryKind.RESUME_NOTE)
     }
     user_turns = [
-        index for index, block in enumerate(blocks)
+        index
+        for index, block in enumerate(blocks)
         if block.role == 'user' and kind_of(block) is None
     ]
     if user_turns:

@@ -38,9 +38,7 @@ class MemoryStore(Protocol):
         """某 (scope, workspace) 的长期整理结果；没整理过时是 None。返回快照，改它不影响存储。"""
         ...
 
-    async def consolidate(
-        self, sections: RedactedMemorySections, *, expected_version: int
-    ) -> int:
+    async def consolidate(self, sections: RedactedMemorySections, *, expected_version: int) -> int:
         """把长期段落原子换入，返回新 `version`。`expected_version` 与当前不符时报冲突、不覆盖
         （乐观并发，spec §6.4）。`through_seq` 一并写入。只收脱敏类型。"""
         ...
