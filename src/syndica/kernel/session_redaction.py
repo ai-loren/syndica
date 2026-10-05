@@ -91,26 +91,33 @@ def _redact_block(block: ContextBlock, redactor: Redactor) -> ContextBlock:
     )
 
 
-def _checked(content: list[ContextBlock]) -> None:
-    ids = [call.id for block in content for call in block.tool_calls]
-    if len(ids) != len(set(ids)):
+def _tool_call_ids(content: list[ContextBlock]) -> list[str]:
+    return [call.id for block in content for call in block.tool_calls]
+
+
+def _checked(before: list[ContextBlock], after: list[ContextBlock]) -> None:
+    # 脱敏前后的 tool_call id 必须逐个相同。不是查「全局唯一」：模型在更早的轮里用过同一个 id
+    # （`call_0`、空串）是合法的，执行器按位置配对（见 tool_executor.append_unexecuted），查全局唯一
+    # 会让这类轨迹每次存盘都报错并把失败误报成「磁盘满」。真正要守的是「脱敏不碰 id」。
+    if _tool_call_ids(before) != _tool_call_ids(after):
         raise ContractViolation(
-            expected='脱敏之后工具调用 id 仍然唯一',
-            received='脱敏后出现了重复的 tool_call id',
-            next_action='脱敏不该改 id；出现重复说明脱敏规则动了 id，检查用户规则是否命中 id 字段',
+            expected='脱敏之后工具调用 id 与脱敏前逐个相同（顺序与多重性都不变）',
+            received='脱敏改动了某个 tool_call id',
+            next_action='脱敏只该动文本叶子，不该碰 id；检查用户规则是否命中了 id 字段',
         )
 
 
 def redacted_content(content: list[ContextBlock], redactor: Redactor) -> RedactedContent:
     redacted = [_redact_block(copy.deepcopy(block), redactor) for block in content]
-    _checked(redacted)
+    _checked(content, redacted)
     return RedactedContent(redacted, _mint=_MINT)
 
 
 def redacted_record(record: SessionRecord, redactor: Redactor) -> RedactedSessionRecord:
     copied = copy.deepcopy(record)
+    before = [copy.deepcopy(block) for block in copied.content]
     copied.content = [_redact_block(block, redactor) for block in copied.content]
     copied.system_prompt = redactor.redact(copied.system_prompt)
     copied.meta.title = redactor.redact(copied.meta.title)
-    _checked(copied.content)
+    _checked(before, copied.content)
     return RedactedSessionRecord(copied, _mint=_MINT)

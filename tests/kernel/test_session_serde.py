@@ -1,10 +1,12 @@
-"""会话序列化（M6 T2）：全字段 round-trip、拒更高版本、trust fail-closed、坏块跳过。"""
+"""会话序列化（M6 T2）：全字段 round-trip、拒更高版本 / 外来 / 乱码 schema、trust fail-closed、
+坏块即坏记录（fail-closed）、类型校验。"""
 
 from __future__ import annotations
 
 import pytest
 
 from syndica.kernel.context import ArtifactRef, ContextBlock, ToolCall, TrustLevel
+from syndica.kernel.errors import ConfigError
 from syndica.kernel.session_serde import (
     NewerSessionSchema,
     record_from_json,
@@ -89,12 +91,52 @@ def test_missing_or_unknown_trust_reads_as_untrusted() -> None:
     assert after.content[1].trust is TrustLevel.UNTRUSTED
 
 
-def test_a_bad_block_is_skipped_and_recorded() -> None:
+def test_a_bad_block_fails_the_whole_load_closed() -> None:
+    # 坏块即坏记录（fail-closed，评审 F3）：静默跳过一个块会把唯一的不可信块一起丢掉、洗白
+    # provenance，还可能在历史中段留下未配对的工具调用。恢复宁可拒绝整份。
     data = record_to_json(_record())
     content = data['content']
     assert isinstance(content, list)
     content[1] = {'role': 'assistant', 'tool_calls': [{'name': 'Bash'}]}  # tool call missing id
-    dropped: list[str] = []
-    after = record_from_json(data, dropped=dropped)
-    assert len(after.content) == 2
-    assert len(dropped) == 1 and 'content[1]' in dropped[0]
+    with pytest.raises(ConfigError):
+        record_from_json(data)
+
+
+def test_foreign_or_garbled_schema_is_refused() -> None:
+    # 外来前缀（trace 记录）不许当会话读，乱码版本不许当 v1 收下（评审 F12）。
+    for schema in ('syndica.trace/1', 'syndica.session/abc', 'syndica.session/0', 'nonsense'):
+        data = record_to_json(_record())
+        data['schema'] = schema
+        with pytest.raises(ConfigError):
+            record_from_json(data)
+
+
+def test_wrong_types_are_refused_not_silently_coerced() -> None:
+    # tools: "abc" 不该静默变成 ['a','b','c']；turns=True 不该当 1；status 乱码不该抛裸 ValueError。
+    bad_tools = record_to_json(_record())
+    bad_tools['tools'] = 'abc'
+    with pytest.raises(ConfigError):
+        record_from_json(bad_tools)
+
+    bad_turns = record_to_json(_record())
+    meta = bad_turns['meta']
+    assert isinstance(meta, dict)
+    meta['turns'] = True
+    with pytest.raises(ConfigError):
+        record_from_json(bad_turns)
+
+    bad_status = record_to_json(_record())
+    meta2 = bad_status['meta']
+    assert isinstance(meta2, dict)
+    meta2['status'] = 'bogus'
+    with pytest.raises(ConfigError):
+        record_from_json(bad_status)
+
+
+def test_a_disallowed_role_is_refused() -> None:
+    data = record_to_json(_record())
+    content = data['content']
+    assert isinstance(content, list)
+    content[0]['role'] = 'root'
+    with pytest.raises(ConfigError):
+        record_from_json(data)

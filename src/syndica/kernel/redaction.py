@@ -42,6 +42,7 @@ __all__ = [
     'RedactionRule',
     'Redactor',
     'RuleRedactor',
+    'encode_assured',
     'encode_prepared',
     'encode_redacted',
     'looks_secret',
@@ -852,6 +853,34 @@ def encode_prepared(
             expected='encode_prepared 的值能编码成 JSON',
             received=f'编码失败：{exc}',
             next_action='只放 JSON 能表达的值；过大的整数先转成字符串',
+        ) from exc
+    escaped = _RAW_IN_JSON.sub(lambda match: f'\\u{ord(match.group()):04x}', text)
+    return RedactedText(escaped, _mint=_MINT)
+
+
+def encode_assured(value: object) -> RedactedText:
+    """把一份**调用方的类型已经证明脱过敏**的 JSON 结构编码成 RedactedText：**保留键序、不排序、
+    不再脱敏**。
+
+    `encode_redacted` / `encode_prepared` 为 trace 做规范化（排序键、逐值复核或重脱），这对会话记录
+    是错的：它会打乱 `extra` 的键序（进请求前缀，排序 = 恢复后缓存从该块起全失效），并把内核私有的
+    幂等键 `extra['syndica.key']` 当凭证改掉（恢复后环境事实按键查重失败、重复注入）。本函数不动值、
+    不排序，脱敏责任整个落在上游的收口（`redacted_record` / `redacted_content`，其输出类型即证明）。
+
+    **它绕过 `write_redacted` 的逐值核对**，所以只有「类型即脱敏证明」的那条路可以用它——由
+    `tests/test_write_points.py` 的 AST 守卫强制。只收 JSON 能表达的值；非 JSON 值（datetime、set、
+    NaN 等）报 `ContractViolation` 而不是写半截。
+    """
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ContractViolation(
+            expected=(
+                'encode_assured 的值只含 JSON 能表达的类型'
+                '（dict/list/str/int/有限 float/bool/None）'
+            ),
+            received=f'编码失败：{exc}',
+            next_action='在收口处把非 JSON 值（datetime、Path、set、bytes、NaN）先转成字符串',
         ) from exc
     escaped = _RAW_IN_JSON.sub(lambda match: f'\\u{ord(match.group()):04x}', text)
     return RedactedText(escaped, _mint=_MINT)

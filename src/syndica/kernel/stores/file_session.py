@@ -8,8 +8,8 @@
 同步 IO：同一个事件循环里并发的 `save` / `archive` 之间没有挂起点，因此天然串行（last-writer、序号
 互异）。跨进程不做保证——宿主在 resume 时用锁文件挡住并发恢复同一个会话。
 
-写入面只收 `RedactedSessionRecord` / `RedactedContent`：正文已逐叶脱敏。这里写盘不再脱敏，但按
-`encode_redacted` 的内置规则编码成一行（与 `FileTraceStore` 同一招，防内核标识被用户规则改坏）。
+写入面只收 `RedactedSessionRecord` / `RedactedContent`：正文已逐叶脱敏。这里写盘不再脱敏、也不排
+序键，用 `encode_assured` 保真序列化（类型即脱敏证明）——重脱会打乱 extra 键序、把幂等键改坏。
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from syndica.kernel.errors import ConfigError, ContractViolation
-from syndica.kernel.redaction import RuleRedactor, encode_redacted
+from syndica.kernel.redaction import encode_assured
 from syndica.kernel.session_redaction import RedactedContent, RedactedSessionRecord
 from syndica.kernel.session_serde import (
     meta_from_json,
@@ -42,17 +42,26 @@ __all__ = ['FileSessionStore']
 _META = 'meta.json'
 _RECORD = 'record.json'
 _ARCHIVE = 'archive'
-_ENCODER = RuleRedactor()
 # 元数据只有几 KB；整份记录给足余量，只挡住把宿主内存撑爆的那种。
 _META_LIMIT = 4 * 1024 * 1024
 _RECORD_LIMIT = 512 * 1024 * 1024
 
 
 def _valid_sid(sid: str) -> str:
-    # sid 是目录名：不许空、不许带路径分隔或 `.`，否则会走出 root。
-    if not isinstance(cast(object, sid), str) or not sid or '/' in sid or sid in ('.', '..'):
+    # sid 是目录名：不许空、不许带路径分隔或 `.`，否则会走出 root。NUL / 换行 / 过长会让底层 open
+    # 抛裸 OSError / ValueError，这里换成三件套（255 是常见文件名上限）。
+    if (
+        not isinstance(cast(object, sid), str)
+        or not sid
+        or '/' in sid
+        or sid in ('.', '..')
+        or '\x00' in sid
+        or '\n' in sid
+        or '\r' in sid
+        or len(sid.encode('utf-8')) > 255
+    ):
         raise ConfigError(
-            expected='sid 是一个非空、不含 / 与 . 的会话 id',
+            expected='sid 是一个非空、不含 / . 换行与 NUL、不超过 255 字节的会话 id',
             received=f'收到 sid={sid!r}',
             next_action='用 run / chat 生成的会话 id（它是根 Agent 的 id）',
         )
@@ -77,22 +86,38 @@ class FileSessionStore:
 
     async def exists(self, sid: str) -> bool:
         _valid_sid(sid)
-        with self._root_fd() as root:
-            return root is not None and self._is_session_dir(root, sid)
+        # 按最后写的 meta.json 判存在，不按目录：第一次存盘在写 record.json 时失败（磁盘满 / 权限 /
+        # 进程中途死）会留下半截目录，按目录判会让 exists 说有、而 load 取不回，并让此后每次存盘都先
+        # 在 load_meta 上炸、永远存不进去（F2）。meta 在 record 之后写，有它即两者都在。
+        with self._session_fd(sid) as session:
+            return session is not None and self._has_file(session, _META)
 
     async def load_meta(self, sid: str) -> SessionMeta | None:
         _valid_sid(sid)
         with self._session_fd(sid) as session:
             if session is None:
                 return None
-            return self._read_meta(session, sid)
+            try:
+                return self._read_meta(session, sid)
+            except FileNotFoundError:
+                return None
 
     async def load(self, sid: str) -> SessionRecord | None:
         _valid_sid(sid)
         with self._session_fd(sid) as session:
             if session is None:
                 return None
-            return self._read_record(session, sid)
+            try:
+                record = self._read_record(session, sid)
+            except FileNotFoundError:
+                return None
+            # meta.json 是 live 元数据的权威，archive 只前移它。读 record 时拿 meta.json
+            # 覆盖内嵌那份（F6），否则 archived 落后、随后写又回滚。归档副本不覆盖。
+            try:
+                record.meta = self._read_meta(session, sid)
+            except FileNotFoundError:
+                pass
+            return record
 
     async def save(self, sid: str, record: RedactedSessionRecord) -> None:
         _valid_sid(sid)
@@ -110,7 +135,7 @@ class FileSessionStore:
     async def archive(self, sid: str, record: RedactedSessionRecord) -> int:
         _valid_sid(sid)
         with self._created_session(sid) as session:
-            seq = self._next_seq(session)
+            seq = self._next_seq(session, sid)
             snapshot = record_to_json(record.record)
             snapshot['meta'] = {
                 **cast('dict[str, object]', snapshot['meta']),
@@ -162,6 +187,8 @@ class FileSessionStore:
                     next_action='先 save 再 replace_content，或检查 sid 是否拼错',
                 )
             record = self._read_record(session, sid)
+            # 用 meta.json（权威）覆盖内嵌 meta，否则把 archive 前移过的 archived 写回成旧值（F6）。
+            record.meta = self._read_meta(session, sid)
             record.content = content.content
             record.meta.updated_at = time.time()
             self._write_json(session, _RECORD, record_to_json(record))
@@ -253,18 +280,32 @@ class FileSessionStore:
             return False
         return stat.S_ISDIR(mode)
 
-    def _next_seq(self, session: int) -> int:
-        if not self._has_archive(session):
-            return 1
+    def _has_file(self, session: int, name: str) -> bool:
+        try:
+            mode = os.stat(name, dir_fd=session, follow_symlinks=False).st_mode
+        except OSError:
+            return False
+        return stat.S_ISREG(mode)
+
+    def _next_seq(self, session: int, sid: str) -> int:
+        # 取 meta.archived 与现存归档文件名的最大值 +1。只看文件名：删掉最新归档文件（目录
+        # Agent 可写）会让下次重发同一个 seq，trace 引过的 seq 此后指向别的快照（F6）。只增不补。
         highest = 0
-        for name in self._archive_names(session):
-            highest = max(highest, int(name.removesuffix('.json')))
+        try:
+            highest = self._read_meta(session, sid).archived
+        except (OSError, ContractViolation, ConfigError):
+            pass
+        if self._has_archive(session):
+            for name in self._archive_names(session):
+                highest = max(highest, int(name.removesuffix('.json')))
         return highest + 1
 
     def _archive_names(self, session: int) -> Iterator[str]:
         with io.opened(_ARCHIVE, session) as archive:
             for name in os.listdir(archive):
-                if name.endswith('.json') and name.removesuffix('.json').isdigit():
+                stem = name.removesuffix('.json')
+                # isascii 挡 '²'：isdigit() 真但 int() 抛 ValueError，会让此后 archive 全失败。
+                if name.endswith('.json') and stem.isascii() and stem.isdigit():
                     yield name
 
     def _bump_archived(self, session: int, sid: str, seq: int) -> None:
@@ -296,8 +337,13 @@ class FileSessionStore:
         return cast('dict[str, Any]', value)
 
     def _write_json(self, directory: int, name: str, value: dict[str, object]) -> None:
-        """原子写：写一个临时文件再 `os.replace` 盖上去，崩溃时要么是旧的要么是新的，不留半截。"""
-        encoded = encode_redacted(value, _ENCODER)
+        """原子写：写一个临时文件再 `os.replace` 盖上去，崩溃时要么是旧的要么是新的，不留半截。
+
+        记录已在收口（`redacted_record` / `redacted_content`）逐叶脱过敏，这里只做保真序列化：
+        `encode_assured` 不排序、不重脱——否则 `extra` 键序丢失、内核幂等键 `syndica.key` 被当凭证
+        改掉（见 redaction.encode_assured）。
+        """
+        encoded = encode_assured(value)
         temporary = f'.{name}.{uuid.uuid4().hex}.tmp'
         io.write_new(directory, temporary, encoded)
         try:

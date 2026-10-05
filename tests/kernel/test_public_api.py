@@ -494,6 +494,7 @@ _WITHHELD: tuple[str, ...] = (
     'current_tool_call',
     'disposition_of',
     'driving_agent',
+    'encode_assured',
     'encode_prepared',
     'entering_owner',
     'entering_tool_call',
