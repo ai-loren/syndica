@@ -32,6 +32,7 @@ __all__ = [
     'VerdictStatus',
     'derive_verdict',
     'rubric_trust',
+    'unfinished_verdict',
 ]
 
 
@@ -203,6 +204,32 @@ def _derive_status(
     if any(o.kind is OutcomeKind.UNCONFIRMED for o in checkable):
         return VerdictStatus.PARTIAL, None
     return VerdictStatus.PASS, None
+
+
+def unfinished_verdict(
+    rubrics: Sequence[Rubric], *, reason: str = '', trust: TrustLevel = TrustLevel.TRUSTED
+) -> Verdict:
+    """L2 输出验收判「没做完」时的裁决：恒 `PARTIAL`（§7.5：未完成 → partial）。
+
+    这是一次**降级**——由 L2 的二值结论确定地映射，不收验收器自报的状态，永远不会是 `PASS`，所以不
+    违反「状态由内核推导」。各 checkable 条记 `UNCONFIRMED`（L2 不逐条判）、judgment 条照旧
+    `NEEDS_HUMAN`。没有 Rubric 时也给 `PARTIAL`：L2 不靠 Rubric 判「要求做完没有」。"""
+    active = [r for r in rubrics if r.status is RubricStatus.ACTIVE]
+    outcomes: list[RubricOutcome] = []
+    needs_human: list[str] = []
+    for rubric in active:
+        if rubric.kind is RubricKind.JUDGMENT:
+            outcomes.append(RubricOutcome(rubric.id, OutcomeKind.NEEDS_HUMAN))
+            needs_human.append(rubric.id)
+        else:
+            outcomes.append(RubricOutcome(rubric.id, OutcomeKind.UNCONFIRMED))
+    return Verdict(
+        status=VerdictStatus.PARTIAL,
+        outcomes=tuple(outcomes),
+        needs_human=tuple(needs_human),
+        reason=reason,
+        trust=trust,
+    )
 
 
 def rubric_trust(inputs: Sequence[TrustLevel]) -> TrustLevel:
