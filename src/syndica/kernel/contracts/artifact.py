@@ -105,6 +105,18 @@ class ArtifactStoreContract(ContractSuite):
         await store.register(_ref('file:report.md', 'v2', is_deliverable=False))
         assert {r.id for r in await store.list(deliverable_only=True)} == {'file:report.md'}
 
+    async def test_re_registering_the_current_version_marks_it_deliverable(
+        self, store: ArtifactStore
+    ) -> None:
+        # Deliver 的流程：某版本已被隐式追踪登记（非交付物），Deliver 把**同一个版本**（内容没变、
+        # 版本号不变）重登记一次、只为置上交付标记。幂等跳过不能把这个标记丢了。
+        await store.register(_ref('file:report.md', 'v1', is_deliverable=False))
+        await store.register(_ref('file:report.md', 'v1', is_deliverable=True))
+        assert {r.id for r in await store.list(deliverable_only=True)} == {'file:report.md'}
+        assert await store.versions_of('file:report.md') == [
+            _ref('file:report.md', 'v1', is_deliverable=False)
+        ]  # 没多出一个版本
+
     async def test_three_concurrent_registrations_of_one_id_all_land(
         self, store: ArtifactStore
     ) -> None:

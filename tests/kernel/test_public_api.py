@@ -466,6 +466,7 @@ _WITHHELD: tuple[str, ...] = (
     'DangerPolicySpec',
     'DangerRuleSpec',
     'Delegate',
+    'Deliver',
     'Edit',
     'Expected',
     'FROZEN_IMPLS',

@@ -47,24 +47,31 @@ class FileArtifactStore:
 
     async def register(self, ref: ArtifactRef) -> None:
         with self._locked() as key:
-            order, versions = self._read(key)
+            order, versions, deliverable = self._read(key)
             existing = versions.get(ref.id)
             if existing is None:
                 order.append(ref.id)
                 versions[ref.id] = [ref]
             elif any(v.version == ref.version for v in existing):
-                return  # 同 (id, version) 幂等：保留先登记的那条（§7.2）
+                # 同 (id, version) 幂等：保留先登记的那条，但交付物是产物级粘性标记，照样置上
+                # （`Deliver` 走的就是「重登记当前版本只为置交付」这条路，§7.4）。
+                if ref.is_deliverable:
+                    deliverable.add(ref.id)
+                    self._write(key, index_to_json(order, versions, deliverable))
+                return
             else:
                 existing.append(ref)
-            self._write(key, index_to_json(order, versions))
+            if ref.is_deliverable:
+                deliverable.add(ref.id)
+            self._write(key, index_to_json(order, versions, deliverable))
 
     async def get(self, artifact_id: str) -> ArtifactRef | None:
-        _, versions = self._read_only()
+        _, versions, _ = self._read_only()
         chain = versions.get(artifact_id)
         return chain[-1] if chain else None
 
     async def versions_of(self, artifact_id: str) -> list[ArtifactRef]:
-        _, versions = self._read_only()
+        _, versions, _ = self._read_only()
         return list(versions.get(artifact_id, ()))
 
     async def list(
@@ -74,7 +81,7 @@ class FileArtifactStore:
         producer: str | None = None,
         deliverable_only: bool = False,
     ) -> list[ArtifactRef]:
-        order, versions = self._read_only()
+        order, versions, deliverable = self._read_only()
         out: list[ArtifactRef] = []
         for artifact_id in order:
             chain = versions[artifact_id]
@@ -83,7 +90,7 @@ class FileArtifactStore:
                 continue
             if producer is not None and latest.producer != producer:
                 continue
-            if deliverable_only and not any(v.is_deliverable for v in chain):
+            if deliverable_only and artifact_id not in deliverable:
                 continue
             out.append(latest)
         return out
@@ -126,17 +133,17 @@ class FileArtifactStore:
             finally:
                 os.close(lock)
 
-    def _read_only(self) -> tuple[list[str], dict[str, list[ArtifactRef]]]:
+    def _read_only(self) -> tuple[list[str], dict[str, list[ArtifactRef]], set[str]]:
         with self._root_fd() as root:
             if root is None:
-                return [], {}
+                return [], {}, set()
             return self._read(root)
 
-    def _read(self, root: int) -> tuple[list[str], dict[str, list[ArtifactRef]]]:
+    def _read(self, root: int) -> tuple[list[str], dict[str, list[ArtifactRef]], set[str]]:
         try:
             text = io.read_text(root, _INDEX, f'{self._root}/{_INDEX}', _LIMIT, growing=True)
         except FileNotFoundError:
-            return [], {}
+            return [], {}, set()
         try:
             value = json.loads(text)
         except (ValueError, RecursionError):

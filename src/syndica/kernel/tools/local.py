@@ -11,6 +11,7 @@ import math
 import posixpath
 import re
 from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from typing import cast
 
 from syndica.kernel.context import ArtifactRef, TrustLevel
@@ -23,6 +24,7 @@ from syndica.kernel.workspace import ExecResult, Portal, WriteConflict
 __all__ = [
     'Bash',
     'BashOutput',
+    'Deliver',
     'Edit',
     'Glob',
     'Grep',
@@ -317,6 +319,38 @@ class Edit(Tool):
             output=f'已替换 {path} 中的一处文本',
             meta={'path': path},
             artifacts=[_artifact(path, version)],
+        )
+
+
+class Deliver(Tool):
+    """把工作区里的一个文件显式标记为交付物（spec §7.4）。"""
+
+    __tool_name__ = 'Deliver'
+    __tool_command_args__ = ()
+    __tool_external_input__ = False
+
+    def __init__(self, portal: Portal) -> None:
+        self._portal = portal
+
+    async def execute(self, path: str, note: str = '', kind: str = '') -> ToolResult:
+        """把一个已经写出的文件标记为交付物。验收只看交付物，不查临时脚本 / 中间数据，所以这是
+        控制成本的手段：把真正要交付的东西挑出来。
+        path: 相对工作区根的路径，必须已存在
+        note: 这是什么 / 为什么交付它（可空）
+        kind: 覆盖语义类别（document / spreadsheet / diagram / data / code，可空，默认按扩展名）
+        """
+        try:
+            stat = await self._portal.stat(path)
+        except ConfigError as exc:
+            return _told(exc)
+        if stat is None:
+            return ToolResult(
+                output=f'交付失败：{path} 不存在。先写出这个文件再 Deliver，或检查路径是否写对。'
+            )
+        ref = _artifact(path, stat.version)
+        ref = replace(ref, kind=kind or ref.kind, is_deliverable=True)
+        return ToolResult(
+            output=f'已标记交付物：{path}', meta={'path': path, 'note': note}, artifacts=[ref]
         )
 
 
@@ -687,6 +721,7 @@ def local_tools(portal: Portal, *, output_limit: int | None = None) -> dict[str,
     bash_output = BashOutput(portal, output_limit=limit)
     kill_bash = KillBash(portal)
     terminal = Terminal(portal, output_limit=limit)
+    deliver = Deliver(portal)
     return {
         read.name: read,
         write.name: write,
@@ -697,4 +732,5 @@ def local_tools(portal: Portal, *, output_limit: int | None = None) -> dict[str,
         bash_output.name: bash_output,
         kill_bash.name: kill_bash,
         terminal.name: terminal,
+        deliver.name: deliver,
     }

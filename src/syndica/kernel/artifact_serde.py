@@ -81,13 +81,15 @@ def _ref_from(data: object, where: str) -> ArtifactRef:
     )
 
 
-def index_to_json(order: list[str], versions: dict[str, list[ArtifactRef]]) -> dict[str, object]:
+def index_to_json(
+    order: list[str], versions: dict[str, list[ArtifactRef]], deliverable: set[str]
+) -> dict[str, object]:
     return {
         'schema': ARTIFACT_SCHEMA,
         'artifacts': [
             {
                 'id': artifact_id,
-                'deliverable': any(ref.is_deliverable for ref in versions[artifact_id]),
+                'deliverable': artifact_id in deliverable,
                 'versions': [_ref_to(ref) for ref in versions[artifact_id]],
             }
             for artifact_id in order
@@ -95,15 +97,19 @@ def index_to_json(order: list[str], versions: dict[str, list[ArtifactRef]]) -> d
     }
 
 
-def index_from_json(data: dict[str, Any]) -> tuple[list[str], dict[str, list[ArtifactRef]]]:
-    """返回 (登记顺序的 id 列表, id → 版本列表)。交付物标记由各版本的 `is_deliverable` 粘性推出，
-    不单独存——落盘的 `deliverable` 只是便于人读。"""
+def index_from_json(
+    data: dict[str, Any],
+) -> tuple[list[str], dict[str, list[ArtifactRef]], set[str]]:
+    """返回 (登记顺序的 id 列表, id → 版本列表, 交付物 id 集合)。交付物是产物级的粘性标记，单独存：
+    `Deliver` 把当前版本（内容没变、版本号不变）重登记一次只为置上它，靠版本上的 `is_deliverable`
+    推不出来（那次是幂等重登记，被跳过）。"""
     _checked_schema(data)
     raw = data.get('artifacts')
     if not isinstance(raw, list):
         raise _corrupt('artifacts', f'artifacts 不是数组，是 {type(raw).__name__}')
     order: list[str] = []
     versions: dict[str, list[ArtifactRef]] = {}
+    deliverable: set[str] = set()
     for i, entry in enumerate(cast('list[object]', raw)):
         if not isinstance(entry, dict):
             raise _corrupt(f'artifacts[{i}]', '不是对象')
@@ -116,4 +122,6 @@ def index_from_json(data: dict[str, Any]) -> tuple[list[str], dict[str, list[Art
         refs = [_ref_from(v, f'artifacts[{i}].versions[{j}]') for j, v in enumerate(vlist)]
         order.append(artifact_id)
         versions[artifact_id] = refs
-    return order, versions
+        if item.get('deliverable') is True or any(ref.is_deliverable for ref in refs):
+            deliverable.add(artifact_id)
+    return order, versions, deliverable
