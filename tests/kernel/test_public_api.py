@@ -483,6 +483,8 @@ _WITHHELD: tuple[str, ...] = (
     'verify_outcome',
     'verify_output',
     'unfinished_verdict',
+    'is_human_feedback',
+    'propose_feedback_rubric',
     'RUBRIC_SCHEMA',
     'NewerRubricSchema',
     'goal_from_json',
