@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import logging
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -122,6 +123,8 @@ from syndica.kernel.tracing import (
 )
 
 __all__ = ['AgentOptions', 'BaseAgent']
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -438,6 +441,8 @@ class BaseAgent:
         # 压缩控制器（可选）：由压缩 Module 的 agent 插件经 `_attach_compaction` 装上。turn 边界与
         # 超限兜底时内核调它；没装就没有压缩（spec §8.8）。
         self._compaction: CompactionController | None = None
+        # 当前周期的那条输入（query 或第一条注入）：本周期的 Goal 代理，压缩时必须活着（评审 M2）。
+        self._cycle_anchor: ContextBlock | None = None
 
     def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
         """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
@@ -673,29 +678,57 @@ class BaseAgent:
         """turn 边界 / 超限兜底的内核压缩步骤。交回是否真压了。
 
         改写只在这里发生、走 `Context._replace_traj`（不经 append、不让 hook 就地改，spec §8.8）。
-        五条不变量与信任单调由 `apply_compaction` 兜底，策略洗不白。压缩点记入 trace 与事件，否则
-        「这一轮为什么突然变贵」会被误判成前缀漂移缺陷（spec §8.8）。
+        策略拿到的是**深拷副本**，信任 / protected / 原块判定都对内核私藏的那份快照算——策略就地改
+        输入也洗不白（评审 H1）。压缩点记入 trace 与事件，否则「这一轮为什么突然变贵」会被误判成前缀
+        漂移缺陷（spec §8.8）。超限兜底要求占用**严格缩小**才算成功，否则下轮重试、无限循环（H2）。
         """
         controller = self._compaction
         if controller is None:
             return False
-        before = ctx.current_traj
-        tokens_before = traj_tokens(before)
+        live = ctx.current_traj
+        tokens_before = traj_tokens(live)
         if not force and not controller.should_compact(tokens_before):
             return False
-        request = controller.build_request(before)
-        result = await controller.strategy.compact(request)
-        final = apply_compaction(request, result)
-        if final == before:
+        # 权威快照：策略碰不到活对象，apply_compaction 对它算信任与 protected（评审 H1）。
+        pristine = [copy.deepcopy(block) for block in live]
+        working = [copy.deepcopy(block) for block in live]
+        budget = controller.overflow_budget(tokens_before) if force else None
+        request = controller.build_request(
+            working, budget_tokens=budget, extra_protected=self._cycle_anchor_index(live)
+        )
+        try:
+            result = await controller.strategy.compact(request)
+        except ContractViolation:
+            raise
+        except Exception:
+            # 摘要器网络错 / 套娃超限等：压缩失败不该把一次可恢复的局面变成 Agent ERROR（评审 M5）。
+            # 记一条、按「卡住」收尾、继续——不可信标记不受影响（什么都没改写）。
+            logger.exception(
+                '期望: 压缩策略 %s 产出结果。 实际: 它抛了异常。 下一步: 换策略或看上面的栈。',
+                type(controller.strategy).__name__,
+            )
+            controller.settle(tokens_now=tokens_before, changed=False)
+            return False
+        final = apply_compaction(request, result, before=pristine)
+        if ctx.current_traj != live:
+            raise ContractViolation(
+                expected='压缩策略只读它拿到的副本，不改 Agent 的活轨迹',
+                received=f'策略 {type(controller.strategy).__name__} 就地改了活的 Context',
+                next_action='策略只能在 CompactionResult 里提议留 / 丢，不得就地改 request.blocks',
+            )
+        tokens_after = traj_tokens(final)
+        shrank = tokens_after < tokens_before
+        unchanged = final == pristine
+        # 阈值路成功＝有改动；超限兜底成功＝严格缩小（否则落回 hook / 上抛，终止循环，评审 H2/H4）。
+        if unchanged or (force and not shrank):
             controller.settle(tokens_now=tokens_before, changed=False)
             return False
         ctx._replace_traj(final)  # pyright: ignore[reportPrivateUsage]
-        tokens_after = traj_tokens(final)
         self._tracing.event(
             'compaction',
             {
                 'trigger': trigger,
-                'blocks_before': len(before),
+                'blocks_before': len(pristine),
                 'blocks_after': len(final),
                 'tokens_before': tokens_before,
                 'tokens_after': tokens_after,
@@ -706,7 +739,7 @@ class BaseAgent:
             'compaction',
             {
                 'trigger': trigger,
-                'blocks_before': len(before),
+                'blocks_before': len(pristine),
                 'blocks_after': len(final),
                 'tokens_before': tokens_before,
                 'tokens_after': tokens_after,
@@ -716,6 +749,17 @@ class BaseAgent:
         if controller.on_compacted is not None:
             controller.on_compacted()
         return True
+
+    def _cycle_anchor_index(self, blocks: list[ContextBlock]) -> frozenset[int]:
+        """当前周期的那条输入（query 或第一条注入）在 `blocks` 里的下标——它是本周期的 Goal 代理，
+        压缩时必须活着。中途一条插话会把「最后一条 user」顶走，只靠首尾 user 保不住（评审 M2）。"""
+        anchor = self._cycle_anchor
+        if anchor is None:
+            return frozenset()
+        for index, block in enumerate(blocks):
+            if block is anchor:
+                return frozenset({index})
+        return frozenset()
 
     def get_system_prompt(self) -> str:
         """必须逐轮返回字节一致的结果：SP 变一个字节，该会话此后所有请求缓存全失效。"""
@@ -757,12 +801,15 @@ class BaseAgent:
         ) as span:
             ctx = self._context
             ctx.stop_reason = None
+            self._cycle_anchor = None
             repaired = _repair_interrupted_batch(ctx)
             self._executor._trace_interrupted(  # pyright: ignore[reportPrivateUsage]
                 (self.agent_id, self._cycle, self._current_turn), repaired
             )
             if query is not None:
-                ctx.append(ContextBlock(role='user', content=query, trust=trust))
+                anchor = ContextBlock(role='user', content=query, trust=trust)
+                ctx.append(anchor)
+                self._cycle_anchor = anchor
             await self._emit('agent_start', {})
             await self._hooks._dispatch(Junction.AGENT_START, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
             # Exception 而非 BaseException：取消既不是正常结束也不是失败，展开的路上不再触发切点、
@@ -809,9 +856,6 @@ class BaseAgent:
                 stop_reason = await self._one_turn(ctx, turn, decision, tool_defs)
             if stop_reason is not None:
                 return stop_reason
-            # turn 边界的内核压缩步骤：阈值提前触发（主路径）或 Agent 主动要求（spec §8.8）。在 turn
-            # span 之外、下一轮 before_turn 之前——压缩不属于任何一轮、也不该与门抢邮箱。
-            await self._maybe_compact(ctx, trigger='threshold')
         ctx.stop_reason = StopReason.MAX_TURNS
         return StopReason.MAX_TURNS
 
@@ -824,6 +868,9 @@ class BaseAgent:
     ) -> StopReason | None:
         """一轮：注入、模型、第 9 步、工具。交回这个周期停下的原因；None 表示接着下一轮。"""
         await self._inject(ctx, decision)
+        # turn 开始就做阈值 / 主动压缩（§8.8 主路径）：注入之后（新输入成了受保护的「当前输入」）、
+        # 模型调用之前，消息驱动的 Agent（每轮一次回复、无工具）也会压，而非只靠超限兜底（H3）。
+        await self._maybe_compact(ctx, trigger='threshold')
 
         await self._emit('turn_start', {'turn': turn})
         await self._hooks._dispatch(Junction.TURN_START, ctx=ctx, turn=turn)  # pyright: ignore[reportPrivateUsage]
@@ -869,18 +916,19 @@ class BaseAgent:
         ——那是 surface 的事（spec §4.5）。
         """
         for message in decision.messages:
-            ctx.append(
-                ContextBlock(
-                    role='user',
-                    content=message.content,
-                    trust=message.trust,
-                    extra={
-                        'message_id': message.id,
-                        'sender': message.sender,
-                        'trigger': message.trigger.value,
-                    },
-                )
+            injected = ContextBlock(
+                role='user',
+                content=message.content,
+                trust=message.trust,
+                extra={
+                    'message_id': message.id,
+                    'sender': message.sender,
+                    'trigger': message.trigger.value,
+                },
             )
+            ctx.append(injected)
+            if self._cycle_anchor is None:
+                self._cycle_anchor = injected
             self._tracing.consumed(message.id)
             await self._hooks._dispatch(Junction.MESSAGE_INJECTED, ctx=ctx, message=message)  # pyright: ignore[reportPrivateUsage]
         for message_id in decision.deferred:

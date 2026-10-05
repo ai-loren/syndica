@@ -146,12 +146,108 @@ async def test_the_step_places_trust_via_apply_compaction() -> None:
     )
     agent._attach_compaction(controller)  # pyright: ignore[reportPrivateUsage]
     changed = await agent._maybe_compact(  # pyright: ignore[reportPrivateUsage]
-        agent.context, trigger='threshold', force=True
+        agent.context, trigger='threshold'
     )
     assert changed
     # 不可信块被压掉，但内核经 apply_compaction 补了署名标记——溯源不被洗白（绕过 apply_compaction
     # 的改动会让这条变红）。
     assert any(b.trust is TrustLevel.UNTRUSTED for b in agent.context.current_traj)
+
+
+async def test_a_strategy_that_mutates_its_input_cannot_launder_trust() -> None:
+    class _Launderer:
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            for block in request.blocks:
+                block.trust = TrustLevel.TRUSTED  # 就地洗白（评审 H1）
+            return CompactionResult(kept=list(request.blocks), dropped=[])
+
+    agent = _agent([ScriptedTurn(content='x')])
+    agent.context._replace_traj(  # pyright: ignore[reportPrivateUsage]
+        [
+            ContextBlock(role='user', content='task'),
+            ContextBlock(role='assistant', content='web said X', trust=TrustLevel.UNTRUSTED),
+            ContextBlock(role='assistant', content='recent'),
+        ]
+    )
+    agent._attach_compaction(  # pyright: ignore[reportPrivateUsage]
+        CompactionController(strategy=_Launderer(), threshold_tokens=2, target_tokens=1)
+    )
+    await agent._maybe_compact(agent.context, trigger='threshold')  # pyright: ignore[reportPrivateUsage]
+    # 策略只拿到副本、内核对权威快照算信任：洗白无效，不可信标记还在。
+    assert any(b.trust is TrustLevel.UNTRUSTED for b in agent.context.current_traj)
+
+
+async def test_an_env_fact_block_survives_compaction() -> None:
+    from syndica.kernel.history_blocks import HistoryKind, kind_of, signed_block
+
+    agent = _agent([ScriptedTurn(content='x')])
+    env = signed_block(HistoryKind.ENV_FACT, 'cwd=/w, isolated', key='env:isolation:0')
+    agent.context._replace_traj(  # pyright: ignore[reportPrivateUsage]
+        [
+            ContextBlock(role='user', content='task'),
+            env,
+            *(ContextBlock(role='assistant', content=f'chatter {i}' * 20) for i in range(5)),
+            ContextBlock(role='assistant', content='recent'),
+        ]
+    )
+    agent._attach_compaction(  # pyright: ignore[reportPrivateUsage]
+        CompactionController(
+            strategy=RuleBasedCompaction(min_keep_turns=1), threshold_tokens=5, target_tokens=2
+        )
+    )
+    await agent._maybe_compact(agent.context, trigger='threshold')  # pyright: ignore[reportPrivateUsage]
+    assert any(kind_of(b) is HistoryKind.ENV_FACT for b in agent.context.current_traj)
+
+
+async def test_the_current_cycle_query_survives_a_mid_cycle_interjection() -> None:
+    agent = _agent([ScriptedTurn(content='x')])
+    anchor = ContextBlock(role='user', content='THE-CYCLE-TASK')
+    agent.context._replace_traj(  # pyright: ignore[reportPrivateUsage]
+        [
+            ContextBlock(role='user', content='old task'),
+            anchor,
+            *(ContextBlock(role='assistant', content=f'work {i}' * 20) for i in range(5)),
+            ContextBlock(role='user', content='an interjection'),  # 现在的「最后一条 user」
+        ]
+    )
+    agent._cycle_anchor = anchor  # pyright: ignore[reportPrivateUsage]
+    agent._attach_compaction(  # pyright: ignore[reportPrivateUsage]
+        CompactionController(
+            strategy=RuleBasedCompaction(min_keep_turns=1), threshold_tokens=5, target_tokens=2
+        )
+    )
+    await agent._maybe_compact(agent.context, trigger='threshold')  # pyright: ignore[reportPrivateUsage]
+    # 本周期的任务是 Goal 代理：插话顶走「最后一条 user」后它仍必须活着（评审 M2）。
+    assert any('THE-CYCLE-TASK' in str(b.content) for b in agent.context.current_traj)
+
+
+async def test_the_overflow_fallback_terminates_instead_of_looping() -> None:
+    from syndica.kernel.compaction import SummaryCompaction
+
+    async def summarize(blocks: Any) -> str:
+        del blocks
+        return 'digest'
+
+    script = [ScriptedTurn(raises=_overflow()) for _ in range(20)]
+    agent = _agent(script)
+    agent.context._replace_traj(  # pyright: ignore[reportPrivateUsage]
+        [
+            ContextBlock(role='user', content='task'),
+            *(ContextBlock(role='assistant', content=f'old {i}' * 50) for i in range(6)),
+        ]
+    )
+    agent._attach_compaction(  # pyright: ignore[reportPrivateUsage]
+        CompactionController(
+            strategy=SummaryCompaction(min_keep_turns=1),
+            threshold_tokens=10_000,
+            target_tokens=20,
+            summarize=summarize,
+        )
+    )
+    # 永远超限 + 摘要策略：压一把后压不动就落回 hook / 上抛，不无限重摘（评审 H2）。
+    async with asyncio.timeout(5):
+        with pytest.raises(ContextOverflowError):
+            await agent.run('go')
 
 
 async def test_the_task_message_survives_a_real_compaction() -> None:
@@ -191,11 +287,12 @@ def test_should_compact_follows_the_threshold() -> None:
 
 
 def test_backoff_stops_repeated_empty_compaction_until_growth() -> None:
-    controller = _controller()
+    controller = _controller()  # threshold 100, target 40 → 重试余量 60
     assert controller.should_compact(120)
     controller.settle(tokens_now=120, changed=False)  # 压不动
     assert not controller.should_compact(120)  # 没长就不反复空压
-    assert controller.should_compact(130)  # 又长了，再试
+    assert not controller.should_compact(130)  # 只长一点（<余量）也先不试，免得每轮重写前缀
+    assert controller.should_compact(200)  # 长出一整次压缩的收益之后再试（120 + 60）
 
 
 def test_a_successful_compaction_clears_the_backoff() -> None:
@@ -214,7 +311,8 @@ def test_a_request_bit_survives_until_the_next_compaction() -> None:
 
 
 def test_a_compaction_that_stays_over_threshold_keeps_backoff() -> None:
-    controller = _controller()
+    controller = _controller()  # 重试余量 60
     controller.settle(tokens_now=120, changed=True)  # 压了但仍在阈值上
     assert not controller.should_compact(120)
-    assert controller.should_compact(140)
+    assert not controller.should_compact(150)  # 长了但没到余量
+    assert controller.should_compact(200)  # 120 + 60 之后才重试

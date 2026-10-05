@@ -112,6 +112,25 @@ async def test_compaction_rebaselines_prefix_drift_instead_of_reporting_it() -> 
         await runtime.shutdown()
 
 
+async def test_the_compact_tool_requests_a_compaction() -> None:
+    llm = ScriptedLLM(_script(tool_turns=1))
+    runtime = Runtime(
+        modules=[CompactionModule()],
+        flags={'compaction_strategy': 'rule_based', **_SMALL_WINDOW},
+    )
+    try:
+        agent_id = await runtime.spawn(_factory(llm), query='t')
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        agent = _agent_of(runtime, agent_id)
+        result = await agent.options.tools['Compact'].execute()
+        assert '请求' in str(result.output)
+        controller = agent._compaction  # pyright: ignore[reportPrivateUsage]
+        # 位置上了：远低于阈值也会在下一轮边界压（spec §8.8 第三条触发路径）。
+        assert controller is not None and controller.should_compact(0)
+    finally:
+        await runtime.shutdown()
+
+
 async def test_target_not_below_threshold_fails_at_spawn() -> None:
     llm = ScriptedLLM(_script(tool_turns=1))
     runtime = Runtime(

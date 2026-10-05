@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 from syndica.kernel.context import (
     Context,
@@ -112,29 +112,65 @@ def _refuse(invariant: str, detail: str) -> ContractViolation:
     )
 
 
-def apply_compaction(request: CompactionRequest, result: CompactionResult) -> list[ContextBlock]:
+def _kept_originals(
+    before: list[ContextBlock], kept: list[ContextBlock]
+) -> tuple[set[int], list[bool]]:
+    """把 kept 的每一块对回 before：原块必须是 before 的**严格递增子序列**（按下标，不乱序不重复）；
+    对不上 before 任一块的是衍生块。交回（被对上的 before 下标集合，kept 里逐块「是否衍生」）。
+
+    乱序 / 重复会在这里报：按值的 `in` 对它们无感——两个相等的受保护块用一块就「满足」，摘要把任务
+    挪到当前轮之后也照过（评审 M3）。
+    """
+    cursor = 0
+    matched: set[int] = set()
+    derived: list[bool] = []
+    for block in kept:
+        index = next((i for i in range(cursor, len(before)) if before[i] == block), None)
+        if index is None:
+            # cursor 之后找不到：要么是真衍生块，要么乱序 / 重复的原块（它等于 cursor 之前的某块）。
+            if any(before[i] == block for i in range(len(before))):
+                raise _refuse('kept 里的原块按 before 的下标严格递增', '留下的原块乱序或重复')
+            derived.append(True)
+        else:
+            matched.add(index)
+            cursor = index + 1
+            derived.append(False)
+    return matched, derived
+
+
+def apply_compaction(
+    request: CompactionRequest,
+    result: CompactionResult,
+    *,
+    before: list[ContextBlock] | None = None,
+) -> list[ContextBlock]:
     """校验五条不变量、由内核置信任与补标记，交回最终留下的块。违反即 `ContractViolation` 点名哪条。
 
-    返回的是一份新列表，不改 `request.blocks` 也不改 `result.kept` 里的块对象（信任置于副本上）。
+    `before` 是**权威的压缩前快照**（内核深拷的那份）：信任、protected、原块判定都对它算，而不是对
+    `request.blocks`——策略可能就地改了后者来洗白（评审 H1）。缺省退回 `request.blocks`，供不改输入的
+    策略单测直接用。返回新列表，不改入参里的块对象（信任置于副本上）。
     """
-    before = request.blocks
+    authoritative = request.blocks if before is None else before
     if not _pairing_ok(result.kept):
         raise _refuse('工具调用与结果成对', '留下的序列里有半个批次或孤儿 tool 块')
 
-    protected_blocks = [before[index] for index in sorted(request.protected)]
-    for block in protected_blocks:
-        if block not in result.kept:
-            raise _refuse('protected 原样存活', '有 protected 块没有字节相同地留在 kept 里')
+    matched, derived = _kept_originals(authoritative, result.kept)
+    for index in sorted(request.protected):
+        if index not in matched:
+            raise _refuse('protected 原样存活', f'protected 块（下标 {index}）没按下标留在 kept 里')
 
-    carried = _provenance(before)
+    carried = _provenance(authoritative)
     finalized: list[ContextBlock] = []
-    for block in result.kept:
-        # 非字节相同＝摘要 / 改写出来的衍生块：置「压缩前整体溯源」那一档（往严不往松）。字节相同的
-        # 原块原样留（含它自己的 trust）。
-        if block in before:
+    for block, is_derived in zip(result.kept, derived, strict=True):
+        if not is_derived:
+            # 字节相同、且按下标递增对上的原块：原样留（含它自己的 trust）。
             finalized.append(block)
-        else:
-            finalized.append(replace(block, trust=strictest_trust(block.trust, carried)))
+            continue
+        # 衍生块（摘要 / 改写）：不得是 system（会被某些 adapter 并进 SP 位、破坏前缀纪律，M3）。
+        if block.role == 'system':
+            raise _refuse('不得衍生 system 块', '压缩产出里有 role=system 的衍生块')
+        # 置「压缩前整体溯源」那一档（往严不往松）。
+        finalized.append(replace(block, trust=strictest_trust(block.trust, carried)))
 
     if carried is TrustLevel.UNTRUSTED and _provenance(finalized) is not TrustLevel.UNTRUSTED:
         # 纯裁剪把唯一的不可信块丢了、又没有衍生块接住：补一个署名 UNTRUSTED 标记块（硬约束 5）。
@@ -155,18 +191,27 @@ def apply_compaction(request: CompactionRequest, result: CompactionResult) -> li
 # 信任由内核在 `apply_compaction` 里置——策略无须也无权碰 trust。
 
 
+def _text_size(value: object) -> int:
+    """一段内容的 token 估算（保守）：ASCII 约 4 字符 1 token，非 ASCII（CJK 等）按每码点 1 token 算
+    ——`len // 4` 对中文低估 3–6 倍，而本项目的提示 / 标记大量是中文（评审 H4）。列表 / 字典递归进去
+    数文本叶子，不数它的 repr。"""
+    if isinstance(value, str):
+        ascii_chars = sum(1 for char in value if ord(char) < 128)
+        return ascii_chars // 4 + (len(value) - ascii_chars)
+    if isinstance(value, list):
+        return sum(_text_size(item) for item in cast('list[object]', value))
+    if isinstance(value, dict):
+        return sum(_text_size(item) for item in cast('dict[object, object]', value).values())
+    return 0
+
+
 def _estimate_tokens(block: ContextBlock) -> int:
-    """一块的粗略 token 估算，确定性：`len(序列化) // 4`。只用于压缩的相对取舍，不求精确；用确定值
-    是因为压缩点要能回放（spec §11.3），真 tokenizer 既慢又随 provider 变。"""
-    size = 0
-    content = block.content
-    if isinstance(content, str):
-        size += len(content)
-    elif content is not None:
-        size += len(str(content))
+    """一块的确定性 token 估算：只用于压缩的相对取舍，用确定值是为了压缩点可回放（spec §11.3），
+    真 tokenizer 既慢又随 provider 变。保守估：宁可早压也不要晚到超限（评审 H4）。"""
+    size = _text_size(block.content)
     for call in block.tool_calls:
-        size += len(call.name) + len(call.arguments)
-    return (size + 3) // 4
+        size += _text_size(call.name) + _text_size(call.arguments)
+    return size + 1  # 每块留一点结构开销
 
 
 def _turn_bounds(blocks: Sequence[ContextBlock]) -> list[tuple[int, int]]:
@@ -313,9 +358,16 @@ class SummaryCompaction:
     """摘要型（高成本）：把最近 N 轮之前、非 protected 的内容用一次性调用摘成一块。摘要器面对的就是
     最长那份，所以先对每块做廉价的规则型预截断再喂给它（spec §8.8 的套娃问题）。"""
 
-    def __init__(self, *, min_keep_turns: int = 2, max_summary_input_chars: int = 2000) -> None:
+    def __init__(
+        self,
+        *,
+        min_keep_turns: int = 2,
+        max_summary_input_chars: int = 2000,
+        max_summary_input_blocks: int = 200,
+    ) -> None:
         self._min_keep_turns = min_keep_turns
         self._max_summary_input_chars = max_summary_input_chars
+        self._max_summary_input_blocks = max_summary_input_blocks
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         if request.summarize is None:
@@ -328,21 +380,36 @@ class SummaryCompaction:
         protected = request.protected
         floor_from = _floor_start(blocks, self._min_keep_turns)
         to_summarize = [index for index in range(floor_from) if index not in protected]
-        if not to_summarize:
+        # 已经是一块压缩摘要、没有新东西可并时，不要再摘一遍自己——否则超限兜底下每轮重摘、无穷循环
+        # （评审 H2）。
+        if not to_summarize or (
+            len(to_summarize) == 1 and kind_of(blocks[to_summarize[0]]) is HistoryKind.COMPACTION
+        ):
             return CompactionResult(
-                kept=list(blocks), dropped=[], note='摘要型压缩：无可摘要的早期内容'
+                kept=list(blocks), dropped=[], note='摘要型压缩：没有新的早期内容可摘'
             )
-        pre = [_truncated(blocks[index], self._max_summary_input_chars) for index in to_summarize]
+        # 套娃预压缩：摘要器面对的就是最长那份，先按**总量**裁到上限（只摘最早、最该被摘的那些块），
+        # 每块再按长度截断，别让摘要器自己超限（评审 M5）。超出上限的早期块这轮不摘、原样留，不丢。
+        capped = set(to_summarize[: self._max_summary_input_blocks])
+        pre = [_truncated(blocks[index], self._max_summary_input_chars) for index in sorted(capped)]
         summary_text = await request.summarize(pre)
         summary = signed_block(
             HistoryKind.COMPACTION,
             f'（压缩摘要，覆盖此前 {len(pre)} 块）{summary_text}',
             key='compaction:summary',
         )
-        kept = [blocks[index] for index in sorted(protected) if index < floor_from]
-        kept.append(summary)
-        kept.extend(blocks[floor_from:])
-        dropped = [blocks[index] for index in to_summarize]
+        # 遍历全部块：被摘的那些整体换成一块摘要（放在它们第一块的位置），其余原样留——顺序不乱、
+        # protected 与未摘的早期块都在位（评审 M3 的子序列校验）。
+        kept: list[ContextBlock] = []
+        inserted = False
+        for index, block in enumerate(blocks):
+            if index in capped:
+                if not inserted:
+                    kept.append(summary)
+                    inserted = True
+                continue
+            kept.append(block)
+        dropped = [blocks[index] for index in sorted(capped)]
         return CompactionResult(
             kept=kept, dropped=dropped, note=f'摘要型压缩：{len(dropped)} 块早期内容摘成 1 块'
         )
@@ -420,17 +487,33 @@ class CompactionController:
             return True
         if tokens <= self.threshold_tokens:
             return False
-        if self._stuck_at is not None and tokens <= self._stuck_at:
+        if self._stuck_at is not None and tokens <= self._stuck_at + self._rearm_margin():
+            # 压过一次但压不到阈值下：只在占用又长出「一次压缩的预期收益」之后才重试，否则每轮都
+            # 重写前缀、每轮都失效缓存（spec §8.8 要防的「此后每轮持续漂移」，评审 M1）。
             return False
         return True
 
-    def build_request(self, blocks: Sequence[ContextBlock]) -> CompactionRequest:
+    def _rearm_margin(self) -> int:
+        return self.threshold_tokens - self.target_tokens
+
+    def build_request(
+        self,
+        blocks: Sequence[ContextBlock],
+        *,
+        budget_tokens: int | None = None,
+        extra_protected: frozenset[int] = frozenset(),
+    ) -> CompactionRequest:
         return CompactionRequest(
             blocks=list(blocks),
-            budget_tokens=self.target_tokens,
-            protected=_protected_indices(blocks),
+            budget_tokens=self.target_tokens if budget_tokens is None else budget_tokens,
+            protected=_protected_indices(blocks) | extra_protected,
             summarize=self.summarize,
         )
+
+    def overflow_budget(self, tokens_before: int) -> int:
+        """超限兜底的预算：超限说明估算失准、真窗口 ≤ 此刻占用，所以按**此刻占用**折半来逼它真的缩
+        （不是沿用那个刚失败的 target，评审 H4）。连续超限时占用一路降、预算一路降，直到压不动。"""
+        return max(1, min(self.target_tokens, tokens_before // 2))
 
     def settle(self, *, tokens_now: int, changed: bool) -> None:
         """一次 turn 边界压缩之后更新迟滞 / 退避状态。`changed=False`（策略压不动）也要记，
