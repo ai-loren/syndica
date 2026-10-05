@@ -1,14 +1,18 @@
+from syndica.kernel.stores.file_memory import FileMemoryStore
 from syndica.kernel.stores.file_session import FileSessionStore
 from syndica.kernel.stores.file_trace import FileTraceStore
 from syndica.kernel.stores.memory_broker import InMemoryMessageBroker
+from syndica.kernel.stores.memory_memory import InMemoryMemoryStore
 from syndica.kernel.stores.memory_registry import InMemoryAgentRegistry
 from syndica.kernel.stores.memory_session import InMemorySessionStore
 from syndica.kernel.stores.memory_trace import InMemoryTraceStore
 
 __all__ = [
+    'FileMemoryStore',
     'FileSessionStore',
     'FileTraceStore',
     'InMemoryAgentRegistry',
+    'InMemoryMemoryStore',
     'InMemoryMessageBroker',
     'InMemorySessionStore',
     'InMemoryTraceStore',

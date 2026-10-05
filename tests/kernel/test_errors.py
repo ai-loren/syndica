@@ -158,6 +158,7 @@ def test_discovery_covers_every_error_class_present_in_the_kernel():
         'ContractViolation',
         'LLMResponseError',
         'MemoryConflict',
+        'NewerMemorySchema',
         'NewerSessionSchema',
         'NewerTraceSchema',
         'PayloadRefused',
