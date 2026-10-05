@@ -1,0 +1,116 @@
+"""会话记录的脱敏收口（M6 T0 / spec §12.3、§12.5）。
+
+落盘的会话正文一律先过这里。脱敏**逐叶**只动会出现密钥的文本——块内容、`ToolCall.arguments`、工具输出
+（`role='tool'` 的块内容）、system prompt、标题——**绝不**改 role / `ToolCall.id` / `tool_call_id` /
+`extra`（它放着 `message_id`、`thought_signature` 等 provider 私有键，改了会撞坏配对）。多模态部件里
+只脱 `text`，图片 / base64 原样留着。
+
+`SessionStore` 的写入面只收 `RedactedSessionRecord` / `RedactedContent`——它们只由本模块的
+`redacted_record` / `redacted_content` 构造，于是第三方 store（Redis / Postgres）也绕不过脱敏（与
+`TraceStore` 只收 `RedactedText` 同一招）。脱敏后交给 store 前复校工具调用 id 唯一（脱敏不该动 id，
+复校是防回归的那道闸）。
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import replace
+from typing import cast, final
+
+from syndica.kernel.context import ContextBlock
+from syndica.kernel.errors import ContractViolation
+from syndica.kernel.redaction import Redactor
+from syndica.kernel.session_types import SessionRecord
+
+__all__ = ['RedactedContent', 'RedactedSessionRecord', 'redacted_content', 'redacted_record']
+
+_MINT = object()
+
+
+@final
+class RedactedSessionRecord:
+    """`redacted_record` 的输出：正文逐叶脱敏过的 `SessionRecord`。只有 `redacted_record` 构造它，
+    收持久化内容的接口靠这个类型认出「已经脱敏」，所以直接构造报 `ContractViolation`。"""
+
+    __slots__ = ('record',)
+
+    def __init__(self, record: SessionRecord, *, _mint: object = None) -> None:
+        if _mint is not _MINT:
+            raise ContractViolation(
+                expected='RedactedSessionRecord 只由 redacted_record 构造',
+                received='有代码直接构造了它',
+                next_action='把记录交给 redacted_record(record, redactor)：它先逐叶脱敏再复校',
+            )
+        self.record = record
+
+
+@final
+class RedactedContent:
+    """`redacted_content` 的输出：逐叶脱敏过的一段轨迹，`replace_content` 只收它。"""
+
+    __slots__ = ('content',)
+
+    def __init__(self, content: list[ContextBlock], *, _mint: object = None) -> None:
+        if _mint is not _MINT:
+            raise ContractViolation(
+                expected='RedactedContent 只由 redacted_content 构造',
+                received='有代码直接构造了它',
+                next_action='把内容交给 redacted_content(content, redactor)',
+            )
+        self.content = content
+
+
+def _redact_text(value: object, redactor: Redactor) -> object:
+    """块内容的一个叶子：字符串脱敏；多模态部件里只脱 `text`，图片 / base64 原样留。"""
+    if isinstance(value, str):
+        return redactor.redact(value)
+    if isinstance(value, list):
+        out: list[object] = []
+        for raw in cast('list[object]', value):
+            if isinstance(raw, str):
+                out.append(redactor.redact(raw))
+            elif isinstance(raw, dict):
+                item = cast('dict[str, object]', raw)
+                text = item.get('text')
+                out.append(
+                    {**item, 'text': redactor.redact(text)} if isinstance(text, str) else item
+                )
+            else:
+                out.append(raw)
+        return out
+    return value
+
+
+def _redact_block(block: ContextBlock, redactor: Redactor) -> ContextBlock:
+    return replace(
+        block,
+        content=_redact_text(block.content, redactor),
+        tool_calls=[
+            replace(call, arguments=redactor.redact(call.arguments)) for call in block.tool_calls
+        ],
+    )
+
+
+def _checked(content: list[ContextBlock]) -> None:
+    ids = [call.id for block in content for call in block.tool_calls]
+    if len(ids) != len(set(ids)):
+        raise ContractViolation(
+            expected='脱敏之后工具调用 id 仍然唯一',
+            received='脱敏后出现了重复的 tool_call id',
+            next_action='脱敏不该改 id；出现重复说明脱敏规则动了 id，检查用户规则是否命中 id 字段',
+        )
+
+
+def redacted_content(content: list[ContextBlock], redactor: Redactor) -> RedactedContent:
+    redacted = [_redact_block(copy.deepcopy(block), redactor) for block in content]
+    _checked(redacted)
+    return RedactedContent(redacted, _mint=_MINT)
+
+
+def redacted_record(record: SessionRecord, redactor: Redactor) -> RedactedSessionRecord:
+    copied = copy.deepcopy(record)
+    copied.content = [_redact_block(block, redactor) for block in copied.content]
+    copied.system_prompt = redactor.redact(copied.system_prompt)
+    copied.meta.title = redactor.redact(copied.meta.title)
+    _checked(copied.content)
+    return RedactedSessionRecord(copied, _mint=_MINT)

@@ -87,7 +87,13 @@ from syndica.kernel.modules import (
 )
 from syndica.kernel.plugins import Plugin
 from syndica.kernel.prefix_drift import PrefixDriftModule, PrefixDriftRecord, PrefixDriftService
-from syndica.kernel.protocols import AgentRegistry, MessageBroker, MissingQueueCallback, TraceStore
+from syndica.kernel.protocols import (
+    AgentRegistry,
+    MessageBroker,
+    MissingQueueCallback,
+    SessionStore,
+    TraceStore,
+)
 from syndica.kernel.redaction import (
     Finding,
     RedactedText,
@@ -103,10 +109,18 @@ from syndica.kernel.scenario_schema import (
     ScenarioDocument,
     parse_scenario_document,
 )
+from syndica.kernel.session_redaction import (
+    RedactedContent,
+    RedactedSessionRecord,
+    redacted_content,
+    redacted_record,
+)
+from syndica.kernel.session_types import SessionMeta, SessionRecord, SessionStatus
 from syndica.kernel.stores import (
     FileTraceStore,
     InMemoryAgentRegistry,
     InMemoryMessageBroker,
+    InMemorySessionStore,
     InMemoryTraceStore,
 )
 from syndica.kernel.tool import Tool, ToolResult
@@ -213,6 +227,7 @@ __all__ = [
     'IdSource',
     'InMemoryAgentRegistry',
     'InMemoryMessageBroker',
+    'InMemorySessionStore',
     'InMemoryTraceStore',
     'Junction',
     'JunctionKind',
@@ -244,6 +259,8 @@ __all__ = [
     'PrefixDriftService',
     'PtyCapture',
     'PtyStatus',
+    'RedactedContent',
+    'RedactedSessionRecord',
     'RedactedText',
     'RedactionRule',
     'Redactor',
@@ -258,6 +275,10 @@ __all__ = [
     'ScenarioDocument',
     'ScriptedLLM',
     'ScriptedTurn',
+    'SessionMeta',
+    'SessionRecord',
+    'SessionStatus',
+    'SessionStore',
     'Span',
     'SpanEvent',
     'SpanKind',
@@ -295,6 +316,8 @@ __all__ = [
     'orchestration_tools',
     'parse_scenario_document',
     'provenance_of',
+    'redacted_content',
+    'redacted_record',
     'register_builtins',
     'strictest_trust',
     'verbatim_attribute',
