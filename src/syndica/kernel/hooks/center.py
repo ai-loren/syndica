@@ -253,7 +253,7 @@ def _report_discarded_return(junction: JunctionRef, cb: HookCallback, outcome: o
         'skip 没有终止任何 hook，modified 没有进任何人的 kwargs，result 没有顶替任何产出。'
         ' 下一步: 要影响这次操作就把这个 hook 挂到可拦截切点上'
         '（pre_tool_use / post_tool_use / pre_llm_request / post_llm_response /'
-        ' context_overflow / llm_failure）；只做观察就让它返回 None。',
+        ' context_overflow / llm_failure / completion_proposed）；只做观察就让它返回 None。',
         _label(junction),
         getattr(cb, '__qualname__', cb),
         _discarded(outcome),

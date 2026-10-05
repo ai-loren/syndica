@@ -79,6 +79,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
+from syndica.kernel.acceptance import OutcomeKind, Verdict, VerdictStatus
 from syndica.kernel.compaction import (
     CompactionController,
     apply_compaction,
@@ -96,6 +97,7 @@ from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
 from syndica.kernel.danger import DangerJudge, DangerPolicy, Disposition, validate_danger_options
 from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
+from syndica.kernel.history_blocks import HistoryKind, signed_block
 from syndica.kernel.hooks import (
     ExtensionJunction,
     HookCallback,
@@ -280,6 +282,44 @@ def _bad_failure_idiom(outcome: HookResult) -> ContractViolation:
     )
 
 
+def _bad_completion_idiom(outcome: HookResult) -> ContractViolation:
+    """完成切点收到 `skip` 或 `result`：这里「我处理了」只能是给出一个裁决。"""
+    return ContractViolation(
+        expected=(
+            f'{Junction.COMPLETION_PROPOSED.value} hook 表示「我处理了」的唯一写法是'
+            " modified['verdict'] 给出一个 Verdict（可加 modified['send_back']）"
+        ),
+        received=f'收到 skip={outcome.skip}、result={_described(outcome.result)}，本切点两者都不读',
+        next_action=(
+            "把裁决放进 HookResult.modified['verdict']；要打回再做一轮就再加 "
+            "modified['send_back']=True（仅 partial / block 生效）。不打算验收就返回 HookResult()"
+        ),
+    )
+
+
+def _bad_verdict(value: object) -> ContractViolation:
+    return ContractViolation(
+        expected=f"{Junction.COMPLETION_PROPOSED.value} 的 modified['verdict'] 是一个 Verdict",
+        received=f'收到 {_described(value)}',
+        next_action='用 acceptance.derive_verdict(...) 造裁决，别手搓 Verdict 或交别的类型',
+    )
+
+
+def _render_feedback(verdict: Verdict) -> str:
+    """打回时追加给 Agent 的反馈块正文：哪几条已证伪、哪几条没能确认、下一步做什么。"""
+    unmet = [o.rubric_id for o in verdict.outcomes if o.kind is OutcomeKind.UNMET]
+    unconfirmed = [o.rubric_id for o in verdict.outcomes if o.kind is OutcomeKind.UNCONFIRMED]
+    lines = [f'验收未通过（{verdict.status.value}）。']
+    if verdict.reason:
+        lines.append(f'原因：{verdict.reason}')
+    if unmet:
+        lines.append(f'有证据表明做错了、要改：{", ".join(unmet)}')
+    if unconfirmed:
+        lines.append(f'没能确认完成、要补齐或给出证据：{", ".join(unconfirmed)}')
+    lines.append('按上面改完再判定完成。')
+    return '\n'.join(lines)
+
+
 def _bad_post_response_idiom(outcome: HookResult) -> ContractViolation:
     """后置改写切点收到 `result`：那是前置拦截的槽位。"""
     return ContractViolation(
@@ -457,6 +497,9 @@ class BaseAgent:
         # 产物索引（可选）：由 Runtime 经 `_attach_artifact_store` 装上。每批工具跑完后内核把工具
         # 回报的 `ToolResult.artifacts` 登记进去、再触发 ARTIFACT_REGISTERED（§7.4）；没装就不登记。
         self._artifact_store: ArtifactStore | None = None
+        # 最近一次验收裁决（COMPLETION_PROPOSED 的 hook 给出，§7.5）。终态 = 最后一次：重试用完或
+        # 撞 MAX_TURNS 时它是那次的 partial / block，绝不被改成 pass。没装验收就一直是 None。
+        self._verdict: Verdict | None = None
 
     def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
         """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
@@ -945,6 +988,10 @@ class BaseAgent:
 
         ctx.append(response)
         if not response.tool_calls:
+            # Agent 判定完成：先过验收切点（§7.5）。打回则内核已追加反馈块，再做一轮。
+            if await self._propose_completion(ctx, response, turn):
+                await self._end_turn(ctx, turn, response)
+                return None
             ctx.stop_reason = StopReason.COMPLETED
             await self._end_turn(ctx, turn, response)
             return StopReason.COMPLETED
@@ -956,6 +1003,37 @@ class BaseAgent:
         await self._register_new_artifacts(ctx, pre)
         await self._end_turn(ctx, turn, response)
         return None
+
+    async def _propose_completion(self, ctx: Context, response: ContextBlock, turn: int) -> bool:
+        """过 COMPLETION_PROPOSED（§7.5）。交回 True 表示打回、再做一轮。
+
+        hook 给出 `modified['verdict']` 就记下它（终态裁决 = 最后一次，绝不改成 pass）。`send_back`
+        为真且裁决是 partial / block 时由**内核**追加一个署名 VERDICT 反馈块（hook 不能写轨迹），
+        作为下一轮输入；pass / unverified 或没说要打回则照常完成。没人给裁决（没装验收）就直接完成。
+        取消照常上抛（ABORTED，不变成 unverified 的 COMPLETED）；验收器失败由 Module 兜。"""
+        outcome = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
+            Junction.COMPLETION_PROPOSED, ctx=ctx, response=response
+        )
+        if outcome.skip or outcome.result is not None:
+            raise _bad_completion_idiom(outcome)
+        verdict = outcome.get('verdict')
+        if verdict is None:
+            return False
+        if not isinstance(verdict, Verdict):
+            raise _bad_verdict(verdict)
+        self._verdict = verdict
+        send_back = outcome.get('send_back') is True
+        if not send_back or verdict.status not in (VerdictStatus.PARTIAL, VerdictStatus.BLOCK):
+            return False
+        ctx.append(
+            signed_block(
+                HistoryKind.VERDICT,
+                _render_feedback(verdict),
+                key=f'verdict:{self._cycle}:{turn}',
+                trust=verdict.trust,
+            )
+        )
+        return True
 
     async def _register_new_artifacts(self, ctx: Context, pre: int) -> None:
         """这一批工具跑完后，把工具回报的产物登记进索引、逐个触发 ARTIFACT_REGISTERED（§7.4 隐式

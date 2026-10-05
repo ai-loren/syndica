@@ -12,7 +12,7 @@
 
 ## 可拦截切点上「我处理了」怎么写
 
-六个切点的写法**不统一，而这种不统一是承重的**：`skip` 是前置拦截（原操作不发生），
+七个切点的写法**不统一，而这种不统一是承重的**：`skip` 是前置拦截（原操作不发生），
 `modified` 是后置改写（操作已经发生，改它的产出）。合并两者会让「跳过」与「改写结果」无从区分。
 下表逐切点写明哪个槽位表示「已处理」、哪些改写会被读取；**读不到的槽位一律当场报
 `ContractViolation`，不静默丢弃**——作者以为自己处理了而任务照样失败，是最坏的一种反馈。
@@ -26,6 +26,10 @@
 - `CONTEXT_OVERFLOW` —— 已处理 = `skip=True`（本轮不产出 block，下一轮用压缩后的轨迹重试）。
   `modified['response']` 与 `result` 槽位都报错。
 - `LLM_FAILURE` —— 已处理 = `modified['response']` 给出替身。`skip` 与 `result` 槽位都报错。
+- `COMPLETION_PROPOSED` —— Agent 判定完成（本轮无工具调用）时触发，在 `_finish` 快照之前。已处理 =
+  `modified['verdict']`（一个 `Verdict`）；`modified['send_back']` 为真且裁决是 partial / block 时
+  内核追加一个署名 `VERDICT` 反馈块、再做一轮（hook 不能写轨迹，由内核追加）；其余情况照常完成并记下
+  裁决。`skip` 与 `result` 槽位都报错。验收器失败由 Module 兜成 `unverified`，取消照常上抛。
 
 两个失败切点的写法相反，不要互换：超窗是「这一轮不该产出东西」，失败是「这一轮的产出由插件顶上」。
 
@@ -110,6 +114,7 @@ class Junction(Enum):
     CONTEXT_OVERFLOW = 'context_overflow'
     LLM_FAILURE = 'llm_failure'
     ARTIFACT_REGISTERED = 'artifact_registered'
+    COMPLETION_PROPOSED = 'completion_proposed'
 
 
 INTERCEPTABLE: frozenset[Junction] = frozenset(
@@ -120,6 +125,7 @@ INTERCEPTABLE: frozenset[Junction] = frozenset(
         Junction.POST_LLM_RESPONSE,
         Junction.CONTEXT_OVERFLOW,
         Junction.LLM_FAILURE,
+        Junction.COMPLETION_PROPOSED,
     }
 )
 

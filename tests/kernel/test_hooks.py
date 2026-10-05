@@ -25,7 +25,7 @@ from syndica.kernel.hooks import center as center_module
 _TIMEOUT = 1.0
 
 
-def test_seventeen_junctions_exist():
+def test_eighteen_junctions_exist():
     """取值撞车会让成员静默塌成别名；切点名计入公开 API。"""
     assert {junction.name: junction.value for junction in Junction} == {
         'RUNTIME_SHUTDOWN': 'runtime_shutdown',
@@ -45,6 +45,7 @@ def test_seventeen_junctions_exist():
         'CONTEXT_OVERFLOW': 'context_overflow',
         'LLM_FAILURE': 'llm_failure',
         'ARTIFACT_REGISTERED': 'artifact_registered',
+        'COMPLETION_PROPOSED': 'completion_proposed',
     }
 
 
@@ -57,6 +58,7 @@ def test_each_junction_is_classified_as_declared():
         Junction.POST_LLM_RESPONSE,
         Junction.CONTEXT_OVERFLOW,
         Junction.LLM_FAILURE,
+        Junction.COMPLETION_PROPOSED,
     }
     assert OBSERVABLE == {
         Junction.RUNTIME_SHUTDOWN,
@@ -819,6 +821,7 @@ def test_declaring_extension_junctions_leaves_the_kernel_classifications_untouch
         Junction.POST_LLM_RESPONSE,
         Junction.CONTEXT_OVERFLOW,
         Junction.LLM_FAILURE,
+        Junction.COMPLETION_PROPOSED,
     }
     assert OBSERVABLE == {
         Junction.RUNTIME_SHUTDOWN,
@@ -833,7 +836,7 @@ def test_declaring_extension_junctions_leaves_the_kernel_classifications_untouch
         Junction.TOOL_CONFIRMATION_REQUIRED,
         Junction.ARTIFACT_REGISTERED,
     }
-    assert len(set(Junction)) == 17
+    assert len(set(Junction)) == 18
 
 
 async def test_a_kernel_junction_in_neither_classification_is_rejected_at_trigger(
