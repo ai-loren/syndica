@@ -160,6 +160,7 @@ def test_discovery_covers_every_error_class_present_in_the_kernel():
         'MemoryConflict',
         'NewerArtifactSchema',
         'NewerMemorySchema',
+        'NewerRubricSchema',
         'NewerSessionSchema',
         'NewerTraceSchema',
         'PayloadRefused',
