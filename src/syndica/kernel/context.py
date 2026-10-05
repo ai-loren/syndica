@@ -13,9 +13,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from syndica.kernel.errors import ContractViolation
+
+if TYPE_CHECKING:
+    from syndica.kernel.acceptance import Verdict
 
 __all__ = [
     'ArtifactRef',
@@ -82,6 +85,9 @@ class Context:
     def __init__(self) -> None:
         self._blocks: list[ContextBlock] = []
         self.stop_reason: StopReason | None = None
+        # 本周期的验收裁决（§7.5；COMPLETION_PROPOSED 给出、内核记下）。每个周期开始清空：上一周期的
+        # PASS 不能冒充这一周期的结论（评审 H2）。随 `_finish` 的快照一起被 Delegate 读到。
+        self.verdict: Verdict | None = None
 
     @property
     def current_traj(self) -> list[ContextBlock]:

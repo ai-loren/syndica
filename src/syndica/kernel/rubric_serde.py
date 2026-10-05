@@ -15,6 +15,7 @@ from syndica.kernel.acceptance import (
     Goal,
     Rubric,
     RubricKind,
+    RubricOrigin,
     RubricStatus,
 )
 from syndica.kernel.context import TrustLevel
@@ -35,6 +36,7 @@ _KNOWN_VERSION = 1
 _SOURCES = {m.value: m for m in AnchorSource}
 _KINDS = {m.value: m for m in RubricKind}
 _STATUSES = {m.value: m for m in RubricStatus}
+_ORIGINS = {m.value: m for m in RubricOrigin}
 
 
 class NewerRubricSchema(ConfigError):
@@ -109,6 +111,7 @@ def goal_to_json(goal: Goal) -> dict[str, object]:
         'schema': RUBRIC_SCHEMA,
         'intent': goal.intent,
         'anchors': [_anchor_to(a) for a in goal.anchors],
+        'trust': goal.trust.value,
     }
 
 
@@ -116,7 +119,11 @@ def goal_from_json(data: dict[str, Any]) -> Goal:
     _checked_schema(data)
     raw = data.get('anchors')
     anchors = () if not raw else _anchors_from(raw, 'anchors')
-    return Goal(intent=_str(data.get('intent'), 'intent'), anchors=anchors)
+    return Goal(
+        intent=_str(data.get('intent'), 'intent'),
+        anchors=anchors,
+        trust=_trust_from(data.get('trust')),
+    )
 
 
 def _rubric_to(rubric: Rubric) -> dict[str, object]:
@@ -128,6 +135,7 @@ def _rubric_to(rubric: Rubric) -> dict[str, object]:
         'mandatory': rubric.mandatory,
         'status': rubric.status.value,
         'trust': rubric.trust.value,
+        'origin': rubric.origin.value,
     }
 
 
@@ -143,6 +151,10 @@ def _rubric_from(data: object, where: str) -> Rubric:
     status = _STATUSES.get(raw_status) if isinstance(raw_status, str) else None
     if status is None:
         raise _corrupt(f'{where}.status', f'status={raw_status!r} 不是 {sorted(_STATUSES)}')
+    raw_origin = item.get('origin')
+    origin = _ORIGINS.get(raw_origin) if isinstance(raw_origin, str) else None
+    if origin is None:
+        raise _corrupt(f'{where}.origin', f'origin={raw_origin!r} 不是 {sorted(_ORIGINS)}')
     return Rubric(
         id=_str(item.get('id'), f'{where}.id'),
         statement=_str(item.get('statement'), f'{where}.statement'),
@@ -151,6 +163,7 @@ def _rubric_from(data: object, where: str) -> Rubric:
         mandatory=item.get('mandatory') is not False,
         status=status,
         trust=_trust_from(item.get('trust')),
+        origin=origin,
     )
 
 

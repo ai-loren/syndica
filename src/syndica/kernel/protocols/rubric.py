@@ -7,9 +7,9 @@ Runtime 的两个任务、或同一 store 的两个会话，各有各的 Goal �
 `kernel.__all__`）：`SessionStore` 契约已发布、Rubric 契约未发布，第三方验收后端暂无公开契约可自证；
 v1.0 冻结公开 API 时再定（同 `MemoryStore`）。
 
-`put_rubrics` 是**upsert**（按 id 增 / 改，不删别的）：Goal 变更重新投影时同 id 更新、人确认过的反馈
-Rubric（别的 id）照样存活（§7.7 / 评审 H10）。
-"""
+`put_rubrics` 替换**投影出的**那批（`origin=PROJECTED`）：不在新集合里的 projected 条删掉——旧 Goal
+的要求不能拿去验新 Goal（评审 H7）；人的反馈条（`FEEDBACK`）不碰，同 id 撞上时反馈条胜出（评审 H8）
+。`propose` 恒存成 `proposed` / `feedback`，不覆盖已有 id；`activate` 只把 proposed 翻成 active。"""
 
 from __future__ import annotations
 
@@ -32,7 +32,8 @@ class RubricStore(Protocol):
         ...
 
     async def put_rubrics(self, scope: str, rubrics: list[RedactedRubric]) -> None:
-        """upsert 一批 Rubric（按 id 增 / 改，不删别的）：重新投影更新同 id、反馈 Rubric 存活。"""
+        """把投影出的那批换成 `rubrics`：删掉不在其中的 projected 条、不碰反馈条（空列表 = 退役全部
+        projected）。只收脱敏类型。"""
         ...
 
     async def rubrics(self, scope: str, *, include_proposed: bool = False) -> list[Rubric]:
@@ -41,9 +42,11 @@ class RubricStore(Protocol):
         ...
 
     async def propose(self, scope: str, rubric: RedactedRubric) -> None:
-        """提议一条 `proposed` Rubric（§7.7 人反馈）：进库但默认不进验收，等 `activate`。"""
+        """提议一条反馈 Rubric（§7.7）：不论传进来的 status / origin，恒存成 `proposed` /
+        `feedback`；id 已在则不动。进库但默认不进验收，等 `activate`。"""
         ...
 
     async def activate(self, scope: str, rubric_id: str) -> None:
-        """把一条 `proposed` Rubric 置为 `active`（人确认后生效，§7.7）。认不出 id 不报、无操作。"""
+        """把一条 `proposed` Rubric 置为 `active`（人确认后生效，§7.7）。认不出 id 或不是 proposed
+        时无操作。"""
         ...

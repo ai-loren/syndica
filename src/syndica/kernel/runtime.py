@@ -111,6 +111,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import inspect
 import json
 import logging
@@ -404,6 +405,7 @@ def _frozen(context: Context) -> Context:
     for block in context.current_traj:
         frozen.append(block)
     frozen.stop_reason = context.stop_reason
+    frozen.verdict = context.verdict
     return frozen
 
 
@@ -1452,7 +1454,11 @@ class Runtime:
             agent._attach_gate(gate)  # pyright: ignore[reportPrivateUsage]
             agent._attach_tracing(self._tracing)  # pyright: ignore[reportPrivateUsage]
             if self._artifacts is not None:
-                agent._attach_artifact_store(self._artifacts)  # pyright: ignore[reportPrivateUsage]
+                router = self._workspace
+                agent._attach_artifact_store(  # pyright: ignore[reportPrivateUsage]
+                    self._artifacts,
+                    None if router is None else functools.partial(router.scope_of, agent_id),
+                )
         except BaseException:
             agent._assembly_restore(assembly_snapshot)  # pyright: ignore[reportPrivateUsage]
             self.hooks._assembly_restore(runtime_hooks)  # pyright: ignore[reportPrivateUsage]

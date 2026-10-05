@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -26,11 +27,13 @@ __all__ = [
     'OutcomeKind',
     'Rubric',
     'RubricKind',
+    'RubricOrigin',
     'RubricOutcome',
     'RubricStatus',
     'Verdict',
     'VerdictStatus',
     'derive_verdict',
+    'most_severe',
     'rubric_trust',
     'unfinished_verdict',
 ]
@@ -52,6 +55,14 @@ class RubricKind(Enum):
 class RubricStatus(Enum):
     ACTIVE = 'active'
     PROPOSED = 'proposed'
+
+
+class RubricOrigin(Enum):
+    """Rubric 从哪来。重新投影只替换 `PROJECTED` 的那批，
+    人确认过的 `FEEDBACK` 不动（§7.7 / 评审 H7）。"""
+
+    PROJECTED = 'projected'
+    FEEDBACK = 'feedback'
 
 
 class OutcomeKind(Enum):
@@ -87,10 +98,15 @@ class Anchor:
 @dataclass(frozen=True)
 class Goal:
     """唯一权威（spec §7.6）：自然语言 intent（允许含不可检验要求）+ 指回用户原话 / 任务说明的锚点。
-    Rubric 是它的可检验投影，Goal 变更即重新投影。"""
+    Rubric 是它的可检验投影，Goal 变更即重新投影。`trust` 随它的来源：从不可信消息派生的 Goal 仍不可
+    信（§12.2 / 评审 H6）——它被注入历史、永久受压缩保护，标记丢了就是一条永久的洗白路径。"""
 
     intent: str
     anchors: tuple[Anchor, ...] = ()
+    trust: TrustLevel = TrustLevel.TRUSTED
+
+
+_RUBRIC_ID = re.compile(r'[A-Za-z0-9_.:-]{1,64}')
 
 
 @dataclass(frozen=True)
@@ -105,8 +121,23 @@ class Rubric:
     mandatory: bool = True
     status: RubricStatus = RubricStatus.ACTIVE
     trust: TrustLevel = TrustLevel.TRUSTED
+    origin: RubricOrigin = RubricOrigin.PROJECTED
 
     def __post_init__(self) -> None:
+        if not _RUBRIC_ID.fullmatch(self.id):
+            # id 由模型取，落盘、进 Rubric 块、进反馈块：
+            # 放行 `]\n` 一类就能在块里伪造整行（评审 M8）。
+            raise ContractViolation(
+                expected='Rubric id 是 1–64 个字母 / 数字 / `_.:-`',
+                received=f'id={self.id!r}',
+                next_action='换一个只含字母数字与 `_.:-` 的短 id（如 R1、F2）',
+            )
+        if not self.statement.strip():
+            raise ContractViolation(
+                expected='Rubric 有一句非空的验收陈述',
+                received=f'Rubric {self.id!r} 的 statement 为空',
+                next_action='写出这条标准要求什么；说不出来的要求不要写成 Rubric',
+            )
         if not self.anchors:
             raise ContractViolation(
                 expected='每条 Rubric 带非空锚点链，可重新打开追回 Goal（spec §7.6）',
@@ -148,6 +179,44 @@ class Verdict:
     unverified_cause: str | None = None
     trust: TrustLevel = TrustLevel.TRUSTED
 
+    def __post_init__(self) -> None:
+        # 手搓的 Verdict 也不能把「没验证」说成通过（评审 H1）：PASS 必须每条结论都 SATISFIED、没有
+        # 待人确认的；UNVERIFIED 才带原因、别的状态不带；BLOCK 必须有已证伪的那条。
+        kinds = {o.kind for o in self.outcomes}
+        if self.status is VerdictStatus.PASS and (
+            not self.outcomes or kinds != {OutcomeKind.SATISFIED} or self.needs_human
+        ):
+            raise _inconsistent(self, 'PASS 要求至少一条结论、全部 SATISFIED、needs_human 为空')
+        if (self.unverified_cause is None) == (self.status is VerdictStatus.UNVERIFIED):
+            raise _inconsistent(self, 'unverified_cause 当且仅当 status 是 UNVERIFIED 时给出')
+        if self.status is VerdictStatus.BLOCK and OutcomeKind.UNMET not in kinds:
+            raise _inconsistent(self, 'BLOCK 要求至少一条带证据的 UNMET')
+
+
+def _inconsistent(verdict: Verdict, rule: str) -> ContractViolation:
+    return ContractViolation(
+        expected=f'Verdict 自洽：{rule}',
+        received=(
+            f'status={verdict.status.value} outcomes={[o.kind.value for o in verdict.outcomes]} '
+            f'needs_human={list(verdict.needs_human)} unverified_cause={verdict.unverified_cause!r}'
+        ),
+        next_action='用 derive_verdict / unfinished_verdict 造裁决，别手搓 Verdict',
+    )
+
+
+_SEVERITY = {
+    VerdictStatus.BLOCK: 3,
+    VerdictStatus.PARTIAL: 2,
+    VerdictStatus.UNVERIFIED: 1,
+    VerdictStatus.PASS: 0,
+}
+
+
+def most_severe(verdicts: Sequence[Verdict]) -> Verdict:
+    """几个 hook 各给一个裁决时取最严的（BLOCK > PARTIAL > UNVERIFIED > PASS）：链上靠后的 hook 不能
+    把前面的 block 改成 pass（评审 H1）。同级取先给出的那个。`verdicts` 非空。"""
+    return max(verdicts, key=lambda v: _SEVERITY[v.status])
+
 
 def derive_verdict(
     rubrics: Sequence[Rubric],
@@ -164,7 +233,14 @@ def derive_verdict(
 
     状态：验收器自身失败（`failure` 非空）→ `UNVERIFIED`；没有 active checkable 条 → `UNVERIFIED`
     （空集合不是「全满足」，评审 B3）；任一 checkable `UNMET`（带证据）→ `BLOCK`；还有 `UNCONFIRMED`
-    → `PARTIAL`；checkable 全 `SATISFIED` → `PASS`。`needs_human` 不进状态、不触发重试，但带出来。
+    → `PARTIAL`；
+    checkable 全 `SATISFIED` 但还有待人确认的 judgment 条 → `UNVERIFIED`（`needs_human`）；
+    全部 `SATISFIED` 且没有待人确认的 → `PASS`。
+
+    「checkable 全满足 + judgment 待人」不是 PASS：
+    spec §7.5 的 pass 是「**每条**验收标准都已验证满足」，
+    §7.6 要防的正是「满纸术语而验收照判通过」。它也不是 PARTIAL——Agent 改不了一条只有人能判的标准，
+    打回只会白烧重试；`UNVERIFIED` 不打回、导出时默认排除（§13，评审 H9）。
     """
     active = [r for r in rubrics if r.status is RubricStatus.ACTIVE]
     outcomes: list[RubricOutcome] = []
@@ -181,7 +257,7 @@ def derive_verdict(
             outcomes.append(RubricOutcome(rubric.id, got.kind, got.evidence))
 
     checkable = [o for o in outcomes if o.kind is not OutcomeKind.NEEDS_HUMAN]
-    status, cause = _derive_status(checkable, failure)
+    status, cause = _derive_status(checkable, failure, pending_human=bool(needs_human))
     return Verdict(
         status=status,
         outcomes=tuple(outcomes),
@@ -193,7 +269,7 @@ def derive_verdict(
 
 
 def _derive_status(
-    checkable: Sequence[RubricOutcome], failure: str | None
+    checkable: Sequence[RubricOutcome], failure: str | None, *, pending_human: bool
 ) -> tuple[VerdictStatus, str | None]:
     if failure is not None:
         return VerdictStatus.UNVERIFIED, failure
@@ -203,6 +279,8 @@ def _derive_status(
         return VerdictStatus.BLOCK, None
     if any(o.kind is OutcomeKind.UNCONFIRMED for o in checkable):
         return VerdictStatus.PARTIAL, None
+    if pending_human:
+        return VerdictStatus.UNVERIFIED, 'needs_human'
     return VerdictStatus.PASS, None
 
 

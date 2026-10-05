@@ -11,8 +11,10 @@
   验收验收器）。
 - **独立预算**：自己的 `max_turns`，不花主 Agent 的轮次。
 
-绑定是绑在主 Agent 的 **Portal 对象**上（调用方传进来），不按 `agent_id` 查——那正是「作用在错主体」
-入口。两个主 Agent 各自的伴生只能看到各自的 Portal 与各自那份渲染进 `task` 的历史。
+绑定靠调用方交进来的 Portal：有 `WorkspaceRouter` 时**必须**交 `router.reader_for(主 Agent 的 id)`，
+不能交路由本身——路由按此刻在驱动的 Agent 记读基线，伴生在主 Agent 的驱动任务里跑，经路由读就记在主
+Agent 名下、刷新它的写前提，主 Agent 下一次整篇覆盖于是静默盖掉别人的改动（评审 B2）。只读视图钉住
+主 Agent 那份工作区、不记读基线、信任照算。两个主 Agent 的伴生各看各的工作区与历史。
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
-from syndica.kernel.context import TrustLevel
+from syndica.kernel.context import TrustLevel, provenance_of
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
 from syndica.kernel.llm import LLM
@@ -33,10 +35,13 @@ __all__ = ['CompanionResult', 'read_only_tools', 'run_companion']
 
 @dataclass(frozen=True)
 class CompanionResult:
-    """伴生跑完的结果：最终那条 assistant 文本，以及它用了几轮（花的是自己的预算）。"""
+    """伴生跑完的结果：最终那条 assistant 文本、它用了几轮（花的是自己的预算），以及它这份轨迹的
+    溯源结论 `provenance`——它读过的不可信内容（视图本身、Read 到的被污染文件）都在里面。验收器据此给
+    裁决定信任：只看主 Agent 的轨迹会把伴生读到的不可信内容洗成可信（评审 B1）。"""
 
     reply: str
     turns: int
+    provenance: TrustLevel = TrustLevel.TRUSTED
 
 
 def read_only_tools(portal: Portal | None) -> dict[str, Tool]:
@@ -76,7 +81,11 @@ async def run_companion(
         (str(block.content) for block in reversed(ctx.current_traj) if _is_reply(block)),
         '',
     )
-    return CompanionResult(reply=reply, turns=agent._current_turn)  # pyright: ignore[reportPrivateUsage]
+    return CompanionResult(
+        reply=reply,
+        turns=agent._current_turn,  # pyright: ignore[reportPrivateUsage]
+        provenance=provenance_of(ctx),
+    )
 
 
 def _is_reply(block: object) -> bool:

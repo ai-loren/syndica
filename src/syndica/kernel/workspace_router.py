@@ -329,6 +329,26 @@ class WorkspaceRouter:
     def portal(self) -> Portal:
         return self
 
+    def reader_for(self, agent_id: str) -> Portal:
+        """伴生 Agent 用的只读视图（M7 评审 B2）：读 `agent_id` 那份工作区（含隔离副本），**不记**读
+        基线（`_seen`）与溯源边。伴生在主 Agent 的驱动任务里跑，经路由读会记在主 Agent 名下、刷新它
+        的写前提，于是主 Agent 下一次整篇覆盖就把别人的改动静默盖掉（乐观并发被绕过）。信任照算——
+        Read / Grep / Glob 靠它给读到的内容定信任级别；写、命令、终端一律拒绝。"""
+        return _ReadOnlyView(self, agent_id)
+
+    def scope_of(self, agent_id: str) -> str:
+        """`agent_id` 读写的那份工作区的标识：沿父链最近一个有隔离副本的 Agent 的 id，共用根工作区时
+        是空串（与 `_workspace_of` 同一条父链规则）。产物 id 带上它：两个各在自己副本里写同一路径的
+        Agent 是两个产物，不互相顶掉对方的「最新版本」（M7 评审 H5）。"""
+        visited: set[str] = set()
+        agent: str | None = agent_id
+        while agent is not None and agent not in visited:
+            visited.add(agent)
+            if agent in self._copies:
+                return agent
+            agent = self._parents.get(agent)
+        return ''
+
     def _target(self) -> Workspace:
         return self._workspace_of(driving_agent())
 
@@ -536,3 +556,94 @@ class _ArtifactTracing(Protocol):
     def artifact(self, writer: str, path: str, version: str, trust: str) -> None: ...
 
     def provenance(self, source: str, trust: str) -> None: ...
+
+
+def _read_only(operation: str) -> ConfigError:
+    return ConfigError(
+        expected='伴生 Agent 的工作区视图只读（Read / Grep / Glob）',
+        received=f'收到一次 {operation}',
+        next_action='验收只看证据、不改工作区；要改产物由主 Agent 自己改',
+    )
+
+
+class _ReadOnlyView:
+    """`WorkspaceRouter.reader_for` 交出的只读 Portal：按 `agent_id` 定工作区，读直达它的后端，
+    不经路由的读基线与溯源记账；信任按那份工作区的文件污点照算（实现 `TaintAware`）。"""
+
+    def __init__(self, router: WorkspaceRouter, agent_id: str) -> None:
+        self._router = router
+        self._agent = agent_id
+
+    def _workspace(self) -> Workspace:
+        return self._router._workspace_of(self._agent)  # pyright: ignore[reportPrivateUsage]
+
+    def file_trust(self, path: str, version: str | None) -> TrustLevel:
+        taint = self._router._taint_of(self._workspace())  # pyright: ignore[reportPrivateUsage]
+        return TrustLevel.TRUSTED if taint is None else taint.trust_of(path, version)
+
+    def name_trust(self, path: str) -> TrustLevel:
+        taint = self._router._taint_of(self._workspace())  # pyright: ignore[reportPrivateUsage]
+        return TrustLevel.TRUSTED if taint is None else taint.name_trust(path)
+
+    async def read_text(self, path: str, *, offset: int, limit: int) -> str:
+        return await self._workspace().portal().read_text(path, offset=offset, limit=limit)
+
+    async def read_versioned(self, path: str, *, offset: int, limit: int) -> tuple[str, str]:
+        return await self._workspace().portal().read_versioned(path, offset=offset, limit=limit)
+
+    async def read_bytes(self, path: str) -> bytes:
+        return await self._workspace().portal().read_bytes(path)
+
+    async def stat(self, path: str) -> FileStat | None:
+        return await self._workspace().portal().stat(path)
+
+    async def glob_paths(self, pattern: str) -> tuple[str, ...]:
+        return await self._workspace().portal().glob_paths(pattern)
+
+    async def grep_text(self, pattern: str, path: str) -> tuple[GrepHit, ...]:
+        return await self._workspace().portal().grep_text(pattern, path)
+
+    async def write_text(self, path: str, content: str, *, expected: Expected = ANY) -> str:
+        raise _read_only('write_text')
+
+    async def edit_text(self, path: str, old: str, new: str, *, expected: Expected = ANY) -> str:
+        raise _read_only('edit_text')
+
+    async def write_bytes(self, path: str, data: bytes, *, expected: Expected = ANY) -> str:
+        raise _read_only('write_bytes')
+
+    async def remove(self, path: str, *, expected: Expected = ANY) -> None:
+        raise _read_only('remove')
+
+    async def run(self, command: str, *, timeout: float, cwd: str) -> ExecResult:
+        raise _read_only('run')
+
+    async def start(self, command: str, *, cwd: str) -> str:
+        raise _read_only('start')
+
+    async def poll(self, handle: str, *, since: tuple[int, int] = (0, 0)) -> ExecResult:
+        raise _read_only('poll')
+
+    async def kill(self, handle: str) -> None:
+        raise _read_only('kill')
+
+    async def pty_create(self, command: str, *, cwd: str, cols: int = 120, rows: int = 40) -> str:
+        raise _read_only('pty_create')
+
+    async def pty_send(self, handle: str, data: str) -> None:
+        raise _read_only('pty_send')
+
+    async def pty_capture(self, handle: str, *, since: int = 0, wait: float = 0.0) -> PtyCapture:
+        raise _read_only('pty_capture')
+
+    async def pty_resize(self, handle: str, *, cols: int, rows: int) -> None:
+        raise _read_only('pty_resize')
+
+    async def pty_kill(self, handle: str) -> None:
+        raise _read_only('pty_kill')
+
+    async def pty_status(self, handle: str) -> PtyStatus:
+        raise _read_only('pty_status')
+
+    async def close(self) -> None:
+        return None

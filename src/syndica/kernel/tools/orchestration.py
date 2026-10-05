@@ -140,10 +140,17 @@ def _delivered(child_id: str, ctx: Context) -> ToolResult:
         'agent_id': child_id,
         'stop_reason': reason.value if reason is not None else None,
     }
+    verdict = ctx.verdict
+    if verdict is not None:
+        # 子 Agent 的验收裁决随交回（§7.5）：父 Agent 据此知道交回来的东西验过没有、过没过。
+        meta['verdict'] = verdict.status.value
+        meta['needs_human'] = list(verdict.needs_human)
+        meta['unverified_cause'] = verdict.unverified_cause
     trust = provenance_of(ctx)
     text = _final_text(ctx)
     if reason is StopReason.COMPLETED and text is not None:
-        return ToolResult(output=f'agent {child_id} 交回:\n{text}', meta=meta, trust=trust)
+        suffix = '' if verdict is None else f'\n\n（验收裁决：{verdict.status.value}）'
+        return ToolResult(output=f'agent {child_id} 交回:\n{text}{suffix}', meta=meta, trust=trust)
     return ToolResult(
         output=(
             f'期望: agent {child_id} 完成这件工作并给出结论。'

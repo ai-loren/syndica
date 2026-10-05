@@ -30,6 +30,7 @@ from syndica.kernel.rubric_serde import (
     rubrics_to_json,
 )
 from syndica.kernel.stores import guarded_io as io
+from syndica.kernel.stores.memory_rubric import add_proposal, replace_projected
 
 __all__ = ['FileRubricStore']
 
@@ -72,8 +73,7 @@ class FileRubricStore:
     async def put_rubrics(self, scope: str, rubrics: list[RedactedRubric]) -> None:
         with self._locked(scope) as key:
             table = {r.id: r for r in self._read_rubrics(key)}
-            for redacted in rubrics:
-                table[redacted.rubric.id] = redacted.rubric
+            replace_projected(table, [r.rubric for r in rubrics])
             self._write(key, _RUBRICS, rubrics_to_json(list(table.values())))
 
     async def rubrics(self, scope: str, *, include_proposed: bool = False) -> list[Rubric]:
@@ -89,14 +89,14 @@ class FileRubricStore:
     async def propose(self, scope: str, rubric: RedactedRubric) -> None:
         with self._locked(scope) as key:
             table = {r.id: r for r in self._read_rubrics(key)}
-            table[rubric.rubric.id] = replace(rubric.rubric, status=RubricStatus.PROPOSED)
+            add_proposal(table, rubric.rubric)
             self._write(key, _RUBRICS, rubrics_to_json(list(table.values())))
 
     async def activate(self, scope: str, rubric_id: str) -> None:
         with self._locked(scope) as key:
             table = {r.id: r for r in self._read_rubrics(key)}
             existing = table.get(rubric_id)
-            if existing is None:
+            if existing is None or existing.status is not RubricStatus.PROPOSED:
                 return
             table[rubric_id] = replace(existing, status=RubricStatus.ACTIVE)
             self._write(key, _RUBRICS, rubrics_to_json(list(table.values())))

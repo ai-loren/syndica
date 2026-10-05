@@ -14,6 +14,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import cast
 
+from syndica.kernel.artifacts import KINDS
 from syndica.kernel.context import ArtifactRef, TrustLevel
 from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
@@ -346,6 +347,14 @@ class Deliver(Tool):
         if stat is None:
             return ToolResult(
                 output=f'交付失败：{path} 不存在。先写出这个文件再 Deliver，或检查路径是否写对。'
+            )
+        if kind and kind not in KINDS:
+            # 模型自选的 kind 决定交给哪个处理器做 L1：放任自由文本就能把交付物绕过严格的处理器。
+            return ToolResult(
+                output=(
+                    f'交付失败：kind={kind!r} 不认识。期望 {", ".join(sorted(KINDS))} 之一；'
+                    '拿不准就留空，按扩展名推断。'
+                )
             )
         ref = _artifact(path, stat.version)
         ref = replace(ref, kind=kind or ref.kind, is_deliverable=True)

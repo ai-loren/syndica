@@ -10,6 +10,7 @@ Rubric 信任取投影输入里最严的（§12.2：不可信任务输入投出�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Mapping
@@ -19,6 +20,7 @@ from syndica.kernel.acceptance import Anchor, AnchorSource, Goal, Rubric, Rubric
 from syndica.kernel.acceptance_inject import verify_anchors
 from syndica.kernel.companion import run_companion
 from syndica.kernel.context import TrustLevel
+from syndica.kernel.errors import ContractViolation
 from syndica.kernel.llm import LLM
 from syndica.kernel.protocols.rubric import RubricStore
 from syndica.kernel.redaction import Redactor
@@ -52,18 +54,33 @@ async def project_rubrics(
     redactor: Redactor,
     trust: TrustLevel = TrustLevel.TRUSTED,
     max_turns: int = 6,
+    time_limit: float | None = None,
 ) -> list[Rubric]:
-    """把 Goal 投影成 Rubric 并存进 store，返回留下的那些（锚点可重开的）。"""
-    result = await run_companion(
-        name='RubricsBuilder',
-        llm=llm,
-        system_prompt=_SYSTEM_PROMPT,
-        task=_render(goal, sources),
-        portal=None,
-        max_turns=max_turns,
-        trust=trust,
-    )
-    candidates = _parse(result.reply, trust)
+    """把 Goal 投影成 Rubric、**替换**进 store 里投影出的那批，返回留下的那些（锚点可重开的）。
+
+    投影失败（模型错、超时、回复解析不了）只接 `Exception`、按一条也没投出来处理：store 里旧 Goal 投
+    影出的条照样退役——拿旧要求去验新 Goal 会判出不属于它的 PASS（评审 H7）；Rubric 为空时裁决落
+    `unverified`。取消照常上抛。"""
+    try:
+        async with asyncio.timeout(time_limit):
+            result = await run_companion(
+                name='RubricsBuilder',
+                llm=llm,
+                system_prompt=_SYSTEM_PROMPT,
+                task=_render(goal, sources),
+                portal=None,
+                max_turns=max_turns,
+                trust=trust,
+            )
+        candidates = _parse(result.reply, trust)
+    except Exception as exc:
+        logger.warning(
+            '期望: RubricsBuilder 投出 Rubric。 实际: %s 层投影失败（%s）。 '
+            '下一步: 退役旧的投影条，本次验收落 unverified。',
+            scope,
+            type(exc).__name__,
+        )
+        candidates = []
     kept: list[Rubric] = []
     dropped = 0
     for rubric in candidates:
@@ -79,8 +96,7 @@ async def project_rubrics(
             scope,
             dropped,
         )
-    if kept:
-        await store.put_rubrics(scope, [redacted_rubric(r, redactor) for r in kept])
+    await store.put_rubrics(scope, [redacted_rubric(r, redactor) for r in kept])
     return kept
 
 
@@ -116,7 +132,7 @@ def _load(reply: str) -> dict[str, object] | None:
         return None
     try:
         value = json.loads(text[start : end + 1])
-    except ValueError:
+    except (ValueError, RecursionError):
         logger.warning('期望: RubricsBuilder 回合法 JSON。 实际: 解析失败。 下一步: 本次不投影。')
         return None
     return cast('dict[str, object]', value) if isinstance(value, dict) else None
@@ -135,15 +151,18 @@ def _rubric_from(item: object, trust: TrustLevel) -> Rubric | None:
     anchors = _anchors_from(data.get('anchors'))
     if not anchors:
         return None  # 没有锚点的候选直接弃（锚点规则，§7.6）
-    return Rubric(
-        id=rid,
-        statement=statement,
-        kind=kind,
-        anchors=anchors,
-        mandatory=data.get('mandatory') is not False,
-        status=RubricStatus.ACTIVE,
-        trust=trust,
-    )
+    try:
+        return Rubric(
+            id=rid,
+            statement=statement,
+            kind=kind,
+            anchors=anchors,
+            mandatory=data.get('mandatory') is not False,
+            status=RubricStatus.ACTIVE,
+            trust=trust,
+        )
+    except ContractViolation:
+        return None  # 模型给的 id / statement 不合规：弃这一条，不让整次投影崩
 
 
 def _anchors_from(raw: object) -> tuple[Anchor, ...]:

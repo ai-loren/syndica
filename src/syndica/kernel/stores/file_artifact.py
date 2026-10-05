@@ -14,6 +14,7 @@ import os
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -49,26 +50,28 @@ class FileArtifactStore:
         with self._locked() as key:
             order, versions, deliverable = self._read(key)
             existing = versions.get(ref.id)
+            changed = False
             if existing is None:
                 order.append(ref.id)
                 versions[ref.id] = [ref]
-            elif any(v.version == ref.version for v in existing):
-                # 同 (id, version) 幂等：保留先登记的那条，但交付物是产物级粘性标记，照样置上
-                # （`Deliver` 走的就是「重登记当前版本只为置交付」这条路，§7.4）。
-                if ref.is_deliverable:
-                    deliverable.add(ref.id)
-                    self._write(key, index_to_json(order, versions, deliverable))
-                return
-            else:
+                changed = True
+            elif existing[-1].version != ref.version:
+                # 新版本，或改回了早先的某一版（A→B→A）：追加一条，
+                # 最新一条就是当前版本（评审 Medium 7）。
                 existing.append(ref)
-            if ref.is_deliverable:
+                changed = True
+            if ref.is_deliverable and ref.id not in deliverable:
                 deliverable.add(ref.id)
-            self._write(key, index_to_json(order, versions, deliverable))
+                changed = True
+            if changed:
+                self._write(key, index_to_json(order, versions, deliverable))
 
     async def get(self, artifact_id: str) -> ArtifactRef | None:
-        _, versions, _ = self._read_only()
+        _, versions, deliverable = self._read_only()
         chain = versions.get(artifact_id)
-        return chain[-1] if chain else None
+        if not chain:
+            return None
+        return replace(chain[-1], is_deliverable=artifact_id in deliverable)
 
     async def versions_of(self, artifact_id: str) -> list[ArtifactRef]:
         _, versions, _ = self._read_only()
@@ -84,15 +87,14 @@ class FileArtifactStore:
         order, versions, deliverable = self._read_only()
         out: list[ArtifactRef] = []
         for artifact_id in order:
-            chain = versions[artifact_id]
-            latest = chain[-1]
+            latest = versions[artifact_id][-1]
             if kind is not None and latest.kind != kind:
                 continue
             if producer is not None and latest.producer != producer:
                 continue
             if deliverable_only and artifact_id not in deliverable:
                 continue
-            out.append(latest)
+            out.append(replace(latest, is_deliverable=artifact_id in deliverable))
         return out
 
     # --- internals ------------------------------------------------------------------------

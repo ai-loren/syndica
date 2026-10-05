@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 from syndica.kernel.context import ArtifactRef
 
@@ -26,19 +27,19 @@ class InMemoryArtifactStore:
             if versions is None:
                 self._versions[ref.id] = [ref]
                 self._order.append(ref.id)
-            elif any(existing.version == ref.version for existing in versions):
-                # 同一 (id, version) 重复登记幂等：保留先登记的那条，不追加重复版本（§7.2）。
-                if ref.is_deliverable:
-                    self._deliverable.add(ref.id)
-                return
+            elif versions[-1].version == ref.version:
+                # 与当前版本相同：幂等，不追加（§7.2）；交付标记照样置上（Deliver 走这条路）。
+                pass
             else:
+                # 新版本，或改回了早先的某一版（A→B→A）：都追加一条，最新一条就是当前版本。只看「有
+                # 没有登记过」会让改回 A 之后 get() 仍交出已不存在的 B（评审 Medium 7）。
                 versions.append(ref)
             if ref.is_deliverable:
                 self._deliverable.add(ref.id)
 
     async def get(self, artifact_id: str) -> ArtifactRef | None:
         versions = self._versions.get(artifact_id)
-        return versions[-1] if versions else None
+        return self._current(artifact_id, versions[-1]) if versions else None
 
     async def versions_of(self, artifact_id: str) -> list[ArtifactRef]:
         return list(self._versions.get(artifact_id, ()))
@@ -59,5 +60,10 @@ class InMemoryArtifactStore:
                 continue
             if deliverable_only and artifact_id not in self._deliverable:
                 continue
-            out.append(latest)
+            out.append(self._current(artifact_id, latest))
         return out
+
+    def _current(self, artifact_id: str, latest: ArtifactRef) -> ArtifactRef:
+        # 交付标记是产物级的：最新版本是隐式追踪登记的（没带标记）时，交出去的 ref 也要说它是交付
+        # 物。
+        return replace(latest, is_deliverable=artifact_id in self._deliverable)

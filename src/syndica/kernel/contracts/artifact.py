@@ -117,6 +117,27 @@ class ArtifactStoreContract(ContractSuite):
             _ref('file:report.md', 'v1', is_deliverable=False)
         ]  # 没多出一个版本
 
+    async def test_reverting_to_an_earlier_version_makes_it_current(
+        self, store: ArtifactStore
+    ) -> None:
+        # 版本是内容摘要：A→B→A 改回去之后当前版本是 A，不是已不存在的 B（评审 Medium 7）。
+        await store.register(_ref('file:a.md', 'v-a'))
+        await store.register(_ref('file:a.md', 'v-b'))
+        await store.register(_ref('file:a.md', 'v-a'))
+        current = await store.get('file:a.md')
+        assert current is not None and current.version == 'v-a'
+        assert [r.version for r in await store.versions_of('file:a.md')] == ['v-a', 'v-b', 'v-a']
+
+    async def test_get_and_list_report_the_sticky_deliverable_flag(
+        self, store: ArtifactStore
+    ) -> None:
+        # 交付后又被隐式追踪登记了新版本（没带标记）：交出去的「当前」ref 仍要说它是交付物。
+        await store.register(_ref('file:report.md', 'v1', is_deliverable=True))
+        await store.register(_ref('file:report.md', 'v2'))
+        current = await store.get('file:report.md')
+        assert current is not None and current.is_deliverable is True
+        assert [r.is_deliverable for r in await store.list()] == [True]
+
     async def test_three_concurrent_registrations_of_one_id_all_land(
         self, store: ArtifactStore
     ) -> None:

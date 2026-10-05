@@ -25,6 +25,15 @@ __all__ = [
 _MINT = object()
 
 
+def _frozen_after_mint(kind: str, name: str) -> ContractViolation:
+    # 铸造后换掉里面的值，就能把一份没脱敏的内容塞进只收脱敏类型的写入面（评审 Low 6）。
+    return ContractViolation(
+        expected=f'{kind} 铸造之后不可改',
+        received=f'有代码改了它的 {name}',
+        next_action='要换内容就重新铸造一份',
+    )
+
+
 def _redact_anchor(anchor: Anchor, redactor: Redactor) -> Anchor:
     return replace(anchor, quote=redactor.redact(anchor.quote))
 
@@ -42,7 +51,10 @@ class RedactedGoal:
                 received='有代码直接构造了它',
                 next_action='把 goal 交给 redacted_goal(goal, redactor)',
             )
-        self.goal = goal
+        object.__setattr__(self, 'goal', goal)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise _frozen_after_mint('RedactedGoal', name)
 
 
 @final
@@ -58,7 +70,10 @@ class RedactedRubric:
                 received='有代码直接构造了它',
                 next_action='把 rubric 交给 redacted_rubric(rubric, redactor)',
             )
-        self.rubric = rubric
+        object.__setattr__(self, 'rubric', rubric)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise _frozen_after_mint('RedactedRubric', name)
 
 
 def redacted_goal(goal: Goal, redactor: Redactor) -> RedactedGoal:

@@ -74,12 +74,13 @@ from __future__ import annotations
 import copy
 import itertools
 import logging
+import posixpath
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
-from syndica.kernel.acceptance import OutcomeKind, Verdict, VerdictStatus
+from syndica.kernel.acceptance import OutcomeKind, Verdict, VerdictStatus, most_severe
 from syndica.kernel.compaction import (
     CompactionController,
     apply_compaction,
@@ -92,6 +93,8 @@ from syndica.kernel.context import (
     ToolCall,
     TrustLevel,
     _trailing_unpaired_batch,  # pyright: ignore[reportPrivateUsage]
+    provenance_of,
+    strictest_trust,
 )
 from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
 from syndica.kernel.danger import DangerJudge, DangerPolicy, Disposition, validate_danger_options
@@ -305,13 +308,17 @@ def _bad_verdict(value: object) -> ContractViolation:
     )
 
 
+_FEEDBACK_REASON_CHARS = 500
+
+
 def _render_feedback(verdict: Verdict) -> str:
     """打回时追加给 Agent 的反馈块正文：哪几条已证伪、哪几条没能确认、下一步做什么。"""
     unmet = [o.rubric_id for o in verdict.outcomes if o.kind is OutcomeKind.UNMET]
     unconfirmed = [o.rubric_id for o in verdict.outcomes if o.kind is OutcomeKind.UNCONFIRMED]
     lines = [f'验收未通过（{verdict.status.value}）。']
     if verdict.reason:
-        lines.append(f'原因：{verdict.reason}')
+        # 原因是验收器的自由文本：截断，免得每次打回都把一大段塞进主上下文（评审 Low 2）。
+        lines.append(f'原因：{verdict.reason[:_FEEDBACK_REASON_CHARS]}')
     if unmet:
         lines.append(f'有证据表明做错了、要改：{", ".join(unmet)}')
     if unconfirmed:
@@ -497,9 +504,9 @@ class BaseAgent:
         # 产物索引（可选）：由 Runtime 经 `_attach_artifact_store` 装上。每批工具跑完后内核把工具
         # 回报的 `ToolResult.artifacts` 登记进去、再触发 ARTIFACT_REGISTERED（§7.4）；没装就不登记。
         self._artifact_store: ArtifactStore | None = None
-        # 最近一次验收裁决（COMPLETION_PROPOSED 的 hook 给出，§7.5）。终态 = 最后一次：重试用完或
-        # 撞 MAX_TURNS 时它是那次的 partial / block，绝不被改成 pass。没装验收就一直是 None。
-        self._verdict: Verdict | None = None
+        # 产物的隔离作用域（可选）：Runtime 给的函数，交回本 Agent 所在隔离副本的标识（共用根工作区
+        # 时是空串）。进产物 id，两个各在自己副本里写同一路径的 Agent 不撞成一个产物（评审 H5）。
+        self._artifact_scope: Callable[[], str] | None = None
 
     def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
         """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
@@ -740,9 +747,18 @@ class BaseAgent:
         把 Goal 与生效 Rubric 注入历史（§7.6）；第一轮模型调用因此看得到投影结果。"""
         self._rubrics = inject
 
-    def _attach_artifact_store(self, store: ArtifactStore) -> None:
-        """装上产物索引（Runtime 调）。每批工具跑完后内核往它登记工具回报的产物（§7.4）。"""
+    def _attach_artifact_store(
+        self, store: ArtifactStore, scope: Callable[[], str] | None = None
+    ) -> None:
+        """装上产物索引（Runtime 调）。每批工具跑完后内核往它登记工具回报的产物（§7.4）。`scope`
+        交回本 Agent 的隔离作用域，进产物 id（评审 H5）。"""
         self._artifact_store = store
+        self._artifact_scope = scope
+
+    @property
+    def _verdict(self) -> Verdict | None:
+        """本周期的验收裁决（在 `ctx.verdict` 上；终态 = 最后一次，内核从不合成 pass）。"""
+        return self._context.verdict
 
     async def _aux_llm_call(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
         """一次性辅助模型调用（压缩摘要 / 记忆整理）：走录制的同一条路（`llm_call` 作用域 +
@@ -884,6 +900,7 @@ class BaseAgent:
         ) as span:
             ctx = self._context
             ctx.stop_reason = None
+            ctx.verdict = None
             self._cycle_anchor = None
             repaired = _repair_interrupted_batch(ctx)
             self._executor._trace_interrupted(  # pyright: ignore[reportPrivateUsage]
@@ -989,7 +1006,14 @@ class BaseAgent:
         ctx.append(response)
         if not response.tool_calls:
             # Agent 判定完成：先过验收切点（§7.5）。打回则内核已追加反馈块，再做一轮。
-            if await self._propose_completion(ctx, response, turn):
+            sent_back = await self._propose_completion(ctx, response, turn)
+            # 验收可能跑上好一阵（L2 + L3 各有伴生轮次）：期间到达的中止要在这里兑现，否则通过的裁决
+            # 会把一次已被中止的运行收成 COMPLETED，留下的中止位还会漏进下一周期（评审 M10）。
+            if await self._gate.check_abort():
+                ctx.stop_reason = StopReason.ABORTED
+                await self._end_turn(ctx, turn, response)
+                return StopReason.ABORTED
+            if sent_back:
                 await self._end_turn(ctx, turn, response)
                 return None
             ctx.stop_reason = StopReason.COMPLETED
@@ -1000,29 +1024,32 @@ class BaseAgent:
         await self._executor.execute_tool_calls(
             ctx, response.tool_calls, origin=(self.agent_id, self._cycle, turn)
         )
-        await self._register_new_artifacts(ctx, pre)
+        await self._register_new_artifacts(ctx, pre, response.tool_calls)
         await self._end_turn(ctx, turn, response)
         return None
 
     async def _propose_completion(self, ctx: Context, response: ContextBlock, turn: int) -> bool:
         """过 COMPLETION_PROPOSED（§7.5）。交回 True 表示打回、再做一轮。
 
-        hook 给出 `modified['verdict']` 就记下它（终态裁决 = 最后一次，绝不改成 pass）。`send_back`
-        为真且裁决是 partial / block 时由**内核**追加一个署名 VERDICT 反馈块（hook 不能写轨迹），
-        作为下一轮输入；pass / unverified 或没说要打回则照常完成。没人给裁决（没装验收）就直接完成。
-        取消照常上抛（ABORTED，不变成 unverified 的 COMPLETED）；验收器失败由 Module 兜。"""
+        几个 hook 各给裁决时取**最严**的（链上靠后的 hook 不能把前面的 block 改成 pass，评审 H1），
+        记在 `ctx.verdict` 上（终态 = 最后一次，内核从不合成 pass）。任一 hook 要求打回且裁决是
+        partial / block 时由**内核**追加署名 VERDICT 反馈块（hook 不能写轨迹）作为下一轮输入；其余照
+        常完成。没人给裁决（没装验收）就直接完成。反馈块的信任取裁决与主轨迹里最严的（评审 B1）。取
+        消照常上抛。"""
         outcome = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
-            Junction.COMPLETION_PROPOSED, ctx=ctx, response=response
+            Junction.COMPLETION_PROPOSED, ctx=ctx, response=response, cycle=self._cycle
         )
         if outcome.skip or outcome.result is not None:
             raise _bad_completion_idiom(outcome)
-        verdict = outcome.get('verdict')
-        if verdict is None:
+        given = outcome.history.get('verdict', [])
+        if not given:
             return False
-        if not isinstance(verdict, Verdict):
-            raise _bad_verdict(verdict)
-        self._verdict = verdict
-        send_back = outcome.get('send_back') is True
+        for value in given:
+            if not isinstance(value, Verdict):
+                raise _bad_verdict(value)
+        verdict = most_severe(cast('list[Verdict]', given))
+        ctx.verdict = verdict
+        send_back = any(value is True for value in outcome.history.get('send_back', []))
         if not send_back or verdict.status not in (VerdictStatus.PARTIAL, VerdictStatus.BLOCK):
             return False
         ctx.append(
@@ -1030,20 +1057,36 @@ class BaseAgent:
                 HistoryKind.VERDICT,
                 _render_feedback(verdict),
                 key=f'verdict:{self._cycle}:{turn}',
-                trust=verdict.trust,
+                trust=strictest_trust(verdict.trust, provenance_of(ctx)),
             )
         )
         return True
 
-    async def _register_new_artifacts(self, ctx: Context, pre: int) -> None:
+    async def _register_new_artifacts(
+        self, ctx: Context, pre: int, calls: Sequence[ToolCall]
+    ) -> None:
         """这一批工具跑完后，把工具回报的产物登记进索引、逐个触发 ARTIFACT_REGISTERED（§7.4 隐式
         追踪，内核做、不依赖验收 Module）。在执行器窗口之外、不写轨迹：切点是 OBSERVABLE，L1 验收
-        挂它读产物。没装产物索引（宿主没给）就什么都不做。"""
+        挂它读产物。没装产物索引（宿主没给）就什么都不做。
+
+        内核不照单全收工具回报的 ref（评审 H5 / M11）：`id` 按路径 + 本 Agent 的隔离作用域重新派生
+        （两个各在自己副本里写 `report.md` 的 Agent 是两个产物），
+        交付标记只认 `Deliver` 那一次调用。"""
         store = self._artifact_store
         if store is None:
             return
+        names = {call.id: call.name for call in calls}
+        scope = self._artifact_scope() if self._artifact_scope is not None else ''
         for block in ctx.current_traj[pre:]:
-            for ref in block.artifacts:
+            delivered = names.get(block.tool_call_id or '') == 'Deliver'
+            for given in block.artifacts:
+                normal = posixpath.normpath(given.path)
+                ref = replace(
+                    given,
+                    id=f'file:{normal}' if not scope else f'file@{scope}:{normal}',
+                    path=normal,
+                    is_deliverable=given.is_deliverable and delivered,
+                )
                 await store.register(ref)
                 await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
                     Junction.ARTIFACT_REGISTERED, ctx=ctx, artifact=ref

@@ -32,8 +32,19 @@ async def test_deliver_can_override_the_kind(tmp_path: Path) -> None:
     root.mkdir()
     portal = _portal(root)
     await portal.write_text('data.bin', 'x')  # pyright: ignore[reportAttributeAccessIssue]
-    result = await Deliver(portal).execute('data.bin', kind='dataset')  # pyright: ignore[reportArgumentType]
-    assert result.artifacts[0].kind == 'dataset'  # 显式 kind 覆盖扩展名推断（§7.4）
+    result = await Deliver(portal).execute('data.bin', kind='spreadsheet')  # pyright: ignore[reportArgumentType]
+    assert result.artifacts[0].kind == 'spreadsheet'  # 显式 kind 覆盖扩展名推断（§7.4）
+
+
+async def test_deliver_refuses_a_kind_it_does_not_know(tmp_path: Path) -> None:
+    # 模型自选的 kind 决定 L1 交给哪个处理器：自由文本能把交付物绕过严格的处理器（评审 M11）。
+    root = tmp_path / 'ws'
+    root.mkdir()
+    portal = _portal(root)
+    await portal.write_text('a.md', '# A\n')  # pyright: ignore[reportAttributeAccessIssue]
+    result = await Deliver(portal).execute('a.md', kind='dataset')  # pyright: ignore[reportArgumentType]
+    assert result.artifacts == []
+    assert 'dataset' in result.output and 'document' in result.output  # 点名期望的取值
 
 
 async def test_deliver_on_a_missing_path_returns_an_actionable_error(tmp_path: Path) -> None:

@@ -77,6 +77,18 @@ def test_goal_and_active_rubric_blocks_are_protected_from_compaction() -> None:
     assert blocks.index(rubric) in protected
 
 
+def test_only_the_latest_goal_and_rubric_blocks_are_protected() -> None:
+    # 改过的 Goal、变过的 Rubric 集合都追加替代块：旧块不再保护，模型不会同时看见两份要求。
+    old_goal = signed_block(HistoryKind.GOAL, 'write a poem', key='goal:old')
+    new_goal = signed_block(HistoryKind.GOAL, 'write a report', key='goal:new')
+    old_rubric = signed_block(HistoryKind.RUBRIC, 'R1 poem', key='rubric:old')
+    new_rubric = signed_block(HistoryKind.RUBRIC, 'R1 report', key='rubric:new')
+    blocks = [old_goal, old_rubric, *_exchange('a'), new_goal, new_rubric, *_exchange('b')]
+    protected = _protected_indices(blocks)
+    assert blocks.index(new_goal) in protected and blocks.index(new_rubric) in protected
+    assert blocks.index(old_goal) not in protected and blocks.index(old_rubric) not in protected
+
+
 def test_a_goal_block_retires_the_first_user_proxy() -> None:
     # 没有 Goal 块时第一条真实 user 消息是 Goal 代理（受保护）；有了真的 Goal 块，这个代理退役，
     # 否则 Goal 块会把真正的任务消息挤出保护集合（评审 B2）。最后一条当前输入始终保护。

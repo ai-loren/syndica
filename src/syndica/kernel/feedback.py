@@ -26,6 +26,7 @@ from syndica.kernel.acceptance import (
     AnchorSource,
     Rubric,
     RubricKind,
+    RubricOrigin,
     RubricStatus,
 )
 from syndica.kernel.acceptance_inject import verify_anchors
@@ -89,6 +90,7 @@ async def propose_feedback_rubric(
         anchors=anchors,
         status=RubricStatus.PROPOSED,
         trust=trust,
+        origin=RubricOrigin.FEEDBACK,
     )
     await store.propose(scope, redacted_rubric(rubric, redactor))
     return rubric
