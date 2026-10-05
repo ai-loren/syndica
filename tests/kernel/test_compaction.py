@@ -7,6 +7,9 @@ import pytest
 from syndica.kernel.compaction import (
     CompactionRequest,
     CompactionResult,
+    PruningCompaction,
+    RuleBasedCompaction,
+    SummaryCompaction,
     apply_compaction,
 )
 from syndica.kernel.context import ContextBlock, ToolCall, TrustLevel
@@ -118,3 +121,125 @@ def test_a_kept_original_block_is_not_over_tainted_when_nothing_was_untrusted() 
     result = CompactionResult(kept=list(blocks), dropped=[])
     final = apply_compaction(request, result)
     assert all(block.trust is TrustLevel.TRUSTED for block in final)
+
+
+# ---- 基线策略 ----
+
+
+def _exchange(tag: str, *, size: int = 40) -> list[ContextBlock]:
+    """一段交流：一个 user 消息 + 一个 assistant 回答，内容带 tag、长度可控（供预算断言）。"""
+    body = tag * size
+    return [
+        ContextBlock(role='user', content=f'ask-{tag} {body}'),
+        ContextBlock(role='assistant', content=f'ans-{tag} {body}'),
+    ]
+
+
+async def test_rule_based_keeps_recent_turns_and_drops_old_under_budget() -> None:
+    blocks = [*_exchange('a'), *_exchange('b'), *_exchange('c'), *_exchange('d')]
+    request = CompactionRequest(blocks=blocks, budget_tokens=30)
+    result = await RuleBasedCompaction(min_keep_turns=2).compact(request)
+    kept_text = ' '.join(str(b.content) for b in result.kept)
+    assert 'ask-a' not in kept_text and 'ask-b' not in kept_text
+    assert 'ask-c' in kept_text and 'ask-d' in kept_text
+    # 策略结果必须自己过内核的不变量校验。
+    assert apply_compaction(request, result) == result.kept
+
+
+async def test_rule_based_keeps_a_protected_old_block() -> None:
+    blocks = [*_exchange('a'), *_exchange('b'), *_exchange('c'), *_exchange('d')]
+    request = CompactionRequest(blocks=blocks, budget_tokens=30, protected=frozenset({0}))
+    result = await RuleBasedCompaction(min_keep_turns=2).compact(request)
+    assert blocks[0] in result.kept
+    apply_compaction(request, result)
+
+
+async def test_rule_based_preserves_block_order() -> None:
+    # 基数 3、预算充裕：全留。顺序翻转会在这里变红（前缀缓存靠顺序）。
+    blocks = [*_exchange('a'), *_exchange('b'), *_exchange('c')]
+    request = CompactionRequest(blocks=blocks, budget_tokens=10_000)
+    result = await RuleBasedCompaction(min_keep_turns=2).compact(request)
+    assert result.kept == blocks
+
+
+async def test_rule_based_truncates_when_recent_turns_alone_exceed_budget() -> None:
+    huge = 'x' * 4000
+    blocks = [
+        ContextBlock(role='user', content='ask'),
+        ContextBlock(role='assistant', content=huge),
+    ]
+    request = CompactionRequest(blocks=blocks, budget_tokens=5)
+    result = await RuleBasedCompaction(min_keep_turns=2, max_output_chars=40).compact(request)
+    truncated = result.kept[-1]
+    assert isinstance(truncated.content, str) and truncated.content.endswith('字）')
+    assert len(truncated.content) < len(huge)
+    apply_compaction(request, result)
+
+
+async def test_pruning_drops_whole_old_tool_batches_and_keeps_pairing() -> None:
+    blocks = [
+        ContextBlock(role='user', content='task'),
+        *_call_batch('c1', 'x' * 400),
+        *_call_batch('c2', 'y' * 400),
+        *_call_batch('c3', 'z' * 400),
+        ContextBlock(role='assistant', content='final answer'),
+    ]
+    request = CompactionRequest(blocks=blocks, budget_tokens=40)
+    result = await PruningCompaction().compact(request)
+    # 丢的是整批（配对不破）：留下序列过校验。
+    final = apply_compaction(request, result)
+    assert blocks[0] in final and blocks[-1] in final  # 文本块与任务消息留着
+    assert len(result.dropped) >= 2  # 至少两批执行细节被丢
+
+
+async def test_pruning_keeps_a_protected_batch() -> None:
+    blocks = [
+        ContextBlock(role='user', content='task'),
+        *_call_batch('c1', 'x' * 400),
+        *_call_batch('c2', 'y' * 400),
+    ]
+    request = CompactionRequest(blocks=blocks, budget_tokens=5, protected=frozenset({1, 2}))
+    result = await PruningCompaction().compact(request)
+    assert blocks[1] in result.kept and blocks[2] in result.kept  # 受保护那批不丢
+    apply_compaction(request, result)
+
+
+async def test_summary_folds_early_content_into_one_signed_block() -> None:
+    seen: list[int] = []
+
+    async def summarize(blocks: object) -> str:
+        seen.append(len(list(blocks)))  # pyright: ignore[reportArgumentType]
+        return 'EARLY-DIGEST'
+
+    blocks = [*_exchange('a'), *_exchange('b'), *_exchange('c')]
+    request = CompactionRequest(blocks=blocks, budget_tokens=1, summarize=summarize)
+    result = await SummaryCompaction(min_keep_turns=1).compact(request)
+    assert seen and seen[0] > 0  # 摘要器真的被喂了早期内容
+    digest = next(b for b in result.kept if kind_of(b) is HistoryKind.COMPACTION)
+    assert 'EARLY-DIGEST' in str(digest.content)
+    assert 'ask-c' in ' '.join(str(b.content) for b in result.kept)  # 最近一轮留着
+    apply_compaction(request, result)
+
+
+async def test_summary_without_a_summarizer_is_refused() -> None:
+    blocks = [*_exchange('a'), *_exchange('b')]
+    request = CompactionRequest(blocks=blocks, budget_tokens=1)
+    with pytest.raises(ContractViolation, match='summarize'):
+        await SummaryCompaction(min_keep_turns=1).compact(request)
+
+
+async def test_summary_block_inherits_untrusted_provenance() -> None:
+    async def summarize(blocks: object) -> str:
+        del blocks
+        return 'digest of trusted-looking text'
+
+    blocks = [
+        ContextBlock(role='user', content='web said X', trust=TrustLevel.UNTRUSTED),
+        *_exchange('b'),
+        *_exchange('c'),
+    ]
+    request = CompactionRequest(blocks=blocks, budget_tokens=1, summarize=summarize)
+    result = await SummaryCompaction(min_keep_turns=1).compact(request)
+    final = apply_compaction(request, result)
+    digest = next(b for b in final if kind_of(b) is HistoryKind.COMPACTION)
+    assert digest.trust is TrustLevel.UNTRUSTED
