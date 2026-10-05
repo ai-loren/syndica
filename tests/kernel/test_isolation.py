@@ -901,3 +901,62 @@ def test_a_symlinked_copy_directory_is_refused_and_nothing_is_copied_outside(
 
     assert '符号链接' in refused.value.received
     assert list(outside.iterdir()) == []
+
+
+def _executable(path: Path) -> bool:
+    return bool(path.stat().st_mode & 0o111)
+
+
+async def test_a_chmod_in_the_copy_is_merged_back_even_though_the_content_is_unchanged(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    copy = router.isolate('alpha', 'snapshot')
+    assert copy is not None
+    await _as('alpha', lambda: router.set_executable('src/app.py', True))
+
+    report = await router.merge_isolated('alpha')
+
+    assert report.merged == ('src/app.py',)
+    assert _executable(root / 'src' / 'app.py')
+
+
+async def test_a_new_executable_script_lands_executable(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    copy = router.isolate('alpha', 'worktree')
+    assert copy is not None
+    await _as('alpha', lambda: router.write_text('run.sh', 'echo ran\n'))
+    await _as('alpha', lambda: router.set_executable('run.sh', True))
+
+    await router.merge_isolated('alpha')
+
+    assert _executable(root / 'run.sh')
+
+
+async def test_clearing_the_bit_in_the_copy_clears_it_in_the_parent(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    os.chmod(root / 'notes.md', 0o755)
+    copy = router.isolate('alpha', 'snapshot')
+    assert copy is not None
+    await _as('alpha', lambda: router.set_executable('notes.md', False))
+
+    await router.merge_isolated('alpha')
+
+    assert not _executable(root / 'notes.md')
+
+
+async def test_the_parents_own_chmod_survives_a_content_merge(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    # 可执行位只在子 Agent 改过时写回：父那边自己 `chmod +x` 过、子 Agent 只改内容，合并不撤销它。
+    copy = router.isolate('alpha', 'worktree')
+    assert copy is not None
+    os.chmod(root / 'src' / 'app.py', 0o755)
+    await _as('alpha', lambda: router.read_text('src/app.py', offset=1, limit=10))
+    await _as('alpha', lambda: router.write_text('src/app.py', 'print(2)\n'))
+
+    await router.merge_isolated('alpha')
+
+    assert (root / 'src' / 'app.py').read_text() == 'print(2)\n'
+    assert _executable(root / 'src' / 'app.py')

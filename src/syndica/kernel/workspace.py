@@ -55,11 +55,12 @@ class ExecResult:
 
 @dataclass(frozen=True)
 class FileStat:
-    """一个文件此刻的版本与大小。`version` 是内容摘要（`sha256:<hex>`）：同样的内容同样的版本，
-    只做相等比较，不解析它的结构。"""
+    """一个文件此刻的版本、大小与可执行位。`version` 是内容摘要（`sha256:<hex>`）：同样的内容同样
+    的版本，只做相等比较，不解析它的结构；可执行位不进版本（改它不是改内容）。"""
 
     version: str
     size: int
+    executable: bool = False
 
 
 @dataclass(frozen=True)
@@ -160,7 +161,12 @@ class Portal(Protocol):
     async def remove(self, path: str, *, expected: Expected = ANY) -> None: ...
 
     async def stat(self, path: str) -> FileStat | None:
-        """文件的版本与大小；不存在时是 None，存在但不是文件时拒绝。"""
+        """文件的版本、大小与可执行位；不存在时是 None，存在但不是文件时拒绝。"""
+        ...
+
+    async def set_executable(self, path: str, executable: bool) -> None:
+        """打开 / 关掉一个已存在文件的可执行位，内容与版本不变。不存在、不是普通文件（含符号链接）
+        时拒绝。隔离副本合并回去靠它：脚本在副本里 `chmod +x` 过，合并回去也要跑得起来。"""
         ...
 
     async def glob_paths(self, pattern: str) -> tuple[str, ...]: ...

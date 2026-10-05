@@ -713,3 +713,14 @@ async def test_a_command_still_runs_next_to_dot_git(
 
     assert result.exit_code == 0
     assert (exec_root / cwd / 'marker').read_text(encoding='utf-8') == 'x'
+
+
+async def test_the_executable_bit_is_not_changed_through_a_symlink(tmp_path: Path) -> None:
+    # 符号链接没有自己的可执行位：顺着它 chmod 改的是另一个名字下的文件。
+    root = tmp_path / 'ws'
+    root.mkdir()
+    (root / 'real.sh').write_text('echo hi\n')
+    (root / 'link.sh').symlink_to(root / 'real.sh')
+    with pytest.raises(ConfigError):
+        await _workspace(root).portal().set_executable('link.sh', True)
+    assert not (root / 'real.sh').stat().st_mode & 0o111

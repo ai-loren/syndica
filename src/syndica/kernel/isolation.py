@@ -93,7 +93,8 @@ class MergeReport:
 
 
 class IsolatedCopy:
-    """一个子 Agent 的隔离副本。`base` 是拷贝那一刻每个文件的版本。"""
+    """一个子 Agent 的隔离副本。`base` 是拷贝那一刻每个文件的版本，`base_executable` 是那一刻哪些
+    文件带可执行位。"""
 
     def __init__(
         self,
@@ -105,12 +106,14 @@ class IsolatedCopy:
         base: dict[str, str],
         workspace: LocalWorkspace,
         note: str,
+        base_executable: frozenset[str] = frozenset(),
     ) -> None:
         self.agent_id = agent_id
         self.strategy = strategy
         self.location = location
         self.base_dir = base_dir
         self.base = base
+        self.base_executable = base_executable
         self.workspace = workspace
         self.note = note
         self.merged_from: dict[str, str] | None = None
@@ -198,6 +201,7 @@ class LocalIsolator:
             if folder is not None
         ]
         base: dict[str, str] = {}
+        executable: set[str] = set()
         ignore = location.parent / '.gitignore'
         # 任何一级是符号链接，副本就拷到了工作区之外，合并时又从那里读回来。
         _require_real_directories(root, (root / '.syndica', location.parent))
@@ -214,6 +218,8 @@ class LocalIsolator:
                 data = source.read_bytes()
                 mode = source.stat().st_mode & 0o777
                 base[relative] = _version(data)
+                if mode & 0o111:
+                    executable.add(relative)
                 for _, scratch in building:
                     target = scratch / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -235,6 +241,7 @@ class LocalIsolator:
             base=base,
             workspace=workspace,
             note=note,
+            base_executable=frozenset(executable),
         )
 
     async def merge(
@@ -245,15 +252,28 @@ class LocalIsolator:
     ) -> MergeReport:
         """把 `copy` 相对基线的改动逐文件写回 `parent`。每次写回都带着读到的父版本做前提：合并期间
         父那边又被改过，这个文件就算冲突，不覆盖。每次写回之后调 `written(写到哪, 内容, 出自副本里
-        的哪个文件, 是否混了父的内容)`；删除时内容是 None。"""
+        的哪个文件, 是否混了父的内容)`；删除时内容是 None。
+
+        可执行位单独合：子 Agent 改过它（或新建了一个可执行文件）才写回，父那边自己改过的不动。只
+        改了可执行位、内容没变的文件也算合并过。"""
         now = _versions_under(copy.location)
+        now_executable = _executables_under(copy.location)
         copy.merged_from = now
         merged: list[str] = []
         conflicts: list[MergeConflict] = []
         renamed = _case_renames(copy.base, now)
         for path in sorted(set(copy.base) | set(now)):
             base, child = copy.base.get(path), now.get(path)
+            wanted = path in now_executable
+            mode_changed = child is not None and wanted != (path in copy.base_executable)
             if child == base:
+                if mode_changed:
+                    try:
+                        await _carry_executable(parent, path, wanted)
+                        merged.append(path)
+                    except (ConfigError, OSError) as exc:
+                        reason = f'可执行位写不回共享工作区（{_cause(exc)}）'
+                        conflicts.append(MergeConflict(path=path, reason=reason))
                 continue
             if path.casefold() in renamed:
                 # 只改了大小写的改名：大小写不敏感的文件系统上，新名字与旧名字是同一个文件，
@@ -265,15 +285,21 @@ class LocalIsolator:
                 current = await parent.stat(path)
                 ours = None if current is None else current.version
                 if ours == child:
+                    if mode_changed:
+                        await _carry_executable(parent, path, wanted)
                     merged.append(path)
                 elif ours == base:
                     await self._apply(copy, parent, path, child, ours, written)
+                    if mode_changed:
+                        await _carry_executable(parent, path, wanted)
                     merged.append(path)
                 else:
                     reason = await self._both_changed(
                         copy, parent, path, base, child, ours, written
                     )
                     if reason is None:
+                        if mode_changed:
+                            await _carry_executable(parent, path, wanted)
                         merged.append(path)
                     else:
                         conflicts.append(
@@ -454,6 +480,20 @@ def _case_renames(base: Mapping[str, str], now: Mapping[str, str]) -> frozenset[
 
 def _cause(exc: BaseException) -> str:
     return exc.message if isinstance(exc, ConfigError) else f'{type(exc).__name__}: {exc}'
+
+
+async def _carry_executable(parent: Portal, path: str, wanted: bool) -> None:
+    current = await parent.stat(path)
+    if current is not None and current.executable != wanted:
+        await parent.set_executable(path, wanted)
+
+
+def _executables_under(location: Path) -> frozenset[str]:
+    return frozenset(
+        relative
+        for relative in _working_files(location)
+        if (location / relative).stat().st_mode & 0o111
+    )
 
 
 def _versions_under(location: Path) -> dict[str, str]:

@@ -83,8 +83,11 @@ async def test_the_view_refuses_writes_and_commands(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         await view.remove('f.md')
     with pytest.raises(ConfigError):
+        await view.set_executable('f.md', True)
+    with pytest.raises(ConfigError):
         await view.run('rm -rf .', timeout=1, cwd='.')
     assert (tmp_path / 'f.md').read_text(encoding='utf-8') == 'v1\n'
+    assert not (tmp_path / 'f.md').stat().st_mode & 0o111
 
 
 def test_the_view_is_taint_aware_so_reads_keep_their_trust(tmp_path: Path) -> None:

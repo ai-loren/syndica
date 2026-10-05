@@ -229,6 +229,34 @@ class WorkspaceContract(ContractSuite):
         await portal.remove('a.txt', expected=two.version)
         assert await portal.stat('a.txt') is None
 
+    async def test_the_executable_bit_round_trips_and_leaves_the_version_alone(
+        self, workspace: Workspace
+    ) -> None:
+        # 隔离副本合并回去靠它：脚本在副本里 `chmod +x` 过，合回去也要跑得起来；只存一个标记、不真
+        # 改权限的后端在 run 那一步露馅，换文件写（写临时文件再替换）的后端在改写那一步露馅。
+        portal = workspace.portal()
+        version = await portal.write_text('run.sh', 'echo ran\n')
+        written = await portal.stat('run.sh')
+        assert written is not None and written.executable is False
+        await portal.set_executable('run.sh', True)
+        on = await portal.stat('run.sh')
+        assert on is not None and (on.executable, on.version) == (True, version)
+        result = await portal.run('./run.sh', timeout=10, cwd='.')
+        assert (result.exit_code, result.stdout.strip()) == (0, 'ran')
+        rewritten = await portal.write_text('run.sh', 'echo again\n')
+        kept = await portal.stat('run.sh')
+        assert kept is not None and (kept.executable, kept.version) == (True, rewritten)
+        await portal.set_executable('run.sh', False)
+        off = await portal.stat('run.sh')
+        assert off is not None and (off.executable, off.version) == (False, rewritten)
+
+    async def test_the_executable_bit_of_a_missing_or_outside_file_is_refused(
+        self, workspace: Workspace
+    ) -> None:
+        portal = workspace.portal()
+        await _rejects('不存在的文件', lambda: portal.set_executable('missing.sh', True))
+        await _rejects('越界的路径', lambda: portal.set_executable('../outside.sh', True))
+
     async def test_paths_outside_the_root_are_refused(self, workspace: Workspace) -> None:
         portal = workspace.portal()
         outside = '../outside-the-root.txt'

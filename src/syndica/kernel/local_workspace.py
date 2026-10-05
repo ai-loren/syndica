@@ -286,7 +286,27 @@ class LocalWorkspace:
                 next_action='stat 只给文件版本；目录没有版本',
             )
         version, size = _file_version(real)
-        return FileStat(version=version, size=size)
+        return FileStat(version=version, size=size, executable=_is_executable(real))
+
+    async def set_executable(self, path: str, executable: bool) -> None:
+        real = self._writable(path)
+        if (self._root / path).is_symlink():
+            raise ConfigError(
+                expected='set_executable 只改普通文件',
+                received=f'path={path!r} 是符号链接',
+                next_action='符号链接没有自己的可执行位；改它指向的那个文件',
+            )
+        if not real.is_file():
+            raise ConfigError(
+                expected='path 指向根目录内已存在的文件',
+                received=f'path={path!r} 不存在或不是文件',
+                next_action='先写出这个文件，再改它的可执行位',
+            )
+        mode = stat.S_IMODE(real.stat().st_mode)
+        # 打开时在读得到的那几类上加执行位（至少属主）：与 `chmod +x` 在默认 umask 下的结果一致。
+        wanted = mode | 0o100 | ((mode & 0o044) >> 2) if executable else mode & ~0o111
+        if wanted != mode:
+            os.chmod(real, wanted)
 
     def _write(self, path: str, data: bytes, expected: Expected) -> str:
         """写入的全部检查与写本身之间没有挂起点：同一个事件循环里并发的两次带前提的写，后到的那个
@@ -718,6 +738,10 @@ def _utf8(data: bytes, received: str) -> str:
 
 def _version(data: bytes) -> str:
     return f'sha256:{hashlib.sha256(data).hexdigest()}'
+
+
+def _is_executable(real: Path) -> bool:
+    return bool(real.stat().st_mode & 0o111)
 
 
 def _check_expected(path: str, expected: object, current: str | None) -> None:

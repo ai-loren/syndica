@@ -506,6 +506,9 @@ class WorkspaceRouter:
     async def stat(self, path: str) -> FileStat | None:
         return await self._target().portal().stat(path)
 
+    async def set_executable(self, path: str, executable: bool) -> None:
+        await self._target().portal().set_executable(path, executable)
+
     async def glob_paths(self, pattern: str) -> tuple[str, ...]:
         return await self._target().portal().glob_paths(pattern)
 
@@ -614,6 +617,9 @@ class _ReadOnlyView:
 
     async def remove(self, path: str, *, expected: Expected = ANY) -> None:
         raise _read_only('remove')
+
+    async def set_executable(self, path: str, executable: bool) -> None:
+        raise _read_only('set_executable')
 
     async def run(self, command: str, *, timeout: float, cwd: str) -> ExecResult:
         raise _read_only('run')
