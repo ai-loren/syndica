@@ -200,13 +200,17 @@ _CONFIRMATION_TIMEOUT = 300.0
 # Agent 的 Bash 用的 shell。HostFacts 把它告诉模型，两处必须是同一个值。
 _SHELL = '/bin/sh'
 # 文件工具碰不到的目录：trace 里存着此前标成不可信的工具输出，经 Read 读回来就成了可信内容；交接
-# 文件只由宿主写。不整个关 `.syndica`：本仓的 Worker 把长输出存进 `.syndica/tmp/` 再读。
+# 文件只由宿主写；会话与记忆存着 trust 标记，Agent 经 Write 改它们能把不可信内容写成可信、注进此后
+# 每个会话（与 danger._HOST_RECORDS 同一份名单）。不整个关 `.syndica`：Worker 把长输出存进
+# `.syndica/tmp/`。
 _PRIVATE = (
     '.syndica/traces',
     '.syndica/handoffs',
     '.syndica/vcs',
     '.syndica/worktrees',
     '.syndica/snapshots',
+    '.syndica/sessions',
+    '.syndica/memory',
 )
 _INCOMPLETE_TRACE = 'trace（不完整，原因见上面的 ERROR；不要拿它回放）'
 # `run --no-write` 在清单与槽里留下的工具。白名单而不是去掉几个写工具：以后新增的可写工具默认

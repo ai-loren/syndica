@@ -8,17 +8,19 @@ from __future__ import annotations
 import asyncio
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
+from syndica.kernel.catalog import AgentCatalog
 from syndica.kernel.context import Context
 from syndica.kernel.events import EventBus
 from syndica.kernel.history_blocks import HistoryKind, kind_of
 from syndica.kernel.hooks import HooksCenter
-from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
+from syndica.kernel.llm import ContextOverflowError, ScriptedLLM, ScriptedTurn
 from syndica.kernel.memory_module import MemoryModule
 from syndica.kernel.memory_redaction import redacted_memory_sections
 from syndica.kernel.memory_types import MemoryScope, MemorySection
 from syndica.kernel.redaction import RuleRedactor
 from syndica.kernel.runtime import AgentFactory, Runtime
 from syndica.kernel.stores.memory_memory import InMemoryMemoryStore
+from syndica.kernel.topology import AgentSlot, Topology
 
 _TIMEOUT = 2.0
 _REDACTOR = RuleRedactor()
@@ -136,6 +138,48 @@ async def test_only_the_root_coordinator_writes_global_memory() -> None:
         await runtime.shutdown()
 
 
+async def test_in_a_topology_only_the_root_slot_writes_global_memory() -> None:
+    # 拓扑的槽 Agent 互为对等、都没有 parent：只看 parent_id 会让每个工人都成根、能写全局（收口评审
+    # H3）。根只能是占着 is_root 槽的那个。
+    store = InMemoryMemoryStore()
+    runtime = Runtime(modules=[MemoryModule(workspace='/w', store=store)])
+    topology = Topology(
+        slots=(
+            AgentSlot(
+                name='lead', agent='Worker', cardinality='singleton', boot='eager', is_root=True
+            ),
+            AgentSlot(name='hand', agent='Worker', cardinality='singleton', boot='eager'),
+        )
+    )
+    catalog = AgentCatalog()
+    catalog.load_mapping({'name': 'Worker', 'description': 'w'})
+    try:
+        await runtime.assemble(
+            topology,
+            catalog,
+            tools={},
+            models={'default': ScriptedLLM([ScriptedTurn(content='ok')])},
+        )
+        lead = await runtime.resolve('lead')
+        hand = await runtime.resolve('hand')
+        assert lead is not None and hand is not None and lead != hand
+        lead_result = (
+            await _agent_of(runtime, lead)
+            .options.tools['Remember']
+            .execute(text='全局约定', scope='global')
+        )
+        hand_result = (
+            await _agent_of(runtime, hand)
+            .options.tools['Remember']
+            .execute(text='想写全局', scope='global')
+        )
+        assert '已记住' in str(lead_result.output)  # 根槽写得了全局
+        assert '根协调者' in str(hand_result.output)  # 工人槽被拒
+        assert [e.text for e in await store.entries(MemoryScope.GLOBAL, None)] == ['全局约定']
+    finally:
+        await runtime.shutdown()
+
+
 async def test_an_unknown_scope_is_rejected() -> None:
     store = InMemoryMemoryStore()
     runtime = Runtime(modules=[MemoryModule(workspace='/w', store=store)])
@@ -145,6 +189,29 @@ async def test_an_unknown_scope_is_rejected() -> None:
         tool = _agent_of(runtime, agent_id).options.tools['Remember']
         result = await tool.execute(text='x', scope='nonsense')
         assert 'workspace' in str(result.output) and 'global' in str(result.output)
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_failed_consolidation_does_not_crash_remember() -> None:
+    # 整理那次一次性调用抛（超窗 / 坏回复 / store 坏）不能把 Remember、乃至整次 run 拖垮（收口评审
+    # H2）：记一条 ERROR、条目留在短期下次再整理。
+    store = InMemoryMemoryStore()
+    runtime = Runtime(
+        modules=[MemoryModule(workspace='/w', store=store)],
+        flags={'memory_consolidate_after': 1},
+    )
+    try:
+        overflow = ContextOverflowError(expected='在窗口内', received='超窗', next_action='压缩')
+        llm = ScriptedLLM([ScriptedTurn(content='ok'), ScriptedTurn(raises=overflow)])
+        agent_id = await runtime.spawn(_factory(llm), query='t')
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        remember = _agent_of(runtime, agent_id).options.tools['Remember']
+        result = await remember.execute(text='踩坑')  # 整理的 aux 调用抛，被吞
+        assert '已记住' in str(result.output)  # Remember 没崩
+        entries = await store.entries(MemoryScope.WORKSPACE, '/w')
+        assert [e.text for e in entries] == ['踩坑']  # 条目留在短期
+        assert await store.read(MemoryScope.WORKSPACE, '/w') is None  # 整理没完成
     finally:
         await runtime.shutdown()
 

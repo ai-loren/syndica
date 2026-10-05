@@ -3467,6 +3467,21 @@ class Runtime:
             if slot.boot == 'eager':
                 await self._spawn_slot(bindings[slot.name], key=None)
 
+    async def _is_root_coordinator(self, agent_id: str) -> bool:
+        """这个 Agent 是不是根协调者（只有它能写全局记忆，spec §8.9）。装过拓扑时：它占着某个
+        `is_root` 槽；没装拓扑时：注册表里 `parent_id` 为空。拓扑的槽 Agent 互为对等、没有父子，所以
+        `parent_id is None` 对它们恒真——不能用它判根，否则每个工人都成了根（收口评审 H3）。"""
+        if self._assembled:
+            for binding in self._topology_bindings.values():
+                if not binding.slot.is_root:
+                    continue
+                alias = _alias_for(binding.slot, None)
+                if alias is not None and self._topology_aliases.get(alias) == agent_id:
+                    return True
+            return False
+        info = await self.registry.get(agent_id)
+        return info is not None and info.parent_id is None
+
     async def resolve(
         self,
         name: str,

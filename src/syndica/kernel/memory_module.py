@@ -10,12 +10,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, cast
 
 from syndica import __version__
 from syndica.kernel.context import Context, ContextBlock, TrustLevel, call_trust, strictest_trust
-from syndica.kernel.errors import ContractViolation
+from syndica.kernel.errors import ContractViolation, SyndicaError
 from syndica.kernel.history_blocks import HistoryKind, has_block, signed_block
 from syndica.kernel.hooks import HooksCenter
 from syndica.kernel.memory_redaction import redacted_memory_entry, redacted_memory_sections
@@ -32,13 +33,18 @@ if TYPE_CHECKING:
 
 __all__ = ['MemoryModule']
 
+logger = logging.getLogger(__name__)
+
 _SCOPES = {'workspace': MemoryScope.WORKSPACE, 'global': MemoryScope.GLOBAL}
+# 一次整理最多消化多少条短期、每条截多少字：积压分批消化，摘要器不被积压撑爆（收口评审 H2）。
+_CONSOLIDATE_BATCH = 50
+_CONSOLIDATE_CHARS = 2000
 
 
 async def _is_root(runtime: Runtime, agent_id: str) -> bool:
-    """根协调者＝注册表里 `parent_id` 为空的那个 Agent。查不到按非根处置（§8.9：写全局要收紧）。"""
-    info = await runtime.registry.get(agent_id)
-    return info is not None and info.parent_id is None
+    """根协调者：装过拓扑时是 is_root 槽的占用者，否则是注册表里 parent_id 为空的 Agent（§8.9：写
+    全局要收紧）。拓扑的槽 Agent 互为对等、都没有父，所以不能只看 parent_id（收口评审 H3）。"""
+    return await runtime._is_root_coordinator(agent_id)  # pyright: ignore[reportPrivateUsage]
 
 
 class _RememberTool(Tool):
@@ -86,46 +92,61 @@ class _RememberTool(Tool):
         except ContractViolation as exc:
             # 不可信内容进全局被铸造处挡下（spec §8.9）。把原因原样交回模型，让它改记 workspace。
             return ToolResult(output=f'这条记不进全局记忆：{exc.received}。改记 workspace。')
-        await self._store.record(redacted)
+        try:
+            await self._store.record(redacted)
+        except SyndicaError as exc:
+            # 记忆文件坏了 / 版本更新：交回三件套让模型知道没记上，不让整次 run 崩（收口评审 M3）。
+            return ToolResult(output=f'没记上：{exc.received}。{exc.next_action}')
         await self._maybe_consolidate(memory_scope, workspace)
         return ToolResult(output=f'已记住（{scope}）。')
 
     async def _maybe_consolidate(self, scope: MemoryScope, workspace: str | None) -> None:
-        """短期累积到阈值就用一次性调用把它们整理成一段结构化长期记忆（spec §8.9；经 `_aux_llm_call`
-        走录制 / 回放同一条路）。乐观并发：版本被别人抢先就跳，下次再整理。整理出的那段信任取被整理
-        各条里最严的（不可信内容整理出来仍不可信，§12.2）。"""
-        record = await self._store.read(scope, workspace)
-        through = record.through_seq if record is not None else 0
-        version = record.version if record is not None else 0
-        fresh = await self._store.entries(scope, workspace, after_seq=through)
-        if len(fresh) < self._consolidate_after:
-            return
-        rendered = '\n'.join(f'- {entry.text}' for entry in fresh)
-        reply = await self._agent._aux_llm_call(  # pyright: ignore[reportPrivateUsage]
-            [
-                ContextBlock(
-                    role='system',
-                    content=(
-                        '把以下零散记录整理成一段简洁的长期记忆：只保留记录里明确写出的事实'
-                        '（约定、偏好、踩过的坑），不要补充记录里没有的细节、数值或建议。'
-                    ),
-                ),
-                ContextBlock(role='user', content=rendered),
-            ]
-        )
-        folded = MemorySection(
-            heading=f'整理 seq {fresh[0].seq}–{fresh[-1].seq}',
-            text=str(reply.content or ''),
-            trust=_merged_trust(entry.trust for entry in fresh),
-        )
-        existing = list(record.sections) if record is not None else []
-        sections = redacted_memory_sections(
-            scope, workspace, [*existing, folded], fresh[-1].seq, self._redactor
-        )
+        """短期累积到阈值就用一次性调用整理成一段结构化长期记忆（spec §8.9；经 `_aux_llm_call`）。
+        每次最多整理 `_CONSOLIDATE_BATCH` 条、每条截断：积压分批消化，摘要器不被积压撑爆。整理失败
+        （超窗 / 坏回复 / store 坏）只记一条 ERROR、条目留在短期、下次再整理，不让 Remember 拖垮整次
+        run（评审 H2）。乐观并发：版本被抢先就跳。整理出那段的信任取被整理各条里最严的（§12.2）。"""
         try:
+            record = await self._store.read(scope, workspace)
+            through = record.through_seq if record is not None else 0
+            version = record.version if record is not None else 0
+            fresh = await self._store.entries(scope, workspace, after_seq=through)
+            if len(fresh) < self._consolidate_after:
+                return
+            batch = fresh[:_CONSOLIDATE_BATCH]
+            rendered = '\n'.join(f'- {entry.text[:_CONSOLIDATE_CHARS]}' for entry in batch)
+            reply = await self._agent._aux_llm_call(  # pyright: ignore[reportPrivateUsage]
+                [
+                    ContextBlock(
+                        role='system',
+                        content=(
+                            '把以下零散记录整理成一段简洁的长期记忆：只保留记录里明确写出的事实'
+                            '（约定、偏好、踩过的坑），不要补充记录里没有的细节、数值或建议。'
+                        ),
+                    ),
+                    ContextBlock(role='user', content=rendered),
+                ]
+            )
+            folded = MemorySection(
+                heading=f'整理 seq {batch[0].seq}–{batch[-1].seq}',
+                text=str(reply.content or ''),
+                trust=_merged_trust(entry.trust for entry in batch),
+            )
+            existing = list(record.sections) if record is not None else []
+            sections = redacted_memory_sections(
+                scope, workspace, [*existing, folded], batch[-1].seq, self._redactor
+            )
             await self._store.consolidate(sections, expected_version=version)
         except MemoryConflict:
             return  # 别人先整理了；下次带新版本再来
+        except ContractViolation:
+            raise  # 真违反不变量（如不可信进全局）要响亮，不能当成「整理失败」吞掉
+        except Exception as exc:
+            logger.error(
+                '期望: 记忆整理完成。 实际: %s 层整理失败（%s）。 下一步: 条目仍在短期记忆，下次 '
+                'Remember 再试；一直失败就查模型与 .syndica/memory。',
+                scope.value,
+                type(exc).__name__,
+            )
 
 
 def _merged_trust(levels: Iterable[TrustLevel]) -> TrustLevel:
@@ -148,7 +169,18 @@ def _recaller(store: MemoryStore, workspace: str | None) -> Callable[[Context], 
                 continue
             if has_block(ctx.current_traj, key):
                 continue
-            record = await store.read(scope, ws)
+            try:
+                record = await store.read(scope, ws)
+            except SyndicaError as exc:
+                # 记忆文件坏了 / 版本更新：跳过注入、记一条，不让它拖垮每次 run（收口评审 M3）。
+                logger.error(
+                    '期望: 读回 %s 层长期记忆。 实际: %s（%s）。 下一步: 查 .syndica/memory；'
+                    '本轮不注入它。',
+                    scope.value,
+                    type(exc).__name__,
+                    exc.received,
+                )
+                continue
             if record is None or not record.sections:
                 continue
             body = '\n'.join(f'- {section.heading}：{section.text}' for section in record.sections)

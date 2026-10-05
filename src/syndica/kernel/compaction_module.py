@@ -97,7 +97,7 @@ def _build_strategy(name: str, summarize: Summarize | None) -> CompactionStrateg
 
 def _default_summarize(agent: BaseAgent) -> Summarize:
     """用 Agent 自己的模型做一次性摘要。摘要器面对的是最长那份，策略已先做规则型预截断（§8.8）。
-    经 `_aux_llm_call` 走录制 / 回放的同一条路（负 turn 号的 llm_call），回放可定位、不发散。"""
+    经 `_aux_llm_call` 走录制的同一条路；完整回放是回放文档 v4 的事，此刻这类 run 优雅降级。"""
 
     async def summarize(blocks: Sequence[ContextBlock]) -> str:
         rendered = '\n'.join(f'[{b.role}] {b.content}' for b in blocks if b.content)

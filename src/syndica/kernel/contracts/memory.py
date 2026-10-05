@@ -138,6 +138,22 @@ class MemoryStoreContract(ContractSuite):
         second = await store.consolidate(_sections(through_seq=2), expected_version=first)
         assert (first, second) == (1, 2)
 
+    async def test_concurrent_consolidate_lets_exactly_one_win(self, store: MemoryStore) -> None:
+        # 三个写者都从版本 0 整理：乐观并发恰好一个赢、其余显式冲突，不静默互相覆盖（spec §6.4）。
+        # 基数 3：n=2 时「一个赢一个冲突」与「都赢」只看成功数分不开。
+        results = await asyncio.gather(
+            *(
+                store.consolidate(_sections(through_seq=i + 1), expected_version=0)
+                for i in range(3)
+            ),
+            return_exceptions=True,
+        )
+        wins = [r for r in results if isinstance(r, int)]
+        conflicts = [r for r in results if isinstance(r, SyndicaError)]
+        assert len(wins) == 1 and len(conflicts) == 2
+        record = await store.read(MemoryScope.WORKSPACE, '/w')
+        assert record is not None and record.version == 1  # 只前进了一步，不是三步
+
     async def test_read_unknown_returns_none(self, store: MemoryStore) -> None:
         assert await store.read(MemoryScope.WORKSPACE, '/nope') is None
 

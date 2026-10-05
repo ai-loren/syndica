@@ -686,9 +686,10 @@ class BaseAgent:
         self._recall = recall
 
     async def _aux_llm_call(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
-        """一次性辅助模型调用（压缩摘要 / 记忆整理）：走录制 / 回放的同一条路（`llm_call` 作用域 +
-        `llm_attempt`），用负 turn 号定位，不进轨迹、不与正常轮撞键。回放下 `_ReplayLLM` 按这个键取
-        记录的回复——否则一次性调用会让回放发散（spec §11.3 的 aux_calls）。"""
+        """一次性辅助模型调用（压缩摘要 / 记忆整理）：走录制的同一条路（`llm_call` 作用域 +
+        `llm_attempt`），用负 turn 号定位，不进轨迹、不与正常轮撞键。**完整回放是回放文档 v4 的
+        aux_calls 槽（推迟）**：此刻 ReplayCapture 把不在任何一轮里的调用当 gap，这类 run 优雅降级——
+        结构照常记录、不写回放文档并记一条 warning，而不是让回放崩（spec §11.3）。"""
         self._aux_calls += 1
         request = {'messages': messages, **kwargs}
         with self._tracing.llm_call(self.agent_id, -self._aux_calls):

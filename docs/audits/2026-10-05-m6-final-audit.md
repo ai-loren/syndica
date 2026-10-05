@@ -37,7 +37,7 @@ spec §15 的完成判据——**会话持久化与恢复、上下文压缩（§
 | 压缩三基线 + 五条不变量 | `test_compaction`：配对、protected、递增子序列、衍生 system 被拒、信任置于权威快照 | `compaction` 模块装上、run 正常收尾 |
 | 压缩前快照、压缩点 trace、缓存键重建 | 压缩点 trace + 事件；`on_compacted` 让 prefix-drift 忘基线（不报漂移）的用例 | — |
 | 压缩三触发 | `test_compaction_step`：阈值（turn 开始）、超限兜底（严格缩小、终止不死循环）、主动 `Compact` | — |
-| 两层记忆、只有根协调者写全局 | `test_memory_module`：工人写全局被拒；工作区隔离；不可信进全局在铸造处被拒 | `Remember` 写进工作区层 |
+| 两层记忆、只有根协调者写全局 | `test_memory_module`：spawn-parent 的工人与 is_root 拓扑的工人写全局都被拒；工作区隔离；不可信进全局在铸造处被拒；坏文件不崩整次 run | `Remember` 写进工作区层 |
 | 记忆注入历史、只在新会话 / 压缩后重载 | 召回幂等键用例（同一 Context 召回两次只注一块） | — |
 | 接进 CLI | `tests/cli/test_memory_wiring.py`：`modules: [memory]` 一次 `Remember` 落盘；`modules: [compaction]` 正常收尾 | 同左，真模型 |
 
@@ -74,6 +74,12 @@ spec §15 的完成判据——**会话持久化与恢复、上下文压缩（§
 | B-22 后代的单一定义 | M8 | 只持久化根对话之后 M6 不再依赖它，随多 Agent 长程任务（子树管理）做 |
 | D-64 模型请求一侧的收紧（M5 后续） | M7 | 压缩信任由内核在 `apply_compaction` 里置，不依赖它 |
 | 阶段二评审推迟项 M3 / M7 / L2–L4 / L6 | 见计划 P28 | 角色键与 `options.name`、恢复时安全 flags 取更严、`_close_sessions` 首个失败即中断等，各附理由 |
+| 阶段一评审推迟项 F13（`RedactedSessionRecord` 可变 + AST 守卫未覆盖）/ F14（收尾存盘同步做）/ F17-复活态 | 见计划 P27 | 收口评审复核仍未做，原理由不变（扩守卫风险、`to_thread` 优化、自纠低危） |
+| 恢复时安全 flags 取「当前或更严」（阶段二 P28-M7） | M7 | `record.flags` 恢复时未合并；与 M7 的溯源 / 授权一起做，收口评审重新点名了它 |
+| CLI 里「全局」记忆存在各项目的 `.syndica/memory` 内（收口评审 M1） | M12 | 配置信任确认不覆盖记忆文件：clone 进来的仓库里的记忆也会当可信加载；跨项目的真全局记忆位置随 v1 发布定 |
+| 一条不可信工作区记忆永久影响此后每个会话、且无法删（收口评审 M4） | M7 | 记忆没有「忘记 / 撤回」入口；与 M7 的验收 / 溯源一起给记忆加来源与撤回 |
+| `short.json` 永不裁剪，到 64 MiB 后 store 停摆（收口评审 M5） | M8 | 计划里写了裁剪、实现未做；长跑的垃圾回收随 M8 长程任务做 |
+| 记忆注入让回放发散（收口评审 M2）：回放用空 store 重建 Module，早先注入过长期记忆的 run 回放不出 | 后续（回放文档 v4） | 与上面 aux_calls 同属 v4；回放从不写真实记忆目录，是安全的发散 |
 
 ## 评审与变异
 
@@ -83,12 +89,27 @@ spec §15 的完成判据——**会话持久化与恢复、上下文压缩（§
 | 阶段一（会话 store / 脱敏收口） | 6 High + 若干 Medium（17 条） | `8f80b78` / `cbcc366` / `c2afbe1`：保真序列化、fail-closed、必给 redactor、关机存盘读终态、嵌套多模态逐叶脱敏等；F13 / F14 / F17-复活态推迟 |
 | 阶段二（恢复 / CLI） | 5 High / 8 Medium / 6 Low | `7dda947`：未校验 sid 拼锁路径可删工作区外文件（H1）、锁只挡恢复对恢复（H2）、pid 锁竞态改 `flock`（H3）、恢复截掉未配对批次（H4）、`--no-write` 恢复后升权（H5）等 |
 | 阶段三（压缩） | 4 High / 6 Medium | `d094e6f`：策略就地改入参洗白信任（H1）、超限兜底死循环 / 空转（H2 / H4）、阈值对消息驱动 Agent 不触发（H3）、退避每轮失效缓存（M1）、当前周期输入被插话顶走（M2）、kept 乱序 / 重复 / 衍生 system（M3） |
-| 收口 | 见下 | 后台对抗评审 |
+| 收口（整个 M6） | 3 High / 6 Medium / 8 Low | 本次提交，见下 |
 
-**变异的诚实交代。** 本里程碑没有像 M5 那样逐阶段跑「sha256 先校验、施加、清字节码、跑用例、还原、再校验」的系统变异轮。
-变异覆盖来自三轮后台对抗评审各自的「哪一处改动不会让任何用例变红」分析，每条被点名的存活变异都补了单独施加即变红的用例
-（阶段三评审 M6：env_fact 保护、当前周期输入、`Compact` 置位、就地改洗白、kept 乱序 / 重复 / 衍生 system、超限终止）。
-收口前没有再独立跑一轮系统变异，这是本里程碑相对 M5 的已知短板，记在这里而不是假装做过。
+**收口评审（3 High 已修）。** 后台对抗评审（私有快照，报告 `/tmp/syndica-review-m6/`）：
+
+- **H1（已修）** 文件工具的禁写名单 `cli/host._PRIVATE` 漏了 `.syndica/sessions` 与 `.syndica/memory`（shell 侧的
+  `danger._HOST_RECORDS` 两个都有）。于是 Agent 读了恶意网页后能用 `Write` 造一份
+  `.syndica/memory/global/long.json`（`"trust": "trusted"`），store 信磁盘上的内容，此后每个会话都把它当可信记忆注入；
+  同一个洞也能改写落盘的会话洗白 provenance——正是阶段一 F11 本该堵上的。补齐两个目录，补回归用例（两目录各一条，变异验证）。
+- **H2（已修）** 记忆整理的一次性调用没有重试与失败兜底，超窗 / 坏回复属于 tool executor 会上抛的错族：整理一失败，
+  条目已存、整次 run 随即失败；整理输入无上限、积压只增，超窗之后该工作区此后每条 `Remember` 都崩。改为整理失败只记一条
+  ERROR、条目留在短期、下次再整理，输入按 `_CONSOLIDATE_BATCH` 分批、每条截断；`ContractViolation`（真违反不变量）仍响亮上抛。
+- **H3（已修）** 「根」按 `parent_id is None` 判，而拓扑的槽 Agent 互为对等、都没有 parent，于是 `--topology` run 里每个槽都算
+  根、工人都能写全局。加 `Runtime._is_root_coordinator`：装了拓扑按 is_root 槽的占用者判，否则按 `parent_id`。补拓扑用例。
+- **Medium / Low（记入遗留，未在收口改）**：见下表。M3（召回 / 记录遇坏文件不崩）已随 H2 一并加了 try/catch。
+
+**变异的诚实交代。** 本里程碑没有像 M5 那样对每个阶段都跑系统变异轮。变异覆盖来自四轮后台对抗评审
+（含收口评审）各自的「哪一处改动不会让任何用例变红」分析，每条被点名的存活变异都补了单独施加即变红的用例。
+收口评审的三个 High 修复各做了一轮「sha256 先校验、施加反向变异、清字节码、跑用例确认变红、还原、再按 sha256
+校验」：H1（禁写名单去掉新目录）、H2（把宽 catch 收窄到 `ValueError` 让超窗上抛）、H3（把根判定退回只看
+`parent_id`）三条反向变异都让对应用例变红、三份源文件都按 sha256 还原无误。阶段一 / 二 / 三的收口前没有再独立跑系统
+变异轮，这是本里程碑相对 M5 的已知短板，记在这里而不是假装做过。
 
 ## 验证
 
@@ -99,7 +120,7 @@ uv run pyright                                               0 errors
 uv run python scripts/check_deps.py                          通过
 uv run python scripts/check_links.py                         通过
 uv run python scripts/gen_flag_reference.py --check          通过
-uv run pytest -q                                             8894 passed
+uv run pytest -q                                             8900 passed
 ```
 
 推送前对提交的树做导出验证（把这次提交单独检出到临时目录、在那里跑上面每一道门禁）。
