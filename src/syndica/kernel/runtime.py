@@ -2407,9 +2407,21 @@ class Runtime:
         不采信快照（P22）；model / tools 与快照不一致记 warning、按当前值续跑（接受一次缓存失配）。
         """
         store = self._sessions
-        if store is None or not await store.exists(sid):
+        if store is None:
             return False
-        record = await store.load(sid)
+        try:
+            if not await store.exists(sid):
+                return False
+            record = await store.load(sid)
+        except Exception:
+            # 「只答不抛」（spec §4.2）：坏 id、坏记录、后端出错都记一条 ERROR、答 False，不往上抛。
+            logger.exception(
+                '期望: 恢复会话 %s 时 SessionStore 可读。'
+                ' 实际: exists / load 抛了异常（坏 id、坏记录、或后端不可达）。'
+                ' 下一步: 看 .syndica/sessions 下这个会话是否完好；坏了就 sessions rm 再重来。',
+                sid,
+            )
+            return False
         if record is None:
             return False
         factory = self._agents.get(record.meta.agent)
@@ -2422,13 +2434,16 @@ class Runtime:
                 record.meta.agent,
             )
             return False
-        # 整份轨迹的溯源在截断之前取：末尾未配对的批次被 `_forkable_prefix` 截掉时可能连那份轨迹里
-        # 唯一的不可信标记一起截掉，于是把溯源结论挂到 resume_note 上，恢复后 provenance 不被洗白。
+        # 整份轨迹的溯源（截断前就取，防御性保留）：挂到 resume_note 上，恢复后 provenance 不被洗。
         full = Context()
         for block in record.content:
             full.append(block)
         carried = provenance_of(full)
-        seeded = _forkable_prefix(record.content)
+        # **种回原始轨迹，不截末尾未配对的批次**：Ctrl-C / SIGTERM 多半停在工具批次中间，存下的尾部
+        # 是一个已发起（可能已部分执行）的调用批次加已返回结果。`_forkable_prefix` 截掉它会抹掉「副
+        # 作用发生过」，模型会重放非幂等操作。原样种回，`_repair_interrupted_batch` 把未配对调用
+        # 补成「副作用未知」、保住已返回的结果（评审 H4）。
+        seeded = list(record.content)
         note = signed_block(
             HistoryKind.RESUME_NOTE,
             '（恢复）从落盘会话续跑：上一段进程里的子 Agent 已随进程结束失效，'
@@ -2451,7 +2466,27 @@ class Runtime:
             agent._current_turn = turn  # pyright: ignore[reportPrivateUsage]
             return agent
 
-        resumed_id = await self.spawn(resume_factory, exit_mode=ExitMode.ZOMBIE, session=True)
+        if self._closed:
+            # 上面隔着 store 的 await，并发的 shutdown 可能插进来；此刻 spawn 会抛，而这是个问句。
+            return False
+        try:
+            resumed_id = await self.spawn(resume_factory, exit_mode=ExitMode.ZOMBIE, session=True)
+        except Exception:
+            logger.exception('期望: 恢复会话 %s 时能起驱动任务。 实际: spawn 抛异常。', sid)
+            return False
+        if resumed_id != sid:
+            # 工厂没接住交给它的 id（返回缓存实例 / 先建了别的 Agent）：它被登记到别的 id 下、还带着
+            # session_id，会把整份旧轨迹存成一个新会话——拆掉它、答 False，不留影子会话（评审 M2）。
+            logger.error(
+                '期望: 恢复会话 %s 的角色 %r 用交给它的 id 构造 Agent。'
+                ' 实际: 它交回的 Agent id 是 %s，会话会被复制到那个 id 下。'
+                ' 下一步: 让该角色的工厂在这次调用里构造并交回 Agent（读 assigning_agent_id）。',
+                sid,
+                record.meta.agent,
+                resumed_id,
+            )
+            await self.despawn(resumed_id)
+            return False
         self._warn_on_prefix_drift(resumed_id, record)
         return True
 

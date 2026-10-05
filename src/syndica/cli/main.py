@@ -67,6 +67,9 @@ class RunRequest:
     git_mode: str | None = None
     trace: str | None = None
     argv: tuple[str, ...] = ()
+    # 跨进程续一份落盘会话是显式动作，只有顶层 `run --session` 置真；chat 里的 `:use` 不隐式恢复别
+    # 的会话（评审 M4）。session 为 None 时无关紧要。
+    allow_resume: bool = False
 
 
 @dataclass(frozen=True)
@@ -671,5 +674,6 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
         git_mode=namespace.git_mode,
         trace=namespace.trace,
         argv=tuple(received),
+        allow_resume=True,
     )
     return _host_call(lambda: host.run_request(request), streams)

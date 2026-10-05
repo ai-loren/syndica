@@ -73,6 +73,23 @@ def test_sessions_rm_deletes_the_session(tmp_path: Path) -> None:
     assert _session_ids(tmp_path) == []
 
 
+def test_sessions_rm_refuses_while_the_session_is_locked(tmp_path: Path) -> None:
+    from syndica.cli.handoff import session_root
+    from syndica.cli.session_lock import acquire_session_lock
+
+    _cli(tmp_path, _done(), ['run', 'go', '--agent', 'Worker'])
+    [sid] = _session_ids(tmp_path)
+
+    held = acquire_session_lock(session_root(tmp_path), sid)
+    try:
+        code, _, stderr = _cli(tmp_path, _done(), ['sessions', 'rm', sid])
+    finally:
+        held.release()
+    assert code == 1
+    assert sid in stderr
+    assert _session_ids(tmp_path) == [sid]
+
+
 def test_show_and_rm_report_an_absent_session(tmp_path: Path) -> None:
     code, _, stderr = _cli(tmp_path, _done(), ['sessions', 'show', 'nope'])
     assert code == 1

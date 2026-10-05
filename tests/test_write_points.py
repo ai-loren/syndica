@@ -83,9 +83,6 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
     # 看，或者由 `write_redacted` 在运行时查过类型。
     'kernel/redaction.py': ('os.write',),
     'kernel/tools/local.py': ('write_text',),
-    # 恢复锁：`os.write` 往 `.syndica/sessions/<sid>.lock` 写本进程的进程号（挡并发恢复，B-01）。
-    # pid 不是密钥，与 versions.py 往它的锁文件写 pid 同理。
-    'cli/session_lock.py': ('os.write',),
     # 信任存储：配置文件的绝对路径与它们的摘要，不含密钥；写在工作区之外（M4 D15）。
     'cli/trust.py': ('write_text',),
 }

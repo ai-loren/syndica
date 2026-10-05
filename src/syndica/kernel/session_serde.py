@@ -172,7 +172,7 @@ def _block_from(data: object) -> ContextBlock:
         TrustLevel.UNTRUSTED
     )
     return ContextBlock(
-        role=cast('Any', role),
+        role=role,
         content=block.get('content'),
         tool_calls=[_call_from(c) for c in cast('list[object]', calls)],
         tool_call_id=block.get('tool_call_id'),

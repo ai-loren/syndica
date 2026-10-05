@@ -204,6 +204,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'git_mode': None,
         'trace': None,
         'argv': ('write', 'the report'),
+        'allow_resume': True,
     }
     assert asdict(host.requests[1]) == {
         'prompt': 'review this',
@@ -242,6 +243,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
             'attempts=3',
             '--no-write',
         ),
+        'allow_resume': True,
     }
 
 
