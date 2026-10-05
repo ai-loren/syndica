@@ -476,6 +476,7 @@ _WITHHELD: tuple[str, ...] = (
     'CompanionResult',
     'read_only_tools',
     'run_companion',
+    'project_rubrics',
     'RUBRIC_SCHEMA',
     'NewerRubricSchema',
     'goal_from_json',
