@@ -572,7 +572,7 @@ ProvenanceGraph
 
 ### 完成情况（2026-10-05）
 
-已完成。计划与逐阶段决策见 `docs/plans/2026-10-05-m6-state.md`（P1–P34），审计见
+已完成。计划与逐阶段决策见 `docs/plans/2026-10-05-m6-state.md`（P1–P35），审计见
 `docs/audits/2026-10-05-m6-final-audit.md`。
 
 - **会话**：`SessionStore` 协议 + 内存 / 文件实现 + 契约；Runtime 在周期收尾与关机时存盘；`ensure_active` 从记录
