@@ -57,6 +57,7 @@ from syndica.cli.handoff import (
     HandoffWriteError,
     RedactingWriter,
     VerifyResult,
+    artifact_root,
     commit_title,
     exit_code_of,
     front_matter,
@@ -67,6 +68,7 @@ from syndica.cli.handoff import (
     render,
     reviewer_verdict,
     rewrite_handoff,
+    rubric_root,
     session_root,
     status_of,
     trace_directory,
@@ -180,11 +182,15 @@ from syndica.kernel import (
     local_tools,
     register_builtins,
 )
+from syndica.kernel.acceptance import RubricStatus, Verdict, VerdictStatus
+from syndica.kernel.acceptance_module import AcceptanceModule
 from syndica.kernel.compaction_module import CompactionModule
 from syndica.kernel.memory_module import MemoryModule
 from syndica.kernel.redaction import Redactor
 from syndica.kernel.scenario_schema import FROZEN_IMPLS
+from syndica.kernel.stores.file_artifact import FileArtifactStore
 from syndica.kernel.stores.file_memory import FileMemoryStore
+from syndica.kernel.stores.file_rubric import FileRubricStore
 from syndica.kernel.tools import Delegate, Fork, KillAgent, QueryAgent, SendMessage
 
 __all__ = ['RuntimeCliHost', 'reference_modules']
@@ -412,6 +418,8 @@ def _optional_builtin(name: str) -> RuntimeModule:
         return CompactionModule()
     if name == 'memory':
         return MemoryModule()
+    if name == 'acceptance':
+        return AcceptanceModule()
     return PrefixDriftModule()
 
 
@@ -653,6 +661,61 @@ async def _sessions_show(store: SessionStore, sid: str) -> str:
     if meta.title:
         lines.insert(1, f'  标题:    {safe(meta.title)}')
     return '\n'.join(lines)
+
+
+def _rubric_line(text: str) -> str:
+    return one_line(terminal_safe(text))
+
+
+async def _session_rubrics(store: FileRubricStore, sid: str) -> str:
+    """`sessions rubrics <sid>`：这份会话的 Goal 与全部 Rubric（含提议）。模型写的文字一律转义。"""
+    goal = await store.get_goal(sid)
+    rubrics = sorted(await store.rubrics(sid, include_proposed=True), key=lambda r: r.id)
+    if goal is None and not rubrics:
+        raise _config_error(
+            f'会话 {sid} 有验收记录（Goal 或 Rubric）',
+            '它一条也没有：这次 run 没装 acceptance，或会话 id 不对',
+            '用 sessions list 看会话 id；要验收就在 modules 里启用 acceptance',
+        )
+    lines = [f'会话 {sid} 的验收标准']
+    if goal is not None:
+        lines.append(f'  Goal: {_rubric_line(goal.intent)[:200]}')
+    for rubric in rubrics:
+        lines.append(
+            f'  {_rubric_line(rubric.id)}  {rubric.status.value}  {rubric.kind.value}  '
+            f'{_rubric_line(rubric.statement)}'
+        )
+    if any(rubric.status is RubricStatus.PROPOSED for rubric in rubrics):
+        lines.append(f'  让一条提议生效：syndica sessions activate {sid} <rubric-id>')
+    return '\n'.join(lines)
+
+
+async def _session_activate(store: FileRubricStore, sid: str, rubric_id: str) -> str:
+    """`sessions activate <sid> <rubric-id>`：人确认一条提议（§7.7）。store 的写在 `flock` 下做
+    read-modify-write，正在跑的会话不必先停：它下一个周期起就按这条验收。"""
+    current = {rubric.id: rubric for rubric in await store.rubrics(sid, include_proposed=True)}
+    target = current.get(rubric_id)
+    if target is None or target.status is not RubricStatus.PROPOSED:
+        found = '没有这一条' if target is None else '这一条已经生效'
+        raise _config_error(
+            f'activate 指向会话 {sid} 里一条 proposed Rubric',
+            f'{_rubric_line(rubric_id)!r}：{found}',
+            f'用 syndica sessions rubrics {sid} 看有哪些提议',
+        )
+    await store.activate(sid, rubric_id)
+    return f'已生效：{_rubric_line(rubric_id)}。此后每一次验收都按它查'
+
+
+def _verdict_line(verdict: Verdict) -> str:
+    """终态裁决的一行（stderr）。不是 pass 就说清为什么；模型写的理由经转义、截短。"""
+    parts = [f'验收：{verdict.status.value}']
+    if verdict.unverified_cause is not None:
+        parts.append(f'没能验证（{verdict.unverified_cause}）')
+    if verdict.needs_human:
+        parts.append(f'需要人确认 {", ".join(verdict.needs_human)}')
+    if verdict.status is not VerdictStatus.PASS and verdict.reason:
+        parts.append(verdict.reason[:200])
+    return _rubric_line('；'.join(parts))
 
 
 async def _sessions_rm(store: SessionStore, sessions_root: Path, sid: str) -> str:
@@ -1348,6 +1411,7 @@ class RuntimeCliHost:
         self._sigint_before: Any = None
         self._pins: PinnedImports | None = None
         self._sessions: dict[str, _ChatSession] = {}
+        self._announced: set[tuple[str, str]] = set()
         # `--handoff` 下 stdout 只有交接文件，问人的提示改走 stderr。
         self._prompts_to_stderr = False
 
@@ -1386,6 +1450,13 @@ class RuntimeCliHost:
                 return self._runner.run(_sessions_show(store, name))
             if request.action == 'rm':
                 return self._runner.run(_sessions_rm(store, root, name))
+            rubrics = FileRubricStore(rubric_root(self._workspace_root))
+            if request.action == 'rubrics':
+                return self._runner.run(_session_rubrics(rubrics, name))
+            if request.action == 'activate':
+                if request.rubric is None:
+                    raise AssertionError('sessions activate 没有 rubric')
+                return self._runner.run(_session_activate(rubrics, name, request.rubric))
             raise AssertionError(f'sessions {request.action} 不该路由到 host.sessions')
 
     def _trace_export(self, request: TraceRequest, store: FileTraceStore) -> CliOutcome:
@@ -1569,34 +1640,55 @@ class RuntimeCliHost:
             root.removeHandler(handler)
 
     def _configured_modules(
-        self, config: CliConfig, environment: Mapping[str, str]
+        self, config: CliConfig, environment: Mapping[str, str], *, goal: str | None = None
     ) -> tuple[RuntimeModule, ...]:
         """配置里启用的 Module，按写的次序。第三方的在这里才 import：调用方拿到的 config 已经过了
-        信任确认。"""
+        信任确认。`goal` 是 `--goal`，交给验收 Module。"""
         discovered = discover(self._entry_points)
         names = validated_modules(config.modules, discovered)
+        if goal is not None and 'acceptance' not in names:
+            raise _config_error(
+                '--goal 与 modules 里的 acceptance 一起用：Goal 是验收对照的权威',
+                f'modules 是 {list(names)!r}，没有 acceptance',
+                '在配置的 modules 里加上 acceptance（并按需打开 acceptance_* Flag），或去掉 --goal',
+            )
         entries = {entry.name: entry for entry in discovered}
         redactor = host_redactor(self._environ, config.redaction_rules)
         host = ModuleHost(
             workspace_root=self._workspace_root, environment=environment, redactor=redactor
         )
         return tuple(
-            self._builtin_module(name, redactor)
+            self._builtin_module(name, redactor, goal)
             if name in OPTIONAL_BUILTINS
             else load_module(entries[name], host, redactor)
             for name in names
         )
 
-    def _builtin_module(self, name: str, redactor: Redactor) -> RuntimeModule:
-        """可选内置 Module 的「跑时」那一份：记忆要带工作区与 FileMemoryStore（跨会话持久化），其余
-        与参考文档那份相同。记忆的脱敏器用宿主这份（含用户规则），落盘前逐叶脱敏。"""
+    def _builtin_module(
+        self, name: str, redactor: Redactor, goal: str | None = None
+    ) -> RuntimeModule:
+        """可选内置 Module 的「跑时」那一份：记忆要带工作区与 FileMemoryStore、验收要带
+        FileRubricStore（都跨会话持久化）与 `--goal`，其余与参考文档那份相同。脱敏器用宿主这份（含
+        用户规则），落盘前逐叶脱敏。"""
         if name == 'memory':
             return MemoryModule(
                 workspace=str(self._workspace_root),
                 store=FileMemoryStore(memory_root(self._workspace_root)),
                 redactor=redactor,
             )
+        if name == 'acceptance':
+            return AcceptanceModule(
+                store=FileRubricStore(rubric_root(self._workspace_root)),
+                redactor=redactor,
+                goal=goal,
+            )
         return _optional_builtin(name)
+
+    def _artifact_index(self, modules: Sequence[RuntimeModule]) -> FileArtifactStore | None:
+        """装了验收 Module 才建产物索引：L1 靠登记触发，交付物标记也存在这里；别的 run 没有读者。"""
+        if not any(module.name == 'acceptance' for module in modules):
+            return None
+        return FileArtifactStore(artifact_root(self._workspace_root))
 
     def _module_records(
         self, modules: Sequence[RuntimeModule], config: CliConfig
@@ -1623,6 +1715,11 @@ class RuntimeCliHost:
         """这些 Module 让 run 回放不了的原因；回放得了是 None。第三方 Module 只要有一点会跑的代码
         （服务、启停钩子、插件工厂、工具工厂）又没声明 `replay_safe`，回放就得在这台机器上再跑一遍
         别人的代码；只声明 Flag 的不挡。Module 名与发行版被脱敏改掉的，回放认不出是哪一个。"""
+        if any(module.name == 'acceptance' for module in modules):
+            return (
+                '验收 Module 的伴生调用（投影、L2 / L3、反馈提议）不在主 Agent 的录制轮次里：'
+                '回放会把它们当成主 Agent 的轮次，所以装了 acceptance 的 run 不写回放文档'
+            )
         third = set(third_party(config.modules))
         blocking = [
             module.name
@@ -1849,6 +1946,7 @@ class RuntimeCliHost:
         argv: Sequence[str] = (),
         trusted_output: Sequence[str] = (),
         resume: str | None = None,
+        goal: str | None = None,
     ) -> str:
         with self._logging_to_stderr():
             return self._runner.run(
@@ -1859,6 +1957,7 @@ class RuntimeCliHost:
                     argv=argv,
                     trusted_output=trusted_output,
                     resume=resume,
+                    goal=goal,
                 )
             )
 
@@ -2277,7 +2376,31 @@ class RuntimeCliHost:
         notice = _CUT_SHORT.get(context.stop_reason)
         if notice is not None:
             self._warn(notice)
+        if context.verdict is not None:
+            self._warn(_verdict_line(context.verdict))
+        if 'acceptance' in runtime.modules:
+            await self._announce_proposals(agent_id)
         return terminal_safe(text)
+
+    async def _announce_proposals(self, agent_id: str) -> None:
+        """把这次新提议的验收标准告诉人：提议不会自己生效（§7.7），人不知道就永远停在提议。"""
+        root = rubric_root(self._workspace_root)
+        if not root.is_dir():
+            return
+        try:
+            rubrics = await FileRubricStore(root).rubrics(agent_id, include_proposed=True)
+        except SyndicaError as exc:
+            self._warn(f'读不出这次的验收提议：{exc.received}。{exc.next_action}')
+            return
+        for rubric in rubrics:
+            key = (agent_id, rubric.id)
+            if rubric.status is not RubricStatus.PROPOSED or key in self._announced:
+                continue
+            self._announced.add(key)
+            self._warn(
+                f'提议的验收标准 {_rubric_line(rubric.id)}：{_rubric_line(rubric.statement)}'
+                f'（人确认后生效：syndica sessions activate {agent_id} {_rubric_line(rubric.id)}）'
+            )
 
     async def _event_pump(self, runtime: Runtime, subscription: Subscription) -> None:
         async for event in subscription:
@@ -2429,6 +2552,7 @@ class RuntimeCliHost:
         argv: Sequence[str],
         trusted_output: Sequence[str],
         resume: str | None = None,
+        goal: str | None = None,
     ) -> str:
         config = self._trusted_config(path)
         if resume is not None:
@@ -2473,7 +2597,7 @@ class RuntimeCliHost:
             modules = _agent_modules(
                 self._workspace_root,
                 self._environ,
-                configured=self._configured_modules(config, environment.values),
+                configured=self._configured_modules(config, environment.values, goal=goal),
             )
             # 会话是落盘的 run 产物，和 trace 一样受「关了录制就不往磁盘写」约束。但 resume 是显式续
             # 一份已存的会话，无论录制开没开都要有 SessionStore 才读得到、续得上。
@@ -2493,6 +2617,7 @@ class RuntimeCliHost:
                     FileSessionStore(session_root(self._workspace_root)) if want_sessions else None
                 ),
                 redactor=redactor if want_sessions else None,
+                artifacts=self._artifact_index(modules),
             )
             subscription = runtime.events.subscribe()
             pump = asyncio.create_task(
@@ -2802,7 +2927,9 @@ class RuntimeCliHost:
                     self._workspace_root,
                     self._environ,
                     tools if request.no_write else None,
-                    configured=self._configured_modules(config, environment.values),
+                    configured=self._configured_modules(
+                        config, environment.values, goal=request.goal
+                    ),
                 )
                 resolved = resolved_flags(
                     config.flags, flags, (item for module in modules for item in module.flags)
@@ -2860,6 +2987,7 @@ class RuntimeCliHost:
                         if tracer is not None
                         else None
                     ),
+                    artifacts=self._artifact_index(modules),
                 )
                 if tracer is not None and tracer.level is not TraceLevel.STRUCTURE:
                     records = self._module_records(modules, config)

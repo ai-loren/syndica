@@ -39,7 +39,7 @@ ENTRY_POINT_GROUP = 'syndica.modules'
 # 宿主每次都装、排在最前的。
 MANDATORY: tuple[str, ...] = ('safety', 'human-interaction')
 # 配置里点名才装的内置 Module。
-OPTIONAL_BUILTINS: tuple[str, ...] = ('retry', 'prefix-drift', 'compaction', 'memory')
+OPTIONAL_BUILTINS: tuple[str, ...] = ('retry', 'prefix-drift', 'compaction', 'memory', 'acceptance')
 # 命令行决定的开发期 Module：`--no-write` 装 read-only，dev 每次都装、排在最后。
 DEVELOPMENT: tuple[str, ...] = ('read-only', 'dev')
 _BUILTINS = frozenset((*MANDATORY, *OPTIONAL_BUILTINS, *DEVELOPMENT))

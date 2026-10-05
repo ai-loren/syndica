@@ -56,6 +56,15 @@ def test_the_reference_document_matches_an_independent_golden():
         '`compaction_context_tokens`',
         '`memory_recall`',
         '`memory_consolidate_after`',
+        '`acceptance_rubrics`',
+        '`acceptance_output`',
+        '`acceptance_output_retries`',
+        '`acceptance_outcome`',
+        '`acceptance_outcome_block_retries`',
+        '`acceptance_outcome_partial_retries`',
+        '`acceptance_feedback`',
+        '`acceptance_verifier_timeout`',
+        '`acceptance_verifier_max_turns`',
     ]
     by_key = {row[0]: row for row in rows}
     assert by_key['`untrusted_high_risk`'] == [
@@ -76,6 +85,9 @@ def test_the_reference_document_matches_an_independent_golden():
     ]
     assert by_key['`compaction_strategy`'][1:4] == ['`compaction`', 'str', '`"off"`']
     assert by_key['`memory_consolidate_after`'][1:4] == ['`memory`', 'int', '`50`']
+    assert by_key['`acceptance_outcome`'][1:5] == ['`acceptance`', 'bool', '`false`', '—']
+    assert by_key['`acceptance_output_retries`'][2:5] == ['int', '`1`', '≥ 0']
+    assert by_key['`acceptance_verifier_timeout`'][2:5] == ['int', '`300`', '≥ 1']
 
 
 def _module(name: str, *keys: str) -> RuntimeModule:

@@ -72,10 +72,14 @@ def _setup(
     return runtime, router
 
 
-def _factory(llm: ScriptedLLM, router: WorkspaceRouter) -> AgentFactory:
+def _factory(
+    llm: ScriptedLLM, router: WorkspaceRouter, *, own_deliver: bool = False
+) -> AgentFactory:
     def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
         portal = router.portal()
-        tools = {'Write': Write(portal), 'Deliver': Deliver(portal)}
+        tools: dict[str, Any] = {'Write': Write(portal)}
+        if own_deliver:
+            tools['Deliver'] = Deliver(portal)
         return BaseAgent(
             AgentOptions(name='Worker', llm=llm, tools=tools, system_prompt='SP', max_turns=12),
             hooks=hooks,
@@ -321,5 +325,20 @@ async def test_a_failed_projection_is_not_retried_every_cycle(tmp_path: Path) ->
         ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
         assert len(llm.calls) == 3
         assert ctx.current_traj[-1].content == 'v2'
+    finally:
+        await runtime.shutdown()
+
+
+async def test_the_module_brings_deliver_unless_the_role_already_has_it(tmp_path: Path) -> None:
+    # 没装验收的 run 不为 Deliver 多付一个工具定义；角色自己带了 Deliver 也不撞名。
+    runtime, router = _setup(tmp_path, AcceptanceModule())
+    try:
+        given = await runtime.spawn(_factory(ScriptedLLM([]), router), exit_mode=ExitMode.ZOMBIE)
+        own = await runtime.spawn(
+            _factory(ScriptedLLM([]), router, own_deliver=True), exit_mode=ExitMode.ZOMBIE
+        )
+        for agent_id in (given, own):
+            agent = runtime._table.get(agent_id)  # pyright: ignore[reportPrivateUsage]
+            assert agent is not None and 'Deliver' in agent.options.tools
     finally:
         await runtime.shutdown()

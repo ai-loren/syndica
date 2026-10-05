@@ -8,7 +8,7 @@ import signal
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from syndica.cli.main import (
@@ -454,9 +454,12 @@ class _LazyHost:
         argv: Sequence[str] = (),
         trusted_output: Sequence[str] = (),
         resume: str | None = None,
+        goal: str | None = None,
     ) -> str:
-        # 只在给了 --trust-module-output 时才传：没有这个参数的宿主实现照样能开 chat。
-        extra = {'trusted_output': tuple(trusted_output)} if trusted_output else {}
+        # 只在给了 --trust-module-output / --goal 时才传：没有这两个参数的宿主实现照样能开 chat。
+        extra: dict[str, Any] = {'trusted_output': tuple(trusted_output)} if trusted_output else {}
+        if goal is not None:
+            extra['goal'] = goal
         return self._get().open_chat(
             config, max_turns, trace=trace, argv=argv, resume=resume, **extra
         )

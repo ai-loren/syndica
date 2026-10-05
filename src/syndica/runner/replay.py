@@ -157,7 +157,19 @@ def _builtin_modules(llm: _ReplayLLM, fallbacks: str) -> dict[str, Callable[[], 
         'prefix-drift': PrefixDriftModule,
         'compaction': CompactionModule,
         'memory': MemoryModule,
+        'acceptance': _acceptance_not_rebuilt,
     }
+
+
+def _acceptance_not_rebuilt() -> RuntimeModule:
+    """验收 Module 的伴生调用不在录制轮次里：重建它，回放就把伴生的请求交给主 Agent 的录制答复。"""
+    raise ModulesNotRebuilt(
+        expected='回放重建这份文档记着的内置 Module acceptance',
+        received='它的伴生调用（投影、L2 / L3、反馈提议）不在录制的轮次里，回放答不了它们',
+        next_action=(
+            '装了 acceptance 的 run 不写回放文档，这份文档是手写或改过的；用原始 run 的 trace 排查'
+        ),
+    )
 
 
 class ModulesNotRebuilt(SyndicaError):

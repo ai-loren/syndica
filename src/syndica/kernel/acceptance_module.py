@@ -9,6 +9,8 @@
   是第一条用户消息原文时不另注入——那一块已经在轨迹里，压缩也保护它。
 - **投影**（`acceptance_rubrics`）：Goal 新出现或改变时、开工之前跑一次 RubricsBuilder；投影失败按空
   集合处理，本进程内对同一个 Goal 只再试一次。
+- **交付**：装了本 Module 的 Agent 才有 `Deliver`（§7.4 显式提升）——不验收的 run 不为它多付一个工具
+  定义。
 - **L1**：每次登记产物都按处理器校验；交付物的违规在完成时零 token 打回。处理器抛出记一条 WARNING、
   记成「L1 没能跑」，不当成零违规。
 - **L2 / L3**：`acceptance_output` / `acceptance_outcome` 各自开关、各自上限
@@ -43,6 +45,8 @@ from syndica.kernel.redaction import Redactor, RuleRedactor
 from syndica.kernel.rubric_redaction import redacted_goal
 from syndica.kernel.rubrics_builder import project_rubrics
 from syndica.kernel.stores.memory_rubric import InMemoryRubricStore
+from syndica.kernel.tool import Tool
+from syndica.kernel.tools.local import Deliver
 from syndica.kernel.verifiers import acceptance_hook
 from syndica.kernel.workspace import Portal
 
@@ -361,6 +365,14 @@ class AcceptanceModule(RuntimeModule):
                 agent._attach_rubrics(wiring.inject)  # pyright: ignore[reportPrivateUsage]
             return _AcceptancePlugin(hooks)
 
+        def tool_factory(
+            runtime: Runtime, agent: BaseAgent, flags: Mapping[str, FlagValue]
+        ) -> Mapping[str, Tool]:
+            router = runtime.workspace
+            if router is None or 'Deliver' in agent.options.tools:
+                return {}
+            return {'Deliver': Deliver(router.portal())}
+
         super().__init__(
             'acceptance',
             version=__version__,
@@ -420,4 +432,5 @@ class AcceptanceModule(RuntimeModule):
                 ),
             ),
             agent_plugins=(plugin_factory,),
+            tool_factories=(tool_factory,),
         )

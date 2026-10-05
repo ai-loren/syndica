@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, replace
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -198,6 +199,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'max_tokens': None,
         'max_wall_clock': None,
         'flags': (),
+        'goal': None,
         'trust_module_output': (),
         'no_write': False,
         'handoff': False,
@@ -217,6 +219,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'max_tokens': 4096,
         'max_wall_clock': 30.0,
         'flags': ('retry_enabled=true', 'attempts=3'),
+        'goal': None,
         'trust_module_output': (),
         'no_write': True,
         'handoff': False,
@@ -1135,3 +1138,44 @@ def test_an_error_a_module_raised_names_the_module_and_hides_secret_shaped_text(
     assert "（Runtime Module 'svcfail' 的 service 'svcfail_db' 抛出了它）" in text
     assert 'sk-abcdefghijklmnopqrstuvwx1234' not in text
     assert '从配置的 modules 里删掉它' in text
+
+
+def test_chat_forwards_the_goal_only_when_one_is_given() -> None:
+    goals: list[str | None] = []
+
+    class GoalHost(_Host):
+        def open_chat(  # type: ignore[override]
+            self, config: str, max_turns: int | None = None, *, goal: str | None = None, **kw: Any
+        ) -> str:
+            goals.append(goal)
+            return super().open_chat(config, max_turns, **kw)
+
+    io = CliIO(stdin=StringIO(':quit\n'), stdout=StringIO(), stderr=StringIO())
+    assert main(['chat', '--goal', 'ship the report'], host=GoalHost(), io=io) == 0
+    io = CliIO(stdin=StringIO(':quit\n'), stdout=StringIO(), stderr=StringIO())
+    assert main(['chat'], host=_Host(), io=io) == 0  # 不认 goal 的宿主照样能开 chat
+    assert goals == ['ship the report']
+
+
+def test_module_host_forwards_the_goal_to_the_runtime_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    import syndica.cli.host as host_module
+    from syndica.__main__ import _LazyHost  # pyright: ignore[reportPrivateUsage]
+
+    goals: list[str | None] = []
+
+    class RecordingHost:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def open_chat(self, config: str, max_turns: int | None = None, **kw: Any) -> str:
+            goals.append(kw.get('goal'))
+            return 'root-agent-id'
+
+        def close(self, *, interrupted: bool = False) -> None:
+            del interrupted
+
+    monkeypatch.setattr(host_module, 'RuntimeCliHost', RecordingHost)
+    lazy = _LazyHost(CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()))
+    lazy.open_chat('.syndica.yaml', goal='ship the report')
+    lazy.close()
+    assert goals == ['ship the report']

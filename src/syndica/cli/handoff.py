@@ -30,6 +30,7 @@ __all__ = [
     'HandoffWriteError',
     'RedactingWriter',
     'VerifyResult',
+    'artifact_root',
     'commit_title',
     'exit_code_of',
     'front_matter',
@@ -42,6 +43,7 @@ __all__ = [
     'render',
     'reviewer_verdict',
     'rewrite_handoff',
+    'rubric_root',
     'status_of',
     'terminal_safe',
     'trace_directory',
@@ -57,6 +59,8 @@ _HANDOFFS = 'handoffs'
 _TRACES = 'traces'
 _SESSIONS = 'sessions'
 _MEMORY = 'memory'
+_ARTIFACTS = 'artifacts'
+_RUBRICS = 'rubrics'
 # 公开契约里的标记行语法，逐行整行匹配（`\s` 按契约，含 `\r`、NBSP 与全角空格：只认空格与制表符
 # 时，CRLF 结尾的 `verdict: block` 不算数，后面一行 `verdict: pass` 就成了唯一的标记）。
 # 值按 ASCII 不分大小写：Unicode 的大小写折叠会让 `paſſ`（U+017F）也匹配上，front matter 就不再是
@@ -358,6 +362,18 @@ def memory_root(root: Path) -> Path:
     `FileMemoryStore` 自己以 `O_NOFOLLOW` 打开。"""
     _checked_directory(root, root / _OWN)
     return root / _OWN / _MEMORY
+
+
+def artifact_root(root: Path) -> Path:
+    """`.syndica/artifacts` 该在的位置，缺了不建（与 `session_root` 同理）。"""
+    _checked_directory(root, root / _OWN)
+    return root / _OWN / _ARTIFACTS
+
+
+def rubric_root(root: Path) -> Path:
+    """`.syndica/rubrics` 该在的位置，缺了不建（与 `session_root` 同理）。"""
+    _checked_directory(root, root / _OWN)
+    return root / _OWN / _RUBRICS
 
 
 def write_handoff(root: Path, name: str, text: str, redactor: Redactor) -> Path:

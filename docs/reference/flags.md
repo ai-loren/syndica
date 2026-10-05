@@ -21,3 +21,12 @@
 | `compaction_context_tokens` | `compaction` | int | `128000` | ≥ 1 | — | 模型不报上下文窗口时，按多少 token 估算窗口大小 |
 | `memory_recall` | `memory` | bool | `true` | — | — | cycle 起点是否把长期记忆注入历史 |
 | `memory_consolidate_after` | `memory` | int | `50` | ≥ 1 | — | 短期记忆累积多少条后整理成一段长期记忆 |
+| `acceptance_rubrics` | `acceptance` | bool | `false` | — | — | 开工前把 Goal 投影成带锚点的 Rubric（一次伴生调用） |
+| `acceptance_output` | `acceptance` | bool | `false` | — | — | L2 输出验收：完成时判断用户的要求是否都已做完（伴生，判定保守） |
+| `acceptance_output_retries` | `acceptance` | int | `1` | ≥ 0 | — | L2 判没做完或交付物没过 L1 时最多打回几次；0 = 只记裁决 |
+| `acceptance_outcome` | `acceptance` | bool | `false` | — | — | L3 结果验收：完成时按 Rubric 逐条查回复与工作区证据（伴生） |
+| `acceptance_outcome_block_retries` | `acceptance` | int | `2` | ≥ 0 | — | L3 判 block（有证据表明做错了）时最多打回几次；0 = 只记裁决 |
+| `acceptance_outcome_partial_retries` | `acceptance` | int | `1` | ≥ 0 | — | L3 判 partial（没做完或没能确认）时最多打回几次；0 = 只记裁决 |
+| `acceptance_feedback` | `acceptance` | bool | `false` | — | — | 把 Goal 之后人发来的消息提议成 proposed Rubric，人确认后才生效 |
+| `acceptance_verifier_timeout` | `acceptance` | int | `300` | ≥ 1 | — | 一次验收（L2 + L3 合计）或投影的时限，秒；超时放行并标 unverified |
+| `acceptance_verifier_max_turns` | `acceptance` | int | `8` | ≥ 1 | — | 每个伴生 Agent（投影、L2、L3、反馈提议）各自的轮次上限 |

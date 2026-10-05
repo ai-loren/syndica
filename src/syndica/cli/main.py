@@ -61,6 +61,7 @@ class RunRequest:
     max_tokens: int | None = None
     max_wall_clock: float | None = None
     flags: tuple[str, ...] = ()
+    goal: str | None = None
     trust_module_output: tuple[str, ...] = ()
     no_write: bool = False
     handoff: bool = False
@@ -108,11 +109,13 @@ class TraceRequest:
 
 @dataclass(frozen=True)
 class SessionsRequest:
-    """`syndica sessions ...`：`list`、`show <sid>`、`resume <sid>`、`rm <sid>`。`name` 是会话 id
-    （根 Agent id），`list` 不用它。"""
+    """`syndica sessions ...`：`list`、`show <sid>`、`resume <sid>`、`rm <sid>`、`rubrics <sid>`、
+    `activate <sid> <rubric-id>`。`name` 是会话 id（根 Agent id），`list` 不用它；`rubric` 只给
+    `activate`。"""
 
-    action: Literal['list', 'show', 'resume', 'rm']
+    action: Literal['list', 'show', 'resume', 'rm', 'rubrics', 'activate']
     name: str | None = None
+    rubric: str | None = None
     config: str = '.syndica.yaml'
     argv: tuple[str, ...] = ()
 
@@ -248,6 +251,13 @@ def _parser() -> _ArgumentParser:
     chat.add_argument('--max-turns', type=_positive_int)
     for command in (run, chat):
         command.add_argument(
+            '--goal',
+            help=(
+                '这次要交付什么（验收的权威，§7.6）；不给就取第一条消息。要在 modules 里启用 '
+                'acceptance'
+            ),
+        )
+        command.add_argument(
             '--trust-module-output',
             action='append',
             default=[],
@@ -274,9 +284,14 @@ def _parser() -> _ArgumentParser:
     sessions = commands.add_parser('sessions')
     session_actions = sessions.add_subparsers(dest='action', required=True)
     session_actions.add_parser('list')
-    for action in ('show', 'resume', 'rm'):
+    for action in ('show', 'resume', 'rm', 'rubrics'):
         session_action = session_actions.add_parser(action)
         session_action.add_argument('name')
+    activate = session_actions.add_parser(
+        'activate', help='让一条提议的验收标准（proposed Rubric）生效：人确认之后它才进验收'
+    )
+    activate.add_argument('name')
+    activate.add_argument('rubric')
     config = commands.add_parser('config')
     config_actions = config.add_subparsers(dest='action', required=True)
     trust = config_actions.add_parser('trust')
@@ -450,9 +465,12 @@ def _chat(
     argv: Sequence[str],
     trusted_output: Sequence[str] = (),
     resume: str | None = None,
+    goal: str | None = None,
 ) -> int:
-    # 只在给了 --trust-module-output 时才传这个参数：没有它的宿主实现照样能开 chat。
+    # 只在给了 --trust-module-output / --goal 时才传这两个参数：没有它们的宿主实现照样能开 chat。
     extra: dict[str, Any] = {'trusted_output': tuple(trusted_output)} if trusted_output else {}
+    if goal is not None:
+        extra['goal'] = goal
     try:
         target = host.open_chat(config, max_turns, trace=trace, argv=argv, resume=resume, **extra)
     except Exception as exc:
@@ -607,6 +625,7 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
         sessions_request = SessionsRequest(
             action=namespace.action,
             name=getattr(namespace, 'name', None),
+            rubric=getattr(namespace, 'rubric', None),
             config=namespace.config,
             argv=tuple(received),
         )
@@ -656,6 +675,7 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
             trace=namespace.trace,
             argv=received,
             trusted_output=namespace.trust_module_output,
+            goal=namespace.goal,
         )
     request = RunRequest(
         prompt=' '.join(namespace.prompt),
@@ -668,6 +688,7 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
         max_tokens=namespace.max_tokens,
         max_wall_clock=namespace.max_wall_clock,
         flags=flags,
+        goal=namespace.goal,
         trust_module_output=tuple(namespace.trust_module_output),
         no_write=namespace.no_write,
         handoff=namespace.handoff,
