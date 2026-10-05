@@ -445,6 +445,9 @@ class BaseAgent:
         # 记忆召回（可选）：由记忆 Module 经 `_attach_recall` 装上。cycle 起点内核调它注入长期记忆
         # （进历史不进 SP、幂等缓存，spec §8.9）；没装就不注入。
         self._recall: Callable[[Context], Awaitable[None]] | None = None
+        # Goal / Rubric 注入（可选）：验收 Module 经 `_attach_rubrics` 装上。cycle 起点、召回与查询
+        # 之前内核调它把 Goal 与生效 Rubric 注入历史（§7.6）；第一轮模型调用因此看得到投影结果。
+        self._rubrics: Callable[[Context], Awaitable[None]] | None = None
         # 当前周期的那条输入（query 或第一条注入）：本周期的 Goal 代理，压缩时必须活着（评审 M2）。
         self._cycle_anchor: ContextBlock | None = None
         # 一次性辅助调用（压缩摘要、记忆整理）计数：每次用一个**负** turn 号开 llm_call 作用域，既不
@@ -689,6 +692,11 @@ class BaseAgent:
         """装上记忆召回（记忆 Module 的 agent 插件调）。cycle 起点内核调它注入长期记忆（§8.9）。"""
         self._recall = recall
 
+    def _attach_rubrics(self, inject: Callable[[Context], Awaitable[None]]) -> None:
+        """装上 Goal / Rubric 注入（验收 Module 调）。cycle 起点、召回与查询之前内核调它，
+        把 Goal 与生效 Rubric 注入历史（§7.6）；第一轮模型调用因此看得到投影结果。"""
+        self._rubrics = inject
+
     def _attach_artifact_store(self, store: ArtifactStore) -> None:
         """装上产物索引（Runtime 调）。每批工具跑完后内核往它登记工具回报的产物（§7.4）。"""
         self._artifact_store = store
@@ -840,6 +848,9 @@ class BaseAgent:
             )
             # 记忆召回在查询注入之前：长期记忆是本次任务的背景（spec §8.9）。幂等缓存由召回自己用
             # `has_block` 做——只在新会话 / 压缩掉之后重载，不每轮重拉（否则前缀逐轮变、缓存失效）。
+            # Goal / Rubric 更靠前：它们是任务的权威与验收框架（§7.6），在记忆与查询之前注入。
+            if self._rubrics is not None:
+                await self._rubrics(ctx)
             if self._recall is not None:
                 await self._recall(ctx)
             if query is not None:
