@@ -121,3 +121,14 @@ async def test_reprojection_does_not_wipe_a_confirmed_feedback_rubric() -> None:
     )
     await store.put_rubrics('s1', [redacted_rubric(projected, _REDACTOR)])
     assert {r.id for r in await store.rubrics('s1')} == {'R1', 'F1'}
+
+
+async def test_an_unknown_kind_from_the_proposer_is_judgment() -> None:
+    # 拿不准就要人判：提议器回了认不得的 kind，按 judgment 记（变异 M13）。
+    from syndica.kernel.acceptance import RubricKind
+    from syndica.kernel.feedback import _phrase  # pyright: ignore[reportPrivateUsage]
+    from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
+
+    reply = ScriptedTurn(content='{"statement": "use confirmed revenue", "kind": "maybe"}')
+    phrased = await _phrase('column 3 is wrong', ScriptedLLM([reply]), TrustLevel.TRUSTED, 4)
+    assert phrased is not None and phrased[1] is RubricKind.JUDGMENT

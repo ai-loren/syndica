@@ -2298,6 +2298,7 @@ def test_the_free_text_attributes_are_exactly_these():
         'tool.call_id',
         'tool.name',
         'verdict.needs_human',
+        'verdict.outcomes',
         'verdict.unverified_cause',
         'wait.target',
     ]

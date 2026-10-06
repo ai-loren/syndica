@@ -112,8 +112,9 @@ class ArtifactHandlers:
         self.register(GenericHandler())
 
     def register(self, handler: ArtifactHandler) -> None:
-        for kind, mime in handler.handles:
-            key = (kind, mime)
+        """全部 (kind, mime) 先校验、再一起装：被拒的处理器一个键也不留下。"""
+        keys = [(kind, mime) for kind, mime in handler.handles]
+        for key in keys:
             existing = self._by_key.get(key)
             if existing is not None:
                 raise ConfigError(
@@ -121,6 +122,7 @@ class ArtifactHandlers:
                     received=f'{_name(existing)} 与 {_name(handler)} 都声明了它',
                     next_action='卸掉其中一个，或用更具体的 (kind, mime) 区分；别让它看导入顺序',
                 )
+        for key in keys:
             self._by_key[key] = handler
 
     def for_(self, ref: ArtifactRef) -> ArtifactHandler:

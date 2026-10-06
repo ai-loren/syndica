@@ -756,12 +756,19 @@ class ArtifactRef:
 ```
 
 ```python
+class ArtifactReader(Protocol):
+    async def read(self, ref: ArtifactRef) -> str: ...   # 按 ref.version 读；版本不在了就抛
+
 class ArtifactHandler(Protocol):
-    kinds: tuple[str, ...]
-    def preview(self, ref: ArtifactRef) -> Preview: ...
-    def semantic_diff(self, a: ArtifactRef, b: ArtifactRef) -> Diff: ...
-    def validate(self, ref: ArtifactRef) -> list[Violation]: ...
+    handles: tuple[tuple[str, str], ...]                 # 声明的 (kind, mime)，mime 可为 '*'
+    async def preview(self, ref: ArtifactRef, reader: ArtifactReader) -> Preview: ...
+    async def semantic_diff(self, a: ArtifactRef, b: ArtifactRef, reader: ArtifactReader) -> Diff: ...
+    async def validate(self, ref: ArtifactRef, reader: ArtifactReader) -> list[Violation]: ...
 ```
+
+处理器方法都是 `async` 且收一个 `ArtifactReader`：只有 ref 拿不到字节，而每个隔离副本各有一份 Portal（M7 计划评审 H5）。
+L1 按路径扩展名派生的 `(kind, mime)` 选处理器，`Deliver` 声明的 kind 只是标签——让 Agent 自选的 kind 决定交给
+哪个处理器，就能把交付物绕过严格的那个（M7 收口评审 H3）。
 
 `version` 是**不透明字符串**，含义由生效的隔离策略决定：git 策略用提交号，快照策略用单调递增序号。内核只做相等比较与排序，不解析其结构 —— 否则关闭 git 时（§6.3 允许）产物版本就无处安放。
 
@@ -1446,10 +1453,16 @@ CI 检查项：
 | 11 | 训练出口 | 中立轨迹 + SFT / 偏好 / RL 导出器 + 至少一个训练框架对接 |
 | 12 | 发布准备 | 英文文档、文档站、CI 矩阵、许可与贡献流程 |
 
-**状态（2026-10-05）：** 里程碑 1–6 已完成，审计见 [M1 收口审计](../audits/2026-09-23-m1-final-audit.md)、
+**状态（2026-10-06）：** 里程碑 1–7 已完成，审计见 [M1 收口审计](../audits/2026-09-23-m1-final-audit.md)、
 [M2 收口审计](../audits/2026-10-01-m2-final-audit.md)、[M3 收口审计](../audits/2026-10-02-m3-final-audit.md)、
 [M4 收口审计](../audits/2026-10-03-m4-final-audit.md)、[M5 收口审计](../audits/2026-10-04-m5-final-audit.md) 与
-[M6 收口审计](../audits/2026-10-05-m6-final-audit.md)。
+[M6 收口审计](../audits/2026-10-05-m6-final-audit.md) 与 [M7 收口审计](../audits/2026-10-05-m7-final-audit.md)。
+M7 的完成判据（产物模型、处理器、验收标准与锚点、三态裁决、反馈升级为标准）由一套端到端用例与两次真实运行证明：
+免费模型按 `--goal` 投影出一条带锚点的 Rubric，写出报告并 `Deliver`，L2 / L3 判 `pass`；同一任务把验收时限压到 1
+秒，投影与验收都超时，run 照常完成而裁决是 `unverified`（`verifier_timeout`）。裁决是四值的（§7.5 的三态加上 §10
+的 `unverified`），由内核从逐条结论推导；只能由人判断的 Rubric 让裁决停在 `unverified`（`needs_human`）。验收只给根
+协调者：子 Agent 交回的东西由派它的一方验收。装了验收的 run 不写回放文档（伴生调用不在录制轮次里），伴生调用也还
+不进 trace（随 M8 的预算树）。
 M6 的完成判据（会话持久化与恢复、§8.8 上下文压缩、§8.9 分层记忆）由一套端到端用例与一次真实运行证明：免费模型在
 启用了压缩与记忆的工作区里调用 `Remember`，记忆阈值触发一次 LLM 整理写出长期记忆、跨会话落盘，会话与 trace 照常
 记下。M6 只持久化根对话（多 Agent 子树的持久化与恢复不在 M6）；压缩的四种策略交付了规则型、剪枝型、摘要型三种，

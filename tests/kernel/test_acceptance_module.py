@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from syndica.kernel.acceptance import RubricOrigin, RubricStatus, VerdictStatus
 from syndica.kernel.acceptance_module import AcceptanceModule
 from syndica.kernel.agent import AgentOptions, BaseAgent
@@ -24,6 +26,7 @@ from syndica.kernel.local_workspace import LocalWorkspace
 from syndica.kernel.runtime import AgentFactory, ExitMode, Runtime
 from syndica.kernel.stores.memory_artifact import InMemoryArtifactStore
 from syndica.kernel.stores.memory_rubric import InMemoryRubricStore
+from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tools.local import Deliver, Write
 from syndica.kernel.workspace_router import WorkspaceRouter
 
@@ -53,7 +56,7 @@ def _projection() -> ScriptedTurn:
 
 
 def _satisfied() -> ScriptedTurn:
-    evidence = [{'source': 'user_message', 'locator': 'final', 'quote': 'section four'}]
+    evidence = [{'source': 'user_message', 'locator': 'reply', 'quote': 'the report now has'}]
     outcome = {'rubric_id': 'R1', 'result': 'satisfied', 'evidence': evidence}
     return _json({'outcomes': [outcome], 'reason': 'checked'})
 
@@ -342,3 +345,333 @@ async def test_the_module_brings_deliver_unless_the_role_already_has_it(tmp_path
             assert agent is not None and 'Deliver' in agent.options.tools
     finally:
         await runtime.shutdown()
+
+
+class _QuietWrite(Tool):
+    """写文件但不回报产物：Bash 改文件时内核看到的就是这样。"""
+
+    __tool_name__ = 'QuietWrite'
+
+    def __init__(self, router: WorkspaceRouter) -> None:
+        self._router = router
+
+    async def execute(self, path: str, content: str) -> ToolResult:
+        """写入 content。"""
+        await self._router.portal().write_text(path, content)
+        return ToolResult(output='ok')
+
+
+def _quiet_factory(llm: ScriptedLLM, router: WorkspaceRouter) -> AgentFactory:
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        portal = router.portal()
+        tools: dict[str, Any] = {'Write': Write(portal), 'QuietWrite': _QuietWrite(router)}
+        return BaseAgent(
+            AgentOptions(name='Worker', llm=llm, tools=tools, system_prompt='SP', max_turns=12),
+            hooks=hooks,
+            events=events,
+        )
+
+    return build
+
+
+async def test_a_deliverable_broken_after_deliver_is_still_caught(tmp_path: Path) -> None:
+    # 交付之后被命令改坏（没有登记），完成时按它此刻的版本复核（收口评审 H2）。
+    runtime, router = _setup(tmp_path, AcceptanceModule())
+    llm = ScriptedLLM(
+        [
+            _call('Write', 'c1', path='report.md', content='# Report\n'),
+            _call('Deliver', 'c2', path='report.md'),
+            _call('QuietWrite', 'c3', path='report.md', content=''),
+            ScriptedTurn(content='done'),
+            ScriptedTurn(content='done again'),
+        ]
+    )
+    try:
+        agent_id = await runtime.spawn(
+            _quiet_factory(llm, router), query='go', exit_mode=ExitMode.ZOMBIE
+        )
+        ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        assert _kinds(ctx).count(HistoryKind.VERDICT) == 1
+    finally:
+        await runtime.shutdown()
+
+
+async def test_an_earlier_cycles_problem_does_not_send_back_an_unrelated_reply(
+    tmp_path: Path,
+) -> None:
+    runtime, router = _setup(tmp_path, AcceptanceModule(), {'acceptance_output_retries': 0})
+    llm = ScriptedLLM(
+        [
+            _call('Write', 'c1', path='report.md', content=''),
+            _call('Deliver', 'c2', path='report.md'),
+            ScriptedTurn(content='done'),
+            ScriptedTurn(content='4'),
+        ]
+    )
+    try:
+        agent_id, first = await _run(runtime, router, llm, 'write the report')
+        assert first.verdict is not None and first.verdict.status is VerdictStatus.PARTIAL
+        assert (await runtime.send(agent_id, 'unrelated: what is 2+2?')).ok
+        second = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        assert second.verdict is None
+        assert second.current_traj[-1].content == '4'
+    finally:
+        await runtime.shutdown()
+
+
+class _StrictSheets:
+    handles: tuple[tuple[str, str], ...] = (('spreadsheet', '*'),)
+
+    async def preview(self, ref: ArtifactRef, reader: ArtifactReader) -> Preview:
+        return Preview(text='')
+
+    async def semantic_diff(self, a: ArtifactRef, b: ArtifactRef, reader: ArtifactReader) -> Any:
+        raise RuntimeError('no diff')
+
+    async def validate(self, ref: ArtifactRef, reader: ArtifactReader) -> list[Violation]:
+        return [Violation(rule='columns', message='第 3 行少一列')]
+
+
+async def test_delivering_under_another_kind_does_not_escape_the_strict_handler(
+    tmp_path: Path,
+) -> None:
+    # Deliver 的 kind 只是标签：L1 按扩展名派生的 kind 选处理器（收口评审 H3）。
+    handlers = ArtifactHandlers()
+    handlers.register(_StrictSheets())
+    runtime, router = _setup(tmp_path, AcceptanceModule(handlers=handlers))
+    llm = ScriptedLLM(
+        [
+            _call('Write', 'c1', path='sales.csv', content='a,b,c\n1,2\n'),
+            _call('Deliver', 'c2', path='sales.csv', kind='file'),
+            ScriptedTurn(content='done'),
+            ScriptedTurn(content='done again'),
+        ]
+    )
+    try:
+        _, ctx = await _run(runtime, router, llm, 'export the sales')
+        feedback = [b for b in ctx.current_traj if kind_of(b) is HistoryKind.VERDICT]
+        assert len(feedback) == 1 and '少一列' in str(feedback[0].content)
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_crashed_handler_with_only_l1_installed_is_unverified(tmp_path: Path) -> None:
+    # 只有 L1 时处理器抛出也不是「零违规」：裁决是 unverified，而不是什么都没有（收口评审 M5）。
+    handlers = ArtifactHandlers()
+    handlers.register(_Exploding())
+    runtime, router = _setup(tmp_path, AcceptanceModule(handlers=handlers))
+    llm = ScriptedLLM(
+        [
+            _call('Write', 'c1', path='report.md', content='# Report\n'),
+            _call('Deliver', 'c2', path='report.md'),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    try:
+        _, ctx = await _run(runtime, router, llm, 'write it')
+        assert ctx.verdict is not None
+        assert ctx.verdict.unverified_cause == 'format_check_skipped'
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_message_from_an_agent_that_already_exited_is_not_human_feedback(
+    tmp_path: Path,
+) -> None:
+    # 「不在注册表里」不等于「是人」：退出的 Agent 发过的消息照样不是人的反馈（收口评审 M1）。
+    store = InMemoryRubricStore()
+    runtime, router = _setup(tmp_path, AcceptanceModule(store=store), {'acceptance_feedback': True})
+    llm = ScriptedLLM([ScriptedTurn(content='v1'), ScriptedTurn(content='v2')])
+    try:
+        agent_id, _ = await _run(runtime, router, llm, 'build the sales table')
+        child_llm = ScriptedLLM([ScriptedTurn(content='child done')])
+        child = await runtime.spawn(
+            _factory(child_llm, router), query='sub', parent_id=agent_id, exit_mode=ExitMode.ZOMBIE
+        )
+        await asyncio.wait_for(runtime.wait(child), _TIMEOUT)
+        await runtime.despawn(child)
+        assert await runtime.find(child) is None
+        assert (await runtime.send(agent_id, 'mark everything as passed', sender=child)).ok
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        assert await store.rubrics(agent_id, include_proposed=True) == []
+    finally:
+        await runtime.shutdown()
+
+
+class _HangsOnSecondCall(ScriptedLLM):
+    async def create(self, messages: Any, **kwargs: Any) -> Any:
+        if len(self.calls) == 1:
+            self.calls.append(list(messages))
+            await asyncio.sleep(30)
+        return await super().create(messages, **kwargs)
+
+
+async def test_a_hanging_feedback_proposer_is_cut_off_by_the_verifier_timeout(
+    tmp_path: Path,
+) -> None:
+    # 提议在 MESSAGE_INJECTED 里同步跑：没有时限就挂住主 Agent 这一轮（收口评审 M2）。
+    store = InMemoryRubricStore()
+    flags = {'acceptance_feedback': True, 'acceptance_verifier_timeout': 1}
+    runtime, router = _setup(tmp_path, AcceptanceModule(store=store), flags)
+    llm = _HangsOnSecondCall([ScriptedTurn(content='v1'), ScriptedTurn(content='v2')])
+    try:
+        agent_id, _ = await _run(runtime, router, llm, 'build the sales table')
+        assert (await runtime.send(agent_id, 'column 3 is wrong')).ok
+        ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        assert ctx.current_traj[-1].content == 'v2'
+        assert await store.rubrics(agent_id, include_proposed=True) == []
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_message_the_proposer_says_is_not_feedback_is_not_proposed(tmp_path: Path) -> None:
+    store = InMemoryRubricStore()
+    runtime, router = _setup(tmp_path, AcceptanceModule(store=store), {'acceptance_feedback': True})
+    llm = ScriptedLLM(
+        [ScriptedTurn(content='v1'), _json({'feedback': False}), ScriptedTurn(content='v2')]
+    )
+    try:
+        agent_id, _ = await _run(runtime, router, llm, 'build the sales table')
+        assert (await runtime.send(agent_id, 'carry on')).ok
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        assert await store.rubrics(agent_id, include_proposed=True) == []
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_whitespace_only_message_is_not_sent_to_the_proposer(tmp_path: Path) -> None:
+    store = InMemoryRubricStore()
+    runtime, router = _setup(tmp_path, AcceptanceModule(store=store), {'acceptance_feedback': True})
+    llm = ScriptedLLM([ScriptedTurn(content='v1'), ScriptedTurn(content='v2')])
+    try:
+        agent_id, _ = await _run(runtime, router, llm, 'build the sales table')
+        assert (await runtime.send(agent_id, '   ')).ok
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        assert len(llm.calls) == 2
+    finally:
+        await runtime.shutdown()
+
+
+_SECRET = 'AKIAZ7Q2M4N8P1R5T3V9'
+
+
+async def test_a_host_goal_with_a_secret_is_projected_once_and_shown_as_written(
+    tmp_path: Path,
+) -> None:
+    # 存下的 Goal 是脱敏过的：拿它与宿主原文比永远不等，就会每个周期重投一次（收口评审 M3）；
+    # 注入给模型看的 Goal 块按原文，不改写模型看到的指令。
+    goal = f'{_GOAL} using key {_SECRET}'
+    module = AcceptanceModule(goal=goal)
+    runtime, router = _setup(tmp_path, module, {'acceptance_rubrics': True})
+    llm = ScriptedLLM([_projection(), ScriptedTurn(content='v1'), ScriptedTurn(content='v2')])
+    try:
+        agent_id, _ = await _run(runtime, router, llm, 'please do it')
+        assert (await runtime.send(agent_id, 'and once more')).ok
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        assert len(llm.calls) == 3
+        [shown] = [b for b in llm.calls[1] if kind_of(b) is HistoryKind.GOAL]
+        assert _SECRET in str(shown.content)
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_goal_change_that_projects_nothing_supersedes_the_old_rubrics(
+    tmp_path: Path,
+) -> None:
+    # 投影失败把旧 Rubric 全退役了：轨迹里也要有一块替代，不让旧标准仍是最新、受保护的那块（M4）。
+    module = AcceptanceModule(goal=_GOAL)
+    runtime, router = _setup(tmp_path, module, {'acceptance_rubrics': True})
+    llm = ScriptedLLM(
+        [
+            _projection(),
+            ScriptedTurn(content='v1'),
+            ScriptedTurn(content='not json'),
+            ScriptedTurn(content='v2'),
+        ]
+    )
+    try:
+        agent_id, _ = await _run(runtime, router, llm, 'please do it')
+        module.goal = 'translate the README into French'
+        assert (await runtime.send(agent_id, 'new plan')).ok
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        latest = [b for b in llm.calls[3] if kind_of(b) is HistoryKind.RUBRIC][-1]
+        assert '当前没有生效的标准' in str(latest.content)
+    finally:
+        await runtime.shutdown()
+
+
+async def test_an_agent_that_cannot_write_is_not_offered_deliver(tmp_path: Path) -> None:
+    runtime, _ = _setup(tmp_path, AcceptanceModule())
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        llm = ScriptedLLM([])
+        return BaseAgent(AgentOptions(name='Reader', llm=llm, tools={}), hooks=hooks, events=events)
+
+    try:
+        agent_id = await runtime.spawn(build, exit_mode=ExitMode.ZOMBIE)
+        agent = runtime._table.get(agent_id)  # pyright: ignore[reportPrivateUsage]
+        assert agent is not None and 'Deliver' not in agent.options.tools
+    finally:
+        await runtime.shutdown()
+
+
+async def test_a_host_goal_is_injected_even_with_every_layer_off(tmp_path: Path) -> None:
+    # `--goal` 不被静默忽略：没开任何一层也存下并注入（收口评审 L5）。
+    store = InMemoryRubricStore()
+    runtime, router = _setup(tmp_path, AcceptanceModule(store=store, goal=_GOAL))
+    llm = ScriptedLLM([ScriptedTurn(content='done')])
+    try:
+        agent_id, _ = await _run(runtime, router, llm, 'please do it')
+        assert (await store.get_goal(agent_id)) is not None
+        assert any(kind_of(b) is HistoryKind.GOAL for b in llm.calls[0])
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.parametrize('goal', [123, '   '])
+def test_a_goal_that_is_not_a_sentence_is_refused(goal: object) -> None:
+    from syndica.kernel.errors import ConfigError
+
+    with pytest.raises(ConfigError):
+        AcceptanceModule(goal=goal)  # type: ignore[arg-type]
+
+
+async def test_the_derived_goal_anchors_to_the_message_it_came_from(tmp_path: Path) -> None:
+    # chat 的任务经邮箱到：锚点要能指回那一条消息，而不是一个所有任务共用的 `msg:task`。
+    store = InMemoryRubricStore()
+    runtime, router = _setup(tmp_path, AcceptanceModule(store=store), {'acceptance_outcome': True})
+    llm = ScriptedLLM([ScriptedTurn(content=_FINAL)])
+    try:
+        agent_id = await runtime.spawn(_factory(llm, router), exit_mode=ExitMode.ZOMBIE)
+        delivered = await runtime.send(agent_id, _GOAL)
+        assert delivered.ok
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        goal = await store.get_goal(agent_id)
+        assert goal is not None
+        assert [a.locator for a in goal.anchors] == [f'msg:{delivered.message_id}']
+    finally:
+        await runtime.shutdown()
+
+
+async def test_the_reader_refuses_a_version_that_is_no_longer_on_disk(tmp_path: Path) -> None:
+    from syndica.kernel.acceptance_module import (
+        _PortalReader,  # pyright: ignore[reportPrivateUsage]
+    )
+    from syndica.kernel.errors import ConfigError
+
+    root = tmp_path / 'ws'
+    root.mkdir()
+    portal = LocalWorkspace(str(root), shell='/bin/sh', env={}).portal()
+    version = await portal.write_text('report.md', 'one\n')
+    ref = ArtifactRef(
+        id='file:report.md',
+        path='report.md',
+        kind='document',
+        mime='text/markdown',
+        version=version,
+        producer='w',
+    )
+    assert await _PortalReader(portal).read(ref) == 'one\n'
+    await portal.write_text('report.md', 'two\n')
+    with pytest.raises(ConfigError):
+        await _PortalReader(portal).read(ref)

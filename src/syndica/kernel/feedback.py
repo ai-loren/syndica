@@ -44,7 +44,8 @@ logger = logging.getLogger(__name__)
 _PROMPT = (
     '你把人对产出的一条反馈改写成一条可验收的标准。只依据这条反馈本身，不要补充它没说的要求。'
     'kind：反馈要求的是可检验的具体事实（口径、字段、格式）就是 checkable；是整体观感（结论太弱、'
-    '不够易读）就是 judgment。只输出一个 JSON 对象：{"statement": "...", "kind": "checkable"}'
+    '不够易读）就是 judgment。只输出一个 JSON 对象：{"statement": "...", "kind": "checkable"}。'
+    '这条消息不是对产出的反馈（新的请求、致谢、「继续」）时只输出 {"feedback": false}。'
 )
 
 
@@ -72,7 +73,10 @@ async def propose_feedback_rubric(
     锚点 = 反馈消息本身（`locator` → `feedback`）+ 它带出的产物定位（`artifacts`：locator → 原文）。
     """
     sources = {locator: feedback, **(artifacts or {})}
-    statement, kind = await _phrase(feedback, llm, trust, max_turns)
+    phrased = await _phrase(feedback, llm, trust, max_turns)
+    if phrased is None:
+        return None
+    statement, kind = phrased
     anchors = (Anchor(AnchorSource.USER_MESSAGE, locator, feedback),) + tuple(
         Anchor(AnchorSource.ARTIFACT, where, quote) for where, quote in (artifacts or {}).items()
     )
@@ -99,8 +103,9 @@ async def propose_feedback_rubric(
 
 async def _phrase(
     feedback: str, llm: LLM | None, trust: TrustLevel, max_turns: int
-) -> tuple[str, RubricKind]:
-    """把反馈改写成标准句与类别。没有模型或模型失败 → 原话即标准、按 judgment（拿不准就要人判）。"""
+) -> tuple[str, RubricKind] | None:
+    """把反馈改写成标准句与类别；模型明说这不是反馈时交回 None（不提议）。没有模型或模型失败 →
+    原话即标准、按 judgment（拿不准就要人判）。"""
     if llm is None:
         return feedback, RubricKind.JUDGMENT
     try:
@@ -120,6 +125,8 @@ async def _phrase(
     if not isinstance(data, dict):
         return feedback, RubricKind.JUDGMENT
     parsed = cast('dict[str, Any]', data)
+    if parsed.get('feedback') is False:
+        return None
     statement = parsed.get('statement')
     kind = parsed.get('kind')
     if not isinstance(statement, str) or not statement.strip():

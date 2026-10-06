@@ -104,6 +104,8 @@ def _render_goal(goal: Goal) -> str:
 
 
 def _render_rubrics(rubrics: Sequence[Rubric]) -> str:
+    if not rubrics:
+        return '验收标准：当前没有生效的标准（此前列过的那些已不再适用）。'
     lines = ['验收标准（每条都要满足；标「需人工确认」的由人判，不自动通过）：']
     for rubric in sorted(rubrics, key=lambda r: r.id):
         mark = '（需人工确认）' if rubric.kind is RubricKind.JUDGMENT else ''

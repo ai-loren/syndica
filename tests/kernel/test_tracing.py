@@ -429,6 +429,7 @@ async def test_the_agent_span_carries_the_final_verdict():
     assert attributes['verdict.status'] == 'unverified'
     assert attributes['verdict.unverified_cause'] == 'needs_human'
     assert attributes['verdict.needs_human'] == ['J1']
+    assert attributes['verdict.outcomes'] == ['R1=satisfied', 'J1=needs_human']
 
 
 async def test_agent_and_turn_spans_carry_role_cycle_turn_and_stop_reason():

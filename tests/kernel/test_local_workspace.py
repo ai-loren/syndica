@@ -724,3 +724,14 @@ async def test_the_executable_bit_is_not_changed_through_a_symlink(tmp_path: Pat
     with pytest.raises(ConfigError):
         await _workspace(root).portal().set_executable('link.sh', True)
     assert not (root / 'real.sh').stat().st_mode & 0o111
+
+
+async def test_setting_the_executable_bit_follows_the_read_bits(tmp_path: Path) -> None:
+    # 与默认 umask 下的 `chmod +x` 一样：读得到的那几类都加上执行位（变异 M18）。
+    root = tmp_path / 'ws'
+    root.mkdir()
+    script = root / 'run.sh'
+    script.write_text('echo hi\n')
+    os.chmod(script, 0o644)
+    await _workspace(root).portal().set_executable('run.sh', True)
+    assert script.stat().st_mode & 0o777 == 0o755

@@ -960,3 +960,13 @@ async def test_the_parents_own_chmod_survives_a_content_merge(
 
     assert (root / 'src' / 'app.py').read_text() == 'print(2)\n'
     assert _executable(root / 'src' / 'app.py')
+
+
+def test_a_grandchild_of_an_isolated_agent_shares_its_scope(
+    router: WorkspaceRouter, root: Path
+) -> None:
+    # 产物 id 的作用域沿父链找最近一个有副本的祖先：孙 Agent 不能落回根的空作用域（变异 M16）。
+    assert router.isolate('alpha', 'snapshot') is not None
+    router.adopt('beta', 'alpha')
+    router.adopt('gamma', 'beta')
+    assert (router.scope_of('gamma'), router.scope_of('root-agent')) == ('alpha', '')

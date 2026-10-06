@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from syndica.kernel.artifacts import (
@@ -123,3 +125,23 @@ async def test_generic_semantic_diff_counts_changed_lines() -> None:
     b = _ref('a.md', kind='document', mime='text/markdown', version='v2')
     diff = await GenericHandler().semantic_diff(a, b, reader)
     assert diff.changed is True
+
+
+def test_a_rejected_handler_leaves_the_registry_as_it_was() -> None:
+    # 先全部校验、再一起装：第二个键冲突时，第一个键也不留下（收口评审 L6）。
+    class _Both:
+        handles: tuple[tuple[str, str], ...] = (('document', '*'), ('spreadsheet', 'text/csv'))
+
+        async def preview(self, ref: Any, reader: Any) -> Any: ...
+
+        async def semantic_diff(self, a: Any, b: Any, reader: Any) -> Any: ...
+
+        async def validate(self, ref: Any, reader: Any) -> list[Any]:
+            return []
+
+    registry = ArtifactHandlers()
+    registry.register(_SheetHandler())
+    with pytest.raises(ConfigError):
+        registry.register(_Both())
+    handler = registry.for_(_ref('a.md', kind='document', mime='text/markdown'))
+    assert isinstance(handler, GenericHandler)

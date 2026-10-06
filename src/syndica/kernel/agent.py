@@ -319,6 +319,11 @@ def _verdict_attributes(verdict: Verdict) -> dict[str, AttributeValue]:
         attributes['verdict.unverified_cause'] = verdict.unverified_cause
     if verdict.needs_human:
         attributes['verdict.needs_human'] = list(verdict.needs_human)
+    if verdict.outcomes:
+        # 逐条结论（`R1=satisfied`）：事后能查到 pass 是哪几条判出来的，而不只是一个总结论。
+        attributes['verdict.outcomes'] = [
+            f'{outcome.rubric_id}={outcome.kind.value}' for outcome in verdict.outcomes
+        ]
     return attributes
 
 
@@ -1054,9 +1059,10 @@ class BaseAgent:
         记在 `ctx.verdict` 上（终态 = 最后一次，内核从不合成 pass）。任一 hook 要求打回且裁决是
         partial / block 时由**内核**追加署名 VERDICT 反馈块（hook 不能写轨迹）作为下一轮输入；其余照
         常完成。这一次没人给裁决就清掉上一次的：裁决说的是**这份**回复，被打回之前那份的结论不能留
-        到改好之后。反馈块的信任取裁决与主轨迹里最严的（评审 B1）。取消照常上抛。"""
-        outcome = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
-            Junction.COMPLETION_PROPOSED, ctx=ctx, response=response, cycle=self._cycle
+        到改好之后。反馈块的信任取裁决与主轨迹里最严的（评审 B1）；裁决或打回出自被收紧的 Module
+        时，裁决与反馈块一律不可信（与模型侧四个切点同一条规则，D15）。取消照常上抛。"""
+        outcome, authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
+            Junction.COMPLETION_PROPOSED, {}, ctx=ctx, response=response, cycle=self._cycle
         )
         if outcome.skip or outcome.result is not None:
             raise _bad_completion_idiom(outcome)
@@ -1068,6 +1074,8 @@ class BaseAgent:
             if not isinstance(value, Verdict):
                 raise _bad_verdict(value)
         verdict = most_severe(cast('list[Verdict]', given))
+        if self._by_floored(authors.wrote.get('verdict', ()), authors.wrote.get('send_back', ())):
+            verdict = replace(verdict, trust=TrustLevel.UNTRUSTED)
         ctx.verdict = verdict
         send_back = any(value is True for value in outcome.history.get('send_back', []))
         if not send_back or verdict.status not in (VerdictStatus.PARTIAL, VerdictStatus.BLOCK):

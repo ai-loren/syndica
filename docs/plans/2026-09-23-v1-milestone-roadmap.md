@@ -35,6 +35,14 @@ OpenRouter 兜底，每个平台各自指数退避，spec 决策 #89）。
 隔离边界是沙箱化的后端，命令输出照旧不可信。三轮对抗评审（阶段一/二/三）加一轮收口评审的发现都已修进提交。M5 的
 提交同样只按本地验证协议验证过。
 
+里程碑 7 已完成（2026-10-06），审计记录见 [`docs/audits/2026-10-05-m7-final-audit.md`](../audits/2026-10-05-m7-final-audit.md)：
+产物有身份与版本（`ArtifactStore` 内存 / 文件实现 + 契约，`Deliver` 标交付物，`syndica artifacts list|show`），处理器按
+`(kind, mime)` 精度解析；Goal 是唯一权威、Rubric 是带锚点的投影（锚点要能重新打开，judgment 条永不自动判过）；三层验收
+（零 token 的 L1 格式校验、保守的 L2、证据要重新打开的 L3）做成 `acceptance` Runtime Module，四值裁决由内核推导、
+进 CLI 与 trace；人的反馈先提议、人 `sessions activate` 之后才生效。M5 后续的两条（合并带可执行位、D-64 模型侧收紧）
+一并做完。免费模型的真实运行跑通了「投影 → 写 → Deliver → L2 / L3 → pass」与 fail-open（超时 → `unverified`）。M7
+的提交同样只按本地验证协议验证过。
+
 当前主线约束：
 
 - 不重做 M1，不补 `Runtime.start` / `Junction.RUNTIME_START`。
@@ -85,7 +93,7 @@ uv run pytest -q
 | 4 | 扩展点完备 | 已完成 | 只维护回归门禁；CI 在 M12 之前统一补跑 |
 | 5 | 执行面完整化 + 不可信内容 | 已完成 | Workspace/Portal 全量接口与契约套件、Python 写的 git 版本层、worktree/快照隔离、共享模式写入冲突、伪终端、文件污点与真实溯源链；审计见 `docs/audits/2026-10-04-m5-final-audit.md` |
 | 6 | 状态 | 已完成 | 会话持久化与恢复（根对话）、§8.8 三种基线压缩 + 内核压缩步骤 + 三触发、§8.9 两层两阶段记忆（LLM 整理、根才写全局、不可信不进全局）、接进 CLI；审计见 `docs/audits/2026-10-05-m6-final-audit.md` |
-| 7 | 产物与验收 | 未开始 | Artifact、Rubric、Verifier |
+| 7 | 产物与验收 | 已完成 | 产物身份与版本 + 交付物、处理器注册、Goal / Rubric / 锚点规则、L1 / L2 / L3 验收 Module 与四值裁决、反馈升级（人确认）、接进 CLI；审计见 `docs/audits/2026-10-05-m7-final-audit.md` |
 | 8 | 长程任务 | 未开始 | Budget、Progress、Strategy |
 | 9 | 产品面 | 未开始 | HTTP/SSE/WebSocket + React |
 | 10 | 互操作 | 未开始 | MCP -> ACP -> A2A -> OpenAI HTTP |
@@ -126,7 +134,7 @@ deferred items」。
 | D-40 | `ReadOnlyKwarg` 只护顶层 | 已修 | M5 T8：`PRE_TOOL_USE` 盯住 `args` 与 `tool_call` 的投影，嵌套就地写算那个 hook 写的并重取溯源，就地改 `tool_call` 直接拒绝并点名 |
 | D-62 | 开发期记录器可以被更早装配的 Module 的 hook 截掉 | 已修 | M5 T8：`BaseAgent.observe_tool_outcomes` 不经 hook 链，记录器用它补记被截断的调用 |
 | D-63 | 被收紧的 Module 直接往 `runtime.broker` 发消息，文字不收紧 | 已修 | M5 T8：`runtime.broker` 是一层收紧代理，被收紧的 Module 身份下投递的消息收成 UNTRUSTED |
-| D-64 | 收紧不跟着数据走过扩展切点 | 已修（工具侧） | M5 T8：结论出自被收紧的 Module 时 `HookResult.untrusted` 为真，触发它的那次工具调用收紧；模型侧见下方 M5 后续 |
+| D-64 | 收紧不跟着数据走过扩展切点 | 已修 | M5 T8 工具侧：结论出自被收紧的 Module 时 `HookResult.untrusted` 为真，触发它的那次工具调用收紧；M7 模型侧：模型侧切点里触发的这类结论让那一轮的 assistant block 不可信 |
 | D-42 | 可观察切点丢弃返回值，typing 看不见 | 已关闭 | M4 D9 裁决不拆回调类型，登记表已关闭 |
 | D-43 | 扩展切点分类冲突只沿向外方向查 | 接受 | 单向引用结构上补不全，危险方向已挡住 |
 | D-46 | 派活 / 分叉树没有上限也没有回收 | M8 | 预算树与回收策略 |
@@ -149,8 +157,8 @@ deferred items」。
 | M5 后续 | 会话拿控制终端的启动器只能在 Linux 上被证明（macOS 不论有没有 `TIOCSCTTY` 都给控制终端） | M12 | CI 恢复后在 Linux 上跑那条变异 |
 | M5 后续 | 隔离副本里的命令经 `..` 写进兄弟 Agent 的副本，危险判据按形状认不出（副本名是 Agent 的 id） | 沙箱后端 | 每个隔离的 Agent 需要自己的根；文本规则只按路径形状判 |
 | M5 后续 | 合并之后被叫醒的子 Agent，上下文里仍写着「在隔离副本里」 | 接受 | 已经进 ZOMBIE 的 Agent 收不到不叫醒它的消息；合并结果提示父 Agent 在叫醒它的消息里说明 |
-| M5 后续 | 合并只合内容，不合可执行位的变化 | M7 | `Portal` 没有改权限的方法；副本保留可执行位，跑得起来 |
-| M5 后续 | 扩展切点在模型侧切点里被触发、结论出自被收紧的 Module 时，那一轮模型请求不收紧（D-64 只做了工具调用那一侧） | M7 | M6 的压缩没有依赖它（压缩信任由内核在 `apply_compaction` 里置，与模型侧收紧无关）；剩下的是 D-64 模型请求那一侧，随 M7 的溯源 / 验收一起做。`HookResult.untrusted` 已让宿主代码知道这个值不可信 |
+| M5 后续 | 合并只合内容，不合可执行位的变化 | 已修（M7） | `Portal.set_executable` + `FileStat.executable`；子 Agent 改过的可执行位才合回去，父那边自己改的不撤销；契约钉住往返、改写保留、真能执行 |
+| M5 后续 | 扩展切点在模型侧切点里被触发、结论出自被收紧的 Module 时，那一轮模型请求不收紧（D-64 只做了工具调用那一侧） | 已修（M7） | M6 的压缩没有依赖它（压缩信任由内核在 `apply_compaction` 里置，与模型侧收紧无关）；剩下的是 D-64 模型请求那一侧，随 M7 的溯源 / 验收一起做。`HookResult.untrusted` 已让宿主代码知道这个值不可信 |
 | M5 后续 | `shell.download_then_execute` 纯判定认不出 tee 写文件、`wget -P` 前缀、`mv` / `cp` 改名、`uv run` / `deno run` 等解释器 | 接受 | 真实姿态下这些下载落地的文件都不是基线，执行它由执行器的 `exec.untrusted_script` 兜住；纯判定（无路由的消费者）的这些形状留作后续 |
 | M5 后续 | `exec.untrusted_script` 对命令里有多个 `cd` / 变量目录的脚本放过（`effective_cwd` 折不出目录） | 接受 | 折不出目录时宁可不升级、不拿错目录误判；有一个 Agent 之内的窗口上界兜着，真正的边界是沙箱后端 |
 | M5 后续 | 回放重不出 `exec.untrusted_script` 门（收口 C3）：真实 run 的执行器接了路由会按文件污点升级，回放不接路由（`_untrusted_scripts` 恒空），跑过 Bash 写脚本再执行的 CLI trace 会在门上报分歧 | 后续（回放文档 v4） | 响亮失败（回放报分歧非静默）；正确修法要把执行器的文件信任答案记进回放文档并在回放侧接回，是带版本的有意改动，不在时间紧的收口里赶 |
@@ -160,7 +168,23 @@ deferred items」。
 | M6 后续 | 压缩前**完整前像**落 `SessionStore.archive`（spec §8.8「压缩前必须留快照」的完整形态） | M8 | 压缩点已进 trace、被丢的不可信内容有 UNTRUSTED 标记兜溯源；完整前像要把会话 store 递进 Agent 的压缩步骤，随 M8 长程任务的回看需求一起做 |
 | M6 后续 | 多 Agent **子树**的持久化与恢复（子 Agent、broker 队列、租约） | M8 | M6 只持久化根对话（计划 P14）；子树恢复与 M8 的多 Agent 长程任务同属一件事 |
 | M6 后续 | `MemoryStore` / `MemoryStoreContract` 进公开面 | M12 | 先私有：`SessionStoreContract` 已发布，记忆契约未发布，第三方记忆后端暂无公开契约可照着自证；v1.0 冻结公开 API 时一起定 |
-| M6 后续 | LLM 记忆整理可能添油加醋（真实运行实测编造了源里没有的细节，且按源条目记为 trusted） | 接受，附缓解 | 整理 / 摘要提示已要求只保留源事实，重跑只剩源事实；彻底消除要验收器比对（M7） |
+| M6 后续 | LLM 记忆整理可能添油加醋（真实运行实测编造了源里没有的细节，且按源条目记为 trusted） | 接受，附缓解 | 整理 / 摘要提示已要求只保留源事实，重跑只剩源事实；M7 没有接验收器比对（每次整理多一次伴生调用、与验收主路径无关） |
+| M6 后续 | 恢复会话时安全 flags 取「当前或更严」（M6 阶段二 P28-M7），恢复提示列出失效的子 Agent id | 已修（M7） | 快照里更严的 `untrusted_high_risk` / `max_wait_seconds` 作为恢复出的 Agent 的覆盖值并记 warning；当前 Runtime 没声明的 key 不收；恢复提示点名 `tool_meta` 里记着的失效 Agent |
+| M6 后续 | 一条不可信的工作区记忆永久影响此后每个会话、且无法删（M6 收口评审 M4） | 已修（M7） | `syndica memory list` 列出每段的信任与未整理的短期记录，`memory forget <n>` / `--pending` 按版本重写（被并发整理就报冲突）；记忆条目的逐条来源（哪个会话、哪条消息）仍只到「整理 seq 区间」，随 M12 定 |
+| M7 后续 | 伴生（投影、L2 / L3、反馈提议）的模型调用不进 trace：真实运行里 15.7 s 中约 10 s 在伴生上，`trace show` 只列主 Agent 的 3 次调用 | M8 | 伴生是直接构造的 `BaseAgent`、挂空 tracer；要给它们一个子 span 并算进预算树，与 M8 的预算可感知一起做 |
+| M7 后续 | 装了 `acceptance` 的 run 不写回放文档 | 后续（回放文档 v4） | 伴生调用不在主 Agent 的录制轮次里；与 M5 C3、M6 aux 调用同属回放文档 v4 的槽位；回放重建器认得这个名字但拒绝重建（三件套） |
+| M7 后续 | 目标导向型压缩（§8.8 第四种策略） | M8 | 依赖 Rubric，M7 交付了 Rubric；压缩保护 Goal / 最新 Rubric 块已在 M7 做 |
+| M7 后续 | 进度 = 已满足强制 Rubric / 强制总数、目标漂移检测（§8.2 / §8.3） | M8 | 只留 `Rubric.mandatory` 与「只数强制条」的接口 |
+| M7 后续 | 导出器默认排除 `unverified`（§13） | M11 | 四值类型与 fail-open 标记已在内核 |
+| M7 后续 | 二进制格式处理器（xlsx / docx 的 `semantic_diff` 与校验） | 后端 | 内核只给协议与文本 `generic` 处理器 |
+| M7 后续 | `RubricStore` / `ArtifactStore` 契约与验收 Module 进公开面 | M12 | 先私有（同 M6 的记忆）；v1.0 冻结公开 API 时一起定 |
+| M7 后续 | `encode_assured` 的调用方白名单（AST 守卫） | M12 | 产物索引存的路径 / kind 已收窄（kind 只收 `KINDS`、id 由内核派生）；守卫随公开面冻结一起补 |
+| M7 后续 | 只有根协调者有 Goal，子 Agent 的交付不单独验收 | 接受 | 由派活的一方验收；子 Agent 各付一份伴生太贵，需要时由宿主给子 Agent 一个 Goal（M8 的预算树之后再议） |
+| M7 后续 | 裁决的机器可读出口（退出码映射、交接文件字段） | M9 | trace 的 agent span 已带 `verdict.status` / `unverified_cause` / `needs_human` / `outcomes`，`trace export` 与 spans.jsonl 可读；CLI 只在 stderr 打一行 |
+| M7 后续 | 文件 / 产物锚点钉到具体版本（§7.6「`spec.md:12 → protocol.md:88`」「`artifact:report.md#section-4`」） | 后续 | 投影的来源只有 Goal 与任务原文；`Anchor` 没有 version 字段，加它是公开类型的变更 |
+| M7 后续 | 处理器注册新 kind、`preview` / `semantic_diff` 的消费方、反馈带出产物定位、`Deliver.note` 落进交付记录 | M9 | L1 只用 `validate`；预览与语义 diff 的读者是界面 |
+| M7 后续 | Module 服务经 `runtime.send` 发的消息与宿主同一个 sender，会被当成人的反馈提议 | M12 | 提议仍要人 `sessions activate`；正面标记宿主消息要在 `Runtime.send` 上区分调用方，随宿主身份一起定 |
+| M7 后续 | 主 Agent 的整条回复恰好就是要求原文时，L3 仍把它算作证据 | 接受 | 「只回 DONE」这类要求的证据就是那一行；整行之外的复述已被拒 |
 | 卫生 | 基础 CI：每次 push 跑与本地一致的门禁 | M2 | 自举开始改代码之前先有自动门禁 |
 | 卫生 | CHANGELOG、PyPI 预发布、版本策略、issue 模板 | M12 | 发布准备 |
 | 卫生 | `.env.example` | 不做 | key 文件不该放在 Agent 操作的工作区里，`Read` / `Grep` 读得到它 |

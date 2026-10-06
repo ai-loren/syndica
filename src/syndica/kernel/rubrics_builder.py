@@ -88,6 +88,15 @@ async def project_rubrics(
         if problems:
             dropped += 1
             continue
+        if any(earlier.id == rubric.id for earlier in kept):
+            # 同一个 id 投了两条：store 按 id 存，后一条会静默顶掉前一条。留先投的那条，说一声。
+            logger.warning(
+                '期望: 每条 Rubric 的 id 互不相同。 实际: Agent %s 的投影里 %s 出现了不止一次。 '
+                '下一步: 只留第一条；查 RubricsBuilder 的回复。',
+                scope,
+                rubric.id,
+            )
+            continue
         kept.append(rubric)
     if dropped:
         logger.warning(

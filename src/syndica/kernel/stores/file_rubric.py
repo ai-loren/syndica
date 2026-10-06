@@ -101,6 +101,17 @@ class FileRubricStore:
             table[rubric_id] = replace(existing, status=RubricStatus.ACTIVE)
             self._write(key, _RUBRICS, rubrics_to_json(list(table.values())))
 
+    async def forget(self, scope: str) -> None:
+        """删掉一个 scope 的 Goal 与全部 Rubric：宿主删会话时调（会话删了，Goal 里那句原话不该还躺在
+        磁盘上）。不在 `RubricStore` 协议里：只有宿主删会话，内核从不调它。"""
+        with self._locked(scope) as key:
+            for name in (_GOAL, _RUBRICS):
+                try:
+                    os.unlink(name, dir_fd=key)
+                except FileNotFoundError:
+                    pass
+            io.sync_directory(key)
+
     # --- internals ------------------------------------------------------------------------
 
     @contextmanager

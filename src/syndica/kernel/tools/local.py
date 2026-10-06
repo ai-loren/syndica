@@ -65,12 +65,16 @@ _KINDS: dict[str, tuple[str, str]] = {
 }
 
 
+def routed_kind(path: str) -> tuple[str, str]:
+    """按扩展名给出 (kind, mime)：L1 按它选处理器，`Deliver` 自选的 kind 只是标签。"""
+    normal = posixpath.normpath(path)
+    return _KINDS.get(posixpath.splitext(normal)[1].lower(), ('file', 'application/octet-stream'))
+
+
 def _artifact(path: str, version: str) -> ArtifactRef:
     """`id` 由规范化的路径派生：同一个文件的各个版本是同一个产物，与谁写的无关（spec §7.2）。"""
     normal = posixpath.normpath(path)
-    kind, mime = _KINDS.get(
-        posixpath.splitext(normal)[1].lower(), ('file', 'application/octet-stream')
-    )
+    kind, mime = routed_kind(normal)
     return ArtifactRef(
         id=f'file:{normal}',
         path=normal,

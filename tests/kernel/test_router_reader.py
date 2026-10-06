@@ -116,3 +116,19 @@ async def test_an_isolated_agent_is_scoped_by_its_copy(tmp_path: Path) -> None:
         assert router.scope_of('gamma') == ''  # 没有副本的仍在根工作区
     finally:
         await router.close()
+
+
+async def test_the_view_reports_an_externally_planted_file_as_untrusted(tmp_path: Path) -> None:
+    # 只读视图的信任照算：伴生读到的外部文件不可信，裁决据此不可信（收口评审变异 M21）。
+    from syndica.kernel.context import TrustLevel
+    from syndica.kernel.file_taint import FileTaint
+
+    (tmp_path / 'baseline.md').write_text('known\n', encoding='utf-8')
+    router = WorkspaceRouter(
+        LocalWorkspace(str(tmp_path), shell='/bin/sh', env={}), taint=FileTaint(tmp_path)
+    )
+    (tmp_path / 'planted.md').write_text('from outside\n', encoding='utf-8')
+    view = router.reader_for('main')
+    assert view.file_trust('planted.md', None) is TrustLevel.UNTRUSTED  # type: ignore[attr-defined]
+    assert view.file_trust('baseline.md', None) is TrustLevel.TRUSTED  # type: ignore[attr-defined]
+    await router.close()

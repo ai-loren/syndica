@@ -793,7 +793,9 @@ def _verdict_line(verdict: Verdict) -> str:
     return _rubric_line('；'.join(parts))
 
 
-async def _sessions_rm(store: SessionStore, sessions_root: Path, sid: str) -> str:
+async def _sessions_rm(
+    store: SessionStore, sessions_root: Path, sid: str, rubrics: FileRubricStore | None = None
+) -> str:
     if not await store.exists(sid):
         raise _session_absent(sid)
     # 删之前先抢锁：会话正被别的进程续着 / 跑着时删，下一次 checkpoint 会把目录重建、created_at /
@@ -801,6 +803,8 @@ async def _sessions_rm(store: SessionStore, sessions_root: Path, sid: str) -> st
     lock = acquire_session_lock(sessions_root, sid)
     try:
         await store.delete(sid)
+        if rubrics is not None:
+            await rubrics.forget(sid)
     finally:
         lock.release()
     return f'已删除会话 {sid}'
@@ -1524,7 +1528,9 @@ class RuntimeCliHost:
             if request.action == 'show':
                 return self._runner.run(_sessions_show(store, name))
             if request.action == 'rm':
-                return self._runner.run(_sessions_rm(store, root, name))
+                kept = rubric_root(self._workspace_root)
+                rubric_store = FileRubricStore(kept) if kept.is_dir() else None
+                return self._runner.run(_sessions_rm(store, root, name, rubric_store))
             rubrics = FileRubricStore(rubric_root(self._workspace_root))
             if request.action == 'rubrics':
                 return self._runner.run(_session_rubrics(rubrics, name))

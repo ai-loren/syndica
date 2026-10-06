@@ -95,6 +95,29 @@ Milestone 5 completes the execution plane and adds untrusted-content tracking:
 
 Milestone 5 audit: [`docs/audits/2026-10-04-m5-final-audit.md`](docs/audits/2026-10-04-m5-final-audit.md).
 
+Milestone 6 adds state: the root conversation is persisted under `.syndica/sessions` and resumed with
+`run --session` or `sessions resume`; context compaction (rule-based, pruning, summary) runs at a
+threshold, on overflow, or on request; and two-level memory (workspace and global) keeps facts
+across sessions, with only the root coordinator writing global memory and untrusted content never
+reaching it.
+
+Milestone 6 audit: [`docs/audits/2026-10-05-m6-final-audit.md`](docs/audits/2026-10-05-m6-final-audit.md).
+
+Milestone 7 adds artifacts and acceptance (see the `acceptance` module under
+[Configuration](#configuration)):
+
+- Artifacts have identity and versions: every write is registered, `Deliver` marks deliverables,
+  and `syndica artifacts list | show` prints them with their versions and producers.
+- Pluggable artifact handlers resolved by `(kind, mime)` precision, with a generic text handler.
+- A goal and its rubrics: rubrics are projected before work, every rubric must quote the request it
+  comes from, and rubrics only a human can judge are never passed automatically.
+- Three acceptance layers: a zero-cost format check, a conservative output verifier and an outcome
+  verifier that has to re-open its evidence; the kernel derives the four-value verdict
+  (`pass` / `partial` / `block` / `unverified`) itself and shows it in the CLI and the trace.
+- Human feedback becomes a proposed rubric that a person activates.
+
+Milestone 7 audit: [`docs/audits/2026-10-05-m7-final-audit.md`](docs/audits/2026-10-05-m7-final-audit.md).
+
 ## Install From Source
 
 The package is not published yet. Use an editable checkout:
@@ -336,8 +359,8 @@ workspaces agents operate on to avoid this.
 `modules:` enables optional modules in the order written; `syndica modules list` shows which ones
 exist and where they come from without importing any of them, and marks those whose code is inside
 the workspace. `syndica modules show <name>` imports a module to show its manifest; when its code
-is inside the workspace, the configuration must enable it and be confirmed first. Besides the built-in `retry` and
-`prefix-drift`, it can name a third-party module installed under the `syndica.modules` entry-point
+is inside the workspace, the configuration must enable it and be confirmed first. Besides the built-in `retry`,
+`prefix-drift`, `compaction`, `memory` and `acceptance`, it can name a third-party module installed under the `syndica.modules` entry-point
 group. Its entry point is a callable `factory(host: ModuleHost) -> RuntimeModule`; the entry-point
 name must equal the module's name, and its flag keys must start with the module name, hyphens
 turned into underscores (`example` gives `example_`, `git-notes` gives `git_notes_`), and must not
@@ -349,6 +372,20 @@ the workspace; a distribution installed inside the workspace is also checked aga
 configuration cannot. [examples/syndica-example-module](examples/syndica-example-module) is a
 minimal third-party module to start from: one flag, one tool that triggers the module's own
 extension junction, and one plugin that records what it hears there.
+
+`modules: [acceptance]` turns on artifact acceptance (spec §7.5–§7.7). With it installed the host
+keeps an artifact index in `.syndica/artifacts` and the agent gets a `Deliver` tool; a delivered file
+that fails its format check (an empty file, for the generic handler) is sent back once at no model
+cost. The model-backed layers are off until their flags are set: `acceptance_rubrics` projects the
+goal into anchored rubrics before work starts, `acceptance_output` asks a conservative verifier
+whether every request was done, `acceptance_outcome` checks each rubric against the final reply and
+the workspace. The goal is `--goal <text>` on `run` or `chat`, or else the first message. Each run
+ends with one verdict on stderr and in the trace: `pass`, `partial`, `block`, or `unverified` with
+the reason (a verifier that fails or times out lets the run finish but never reports `pass`; a
+rubric only a human can judge stays `unverified`). With `acceptance_feedback`, a later message from
+you becomes a proposed rubric; it counts only after `syndica sessions activate <session> <id>`.
+Runs with acceptance installed do not write a replay document, because the verifiers' model calls
+are not part of the recorded turns.
 
 Writing a module: the entry point returns a `RuntimeModule`, and the kernel checks the following
 when it loads one.
@@ -619,13 +656,16 @@ unless the workspace backend sandboxes it.
 
 ```text
 syndica run <prompt>
-syndica chat [--max-turns <n>] [--trace <level>] [--trust-module-output <name>]
+syndica chat [--max-turns <n>] [--trace <level>] [--trust-module-output <name>] [--goal <text>]
 syndica agents list | show <name>
 syndica topology list | show <name>
 syndica flags list | show <key>
 syndica modules list | show <name>
+syndica artifacts list | show <id>
 syndica config trust [--sha256 <digest>]
-syndica sessions list | show <id> | resume <id> | rm <id>   # reserved for M6
+syndica sessions list | show <id> | resume <id> | rm <id>
+syndica sessions rubrics <id> | activate <id> <rubric-id>
+syndica memory list | forget <n> | forget --pending   [--global]
 syndica doctor [--verify]
 syndica trace list | show <id> | replay <id> [--allow-divergence]
 syndica trace export <id> [--otlp <url>] | prune [<id>...] [--keep <n>]
@@ -643,6 +683,7 @@ syndica version
 --max-tokens <n>
 --max-wall-clock <seconds>
 --flag <key=value>        repeatable
+--goal <text>             what this run must deliver; needs the acceptance module
 --trust-module-output <name>  repeatable; this run treats that third-party module's output as trusted
 --no-write                read-only tools only
 --handoff                 host verification, a redacted handoff file, and the Git question
@@ -752,8 +793,8 @@ The v1.0 roadmap has 12 internal milestones:
 | 3 | Observability + redaction | Done |
 | 4 | Complete extension system | Done |
 | 5 | Complete execution layer + provenance | Done |
-| 6 | State: sessions, compression, memory | Planned |
-| 7 | Artifacts and acceptance | Planned |
+| 6 | State: sessions, compression, memory | Done |
+| 7 | Artifacts and acceptance | Done |
 | 8 | Long-horizon task control | Planned |
 | 9 | HTTP/SSE/Web product surface | Planned |
 | 10 | MCP / ACP / A2A / OpenAI HTTP interop | Planned |

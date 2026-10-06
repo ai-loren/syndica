@@ -334,3 +334,24 @@ async def test_agent_end_reports_the_verdict() -> None:
         delivered = [event async for event in events]
     ending = [event for event in delivered if event.kind == 'agent_end']
     assert ending[0].payload == {'stop_reason': 'completed', 'verdict': 'pass'}
+
+
+async def test_one_hook_asking_for_a_send_back_is_enough() -> None:
+    # 打回是「任一 hook 要求」而不是「每个 hook 都要求」（变异 M09）。
+    agent, hooks = _agent(2)
+    seen = 0
+
+    async def strict(**_: Any) -> HookResult:
+        nonlocal seen
+        seen += 1
+        if seen == 1:
+            return HookResult(modified={'verdict': _block(), 'send_back': True})
+        return HookResult(modified={'verdict': _pass()})
+
+    async def lenient(**_: Any) -> HookResult:
+        return HookResult(modified={'verdict': _pass(), 'send_back': False})
+
+    hooks.register(Junction.COMPLETION_PROPOSED, strict)
+    hooks.register(Junction.COMPLETION_PROPOSED, lenient)
+    ctx = await agent.run('go')
+    assert [kind_of(b) for b in ctx.current_traj].count(HistoryKind.VERDICT) == 1

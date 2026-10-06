@@ -194,3 +194,37 @@ def test_showing_an_unknown_artifact_points_at_the_list(tmp_path: Path) -> None:
     argv = ['--config', _config(tmp_path), 'artifacts', 'show', 'file:nope.md']
     code, _, stderr = _cli(tmp_path, ScriptedLLM([]), argv)
     assert code != 0 and 'artifacts list' in stderr
+
+
+def test_removing_a_session_also_forgets_its_goal_and_rubrics(tmp_path: Path) -> None:
+    # 会话删了，Goal 里那句原话不该还躺在 .syndica/rubrics 里（收口评审 L2）。
+    config = _config(tmp_path, '  acceptance_outcome: true\n')
+    code, _, stderr = _cli(tmp_path, ScriptedLLM([ScriptedTurn(content='done')]), _run(config))
+    assert code == 0, stderr
+    [sid] = [p.name for p in (tmp_path / '.syndica' / 'sessions').iterdir() if p.is_dir()]
+    store = FileRubricStore(tmp_path / '.syndica' / 'rubrics')
+    assert asyncio.run(store.get_goal(sid)) is not None
+
+    code, _, stderr = _cli(tmp_path, ScriptedLLM([]), ['--config', config, 'sessions', 'rm', sid])
+    assert code == 0, stderr
+    assert asyncio.run(store.get_goal(sid)) is None
+
+
+def test_a_proposal_is_announced_once_not_after_every_answer(tmp_path: Path) -> None:
+    config = _config(tmp_path, '  acceptance_feedback: true\n')
+    proposer = ScriptedTurn(
+        content=json.dumps({'statement': 'column 3 uses confirmed revenue', 'kind': 'checkable'})
+    )
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(content='v1'),
+            proposer,
+            ScriptedTurn(content='v2'),
+            ScriptedTurn(content=json.dumps({'feedback': False})),
+            ScriptedTurn(content='v3'),
+        ]
+    )
+    stdin = 'build the sales table\ncolumn 3 is wrong, use confirmed revenue\nthanks\n'
+    code, _, stderr = _cli(tmp_path, llm, ['--config', config, 'chat'], stdin=stdin)
+    assert code == 0, stderr
+    assert stderr.count('提议的验收标准') == 1

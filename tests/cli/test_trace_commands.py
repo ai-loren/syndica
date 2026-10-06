@@ -1093,7 +1093,7 @@ def _rewritten_header(root: Path, change: Any) -> tuple[TraceHeader, str]:
 
 
 def _from_a_newer_syndica(value: dict[str, Any]) -> None:
-    value['schema'] = 'syndica.trace/5'
+    value['schema'] = 'syndica.trace/6'
     value['added_in_2'] = {'anything': True}
     del value['redaction']
 
@@ -1108,7 +1108,7 @@ def test_a_trace_from_a_newer_syndica_is_reported_as_newer_and_never_as_tampered
     assert listed[:2] == (0, '另有 1 个 trace 目录读不进来，没有列出（原因见上面的 WARNING）。\n')
     for code, _, err in (by_prefix, by_name):
         assert code == 2
-        assert 'syndica.trace/5' in err and '不要删掉' in err
+        assert 'syndica.trace/6' in err and '不要删掉' in err
     for _, _, err in (listed, by_prefix, by_name):
         assert '多半是 Agent 的 Bash' not in err and '被 prune 掉的找不回来' not in err
 

@@ -160,3 +160,16 @@ async def test_the_seam_is_idempotent_across_cycles() -> None:
     await agent.run('cycle one')
     ctx = await agent.run('cycle two')
     assert sum(kind_of(b) is HistoryKind.GOAL for b in ctx.current_traj) == 1
+
+
+def test_the_goal_key_follows_its_anchors_not_only_its_intent() -> None:
+    # 同一句要求锚到不同的原话是不同的 Goal（变异 M12）。
+    one = Goal(
+        intent='ship a report',
+        anchors=(Anchor(AnchorSource.USER_MESSAGE, 'msg:1', 'ship a report'),),
+    )
+    two = Goal(
+        intent='ship a report',
+        anchors=(Anchor(AnchorSource.USER_MESSAGE, 'msg:2', 'ship a report'),),
+    )
+    assert goal_key(one) != goal_key(two)

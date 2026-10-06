@@ -217,3 +217,18 @@ async def test_the_announcement_comes_after_the_artifact_is_in_the_store() -> No
     agent._attach_artifact_store(store)  # pyright: ignore[reportPrivateUsage]
     await agent.run('go')
     assert present == [True]
+
+
+async def test_a_registered_path_is_normalised() -> None:
+    # 同一个文件的两种写法是同一个产物：id 与 path 都按规范化后的路径（变异 M08）。
+    store = InMemoryArtifactStore()
+    agent = _agent_with(
+        {'Make': _Make()},
+        [
+            ScriptedTurn(tool_calls=[_call('c1', 'Make', './drafts/../report.md')]),
+            ScriptedTurn(content='done'),
+        ],
+    )
+    agent._attach_artifact_store(store)  # pyright: ignore[reportPrivateUsage]
+    await agent.run('go')
+    assert [(r.id, r.path) for r in await store.list()] == [('file:report.md', 'report.md')]

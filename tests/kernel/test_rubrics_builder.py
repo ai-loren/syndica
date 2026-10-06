@@ -188,3 +188,22 @@ async def test_a_slow_projection_fails_open(caplog: pytest.LogCaptureFixture) ->
         time_limit=0.05,
     )
     assert kept == [] and await store.rubrics('s1') == []
+
+
+async def test_an_omitted_mandatory_flag_means_mandatory() -> None:
+    # 进度只数强制条（M8）：没说就是强制的，不让省略把一条要求变成可有可无（变异 M15）。
+    candidate = _candidate('R1', 'a report with a section 4')
+    candidate.pop('mandatory', None)
+    kept, _ = await _project(_reply([candidate]))
+    assert kept[0].mandatory is True
+
+
+async def test_a_duplicate_projected_id_keeps_the_first_and_says_so(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    first = _candidate('R1', 'a report with a section 4')
+    second = _candidate('R1', 'a --json flag')
+    with caplog.at_level(logging.WARNING):
+        kept, _ = await _project(_reply([first, second]))
+    assert [r.statement for r in kept] == [first['statement']]
+    assert any(r.args and 'R1' in r.args for r in caplog.records)

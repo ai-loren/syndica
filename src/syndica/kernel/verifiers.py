@@ -18,7 +18,7 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
@@ -38,6 +38,7 @@ from syndica.kernel.acceptance import (
 from syndica.kernel.acceptance_inject import meaningful_quote
 from syndica.kernel.companion import run_companion
 from syndica.kernel.context import Context, ContextBlock, TrustLevel, provenance_of, strictest_trust
+from syndica.kernel.errors import SyndicaError
 from syndica.kernel.history_blocks import kind_of
 from syndica.kernel.hooks import HookResult
 from syndica.kernel.llm import LLM
@@ -68,8 +69,10 @@ _OUTCOME_PROMPT = (
     '你是结果验收器。按下面的验收标准逐条查主 Agent 的最终回复与工作区证据'
     '（可用 Read/Grep/Glob）。每条给 result：satisfied（已满足）、unmet（有证据表明做错了）、'
     'unconfirmed（没能确认）。satisfied 与 unmet 都必须给 evidence：引用工作区文件'
-    '（source=file，locator=路径）或轨迹（source=user_message）里**原样出现**的文字，'
-    '引不出来就判 unconfirmed。不要判标「需人工确认」的条。\n'
+    '（source=file，locator=路径）或主 Agent 的回复 / 工具输出'
+    '（source=user_message，locator=reply）'
+    '里**原样出现**的文字；用户的要求原文、照抄要求的话都不算证据。引不出来就判 unconfirmed。'
+    '不要判标「需人工确认」的条。\n'
     + _DATA_NOTICE
     + '\n只输出一个 JSON 对象：{"outcomes": [{"rubric_id": "R1", "result": "satisfied", '
     '"evidence": [{"source": "file", "locator": "report.md", "quote": "原文"}]}], '
@@ -162,7 +165,8 @@ async def verify_outcome(
     evidence_text: str = '',
 ) -> Verdict:
     """L3：逐条判 Rubric，裁决由 `derive_verdict` 推导。SATISFIED / UNMET 的证据重新打开核对：
-    `user_message` 证据须原样出现在 `evidence_text`（主 Agent 轨迹原文）里，`file` / `artifact` 证据
+    `user_message` 证据须原样出现在 `evidence_text`（主 Agent 的回复与工具输出）里、且不只是复述
+    要求，`file` / `artifact` 证据
     须原样出现在 Portal 里那个文件中；对不上的降成 UNCONFIRMED。同一条给了互相矛盾的结论也降成
     UNCONFIRMED。回复解析不了按验收器失败抛出。"""
     async with asyncio.timeout(time_limit):
@@ -177,7 +181,7 @@ async def verify_outcome(
         )
     data = _load(result.reply, 'OutcomeVerifier')
     reason = data.get('reason')
-    reported = await _reported(data.get('outcomes'), evidence_text, portal)
+    reported = await _reported(data.get('outcomes'), evidence_text, portal, rubrics)
     return derive_verdict(
         rubrics,
         reported,
@@ -199,7 +203,7 @@ def acceptance_hook(
     block_retries: int,
     max_turns: int,
     timeout: float,
-    format_check: Callable[[], tuple[Sequence[str], Sequence[str]]] | None = None,
+    format_check: Callable[[object], Awaitable[tuple[Sequence[str], Sequence[str]]]] | None = None,
 ) -> Callable[..., Awaitable[HookResult]]:
     """造挂在 COMPLETION_PROPOSED 上的 hook（每个主 Agent 一个，闭包绑它的工作区视图与 scope）。
 
@@ -218,11 +222,11 @@ def acceptance_hook(
     current: list[object] = [None]
 
     async def hook(**kwargs: Any) -> HookResult:
-        problems, skipped = format_check() if format_check is not None else ((), ())
-        if not output and not outcome and not problems:
-            return HookResult()
         ctx = cast('Context', kwargs['ctx'])
         cycle = kwargs.get('cycle')
+        problems, skipped = await format_check(cycle) if format_check is not None else ((), ())
+        if not output and not outcome and not problems and not skipped:
+            return HookResult()
         if cycle != current[0]:
             current[0] = cycle
             for key in counts:
@@ -234,7 +238,9 @@ def acceptance_hook(
         if problems:
             verdict, bucket = await _format_verdict(ctx, goal is not None, problems)
         elif goal is None or (not output and not outcome):
-            return HookResult()
+            if not skipped:
+                return HookResult()
+            verdict, bucket = await _skipped_verdict(ctx, goal is not None), None
         else:
             verdict, bucket = await _judge(ctx)
             if skipped and verdict.status is VerdictStatus.PASS:
@@ -247,6 +253,18 @@ def acceptance_hook(
         if send_back and bucket is not None:
             counts[bucket] += 1
         return _verdict_result(verdict, send_back)
+
+    async def _skipped_verdict(ctx: Context, has_goal: bool) -> Verdict:
+        """L1 没能跑、又没有别的层验过：不是「零违规」，是 `unverified`（收口评审 M5）。"""
+        rubrics: list[Rubric] = []
+        trust = TrustLevel.UNTRUSTED
+        try:
+            trust = provenance_of(ctx)
+            if has_goal:
+                rubrics = await store.rubrics(scope)
+        except Exception as exc:
+            return _failed(rubrics, trust, exc)
+        return derive_verdict(rubrics, {}, trust=trust, failure='format_check_skipped')
 
     async def _format_verdict(
         ctx: Context, has_goal: bool, problems: Sequence[str]
@@ -284,6 +302,8 @@ def acceptance_hook(
                         return unfinished_verdict(
                             rubrics, reason=check.reason, trust=check.trust
                         ), 'output'
+                    # L2 读过的内容也算这份裁决的来源：L3 判过了，信任照样取两边最严的。
+                    trust = strictest_trust(trust, check.trust)
                 if not outcome:
                     return derive_verdict(
                         rubrics, {}, trust=trust, failure='outcome_check_off'
@@ -298,12 +318,14 @@ def acceptance_hook(
                     max_turns=max_turns,
                     time_limit=None,
                     trust=trust,
-                    evidence_text=_raw_text(ctx),
+                    evidence_text=_evidence_corpus(ctx),
                 )
         except TimeoutError as exc:
             if deadline.expired():
                 logger.warning(
-                    '期望: 验收在时限内完成。 实际: 超时。 下一步: 放行并标 unverified。'
+                    '期望: 验收在 %s 秒内完成。 实际: 超时。 下一步: 放行并标 unverified；'
+                    '验收常常超时就调大 acceptance_verifier_timeout。',
+                    timeout,
                 )
                 return derive_verdict(rubrics, {}, trust=trust, failure='verifier_timeout'), None
             return _failed(rubrics, trust, exc), None
@@ -322,9 +344,13 @@ def _verdict_result(verdict: Verdict, send_back: bool | None) -> HookResult:
 
 
 def _failed(rubrics: list[Rubric], trust: TrustLevel, exc: BaseException) -> Verdict:
+    # 原因只取内核自己写的那几类（解析失败、store 的三件套）：任意异常的文本可能带着模型回复或路径。
+    detail = str(exc)[:200] if isinstance(exc, ValueError | SyndicaError) else ''
     logger.warning(
-        '期望: 验收器正常给出结论。 实际: %s。 下一步: 放行并标 unverified（不装成通过）。',
+        '期望: 验收器正常给出结论。 实际: %s%s。 下一步: 放行并标 unverified（不装成通过）；'
+        '反复出现就查验收用的模型与 .syndica/rubrics。',
         type(exc).__name__,
+        f'（{detail}）' if detail else '',
     )
     return derive_verdict(rubrics, {}, trust=trust, failure=f'verifier_error:{type(exc).__name__}')
 
@@ -342,9 +368,14 @@ def _block_text(block: ContextBlock) -> str:
     return str(content)
 
 
+def _calls(block: ContextBlock) -> list[str]:
+    """工具调用在轨迹里写成的样子：验收器看到的是这个，引它当证据时语料里也得是这个。"""
+    return [f'{call.name}({call.arguments[:_ARGS_CHARS]})' for call in block.tool_calls]
+
+
 def _row(block: ContextBlock) -> str:
     text = _block_text(block)
-    calls = [f'{call.name}({call.arguments[:_ARGS_CHARS]})' for call in block.tool_calls]
+    calls = _calls(block)
     if not text and not calls:
         return ''
     row: dict[str, object] = {'role': block.role}
@@ -355,8 +386,15 @@ def _row(block: ContextBlock) -> str:
     return json.dumps(row, ensure_ascii=False)
 
 
-def _raw_text(ctx: Context) -> str:
-    return '\n'.join(_block_text(block) for block in ctx.current_traj)
+def _evidence_corpus(ctx: Context) -> str:
+    """`user_message` 证据能引的原文：主 Agent 自己的回复与工具输出。用户的消息与内核注入的 Goal /
+    Rubric / 反馈块写的是**要求**，引它们证明不了要求被做到了（M7 收口评审 H1）。"""
+    pieces: list[str] = []
+    for block in ctx.current_traj:
+        if block.role in ('assistant', 'tool') and kind_of(block) is None:
+            pieces.append(_block_text(block))
+            pieces.extend(_calls(block))
+    return '\n'.join(pieces)
 
 
 def _outcome_task(rubrics: Sequence[Rubric], transcript: str) -> str:
@@ -379,10 +417,15 @@ def _load(reply: str, who: str) -> dict[str, Any]:
 
 
 async def _reported(
-    raw: object, evidence_text: str, portal: Portal | None
+    raw: object, evidence_text: str, portal: Portal | None, rubrics: Sequence[Rubric] = ()
 ) -> dict[str, RubricOutcome]:
     if not isinstance(raw, list):
         return {}
+    requirements = {
+        rubric.id: [rubric.statement, *(anchor.quote for anchor in rubric.anchors)]
+        for rubric in rubrics
+    }
+    whole = {line.strip() for line in evidence_text.splitlines() if line.strip()}
     reported: dict[str, RubricOutcome] = {}
     conflicted: set[str] = set()
     for entry in cast('list[object]', raw):
@@ -394,7 +437,9 @@ async def _reported(
             continue
         evidence = _evidence(item.get('evidence'))
         result = item.get('result')
-        reopened = await _reopened(evidence, evidence_text, portal)
+        reopened = await _reopened(evidence, evidence_text, portal) and not _echoes(
+            evidence, requirements.get(rid, ()), whole
+        )
         if result == 'satisfied' and reopened:
             outcome = RubricOutcome(rid, OutcomeKind.SATISFIED, evidence)
         elif result == 'unmet' and reopened:
@@ -433,6 +478,19 @@ async def _reopened(evidence: Sequence[Anchor], text: str, portal: Portal | None
         if anchor.quote not in data.decode('utf-8', errors='replace'):
             return False
     return True
+
+
+def _echoes(evidence: Sequence[Anchor], requirement: Sequence[str], whole: Collection[str]) -> bool:
+    """轨迹证据只是把要求复述了一遍：主 Agent 在回复里照抄要求（「你要我加 section four」）不证明
+    做到了。整行就是这段文字的不算复述：要求就是「只回一个 DONE」时，那一行本身就是证据。文件证据
+    也不算：要求就是「文件里有这段文字」时，那段文字本身就是证据。"""
+    texts = [text.casefold() for text in requirement]
+    return any(
+        anchor.source is AnchorSource.USER_MESSAGE
+        and anchor.quote.strip() not in whole
+        and any(anchor.quote.casefold() in text for text in texts)
+        for anchor in evidence
+    )
 
 
 def _evidence_path(locator: str) -> str:

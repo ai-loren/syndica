@@ -24,10 +24,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 from syndica import __version__
@@ -37,7 +39,7 @@ from syndica.kernel.artifacts import ArtifactHandlers, Violation
 from syndica.kernel.context import ArtifactRef, Context, ContextBlock
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.feedback import is_human_feedback, propose_feedback_rubric
-from syndica.kernel.history_blocks import has_block, kind_of
+from syndica.kernel.history_blocks import HistoryKind, has_block, kind_of
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.modules import FlagDeclaration, FlagValue, RuntimeModule
 from syndica.kernel.protocols.rubric import RubricStore
@@ -46,7 +48,7 @@ from syndica.kernel.rubric_redaction import redacted_goal
 from syndica.kernel.rubrics_builder import project_rubrics
 from syndica.kernel.stores.memory_rubric import InMemoryRubricStore
 from syndica.kernel.tool import Tool
-from syndica.kernel.tools.local import Deliver
+from syndica.kernel.tools.local import Deliver, routed_kind
 from syndica.kernel.verifiers import acceptance_hook
 from syndica.kernel.workspace import Portal
 
@@ -60,6 +62,8 @@ __all__ = ['AcceptanceModule']
 logger = logging.getLogger(__name__)
 
 _HOST_GOAL_LOCATOR = 'msg:goal'
+# 能写出产物的工具：只读的 Agent（`--no-write`、Explorer）不为 Deliver 多付一个工具定义。
+_WRITERS = frozenset({'Write', 'Edit', 'Bash'})
 _FEEDBACK_ID = re.compile(r'[^A-Za-z0-9_.:-]')
 
 
@@ -83,23 +87,40 @@ class _PortalReader:
 
 
 class _FormatChecks:
-    """一个 Agent 的 L1 结果：每个产物最新登记那一版的违规（None = 处理器没能跑），
-    以及哪些是交付物。"""
+    """一个 Agent 的 L1：每个交付物最近校验的那一版与结果（None = 处理器没能跑），以及它在哪个周期被
+    动过。
 
-    def __init__(self, handlers: ArtifactHandlers, portal: Portal | None) -> None:
+    处理器按扩展名派生的 (kind, mime) 选：`Deliver` 的 kind 只是标签——由模型自选的 kind 决定交给哪个
+    处理器，就能把交付物绕过严格的那个（收口评审 H3）。完成时按交付物此刻的版本复核：登记之后被命令
+    改坏的、被删掉的都算在这一次里（H2）；只报这个周期动过的，前一周期留下的问题不让一句无关的回复也被
+    打回。"""
+
+    def __init__(
+        self, handlers: ArtifactHandlers, portal: Portal | None, cycle: Callable[[], int]
+    ) -> None:
         self._handlers = handlers
+        self._portal = portal
         self._reader = None if portal is None else _PortalReader(portal)
+        self._cycle = cycle
+        self._deliverables: dict[str, ArtifactRef] = {}
         self._results: dict[str, tuple[str, list[Violation] | None]] = {}
-        self._deliverables: dict[str, str] = {}
+        self._touched: dict[str, int] = {}
 
     async def on_registered(self, **kwargs: Any) -> HookResult:
         ref = cast(ArtifactRef, kwargs['artifact'])
-        if ref.is_deliverable:
-            self._deliverables[ref.id] = ref.path
-        if self._reader is None:
-            return HookResult()
+        if ref.is_deliverable or ref.id in self._deliverables:
+            self._deliverables[ref.id] = ref
+            self._touched[ref.id] = self._cycle()
+        if self._reader is not None:
+            await self._validate(ref)
+        return HookResult()
+
+    async def _validate(self, ref: ArtifactRef) -> None:
+        assert self._reader is not None
+        kind, mime = routed_kind(ref.path)
+        routed = replace(ref, kind=kind, mime=mime)
         try:
-            violations = await self._handlers.for_(ref).validate(ref, self._reader)
+            violations = await self._handlers.for_(routed).validate(routed, self._reader)
         except Exception as exc:
             logger.warning(
                 '期望: L1 校验 %s（%s）。 实际: 处理器抛出 %s。 下一步: 这一版记成「L1 没能跑」，'
@@ -109,21 +130,39 @@ class _FormatChecks:
                 type(exc).__name__,
             )
             self._results[ref.id] = (ref.version, None)
-            return HookResult()
+            return
         self._results[ref.id] = (ref.version, list(violations))
-        return HookResult()
 
-    def report(self) -> tuple[list[str], list[str]]:
+    async def report(self, cycle: object) -> tuple[list[str], list[str]]:
         problems: list[str] = []
         skipped: list[str] = []
-        for artifact_id, path in self._deliverables.items():
-            result = self._results.get(artifact_id)
-            if result is None or result[1] is None:
-                if self._reader is not None:
-                    skipped.append(path)
+        if self._reader is None or self._portal is None:
+            return problems, skipped
+        for artifact_id, ref in self._deliverables.items():
+            last = self._results.get(artifact_id)
+            try:
+                current = await self._portal.stat(ref.path)
+            except Exception:
+                current = None
+            version = _MISSING if current is None else current.version
+            if last is None or last[0] != version:
+                self._touched[artifact_id] = cast(int, cycle)
+                if current is None:
+                    gone = Violation(rule='missing', message=f'{ref.path} 不见了', anchor=ref.path)
+                    self._results[artifact_id] = (_MISSING, [gone])
+                else:
+                    await self._validate(replace(ref, version=current.version))
+            if self._touched.get(artifact_id) != cycle:
                 continue
-            problems.extend(f'{path}：{v.message}（{v.rule}）' for v in result[1])
+            found = self._results[artifact_id][1]
+            if found is None:
+                skipped.append(ref.path)
+                continue
+            problems.extend(f'{ref.path}：{v.message}（{v.rule}）' for v in found)
         return problems, skipped
+
+
+_MISSING = 'missing'
 
 
 def _first_task(ctx: Context) -> ContextBlock | None:
@@ -158,7 +197,11 @@ class _AgentAcceptance:
         self._portal: Portal | None = None if router is None else router.reader_for(agent.agent_id)
         self._timeout = float(cast(int, flags['acceptance_verifier_timeout']))
         self._max_turns = cast(int, flags['acceptance_verifier_max_turns'])
-        self.formats = _FormatChecks(module.handlers, self._portal)
+        self.formats = _FormatChecks(
+            module.handlers,
+            self._portal,
+            lambda: agent._cycle,  # pyright: ignore[reportPrivateUsage]
+        )
         self.completion = acceptance_hook(
             store=module.store,
             scope=self._scope,
@@ -176,6 +219,8 @@ class _AgentAcceptance:
 
     @property
     def injects(self) -> bool:
+        if self._module.goal is not None:
+            return True  # 宿主给了 Goal：没开任何一层也注入它，`--goal` 不被静默忽略（收口评审 L5）
         return any(
             bool(self._flags[key])
             for key in (
@@ -203,12 +248,24 @@ class _AgentAcceptance:
             )
             return
         task = _first_task(ctx)
-        if (task is None or goal.intent != task.content) and not has_block(
-            ctx.current_traj, goal_key(goal)
-        ):
-            ctx.append(goal_block(goal))
-        if rubrics and not has_block(ctx.current_traj, rubric_key(rubrics)):
+        derived = task is not None and goal.intent == self._module.redactor.redact(
+            cast(str, task.content)
+        )
+        shown = self._shown_goal(goal)
+        if not derived and not has_block(ctx.current_traj, goal_key(shown)):
+            ctx.append(goal_block(shown))
+        stale = not rubrics and any(kind_of(b) is HistoryKind.RUBRIC for b in ctx.current_traj)
+        if (rubrics or stale) and not has_block(ctx.current_traj, rubric_key(rubrics)):
+            # 集合变空也追加一块替代：否则上一个 Goal 的标准仍是最新、受压缩保护的那块。
             ctx.append(rubric_block(rubrics))
+
+    def _shown_goal(self, stored: Goal) -> Goal:
+        """注入给模型看的 Goal：宿主给的那句按原文（只在落盘时脱敏，注入历史不改写模型看到的指令，
+        收口评审 M3）；派生的与读回的照存下的。"""
+        host = self._module.goal
+        if host is None or stored.intent != self._module.redactor.redact(host):
+            return stored
+        return Goal(intent=host, anchors=(_host_anchor(host),), trust=stored.trust)
 
     async def _settle_goal(self, ctx: Context) -> Goal | None:
         store = self._module.store
@@ -220,10 +277,17 @@ class _AgentAcceptance:
         if stored is None:
             return None
         if self._flags['acceptance_rubrics'] and await self._needs_projection(stored, wanted):
+            sources = {anchor.locator: anchor.quote for anchor in stored.anchors}
+            task = _first_task(ctx)
+            if task is not None:
+                # 投影「从 Goal 与任务输入」推导（§7.6）：宿主给了 Goal 时，任务原文也要锚得回去。
+                sources.setdefault(
+                    _locator(task), self._module.redactor.redact(cast(str, task.content))
+                )
             await project_rubrics(
                 scope=self._scope,
                 goal=stored,
-                sources={anchor.locator: anchor.quote for anchor in stored.anchors},
+                sources=sources,
                 llm=self._agent.options.llm,
                 store=store,
                 redactor=self._module.redactor,
@@ -240,11 +304,9 @@ class _AgentAcceptance:
             return None
         host = self._module.goal
         if host is not None:
-            if stored is not None and stored.intent == host:
+            if stored is not None and stored.intent == self._module.redactor.redact(host):
                 return None
-            return Goal(
-                intent=host, anchors=(Anchor(AnchorSource.USER_MESSAGE, _HOST_GOAL_LOCATOR, host),)
-            )
+            return Goal(intent=host, anchors=(_host_anchor(host),))
         if stored is not None:
             return None
         task = _first_task(ctx)
@@ -280,28 +342,37 @@ class _AgentAcceptance:
             if any(anchor.locator == locator for anchor in goal.anchors):
                 return HookResult()
             agents = {info.agent_id for info in await self._runtime.registry.list()}
-            if not is_human_feedback(message.sender, agents):
+            if not is_human_feedback(message.sender, agents | self._module.known_agents):
                 return HookResult()
-            await propose_feedback_rubric(
-                scope=self._scope,
-                rubric_id=_feedback_id(message.id),
-                feedback=content,
-                locator=locator,
-                store=self._module.store,
-                redactor=self._module.redactor,
-                llm=self._agent.options.llm,
-                trust=message.trust,
-                max_turns=self._max_turns,
-            )
+            async with asyncio.timeout(self._timeout):
+                await self._propose(message, locator, content)
         except Exception as exc:
             logger.warning(
                 '期望: 把人的反馈提议成 Rubric。 实际: %s（%s）。 '
-                '下一步: 这条反馈没有提议；它仍作为'
-                '普通消息进了对话。',
+                '下一步: 这条反馈没有提议；它仍作为普通消息进了对话。',
                 self._scope,
                 type(exc).__name__,
             )
         return HookResult()
+
+    async def _propose(self, message: Message, locator: str, content: str) -> None:
+        """有时限（同验收器）：提议在 MESSAGE_INJECTED 里同步跑，挂住就挂住主 Agent 这一轮（收口评审
+        M2）。"""
+        await propose_feedback_rubric(
+            scope=self._scope,
+            rubric_id=_feedback_id(message.id),
+            feedback=content,
+            locator=locator,
+            store=self._module.store,
+            redactor=self._module.redactor,
+            llm=self._agent.options.llm,
+            trust=message.trust,
+            max_turns=self._max_turns,
+        )
+
+
+def _host_anchor(host: str) -> Anchor:
+    return Anchor(AnchorSource.USER_MESSAGE, _HOST_GOAL_LOCATOR, host)
 
 
 def _feedback_id(message_id: str) -> str:
@@ -339,7 +410,7 @@ class AcceptanceModule(RuntimeModule):
         goal: str | None = None,
         handlers: ArtifactHandlers | None = None,
     ) -> None:
-        if goal is not None and not goal.strip():
+        if goal is not None and (not isinstance(cast(object, goal), str) or not goal.strip()):
             raise ConfigError(
                 expected='goal 是一句非空的要求，或省略（从第一条用户消息派生）',
                 received=f'goal={goal!r}',
@@ -350,10 +421,13 @@ class AcceptanceModule(RuntimeModule):
         self.goal = goal
         self.handlers = handlers if handlers is not None else ArtifactHandlers()
         self.attempted: set[tuple[str, str]] = set()
+        # 这个 Runtime 里起过的每个 Agent：退出之后它发过的消息仍不是人的反馈（收口评审 M1）。
+        self.known_agents: set[str] = set()
 
         def plugin_factory(
             runtime: Runtime, agent: BaseAgent, flags: Mapping[str, FlagValue]
         ) -> _AcceptancePlugin:
+            self.known_agents.add(agent.agent_id)
             wiring = _AgentAcceptance(self, runtime, agent, flags)
             hooks: list[tuple[Junction, Callable[..., Awaitable[HookResult]]]] = [
                 (Junction.ARTIFACT_REGISTERED, wiring.formats.on_registered),
@@ -369,7 +443,8 @@ class AcceptanceModule(RuntimeModule):
             runtime: Runtime, agent: BaseAgent, flags: Mapping[str, FlagValue]
         ) -> Mapping[str, Tool]:
             router = runtime.workspace
-            if router is None or 'Deliver' in agent.options.tools:
+            tools = agent.options.tools
+            if router is None or 'Deliver' in tools or not _WRITERS & set(tools):
                 return {}
             return {'Deliver': Deliver(router.portal())}
 
