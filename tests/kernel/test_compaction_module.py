@@ -10,6 +10,11 @@ import asyncio
 import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
+from syndica.kernel.compaction import (
+    GoalDirectedCompaction,
+    PruningCompaction,
+    RuleBasedCompaction,
+)
 from syndica.kernel.compaction_module import CompactionModule
 from syndica.kernel.context import StopReason, ToolCall
 from syndica.kernel.events import EventBus
@@ -59,6 +64,30 @@ def _agent_of(runtime: Runtime, agent_id: str) -> BaseAgent:
     agent = runtime._table.get(agent_id)  # pyright: ignore[reportPrivateUsage]
     assert agent is not None
     return agent
+
+
+@pytest.mark.parametrize(
+    ('name', 'strategy'),
+    [
+        ('goal_directed', GoalDirectedCompaction),
+        ('rule_based', RuleBasedCompaction),
+        ('pruning', PruningCompaction),
+    ],
+)
+async def test_the_strategy_flag_picks_the_named_strategy(name: str, strategy: type) -> None:
+    llm = ScriptedLLM(_script())
+    runtime = Runtime(
+        modules=[CompactionModule()], flags={'compaction_strategy': name, **_SMALL_WINDOW}
+    )
+    try:
+        agent_id = await runtime.spawn(_factory(llm), query='the-task')
+        ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        controller = _agent_of(runtime, agent_id)._compaction  # pyright: ignore[reportPrivateUsage]
+        assert controller is not None and type(controller.strategy) is strategy
+        assert ctx.stop_reason is StopReason.COMPLETED
+        assert len(ctx.current_traj) < 12
+    finally:
+        await runtime.shutdown()
 
 
 async def test_enabled_compaction_bounds_the_context_and_adds_the_tool() -> None:

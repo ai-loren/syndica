@@ -36,6 +36,10 @@ class HistoryKind(Enum):
     GOAL = 'goal'
     RUBRIC = 'rubric'
     VERDICT = 'verdict'
+    BUDGET = 'budget'
+    PROGRESS = 'progress'
+    STRATEGY = 'strategy'
+    BACKGROUND = 'background'
 
 
 def signed_block(

@@ -22,6 +22,10 @@ def test_history_kind_name_to_value_map_is_exactly_this() -> None:
         'GOAL': 'goal',
         'RUBRIC': 'rubric',
         'VERDICT': 'verdict',
+        'BUDGET': 'budget',
+        'PROGRESS': 'progress',
+        'STRATEGY': 'strategy',
+        'BACKGROUND': 'background',
     }
 
 

@@ -2265,6 +2265,7 @@ async def test_end_attributes_land_on_top_of_start_attributes_and_tuples_are_red
 
 _VERBATIM_TEXT = {
     'agent.id',
+    'agent.serves',
     'child.agent_id',
     'message.id',
     'message.to',
@@ -2285,6 +2286,8 @@ def test_the_free_text_attributes_are_exactly_these():
     assert _free_text_keys() == [
         'agent.role',
         'artifact.path',
+        'budget.dimensions',
+        'compaction.note',
         'danger.rule_ids',
         'junction.name',
         'llm.error',

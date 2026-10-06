@@ -153,6 +153,8 @@ def test_discovery_covers_every_error_class_present_in_the_kernel():
     """往返用例参数化自这份清单，新子类因此自动落进覆盖；但清单少认一个不会报错，参数化只会
     跟着缩水。断言确切内容让缩水必须先变红——新增子类要么已被覆盖，要么在这里被拦住。"""
     assert [cls.__name__ for cls in KERNEL_ERROR_CLASSES] == [
+        'BudgetExhausted',
+        'BudgetRefused',
         'ConfigError',
         'ContextOverflowError',
         'ContractViolation',

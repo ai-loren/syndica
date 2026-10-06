@@ -117,6 +117,7 @@ def test_stop_reason_covers_every_terminal_outcome():
         'ABORTED': 'aborted',
         'ERROR': 'error',
         'MAX_TURNS': 'max_turns',
+        'BUDGET': 'budget',
     }
 
 

@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from syndica.kernel.acceptance import VerdictStatus
+from syndica.kernel.budget import Exhaustion
 from syndica.kernel.context import StopReason, TrustLevel
 from syndica.kernel.danger import ConfirmationOutcome, Disposition, RiskLevel
 from syndica.kernel.errors import ContractViolation
@@ -117,7 +118,7 @@ def test_the_enum_values_are_the_schema():
         'REPLAY': 'replay',
         'FULL': 'full',
     }
-    assert TRACE_SCHEMA == 'syndica.trace/5'
+    assert TRACE_SCHEMA == 'syndica.trace/6'
 
 
 def test_the_attribute_set_is_exactly_the_schema():
@@ -174,6 +175,27 @@ def test_the_attribute_set_is_exactly_the_schema():
         'verdict.unverified_cause': 'str',
         'verdict.needs_human': 'str[]',
         'verdict.outcomes': 'str[]',
+        'compaction.trigger': 'str',
+        'compaction.blocks_before': 'int',
+        'compaction.blocks_after': 'int',
+        'compaction.tokens_before': 'int',
+        'compaction.tokens_after': 'int',
+        'compaction.note': 'str',
+        'compaction.archive': 'int?',
+        'budget.input_tokens': 'int',
+        'budget.output_tokens': 'int',
+        'budget.cached_input_tokens': 'int',
+        'budget.turns': 'int',
+        'budget.cost': 'str?',
+        'budget.estimated': 'bool',
+        'budget.limit_tokens': 'int?',
+        'budget.limit_cost': 'str?',
+        'budget.limit_turns': 'int?',
+        'budget.limit_wall_clock_s': 'int?',
+        'budget.percent_left': 'int',
+        'budget.dimensions': 'str[]',
+        'budget.disposition': 'str',
+        'agent.serves': 'str',
     }
 
 
@@ -192,6 +214,8 @@ def test_the_attributes_with_a_fixed_set_of_values_follow_the_kernel_enums():
     assert ATTRIBUTE_DOMAINS['danger.disposition'] == {member.value for member in Disposition}
     assert ATTRIBUTE_DOMAINS['wait.kind'] == {'agent', 'human'}
     assert ATTRIBUTE_DOMAINS['danger.decided_by'] == {'flag', 'policy'}
+    assert ATTRIBUTE_DOMAINS['budget.disposition'] == {member.value for member in Exhaustion}
+    assert ATTRIBUTE_DOMAINS['compaction.trigger'] == {'threshold', 'overflow'}
     assert ATTRIBUTE_DOMAINS['tool.outcome'] == {
         'ok',
         'error',
@@ -440,7 +464,7 @@ def test_a_malformed_header_is_refused(changes: dict[str, Any]):
         _header(**changes)
 
 
-@pytest.mark.parametrize('schema', ['syndica.trace/6', 'syndica.trace/10'])
+@pytest.mark.parametrize('schema', ['syndica.trace/7', 'syndica.trace/10'])
 def test_a_header_from_a_newer_version_says_so_and_that_it_is_not_broken(schema: str):
     with pytest.raises(NewerTraceSchema) as caught:
         _header(schema=schema)
@@ -553,6 +577,12 @@ def test_no_name_that_looks_secret_holds_text():
 
     assert sorted(name for name in fields | textual if looks_secret(name)) == []
     assert sorted(key for key in ATTRIBUTE_KINDS if looks_secret(key)) == [
+        'budget.cached_input_tokens',
+        'budget.input_tokens',
+        'budget.limit_tokens',
+        'budget.output_tokens',
+        'compaction.tokens_after',
+        'compaction.tokens_before',
         'llm.cached_input_tokens',
         'llm.input_tokens',
         'llm.output_tokens',

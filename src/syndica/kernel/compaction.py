@@ -32,12 +32,14 @@ from syndica.kernel.context import (
 )
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.history_blocks import HistoryKind, kind_of, signed_block
+from syndica.kernel.lexical import overlap, terms
 
 __all__ = [
     'CompactionController',
     'CompactionRequest',
     'CompactionResult',
     'CompactionStrategy',
+    'GoalDirectedCompaction',
     'PruningCompaction',
     'RuleBasedCompaction',
     'SummaryCompaction',
@@ -57,6 +59,9 @@ class CompactionRequest:
     budget_tokens: int
     protected: frozenset[int] = frozenset()
     summarize: Summarize | None = None
+    # 还需要什么：未满足的 Rubric 与 Goal 的原文（目标导向型压缩据它挑要留的旧轮次）。空 = 由策略
+    # 自己从轨迹里最新的 Goal / Rubric 块推。
+    needed: tuple[str, ...] = ()
 
 
 @dataclass
@@ -331,6 +336,65 @@ class RuleBasedCompaction:
         return CompactionResult(kept=kept, dropped=dropped, note=note)
 
 
+class GoalDirectedCompaction:
+    """目标导向型（零 LLM 的近似，spec §8.8 第四种）：「最近」与「还需要」是两件事——五十轮前定下的一
+    条约束可能仍然关键，刚才三轮的调试输出完全可以丢。留 protected 与最近 N 轮，再把更早的轮次按
+    与**还需要的东西**（未满足的 Rubric、Goal）的词面相关度从高到低加回来，同分的新者优先，加到预算
+    为止；不相关的轮次最先被丢。没给 `needed` 时按轨迹里最新的 Goal / Rubric 块（没有就按第一条任务
+    消息）推，相当于把全部生效的 Rubric 都当成未满足——宁可多留。"""
+
+    def __init__(self, *, min_keep_turns: int = 2, max_output_chars: int = 4000) -> None:
+        self._min_keep_turns = min_keep_turns
+        self._max_output_chars = max_output_chars
+
+    async def compact(self, request: CompactionRequest) -> CompactionResult:
+        blocks = request.blocks
+        protected = request.protected
+        vocabulary: set[str] = set()
+        for text in _needed_texts(request):
+            vocabulary |= terms(text)
+        floor_from = _floor_start(blocks, self._min_keep_turns)
+        keep: set[int] = set(protected) | set(range(floor_from, len(blocks)))
+        older = [bounds for bounds in _turn_bounds(blocks) if bounds[0] < floor_from]
+        scored = [(overlap(_turn_text(blocks, *bounds), vocabulary), bounds) for bounds in older]
+        relevant = 0
+        for score, (start, end) in sorted(scored, key=lambda item: (-item[0], -item[1][0])):
+            trial = keep | set(range(start, end))
+            if _projected_tokens(blocks, trial, protected, 0) <= request.budget_tokens:
+                keep = trial
+                relevant += score > 0
+        over = _projected_tokens(blocks, keep, protected, 0) > request.budget_tokens
+        cap = self._max_output_chars if over else 0
+        kept, dropped = _materialize(blocks, keep, protected, cap)
+        note = (
+            f'目标导向型压缩：留 {len(kept)} 块（其中 {relevant} 轮旧轮次与未满足的要求相关）、'
+            f'丢 {len(dropped)} 块'
+        )
+        return CompactionResult(kept=kept, dropped=dropped, note=note)
+
+
+def _needed_texts(request: CompactionRequest) -> tuple[str, ...]:
+    if request.needed:
+        return request.needed
+    latest: dict[HistoryKind, str] = {}
+    for block in request.blocks:
+        kind = kind_of(block)
+        if kind in (HistoryKind.GOAL, HistoryKind.RUBRIC):
+            latest[kind] = str(block.content or '')
+    if latest:
+        return tuple(latest.values())
+    first = next((b for b in request.blocks if b.role == 'user' and kind_of(b) is None), None)
+    return () if first is None else (str(first.content or ''),)
+
+
+def _turn_text(blocks: Sequence[ContextBlock], start: int, end: int) -> str:
+    pieces: list[str] = []
+    for block in blocks[start:end]:
+        pieces.append(str(block.content or ''))
+        pieces.extend(f'{call.name} {call.arguments}' for call in block.tool_calls)
+    return '\n'.join(pieces)
+
+
 class PruningCompaction:
     """剪枝型（低成本）：按已完成工具批次丢执行细节——整批丢（assistant 调用 + 结果），保住配对与
     文本推理；protected 的批次不丢。丢到预算内为止（spec §8.8）。"""
@@ -471,6 +535,7 @@ class CompactionController:
     target_tokens: int
     summarize: Summarize | None = None
     on_compacted: Callable[[], None] | None = None
+    needed: Callable[[], Sequence[str]] | None = None
     _requested: bool = field(default=False, init=False)
     _stuck_at: int | None = field(default=None, init=False)
 
@@ -518,6 +583,7 @@ class CompactionController:
             budget_tokens=self.target_tokens if budget_tokens is None else budget_tokens,
             protected=_protected_indices(blocks) | extra_protected,
             summarize=self.summarize,
+            needed=tuple(self.needed()) if self.needed is not None else (),
         )
 
     def overflow_budget(self, tokens_before: int) -> int:

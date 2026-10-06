@@ -15,6 +15,7 @@ from syndica import __version__
 from syndica.kernel.compaction import (
     CompactionController,
     CompactionStrategy,
+    GoalDirectedCompaction,
     PruningCompaction,
     RuleBasedCompaction,
     Summarize,
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 __all__ = ['CompactionModule']
 
 _OFF = 'off'
-_STRATEGIES = (_OFF, 'rule_based', 'pruning', 'summary')
+_STRATEGIES = (_OFF, 'rule_based', 'pruning', 'summary', 'goal_directed')
 
 
 class _CompactTool(Tool):
@@ -88,6 +89,8 @@ def _build_strategy(name: str, summarize: Summarize | None) -> CompactionStrateg
         return PruningCompaction()
     if name == 'summary':
         return SummaryCompaction()
+    if name == 'goal_directed':
+        return GoalDirectedCompaction()
     raise ConfigError(
         expected=f'compaction_strategy 是 {list(_STRATEGIES)} 之一',
         received=f'收到 {name!r}',
@@ -166,7 +169,7 @@ class CompactionModule(RuntimeModule):
                 FlagDeclaration(
                     key='compaction_strategy',
                     default=_OFF,
-                    description='压缩策略：off / rule_based / pruning / summary',
+                    description='压缩策略：off / rule_based / pruning / summary / goal_directed',
                     choices=_STRATEGIES,
                 ),
                 FlagDeclaration(

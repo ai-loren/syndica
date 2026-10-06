@@ -93,6 +93,7 @@ _UNFINISHED: dict[StopReason | None, str] = {
     None: '它在给出结论之前被硬终止了（kill / 关机），轨迹可能停在一轮的中间',
     StopReason.ERROR: '它以错误结束',
     StopReason.MAX_TURNS: '它用完了轮次预算',
+    StopReason.BUDGET: '它的预算（轮次 / token / 成本 / 时间之一）用完了',
     StopReason.ABORTED: '它被中止了',
     StopReason.COMPLETED: '它正常结束，但最后一轮没有留下任何文字',
 }
@@ -112,6 +113,11 @@ def _next_step(child_id: str, reason: StopReason | None) -> str:
     让它立刻再次 `max_turns`，那条消息留在邮箱里随队列被摘掉——模型会一轮接一轮地叫醒一个再也
     干不了活的 Agent，把自己的预算也耗光。
     """
+    if reason is StopReason.BUDGET:
+        return (
+            '预算用完的 Agent 拒收消息，SendMessage 叫不醒它；用 GetBudget 看你自己还剩多少，'
+            '剩得够就用 Delegate 派一个新的 Agent、只交给它一件更小的事，不够就自己收尾交付。'
+        )
     if reason is StopReason.MAX_TURNS:
         return (
             '它的轮次预算不会重置，再给它发 SendMessage 只会让它立刻停下、那条消息随之丢失；'

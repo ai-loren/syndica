@@ -70,7 +70,11 @@ class FileMemoryStore:
         inner = entry.entry
         with self._locked_key(inner.scope, inner.workspace) as key:
             entries = self._read_short(key, inner.scope, inner.workspace)
-            seq = (entries[-1].seq if entries else 0) + 1
+            # 整理过的条目会被裁掉：序号要越过 through_seq 接着发，不然新条目会落在已整理的区间里、
+            # 再也不被整理（entries(after_seq=through_seq) 看不见它们）。
+            folded = self._read_long(key)
+            last = max(entries[-1].seq if entries else 0, folded.through_seq if folded else 0)
+            seq = last + 1
             stored = MemoryEntry(
                 seq=seq,
                 scope=inner.scope,
@@ -117,6 +121,11 @@ class FileMemoryStore:
                 updated_at=time.time(),
             )
             self._write(key, _LONG, long_to_json(record))
+            # 整理进长期层的短期条目不再有读者：裁掉，短期文件不随长跑无界增长（M6 收口评审 M5）。
+            entries = self._read_short(key, sections.scope, sections.workspace)
+            kept = [entry for entry in entries if entry.seq > sections.through_seq]
+            if len(kept) != len(entries):
+                self._write(key, _SHORT, short_to_json(sections.scope, sections.workspace, kept))
             return version + 1
 
     # --- internals ------------------------------------------------------------------------

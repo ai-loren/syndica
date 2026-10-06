@@ -512,6 +512,8 @@ class BaseAgent:
         # 之后调它（§7.6）。`_rubrics_due` 标「这个周期还没调过」。
         self._rubrics: Callable[[Context], Awaitable[None]] | None = None
         self._rubrics_due = False
+        # 压缩前的归档（会话根才有）：Runtime 经 `_attach_archive` 装上。
+        self._archive: Callable[[list[ContextBlock]], Awaitable[int | None]] | None = None
         # 当前周期的那条输入（query 或第一条注入）：本周期的 Goal 代理，压缩时必须活着（评审 M2）。
         self._cycle_anchor: ContextBlock | None = None
         # 一次性辅助调用（压缩摘要、记忆整理）计数：每次用一个**负** turn 号开 llm_call 作用域，既不
@@ -839,16 +841,21 @@ class BaseAgent:
         if unchanged or (force and not shrank):
             controller.settle(tokens_now=tokens_before, changed=False)
             return False
+        archived, proceed = await self._archive_before_compaction(pristine, force=force)
+        if not proceed:
+            controller.settle(tokens_now=tokens_before, changed=False)
+            return False
         ctx._replace_traj(final)  # pyright: ignore[reportPrivateUsage]
         self._tracing.event(
             'compaction',
             {
-                'trigger': trigger,
-                'blocks_before': len(pristine),
-                'blocks_after': len(final),
-                'tokens_before': tokens_before,
-                'tokens_after': tokens_after,
-                'note': result.note,
+                'compaction.trigger': trigger,
+                'compaction.blocks_before': len(pristine),
+                'compaction.blocks_after': len(final),
+                'compaction.tokens_before': tokens_before,
+                'compaction.tokens_after': tokens_after,
+                'compaction.note': result.note,
+                'compaction.archive': archived,
             },
         )
         await self._emit(
@@ -865,6 +872,31 @@ class BaseAgent:
         if controller.on_compacted is not None:
             controller.on_compacted()
         return True
+
+    async def _archive_before_compaction(
+        self, pristine: list[ContextBlock], *, force: bool
+    ) -> tuple[int | None, bool]:
+        """压缩不可逆：会话持久化开着时，先把压缩前的整份轨迹归档进 SessionStore（spec §8.8「压缩前
+        必须留快照」）。交回（归档序号, 要不要接着压）。归档失败时阈值路这次不压、下一轮再试；超限兜
+        底照压并记 ERROR——不压这一轮就失败，宁可少一份前像也不让 run 卡死在超窗上。取消照常上抛。"""
+        archive = self._archive
+        if archive is None:
+            return None, True
+        try:
+            return await archive(pristine), True
+        except Exception:
+            logger.exception(
+                '期望: 压缩前把整份轨迹归档进会话存储。 实际: 归档失败。 下一步: %s；查会话存储'
+                '（磁盘满 / 权限）。',
+                '这一次照常压缩（超限兜底）、前像没有留下' if force else '这次不压缩，下一轮再试',
+            )
+            return None, force
+
+    def _attach_archive(
+        self, archive: Callable[[list[ContextBlock]], Awaitable[int | None]]
+    ) -> None:
+        """装上压缩前的归档（Runtime 在会话根上调）。"""
+        self._archive = archive
 
     def _cycle_anchor_index(self, blocks: list[ContextBlock]) -> frozenset[int]:
         """当前周期的那条输入（query 或第一条注入）在 `blocks` 里的下标——它是本周期的 Goal 代理，

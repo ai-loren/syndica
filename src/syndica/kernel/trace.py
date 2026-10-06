@@ -44,7 +44,7 @@ __all__ = [
     'verbatim_attribute',
 ]
 
-TRACE_SCHEMA = 'syndica.trace/5'
+TRACE_SCHEMA = 'syndica.trace/6'
 _SCHEMA_VERSION = re.compile(r'syndica\.trace/([1-9][0-9]{0,8})')
 
 
@@ -57,8 +57,8 @@ def readable_schema(schema: object) -> None:
     `ContractViolation`。读 trace 的一方在读任何别的字段之前先问它：新版本的头可能连字段都不一样。
 
     更旧的版本照样读：闭集只增不减，旧 trace 里的每个字段新读者都认得（`/2` 加了 Module 的 span 属性
-    与扩展切点事件，`/3` 加了产物边的属性与读到的文件的出处，`/4` 加了验收裁决，`/5` 加了逐条结
-    论）。按相等判的话，升一次版本就让此前的每一个 trace 报「删掉它」。
+    与扩展切点事件，`/3` 加了产物边的属性与读到的文件的出处，`/4` 加了验收裁决，`/5` 加了逐条结论，
+    `/6` 加了预算与长程）。按相等判的话，升一次版本就让此前的每一个 trace 报「删掉它」。
     """
     if schema == TRACE_SCHEMA:
         return
@@ -180,6 +180,30 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'verdict.unverified_cause': 'str',
         'verdict.needs_human': 'str[]',
         'verdict.outcomes': 'str[]',
+        'compaction.trigger': 'str',
+        'compaction.blocks_before': 'int',
+        'compaction.blocks_after': 'int',
+        'compaction.tokens_before': 'int',
+        'compaction.tokens_after': 'int',
+        'compaction.note': 'str',
+        'compaction.archive': 'int?',
+        # 预算（agent span 收尾时）：这个 Agent 含后代用掉的三档 token、轮次与成本（Decimal 的十进制
+        # 文字；None = 有价格未知的调用），以及约束它的那一层上限。
+        'budget.input_tokens': 'int',
+        'budget.output_tokens': 'int',
+        'budget.cached_input_tokens': 'int',
+        'budget.turns': 'int',
+        'budget.cost': 'str?',
+        'budget.estimated': 'bool',
+        'budget.limit_tokens': 'int?',
+        'budget.limit_cost': 'str?',
+        'budget.limit_turns': 'int?',
+        'budget.limit_wall_clock_s': 'int?',
+        'budget.percent_left': 'int',
+        'budget.dimensions': 'str[]',
+        'budget.disposition': 'str',
+        # 伴生 Agent 的 agent span 上：它替谁干活。
+        'agent.serves': 'str',
     }
 )
 
@@ -188,8 +212,10 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
 # 是为了不让模型依赖执行层。`tool.outcome` 与追加结果块的位置一一对应（M3 trace schema）。
 ATTRIBUTE_DOMAINS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
-        'stop_reason': frozenset({'completed', 'aborted', 'error', 'max_turns'}),
+        'stop_reason': frozenset({'completed', 'aborted', 'error', 'max_turns', 'budget'}),
         'verdict.status': frozenset({'pass', 'partial', 'block', 'unverified'}),
+        'compaction.trigger': frozenset({'threshold', 'overflow'}),
+        'budget.disposition': frozenset({'graceful_wrapup', 'hard_stop', 'ask_human'}),
         'tool.outcome': frozenset(
             {
                 'ok',
@@ -231,6 +257,7 @@ _IDENTIFIER_ATTRIBUTES = frozenset(
     {
         'agent.id',
         'child.agent_id',
+        'agent.serves',
         'message.id',
         'message.to',
         'llm.request_digest',

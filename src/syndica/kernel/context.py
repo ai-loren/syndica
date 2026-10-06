@@ -47,6 +47,7 @@ class StopReason(Enum):
     ABORTED = 'aborted'
     ERROR = 'error'
     MAX_TURNS = 'max_turns'
+    BUDGET = 'budget'
 
 
 @dataclass(frozen=True)

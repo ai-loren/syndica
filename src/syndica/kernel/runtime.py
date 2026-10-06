@@ -1473,6 +1473,10 @@ class Runtime:
                 self._carry_truncated_taint(agent, fork_from, source_trust)
             agent._attach_gate(gate)  # pyright: ignore[reportPrivateUsage]
             agent._attach_tracing(self._tracing)  # pyright: ignore[reportPrivateUsage]
+            if session and self._sessions is not None:
+                agent._attach_archive(  # pyright: ignore[reportPrivateUsage]
+                    functools.partial(self._archive_pre_image, agent_id)
+                )
             if self._artifacts is not None:
                 router = self._workspace
                 agent._attach_artifact_store(  # pyright: ignore[reportPrivateUsage]
@@ -2101,6 +2105,18 @@ class Runtime:
             return
         for agent_id in list(self._table.agent_ids()):
             await self._checkpoint(agent_id)
+
+    async def _archive_pre_image(self, agent_id: str, blocks: list[ContextBlock]) -> int | None:
+        """把会话根压缩前的整份轨迹归档（只增的历史副本），交回归档序号。落盘前过 Runtime 的
+        Redactor；不是会话根、或这时已不在表里，就不归档。"""
+        store = self._sessions
+        agent = self._table.get(agent_id)
+        info = await self.registry.get(agent_id)
+        if store is None or agent is None or info is None or info.session_id is None:
+            return None
+        record = await self._session_record(store, info.session_id, agent, info)
+        record.content = list(blocks)
+        return await store.archive(info.session_id, redacted_record(record, self._redactor))
 
     async def _checkpoint(self, agent_id: str) -> None:
         """把一个会话根 Agent 的当前轨迹存进 SessionStore（spec §15 的会话持久化）。

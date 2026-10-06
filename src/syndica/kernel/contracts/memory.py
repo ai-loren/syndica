@@ -81,6 +81,27 @@ class MemoryStoreContract(ContractSuite):
         later = await store.entries(MemoryScope.WORKSPACE, '/w', after_seq=1)
         assert [e.seq for e in later] == [2, 3]
 
+    async def test_consolidated_entries_are_trimmed_from_short_term(
+        self, store: MemoryStore
+    ) -> None:
+        # 整理进长期层的短期条目不再有读者：留着它们，短期记录随长跑无界增长（M6 收口评审 M5）。
+        for i in range(3):
+            await store.record(_entry(text=f'n{i}'))
+        await store.consolidate(_sections(through_seq=2), expected_version=0)
+        remaining = await store.entries(MemoryScope.WORKSPACE, '/w')
+        assert [e.seq for e in remaining] == [3]
+
+    async def test_seq_keeps_counting_after_everything_was_trimmed(
+        self, store: MemoryStore
+    ) -> None:
+        # 裁空之后若从 1 重新编号，新条目落在已整理的区间里，此后再也不被整理。
+        for i in range(2):
+            await store.record(_entry(text=f'n{i}'))
+        await store.consolidate(_sections(through_seq=2), expected_version=0)
+        assert await store.record(_entry(text='later')) == 3
+        later = await store.entries(MemoryScope.WORKSPACE, '/w', after_seq=2)
+        assert [e.text for e in later] == ['later']
+
     async def test_two_levels_are_isolated(self, store: MemoryStore) -> None:
         await store.record(_entry(scope=MemoryScope.WORKSPACE, workspace='/w', text='ws'))
         await store.record(_entry(scope=MemoryScope.GLOBAL, workspace=None, text='global'))

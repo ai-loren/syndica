@@ -318,3 +318,126 @@ def test_a_compaction_that_stays_over_threshold_keeps_backoff() -> None:
     assert not controller.should_compact(120)
     assert not controller.should_compact(150)  # 长了但没到余量
     assert controller.should_compact(200)  # 120 + 60 之后才重试
+
+
+async def test_a_traced_compaction_is_recorded_and_leaves_the_trace_complete() -> None:
+    # 压缩点要进 trace（spec §8.8）：事件的属性键得在闭集里，否则这一条丢掉、整个 trace 不写结局。
+    from syndica.kernel.redaction import RuleRedactor
+    from syndica.kernel.runtime import Runtime
+    from syndica.kernel.stores import InMemoryTraceStore
+    from syndica.kernel.trace import SpanKind
+    from syndica.kernel.trace_recorder import TraceRecorder
+
+    store = InMemoryTraceStore()
+    recorder = TraceRecorder(store, RuleRedactor())
+    await recorder.begin()
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = _agent([_call('c1'), _call('c2'), _call('c3'), ScriptedTurn(content='done')])
+        agent._attach_compaction(  # pyright: ignore[reportPrivateUsage]
+            CompactionController(
+                strategy=RuleBasedCompaction(min_keep_turns=1),
+                threshold_tokens=30,
+                target_tokens=15,
+            )
+        )
+        return agent
+
+    runtime = Runtime(tracer=recorder)
+    try:
+        agent_id = await runtime.spawn(build, query='the-task-go')
+        await runtime.wait(agent_id)
+    finally:
+        await runtime.shutdown()
+    await recorder.finish()
+
+    assert recorder.complete and recorder.dropped == 0
+    spans = await store.spans(recorder.trace_id)
+    turns = [s for s in spans if s.kind is SpanKind.TURN]
+    events = [e for s in turns for e in s.events if e.name == 'compaction']
+    assert events and events[0].attributes['compaction.trigger'] == 'threshold'
+
+
+def _compacting_factory(script: list[ScriptedTurn]) -> Any:
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = _agent(script)
+        agent._attach_compaction(  # pyright: ignore[reportPrivateUsage]
+            CompactionController(
+                strategy=RuleBasedCompaction(min_keep_turns=1),
+                threshold_tokens=30,
+                target_tokens=15,
+            )
+        )
+        return agent
+
+    return build
+
+
+async def test_a_session_root_archives_its_whole_pre_image_before_compacting() -> None:
+    # 压缩不可逆：压掉的那几块要能从归档里回看（spec §8.8「压缩前必须留快照」，M6 后续）。
+    from syndica.kernel.redaction import RuleRedactor
+    from syndica.kernel.runtime import ExitMode, Runtime
+    from syndica.kernel.stores import InMemorySessionStore
+
+    store = InMemorySessionStore()
+    runtime = Runtime(sessions=store, redactor=RuleRedactor())
+    script = [_call('c1'), _call('c2'), _call('c3'), ScriptedTurn(content='done')]
+    try:
+        sid = await runtime.spawn(
+            _compacting_factory(script),
+            query='the-task-go',
+            exit_mode=ExitMode.ZOMBIE,
+            session=True,
+        )
+        ctx = await runtime.wait(sid)
+    finally:
+        await runtime.shutdown()
+    archived = await store.read_archived(sid, 1)
+    assert archived is not None
+    kept = {b.tool_call_id for b in ctx.current_traj if b.tool_call_id}
+    before = {b.tool_call_id for b in archived.content if b.tool_call_id}
+    assert 'c1' in before and 'c1' not in kept  # 压掉的那块在归档里
+
+
+class _BrokenArchive(Exception):
+    pass
+
+
+async def test_a_failed_archive_skips_the_threshold_compaction_this_turn() -> None:
+    async def failing(blocks: list[Any]) -> int:
+        raise _BrokenArchive('disk full')
+
+    agent = _agent([_call('c1'), _call('c2'), _call('c3'), ScriptedTurn(content='done')])
+    agent._attach_compaction(  # pyright: ignore[reportPrivateUsage]
+        CompactionController(
+            strategy=RuleBasedCompaction(min_keep_turns=1), threshold_tokens=30, target_tokens=15
+        )
+    )
+    agent._attach_archive(failing)  # pyright: ignore[reportPrivateUsage]
+    ctx = await agent.run('the-task-go')
+    assert len(ctx.current_traj) >= 8  # 前像没存下：不做不可逆的改写
+
+
+async def test_a_failed_archive_does_not_stop_the_overflow_fallback() -> None:
+    # 超限兜底不压这一轮就失败：前像没存下也照压，宁可少一份快照也不让 run 卡死在超窗上。
+    async def failing(blocks: list[Any]) -> int:
+        raise _BrokenArchive('disk full')
+
+    agent = _agent(
+        [
+            _call('c1'),
+            _call('c2'),
+            ScriptedTurn(raises=_overflow()),
+            ScriptedTurn(content='recovered'),
+        ]
+    )
+    agent._attach_compaction(  # pyright: ignore[reportPrivateUsage]
+        CompactionController(
+            strategy=RuleBasedCompaction(min_keep_turns=1),
+            threshold_tokens=10_000,
+            target_tokens=20,
+        )
+    )
+    agent._attach_archive(failing)  # pyright: ignore[reportPrivateUsage]
+    ctx = await agent.run('go')
+    assert ctx.current_traj[-1].content == 'recovered'

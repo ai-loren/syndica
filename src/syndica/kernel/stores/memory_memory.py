@@ -30,7 +30,8 @@ class InMemoryMemoryStore:
         inner = entry.entry
         key = _key(inner.scope, inner.workspace)
         log = self._short.setdefault(key, [])
-        seq = (log[-1].seq if log else 0) + 1
+        folded = self._long.get(key)
+        seq = max(log[-1].seq if log else 0, folded.through_seq if folded else 0) + 1
         stored = copy.deepcopy(inner)
         stored.seq = seq
         log.append(stored)
@@ -64,4 +65,6 @@ class InMemoryMemoryStore:
             version=version + 1,
             updated_at=time.time(),
         )
+        log = self._short.get(key, [])
+        self._short[key] = [entry for entry in log if entry.seq > sections.through_seq]
         return version + 1

@@ -561,6 +561,10 @@ _NO_ANSWER: dict[StopReason | None, tuple[str, str]] = {
             'chat 里同一个 Agent 的轮数跨消息累计，用完要重开 chat'
         ),
     ),
+    StopReason.BUDGET: (
+        '它的预算用完了，收尾的那一轮也没有留下文字',
+        '提高 --max-turns / --max-tokens / --max-cost / --max-wall-clock 后重试，或把任务拆小',
+    ),
     StopReason.ABORTED: (
         '它被中止了，例如等人回答时 stdin 已经关闭',
         '在交互终端里重跑并回答它的提问，或在 prompt 里一次给全它需要的信息',
@@ -579,6 +583,10 @@ _CUT_SHORT: dict[StopReason | None, str] = {
     StopReason.MAX_TURNS: (
         '注意: Agent 用完了轮次预算（max_turns）才停下，本次输出是它最后留下的一段文字，'
         '可能不完整；需要完整结果就提高 --max-turns 重试'
+    ),
+    StopReason.BUDGET: (
+        '注意: Agent 的预算用完了，本次输出是它收尾时交出的那一段，未完成的部分写在里面；'
+        '需要做完就提高预算重试'
     ),
     StopReason.ABORTED: '注意: Agent 被中止了，本次输出是它最后留下的一段文字，可能不完整',
 }
