@@ -71,6 +71,7 @@ def test_the_reference_document_matches_an_independent_golden():
         '`long_horizon_drift_window`',
         '`long_horizon_semantic_drift`',
         '`long_horizon_max_continuations`',
+        '`background_after_seconds`',
     ]
     by_key = {row[0]: row for row in rows}
     assert by_key['`untrusted_high_risk`'] == [

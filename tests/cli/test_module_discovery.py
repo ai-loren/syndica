@@ -104,6 +104,7 @@ def test_module_rows_put_builtins_first_in_install_order_then_third_parties():
         ('memory', '可启用'),
         ('acceptance', '可启用'),
         ('long-horizon', '可启用'),
+        ('background', '可启用'),
         ('read-only', '开发期（命令行决定）'),
         ('dev', '开发期（命令行决定）'),
         ('alpha', '已启用'),
@@ -112,8 +113,8 @@ def test_module_rows_put_builtins_first_in_install_order_then_third_parties():
         ('zeta', '可启用'),
     ]
     assert rows[0].source.startswith('内置 ')
-    assert rows[11].source == '来源不明'
-    assert rows[10].source == 'syndica-example-module 1.2.0'
+    assert rows[12].source == '来源不明'
+    assert rows[11].source == 'syndica-example-module 1.2.0'
 
 
 def test_optional_builtins_and_discovered_third_party_modules_can_be_enabled_in_order():
@@ -214,7 +215,7 @@ def test_modules_list_escapes_what_a_distribution_says_about_itself(tmp_path: Pa
     assert '\x1b' not in stdout
     assert '\u202e' not in stdout
     assert stdout.splitlines()[-1].startswith('alpha\t')
-    assert len(stdout.splitlines()) == 11
+    assert len(stdout.splitlines()) == 12
 
 
 def test_modules_show_prints_a_builtin_manifest(tmp_path: Path):

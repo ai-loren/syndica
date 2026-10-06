@@ -88,3 +88,14 @@ def test_a_drifting_run_restates_the_goal_and_trace_show_lists_it(tmp_path: Path
     assert code == 0, stderr
     section = shown.split('长程：\n', 1)[1].split('\n\n', 1)[0]
     assert 'goal.drift' in section and 'on_goal_drift → remind' in section
+
+
+def test_a_run_with_background_installed_writes_no_replay_document(tmp_path: Path) -> None:
+    config = _config(tmp_path, 'background', '  background_after_seconds: 30\n')
+    llm = ScriptedLLM([ScriptedTurn(content='done')])
+    argv = ['--config', config, 'run', 'go', '--agent', 'Worker', '--trace', 'replay']
+    code, stdout, stderr = _cli(tmp_path, llm, argv)
+    assert code == 0, stderr
+    assert stdout == 'done\n'
+    traces = list((tmp_path / '.syndica' / 'traces').iterdir())
+    assert traces and not any((trace / 'replay.json').exists() for trace in traces)

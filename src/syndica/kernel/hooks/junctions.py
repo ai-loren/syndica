@@ -40,6 +40,10 @@
 可拦截等于让一个 hook 把闸放掉，而 hook 只能收紧不能放宽——与信任级别那条是同一条规则。
 **观察者也答不了这次确认**：可观察切点的返回值被整个丢弃，答复通道在 surface 侧。
 
+两个背景化切点同样可观察：`TOOL_MOVED_TO_BACKGROUND` 报「这次调用已经转到后台、占位已经交回」，
+`BACKGROUND_TOOL_COMPLETED` 报「真结果已经过了 `POST_TOOL_USE`、正交给 Agent」。要改真结果，照旧在
+`POST_TOOL_USE` 改——它在后台那一段也跑，跑在真结果上。
+
 三个生命周期切点（`RUNTIME_SHUTDOWN` / `AGENT_SPAWN` / `AGENT_DESPAWN`）同样只报既成事实：
 Agent 已经建好、条目已经摘掉、关机已经开始，没有一处还能被 hook 改。`AGENT_DESPAWN` 在条目消失
 **之后**触发，因此想留下父子关系只能在 `AGENT_SPAWN` 上记（它带 `parent_id`）。`RUNTIME_START`
@@ -115,6 +119,8 @@ class Junction(Enum):
     LLM_FAILURE = 'llm_failure'
     ARTIFACT_REGISTERED = 'artifact_registered'
     COMPLETION_PROPOSED = 'completion_proposed'
+    TOOL_MOVED_TO_BACKGROUND = 'tool_moved_to_background'
+    BACKGROUND_TOOL_COMPLETED = 'background_tool_completed'
 
 
 INTERCEPTABLE: frozenset[Junction] = frozenset(
@@ -142,6 +148,8 @@ OBSERVABLE: frozenset[Junction] = frozenset(
         Junction.MESSAGE_INJECTED,
         Junction.TOOL_CONFIRMATION_REQUIRED,
         Junction.ARTIFACT_REGISTERED,
+        Junction.TOOL_MOVED_TO_BACKGROUND,
+        Junction.BACKGROUND_TOOL_COMPLETED,
     }
 )
 

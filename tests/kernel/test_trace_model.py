@@ -206,6 +206,7 @@ def test_the_attribute_set_is_exactly_the_schema():
         'drift.confirmed': 'bool?',
         'strategy.hook': 'str',
         'strategy.move': 'str',
+        'background.id': 'str',
     }
 
 
@@ -254,6 +255,7 @@ def test_the_attributes_with_a_fixed_set_of_values_follow_the_kernel_enums():
         'unknown_tool',
         'bad_arguments',
         'interrupted',
+        'backgrounded',
     }
     assert set(ATTRIBUTE_DOMAINS) <= set(ATTRIBUTE_KINDS)
 

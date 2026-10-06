@@ -162,6 +162,7 @@ def _builtin_modules(llm: _ReplayLLM, fallbacks: str) -> dict[str, Callable[[], 
         'memory': MemoryModule,
         'acceptance': _acceptance_not_rebuilt,
         'long-horizon': _long_horizon_not_rebuilt,
+        'background': _background_not_rebuilt,
     }
 
 
@@ -184,6 +185,17 @@ def _long_horizon_not_rebuilt() -> RuntimeModule:
         next_action=(
             '装了 long-horizon 的 run 不写回放文档，这份文档是手写或改过的；'
             '用原始 run 的 trace 排查'
+        ),
+    )
+
+
+def _background_not_rebuilt() -> RuntimeModule:
+    """后台调用的结果在哪一轮进历史取决于真实耗时：回放没有那段时间。"""
+    raise ModulesNotRebuilt(
+        expected='回放重建这份文档记着的内置 Module background',
+        received='它的结果在哪一轮进历史取决于后台调用真实跑了多久，回放复现不了',
+        next_action=(
+            '装了 background 的 run 不写回放文档，这份文档是手写或改过的；用原始 run 的 trace 排查'
         ),
     )
 

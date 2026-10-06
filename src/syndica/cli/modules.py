@@ -46,6 +46,7 @@ OPTIONAL_BUILTINS: tuple[str, ...] = (
     'memory',
     'acceptance',
     'long-horizon',
+    'background',
 )
 # 命令行决定的开发期 Module：`--no-write` 装 read-only，dev 每次都装、排在最后。
 DEVELOPMENT: tuple[str, ...] = ('read-only', 'dev')

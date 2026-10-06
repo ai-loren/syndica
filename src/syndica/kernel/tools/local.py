@@ -430,6 +430,7 @@ class Bash(Tool):
     __tool_name__ = 'Bash'
     __tool_command_args__ = ('command',)
     __tool_external_input__ = True
+    __tool_backgroundable__ = True
 
     def __init__(self, portal: Portal, *, output_limit: int | None = None) -> None:
         self._portal = portal

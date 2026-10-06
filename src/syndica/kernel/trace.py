@@ -214,6 +214,8 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'drift.confirmed': 'bool?',
         'strategy.hook': 'str',
         'strategy.move': 'str',
+        # 背景化（tool_call span 上）：这次调用转到后台时的编号。
+        'background.id': 'str',
     }
 )
 
@@ -247,6 +249,7 @@ ATTRIBUTE_DOMAINS: Mapping[str, frozenset[str]] = MappingProxyType(
                 'unknown_tool',
                 'bad_arguments',
                 'interrupted',
+                'backgrounded',
             }
         ),
         'danger.risk': frozenset({'none', 'low', 'high'}),
@@ -276,6 +279,7 @@ _IDENTIFIER_ATTRIBUTES = frozenset(
         'message.to',
         'llm.request_digest',
         'artifact.version',
+        'background.id',
     }
 )
 

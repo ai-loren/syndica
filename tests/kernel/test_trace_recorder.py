@@ -2271,6 +2271,7 @@ _VERBATIM_TEXT = {
     'message.to',
     'llm.request_digest',
     'artifact.version',
+    'background.id',
 }
 
 

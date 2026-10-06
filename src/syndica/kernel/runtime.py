@@ -3268,6 +3268,11 @@ class Runtime:
         for interrupted in (slot.waiter, slot.delegation):
             if interrupted is not None:
                 interrupted.interrupt(WaitState.ABORTED)
+        # 后台调用同理：等它们的那一轮要被叫醒，它们自己也是这件被中止的活的一部分。
+        agent = self._table.get(agent_id)
+        background = None if agent is None else agent._background  # pyright: ignore[reportPrivateUsage]
+        if background is not None:
+            background.cancel_all('被中止了')
 
     async def _pause_one(self, agent_id: str, *, named: bool) -> None:
         slot, info = await self._control_target('pause', agent_id, named=named)

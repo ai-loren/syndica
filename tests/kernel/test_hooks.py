@@ -25,7 +25,7 @@ from syndica.kernel.hooks import center as center_module
 _TIMEOUT = 1.0
 
 
-def test_eighteen_junctions_exist():
+def test_twenty_junctions_exist():
     """取值撞车会让成员静默塌成别名；切点名计入公开 API。"""
     assert {junction.name: junction.value for junction in Junction} == {
         'RUNTIME_SHUTDOWN': 'runtime_shutdown',
@@ -46,6 +46,8 @@ def test_eighteen_junctions_exist():
         'LLM_FAILURE': 'llm_failure',
         'ARTIFACT_REGISTERED': 'artifact_registered',
         'COMPLETION_PROPOSED': 'completion_proposed',
+        'TOOL_MOVED_TO_BACKGROUND': 'tool_moved_to_background',
+        'BACKGROUND_TOOL_COMPLETED': 'background_tool_completed',
     }
 
 
@@ -72,6 +74,8 @@ def test_each_junction_is_classified_as_declared():
         Junction.MESSAGE_INJECTED,
         Junction.TOOL_CONFIRMATION_REQUIRED,
         Junction.ARTIFACT_REGISTERED,
+        Junction.TOOL_MOVED_TO_BACKGROUND,
+        Junction.BACKGROUND_TOOL_COMPLETED,
     }
 
 
@@ -835,8 +839,10 @@ def test_declaring_extension_junctions_leaves_the_kernel_classifications_untouch
         Junction.MESSAGE_INJECTED,
         Junction.TOOL_CONFIRMATION_REQUIRED,
         Junction.ARTIFACT_REGISTERED,
+        Junction.TOOL_MOVED_TO_BACKGROUND,
+        Junction.BACKGROUND_TOOL_COMPLETED,
     }
-    assert len(set(Junction)) == 18
+    assert len(set(Junction)) == 20
 
 
 async def test_a_kernel_junction_in_neither_classification_is_rejected_at_trigger(

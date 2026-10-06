@@ -361,7 +361,7 @@ workspaces agents operate on to avoid this.
 exist and where they come from without importing any of them, and marks those whose code is inside
 the workspace. `syndica modules show <name>` imports a module to show its manifest; when its code
 is inside the workspace, the configuration must enable it and be confirmed first. Besides the built-in `retry`,
-`prefix-drift`, `compaction`, `memory`, `acceptance` and `long-horizon`, it can name a third-party module installed under the `syndica.modules` entry-point
+`prefix-drift`, `compaction`, `memory`, `acceptance`, `long-horizon` and `background`, it can name a third-party module installed under the `syndica.modules` entry-point
 group. Its entry point is a callable `factory(host: ModuleHost) -> RuntimeModule`; the entry-point
 name must equal the module's name, and its flag keys must start with the module name, hyphens
 turned into underscores (`example` gives `example_`, `git-notes` gives `git_notes_`), and must not
@@ -401,6 +401,15 @@ default) asks the model to confirm suspected drift first. When a milestone passe
 mandatory rubric satisfied the agent is asked for its final answer, and after a `partial` or
 `block` verdict the strategy may send it back up to `long_horizon_max_continuations` times per
 cycle. The events appear under `长程：` in `syndica trace show`.
+
+`modules: [background]` with `background_after_seconds: N` moves a `Bash` call that is still running
+after N seconds to the background: the agent gets a placeholder with an id (`bg-1`) and keeps
+working, and the real result enters its history in a later turn, after the same post-tool hooks and
+trust rules as any other result. `QueryBackgroundTool` and `CancelBackgroundTool` look at or stop a
+call. An agent cannot finish while background calls are running: its final answer waits for them,
+and running out of budget or turns, an abort or a kill cancels them and records that their side
+effects are unknown. Calls approved by a human are never moved. Runs with background installed do
+not write a replay document.
 
 Writing a module: the entry point returns a `RuntimeModule`, and the kernel checks the following
 when it loads one.

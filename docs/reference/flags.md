@@ -36,3 +36,4 @@
 | `long_horizon_drift_window` | `long-horizon` | int | `8` | ≥ 0 | — | 每隔几轮检查一次最近的动作还锚不锚得回 Goal；0 = 不检查 |
 | `long_horizon_semantic_drift` | `long-horizon` | bool | `false` | — | — | 锚点检查可疑时再做一次语义比对确认（一次伴生调用） |
 | `long_horizon_max_continuations` | `long-horizon` | int | `3` | ≥ 0 | — | 验收没过、打回也用完之后，策略最多让 Agent 接着干几次（每个周期） |
+| `background_after_seconds` | `background` | int | `0` | ≥ 0 | — | 声明了可后台化的调用跑过几秒就转到后台；0 = 关 |

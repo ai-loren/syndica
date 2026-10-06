@@ -174,6 +174,9 @@ class Tool(ABC):
     # 会留到下一次）。为真时危险判定认不出它此刻的 cwd，对 `__tool_command_args__` 里的相对脚本放弃
     # 解析（不升级），绝对的工作区内脚本照判（C7）。缺省 `False`：命令每次从给定 cwd 起（`Bash`）。
     __tool_session_cwd__: ClassVar[bool] = False
+    # 这个工具的一次调用能不能在跑得太久时转到后台（背景化 Module 开着时）。缺省 `False`：转到后台的
+    # 调用与此后的轮次并发，只有本来就能与模型的下一步并行的工具（跑一条长命令）才该声明。
+    __tool_backgroundable__: ClassVar[bool] = False
 
     @property
     def name(self) -> str:

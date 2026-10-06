@@ -104,6 +104,7 @@ ConfigError、ContractViolation、LLMResponseError、ContextOverflowError 都是
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -115,6 +116,7 @@ from dataclasses import replace
 from types import MappingProxyType
 from typing import Any, cast
 
+from syndica.kernel.background import BackgroundCall, BackgroundCalls
 from syndica.kernel.context import (
     _CALL_TRUST,  # pyright: ignore[reportPrivateUsage]
     Context,
@@ -154,6 +156,7 @@ from syndica.kernel.tracing import (
     _OpenSpan,  # pyright: ignore[reportPrivateUsage]
     _Span,  # pyright: ignore[reportPrivateUsage]
     _Tracing,  # pyright: ignore[reportPrivateUsage]
+    outside_any_span,
 )
 
 __all__ = [
@@ -666,6 +669,16 @@ def _misregistered(tools: dict[str, Tool], requested: str) -> ConfigError | None
     return None
 
 
+def _moved_output(call: ToolCall, background_id: str, after: float) -> str:
+    return (
+        f'{call.name} 跑过 {after:g} 秒还没结束，已转到后台继续跑（编号 {background_id}）。'
+        '它的结果出来后会在之后的某一轮自己进你的历史；在那之前不要再发起同一个调用。'
+        f'要看它还在不在跑用 QueryBackgroundTool({background_id})，'
+        f'不再需要它就用 CancelBackgroundTool({background_id})。'
+        '还有后台调用在跑时交最终回复，内核会先等它们。'
+    )
+
+
 def _skipped_result(call: ToolCall, substitute: object) -> ToolResult:
     if isinstance(substitute, ToolResult):
         return substitute
@@ -716,6 +729,11 @@ class ToolExecutor:
         self._untrusted_tools: frozenset[str] = frozenset()
         self._untrusted_modules: frozenset[str] = frozenset()
         self._tool_owners: Mapping[str, str] = MappingProxyType({})
+        # 背景化（背景化 Module 开着时才有）：这个 Agent 的后台调用表、跑过几秒转后台、转之前
+        # 怎么等。
+        self._background: BackgroundCalls | None = None
+        self._background_after = 0.0
+        self._background_timer: Callable[[float], Awaitable[None]] = asyncio.sleep
 
     def _attach_tracing(self, tracing: _Tracing) -> None:
         self._tracing = tracing
@@ -852,6 +870,13 @@ class ToolExecutor:
         if call.name in self._untrusted_tools and result.trust is not TrustLevel.UNTRUSTED:
             return replace(result, trust=TrustLevel.UNTRUSTED)
         return result
+
+    def _configure_background(
+        self, calls: BackgroundCalls, after: float, timer: Callable[[float], Awaitable[None]]
+    ) -> None:
+        self._background = calls
+        self._background_after = after
+        self._background_timer = timer
 
     def _configure_untrusted_high_risk(self, disposition: Disposition) -> None:
         """配置 HIGH + UNTRUSTED 的宿主处置；值已经由 SafetyModule Flag 解析。"""
@@ -1283,9 +1308,22 @@ class ToolExecutor:
             )
             extension_taint: list[str] = []
             taint_token = EXTENSION_TAINT.set(extension_taint)
+            moved: asyncio.Future[object] | None = None
+            returned: object = None
             try:
                 with acting_as(None if owner is None else Installer('module', owner)):
-                    returned = cast(object, await tool.execute(**args))
+                    if self._backgroundable(tool, exclusive):
+                        # 起成任务才能在它跑着的时候先交回：任务建在此刻的上下文里，工具看到的
+                        # 「这次调用的信任」与扩展污点仍是这一次调用的。
+                        work: asyncio.Future[object] = asyncio.ensure_future(
+                            cast(Awaitable[object], tool.execute(**args))
+                        )
+                        if await self._outlasted_threshold(work):
+                            moved = work
+                        else:
+                            returned = work.result()
+                    else:
+                        returned = cast(object, await tool.execute(**args))
             except SyndicaError as exc:
                 # 三件套写给程序员或运维，模型执行不了它的 next_action。
                 if traced is not None:
@@ -1297,55 +1335,221 @@ class ToolExecutor:
                 returned = _tool_raised_result(call, exc, self._raised_trust(call, provenance))
                 outcome = 'error'
             else:
-                if isinstance(returned, ToolResult):
-                    returned = self._floored(call, returned)
-                if traced is not None and isinstance(returned, ToolResult):
-                    self._tracing.tool_result(traced[1], returned, None, arguments=args)
+                if moved is None:
+                    if isinstance(returned, ToolResult):
+                        returned = self._floored(call, returned)
+                    if traced is not None and isinstance(returned, ToolResult):
+                        self._tracing.tool_result(traced[1], returned, None, arguments=args)
             finally:
                 EXTENSION_TAINT.reset(taint_token)
                 _CALL_TRUST.reset(trust_token)
-            if extension_taint and isinstance(returned, ToolResult):
-                returned = replace(returned, trust=TrustLevel.UNTRUSTED)
-            if not isinstance(returned, ToolResult):
-                raise _bad_tool_return(call, tool, returned)
-            result = returned
-            if traced is not None:
-                traced[1].attributes.update(_recorded_exit(result.meta))
-
-            # 结果是可变的：就地把 trust 改回 TRUSTED 不经 `modified`，收紧的底线于是按分发之前的
-            # 那个值算；被收紧的 Module 就地改了内容，同样按它是作者收紧。
-            handed_trust = result.trust
-            watch = {'result': _result_content} if self._untrusted_modules else {}
-            post_taint: list[str] = []
-            post_taint_token = EXTENSION_TAINT.set(post_taint)
-            try:
-                post, post_authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
-                    Junction.POST_TOOL_USE,
-                    watch,
-                    tool_call=call,
-                    tool=tool,
-                    args=args,
-                    result=result,
+            if moved is not None:
+                placeholder = await self._move_to_background(
+                    call, tool, args, provenance, moved, extension_taint, traced
                 )
-            finally:
-                EXTENSION_TAINT.reset(post_taint_token)
-            if post.result is not None:
-                raise _post_result_slot_rejected(post)
-            rewritten = post.get('result', result)
-            if not isinstance(rewritten, ToolResult):
-                raise _rewrite_rejected(Junction.POST_TOOL_USE, 'result', ToolResult, rewritten)
-            # `post_taint` 非空且 hook 改写了结果：某个 POST hook 在触发被收紧的扩展切点后把它的结论
-            # 写进了结果，经一层可信 hook 不会变可信（评审 F12）。
-            baseline = (
-                TrustLevel.UNTRUSTED
-                if (bool(post_taint) and post.rewrites('result'))
-                or self._by_untrusted(post_authors.wrote.get('result', ()))
-                or self._by_untrusted(post_authors.changed.get('result', ()))
-                else strictest_trust(handed_trust, _strictest(result, post.rewrites('result')))
+                return placeholder, 'backgrounded'
+            return await self._finalize(
+                call, tool, args, returned, outcome, extension_taint, traced
             )
-            final = _tightened(baseline, rewritten)
-            self._report_outcome(call, args, final)
-            return final, outcome
+
+    async def _finalize(
+        self,
+        call: ToolCall,
+        tool: Tool,
+        args: dict[str, Any],
+        returned: object,
+        outcome: str,
+        extension_taint: list[str],
+        traced: tuple[ToolCallKey, _OpenSpan] | None,
+    ) -> tuple[ToolResult, str]:
+        """工具交回之后的那一半：守卫、POST_TOOL_USE、收紧信任、报给观察者。同步跑完的调用与转到后台
+        的调用走同一段：POST hook、观察者与 trace 看到的都是真结果，不是占位。"""
+        if extension_taint and isinstance(returned, ToolResult):
+            returned = replace(returned, trust=TrustLevel.UNTRUSTED)
+        if not isinstance(returned, ToolResult):
+            raise _bad_tool_return(call, tool, returned)
+        result = returned
+        if traced is not None:
+            traced[1].attributes.update(_recorded_exit(result.meta))
+
+        # 结果是可变的：就地把 trust 改回 TRUSTED 不经 `modified`，收紧的底线于是按分发之前的
+        # 那个值算；被收紧的 Module 就地改了内容，同样按它是作者收紧。
+        handed_trust = result.trust
+        watch = {'result': _result_content} if self._untrusted_modules else {}
+        post_taint: list[str] = []
+        post_taint_token = EXTENSION_TAINT.set(post_taint)
+        try:
+            post, post_authors = await self._hooks._dispatch_attributed(  # pyright: ignore[reportPrivateUsage]
+                Junction.POST_TOOL_USE,
+                watch,
+                tool_call=call,
+                tool=tool,
+                args=args,
+                result=result,
+            )
+        finally:
+            EXTENSION_TAINT.reset(post_taint_token)
+        if post.result is not None:
+            raise _post_result_slot_rejected(post)
+        rewritten = post.get('result', result)
+        if not isinstance(rewritten, ToolResult):
+            raise _rewrite_rejected(Junction.POST_TOOL_USE, 'result', ToolResult, rewritten)
+        # `post_taint` 非空且 hook 改写了结果：某个 POST hook 在触发被收紧的扩展切点后把它的结论
+        # 写进了结果，经一层可信 hook 不会变可信（评审 F12）。
+        baseline = (
+            TrustLevel.UNTRUSTED
+            if (bool(post_taint) and post.rewrites('result'))
+            or self._by_untrusted(post_authors.wrote.get('result', ()))
+            or self._by_untrusted(post_authors.changed.get('result', ()))
+            else strictest_trust(handed_trust, _strictest(result, post.rewrites('result')))
+        )
+        final = _tightened(baseline, rewritten)
+        self._report_outcome(call, args, final)
+        return final, outcome
+
+    def _backgroundable(self, tool: Tool, exclusive: bool) -> bool:
+        """转不转得到后台：背景化开着、工具类声明了可后台化、而且这次不是获批之后独占执行的调用。"""
+        return (
+            self._background is not None
+            and not exclusive
+            and getattr(type(tool), '__tool_backgroundable__', False) is True
+        )
+
+    async def _outlasted_threshold(self, work: asyncio.Future[object]) -> bool:
+        timer = asyncio.ensure_future(self._background_timer(self._background_after))
+        try:
+            await asyncio.wait({work, timer}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            work.cancel()
+            raise
+        finally:
+            timer.cancel()
+        return not work.done()
+
+    async def _move_to_background(
+        self,
+        call: ToolCall,
+        tool: Tool,
+        args: dict[str, Any],
+        provenance: TrustLevel,
+        work: asyncio.Future[object],
+        extension_taint: list[str],
+        traced: tuple[ToolCallKey, _OpenSpan] | None,
+    ) -> ToolResult:
+        calls = cast(BackgroundCalls, self._background)
+        entry = calls.start(call)
+        entry.work = work
+        if traced is not None:
+            traced[1].attributes['background.id'] = entry.id
+        entry.task = asyncio.create_task(
+            self._finish_in_background(
+                entry, call, tool, args, provenance, work, extension_taint, traced
+            ),
+            name=f'background:{entry.id}',
+        )
+        await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
+            Junction.TOOL_MOVED_TO_BACKGROUND,
+            tool_call=call,
+            tool=tool,
+            args=args,
+            background_id=entry.id,
+        )
+        return ToolResult(
+            output=_moved_output(call, entry.id, self._background_after),
+            meta={'background_id': entry.id},
+        )
+
+    async def _finish_in_background(
+        self,
+        entry: BackgroundCall,
+        call: ToolCall,
+        tool: Tool,
+        args: dict[str, Any],
+        provenance: TrustLevel,
+        work: asyncio.Future[object],
+        extension_taint: list[str],
+        placed: tuple[ToolCallKey, _OpenSpan] | None,
+    ) -> None:
+        """等真结果、跑完 `_finalize`、交给这个 Agent 的后台调用表。任何结局都要交回一个结果：
+        交不回，等它的那一轮就永远等下去。被取消时连同工具一起取消。"""
+        calls = cast(BackgroundCalls, self._background)
+        outside_any_span()
+        key = None if placed is None else placed[0]
+        try:
+            span_cm = (
+                contextlib.nullcontext(None)
+                if key is None
+                else self._background_span(key, call, entry.id)
+            )
+            with span_cm as span:
+                traced = None if key is None or span is None else (key, span)
+                outcome = 'ok'
+                returned: object
+                try:
+                    returned = await work
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if traced is not None:
+                        self._tracing.tool_result(traced[1], None, exc, arguments=args)
+                    returned = _tool_raised_result(call, exc, self._raised_trust(call, provenance))
+                    outcome = 'error'
+                else:
+                    if isinstance(returned, ToolResult):
+                        returned = self._floored(call, returned)
+                    if traced is not None and isinstance(returned, ToolResult):
+                        self._tracing.tool_result(traced[1], returned, None, arguments=args)
+                final, outcome = await self._finalize(
+                    call, tool, args, returned, outcome, extension_taint, traced
+                )
+                if span is not None:
+                    span.attributes['tool.outcome'] = outcome
+            await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
+                Junction.BACKGROUND_TOOL_COMPLETED,
+                tool_call=call,
+                result=final,
+                background_id=entry.id,
+            )
+        except asyncio.CancelledError:
+            work.cancel()
+            raise
+        except Exception as exc:
+            logger.error(
+                '期望: 后台调用 %s（%s）收尾时 POST_TOOL_USE 与工具的返回值都合规。'
+                ' 实际: %s: %s；这次调用以一条错误结果交回 Agent。'
+                ' 下一步: 修好那个 hook 或工具；它在同步跑完的路上会让整批调用停下。',
+                entry.id,
+                call.name,
+                type(exc).__name__,
+                exc,
+            )
+            final = ToolResult(
+                output=(
+                    f'期望: 后台调用 {entry.id}（{call.name}）交回一个结果。'
+                    f' 实际: 它收尾时出错（{type(exc).__name__}），结果没能取回。'
+                    ' 下一步: 需要它的结果就重新发起；它在出错之前可能已经做了一部分。'
+                ),
+                trust=self._raised_trust(call, provenance),
+            )
+        calls.finished(entry, final)
+
+    def _background_span(self, key: ToolCallKey, call: ToolCall, background_id: str) -> _Span:
+        """真结果那一段的 span。不挂在原调用的 span 下：那一个在交回占位时已经结束，而它所在的那一轮
+        也早已结束。"""
+        name = call.name if call.name in self._tools else '<unknown>'
+        return self._tracing.span(
+            SpanKind.TOOL_CALL,
+            (*key.key[1:], 'background'),
+            name=name,
+            agent_id=key.agent_id,
+            attributes={
+                'tool.name': name,
+                'tool.call_id': call.id,
+                'tool.index': key.index,
+                'background.id': background_id,
+            },
+            detached=True,
+        )
 
     async def _gated(
         self,

@@ -781,7 +781,7 @@ async def test_the_calls_an_abort_after_the_model_stops_are_not_executed():
     assert recorder.attributes(span_id_of(SpanKind.AGENT, agent_id, 1))['stop_reason'] == 'aborted'
 
 
-def test_every_tool_outcome_in_the_schema_is_produced_by_some_case_here():
+def test_every_tool_outcome_in_the_schema_is_produced_by_some_kernel_case():
     produced = {
         'ok',
         'error',
@@ -798,6 +798,7 @@ def test_every_tool_outcome_in_the_schema_is_produced_by_some_case_here():
         'unknown_tool',
         'bad_arguments',
         'interrupted',
+        'backgrounded',
     }
     assert produced == set(ATTRIBUTE_DOMAINS['tool.outcome'])
 

@@ -191,6 +191,7 @@ from syndica.kernel import (
 )
 from syndica.kernel.acceptance import RubricStatus, Verdict, VerdictStatus
 from syndica.kernel.acceptance_module import AcceptanceModule
+from syndica.kernel.background_module import BackgroundModule
 from syndica.kernel.compaction_module import CompactionModule
 from syndica.kernel.long_horizon_module import LongHorizonModule
 from syndica.kernel.memory_module import MemoryModule
@@ -436,6 +437,8 @@ def _optional_builtin(name: str) -> RuntimeModule:
         return AcceptanceModule()
     if name == 'long-horizon':
         return LongHorizonModule(AcceptanceModule())
+    if name == 'background':
+        return BackgroundModule()
     return PrefixDriftModule()
 
 
@@ -1862,6 +1865,11 @@ class RuntimeCliHost:
             return (
                 '验收 Module 的伴生调用（投影、L2 / L3、反馈提议）不在主 Agent 的录制轮次里：'
                 '回放会把它们当成主 Agent 的轮次，所以装了 acceptance 的 run 不写回放文档'
+            )
+        if any(module.name == 'background' for module in modules):
+            return (
+                '背景化 Module 开着时，后台调用的结果在哪一轮进历史取决于它真实跑了多久：'
+                '回放复现不了那个先后，所以装了 background 的 run 不写回放文档'
             )
         third = set(third_party(config.modules))
         blocking = [

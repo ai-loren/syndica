@@ -84,6 +84,7 @@ from decimal import Decimal
 from typing import Any, cast
 
 from syndica.kernel.acceptance import OutcomeKind, Verdict, VerdictStatus, most_severe
+from syndica.kernel.background import BackgroundCall, BackgroundCalls
 from syndica.kernel.budget import Budget, BudgetView, Exhaustion
 from syndica.kernel.budget_tree import (
     BudgetAccount,
@@ -433,6 +434,12 @@ _WRAP_UP_TEXT = (
     '预算快用完了（{dims}）：这是最后一轮，这一轮里的工具调用不会被执行。'
     '直接把已经完成的部分整理成最终回答交付，写清哪些还没做完、做到了哪一步。'
 )
+_BACKGROUND_STOPPED: Mapping[StopReason | None, str] = {
+    StopReason.BUDGET: '预算用完了',
+    StopReason.MAX_TURNS: '轮次用完了',
+    StopReason.ABORTED: '被中止了',
+    StopReason.ERROR: '这个周期出错停下了',
+}
 _STRATEGY_WRAP_TEXT = (
     '长程策略判断该收尾了：这是最后一轮，这一轮里的工具调用不会被执行。'
     '直接把已经完成的部分整理成最终回答交付，写清哪些还没做完、做到了哪一步。'
@@ -614,6 +621,8 @@ class BaseAgent:
         self._companions = 0
         # 长程控制器（可选）：长程 Module 经 `_attach_long_horizon` 装上（spec §8.2–§8.6）。
         self._long_horizon: LongHorizonController | None = None
+        # 后台调用表（可选）：背景化 Module 开着时由它装上，执行器与这里共用同一张。
+        self._background: BackgroundCalls | None = None
         # 这一轮只交付最终回答（`should_stop` 在完成判据成立时被兑现）：工具调用不执行。
         self._finalizing = False
         # 最近一次停在预算上，是因为模型没有价格（设了成本上限时）：伴生据此报 price_unknown。
@@ -1060,6 +1069,7 @@ class BaseAgent:
             try:
                 return await self._cycle_body(query, trust, span.attributes)
             finally:
+                self._close_background()
                 _SERVED.reset(served)
                 if budget is not None:
                     budget.end_cycle()
@@ -1152,6 +1162,7 @@ class BaseAgent:
     ) -> StopReason | None:
         """一轮：注入、模型、第 9 步、工具。交回这个周期停下的原因；None 表示接着下一轮。"""
         await self._inject(ctx, decision)
+        await self._inject_background(ctx)
         # Goal / Rubric 在任务进了轨迹之后、这一轮模型调用之前注入（§7.6）：Goal 可能就是这条任务，
         # 而第一轮就要看得到投影结果。每个周期只在第一轮调一次，注入器自己幂等。
         if self._rubrics is not None and self._rubrics_due:
@@ -1234,6 +1245,11 @@ class BaseAgent:
             await self._end_turn(ctx, turn, response)
             return StopReason.BUDGET
         if not response.tool_calls:
+            if self._background is not None and self._background.outstanding:
+                # 还有后台调用在跑：交不了最终回复。等到有结果（或没有在跑的了），下一轮把它注入。
+                await self._background.wait_for_change()
+                await self._end_turn(ctx, turn, response)
+                return None
             # Agent 判定完成：先过验收切点（§7.5）。打回则内核已追加反馈块，再做一轮。
             sent_back = await self._propose_completion(ctx, response, turn)
             # 验收可能跑上好一阵（L2 + L3 各有伴生轮次）：期间到达的中止要在这里兑现，否则通过的裁决
@@ -1304,6 +1320,53 @@ class BaseAgent:
             )
         )
         return True
+
+    async def _inject_background(self, ctx: Context) -> None:
+        """注入已经出结果的后台调用（spec §5.1 第 4 步），并登记它们交回的产物。"""
+        calls = self._background
+        if calls is None:
+            return
+        ready = calls.take_ready()
+        if not ready:
+            return
+        pre = len(ctx.current_traj)
+        self._append_background(ctx, ready)
+        await self._register_new_artifacts(ctx, pre, [entry.call for entry in ready])
+
+    def _close_background(self) -> None:
+        """周期收尾：还在跑的后台调用取消，有结果还没进历史的与被取消的都记进历史。同步：收尾可能
+        跑在取消路径上，这时不能再 await；收尾才到的结果因此只进历史、不登记产物。"""
+        calls = self._background
+        if calls is None:
+            return
+        why = _BACKGROUND_STOPPED.get(self._context.stop_reason, '这个周期被终止')
+        calls.cancel_all(why)
+        self._append_background(self._context, calls.take_ready())
+
+    def _append_background(self, ctx: Context, entries: Sequence[BackgroundCall]) -> None:
+        for entry in entries:
+            key = f'background:{self.agent_id}:{entry.id}'
+            if has_block(ctx.current_traj, key):
+                continue
+            result = entry.result
+            if entry.state == 'done' and result is not None:
+                output = result.output if isinstance(result.output, str) else str(result.output)
+                block = signed_block(
+                    HistoryKind.BACKGROUND,
+                    f'后台调用 {entry.id}（{entry.call.name}）结束了，结果如下：\n{output}',
+                    key=key,
+                    trust=result.trust,
+                )
+                if result.artifacts:
+                    block = replace(block, artifacts=list(result.artifacts))
+            else:
+                block = signed_block(
+                    HistoryKind.BACKGROUND,
+                    f'后台调用 {entry.id}（{entry.call.name}）在结束之前被取消了（{entry.why}），'
+                    '副作用未知：它可能已经做了一部分。需要它的结果就重新发起。',
+                    key=key,
+                )
+            ctx.append(block)
 
     def _append_long_horizon(self, ctx: Context, block: LongHorizonBlock) -> None:
         """控制器交回的块由内核署名追加；信任取控制器给的与主轨迹溯源里最严的（计划 P1 B3：策略
