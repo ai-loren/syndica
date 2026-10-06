@@ -57,9 +57,9 @@ spec §15 的完成判据——**目标持久化与漂移检测、预算树与�
 | 预算注入不改 System Prompt 前缀 | 预算块是署名历史块；`test_capture_replay` 的逐块比较按 kind 跳过预算块，前缀守卫照旧 | — |
 | 父预算被切分、子无法超额 | `test_budget_tree` / `test_budget_runtime`；`Delegate` / `Fork` 的 `turns` / `tokens` | 子 Agent 3 / 3 |
 | 连续 N 轮无进展 → 纠偏而非无限循环 | `test_a_stall_nudges_once_per_window_not_every_turn` 等 | — |
-| 漂移：锚点失败 → 语义比对 → 回正 | 锚点检查、语义比对确认 / 否认、比对挂住被截断、比对放不下预算时跳过 | — |
+| 漂移：锚点失败 → 语义比对 → 回正 | 锚点检查、语义比对确认 / 否认、比对挂住被截断、比对放不下预算时跳过；`test_once_the_goal_is_restated_work_back_on_the_goal_draws_no_further_reminder`：确认漂移、重申一次，回到 Goal 上之后不再提醒 | — |
 | 接近耗尽时读 `GetBudget` 并交付已完成部分 | 收尾轮用例；`GetBudget` 用例 | 两次运行都读了预算、成本运行收尾交付 |
-| 接近窗口上限时主动 `Compact` | M6 的 `Compact` 工具与三触发；目标导向型压缩 | — |
+| 接近窗口上限时主动 `Compact` | `GetBudget` 同时报上下文占用与压缩阈值（P1 M16）；`test_get_budget_shows_context_vs_threshold_and_compact_acts_below_it`：脚本化模型读到占用、调 `Compact`，阈值以下照压 | — |
 | UI / CLI / trace 显示预算、进度、停止原因 | `test_trace_view`（预算、长程两节）、`tests/cli/test_budget_cli.py` | stderr 一行预算、`trace show` |
 | 预算耗尽不丢产物 | 硬停 / 收尾各一条「产物不丢」 | `planets.md` 五颗行星留着 |
 | 子 Agent 树不无界增长、增长可归因到切分 | 预算树（每个子至少一轮）；`test_reaping` | — |

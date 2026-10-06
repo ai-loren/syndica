@@ -327,6 +327,23 @@ async def test_the_semantic_check_decides_whether_suspected_drift_is_real(
     assert bool(_strategy_blocks(ctx, 'drift')) is restated
 
 
+async def test_once_the_goal_is_restated_work_back_on_the_goal_draws_no_further_reminder() -> None:
+    def script(n: int) -> ContextBlock:
+        if n < 8:
+            return _echo(_OFF_GOAL if n < 2 else _ON_GOAL, n)
+        return _reply('the quarterly report is done')
+
+    llm = _Router(script, drift=lambda _: {'on_track': False, 'reason': 'r'})
+    runtime = _runtime({'long_horizon_drift_window': 2, 'long_horizon_semantic_drift': True})
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert _turns_of(_strategy_blocks(ctx, 'drift')) == [3]
+    assert llm.calls.count('drift') == 1
+    assert ctx.stop_reason is StopReason.COMPLETED
+
+
 # ---- 完成判据 ----
 
 

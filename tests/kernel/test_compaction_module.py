@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from typing import cast
 
 import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
+from syndica.kernel.budget import Budget, BudgetPolicy
 from syndica.kernel.compaction import (
     GoalDirectedCompaction,
     PruningCompaction,
@@ -158,6 +161,45 @@ async def test_the_compact_tool_requests_a_compaction() -> None:
         assert controller is not None and controller.should_compact(0)
     finally:
         await runtime.shutdown()
+
+
+async def test_get_budget_shows_context_vs_threshold_and_compact_acts_below_it() -> None:
+    llm = ScriptedLLM(
+        [
+            *[
+                ScriptedTurn(tool_calls=[ToolCall(id=f'c{i}', name='Echo', arguments='{}')])
+                for i in range(3)
+            ],
+            ScriptedTurn(tool_calls=[ToolCall(id='b', name='GetBudget', arguments='{}')]),
+            ScriptedTurn(tool_calls=[ToolCall(id='k', name='Compact', arguments='{}')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    runtime = Runtime(
+        budget=BudgetPolicy(root=Budget(turns=20)),
+        modules=[CompactionModule()],
+        flags={
+            'compaction_strategy': 'rule_based',
+            'compaction_context_tokens': 1000,
+            'compaction_threshold_percent': 80,
+            'compaction_target_percent': 10,
+        },
+    )
+    events = runtime.events.subscribe()
+    try:
+        agent_id = await runtime.spawn(_factory(llm), query='the-task')
+        ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    compactions = [event.payload async for event in events if event.kind == 'compaction']
+
+    reading = json.loads(str(next(b for b in ctx.current_traj if b.tool_call_id == 'b').content))
+    assert reading['context']['compaction_threshold_tokens'] == 800
+    assert 0 < reading['context']['tokens'] < 800
+    assert [entry['trigger'] for entry in compactions] == ['threshold']
+    assert cast(int, compactions[0]['tokens_before']) < 800
+    assert not any(b.tool_call_id == 'c0' for b in ctx.current_traj)
+    assert ctx.stop_reason is StopReason.COMPLETED
 
 
 async def test_target_not_below_threshold_fails_at_spawn() -> None:

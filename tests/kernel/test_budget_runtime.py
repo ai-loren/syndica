@@ -184,6 +184,7 @@ async def test_a_budgeted_agent_gets_get_budget_and_reads_its_remaining_turns() 
     assert reading['limit']['turns'] == 10
     assert reading['remaining']['turns'] == 9
     assert reading['used']['turns'] == 1
+    assert 'context' not in reading
 
 
 async def test_the_cycle_start_block_and_a_threshold_block_are_appended_not_inserted() -> None:
