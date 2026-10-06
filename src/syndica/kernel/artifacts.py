@@ -17,6 +17,7 @@ import difflib
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from syndica.kernel.clipping import clip_head
 from syndica.kernel.context import ArtifactRef
 from syndica.kernel.errors import ConfigError
 
@@ -87,7 +88,7 @@ class GenericHandler:
     handles: tuple[tuple[str, str], ...] = (('*', '*'),)
 
     async def preview(self, ref: ArtifactRef, reader: ArtifactReader) -> Preview:
-        return Preview(text=(await reader.read(ref))[:_PREVIEW_CHARS])
+        return Preview(text=clip_head(await reader.read(ref), _PREVIEW_CHARS))
 
     async def semantic_diff(self, a: ArtifactRef, b: ArtifactRef, reader: ArtifactReader) -> Diff:
         before = (await reader.read(a)).splitlines()

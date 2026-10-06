@@ -108,7 +108,7 @@ async def test_the_feedback_block_carries_a_bounded_reason() -> None:
         nonlocal seen
         seen += 1
         if seen == 1:
-            reason = 'missing the totals table ' + 'x' * 2000
+            reason = 'missing the totals table ' + 'x ' * 1000
             unmet = {'R1': RubricOutcome('R1', OutcomeKind.UNMET, _A)}
             verdict = derive_verdict([_R1], unmet, reason=reason)
             return HookResult(modified={'verdict': verdict, 'send_back': True})
@@ -119,7 +119,7 @@ async def test_the_feedback_block_carries_a_bounded_reason() -> None:
     feedback = [b for b in ctx.current_traj if kind_of(b) is HistoryKind.VERDICT]
     text = str(feedback[0].content)
     assert 'missing the totals table' in text
-    assert 'x' * 400 in text and 'x' * 500 not in text
+    assert 'x ' * 200 in text and 'x ' * 250 not in text
 
 
 async def test_send_back_is_ignored_for_a_pass_verdict() -> None:

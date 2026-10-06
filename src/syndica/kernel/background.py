@@ -11,14 +11,24 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import Any
 
-from syndica.kernel.context import ToolCall
+from syndica.kernel.context import ContextBlock, ToolCall
 from syndica.kernel.tool import ToolResult
 
-__all__ = ['BackgroundCall', 'BackgroundCalls']
+__all__ = ['BackgroundCall', 'BackgroundCalls', 'drain_cancelled']
+
+logger = logging.getLogger(__name__)
+
+# 取消之后等工具收完尾的上限：模块关着时 despawn 返回那一刻工具的取消处理已经跑完，转到后台不能
+# 改变这一点；一个吞掉取消的工具也不能让收尾永远等下去。
+CANCEL_DRAIN_S = 5.0
+_ISSUED = re.compile(r'\bbg-(\d+)\b')
 
 
 @dataclass
@@ -33,19 +43,30 @@ class BackgroundCall:
     why: str = ''
     task: asyncio.Task[None] | None = None
     work: asyncio.Future[object] | None = None
+    # 工具抛出的 `SyndicaError`：三件套写给运维，Agent 注入结果时把它抛出来，周期停在 ERROR。
+    error: BaseException | None = None
 
 
 class BackgroundCalls:
     """一个 Agent 的后台调用表：谁在跑、谁有结果还没进历史、等它们的变化。"""
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        history: Callable[[], Iterable[ContextBlock]] = tuple,
+    ) -> None:
         self._clock = clock
+        self._history = history
         self._calls: dict[str, BackgroundCall] = {}
         self._ready: list[BackgroundCall] = []
         self._changed = asyncio.Event()
-        self._issued = 0
+        self._issued: int | None = None
 
     def start(self, call: ToolCall) -> BackgroundCall:
+        # 编号在这个 Agent 的历史里唯一，不只在这张表里：恢复的会话与分叉出来的 Agent 带着上一张表
+        # 发过的编号，撞上了，新结果就被当成已经进过历史而丢掉，模型读到的是旧的那一条。
+        if self._issued is None:
+            self._issued = _highest_issued(self._history())
         self._issued += 1
         entry = BackgroundCall(id=f'bg-{self._issued}', call=call, started=self._clock())
         self._calls[entry.id] = entry
@@ -83,9 +104,20 @@ class BackgroundCalls:
         self._changed.set()
         return entry
 
-    def cancel_all(self, why: str) -> None:
-        for entry in [entry for entry in self._calls.values() if entry.state == 'running']:
+    def cancel_all(self, why: str) -> list[BackgroundCall]:
+        cancelled = [entry for entry in self._calls.values() if entry.state == 'running']
+        for entry in cancelled:
             self.cancel(entry.id, why, report=True)
+        return cancelled
+
+    def lost(self, entry: BackgroundCall, why: str) -> None:
+        """收尾任务没交回结果就退出了：按取消记进历史，不再等它。"""
+        if entry.state != 'running':
+            return
+        entry.state = 'cancelled'
+        entry.why = why
+        self._ready.append(entry)
+        self._changed.set()
 
     @property
     def running(self) -> list[BackgroundCall]:
@@ -105,3 +137,26 @@ class BackgroundCalls:
         while not self._ready and self.running:
             self._changed.clear()
             await self._changed.wait()
+
+
+def _highest_issued(blocks: Iterable[ContextBlock]) -> int:
+    highest = 0
+    for block in blocks:
+        for found in _ISSUED.finditer(str(block.content or '')):
+            highest = max(highest, int(found.group(1)))
+    return highest
+
+
+async def drain_cancelled(futures: Iterable[asyncio.Future[Any] | None]) -> None:
+    """等被取消的工具与收尾任务收完尾，至多 `CANCEL_DRAIN_S` 秒；到时还没收完的记一条 WARNING。"""
+    pending = {future for future in futures if future is not None and not future.done()}
+    if not pending:
+        return
+    _, unsettled = await asyncio.wait(pending, timeout=CANCEL_DRAIN_S)
+    if unsettled:
+        logger.warning(
+            '期望: 被取消的后台调用在 %s 秒内收完尾。 实际: 还有 %d 个没收完，内核不再等它们。'
+            ' 下一步: 检查对应工具的取消处理（它可能吞掉了取消，或在清理里一直等）。',
+            CANCEL_DRAIN_S,
+            len(unsettled),
+        )

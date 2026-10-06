@@ -40,8 +40,9 @@
 可拦截等于让一个 hook 把闸放掉，而 hook 只能收紧不能放宽——与信任级别那条是同一条规则。
 **观察者也答不了这次确认**：可观察切点的返回值被整个丢弃，答复通道在 surface 侧。
 
-两个背景化切点同样可观察：`TOOL_MOVED_TO_BACKGROUND` 报「这次调用已经转到后台、占位已经交回」，
-`BACKGROUND_TOOL_COMPLETED` 报「真结果已经过了 `POST_TOOL_USE`、正交给 Agent」。要改真结果，照旧在
+两个背景化切点同样可观察：`TOOL_MOVED_TO_BACKGROUND` 报「这次调用已经转到后台」（占位在观察者
+跑完之后交回），`BACKGROUND_TOOL_COMPLETED` 报「真结果已经过了 `POST_TOOL_USE`、正交给 Agent」；工具
+跑得快时后者可能先于前者的观察者跑完。观察者拿到的调用、参数与结果都是副本。要改真结果，照旧在
 `POST_TOOL_USE` 改——它在后台那一段也跑，跑在真结果上。
 
 三个生命周期切点（`RUNTIME_SHUTDOWN` / `AGENT_SPAWN` / `AGENT_DESPAWN`）同样只报既成事实：

@@ -15,6 +15,7 @@ from dataclasses import replace
 from typing import cast
 
 from syndica.kernel.artifacts import KINDS
+from syndica.kernel.clipping import clip_head, clip_tail
 from syndica.kernel.context import ArtifactRef, TrustLevel
 from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
@@ -134,14 +135,14 @@ def _clipped(text: str, limit: int | None) -> tuple[str, bool]:
     """
     if limit is None or len(text) <= limit:
         return text, False
-    head = int(limit * _HEAD_SHARE)
-    tail = limit - head
-    omitted = len(text) - head - tail
+    shown_head = clip_head(text, int(limit * _HEAD_SHARE))
+    shown_tail = clip_tail(text, limit - int(limit * _HEAD_SHARE))
+    omitted = len(text) - len(shown_head) - len(shown_tail)
     marker = (
         f'\n…[这条流的中间截掉了 {omitted} 个字符。要看被截掉的部分，把命令输出重定向到工作区里的'
         "文件，再用 grep、sed -n '起,止p' 或 tail 分段看]…\n"
     )
-    return text[:head] + marker + text[len(text) - tail :], True
+    return shown_head + marker + shown_tail, True
 
 
 def _listed(items: Sequence[str], limit: int | None, narrow: str) -> list[str]:
@@ -171,7 +172,7 @@ def _listed(items: Sequence[str], limit: int | None, narrow: str) -> list[str]:
     first = items[0]
     rest = f'共 {len(items)} 条，其余没有列出：{narrow}' if len(items) > 1 else ''
     return [
-        f'{first[:limit]}…',
+        f'{clip_head(first, limit)}…',
         f'…[第一条结果有 {len(first)} 个字符，只显示了前 {limit} 个，要看全文用 Read 读它所在的'
         f'文件。{rest}]',
     ]

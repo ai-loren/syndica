@@ -84,7 +84,7 @@ from decimal import Decimal
 from typing import Any, cast
 
 from syndica.kernel.acceptance import OutcomeKind, Verdict, VerdictStatus, most_severe
-from syndica.kernel.background import BackgroundCall, BackgroundCalls
+from syndica.kernel.background import BackgroundCall, BackgroundCalls, drain_cancelled
 from syndica.kernel.budget import Budget, BudgetView, Exhaustion
 from syndica.kernel.budget_tree import (
     BudgetAccount,
@@ -93,6 +93,7 @@ from syndica.kernel.budget_tree import (
     granted_dims,
     seconds,
 )
+from syndica.kernel.clipping import clip_head
 from syndica.kernel.compaction import (
     CompactionController,
     apply_compaction,
@@ -347,7 +348,7 @@ def _render_feedback(verdict: Verdict) -> str:
     lines = [f'验收未通过（{verdict.status.value}）。']
     if verdict.reason:
         # 原因是验收器的自由文本：截断，免得每次打回都把一大段塞进主上下文（评审 Low 2）。
-        lines.append(f'原因：{verdict.reason[:_FEEDBACK_REASON_CHARS]}')
+        lines.append(f'原因：{clip_head(verdict.reason, _FEEDBACK_REASON_CHARS)}')
     if unmet:
         lines.append(f'有证据表明做错了、要改：{", ".join(unmet)}')
     if unconfirmed:
@@ -1071,7 +1072,7 @@ class BaseAgent:
             try:
                 return await self._cycle_body(query, trust, span.attributes)
             finally:
-                self._close_background()
+                await self._close_background()
                 _SERVED.reset(served)
                 if budget is not None:
                     budget.end_cycle()
@@ -1347,21 +1348,54 @@ class BaseAgent:
         pre = len(ctx.current_traj)
         self._append_background(ctx, ready)
         await self._register_new_artifacts(ctx, pre, [entry.call for entry in ready])
+        for entry in ready:
+            if entry.error is not None:
+                raise entry.error
 
-    def _close_background(self) -> None:
-        """周期收尾：还在跑的后台调用取消，有结果还没进历史的与被取消的都记进历史。同步：收尾可能
-        跑在取消路径上，这时不能再 await；收尾才到的结果因此只进历史、不登记产物。"""
+    async def _close_background(self) -> None:
+        """周期收尾：还在跑的后台调用取消、等它们收完尾（有上限），有结果还没进历史的与被取消的都
+        记进历史。收尾跑在取消路径上时同样要等：被杀的 Agent 交回之后工作区与隔离副本就要释放，工具
+        的取消处理不能还在用它们。收尾才到的结果只进历史、不登记产物。"""
         calls = self._background
         if calls is None:
             return
         why = _BACKGROUND_STOPPED.get(self._context.stop_reason, '这个周期被终止')
-        calls.cancel_all(why)
-        self._append_background(self._context, calls.take_ready())
+        cancelled = calls.cancel_all(why)
+        await drain_cancelled(future for entry in cancelled for future in (entry.work, entry.task))
+        ready = calls.take_ready()
+        if not ready:
+            return
+        for entry in ready:
+            if entry.error is not None:
+                logger.error(
+                    '期望: 后台调用 %s（%s）交回一个结果。 实际: 它抛出了 %s: %s，周期已经在收尾，'
+                    '这条错误只记进历史。 下一步: 按这条错误的下一步修好宿主侧的配置或工具。',
+                    entry.id,
+                    entry.call.name,
+                    type(entry.error).__name__,
+                    entry.error,
+                )
+        # 先补齐被中断那一批：后台记录追加在一批没配对完的调用后面，下次起跑的修复就认不出那一批，
+        # 此后每次请求都带着一个没有结果的调用，provider 拒掉整个请求。
+        repaired = _repair_interrupted_batch(self._context)
+        self._executor._trace_interrupted(  # pyright: ignore[reportPrivateUsage]
+            (self.agent_id, self._cycle, self._current_turn), repaired
+        )
+        self._append_background(self._context, ready)
 
     def _append_background(self, ctx: Context, entries: Sequence[BackgroundCall]) -> None:
         for entry in entries:
             key = f'background:{self.agent_id}:{entry.id}'
             if has_block(ctx.current_traj, key):
+                if entry.state == 'done':
+                    logger.error(
+                        '期望: 后台调用 %s（%s）的结果进 agent %s 的历史。'
+                        ' 实际: 历史里已经有同一个编号的结果块，这一条被丢掉了。'
+                        ' 下一步: 这是内核的编号缺陷，请附上这条日志报告。',
+                        entry.id,
+                        entry.call.name,
+                        self.agent_id,
+                    )
                 continue
             result = entry.result
             if entry.state == 'done' and result is not None:

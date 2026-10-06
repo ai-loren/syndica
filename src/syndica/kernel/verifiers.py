@@ -37,6 +37,7 @@ from syndica.kernel.acceptance import (
 )
 from syndica.kernel.acceptance_inject import meaningful_quote
 from syndica.kernel.budget_tree import BudgetExhausted, PriceUnknown
+from syndica.kernel.clipping import clip_head
 from syndica.kernel.companion import CompanionResult, run_companion
 from syndica.kernel.context import (
     Context,
@@ -357,7 +358,7 @@ def _verdict_result(verdict: Verdict, send_back: bool | None) -> HookResult:
 
 def _failed(rubrics: list[Rubric], trust: TrustLevel, exc: BaseException) -> Verdict:
     # 原因只取内核自己写的那几类（解析失败、store 的三件套）：任意异常的文本可能带着模型回复或路径。
-    detail = str(exc)[:200] if isinstance(exc, ValueError | SyndicaError) else ''
+    detail = clip_head(str(exc), 200) if isinstance(exc, ValueError | SyndicaError) else ''
     logger.warning(
         '期望: 验收器正常给出结论。 实际: %s%s。 下一步: 放行并标 unverified（不装成通过）；'
         '反复出现就查验收用的模型与 .syndica/rubrics。',
@@ -382,7 +383,7 @@ def _block_text(block: ContextBlock) -> str:
 
 def _calls(block: ContextBlock) -> list[str]:
     """工具调用在轨迹里写成的样子：验收器看到的是这个，引它当证据时语料里也得是这个。"""
-    return [f'{call.name}({call.arguments[:_ARGS_CHARS]})' for call in block.tool_calls]
+    return [f'{call.name}({clip_head(call.arguments, _ARGS_CHARS)})' for call in block.tool_calls]
 
 
 def _row(block: ContextBlock) -> str:
@@ -392,7 +393,7 @@ def _row(block: ContextBlock) -> str:
         return ''
     row: dict[str, object] = {'role': block.role}
     if text:
-        row['text'] = text[:_BLOCK_CHARS]
+        row['text'] = clip_head(text, _BLOCK_CHARS)
     if calls:
         row['tool_calls'] = calls
     return json.dumps(row, ensure_ascii=False)

@@ -628,12 +628,12 @@ async def test_file_evidence_with_a_line_suffix_reopens_the_file(tmp_path: Path)
 
 
 def test_one_oversized_block_is_cut_and_does_not_crowd_out_the_rest() -> None:
-    huge = ContextBlock(role='tool', tool_call_id='c', content='x' * 50_000)
+    huge = ContextBlock(role='tool', tool_call_id='c', content='x ' * 25_000)
     final = ContextBlock(role='assistant', content='the final answer')
     rows = render_transcript(
         _ctx(ContextBlock(role='user', content='task'), huge, final)
     ).splitlines()
-    assert 'x' * 1_000 in rows[1] and len(rows[1]) < 3_000  # 截短留下，而不是整块丢掉
+    assert 'x ' * 500 in rows[1] and len(rows[1]) < 3_000  # 截短留下，而不是整块丢掉
     assert 'the final answer' in rows[-1]
 
 

@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from syndica import __version__
 from syndica.kernel.acceptance import Goal, Rubric, RubricKind, RubricStatus, Verdict, VerdictStatus
+from syndica.kernel.clipping import clip_head
 from syndica.kernel.companion import run_companion
 from syndica.kernel.context import (
     Context,
@@ -660,7 +661,7 @@ def _malformed(hook: str, action: object) -> str | None:
 
 
 def _clipped(text: str) -> str:
-    return text if len(text) <= MESSAGE_LIMIT else text[:MESSAGE_LIMIT] + '…'
+    return text if len(text) <= MESSAGE_LIMIT else clip_head(text, MESSAGE_LIMIT) + '…'
 
 
 def _report_strategy(strategy: object, hook: str, what: str) -> None:

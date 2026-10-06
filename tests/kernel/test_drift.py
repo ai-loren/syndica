@@ -114,10 +114,10 @@ def test_the_judge_sees_tool_names_and_arguments_but_never_written_content() -> 
     lines = call_lines(
         [
             _call('Write', path='reports/q.md', content='SECRET' * 100),
-            _call('Bash', command='x' * 500),
+            _call('Bash', command='x ' * 250),
         ],
         line_chars=60,
     )
     assert lines[0] == '- Write {"path": "reports/q.md"}'
-    assert lines[1].startswith('- Bash {"command": "xxx') and lines[1].endswith('…')
+    assert lines[1].startswith('- Bash {"command": "x x') and lines[1].endswith('…')
     assert len(lines[1]) == 61

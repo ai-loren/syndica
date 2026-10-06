@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from syndica.kernel.background import BackgroundCalls
+from syndica.kernel.background import BackgroundCalls, drain_cancelled
 from syndica.kernel.tool import Tool, ToolResult
 
 __all__ = ['CancelBackgroundTool', 'QueryBackgroundTool']
@@ -51,6 +51,12 @@ class QueryBackgroundTool(Tool):
         return ToolResult(output=text, meta={'background_id': entry.id, 'state': entry.state})
 
 
+_NOT_RUNNING = {
+    'done': '已经结束了，结果在你的历史里或会在下一轮进来',
+    'cancelled': '已经被取消了',
+}
+
+
 class CancelBackgroundTool(Tool):
     __tool_name__ = 'CancelBackgroundTool'
     __tool_command_args__ = ()
@@ -70,9 +76,11 @@ class CancelBackgroundTool(Tool):
         cancelled = self._calls.cancel(background_id, '你自己取消的', report=False)
         if cancelled is None:
             return ToolResult(
-                output=f'{entry.id}（{entry.call.name}）已经不在跑了（{entry.state}），不必再取消。',
+                output=f'{entry.id}（{entry.call.name}）{_NOT_RUNNING[entry.state]}，不必再取消。',
                 meta={'background_id': entry.id, 'state': entry.state},
             )
+        # 交回「已取消」之前等它收完尾：下一个调用不该撞上一个还在清理的工具。
+        await drain_cancelled([cancelled.work, cancelled.task])
         return ToolResult(
             output=(
                 f'{entry.id}（{entry.call.name}）已取消。它在被取消之前可能已经做了一部分，'

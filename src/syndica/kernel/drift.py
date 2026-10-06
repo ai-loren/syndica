@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import cast
 
 from syndica.kernel.acceptance import Goal, Rubric, RubricStatus
+from syndica.kernel.clipping import clip_head
 from syndica.kernel.context import ContextBlock, ToolCall
 from syndica.kernel.lexical import terms
 
@@ -64,7 +65,7 @@ def call_lines(blocks: Sequence[ContextBlock], *, line_chars: int) -> tuple[str,
             shown = _without_content(_arguments(call))
             text = shown if isinstance(shown, str) else json.dumps(shown, ensure_ascii=False)
             line = f'- {call.name} {text}'
-            lines.append(line if len(line) <= line_chars else line[:line_chars] + '…')
+            lines.append(line if len(line) <= line_chars else clip_head(line, line_chars) + '…')
     return tuple(lines)
 
 

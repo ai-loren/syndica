@@ -41,7 +41,7 @@ class _NoHooks:
 def _calls_of(agent: BaseAgent) -> BackgroundCalls:
     calls = agent._background  # pyright: ignore[reportPrivateUsage]
     if calls is None:
-        calls = BackgroundCalls()
+        calls = BackgroundCalls(history=lambda: agent.context.current_traj)
         agent._background = calls  # pyright: ignore[reportPrivateUsage]
     return calls
 

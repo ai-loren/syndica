@@ -449,25 +449,25 @@ async def test_a_stream_past_the_capture_budget_keeps_its_head_and_tail(
     monkeypatch.setattr('syndica.kernel.local_workspace._CAPTURE_HEAD', 10)
     monkeypatch.setattr('syndica.kernel.local_workspace._CAPTURE_TAIL', 40)
     workspace = LocalWorkspace(str(exec_root), shell=shell_path, env={})
-    body = 'H' * 10 + 'm' * 150 + 'T' * 40
+    body = 'H' * 9 + ' ' + 'm' * 150 + ' ' + 'T' * 39
 
-    finished = await workspace.run(f'printf {body}', timeout=5, cwd='.')
-    handle = await workspace.start(f'printf {body}; sleep 5', cwd='.')
+    finished = await workspace.run(f"printf '{body}'", timeout=5, cwd='.')
+    handle = await workspace.start(f"printf '{body}'; sleep 5", cwd='.')
     await asyncio.sleep(0.3)
     running = await workspace.poll(handle)
     await workspace.close()
 
     for result in (finished, running):
         assert result.truncated is True
-        assert result.stdout.startswith('H' * 10 + '\n…[')
-        assert result.stdout.endswith(']…\n' + 'T' * 40)
+        assert result.stdout.startswith('H' * 9 + ' \n…[')
+        assert result.stdout.endswith(']…\n ' + 'T' * 39)
         assert '150 个字节' in result.stdout
 
 
 @pytest.mark.parametrize(
     ('since', 'shown', 'truncated'),
     [
-        (4, 'H' * 6 + '\n…[内核丢弃了这条流中间 150 个字节', True),
+        (4, 'H' * 5 + ' \n…[内核丢弃了这条流中间 150 个字节', True),
         (60, '\n…[内核丢弃了这条流中间 100 个字节', True),
         (175, 'T' * 25, False),
         (200, '', False),
@@ -480,14 +480,14 @@ def test_reading_since_an_offset_counts_the_dropped_middle_in_the_offsets(
     monkeypatch.setattr('syndica.kernel.local_workspace._CAPTURE_HEAD', 10)
     monkeypatch.setattr('syndica.kernel.local_workspace._CAPTURE_TAIL', 40)
     capture = _Capture()
-    capture.extend(b'H' * 10 + b'm' * 150 + b'T' * 40)
+    capture.extend(b'H' * 9 + b' ' + b'm' * 150 + b' ' + b'T' * 39)
 
     text, dropped, end = capture.rendered(since, settled=True)
 
     assert text.startswith(shown) if shown else text == ''
     assert (dropped, end) == (truncated, 200)
     if since < 160:
-        assert text.endswith(']…\n' + 'T' * 40)
+        assert text.endswith(']…\n ' + 'T' * 39)
 
 
 @pytest.mark.parametrize(

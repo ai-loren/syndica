@@ -5706,13 +5706,39 @@ async def test_the_self_refusal_pre_pass_finishes_before_the_first_node_comes_do
     await runtime.shutdown()
 
 
+async def test_reviving_a_zombie_already_pinned_for_destruction_is_refused_before_it_writes(
+    caplog: pytest.LogCaptureFixture,
+):
+    registry = _RecordingRegistry()
+    broker = _SpyBroker(registry)
+    runtime = Runtime(registry=registry, broker=broker)
+    agent_id = await runtime.spawn(_factory(_done()), query='go')
+    await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    task = runtime._table.get_task(agent_id)
+    registry.hold_children_of = agent_id
+    registry.walks.close()
+    despawning = asyncio.create_task(runtime.despawn(agent_id))
+    await asyncio.wait_for(registry.walks.reach(1), _TIMEOUT)
+    attempted = len(registry.transitions)
+    caplog.set_level(logging.INFO)
+
+    assert await runtime.ensure_active(agent_id) is False
+
+    assert registry.transitions[attempted:] == []
+    assert runtime._table.get_task(agent_id) is task
+    assert caplog.records == []
+    registry.walks.open()
+    await asyncio.wait_for(despawning, _TIMEOUT)
+    assert await runtime.find(agent_id) is None
+    await runtime.shutdown()
+
+
 async def test_reviving_a_zombie_that_sits_in_a_doomed_subtree_is_refused(
     caplog: pytest.LogCaptureFixture,
 ):
     """复活一个正在被拆的节点，它的驱动会在条目被摘掉时失去句柄——一个永不被取消的孤儿。
 
-    这道守卫够得着，需要一个「已经是 ZOMBIE、又落在被拆的树里」的节点：钉住相在遍历返回之后
-    才落，所以窗口只能架在被点名的那一个身上。
+    这道守卫够得着，需要钉住落在复活的半路：复活已经把 ZOMBIE 换成 IDLE，钉住才落下。
     """
     registry = _RecordingRegistry()
     broker = _SpyBroker(registry)
@@ -5721,13 +5747,19 @@ async def test_reviving_a_zombie_that_sits_in_a_doomed_subtree_is_refused(
     await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
     assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE
     task = runtime._table.get_task(agent_id)
+    registry.hold_after = AgentStatus.IDLE
+    registry.settles.close()
+    reviving = asyncio.create_task(runtime.ensure_active(agent_id))
+    await asyncio.wait_for(registry.settles.reach(1), _TIMEOUT)
     registry.hold_children_of = agent_id
     registry.walks.close()
     despawning = asyncio.create_task(runtime.despawn(agent_id))
     await asyncio.wait_for(registry.walks.reach(1), _TIMEOUT)
     caplog.set_level(logging.INFO)
+    registry.hold_after = None
+    registry.settles.open()
 
-    assert await runtime.ensure_active(agent_id) is False
+    assert await asyncio.wait_for(reviving, _TIMEOUT) is False
 
     # 复活写下去的那个 IDLE 必须收回：留着它就是宣布「它能处理消息」，而 zombie 才是复活的凭据。
     assert await _status(runtime, agent_id) is AgentStatus.ZOMBIE

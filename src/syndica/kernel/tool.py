@@ -175,7 +175,8 @@ class Tool(ABC):
     # 解析（不升级），绝对的工作区内脚本照判（C7）。缺省 `False`：命令每次从给定 cwd 起（`Bash`）。
     __tool_session_cwd__: ClassVar[bool] = False
     # 这个工具的一次调用能不能在跑得太久时转到后台（背景化 Module 开着时）。缺省 `False`：转到后台的
-    # 调用与此后的轮次并发，只有本来就能与模型的下一步并行的工具（跑一条长命令）才该声明。
+    # 调用与此后的轮次并发，只有本来就能与模型的下一步并行的工具（跑一条长命令）才该声明。同一批里
+    # 排在它后面的调用依赖它跑完，所以只有一批最后一段里的调用会被转。
     __tool_backgroundable__: ClassVar[bool] = False
 
     @property

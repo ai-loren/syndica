@@ -156,7 +156,7 @@ async def test_one_character_past_the_limit_drops_the_last_hit(tmp_path: Path) -
 
 
 async def test_a_first_hit_longer_than_the_limit_is_clipped_and_said_to_be(tmp_path: Path) -> None:
-    hits = _notes(tmp_path / 'ws', ['needle ' + 'y' * 80, 'needle z'])
+    hits = _notes(tmp_path / 'ws', ['needle ' + 'y ' * 40, 'needle z'])
     grep = _capped(tmp_path / 'ws', 30)['Grep']
 
     result = await grep.execute('needle')
@@ -171,7 +171,7 @@ async def test_a_first_hit_longer_than_the_limit_is_clipped_and_said_to_be(tmp_p
 
 
 async def test_a_single_hit_too_long_to_show_says_so_without_other_hits(tmp_path: Path) -> None:
-    hits = _notes(tmp_path / 'ws', ['needle ' + 'y' * 80])
+    hits = _notes(tmp_path / 'ws', ['needle ' + 'y ' * 40])
     grep = _capped(tmp_path / 'ws', 30)['Grep']
 
     result = await grep.execute('needle')

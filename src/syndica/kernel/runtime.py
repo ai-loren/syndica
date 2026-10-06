@@ -608,6 +608,42 @@ def _reaped_reason(agent_id: str, keep: int) -> str:
     )
 
 
+def _note_foreign_background(agent: BaseAgent, fork_from: str) -> None:
+    """分身继承了源 Agent 还没等到结果的后台占位：那些结果只进源 Agent 的历史，分身的表里也查不到
+    它们。说清楚，免得分身一直等、或拿编号去查自己那张表。追加在继承来的轨迹之后，前缀逐字节不变。"""
+    blocks = agent.context.current_traj
+    reported = {str(block.extra.get('syndica.key', '')) for block in blocks}
+    pending: list[str] = []
+    for block in blocks:
+        meta = block.extra.get('tool_meta') if block.role == 'tool' else None
+        background_id = (
+            cast('dict[str, object]', meta).get('background_id') if isinstance(meta, dict) else None
+        )
+        if isinstance(background_id, str) and (
+            f'background:{fork_from}:{background_id}' not in reported
+        ):
+            pending.append(background_id)
+    if not pending:
+        return
+    agent.context.append(
+        signed_block(
+            HistoryKind.BACKGROUND,
+            f'你是分叉出来的。分叉之前转到后台的调用（{"、".join(pending)}）属于源 Agent：'
+            '它们的结果只会进源 Agent 的历史，不会出现在这里，'
+            '你的 QueryBackgroundTool 也查不到它们。需要那些结果就自己重新发起。',
+            key=f'background:{agent.agent_id}:forked',
+        )
+    )
+
+
+def _being_destroyed_reason(agent_id: str) -> str:
+    return (
+        f'期望: agent {agent_id!r} 还在，可以接收消息。'
+        ' 实际: 它正在被拆除（做完之后被回收，或被 despawn / kill），这条消息没有投进去。'
+        ' 下一步: 不要再给它发；需要它做的事派给一个新的 Agent。'
+    )
+
+
 def _cannot_fork_from(fork_from: str) -> ContractViolation:
     return ContractViolation(
         expected=f'分叉源 {fork_from!r} 的实例在本进程手里，它的轨迹才拷得到',
@@ -1404,8 +1440,6 @@ class Runtime:
                 received=f'收到 {type(budget).__name__}',
                 next_action='写成 budget=Budget(turns=..., tokens=...)',
             )
-        if parent_id is not None:
-            await self._reap_finished(parent_id)
         # 切不出来的在任何副作用之前拒绝；真正的切分在注册之后、驱动任务起跑之前那段同步代码里重算。
         planned, _ = self._budget.split(parent_id, budget)
         query_trust = self._from_listed_module(query_trust)
@@ -1536,6 +1570,8 @@ class Runtime:
                 agent.context.append(block)
             if fork_from is not None and query is None:
                 self._carry_truncated_taint(agent, fork_from, source_trust)
+            if fork_from is not None:
+                _note_foreign_background(agent, fork_from)
             agent._attach_gate(gate)  # pyright: ignore[reportPrivateUsage]
             agent._attach_tracing(self._tracing)  # pyright: ignore[reportPrivateUsage]
             if session and self._sessions is not None:
@@ -1662,6 +1698,9 @@ class Runtime:
         self._tracing.spawned(agent_id, agent._cycle + 1)  # pyright: ignore[reportPrivateUsage]
         self._trace_modules(agent_id, module_tools, module_plugins)
         await self.hooks._dispatch(Junction.AGENT_SPAWN, agent_id=agent_id, parent_id=parent_id)  # pyright: ignore[reportPrivateUsage]
+        # 回收在这次 spawn 成功之后：被拒的 spawn 什么都不该发生，不能已经拆掉了别的子 Agent。
+        if parent_id is not None:
+            await self._reap_finished(parent_id)
         return agent_id
 
     def _trace_modules(
@@ -2611,6 +2650,9 @@ class Runtime:
         delivered = None
         try:
             delivered = await self.broker.publish(agent_id, message)
+            if not delivered.ok and agent_id in self._doomed:
+                # broker 只知道邮箱没建起来；没建起来是因为它正在被拆，照实说。
+                delivered = DeliveryResult(ok=False, reason=_being_destroyed_reason(agent_id))
             return delivered
         finally:
             _ACTIVATION_ALLOWED.reset(token)
@@ -2664,7 +2706,11 @@ class Runtime:
                 agent_id,
             )
             return False
-        # 叫醒的是一个又要干活的 Agent：它这一轮的结果还没人取走，回收账上不再算它做完了。
+        # 叫醒的是一个又要干活的 Agent：它这一轮的结果还没人取走，回收账上不再算它做完了。查钉住与
+        # 摘掉回收账是同一段同步代码：回收按这本账挑人再钉住，两边于是只有两种先后——这里先摘掉，
+        # 回收就不挑它；回收先钉住，这里就拒绝，邮箱不重建，叫醒它的 send 拿到的是如实的拒绝。
+        if self._closed or agent_id in self._doomed:
+            return False
         self._finish_order.pop(agent_id, None)
         self._collected.discard(agent_id)
         if not await self._switch(agent_id, new=AgentStatus.IDLE, allowed=(AgentStatus.ZOMBIE,)):
@@ -3414,7 +3460,7 @@ class Runtime:
 
     async def _reap_finished(self, parent_id: str) -> None:
         """派活树的回收（D-46）：`parent_id` 结束了的子 Agent 超过 `keep_finished_children` 时，按
-        进 zombie 的先后拆掉最早的那些（预算随拆除结算进父）。在给它挂新子之前做：树只在这时长大。
+        进 zombie 的先后拆掉最早的那些（预算随拆除结算进父）。在给它挂上新子之后做：树只在这时长大。
 
         只收结果已经交回给父的（派活等待取走过）、整棵子树都是 zombie、没有留着的隔离副本、此刻也
         没有等待指着它的子 Agent：别的情况下拆掉它会丢掉还活着的后代、没合并的改动，或让一次正在
@@ -3423,41 +3469,58 @@ class Runtime:
         """
         if self._closed or parent_id in self._doomed:
             return
-        finished = [
-            child
-            for child in await self.registry.children_of(parent_id)
-            if child in self._collected and child in self._finish_order
-        ]
-        reapable = [child for child in finished if await self._reapable(child)]
-        reapable.sort(key=lambda child: self._finish_order[child])
-        for child in reapable[: max(len(reapable) - self._keep_finished, 0)]:
-            try:
-                await self.despawn(child)
-            except Exception as exc:
-                logger.warning(
-                    '期望: 回收 agent %s 的子 Agent %s（它做完了、结果已交回）。'
-                    ' 实际: 拆除失败：%s: %s。'
-                    ' 下一步: 它留在注册表里，不影响这次 spawn；反复出现就查注册表与工作区。',
-                    parent_id,
-                    child,
-                    type(exc).__name__,
-                    exc,
-                )
-                continue
-            self._reaped.add(child)
-            self._finish_order.pop(child, None)
-            self._collected.discard(child)
+        reapable: list[tuple[str, tuple[str, ...]]] = []
+        for child in await self.registry.children_of(parent_id):
+            if self._finished_and_collected(child):
+                members = await self._reap_members(child)
+                if members is not None:
+                    reapable.append((child, members))
+        # 从这里到钉住没有挂起点（与 `_ensure_active` 摘回收账那一段配对）：判定里的 await 期间
+        # 被叫醒的已经不在账上，钉住之后再叫醒的被如实拒绝。连整棵子树一起钉：后代被叫醒同样会让
+        # 一个正在干活的周期被拆掉。
+        reapable = [entry for entry in reapable if self._finished_and_collected(entry[0])]
+        reapable.sort(key=lambda entry: self._finish_order[entry[0]])
+        victims = reapable[: max(len(reapable) - self._keep_finished, 0)]
+        pinned = [member for _, members in victims for member in members]
+        self._pin(pinned)
+        try:
+            for child, members in victims:
+                if await self._reap_members(child) != members:
+                    continue
+                try:
+                    await self.despawn(child)
+                except Exception as exc:
+                    logger.warning(
+                        '期望: 回收 agent %s 的子 Agent %s（它做完了、结果已交回）。'
+                        ' 实际: 拆除失败：%s: %s。'
+                        ' 下一步: 它留在注册表里，不影响这次 spawn；反复出现就查注册表与工作区。',
+                        parent_id,
+                        child,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    continue
+                self._reaped.add(child)
+                self._finish_order.pop(child, None)
+                self._collected.discard(child)
+        finally:
+            self._unpin(pinned)
 
-    async def _reapable(self, agent_id: str) -> bool:
-        for member in (agent_id, *await self._descendants(agent_id)):
+    def _finished_and_collected(self, agent_id: str) -> bool:
+        return agent_id in self._collected and agent_id in self._finish_order
+
+    async def _reap_members(self, agent_id: str) -> tuple[str, ...] | None:
+        """能回收时交回它与它的全部后代，否则 None。"""
+        members = (agent_id, *await self._descendants(agent_id))
+        for member in members:
             info = await self.registry.get(member)
             if info is None or info.status is not AgentStatus.ZOMBIE:
-                return False
+                return None
             if self._await_count.get(member):
-                return False
+                return None
             if self._workspace is not None and self._workspace.isolated(member) is not None:
-                return False
-        return True
+                return None
+        return members
 
     def _reaped_text(self, agent_id: str) -> str | None:
         """这个 id 是被回收掉的就交回说明（期望 / 实际 / 下一步），否则 None。"""

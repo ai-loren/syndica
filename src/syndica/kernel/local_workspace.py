@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
+from syndica.kernel.clipping import drop_cut_end, drop_cut_start
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.local_pty import PtySessions
 from syndica.kernel.terminal_text import utf8_prefix_length
@@ -90,7 +91,7 @@ class _Capture:
         tail_start = head_end + self._dropped
         parts: list[str] = []
         if since < head_end:
-            parts.append(_decoded(self._head[since:]))
+            parts.append(drop_cut_end(_decoded(self._head[since:])))
         if since < tail_start:
             parts.append(
                 f'\n…[内核丢弃了这条流中间 {tail_start - max(since, head_end)} 个字节：每条流最多'
@@ -99,7 +100,8 @@ class _Capture:
         tail_from = max(0, since - tail_start)
         data = bytes(self._tail[tail_from:])
         keep = len(data) if settled else utf8_prefix_length(data)
-        parts.append(_decoded(data[:keep]))
+        shown = _decoded(data[:keep])
+        parts.append(drop_cut_start(shown) if tail_from == 0 else shown)
         return ''.join(parts), since < tail_start, tail_start + tail_from + keep
 
 

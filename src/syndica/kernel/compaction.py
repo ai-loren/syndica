@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Protocol, cast, runtime_checkable
 
+from syndica.kernel.clipping import clip_head
 from syndica.kernel.context import (
     Context,
     ContextBlock,
@@ -267,7 +268,9 @@ def _truncated(block: ContextBlock, max_chars: int) -> ContextBlock:
     content = block.content
     if max_chars <= 0 or not isinstance(content, str) or len(content) <= max_chars:
         return block
-    return replace(block, content=f'{content[:max_chars]}…（压缩截断，原长 {len(content)} 字）')
+    return replace(
+        block, content=f'{clip_head(content, max_chars)}…（压缩截断，原长 {len(content)} 字）'
+    )
 
 
 def _projected_tokens(

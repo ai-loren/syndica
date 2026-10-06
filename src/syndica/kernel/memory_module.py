@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, cast
 
 from syndica import __version__
+from syndica.kernel.clipping import clip_head
 from syndica.kernel.context import Context, ContextBlock, TrustLevel, call_trust, strictest_trust
 from syndica.kernel.errors import ContractViolation, SyndicaError
 from syndica.kernel.history_blocks import HistoryKind, has_block, signed_block
@@ -113,7 +114,9 @@ class _RememberTool(Tool):
             if len(fresh) < self._consolidate_after:
                 return
             batch = fresh[:_CONSOLIDATE_BATCH]
-            rendered = '\n'.join(f'- {entry.text[:_CONSOLIDATE_CHARS]}' for entry in batch)
+            rendered = '\n'.join(
+                f'- {clip_head(entry.text, _CONSOLIDATE_CHARS)}' for entry in batch
+            )
             reply = await self._agent._aux_llm_call(  # pyright: ignore[reportPrivateUsage]
                 [
                     ContextBlock(

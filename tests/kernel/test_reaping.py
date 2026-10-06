@@ -237,3 +237,159 @@ async def test_a_parent_that_asks_about_a_reaped_child_is_told_what_happened() -
         await runtime.shutdown()
     answer = str(next(b for b in ctx.current_traj if b.tool_call_id == 'q').content)
     assert '被回收' in answer and '最近结束的 1 个' in answer
+
+
+class _Hears:
+    """记下每次被问到时最后一条消息；`gate` 放行之前停着。"""
+
+    def __init__(self) -> None:
+        self.config = LLMConfig(provider='scripted', model='m')
+        self.gate = asyncio.Event()
+        self.gate.set()
+        self.heard: list[str] = []
+
+    async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        await self.gate.wait()
+        self.heard.append(str(messages[-1].content))
+        return ContextBlock(role='assistant', content='child done')
+
+
+async def test_a_child_woken_while_its_parent_spawns_is_never_reaped_after_saying_ok() -> None:
+    runtime = Runtime(keep_finished_children=1)
+    try:
+        parent = await runtime.spawn(_agent(ScriptedLLM([]), 'Parent'))
+        llms = [_Hears() for _ in range(3)]
+        children = [
+            await runtime.spawn(_agent(llm), query='work', parent_id=parent) for llm in llms
+        ]
+        slot = runtime._slots[parent]  # pyright: ignore[reportPrivateUsage]
+        for child in children:
+            await asyncio.wait_for(runtime.wait(child), _TIMEOUT)
+            result = await runtime._waited_in_turn(slot, child)  # pyright: ignore[reportPrivateUsage]
+            assert result.state.value == 'answered'
+        llms[1].gate.clear()
+        sender = asyncio.create_task(runtime.send(children[1], 'URGENT: one more fix'))
+        await runtime.spawn(_agent(ScriptedLLM([])), parent_id=parent)
+        delivered = await asyncio.wait_for(sender, _TIMEOUT)
+        llms[1].gate.set()
+        if delivered.ok:
+            await asyncio.wait_for(runtime.wait(children[1]), _TIMEOUT)
+        still_there = await runtime.find(children[1]) is not None
+    finally:
+        await runtime.shutdown()
+    if delivered.ok:
+        assert still_there
+        assert any('URGENT' in heard for heard in llms[1].heard)
+    else:
+        assert not any('URGENT' in heard for heard in llms[1].heard)
+
+
+async def test_a_refused_spawn_reaps_nothing() -> None:
+    runtime = Runtime(keep_finished_children=1, budget=BudgetPolicy(root=Budget(turns=8)))
+    try:
+        parent = await runtime.spawn(_agent(ScriptedLLM([]), 'Parent'))
+        children = await _children(runtime, parent, 3, order=[0, 1, 2])
+        with pytest.raises(ConfigError):
+            await runtime.spawn(
+                _agent(ScriptedLLM([])), parent_id=parent, budget=Budget(turns=10_000)
+            )
+        alive = await _alive(runtime, children)
+    finally:
+        await runtime.shutdown()
+    assert alive == [True, True, True]
+
+
+async def _collected_children(runtime: Runtime, parent: str, llms: list[_Hears]) -> list[str]:
+    children = [await runtime.spawn(_agent(llm), query='work', parent_id=parent) for llm in llms]
+    slot = runtime._slots[parent]  # pyright: ignore[reportPrivateUsage]
+    for child in children:
+        await asyncio.wait_for(runtime.wait(child), _TIMEOUT)
+        result = await runtime._waited_in_turn(slot, child)  # pyright: ignore[reportPrivateUsage]
+        assert result.state.value == 'answered'
+    return children
+
+
+async def test_a_child_woken_just_before_it_is_destroyed_is_refused_not_destroyed() -> None:
+    runtime = Runtime(keep_finished_children=1)
+    deliveries: list[bool] = []
+    reasons: list[str] = []
+    try:
+        parent = await runtime.spawn(_agent(ScriptedLLM([]), 'Parent'))
+        llms = [_Hears() for _ in range(3)]
+        children = await _collected_children(runtime, parent, llms)
+        destroy = runtime.despawn
+
+        async def woken_first(agent_id: str) -> None:
+            if agent_id == children[1] and not deliveries:
+                delivered = await runtime.send(agent_id, 'URGENT: one more fix')
+                deliveries.append(delivered.ok)
+                reasons.append(delivered.reason or '')
+            await destroy(agent_id)
+
+        runtime.despawn = woken_first  # type: ignore[method-assign]
+        await runtime.spawn(_agent(ScriptedLLM([])), parent_id=parent)
+        await asyncio.sleep(0.05)
+        alive = await runtime.find(children[1]) is not None
+    finally:
+        await runtime.shutdown()
+    assert deliveries == [False]
+    assert '正在被拆除' in reasons[0] and '新的 Agent' in reasons[0]
+    assert not alive
+    assert not any('URGENT' in heard for heard in llms[1].heard)
+
+
+async def test_a_child_whose_descendant_wakes_while_it_is_chosen_is_kept() -> None:
+    runtime = Runtime(keep_finished_children=1)
+    deliveries: list[bool] = []
+    try:
+        parent = await runtime.spawn(_agent(ScriptedLLM([]), 'Parent'))
+        llms = [_Hears() for _ in range(3)]
+        children = await _collected_children(runtime, parent, llms)
+        grandchild_llm = _Hears()
+        grandchild = await runtime.spawn(
+            _agent(grandchild_llm), query='sub-work', parent_id=children[1]
+        )
+        await asyncio.wait_for(runtime.wait(grandchild), _TIMEOUT)
+        members_of = runtime._reap_members  # pyright: ignore[reportPrivateUsage]
+
+        async def descendant_wakes(agent_id: str) -> tuple[str, ...] | None:
+            members = await members_of(agent_id)
+            if agent_id == children[1] and not deliveries:
+                deliveries.append((await runtime.send(grandchild, 'URGENT: sub-fix')).ok)
+            return members
+
+        runtime._reap_members = descendant_wakes  # type: ignore[method-assign]
+        await runtime.spawn(_agent(ScriptedLLM([])), parent_id=parent)
+        await asyncio.wait_for(runtime.wait(grandchild), _TIMEOUT)
+        alive = await runtime.find(grandchild) is not None
+    finally:
+        await runtime.shutdown()
+    assert deliveries == [True]
+    assert alive
+    assert any('URGENT' in heard for heard in grandchild_llm.heard)
+
+
+async def test_a_child_woken_while_its_siblings_are_judged_is_left_to_its_new_cycle() -> None:
+    runtime = Runtime(keep_finished_children=1)
+    deliveries: list[bool] = []
+    try:
+        parent = await runtime.spawn(_agent(ScriptedLLM([]), 'Parent'))
+        llms = [_Hears() for _ in range(3)]
+        children = await _collected_children(runtime, parent, llms)
+        members_of = runtime._reap_members  # pyright: ignore[reportPrivateUsage]
+
+        async def earlier_sibling_wakes(agent_id: str) -> tuple[str, ...] | None:
+            members = await members_of(agent_id)
+            if agent_id == children[2] and not deliveries:
+                deliveries.append((await runtime.send(children[0], 'URGENT: one more fix')).ok)
+            return members
+
+        runtime._reap_members = earlier_sibling_wakes  # type: ignore[method-assign]
+        await runtime.spawn(_agent(ScriptedLLM([])), parent_id=parent)
+        await asyncio.wait_for(runtime.wait(children[0]), _TIMEOUT)
+        alive = await _alive(runtime, children)
+    finally:
+        await runtime.shutdown()
+    assert deliveries == [True]
+    assert alive == [True, False, True]
+    assert any('URGENT' in heard for heard in llms[0].heard)

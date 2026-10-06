@@ -643,7 +643,7 @@ async def test_long_horizon_events_are_recorded_in_the_trace() -> None:
 
 class _Rambles(BaselineStrategy):
     async def on_progress_stall(self, ctx: LongHorizonContext) -> StallAction:
-        return StallAction(StallMove.NUDGE, 'x' * 5000)
+        return StallAction(StallMove.NUDGE, 'x ' * 2500)
 
 
 async def test_a_long_strategy_message_is_clipped_before_it_enters_history() -> None:
@@ -1112,7 +1112,7 @@ async def test_every_strategy_text_is_clipped_before_it_enters_history(hook: str
     llm = _Router(main)
     runtime = _runtime(
         flags,
-        strategy=_Says('x' * (MESSAGE_LIMIT + 500)),
+        strategy=_Says('x ' * (MESSAGE_LIMIT // 2 + 250)),
         trusted=True,
         budget=BudgetPolicy(root=Budget(turns=20)),
     )
@@ -1121,7 +1121,7 @@ async def test_every_strategy_text_is_clipped_before_it_enters_history(hook: str
     finally:
         await runtime.shutdown()
     [first, *_] = _strategy_blocks(ctx, hook)
-    assert str(first.content).startswith('x' * MESSAGE_LIMIT + '…')
+    assert str(first.content).startswith('x ' * (MESSAGE_LIMIT // 2) + '…')
 
 
 async def test_a_restated_goal_is_clipped_and_the_judge_never_sees_written_content() -> None:

@@ -278,8 +278,8 @@ async def test_a_foreground_bash_result_carries_six_meta_keys(
     assert result.meta == {**expected, 'running': False, 'truncated': False}
 
 
-_LONG_STDOUT = 'o' * 900 + '\n== 5 passed in 0.1s =='
-_LONG_STDERR = 'E' * 900 + '\nFAILED tests/x.py::y'
+_LONG_STDOUT = 'o ' * 450 + '\n== 5 passed in 0.1s =='
+_LONG_STDERR = 'E ' * 450 + '\nFAILED tests/x.py::y'
 
 
 async def test_output_limit_clips_each_stream_on_its_own_keeping_both_tails(
@@ -294,15 +294,29 @@ async def test_output_limit_clips_each_stream_on_its_own_keeping_both_tails(
     stdout, stderr = result.meta['stdout'], result.meta['stderr']
     assert isinstance(stdout, str) and isinstance(stderr, str)
     assert result.meta['truncated'] is True
-    assert stdout.startswith('o' * 20 + '\n…[')
+    assert stdout.startswith('o ' * 10 + '\n…[')
     assert stdout.endswith(_LONG_STDOUT[-80:])
-    assert stderr.startswith('E' * 20 + '\n…[')
+    assert stderr.startswith('E ' * 10 + '\n…[')
     assert stderr.endswith(_LONG_STDERR[-80:])
     assert f'截掉了 {len(_LONG_STDOUT) - 100} 个字符' in stdout
     assert 'sed -n' in stdout
     assert f'stdout:\n{stdout}\nstderr:\n{stderr}' in result.output
-    assert 'o' * 900 not in result.output
+    assert 'o ' * 450 not in result.output
     assert 'truncated: true' in result.output
+
+
+async def test_a_clipped_credential_run_is_dropped_whole_and_the_count_says_so(
+    root: Path, shell_path: str
+) -> None:
+    (root / 'out.txt').write_text('A' * 900, encoding='utf-8')
+    bash = _bash(root, shell_path, output_limit=100)
+
+    result = await bash.execute('cat out.txt')
+
+    stdout = result.meta['stdout']
+    assert isinstance(stdout, str)
+    assert 'A' not in stdout
+    assert '截掉了 900 个字符' in stdout
 
 
 async def test_a_short_stream_is_left_alone_when_the_other_is_clipped(

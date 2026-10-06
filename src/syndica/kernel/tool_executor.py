@@ -112,11 +112,12 @@ import posixpath
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from types import MappingProxyType
 from typing import Any, cast
 
-from syndica.kernel.background import BackgroundCall, BackgroundCalls
+from syndica.kernel.background import BackgroundCall, BackgroundCalls, drain_cancelled
 from syndica.kernel.context import (
     _CALL_TRUST,  # pyright: ignore[reportPrivateUsage]
     Context,
@@ -222,6 +223,11 @@ def _parsed_arguments(call: ToolCall) -> dict[str, Any] | None:
     if not isinstance(decoded, dict):
         return None
     return cast('dict[str, Any]', decoded)
+
+
+# 正在跑的这一段是不是这一批的最后一段：只有它里面的调用能转后台。后面还有段时，后面的调用依赖它
+# 跑完（不可并发的工具切开的段就是在表达先后），转走了它们就读到它做到一半的状态。
+_LAST_SEGMENT: ContextVar[bool] = ContextVar('syndica_last_segment', default=True)
 
 
 def _segments(safety: Sequence[bool], limit: int) -> list[list[int]]:
@@ -390,7 +396,7 @@ def _bad_arguments_result(call: ToolCall, tool: Tool, detail: str) -> ToolResult
     )
 
 
-def _tool_raised_result(call: ToolCall, exc: Exception, trust: TrustLevel) -> ToolResult:
+def _tool_raised_result(call: ToolCall, exc: BaseException, trust: TrustLevel) -> ToolResult:
     """`trust` 由调用方按工具会不会带进外部内容算（`_raised_trust`）：异常文字可以整份来自工具读到
     的外部内容，也可以只是参数的回显。"""
     return ToolResult(
@@ -533,6 +539,19 @@ def _gated_result(call: ToolCall, verdict: DangerVerdict, disposition: Dispositi
             f'（{verdict.reason}），本次调用已被阻断，没有执行、也没有产生任何副作用。'
             ' 下一步: 换一种达成同一目标的做法——缩小作用范围、去掉提权、避开不可逆操作；'
             '这次阻断不会被记住，也不存在「此后均可」的放行，同样的调用重来一次仍会被阻断。'
+        )
+    )
+
+
+def _background_running_result(call: ToolCall, running: Sequence[BackgroundCall]) -> ToolResult:
+    listed = '、'.join(f'{entry.id}（{entry.call.name}）' for entry in running)
+    return ToolResult(
+        output=(
+            f'期望: 需要人工确认的 {call.name}（id={call.id}）独占执行，执行时没有别的调用在跑。'
+            f' 实际: 你还有转到后台、还在跑的调用：{listed}。本次调用没有交给人确认，没有执行、'
+            '也没有产生任何副作用。'
+            ' 下一步: 等它们结束（用 QueryBackgroundTool 查看）或用 CancelBackgroundTool 取消，'
+            '再重新发起这次调用。'
         )
     )
 
@@ -926,23 +945,28 @@ class ToolExecutor:
         handled = 0
         failure: Exception | None = None
         failed_call: ToolCall | None = None
-        for segment in _segments(safety, self._max_concurrency):
+        segments = _segments(safety, self._max_concurrency)
+        for position, segment in enumerate(segments):
             calls = [tool_calls[index] for index in segment]
-            outcomes = _without_cancellation(
-                await self._run_segment(
-                    ctx,
-                    calls,
-                    provenance,
-                    execution_gate,
-                    confirmation_lock,
-                    keys=[
-                        None
-                        if origin is None
-                        else ToolCallKey(*origin, index, tool_calls[index].id)
-                        for index in segment
-                    ],
+            last = _LAST_SEGMENT.set(position == len(segments) - 1)
+            try:
+                outcomes = _without_cancellation(
+                    await self._run_segment(
+                        ctx,
+                        calls,
+                        provenance,
+                        execution_gate,
+                        confirmation_lock,
+                        keys=[
+                            None
+                            if origin is None
+                            else ToolCallKey(*origin, index, tool_calls[index].id)
+                            for index in segment
+                        ],
+                    )
                 )
-            )
+            finally:
+                _LAST_SEGMENT.reset(last)
             for call, outcome in zip(calls, outcomes, strict=True):
                 # 判定抛出这条路单独接：它是唯一能断言「工具没运行」的抛出点。
                 if isinstance(outcome, _JudgeFailure):
@@ -1408,11 +1432,13 @@ class ToolExecutor:
         return final, outcome
 
     def _backgroundable(self, tool: Tool, exclusive: bool) -> bool:
-        """转不转得到后台：背景化开着、工具类声明了可后台化、而且这次不是获批之后独占执行的调用。"""
+        """转不转得到后台：背景化开着、工具类声明了可后台化、这次不是获批之后独占执行的调用，而且
+        它在这一批的最后一段里。"""
         return (
             self._background is not None
             and not exclusive
             and getattr(type(tool), '__tool_backgroundable__', False) is True
+            and _LAST_SEGMENT.get()
         )
 
     async def _outlasted_threshold(self, work: asyncio.Future[object]) -> bool:
@@ -1421,6 +1447,7 @@ class ToolExecutor:
             await asyncio.wait({work, timer}, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             work.cancel()
+            await drain_cancelled([work])
             raise
         finally:
             timer.cancel()
@@ -1447,11 +1474,13 @@ class ToolExecutor:
             ),
             name=f'background:{entry.id}',
         )
+        # 观察者拿副本：参数之后还要交给 POST hook、观察者与 trace，就地改了它们
+        # 就记下一次没跑过的调用。
         await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
             Junction.TOOL_MOVED_TO_BACKGROUND,
-            tool_call=call,
+            tool_call=replace(call),
             tool=tool,
-            args=args,
+            args=copy.deepcopy(args),
             background_id=entry.id,
         )
         return ToolResult(
@@ -1474,6 +1503,25 @@ class ToolExecutor:
         交不回，等它的那一轮就永远等下去。被取消时连同工具一起取消。"""
         calls = cast(BackgroundCalls, self._background)
         outside_any_span()
+        try:
+            await self._finish_entry(
+                entry, call, tool, args, provenance, work, extension_taint, placed
+            )
+        finally:
+            calls.lost(entry, '收尾任务没有交回结果就退出了')
+
+    async def _finish_entry(
+        self,
+        entry: BackgroundCall,
+        call: ToolCall,
+        tool: Tool,
+        args: dict[str, Any],
+        provenance: TrustLevel,
+        work: asyncio.Future[object],
+        extension_taint: list[str],
+        placed: tuple[ToolCallKey, _OpenSpan] | None,
+    ) -> None:
+        calls = cast(BackgroundCalls, self._background)
         key = None if placed is None else placed[0]
         try:
             span_cm = (
@@ -1487,8 +1535,23 @@ class ToolExecutor:
                 returned: object
                 try:
                     returned = await work
-                except asyncio.CancelledError:
-                    raise
+                except asyncio.CancelledError as exc:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                    # 没有人取消这次收尾，是工具自己抛出的取消（它等的 future 被别人取消了）：
+                    # 照样要交回一个结果，否则这条后台调用一直是 running，等它的那一轮永远等下去。
+                    if traced is not None:
+                        self._tracing.tool_result(traced[1], None, exc, arguments=args)
+                    returned = _tool_raised_result(call, exc, self._raised_trust(call, provenance))
+                    outcome = 'error'
+                except SyndicaError as exc:
+                    # 与同步那条路一样：三件套写给程序员或运维，模型执行不了它的 next_action。
+                    if traced is not None:
+                        self._tracing.tool_result(traced[1], None, exc, arguments=args)
+                    entry.error = exc
+                    calls.finished(entry, _aborted_result(call, exc))
+                    return
                 except Exception as exc:
                     if traced is not None:
                         self._tracing.tool_result(traced[1], None, exc, arguments=args)
@@ -1504,10 +1567,12 @@ class ToolExecutor:
                 )
                 if span is not None:
                     span.attributes['tool.outcome'] = outcome
+            # 观察者拿副本：交给 Agent 的是 `final` 本身，就地改它的信任或内容
+            # 就绕过了 POST_TOOL_USE 的收紧。
             await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
                 Junction.BACKGROUND_TOOL_COMPLETED,
-                tool_call=call,
-                result=final,
+                tool_call=replace(call),
+                result=copy.deepcopy(final),
                 background_id=entry.id,
             )
         except asyncio.CancelledError:
@@ -1602,6 +1667,15 @@ class ToolExecutor:
                 _report_allowed_low_risk_from_untrusted(call, verdict)
             return None, 'ok', False, args
         if disposition is Disposition.CONFIRM:
+            # 获批的调用独占执行，转到后台还在跑的调用也算兄弟：人批准的是此刻的状态，后台的命令还在
+            # 改它。在问人之前拒绝，不白问一次；也不等（后台常是不会结束的服务进程）、不替模型取消。
+            if self._background is not None and self._background.running:
+                return (
+                    _background_running_result(call, self._background.running),
+                    'blocked',
+                    False,
+                    args,
+                )
             request = (
                 self._confirmation_request(call, args, verdict)
                 if self._confirmation is not None and self._confirmation_agent_id is not None

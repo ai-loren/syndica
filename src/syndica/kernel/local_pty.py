@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+from syndica.kernel.clipping import drop_cut_end, drop_cut_start
 from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.terminal_text import UNSAFE_TEXT, utf8_prefix_length
@@ -105,14 +106,15 @@ class _Session:
         tail_start = head_end + self.dropped
         parts: list[str] = []
         if offset < head_end:
-            parts.append(_plain(bytes(self.head[offset:])))
+            parts.append(drop_cut_end(_plain(bytes(self.head[offset:]))))
         lost = tail_start - max(offset, head_end) if offset < tail_start else 0
         if lost:
             parts.append(f'\n…[这个会话中间 {lost} 个字节的输出没有保留]…\n')
         tail_from = max(0, offset - tail_start)
         data = bytes(self.tail[tail_from:])
         keep = len(data) if settled else _complete(data)
-        parts.append(_plain(data[:keep]))
+        shown = _plain(data[:keep])
+        parts.append(drop_cut_start(shown) if tail_from == 0 else shown)
         return ''.join(parts), bool(lost), max(offset, tail_start + tail_from + keep)
 
 
