@@ -493,6 +493,7 @@ def test_assemble_does_not_add_runtime_start_or_a_start_method() -> None:
         'sessions',
         'redactor',
         'artifacts',
+        'budget',
     )
     source = inspect.getsource(Runtime.assemble)
     assert 'RUNTIME_START' not in source

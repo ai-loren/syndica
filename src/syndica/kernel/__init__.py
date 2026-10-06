@@ -15,6 +15,16 @@
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
 from syndica.kernel.agents import Orchestrator, register_builtins
+from syndica.kernel.budget import (
+    Budget,
+    BudgetPolicy,
+    BudgetView,
+    Exhaustion,
+    Prices,
+    PriceTable,
+    StaticPrices,
+    Usage,
+)
 from syndica.kernel.catalog import AgentCatalog, HostFacts, OverrideRecord
 from syndica.kernel.context import (
     ArtifactRef,
@@ -187,6 +197,9 @@ __all__ = [
     'AttributeValue',
     'BaseAgent',
     'BlockHighRisk',
+    'Budget',
+    'BudgetPolicy',
+    'BudgetView',
     'CachePrefixProvider',
     'CausalityEdge',
     'ConfigError',
@@ -210,6 +223,7 @@ __all__ = [
     'Event',
     'EventBus',
     'ExecResult',
+    'Exhaustion',
     'ExitMode',
     'ExtensionJunction',
     'FileSessionStore',
@@ -259,6 +273,8 @@ __all__ = [
     'PrefixDriftModule',
     'PrefixDriftRecord',
     'PrefixDriftService',
+    'PriceTable',
+    'Prices',
     'PtyCapture',
     'PtyStatus',
     'RedactedContent',
@@ -286,6 +302,7 @@ __all__ = [
     'SpanKind',
     'SpanStatus',
     'StableKey',
+    'StaticPrices',
     'StopReason',
     'Subscription',
     'SyndicaError',
@@ -303,6 +320,7 @@ __all__ = [
     'Tracer',
     'Trigger',
     'TrustLevel',
+    'Usage',
     'UserInput',
     'VersionEntry',
     'VersionStore',

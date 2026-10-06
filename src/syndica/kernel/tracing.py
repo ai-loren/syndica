@@ -31,6 +31,7 @@ from syndica.kernel.errors import ContractViolation
 from syndica.kernel.trace import AttributeValue, CausalityEdge, EdgeKind, SpanKind, SpanStatus
 
 if TYPE_CHECKING:
+    from syndica.kernel.budget_tree import BudgetAccount
     from syndica.kernel.context import ContextBlock
     from syndica.kernel.message import Message
     from syndica.kernel.tool import ToolResult
@@ -214,6 +215,9 @@ class _LlmCall:
     turn: int
     attempts: int = 0
     in_flight: bool = False
+    # 这次调用记在谁的预算上（spec §8.4）。每一次 `create` 都经 `llm_attempt`：准入与计量挂在这里，
+    # 主轮、重试、轮换、辅助调用与伴生就没有一条能绕过预算。
+    account: BudgetAccount | None = None
 
 
 _LLM_CALL: ContextVar[_LlmCall | None] = ContextVar('syndica_current_llm_call', default=None)
@@ -483,9 +487,9 @@ class _Tracing:
         for message_id in stale:
             del self._sent_from[message_id]
 
-    def llm_call(self, agent_id: str, turn: int) -> _LlmScope:
-        """一轮里的模型调用：首次与重试共用这一份计数（D3 / D11）。"""
-        return _LlmScope(_LlmCall(self, agent_id, turn))
+    def llm_call(self, agent_id: str, turn: int, account: BudgetAccount | None = None) -> _LlmScope:
+        """一轮里的模型调用：首次与重试共用这一份计数（D3 / D11），也共用 `account` 这份预算。"""
+        return _LlmScope(_LlmCall(self, agent_id, turn, account=account))
 
     def tool_result(
         self,
@@ -553,6 +557,7 @@ class _Attempt:
         self._request = request
         self._reply: object = None
         self._span: _Span | None = None
+        self._ticket: object = None
 
     def observe(self, reply: object) -> None:
         """把回复里 backend 报的事实记到这次的 span 上：哪个平台答的（`extra['llm_route']`）、同一次
@@ -577,6 +582,21 @@ class _Attempt:
                 '期望: 模型回复的 extra 是一个读得出的映射。'
                 ' 实际: 读它时抛出 %s: %s；这一次的平台与 token 计数没记下，run 照常进行。'
                 ' 下一步: 检查这个 LLM backend 交回的 ContextBlock.extra。',
+                type(error).__name__,
+                error,
+            )
+        account = self._call.account
+        if account is None:
+            return
+        ticket, self._ticket = self._ticket, None
+        try:
+            account.settle(cast('Any', ticket), self._llm, self._request, reply)
+        except Exception as error:
+            logger.error(
+                '期望: 这次模型调用的消耗记进 agent %s 的预算。'
+                ' 实际: 记账时抛出 %s: %s；这一次没有记上，预算因此少算了一次调用。'
+                ' 下一步: 检查价格表（price_of 必须交回 Prices 或 None）与 backend 报的 usage。',
+                self._call.agent_id,
                 type(error).__name__,
                 error,
             )
@@ -612,6 +632,9 @@ class _Attempt:
         call = self._call
         if call is None:
             return self
+        if call.account is not None:
+            # 放不进剩余预算时在这里抛 `BudgetExhausted`：调用不发出去、不开 span、不算一次尝试。
+            self._ticket = call.account.admit(self._llm, self._request)
         call.attempts += 1
         attributes: dict[str, AttributeValue] = {'llm.attempt': call.attempts}
         model = _model_of(self._llm)
@@ -636,6 +659,9 @@ class _Attempt:
     ) -> None:
         if self._call is not None:
             self._call.in_flight = False
+            if self._ticket is not None and self._call.account is not None:
+                self._call.account.release(cast('Any', self._ticket))
+                self._ticket = None
         if self._span is None or self._call is None:
             return
         # 取消不是这次调用的结局：被取消的调用没有回复也没有错误可回放（D11：回放在同一处阻塞）。

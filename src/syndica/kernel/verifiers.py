@@ -36,8 +36,16 @@ from syndica.kernel.acceptance import (
     unfinished_verdict,
 )
 from syndica.kernel.acceptance_inject import meaningful_quote
-from syndica.kernel.companion import run_companion
-from syndica.kernel.context import Context, ContextBlock, TrustLevel, provenance_of, strictest_trust
+from syndica.kernel.budget_tree import BudgetExhausted
+from syndica.kernel.companion import CompanionResult, run_companion
+from syndica.kernel.context import (
+    Context,
+    ContextBlock,
+    StopReason,
+    TrustLevel,
+    provenance_of,
+    strictest_trust,
+)
 from syndica.kernel.errors import SyndicaError
 from syndica.kernel.history_blocks import kind_of
 from syndica.kernel.hooks import HookResult
@@ -144,7 +152,7 @@ async def verify_output(
             max_turns=max_turns,
             trust=trust,
         )
-    data = _load(result.reply, 'OutputVerifier')
+    data = _loaded(result, 'OutputVerifier')
     reason = data.get('reason')
     return OutputCheck(
         complete=data.get('complete') is True,
@@ -179,7 +187,7 @@ async def verify_outcome(
             max_turns=max_turns,
             trust=trust,
         )
-    data = _load(result.reply, 'OutcomeVerifier')
+    data = _loaded(result, 'OutcomeVerifier')
     reason = data.get('reason')
     reported = await _reported(data.get('outcomes'), evidence_text, portal, rubrics)
     return derive_verdict(
@@ -329,6 +337,8 @@ def acceptance_hook(
                 )
                 return derive_verdict(rubrics, {}, trust=trust, failure='verifier_timeout'), None
             return _failed(rubrics, trust, exc), None
+        except BudgetExhausted:
+            return derive_verdict(rubrics, {}, trust=trust, failure='budget_exhausted'), None
         except Exception as exc:
             return _failed(rubrics, trust, exc), None
         bucket = {VerdictStatus.PARTIAL: 'partial', VerdictStatus.BLOCK: 'block'}.get(
@@ -403,6 +413,27 @@ def _outcome_task(rubrics: Sequence[Rubric], transcript: str) -> str:
         lines.append(f'- [{rubric.id}]（{rubric.kind.value}）{rubric.statement}')
     lines += ['', '主 Agent 的轨迹：', transcript]
     return '\n'.join(lines)
+
+
+def _loaded(result: CompanionResult, who: str) -> dict[str, Any]:
+    """伴生的结论；它停在预算上、没留下解析得了的回复时抛 `BudgetExhausted`（验收标
+    `budget_exhausted`，而不是一次解析失败）。"""
+    try:
+        return _load(result.reply, who)
+    except ValueError:
+        if result.stop_reason is StopReason.BUDGET:
+            raise _companion_out_of_budget(who) from None
+        raise
+
+
+def _companion_out_of_budget(who: str) -> BudgetExhausted:
+    error = BudgetExhausted(
+        expected=f'{who} 在被验收 Agent 的剩余预算里给出结论',
+        received='被验收 Agent 的预算用完了，伴生没能给出结论',
+        next_action='放行并标 unverified；要它验完就给这个 Agent 留出预算或追加',
+    )
+    error.dimension = 'tokens'
+    return error
 
 
 def _load(reply: str, who: str) -> dict[str, Any]:

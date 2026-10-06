@@ -71,16 +71,21 @@ block——provider 会拒掉这样的消息。本类是那份 Context 此后唯
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import itertools
 import logging
 import posixpath
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 from typing import Any, cast
 
 from syndica.kernel.acceptance import OutcomeKind, Verdict, VerdictStatus, most_severe
+from syndica.kernel.budget import Budget, BudgetView, Exhaustion
+from syndica.kernel.budget_tree import BudgetAccount, BudgetExhausted, granted_dims, seconds
 from syndica.kernel.compaction import (
     CompactionController,
     apply_compaction,
@@ -415,6 +420,57 @@ def _unpaired_calls(blocks: list[ContextBlock]) -> list[ToolCall]:
 
 
 _ABORT_AFTER_LLM_WHY = '中止在模型已经产出之后、任何工具执行之前被兑现，本批调用就此停下。'
+_BUDGET_WRAP_WHY = '预算用完了，这是收尾的一轮：内核不再执行工具调用，本批调用就此停下。'
+_WRAP_UP_TEXT = (
+    '预算快用完了（{dims}）：这是最后一轮，这一轮里的工具调用不会被执行。'
+    '直接把已经完成的部分整理成最终回答交付，写清哪些还没做完、做到了哪一步。'
+)
+_BUDGET_BLOCK_SAMPLE = ContextBlock(
+    role='user', content=_WRAP_UP_TEXT.format(dims='tokens / cost / turns / wall_clock_s')
+)
+
+
+@dataclass(frozen=True)
+class _Served:
+    agent: BaseAgent
+    account: BudgetAccount | None
+    tracing: _Tracing
+
+
+# 此刻在替谁干活：`_run` 在整个周期里设好，伴生运行器据此把伴生的预算与 trace 接到被服务的 Agent
+# 上。伴生跑在被服务 Agent 的驱动任务里（验收 hook 内），读得到它；派出去的子 Agent 在自己的 `_run`
+# 里覆盖。
+SERVED: ContextVar[_Served | None] = ContextVar('syndica_served_agent', default=None)
+
+
+def _render_budget(view: BudgetView, heading: str) -> str:
+    limit, left = view.limit, view.remaining
+    parts: list[str] = []
+    if limit.turns is not None:
+        parts.append(f'轮次剩 {left.turns} / {limit.turns}')
+    if limit.tokens is not None:
+        parts.append(f'token 剩 {left.tokens} / {limit.tokens}')
+    if limit.cost is not None:
+        parts.append(f'成本剩 {left.cost} / {limit.cost}')
+    if limit.wall_clock_s is not None:
+        parts.append(f'时间剩 {seconds(left.wall_clock_s)} / {seconds(limit.wall_clock_s)} 秒')
+    return f'{heading}：' + '；'.join(parts) + '。三档 token 的明细用 GetBudget 看。'
+
+
+def _budget_attributes(view: BudgetView) -> dict[str, AttributeValue]:
+    used, limit = view.used, view.limit
+    return {
+        'budget.input_tokens': used.input_tokens,
+        'budget.output_tokens': used.output_tokens,
+        'budget.cached_input_tokens': used.cached_input_tokens,
+        'budget.turns': used.turns,
+        'budget.cost': None if used.cost is None else str(used.cost),
+        'budget.estimated': used.estimated,
+        'budget.limit_tokens': limit.tokens,
+        'budget.limit_cost': None if limit.cost is None else str(limit.cost),
+        'budget.limit_turns': limit.turns,
+        'budget.limit_wall_clock_s': seconds(limit.wall_clock_s),
+    }
 
 
 def _interrupted_output(call: ToolCall) -> str:
@@ -526,6 +582,23 @@ class BaseAgent:
         # 产物的隔离作用域（可选）：Runtime 给的函数，交回本 Agent 所在隔离副本的标识（共用根工作区
         # 时是空串）。进产物 id，两个各在自己副本里写同一路径的 Agent 不撞成一个产物（评审 H5）。
         self._artifact_scope: Callable[[], str] | None = None
+        # 预算（可选）：Runtime 经 `_attach_budget` 装上（伴生运行器装被服务 Agent 的那一份）。没装
+        # 就不限、不计量（spec §8.4）。
+        self._budget: BudgetAccount | None = None
+        # 这一轮是收尾轮：工具调用不执行、打回不生效，之后停在 BUDGET（`_wrap_dims` 触发了它）。
+        self._wrapping = False
+        self._wrap_dims: tuple[str, ...] = ()
+        # 上一轮的耗时（秒）：wall clock 按它预测下一轮能不能在截止时刻之前跑完。
+        self._last_turn_s = 0.0
+        self._last_system: ContextBlock | None = None
+        # 问过人的追加代数：同一次耗尽只问一次，人不追加就按收尾处置，不是每一轮都问。
+        self._asked: int | None = None
+        # 本周期的预算提醒是否已经注入过周期起点那一块。
+        self._budget_cycle = 0
+        # 伴生 Agent 替谁干活（伴生运行器设）：它的 agent span 挂在当前 span 下、带 `agent.serves`。
+        self._serves: str | None = None
+        # 本 Agent 派出过几个伴生：伴生 id 由（本 Agent、伴生名、第几个）派生，span id 因此稳定。
+        self._companions = 0
 
     def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
         """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
@@ -766,6 +839,10 @@ class BaseAgent:
         模型调用之前调它（§7.6）：任务已在轨迹里，第一轮就看得到投影结果。"""
         self._rubrics = inject
 
+    def _attach_budget(self, account: BudgetAccount) -> None:
+        """装上预算（Runtime 在 spawn 时调；伴生运行器装被服务 Agent 的伴生那一份）。"""
+        self._budget = account
+
     def _attach_artifact_store(
         self, store: ArtifactStore, scope: Callable[[], str] | None = None
     ) -> None:
@@ -786,7 +863,7 @@ class BaseAgent:
         结构照常记录、不写回放文档并记一条 warning，而不是让回放崩（spec §11.3）。"""
         self._aux_calls += 1
         request = {'messages': messages, **kwargs}
-        with self._tracing.llm_call(self.agent_id, -self._aux_calls):
+        with self._tracing.llm_call(self.agent_id, -self._aux_calls, self._budget):
             with llm_attempt(self.options.llm, request) as attempt:
                 reply = await self.options.llm.create(messages, **kwargs)
                 attempt.observe(reply)
@@ -939,52 +1016,75 @@ class BaseAgent:
 
     async def _run(self, query: str | None, trust: TrustLevel) -> Context:
         self._cycle += 1
+        attributes: dict[str, AttributeValue] = {
+            'agent.role': self.options.name,
+            'agent.cycle': self._cycle,
+        }
+        if self._serves is not None:
+            attributes['agent.serves'] = self._serves
         with self._tracing.span(
             SpanKind.AGENT,
             (self.agent_id, self._cycle),
             name=self.options.name,
             agent_id=self.agent_id,
-            attributes={'agent.role': self.options.name, 'agent.cycle': self._cycle},
-            detached=True,
+            attributes=attributes,
+            detached=self._serves is None,
         ) as span:
-            ctx = self._context
-            ctx.stop_reason = None
-            ctx.verdict = None
-            self._cycle_anchor = None
-            repaired = _repair_interrupted_batch(ctx)
-            self._executor._trace_interrupted(  # pyright: ignore[reportPrivateUsage]
-                (self.agent_id, self._cycle, self._current_turn), repaired
-            )
-            # 记忆召回在查询注入之前：长期记忆是本次任务的背景（spec §8.9）。幂等缓存由召回自己用
-            # `has_block` 做——只在新会话 / 压缩掉之后重载，不每轮重拉（否则前缀逐轮变、缓存失效）。
-            self._rubrics_due = True
-            if self._recall is not None:
-                await self._recall(ctx)
-            if query is not None:
-                anchor = ContextBlock(role='user', content=query, trust=trust)
-                ctx.append(anchor)
-                self._cycle_anchor = anchor
-            await self._emit('agent_start', {})
-            await self._hooks._dispatch(Junction.AGENT_START, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
-            # Exception 而非 BaseException：取消既不是正常结束也不是失败，展开的路上不再触发切点、
-            # 不再发事件。
+            budget = self._budget
+            if budget is not None:
+                budget.begin_cycle()
+            served = SERVED.set(_Served(self, budget, self._tracing))
             try:
-                stop_reason = await self._run_turns(ctx)
-            except Exception:
-                ctx.stop_reason = StopReason.ERROR
-                span.attributes['stop_reason'] = StopReason.ERROR.value
-                await self._hooks._dispatch(Junction.AGENT_ERROR, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
-                await self._emit('agent_error', {})
-                raise
-            span.attributes['stop_reason'] = stop_reason.value
-            ending: dict[str, object] = {'stop_reason': stop_reason.value}
-            if ctx.verdict is not None:
-                span.attributes.update(_verdict_attributes(ctx.verdict))
-                ending['verdict'] = ctx.verdict.status.value
-            await self._hooks._dispatch(Junction.AGENT_END, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
-            # 事件 payload 必须是纯数据：枚举成员走不出序列化的 SSE 出口。
-            await self._emit('agent_end', ending)
-            return ctx
+                return await self._cycle_body(query, trust, span.attributes)
+            finally:
+                SERVED.reset(served)
+                if budget is not None:
+                    budget.end_cycle()
+                    if budget.limited:
+                        span.attributes.update(_budget_attributes(budget.view()))
+
+    async def _cycle_body(
+        self, query: str | None, trust: TrustLevel, attributes: dict[str, AttributeValue]
+    ) -> Context:
+        ctx = self._context
+        ctx.stop_reason = None
+        ctx.verdict = None
+        self._cycle_anchor = None
+        self._wrapping = False
+        repaired = _repair_interrupted_batch(ctx)
+        self._executor._trace_interrupted(  # pyright: ignore[reportPrivateUsage]
+            (self.agent_id, self._cycle, self._current_turn), repaired
+        )
+        # 记忆召回在查询注入之前：长期记忆是本次任务的背景（spec §8.9）。幂等缓存由召回自己用
+        # `has_block` 做——只在新会话 / 压缩掉之后重载，不每轮重拉（否则前缀逐轮变、缓存失效）。
+        self._rubrics_due = True
+        if self._recall is not None:
+            await self._recall(ctx)
+        if query is not None:
+            anchor = ContextBlock(role='user', content=query, trust=trust)
+            ctx.append(anchor)
+            self._cycle_anchor = anchor
+        await self._emit('agent_start', {})
+        await self._hooks._dispatch(Junction.AGENT_START, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
+        # Exception 而非 BaseException：取消既不是正常结束也不是失败，展开的路上不再触发切点、
+        # 不再发事件。
+        try:
+            stop_reason = await self._run_turns(ctx)
+        except Exception:
+            ctx.stop_reason = StopReason.ERROR
+            attributes['stop_reason'] = StopReason.ERROR.value
+            await self._hooks._dispatch(Junction.AGENT_ERROR, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
+            await self._emit('agent_error', {})
+            raise
+        attributes['stop_reason'] = stop_reason.value
+        ending: dict[str, object] = {'stop_reason': stop_reason.value}
+        if ctx.verdict is not None:
+            attributes.update(_verdict_attributes(ctx.verdict))
+            ending['verdict'] = ctx.verdict.status.value
+        await self._hooks._dispatch(Junction.AGENT_END, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
+        # 事件 payload 必须是纯数据：枚举成员走不出序列化的 SSE 出口。
+        await self._emit('agent_end', ending)
+        return ctx
 
     async def _run_turns(self, ctx: Context) -> StopReason:
         tool_defs = [tool.schema for tool in self.options.tools.values()]
@@ -1004,6 +1104,7 @@ class BaseAgent:
             # 在这一轮的任何一步之前计数：死在注入里的一轮也消耗了预算，下一个周期从下一轮开始，
             # 不会再开一个同号的 turn span。
             self._current_turn = turn
+            began = None if self._budget is None else self._budget.tree.now()
             with self._tracing.span(
                 SpanKind.TURN,
                 (self.agent_id, turn),
@@ -1012,6 +1113,8 @@ class BaseAgent:
                 attributes={'turn': turn},
             ):
                 stop_reason = await self._one_turn(ctx, turn, decision, tool_defs)
+            if self._budget is not None and began is not None:
+                self._last_turn_s = self._budget.tree.now() - began
             if stop_reason is not None:
                 return stop_reason
         ctx.stop_reason = StopReason.MAX_TURNS
@@ -1031,6 +1134,12 @@ class BaseAgent:
         if self._rubrics is not None and self._rubrics_due:
             self._rubrics_due = False
             await self._rubrics(ctx)
+        # 预算判定在注入之后（硬停时已收下的消息留在轨迹里、随会话存下，不随停下而丢）、压缩与模型调
+        # 用之前（spec §8.4，计划 P1 B2）。
+        if self._budget is not None:
+            stopped = await self._budget_turn(ctx, tool_defs)
+            if stopped is not None:
+                return stopped
         # turn 开始就做阈值 / 主动压缩（§8.8 主路径）：注入之后（新输入成了受保护的「当前输入」）、
         # 模型调用之前，消息驱动的 Agent（每轮一次回复、无工具）也会压，而非只靠超限兜底（H3）。
         await self._maybe_compact(ctx, trigger='threshold')
@@ -1038,7 +1147,12 @@ class BaseAgent:
         await self._emit('turn_start', {'turn': turn})
         await self._hooks._dispatch(Junction.TURN_START, ctx=ctx, turn=turn)  # pyright: ignore[reportPrivateUsage]
 
-        response = await self._one_llm_call(ctx, tool_defs)
+        try:
+            response = await self._one_llm_call(ctx, tool_defs)
+        except BudgetExhausted as refused:
+            await self._stop_for_budget(ctx, (refused.dimension,), self._disposition())
+            await self._end_turn(ctx, turn, None)
+            return StopReason.BUDGET
         if response is None:
             await self._end_turn(ctx, turn, None)
             return None
@@ -1060,6 +1174,19 @@ class BaseAgent:
             return StopReason.ABORTED
 
         ctx.append(response)
+        if self._wrapping:
+            if response.tool_calls:
+                self._executor.append_unexecuted(
+                    ctx,
+                    response.tool_calls,
+                    why=_BUDGET_WRAP_WHY,
+                    origin=(self.agent_id, self._cycle, turn),
+                )
+            else:
+                await self._propose_completion(ctx, response, turn, send_back=False)
+            await self._stop_for_budget(ctx, self._wrap_dims, Exhaustion.GRACEFUL_WRAPUP)
+            await self._end_turn(ctx, turn, response)
+            return StopReason.BUDGET
         if not response.tool_calls:
             # Agent 判定完成：先过验收切点（§7.5）。打回则内核已追加反馈块，再做一轮。
             sent_back = await self._propose_completion(ctx, response, turn)
@@ -1084,7 +1211,9 @@ class BaseAgent:
         await self._end_turn(ctx, turn, response)
         return None
 
-    async def _propose_completion(self, ctx: Context, response: ContextBlock, turn: int) -> bool:
+    async def _propose_completion(
+        self, ctx: Context, response: ContextBlock, turn: int, *, send_back: bool = True
+    ) -> bool:
         """过 COMPLETION_PROPOSED（§7.5）。交回 True 表示打回、再做一轮。
 
         几个 hook 各给裁决时取**最严**的（链上靠后的 hook 不能把前面的 block 改成 pass，评审 H1），
@@ -1109,8 +1238,10 @@ class BaseAgent:
         if self._by_floored(authors.wrote.get('verdict', ()), authors.wrote.get('send_back', ())):
             verdict = replace(verdict, trust=TrustLevel.UNTRUSTED)
         ctx.verdict = verdict
-        send_back = any(value is True for value in outcome.history.get('send_back', []))
-        if not send_back or verdict.status not in (VerdictStatus.PARTIAL, VerdictStatus.BLOCK):
+        sent_back = send_back and any(
+            value is True for value in outcome.history.get('send_back', [])
+        )
+        if not sent_back or verdict.status not in (VerdictStatus.PARTIAL, VerdictStatus.BLOCK):
             return False
         ctx.append(
             signed_block(
@@ -1121,6 +1252,139 @@ class BaseAgent:
             )
         )
         return True
+
+    def _disposition(self) -> Exhaustion:
+        budget = self._budget
+        if budget is None or budget.companion:
+            return Exhaustion.GRACEFUL_WRAPUP
+        return budget.tree.policy.on_exhausted
+
+    def _budget_move(
+        self, ctx: Context, tool_defs: list[dict[str, Any]]
+    ) -> tuple[str, tuple[str, ...]]:
+        budget = cast(BudgetAccount, self._budget)
+        if not budget.metered:
+            return budget.plan_turn(0, Decimal(0), self._last_turn_s)
+        # 估算沿用上一次请求的 SP 块：SP 本该逐轮字节一致（§5.2），为估算再拼一次只会多调一次。
+        system_block = self._last_system or ContextBlock(
+            role='system', content=self.get_system_prompt()
+        )
+        # 判定之后这一轮还会追加至多两块预算块（提醒 + 收尾），请求按它们也在里面估。
+        pending = [_BUDGET_BLOCK_SAMPLE, _BUDGET_BLOCK_SAMPLE]
+        request = {'messages': [system_block, *ctx.current_traj, *pending], 'tools': tool_defs}
+        tokens, cost, _ = budget.estimate(self.options.llm, request)
+        return budget.plan_turn(tokens, cost, self._last_turn_s)
+
+    async def _budget_turn(
+        self, ctx: Context, tool_defs: list[dict[str, Any]]
+    ) -> StopReason | None:
+        """这一轮的预算判定（计划 P1 B2）：一次调用都放不下了就停在 BUDGET；这一次放得下、下一次放不
+        下，这一轮就是收尾轮；否则照常。`ask_human` 先问一次人（同一次耗尽只问一次），人追加了就重
+        判；`hard_stop` 不收尾，用到放不下为止。照常与收尾的这一轮计一轮。"""
+        budget = cast(BudgetAccount, self._budget)
+        disposition = self._disposition()
+        move, dims = self._budget_move(ctx, tool_defs)
+        if move != 'normal' and disposition is Exhaustion.ASK_HUMAN:
+            if self._asked != budget.generation:
+                self._asked = budget.generation
+                if await self._ask_for_budget(budget):
+                    move, dims = self._budget_move(ctx, tool_defs)
+        if move == 'wrap_up' and disposition is Exhaustion.HARD_STOP:
+            move = 'normal'
+        if move == 'stop':
+            await self._stop_for_budget(ctx, dims, disposition)
+            return StopReason.BUDGET
+        budget.take_turn()
+        self._announce_budget(ctx, budget)
+        if move == 'wrap_up':
+            self._wrapping = True
+            self._wrap_dims = dims
+            ctx.append(
+                signed_block(
+                    HistoryKind.BUDGET,
+                    _WRAP_UP_TEXT.format(dims=' / '.join(dims)),
+                    key=f'budget:{self.agent_id}:wrap:{self._cycle}:{self._current_turn}',
+                )
+            )
+            self._tracing.event('budget.wrap_up', {'budget.dimensions': list(dims)})
+        return None
+
+    def _announce_budget(self, ctx: Context, budget: BudgetAccount) -> None:
+        """预算注入历史（spec §8.4：Agent 可感知，不进 SP）：剩余跨过 50% / 25% / 10% 时一块，周期起
+        点一块；只写事实，「该怎么办」归长程策略。幂等键带 agent id（分叉出来的子 Agent 继承父的块与
+        键）与追加代数（追加之后再跨同一个阈值要再提醒）。"""
+        if budget.companion or not budget.limited:
+            return
+        threshold = budget.crossed_threshold()
+        if threshold is not None:
+            heading = f'预算提醒：最紧的那一维只剩不到 {threshold}%'
+            key = f'budget:{self.agent_id}:{budget.generation}:{threshold}'
+            self._tracing.event('budget.threshold', {'budget.percent_left': threshold})
+        elif self._budget_cycle != self._cycle:
+            heading = '本周期开始时的预算'
+            key = f'budget:{self.agent_id}:c{self._cycle}'
+        else:
+            return
+        self._budget_cycle = self._cycle
+        ctx.append(
+            signed_block(HistoryKind.BUDGET, _render_budget(budget.view(), heading), key=key)
+        )
+
+    async def _ask_for_budget(self, budget: BudgetAccount) -> bool:
+        """`ask_human`：问宿主的处理器要不要追加。超时、抛出、交回的不是 Budget 都按不追加（收尾）处
+        置并记 ERROR；取消照常上抛。"""
+        policy = budget.tree.policy
+        ask = policy.ask_human
+        if ask is None:
+            return False
+        try:
+            async with asyncio.timeout(policy.ask_timeout_s):
+                extra = await ask(self.agent_id, budget.view())
+        except TimeoutError:
+            logger.error(
+                '期望: ask_human 处理器在 %s 秒内答复要不要给 agent %s 追加预算。'
+                ' 实际: 超时了；按 graceful_wrapup 收尾。'
+                ' 下一步: 让处理器更快答复，或调大 BudgetPolicy.ask_timeout_s。',
+                policy.ask_timeout_s,
+                self.agent_id,
+            )
+            return False
+        except Exception as error:
+            logger.error(
+                '期望: ask_human 处理器答复要不要给 agent %s 追加预算。'
+                ' 实际: 它抛出 %s: %s；按 graceful_wrapup 收尾。'
+                ' 下一步: 修好处理器，让它交回 Budget 或 None。',
+                self.agent_id,
+                type(error).__name__,
+                error,
+            )
+            return False
+        if extra is None:
+            return False
+        if not isinstance(cast(object, extra), Budget):
+            logger.error(
+                '期望: ask_human 处理器交回 Budget（要追加的额度）或 None（不追加）。'
+                ' 实际: 交回了 %s；按不追加处置，agent %s 收尾。'
+                ' 下一步: 让处理器交回 Budget(turns=..., tokens=...) 或 None。',
+                type(extra).__name__,
+                self.agent_id,
+            )
+            return False
+        budget.grant(extra)
+        self._tracing.event('budget.granted', {'budget.dimensions': granted_dims(extra)})
+        return True
+
+    async def _stop_for_budget(
+        self, ctx: Context, dims: tuple[str, ...], disposition: Exhaustion
+    ) -> None:
+        ctx.stop_reason = StopReason.BUDGET
+        self._tracing.event(
+            'budget.exhausted',
+            {'budget.dimensions': list(dims), 'budget.disposition': disposition.value},
+        )
+        await self._emit(
+            'budget_exhausted', {'dimensions': list(dims), 'disposition': disposition.value}
+        )
 
     async def _register_new_artifacts(
         self, ctx: Context, pre: int, calls: Sequence[ToolCall]
@@ -1191,7 +1455,7 @@ class BaseAgent:
         首次调用与 `LLM_FAILURE` 里的每次重试共用一份计数（「当前 LLM 调用」，D11）：重试发生在
         hook 里，计数放在调用之外它就看不见。
         """
-        with self._tracing.llm_call(self.agent_id, self._current_turn):
+        with self._tracing.llm_call(self.agent_id, self._current_turn, self._budget):
             return await self._one_llm_exchange(ctx, tool_defs)
 
     async def _one_llm_exchange(
@@ -1214,6 +1478,7 @@ class BaseAgent:
         self, ctx: Context, tool_defs: list[dict[str, Any]]
     ) -> ContextBlock | None:
         system_block = ContextBlock(role='system', content=self.get_system_prompt())
+        self._last_system = system_block
         request: dict[str, Any] = {
             'messages': [system_block, *(_isolated(block) for block in ctx.current_traj)],
             'tools': tool_defs,
@@ -1300,6 +1565,8 @@ class BaseAgent:
                 raise _bad_overflow_idiom(outcome) from exc
             if outcome.skip:
                 return None
+            raise
+        except BudgetExhausted:
             raise
         except Exception as exc:
             return await self._substituted(ctx, request, exc)

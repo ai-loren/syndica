@@ -124,6 +124,8 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from syndica.kernel.agent import BaseAgent
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
+from syndica.kernel.budget import Budget, BudgetPolicy, BudgetView
+from syndica.kernel.budget_tree import BudgetRefused, BudgetTree, granted_dims
 from syndica.kernel.context import (
     Context,
     ContextBlock,
@@ -193,6 +195,7 @@ from syndica.kernel.session_redaction import redacted_record
 from syndica.kernel.session_types import SessionMeta, SessionRecord, SessionStatus
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tools import orchestration_tools
+from syndica.kernel.tools.budget import GetBudget
 from syndica.kernel.trace import AttributeValue, SpanKind
 from syndica.kernel.tracing import (
     Tracer,
@@ -1059,9 +1062,18 @@ class Runtime:
         sessions: SessionStore | None = None,
         redactor: Redactor | None = None,
         artifacts: ArtifactStore | None = None,
+        budget: BudgetPolicy | None = None,
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
+        if budget is not None and not isinstance(cast(object, budget), BudgetPolicy):
+            raise ConfigError(
+                expected='budget 是 BudgetPolicy 或省略（不限）',
+                received=f'收到 {type(budget).__name__}',
+                next_action='写成 Runtime(budget=BudgetPolicy(root=Budget(turns=..., tokens=...)))',
+            )
+        # 预算树（spec §8.4）：缺省不限——树的规模由宿主的预算决定，内核不替宿主猜一个上限。
+        self._budget = BudgetTree(budget)
         validate_confirmation_handler(confirmation_handler)
         if sessions is not None and redactor is None:
             raise ConfigError(
@@ -1302,8 +1314,13 @@ class Runtime:
         flags: Mapping[str, FlagValue] | None = None,
         isolation: str = 'shared',
         session: bool = False,
+        budget: Budget | None = None,
     ) -> str:
         """建一个 Agent 并启动它的事件循环，返回它的 agent_id。
+
+        `budget` 是给它的预算（spec §8.4）：从父（`parent_id`；没有父就是 Runtime 级预算）此刻能
+        给的里切出来，请求的超过能给的就 `BudgetRefused` 三件套拒绝、什么都不发生。省略的那一维取父
+        能给的一半；顶层 Agent 省略时直接从 Runtime 级预算里取。
 
         `isolation` 是 `shared`（缺省，与父共用工作区）、`worktree` 或 `snapshot`：后两者让它在
         共享工作区的一份拷贝里干活（spec §6.4），需要构造时交了能隔离的 `workspace`。副本在它的
@@ -1345,6 +1362,14 @@ class Runtime:
                     '或者用 isolation=shared'
                 ),
             )
+        if budget is not None and not isinstance(cast(object, budget), Budget):
+            raise ConfigError(
+                expected='spawn 的 budget 是 Budget 或省略',
+                received=f'收到 {type(budget).__name__}',
+                next_action='写成 budget=Budget(turns=..., tokens=...)',
+            )
+        # 切不出来的在任何副作用之前拒绝；真正的切分在注册之后、驱动任务起跑之前那段同步代码里重算。
+        planned, _ = self._budget.split(parent_id, budget)
         query_trust = self._from_listed_module(query_trust)
         # 取走而不是只读：工厂与 hook 里再 spawn 的 Agent 不是这个槽的，也不该拿这个槽的身份。
         slot_spawn = _SLOT_SPAWN.get()
@@ -1373,6 +1398,7 @@ class Runtime:
         if not isinstance(produced, BaseAgent):
             raise _bad_factory_return(factory, produced)
         agent = produced
+        self._refuse_unpriced(agent, parent_id, planned)
         # 工厂交回的 Agent 可能建在别的中心上（在别处建好的实例）：Module 插件照样装进它的 Module
         # 层，所以那一层同样标成「服务单个 Agent、属于 Runtime」——挂不上只由 Runtime 触发的切点，
         # 公开入口也触发不了内核切点。建在 Runtime 中心本身上的不能这样标：那会让 Runtime 级也
@@ -1432,6 +1458,7 @@ class Runtime:
         try:
             role_tools = frozenset(agent.options.tools)
             self._install_orchestration(agent, agent_id)
+            self._install_budget_tool(agent, parent_id, planned)
             module_tools, module_plugins = self._module_assembly.install_agent(
                 self, agent, agent_flags
             )
@@ -1528,13 +1555,21 @@ class Runtime:
         # 因为能注销这个条目的级联必然先把它钉住、且钉住活到该级联自己结束：还在飞的被 `_doomed`
         # 按住，已经跑完的被这次 get 按住。顺序是**先带 await 的那一问、再读两个同步标志位**，
         # 于是最后一道守卫与 create_task 之间没有挂起点。
-        refusal: ContractViolation | None = None
+        refusal: ContractViolation | BudgetRefused | None = None
         if await self.registry.get(agent_id) is None:
             refusal = _entry_vanished_during_spawn(agent_id, parent_id)
         elif self._closed:
             refusal = _already_shut_down()
         elif parent_id is not None and parent_id in self._doomed:
             refusal = _parent_being_destroyed(parent_id)
+        if refusal is None:
+            try:
+                account = self._budget.carve(agent_id, parent_id, budget, running=query is not None)
+            except BudgetRefused as exc:
+                # 开头那次切分与此刻之间隔着注册的两个 await：并发的兄弟可能已经把父能给的切走了。
+                refusal = exc
+            else:
+                agent._attach_budget(account)  # pyright: ignore[reportPrivateUsage]
         if refusal is not None:
             await self._rollback_unstarted_spawn(
                 agent_id,
@@ -1684,6 +1719,77 @@ class Runtime:
             raise _orchestration_name_clash(agent.options.name, clashes)
         agent.install_runtime_tools(installed)
 
+    def _refuse_unpriced(
+        self, agent: BaseAgent, parent_id: str | None, planned: Mapping[str, object]
+    ) -> None:
+        """设了成本上限而这个 Agent 的模型没有价格：在 spawn 处拒绝（fail closed），不当 0 价跑。
+        轮换里别的平台作答时价格在计量处再查一次，那里查不到就按成本耗尽算。"""
+        if not self._budget.capped(parent_id, planned, 'cost'):
+            return
+        model = getattr(agent.options.llm.config, 'model', None)
+        prices = self._budget.policy.prices
+        if isinstance(model, str) and prices is not None and prices.price_of(model) is not None:
+            return
+        raise BudgetRefused(
+            expected=f'设了成本上限时，agent {agent.options.name} 的模型有价格',
+            received=f'模型 {model!r} 不在价格表里，成本没法算',
+            next_action=(
+                '在 BudgetPolicy(prices=...)（CLI 是 .syndica.yaml 的 prices:）里给它写三档单价，'
+                '或去掉成本上限'
+            ),
+        )
+
+    def _install_budget_tool(
+        self, agent: BaseAgent, parent_id: str | None, planned: Mapping[str, object]
+    ) -> None:
+        """预算链上有上限时装 GetBudget（spec §8.4：Agent 可感知）；同名工具报错，理由同编排
+        工具。"""
+        if not self._budget.would_be_limited(parent_id, planned):
+            return
+        if 'GetBudget' in agent.options.tools:
+            raise _orchestration_name_clash(agent.options.name, ['GetBudget'])
+        agent.install_runtime_tools({'GetBudget': GetBudget(agent)})
+
+    def _budget_of(self, agent_id: str) -> BudgetView | None:
+        """这个 Agent 此刻的预算视图；不在树上（已拆除或不归本 Runtime）时 None。"""
+        account = self._budget.account(agent_id)
+        return None if account is None else account.view()
+
+    def _grant_budget(self, agent_id: str, extra: Budget) -> None:
+        """宿主追加预算（钱从树外来：这个节点与链上每个有上限的祖先同加）。被收紧的 Module 调用时
+        拒绝：追加是铸钱，比改一条消息的信任要紧得多。"""
+        installer = current_installer()
+        if (
+            installer is not None
+            and installer.kind == 'module'
+            and installer.name in self._untrusted_output
+        ):
+            raise ConfigError(
+                expected='追加预算只由宿主自己的代码调用',
+                received=f'调用来自被收紧的 Module {installer.name!r}',
+                next_action=(
+                    '由宿主在 ask_human 处理器里交回追加的额度，不要让第三方 Module 直接追加'
+                ),
+            )
+        if not isinstance(cast(object, extra), Budget):
+            raise ConfigError(
+                expected='追加的额度是 Budget',
+                received=f'收到 {type(extra).__name__}',
+                next_action='写成 Budget(turns=..., tokens=...)',
+            )
+        account = self._budget.account(agent_id)
+        if account is None:
+            raise ConfigError(
+                expected=f'agent {agent_id!r} 在本 Runtime 的预算树上',
+                received='找不到它（已被拆除，或不是本 Runtime spawn 的）',
+                next_action='用 find() 确认它还在；拆除之后再追加没有意义',
+            )
+        account.grant(extra)
+        self._tracing.event(
+            'budget.granted',
+            {'agent.id': agent_id, 'budget.dimensions': granted_dims(extra)},
+        )
+
     def _install_slot_tools(
         self, agent: BaseAgent, role_tools: frozenset[str], module_tools: Mapping[str, str]
     ) -> None:
@@ -1798,6 +1904,7 @@ class Runtime:
         queue_attempted: bool,
     ) -> None:
         """回滚尚未创建驱动任务的 spawn，不让清理失败盖掉原始异常。"""
+        self._budget.close(agent_id)
         cleanups: list[tuple[str, Callable[[str], Awaitable[None]]]] = []
         if queue_attempted:
             cleanups.append(('remove_queue', self.broker.remove_queue))
@@ -1952,7 +2059,7 @@ class Runtime:
             seed = None
             # 预算耗尽这条路无条件退出，即便还有已收下的输入：没有轮次可用，再开一个周期只会
             # 被同一条消息反复唤醒又立刻返回。丢下的那些由 `_finish` 记成 ERROR。
-            if agent.context.stop_reason is StopReason.MAX_TURNS:
+            if agent.context.stop_reason in (StopReason.MAX_TURNS, StopReason.BUDGET):
                 return
             if slot.exit_mode is not ExitMode.IDLE and not await self._has_unhandled_input(
                 agent_id, slot
@@ -2038,7 +2145,8 @@ class Runtime:
             'publish 答过 ok=True 的消息不该随队列一起消失。'
             ' 实际: 还剩 %d 条暂存的延迟消息，邮箱非空=%s；队列即将被摘掉，'
             '邮箱里那些就此丢失，暂存的那些留在控制块里但这个循环不会再读。'
-            ' 下一步: 读 wait() 交回的 Context 看它停在哪一轮（预算耗尽就提高 max_turns），'
+            ' 下一步: 读 wait() 交回的 Context 看它停在哪一轮（stop_reason 是 max_turns / budget 就'
+            '提高 max_turns 或追加预算），'
             '再把这些消息重投一次——在发送方看来它们是投递成功的。',
             agent_id,
             stashed,
@@ -2342,6 +2450,19 @@ class Runtime:
                     f'期望: agent {agent_id!r} 已注册，因而可寻址。'
                     ' 实际: 注册表里没有这个条目。'
                     ' 下一步: 先 spawn 它；以 ExitMode.EXIT 结束的 Agent 已被销毁，只能重新 spawn。'
+                ),
+            )
+        account = self._budget.account(agent_id)
+        spent = () if account is None else account.unwakeable()
+        if spent:
+            # 收下了也处理不了：它没有预算再跑一轮，消息只会随它停下而丢（B-21）。
+            return DeliveryResult(
+                ok=False,
+                reason=(
+                    f'期望: agent {agent_id!r} 还有预算处理这条消息。'
+                    f' 实际: 它（连同它这一支能给它的）在 {" / ".join(spent)} 上已经用完。'
+                    ' 下一步: 自己把这件事做完，或派一个新的 Agent 只交给它一件更小的事；'
+                    '宿主可以先给它追加预算。'
                 ),
             )
         message = Message(
@@ -2846,6 +2967,7 @@ class Runtime:
             await self.registry.unregister(agent_id)
             self._table.pop(agent_id)
             self._slots.pop(agent_id, None)
+            self._budget.close(agent_id)
             if self._workspace is not None:
                 await self._workspace.release(agent_id)
             if await self._has_traces(agent_id):

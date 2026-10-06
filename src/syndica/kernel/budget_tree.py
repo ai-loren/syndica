@@ -65,7 +65,9 @@ class BudgetRefused(ConfigError):
 
 
 class BudgetExhausted(SyndicaError):
-    """这次模型调用按估算放不进剩余预算：不发出去。"""
+    """这次模型调用按估算放不进剩余预算：不发出去。`dimension` 是放不下的那一维。"""
+
+    dimension: str = ''
 
 
 def _zero(dim: str) -> Amount:
@@ -273,7 +275,7 @@ class BudgetTree:
             raise _nothing_left(parent_id, WALL)
         return caps, deadline
 
-    def open(
+    def carve(
         self,
         agent_id: str,
         parent_id: str | None,
@@ -301,6 +303,16 @@ class BudgetTree:
         for member in node.subtree():
             if member.agent_id is not None:
                 self._nodes.pop(member.agent_id, None)
+
+    def capped(self, parent_id: str | None, planned: Mapping[str, object], dim: str) -> bool:
+        """按 `split` 的结论，新 Agent 在 `dim` 上是否受上限约束（自己的，或从池里取时池的）。"""
+        return planned.get(dim) is not None or _room(self._parent(parent_id), dim) is not None
+
+    def would_be_limited(self, parent_id: str | None, planned: Mapping[str, object]) -> bool:
+        parent = self._parent(parent_id)
+        if parent.deadline is not None or any(planned.get(dim) is not None for dim in _ADDITIVE):
+            return True
+        return any(_room(parent, dim) is not None for dim in _ADDITIVE)
 
     def account(self, agent_id: str) -> BudgetAccount | None:
         node = self._nodes.get(agent_id)
@@ -384,6 +396,11 @@ class BudgetAccount:
         return any(_room(self._node, dim) is not None for dim in _ADDITIVE)
 
     @property
+    def metered(self) -> bool:
+        """tokens 或 cost 有上限：轮开始时才值得为判定估算一次请求。"""
+        return any(_room(self._node, dim) is not None for dim in _METERED)
+
+    @property
     def cost_capped(self) -> bool:
         return _room(self._node, 'cost') is not None
 
@@ -445,6 +462,49 @@ class BudgetAccount:
             out.append(WALL)
         return tuple(out)
 
+    @property
+    def companion(self) -> bool:
+        return self._companion
+
+    def plan_turn(
+        self, tokens: int, cost: Decimal | None, last_turn_s: float
+    ) -> tuple[str, tuple[str, ...]]:
+        """轮开始时的判定：`stop`（一次调用都放不下了）、`wrap_up`（这一次放得下、下一次放不下——这一轮
+        就是收尾轮）或 `normal`，连同触发它的那几维。`tokens` / `cost` 是下一次调用的估算。"""
+        node = self._node
+        stop: list[str] = []
+        wrap: list[str] = []
+        if not self._companion:
+            turns = _room(node, 'turns')
+            if turns is not None:
+                if turns <= 0:
+                    stop.append('turns')
+                elif turns == 1:
+                    wrap.append('turns')
+        room = _room(node, 'tokens')
+        if room is not None:
+            if room < tokens:
+                stop.append('tokens')
+            elif room < 2 * tokens:
+                wrap.append('tokens')
+        room_cost = _room(node, 'cost')
+        if room_cost is not None:
+            if cost is None or room_cost < cost:
+                stop.append('cost')
+            elif room_cost < 2 * cost:
+                wrap.append('cost')
+        if node.deadline is not None:
+            left = node.deadline - self._tree.now()
+            if left <= 0:
+                stop.append(WALL)
+            elif left < 2 * last_turn_s:
+                wrap.append(WALL)
+        if stop:
+            return 'stop', tuple(stop)
+        if wrap:
+            return 'wrap_up', tuple(wrap)
+        return 'normal', ()
+
     # ---- 记账 ----
 
     def take_turn(self) -> None:
@@ -491,7 +551,7 @@ class BudgetAccount:
         作答的模型与平台折成钱（不认识的记未知）。"""
         if ticket is not None:
             self.release(ticket)
-        reported = _reported_usage(reply)
+        reported, platform = _reported(reply)
         estimated = False
         input_tokens = reported.get('input_tokens')
         if input_tokens is None:
@@ -505,7 +565,7 @@ class BudgetAccount:
             output_tokens = _estimate([reply])
             estimated = True
         cached = min(reported.get('cached_input_tokens') or 0, input_tokens)
-        price = self._tree._price(llm, _platform(reply))  # pyright: ignore[reportPrivateUsage]
+        price = self._tree._price(llm, platform)  # pyright: ignore[reportPrivateUsage]
         cost = None if price is None else price.cost_of(input_tokens, output_tokens, cached)
         if cost is None and self.cost_capped:
             self._tree._report_unpriced(llm)  # pyright: ignore[reportPrivateUsage]
@@ -598,6 +658,15 @@ def _extra(reply: object) -> Mapping[str, object]:
     return cast(Mapping[str, object], extra) if isinstance(extra, Mapping) else {}
 
 
+def _reported(reply: object) -> tuple[dict[str, int | None], str | None]:
+    """（报的三档计数、作答的平台）。读不出来的 extra 当作没报：trace 那一侧已经为它记过一次 ERROR，
+    计量按字符估算并标 `estimated`。"""
+    try:
+        return _reported_usage(reply), _platform(reply)
+    except Exception:
+        return {}, None
+
+
 def _reported_usage(reply: object) -> dict[str, int | None]:
     usage = _extra(reply).get('usage')
     if not isinstance(usage, Mapping):
@@ -682,11 +751,17 @@ def _not_admitted(
 ) -> BudgetExhausted:
     who = 'Runtime 级预算' if agent_id is None else f'agent {agent_id}'
     asked = '价格未知' if wanted is None else f'估算要 {wanted}'
-    return BudgetExhausted(
+    error = BudgetExhausted(
         expected=f'这次模型调用放得进 {who} 剩下的 {dim}',
         received=f'{asked}，只剩 {room}',
         next_action='这次调用不发出去；Agent 收尾交付已完成的部分，需要更多就追加预算',
     )
+    error.dimension = dim
+    return error
+
+
+def granted_dims(extra: Budget) -> list[str]:
+    return [dim for dim in (*_ADDITIVE, WALL) if getattr(extra, dim) is not None]
 
 
 def seconds(value: float | None) -> int | None:

@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from syndica import __version__
+from syndica.kernel.budget_tree import BudgetExhausted
 from syndica.kernel.context import ContextBlock
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
@@ -147,6 +148,8 @@ class _RetryPlugin:
                     traced.observe(response)
             except asyncio.CancelledError:
                 raise
+            except BudgetExhausted:
+                raise
             except Exception as exc:
                 self._record_failure(error, f'original retry {attempt}', exc)
                 continue
@@ -158,6 +161,8 @@ class _RetryPlugin:
                     response = await candidate.create(messages, **call_kwargs)
                     traced.observe(response)
             except asyncio.CancelledError:
+                raise
+            except BudgetExhausted:
                 raise
             except Exception as exc:
                 self._record_failure(error, f'fallback {name}', exc)

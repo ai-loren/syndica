@@ -51,6 +51,8 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from syndica.kernel.agent_types import ExitMode
+from syndica.kernel.budget import Budget
+from syndica.kernel.budget_tree import BudgetRefused
 from syndica.kernel.context import Context, StopReason, TrustLevel, provenance_of
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.isolation import ISOLATIONS
@@ -157,6 +159,17 @@ def _delivered(child_id: str, ctx: Context) -> ToolResult:
     if reason is StopReason.COMPLETED and text is not None:
         suffix = '' if verdict is None else f'\n\n（验收裁决：{verdict.status.value}）'
         return ToolResult(output=f'agent {child_id} 交回:\n{text}{suffix}', meta=meta, trust=trust)
+    if reason is StopReason.BUDGET and text is not None:
+        # 预算耗尽默认收尾交付（spec §8.4）：它最后那段就是已完成的部分，丢在这里收尾就白做了。
+        suffix = '' if verdict is None else f'（验收裁决：{verdict.status.value}）'
+        return ToolResult(
+            output=(
+                f'agent {child_id} 的预算用完了，交回的是部分结果{suffix}:\n{text}\n\n'
+                f'下一步: {_next_step(child_id, reason)}'
+            ),
+            meta=meta,
+            trust=trust,
+        )
     return ToolResult(
         output=(
             f'期望: agent {child_id} 完成这件工作并给出结论。'
@@ -260,6 +273,25 @@ def _isolation_refused(isolation: str, runtime: Runtime) -> ToolResult | None:
     return None
 
 
+def _budget_refused(turns: object, tokens: object) -> ToolResult | None:
+    for name, value in (('turns', turns), ('tokens', tokens)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return ToolResult(
+                output=(
+                    f'期望: {name} 是 >= 0 的整数（0 = 取你剩余预算的一半）。'
+                    f' 实际: {name}={value!r}。'
+                    f' 下一步: 给一个整数，或省略 {name}。'
+                )
+            )
+    return None
+
+
+def _requested(turns: int, tokens: int) -> Budget | None:
+    if not turns and not tokens:
+        return None
+    return Budget(turns=turns or None, tokens=tokens or None)
+
+
 class _AgentTool(Tool):
     """编排工具的共同构造：一个工具实例代表**某一个** Agent 对 Runtime 控制面的调用权。
 
@@ -286,7 +318,9 @@ class Delegate(_AgentTool):
     __tool_command_args__ = ()
     __tool_external_input__ = True
 
-    async def execute(self, agent: str, query: str, isolation: str = 'shared') -> ToolResult:
+    async def execute(
+        self, agent: str, query: str, isolation: str = 'shared', turns: int = 0, tokens: int = 0
+    ) -> ToolResult:
         """把一件独立的工作派给一个 Agent 角色，等它做完并取回它的结果。
         它冷启动、**看不到你的上下文**，所以用于需要独立视角的工作。
         已有 Agent 能继续同一工作时用 SendMessage，不要新建；
@@ -294,11 +328,14 @@ class Delegate(_AgentTool):
         返回的第一行带着它的 agent_id——它做完之后仍然留在注册表里可寻址。
         isolation 为 worktree 或 snapshot 时它在共享工作区的一份拷贝里改，做完逐文件合并回来，
         冲突的文件另存成旁边的 .theirs；缺省 shared 直接改共享工作区。
+        它的预算从你的剩余里切：turns / tokens 省略（0）时取你剩余的一半，切不出来就交回原因。
         agent: 角色名
         query: 交给它的完整任务描述，它看不到你的上下文，所以要自带全部前提
         isolation: shared（缺省）/ worktree / snapshot
+        turns: 给它的轮次上限；0 = 你剩余的一半
+        tokens: 给它的 token 上限；0 = 你剩余的一半
         """
-        refused = _isolation_refused(isolation, self._runtime)
+        refused = _isolation_refused(isolation, self._runtime) or _budget_refused(turns, tokens)
         if refused is not None:
             return refused
         factory = self._runtime.agent_factory(agent)
@@ -315,16 +352,20 @@ class Delegate(_AgentTool):
         # （spec §12.2 第 2 条）。丢掉这一步，任何不可信内容都能经一次派活洗成子 Agent 的可信
         # 输入，而子 Agent 的高风险调用于是绕过宿主配置的升级处置。
         trust = self._runtime._provenance_of(self._agent_id)  # pyright: ignore[reportPrivateUsage]
-        child_id = await self._runtime.spawn(
-            factory,
-            query=query,
-            query_trust=trust,
-            parent_id=self._agent_id,
-            # ZOMBIE 而不是 EXIT：EXIT 会让子 Agent 做完即连同条目一起消失，而这次调用交回的
-            # 那个 agent_id 就成了悬空引用。
-            exit_mode=ExitMode.ZOMBIE,
-            isolation=isolation,
-        )
+        try:
+            child_id = await self._runtime.spawn(
+                factory,
+                query=query,
+                query_trust=trust,
+                parent_id=self._agent_id,
+                # ZOMBIE 而不是 EXIT：EXIT 会让子 Agent 做完即连同条目一起消失，而这次调用交回的
+                # 那个 agent_id 就成了悬空引用。
+                exit_mode=ExitMode.ZOMBIE,
+                isolation=isolation,
+                budget=_requested(turns, tokens),
+            )
+        except BudgetRefused as exc:
+            return ToolResult(output=str(exc))
         return await _collected(self._runtime, self._agent_id, child_id, isolation)
 
 
@@ -337,7 +378,9 @@ class Fork(_AgentTool):
     __tool_command_args__ = ()
     __tool_external_input__ = True
 
-    async def execute(self, query: str, isolation: str = 'shared') -> ToolResult:
+    async def execute(
+        self, query: str, isolation: str = 'shared', turns: int = 0, tokens: int = 0
+    ) -> ToolResult:
         """分叉出一个继承了你当前上下文的 Agent，交给它一件延续性的工作，等它做完。
         用于你已有的结论有价值、需要在此基础上并行推进的场景：
         分身看得到你到此刻为止的轨迹，因此不必重复前提。
@@ -346,10 +389,13 @@ class Fork(_AgentTool):
         返回的第一行带着分身的 agent_id——它做完之后仍然留在注册表里可寻址。
         isolation 为 worktree 或 snapshot 时分身在共享工作区的一份拷贝里改，做完逐文件合并回来，
         冲突的文件另存成旁边的 .theirs；缺省 shared 直接改共享工作区。
+        分身的预算从你的剩余里切：turns / tokens 省略（0）时取你剩余的一半，切不出来就交回原因。
         query: 交给分身的任务描述；它已经看得到你到此刻为止的轨迹，不必重复前提
         isolation: shared（缺省）/ worktree / snapshot
+        turns: 给分身的轮次上限；0 = 你剩余的一半
+        tokens: 给分身的 token 上限；0 = 你剩余的一半
         """
-        refused = _isolation_refused(isolation, self._runtime)
+        refused = _isolation_refused(isolation, self._runtime) or _budget_refused(turns, tokens)
         if refused is not None:
             return refused
         factory = self._runtime._factory_of(self._agent_id)  # pyright: ignore[reportPrivateUsage]
@@ -366,14 +412,18 @@ class Fork(_AgentTool):
         # 不传 query_trust：分叉的信任级别由 `spawn` 从源 Agent 的轨迹算出来，它才知道自己截掉了
         # 哪些块——而被截掉的那些可能携带这份轨迹里唯一的不可信标记。本工具恒带 query，所以走的是
         # `query_trust` 那条落点，不是 `_carry_truncated_taint`。
-        child_id = await self._runtime.spawn(
-            factory,
-            query=query,
-            parent_id=self._agent_id,
-            exit_mode=ExitMode.ZOMBIE,
-            fork_from=self._agent_id,
-            isolation=isolation,
-        )
+        try:
+            child_id = await self._runtime.spawn(
+                factory,
+                query=query,
+                parent_id=self._agent_id,
+                exit_mode=ExitMode.ZOMBIE,
+                fork_from=self._agent_id,
+                isolation=isolation,
+                budget=_requested(turns, tokens),
+            )
+        except BudgetRefused as exc:
+            return ToolResult(output=str(exc))
         return await _collected(self._runtime, self._agent_id, child_id, isolation)
 
 
