@@ -1435,7 +1435,7 @@ agents:
     assert llm.calls[0][0].content == 'notes.md'
 
 
-def test_max_turns_is_shared_by_the_tree_and_a_child_gets_half_of_what_is_left(
+def test_max_turns_is_shared_by_the_tree_and_a_child_gets_half_of_what_the_parent_can_spare(
     tmp_path: Path,
 ) -> None:
     root = _delegating('Worker', answer='root done')
@@ -1448,7 +1448,7 @@ def test_max_turns_is_shared_by_the_tree_and_a_child_gets_half_of_what_is_left(
 
     delegated = next(b for b in root.calls[1] if b.tool_call_id == 'delegate-1').content
     assert output == 'root done'
-    assert len(worker.calls) == 3
+    assert len(worker.calls) == 2
     assert isinstance(delegated, str)
     assert '预算' in delegated and '用完' in delegated
 
@@ -1478,7 +1478,7 @@ topologies:
         host.close()
 
     assert output == 'lead done'
-    assert len(worker.calls) == 3
+    assert len(worker.calls) == 2
 
 
 def test_max_turns_tightens_explicit_slot_budgets_instead_of_breaking_assembly(
@@ -1518,4 +1518,4 @@ def test_chat_max_turns_is_shared_by_every_agent_in_the_session(tmp_path: Path) 
         host.close()
 
     assert output == 'root done'
-    assert len(worker.calls) == 3
+    assert len(worker.calls) == 2

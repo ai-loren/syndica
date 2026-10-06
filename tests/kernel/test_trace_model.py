@@ -14,6 +14,7 @@ from syndica.kernel.budget import Exhaustion
 from syndica.kernel.context import StopReason, TrustLevel
 from syndica.kernel.danger import ConfirmationOutcome, Disposition, RiskLevel
 from syndica.kernel.errors import ContractViolation
+from syndica.kernel.long_horizon import BudgetMove, DriftMove, StallMove
 from syndica.kernel.redaction import RedactionRule, RuleRedactor, encode_redacted, looks_secret
 from syndica.kernel.trace import (
     ATTRIBUTE_DOMAINS,
@@ -196,6 +197,15 @@ def test_the_attribute_set_is_exactly_the_schema():
         'budget.dimensions': 'str[]',
         'budget.disposition': 'str',
         'agent.serves': 'str',
+        'progress.satisfied': 'int',
+        'progress.mandatory': 'int',
+        'progress.pending_human': 'int',
+        'progress.regressed': 'str[]',
+        'progress.stalled_turns': 'int',
+        'drift.anchored': 'bool',
+        'drift.confirmed': 'bool?',
+        'strategy.hook': 'str',
+        'strategy.move': 'str',
     }
 
 
@@ -216,6 +226,18 @@ def test_the_attributes_with_a_fixed_set_of_values_follow_the_kernel_enums():
     assert ATTRIBUTE_DOMAINS['danger.decided_by'] == {'flag', 'policy'}
     assert ATTRIBUTE_DOMAINS['budget.disposition'] == {member.value for member in Exhaustion}
     assert ATTRIBUTE_DOMAINS['compaction.trigger'] == {'threshold', 'overflow'}
+    assert ATTRIBUTE_DOMAINS['strategy.hook'] == {
+        'on_progress_stall',
+        'on_budget_low',
+        'on_goal_drift',
+        'should_stop',
+    }
+    assert ATTRIBUTE_DOMAINS['strategy.move'] == (
+        {m.value for m in StallMove}
+        | {m.value for m in BudgetMove}
+        | {m.value for m in DriftMove}
+        | {'stop', 'continue'}
+    )
     assert ATTRIBUTE_DOMAINS['tool.outcome'] == {
         'ok',
         'error',

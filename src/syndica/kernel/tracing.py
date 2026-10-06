@@ -558,6 +558,7 @@ class _Attempt:
         self._reply: object = None
         self._span: _Span | None = None
         self._ticket: object = None
+        self._admitted = False
 
     def observe(self, reply: object) -> None:
         """把回复里 backend 报的事实记到这次的 span 上：哪个平台答的（`extra['llm_route']`）、同一次
@@ -628,11 +629,27 @@ class _Attempt:
                 if value is None or _count(value):
                     attributes[attribute] = cast(int | None, value)
 
+    async def __aenter__(self) -> _Attempt:
+        """内核走的路：只因为兄弟在飞的估算放不下时等它们回来再试，而不是当成耗尽。"""
+        call = self._call
+        if call is not None and call.account is not None:
+            self._ticket = await call.account.admit_waiting(self._llm, self._request)
+            self._admitted = True
+        return self.__enter__()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.__exit__(exc_type, exc, tb)
+
     def __enter__(self) -> _Attempt:
         call = self._call
         if call is None:
             return self
-        if call.account is not None:
+        if call.account is not None and not self._admitted:
             # 放不进剩余预算时在这里抛 `BudgetExhausted`：调用不发出去、不开 span、不算一次尝试。
             self._ticket = call.account.admit(self._llm, self._request)
         call.attempts += 1

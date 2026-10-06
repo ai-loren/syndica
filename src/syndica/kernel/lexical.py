@@ -11,8 +11,9 @@ from collections.abc import Iterable
 
 __all__ = ['overlap', 'terms']
 
-_WORD = re.compile(r'[A-Za-z0-9_]{3,}')
-_CJK = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff]+')
+# 拉丁字母含带重音的（Größe、café）；汉字、假名、谚文按相邻两字切。
+_WORD = re.compile(r'[A-Za-z0-9_\u00c0-\u024f]{3,}')
+_CJK = re.compile(r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]+')
 # 几乎出现在任何动作里、不带指向的词：留着它们，什么都「锚得上」。
 _STOP = frozenset(
     {
@@ -33,13 +34,18 @@ _STOP = frozenset(
         'command',
         'file',
         'text',
+        'query',
+        'agent',
+        'isolation',
+        'pattern',
     }
 )
 
 
 def terms(text: str) -> frozenset[str]:
     """`text` 的词面单位：小写的拉丁词（≥ 3 字符、去掉无指向的常用词）与汉字二元组。"""
-    found = {word.lower() for word in _WORD.findall(text)} - _STOP
+    # 纯数字（行号、计数、年份）几乎和什么都能撞上，不带指向。
+    found = {word.lower() for word in _WORD.findall(text) if not word.isdigit()} - _STOP
     for run in _CJK.findall(text):
         if len(run) == 1:
             found.add(run)

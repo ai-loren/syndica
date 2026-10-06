@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
 from syndica.kernel.budget import Budget, BudgetPolicy, Prices, StaticPrices, Usage
-from syndica.kernel.budget_tree import BudgetAccount, BudgetExhausted, BudgetRefused, BudgetTree
+from syndica.kernel.budget_tree import (
+    BudgetAccount,
+    BudgetExhausted,
+    BudgetRefused,
+    BudgetTree,
+    PriceUnknown,
+)
 from syndica.kernel.context import ContextBlock
 from syndica.kernel.llm import LLMConfig
 
@@ -115,10 +122,23 @@ def test_live_children_reserve_and_their_reservations_never_exceed_the_parent() 
     tree = _tree()
     parent = tree.carve('p', None, Budget(turns=10))
     caps = [tree.carve(name, 'p', None).view().limit.turns for name in ('a', 'b', 'c')]
-    assert caps == [5, 3, 1]
-    assert parent.view().remaining.turns == 1
+    assert caps == [5, 2, 1]
+    assert parent.view().remaining.turns == 2
+    parent.take_turn()
     parent.take_turn()
     assert parent.exhausted() == ('turns',)
+
+
+def test_a_parent_keeps_its_last_turn_for_itself() -> None:
+    tree = _tree()
+    parent = tree.carve('p', None, Budget(turns=3))
+    parent.take_turn()
+    assert tree.carve('c', 'p', None).view().limit.turns == 1
+    with pytest.raises(BudgetRefused) as caught:
+        tree.carve('d', 'p', None)
+    assert 'turns' in caught.value.received
+    with pytest.raises(BudgetRefused):
+        tree.carve('e', 'p', Budget(turns=1))
 
 
 def test_a_child_spends_its_own_reservation_not_the_parents_room() -> None:
@@ -336,7 +356,8 @@ def test_admission_under_a_cost_cap_refuses_a_model_without_a_price() -> None:
     agent = tree.carve('a', None, Budget(cost=Decimal('1')))
     with pytest.raises(BudgetExhausted) as caught:
         agent.admit(_Model('mystery'), {'messages': []})
-    assert '价格未知' in caught.value.received
+    assert isinstance(caught.value, PriceUnknown)
+    assert 'mystery' in caught.value.received and 'prices:' in caught.value.next_action
 
 
 def test_admission_after_the_deadline_is_refused() -> None:
@@ -390,7 +411,7 @@ def test_a_grant_raises_the_node_and_every_capped_level_and_rearms_the_reminders
     child = tree.carve('c', 'p', Budget(turns=4))
     _turns(child, 4)
     assert child.crossed_threshold() == 10
-    child.grant(Budget(turns=6, tokens=500))
+    child._grant(Budget(turns=6, tokens=500))  # pyright: ignore[reportPrivateUsage]
     assert child.view().limit == Budget(turns=10)
     assert parent.view().limit.turns == 16
     assert tree.pool().view().limit.turns == 36
@@ -460,3 +481,171 @@ def test_cached_tokens_over_the_input_count_are_clamped() -> None:
         None, _Model('m'), {}, _reply(input_tokens=10, output_tokens=1, cached_input_tokens=50)
     )
     assert agent.view().used.cached_input_tokens == 10
+
+
+# ---- 评审处置 ----
+
+
+def test_a_siblings_in_flight_estimate_does_not_shape_my_turn_plan() -> None:
+    tree = _tree(Budget(tokens=5000))
+    first = tree.carve('a', None, None)
+    second = tree.carve('b', None, None)
+    first.admit(_Model('m', max_tokens=2000), {'messages': []})
+    assert second.plan_turn(2000, Decimal(0), 0.0) == ('normal', ())
+
+
+async def test_admission_waits_for_a_siblings_estimate_instead_of_refusing() -> None:
+    tree = _tree(Budget(tokens=3000))
+    first = tree.carve('a', None, None)
+    second = tree.carve('b', None, None)
+    model = _Model('m', max_tokens=2000)
+    held = first.admit(model, {'messages': []})
+    waiting = asyncio.create_task(second.admit_waiting(model, {'messages': []}))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    first.settle(held, model, {}, _reply(input_tokens=10, output_tokens=10))
+    ticket = await asyncio.wait_for(waiting, 1.0)
+    assert ticket.tokens == 2000
+
+
+async def test_admission_stops_waiting_when_the_sibling_never_comes_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from syndica.kernel import budget_tree
+
+    monkeypatch.setattr(budget_tree, '_CONTENTION_WAIT', 0.05)
+    tree = _tree(Budget(tokens=3000))
+    tree.carve('a', None, None).admit(_Model('m', max_tokens=2000), {'messages': []})
+    with pytest.raises(BudgetExhausted) as caught:
+        await tree.carve('b', None, None).admit_waiting(
+            _Model('m', max_tokens=2000), {'messages': []}
+        )
+    assert '收尾' in caught.value.next_action
+
+
+def test_the_output_allowance_follows_what_the_model_actually_wrote() -> None:
+    tree = _tree()
+    agent = tree.carve('a', None, None)
+    model = _Model('m')
+    assert agent.estimate(model, {'messages': []})[0] == 2048
+    agent.settle(None, model, {}, _reply(input_tokens=1, output_tokens=50))
+    assert agent.estimate(model, {'messages': []})[0] == 256
+    agent.settle(None, model, {}, _reply(input_tokens=1, output_tokens=600))
+    assert agent.estimate(model, {'messages': []})[0] == 1200
+
+
+def test_the_input_calibration_is_clamped() -> None:
+    tree = _tree()
+    agent = tree.carve('a', None, None)
+    model = _Model('m', max_tokens=1)
+    request = {'messages': [ContextBlock(role='user', content='x' * 400)]}
+    ticket = agent.admit(model, request)
+    agent.settle(
+        ticket, model, request, _reply(input_tokens=ticket.raw_input * 100, output_tokens=1)
+    )
+    assert agent.estimate(model, request)[0] - 1 == ticket.raw_input * 4
+
+
+def test_a_settled_ancestor_passes_a_descendants_surplus_up_to_the_running_one() -> None:
+    tree = _tree()
+    top = tree.carve('top', None, Budget(turns=20))
+    middle = tree.carve('mid', 'top', Budget(turns=8))
+    leaf = tree.carve('leaf', 'mid', Budget(turns=4))
+    leaf.take_turn()
+    middle.take_turn()
+    middle.end_cycle()
+    leaf.end_cycle()
+    assert top.view().remaining.turns == 18
+    leaf.begin_cycle()
+    leaf.end_cycle()
+    assert top.view().remaining.turns == 18
+
+
+def test_a_running_parent_whose_room_its_child_holds_is_still_wakeable() -> None:
+    tree = _tree()
+    parent = tree.carve('p', None, Budget(turns=4))
+    parent.take_turn()
+    tree.carve('c', 'p', Budget(turns=2))
+    parent.take_turn()
+    assert parent.view().remaining.turns == 0
+    assert parent.unwakeable() == ()
+
+
+def test_a_child_can_be_split_off_a_settled_parent_that_can_grow_back() -> None:
+    tree = _tree()
+    top = tree.carve('top', None, Budget(turns=20))
+    middle = tree.carve('mid', 'top', Budget(turns=8))
+    middle.take_turn()
+    middle.end_cycle()
+    child = tree.carve('c', 'mid', None)
+    assert child.view().limit.turns == 3
+    assert top.view().remaining.turns == 20 - (1 + 3)
+    assert middle.view().remaining.turns == 0
+
+
+def test_a_child_can_be_split_off_a_lazily_started_parent() -> None:
+    tree = _tree()
+    tree.carve('top', None, Budget(turns=20))
+    tree.carve('lazy', 'top', Budget(turns=6), running=False)
+    assert tree.carve('c', 'lazy', None).view().limit.turns == 3
+
+
+def test_a_price_table_that_raises_counts_as_an_unknown_price(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _Broken:
+        def price_of(self, model: str, platform: str | None = None) -> Prices | None:
+            raise RuntimeError('price service down')
+
+    tree = _tree(prices=_Broken())
+    agent = tree.carve('a', None, Budget(cost=Decimal('1')))
+    with caplog.at_level('ERROR'), pytest.raises(PriceUnknown):
+        agent.admit(_Model('m'), {'messages': []})
+    [record] = [r for r in caplog.records if 'price service down' in r.getMessage()]
+    assert isinstance(record.args, tuple) and record.args[:3] == ('_Broken', 'm', 'RuntimeError')
+
+
+def test_a_grant_survives_settling_and_waking_again() -> None:
+    tree = _tree(Budget(turns=30))
+    tree.carve('p', None, Budget(turns=10))
+    child = tree.carve('c', 'p', Budget(turns=4))
+    _turns(child, 4)
+    child._grant(Budget(turns=6))  # pyright: ignore[reportPrivateUsage]
+    child.end_cycle()
+    child.begin_cycle()
+    assert child.view().limit.turns == 10
+
+
+def test_a_grant_of_wall_clock_moves_the_deadline() -> None:
+    clock = _Clock()
+    tree = BudgetTree(BudgetPolicy(root=Budget(wall_clock_s=10)), clock=clock)
+    agent = tree.carve('a', None, None)
+    clock.now += 10
+    assert agent.exhausted() == ('wall_clock_s',)
+    agent._grant(Budget(wall_clock_s=5))  # pyright: ignore[reportPrivateUsage]
+    assert agent.exhausted() == ()
+
+
+def test_an_agent_past_its_deadline_cannot_be_woken() -> None:
+    clock = _Clock()
+    tree = BudgetTree(BudgetPolicy(), clock=clock)
+    agent = tree.carve('a', None, Budget(wall_clock_s=5))
+    agent.end_cycle()
+    clock.now += 5
+    assert agent.unwakeable() == ('wall_clock_s',)
+
+
+def test_a_refused_admission_says_the_agent_wraps_up() -> None:
+    tree = _tree()
+    agent = tree.carve('a', None, Budget(tokens=10))
+    with pytest.raises(BudgetExhausted) as caught:
+        agent.admit(_Model('m', max_tokens=100), {'messages': []})
+    assert '收尾' in caught.value.next_action and 'tokens' in caught.value.expected
+
+
+def test_a_zero_request_says_to_omit_it() -> None:
+    tree = _tree()
+    tree.carve('p', None, Budget(turns=10))
+    with pytest.raises(BudgetRefused) as caught:
+        tree.carve('c', 'p', Budget(tokens=0))
+    assert '省略' in caught.value.next_action

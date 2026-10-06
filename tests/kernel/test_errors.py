@@ -166,6 +166,7 @@ def test_discovery_covers_every_error_class_present_in_the_kernel():
         'NewerSessionSchema',
         'NewerTraceSchema',
         'PayloadRefused',
+        'PriceUnknown',
         'SyndicaError',
         'ToolFatalError',
     ]

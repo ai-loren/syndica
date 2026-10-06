@@ -42,6 +42,8 @@ __all__ = ['FileSessionStore']
 _META = 'meta.json'
 _RECORD = 'record.json'
 _ARCHIVE = 'archive'
+# 每个会话只留最近这么多份归档：每次压缩归档一份完整前像（spec §8.8），跑几天的会话会一直长下去。
+_ARCHIVE_KEEP = 20
 # 元数据只有几 KB；整份记录给足余量，只挡住把宿主内存撑爆的那种。
 _META_LIMIT = 4 * 1024 * 1024
 _RECORD_LIMIT = 512 * 1024 * 1024
@@ -152,6 +154,7 @@ class FileSessionStore:
                 os.mkdir(_ARCHIVE, mode=0o700, dir_fd=session)
             with io.opened(_ARCHIVE, session) as archive:
                 self._write_json(archive, f'{seq}.json', snapshot)
+                _prune_archives(archive, keep_after=seq - _ARCHIVE_KEEP)
             self._bump_archived(session, sid, seq)
             return seq
 
@@ -358,3 +361,13 @@ class FileSessionStore:
             os.unlink(temporary, dir_fd=directory)
             raise
         io.sync_directory(directory)
+
+
+def _prune_archives(archive: int, *, keep_after: int) -> None:
+    """删掉序号不大于 `keep_after` 的归档（`read_archived` 对它们交回 None）。"""
+    if keep_after <= 0:
+        return
+    for name in os.listdir(archive):
+        stem, dot, ext = name.partition('.')
+        if dot and ext == 'json' and stem.isdigit() and int(stem) <= keep_after:
+            os.unlink(name, dir_fd=archive)

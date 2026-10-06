@@ -36,7 +36,7 @@ from syndica.kernel.acceptance import (
     unfinished_verdict,
 )
 from syndica.kernel.acceptance_inject import meaningful_quote
-from syndica.kernel.budget_tree import BudgetExhausted
+from syndica.kernel.budget_tree import BudgetExhausted, PriceUnknown
 from syndica.kernel.companion import CompanionResult, run_companion
 from syndica.kernel.context import (
     Context,
@@ -337,6 +337,8 @@ def acceptance_hook(
                 )
                 return derive_verdict(rubrics, {}, trust=trust, failure='verifier_timeout'), None
             return _failed(rubrics, trust, exc), None
+        except PriceUnknown:
+            return derive_verdict(rubrics, {}, trust=trust, failure='price_unknown'), None
         except BudgetExhausted:
             return derive_verdict(rubrics, {}, trust=trust, failure='budget_exhausted'), None
         except Exception as exc:
@@ -422,11 +424,19 @@ def _loaded(result: CompanionResult, who: str) -> dict[str, Any]:
         return _load(result.reply, who)
     except ValueError:
         if result.stop_reason is StopReason.BUDGET:
-            raise _companion_out_of_budget(who) from None
+            raise _companion_out_of_budget(who, unpriced=result.unpriced) from None
         raise
 
 
-def _companion_out_of_budget(who: str) -> BudgetExhausted:
+def _companion_out_of_budget(who: str, *, unpriced: bool = False) -> BudgetExhausted:
+    if unpriced:
+        error: BudgetExhausted = PriceUnknown(
+            expected=f'{who} 用的模型有价格（被验收的 Agent 设了成本上限）',
+            received='验收用的模型不在价格表里，伴生一次调用都没发出去',
+            next_action='放行并标 unverified；在 .syndica.yaml 的 prices: 里给验收用的模型写价格',
+        )
+        error.dimension = 'cost'
+        return error
     error = BudgetExhausted(
         expected=f'{who} 在被验收 Agent 的剩余预算里给出结论',
         received='被验收 Agent 的预算用完了，伴生没能给出结论',

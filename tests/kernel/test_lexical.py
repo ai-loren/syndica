@@ -31,3 +31,23 @@ def test_overlap_counts_shared_units_once() -> None:
     vocabulary = terms('invoice numbering 单调递增')
     assert overlap('invoice invoice 递增 numbering', vocabulary) == 3
     assert overlap('nothing shared', vocabulary) == 0
+
+
+def test_kana_and_hangul_runs_become_adjacent_pairs() -> None:
+    assert terms('レポート') == {'レポ', 'ポー', 'ート'}
+    assert terms('보고서 작성') == {'보고', '고서', '작성'}
+
+
+def test_accented_latin_letters_stay_inside_their_word() -> None:
+    assert terms('Größe café naïve') == {'größe', 'café', 'naïve'}
+
+
+def test_bare_numbers_are_not_terms() -> None:
+    assert terms('2024 report 300') == {'report'}
+
+
+def test_json_keys_of_orchestration_calls_are_not_terms() -> None:
+    assert terms('{"query": "x", "agent": "Writer", "isolation": "shared"}') == {
+        'writer',
+        'shared',
+    }

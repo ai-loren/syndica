@@ -122,7 +122,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
-from syndica.kernel.agent import BaseAgent
+from syndica.kernel.agent import _SERVED, BaseAgent  # pyright: ignore[reportPrivateUsage]
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
 from syndica.kernel.budget import Budget, BudgetPolicy, BudgetView
 from syndica.kernel.budget_tree import BudgetRefused, BudgetTree, granted_dims
@@ -1458,7 +1458,7 @@ class Runtime:
         try:
             role_tools = frozenset(agent.options.tools)
             self._install_orchestration(agent, agent_id)
-            self._install_budget_tool(agent, parent_id, planned)
+            self._install_budget_tool(agent, parent_id, planned, fork_from)
             module_tools, module_plugins = self._module_assembly.install_agent(
                 self, agent, agent_flags
             )
@@ -1740,11 +1740,20 @@ class Runtime:
         )
 
     def _install_budget_tool(
-        self, agent: BaseAgent, parent_id: str | None, planned: Mapping[str, object]
+        self,
+        agent: BaseAgent,
+        parent_id: str | None,
+        planned: Mapping[str, object],
+        fork_from: str | None = None,
     ) -> None:
         """预算链上有上限时装 GetBudget（spec §8.4：Agent 可感知）；同名工具报错，理由同编排
-        工具。"""
-        if not self._budget.would_be_limited(parent_id, planned):
+        工具。分叉出来的跟源 Agent 走：工具表不同，继承来的缓存前缀就对不上（spec §5.2 第 4
+        条）。"""
+        source = None if fork_from is None else self._table.get(fork_from)
+        if source is not None:
+            if 'GetBudget' not in source.options.tools:
+                return
+        elif not self._budget.would_be_limited(parent_id, planned):
             return
         if 'GetBudget' in agent.options.tools:
             raise _orchestration_name_clash(agent.options.name, ['GetBudget'])
@@ -1784,7 +1793,7 @@ class Runtime:
                 received='找不到它（已被拆除，或不是本 Runtime spawn 的）',
                 next_action='用 find() 确认它还在；拆除之后再追加没有意义',
             )
-        account.grant(extra)
+        account._grant(extra)  # pyright: ignore[reportPrivateUsage]
         self._tracing.event(
             'budget.granted',
             {'agent.id': agent_id, 'budget.dimensions': granted_dims(extra)},
@@ -1946,6 +1955,9 @@ class Runtime:
         # 取 id；同理也继承了别人的当前 span，以及别人所在的轨迹窗口。
         becoming_owner(('agent', agent_id), slot.issued)
         outside_any_span()
+        # 也继承了创建它的那个 Agent 的「此刻在替谁干活」：不清，它周期之外跑的收尾 hook 里起的伴生
+        # 会记在创建者的预算上。
+        _SERVED.set(None)
         _no_windows()
         if not await self.registry.compare_and_set_status(
             agent_id, expected=AgentStatus.IDLE, new=AgentStatus.RUNNING
@@ -3039,6 +3051,7 @@ class Runtime:
         # hook 在 `_destroy` 里换到它自己的出处。
         becoming_owner(('reap', agent_id), {})
         outside_any_span()
+        _SERVED.set(None)
         no_installer()
         try:
             task = self._table.get_task(agent_id)

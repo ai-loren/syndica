@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -44,6 +45,7 @@ __all__ = [
     'BudgetExhausted',
     'BudgetRefused',
     'BudgetTree',
+    'PriceUnknown',
 ]
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,11 @@ THRESHOLDS = (50, 25, 10)
 # 请求里没写输出上限时，按这么多输出 token 估算一次调用。
 OUTPUT_ALLOWANCE = 2048
 _CALIBRATION = (0.5, 4.0)
+# 输出余量按此前报过的最大输出校准：没写 max_tokens 时每次都按 2048 预占，真实输出常常只有几十，
+# 并发的兄弟就会被一个虚高的在飞估算挤掉。
+_OUTPUT_FLOOR = 256
+# 准入只因为兄弟在飞的估算而放不下时，等它们回来再试，至多等这么久。
+_CONTENTION_WAIT = 60.0
 
 
 class BudgetRefused(ConfigError):
@@ -68,6 +75,15 @@ class BudgetExhausted(SyndicaError):
     """这次模型调用按估算放不进剩余预算：不发出去。`dimension` 是放不下的那一维。"""
 
     dimension: str = ''
+
+
+class PriceUnknown(BudgetExhausted):
+    """设了成本上限，而这次调用的模型没有价格：算不出它要花多少，不发出去（fail closed）。它说的是
+    「这个模型不能用」，不是「钱花完了」——重试链换一个有价格的候选接着试。"""
+
+
+class _Contended(Exception):
+    """放不下只是因为兄弟在飞的估算：等它们回来再试。"""
 
 
 def _zero(dim: str) -> Amount:
@@ -88,6 +104,7 @@ class _Node:
         'announced',
         'calibration',
         'cap',
+        'output_seen',
         'children',
         'closed',
         'deadline',
@@ -128,6 +145,8 @@ class _Node:
         self.announced: set[tuple[int, int]] = set()
         # 实报 / 估算的输入 token 之比：按字符估算对中文严重偏低，上一次实报校准下一次准入。
         self.calibration = 1.0
+        # 报过的最大输出 token：校准没写 max_tokens 时的输出余量。
+        self.output_seen = 0
 
     def chain(self) -> Iterator[_Node]:
         node: _Node | None = self
@@ -141,39 +160,42 @@ class _Node:
             yield from child.subtree()
 
 
-def _spent(node: _Node, dim: str) -> Amount | None:
-    """这个节点在 `dim` 上已经占掉的：自己的消耗 + 在飞估算 + 已拆除子树 + 活着的子各自占着的。None
-    = 成本未知。"""
-    own, closed = _value(node.own, dim), _value(node.closed, dim)
-    if own is None or closed is None:
+def _spent(node: _Node, dim: str, own: _Node | None = None) -> Amount | None:
+    """这个节点在 `dim` 上已经占掉的：自己的消耗 + 在飞估算 + 已拆除子树 + 活着的子各自占着的。
+    None = 成本未知。给了 `own` 时只算它自己的在飞估算：别的节点在飞的那些很快就回来。"""
+    used, closed = _value(node.own, dim), _value(node.closed, dim)
+    if used is None or closed is None:
         return None
-    total = own + closed + node.pending.get(dim, _zero(dim))
+    total = used + closed
+    if own is None or node is own:
+        total += node.pending.get(dim, _zero(dim))
     for child in node.children.values():
-        held = _occupied(child, dim)
+        held = _occupied(child, dim, own)
         if held is None:
             return None
         total += held
     return total
 
 
-def _occupied(node: _Node, dim: str) -> Amount | None:
+def _occupied(node: _Node, dim: str, own: _Node | None = None) -> Amount | None:
     limit = node.limit[dim]
-    return limit if limit is not None else _spent(node, dim)
+    return limit if limit is not None else _spent(node, dim, own)
 
 
-def _available(node: _Node, dim: str) -> Amount:
+def _available(node: _Node, dim: str, own: _Node | None = None) -> Amount:
     limit = cast(Amount, node.limit[dim])
-    spent = _spent(node, dim)
+    spent = _spent(node, dim, own)
     if spent is None:
         return _zero(dim)
     return max(limit - spent, _zero(dim))
 
 
-def _room(node: _Node, dim: str) -> Amount | None:
-    """这个节点此刻自己还能花多少：最近一个有上限的那一层的可用；整条链都不限时 None。"""
+def _room(node: _Node, dim: str, own: _Node | None = None) -> Amount | None:
+    """这个节点此刻自己还能花多少：最近一个有上限的那一层的可用；整条链都不限时 None。给了 `own`
+    时不算别的节点在飞的估算（轮开始时的判定用：兄弟在飞的调用不是花掉了）。"""
     for level in node.chain():
         if level.limit[dim] is not None:
-            return _available(level, dim)
+            return _available(level, dim, own)
     return None
 
 
@@ -196,6 +218,52 @@ def _capacity(parent: _Node, want: Amount | None, dim: str, *, commit: bool) -> 
                 parent.limit[dim] = cast(Amount, parent.limit[dim]) + extra
             available += extra
     return available if want is None else min(available, want)
+
+
+def _offer(parent: _Node, dim: str) -> Amount | None:
+    """父此刻能给一个新子节点多少：正在跑的父是它的可用；在收尾态（zombie、起来等消息）的父还能
+    从它自己的父那里长回来，长得回来的也算。"""
+    room = _room(parent, dim)
+    cap, limit = parent.cap[dim], parent.limit[dim]
+    if (
+        room is not None
+        and parent.parent is not None
+        and not parent.running
+        and cap is not None
+        and limit is not None
+        and cap > limit
+    ):
+        room += cast(Amount, _capacity(parent.parent, cap - limit, dim, commit=False))
+    return room
+
+
+def _grow_settled(parent: _Node, caps: Mapping[str, Amount | None]) -> None:
+    """在收尾态的父下面切一个马上要跑的子：先把父长到装得下它。"""
+    if parent.parent is None or parent.running:
+        return
+    for dim, want in caps.items():
+        cap, limit = parent.cap[dim], parent.limit[dim]
+        if want is None or cap is None or limit is None:
+            continue
+        short = want - _available(parent, dim)
+        if short > 0:
+            grow = min(short, cap - limit)
+            if grow > 0:
+                granted = cast(Amount, _capacity(parent.parent, grow, dim, commit=True))
+                parent.limit[dim] = limit + granted
+
+
+def _returnable(node: _Node, dim: str) -> Amount:
+    """正在跑的子节点做完会退回来的那部分（它的预留减去它真占着的）。"""
+    total = _zero(dim)
+    for child in node.children.values():
+        limit = child.limit[dim]
+        if limit is None or not child.running:
+            continue
+        spent = _spent(child, dim)
+        if spent is not None and limit > spent:
+            total += limit - spent
+    return total
 
 
 def _half(value: Amount) -> Amount:
@@ -222,6 +290,20 @@ class BudgetTree:
         self._root_started = False
         self._nodes: dict[str, _Node] = {}
         self._unpriced: set[str] = set()
+        self._price_failures: set[str] = set()
+        # 有预占放掉了：等在准入上的调用醒来再试。边沿信号：放的一方置位并换一个新的，等的一方只等它
+        # 拿到的那一个。
+        self._released: asyncio.Event | None = None
+
+    def _notify(self) -> None:
+        if self._released is not None:
+            self._released.set()
+            self._released = None
+
+    def _release_signal(self) -> asyncio.Event:
+        if self._released is None:
+            self._released = asyncio.Event()
+        return self._released
 
     def now(self) -> float:
         return self._clock()
@@ -255,7 +337,10 @@ class BudgetTree:
             want = cast('Amount | None', getattr(asked, dim))
             if want is not None and want <= 0:
                 raise _zero_request(dim)
-            room = _room(parent, dim)
+            room = _offer(parent, dim)
+            if room is not None and dim == 'turns' and not pooled:
+                # 父自己留一轮收尾：把最后一轮也切给子，父拿回结果之后就一轮都没有、交不出回答。
+                room = max(room - 1, 0)
             if want is None and pooled:
                 caps[dim] = None
             elif room is None:
@@ -288,6 +373,8 @@ class BudgetTree:
         """建节点并挂到父下。`running=False`（起来等消息）的不先占额度，第一个周期开始时再切。"""
         caps, deadline = self.split(parent_id, requested)
         parent = self._parent(parent_id)
+        if running:
+            _grow_settled(parent, caps)
         node = _Node(agent_id, parent, caps, running=running, started=self.now(), deadline=deadline)
         parent.children[agent_id] = node
         self._nodes[agent_id] = node
@@ -330,11 +417,28 @@ class BudgetTree:
         return node.parent.agent_id
 
     def _price(self, llm: object, platform: str | None) -> Any:
+        """作答模型的价格；价格表抛出时按价格未知（设了成本上限的那一层于是按耗尽算），记一次
+        ERROR。"""
         prices = self.policy.prices
         model = _model_of(llm)
         if prices is None or model is None:
             return None
-        return prices.price_of(model, platform)
+        try:
+            return prices.price_of(model, platform)
+        except Exception as error:
+            if model not in self._price_failures:
+                self._price_failures.add(model)
+                logger.error(
+                    '期望: 价格表 %s 交回模型 %s 的价格（Prices 或 None）。'
+                    ' 实际: 它抛出 %s: %s；按价格未知处理，设了成本上限的那一层因此按耗尽算。'
+                    ' 下一步: 修好这个价格表，'
+                    '或在 .syndica.yaml 的 prices: 里直接写这个模型的价格。',
+                    type(prices).__name__,
+                    model,
+                    type(error).__name__,
+                    error,
+                )
+            return None
 
     def _report_unpriced(self, llm: object) -> None:
         model = _model_of(llm) or '<没有 config.model>'
@@ -431,12 +535,18 @@ class BudgetAccount:
             return
         node = self._node
         node.running = False
-        for dim in _ADDITIVE:
-            if node.limit[dim] is None:
-                continue
-            spent = _spent(node, dim)
-            if spent is not None:
-                node.limit[dim] = spent
+        # 自己缩完，再把沿途同样在收尾态的祖先也缩到实际占用：退回来的余量一直传到正在跑的那一层，
+        # 不停在一个也许再也不会醒的 zombie 身上。
+        for level in node.chain():
+            if level is not node and (level.running or level.parent is None):
+                break
+            for dim in _ADDITIVE:
+                if level.limit[dim] is None:
+                    continue
+                spent = _spent(level, dim)
+                if spent is not None:
+                    level.limit[dim] = spent
+        self._tree._notify()  # pyright: ignore[reportPrivateUsage]
 
     # ---- 耗尽 ----
 
@@ -463,6 +573,9 @@ class BudgetAccount:
             if not node.running and cap is not None and limit is not None and cap > limit:
                 assert node.parent is not None
                 room += cast(Amount, _capacity(node.parent, cap - limit, dim, commit=False))
+            elif node.running:
+                # 正在跑的节点此刻的剩余可能都被它的子占着：子做完会退回来，不算用完。
+                room += _returnable(node, dim)
             if room <= 0:
                 out.append(dim)
         if self._out(WALL):
@@ -482,19 +595,19 @@ class BudgetAccount:
         stop: list[str] = []
         wrap: list[str] = []
         if not self._companion:
-            turns = _room(node, 'turns')
+            turns = _room(node, 'turns', node)
             if turns is not None:
                 if turns <= 0:
                     stop.append('turns')
                 elif turns == 1:
                     wrap.append('turns')
-        room = _room(node, 'tokens')
+        room = _room(node, 'tokens', node)
         if room is not None:
             if room < tokens:
                 stop.append('tokens')
             elif room < 2 * tokens:
                 wrap.append('tokens')
-        room_cost = _room(node, 'cost')
+        room_cost = _room(node, 'cost', node)
         if room_cost is not None:
             if cost is None or room_cost < cost:
                 stop.append('cost')
@@ -525,31 +638,59 @@ class BudgetAccount:
         """一次调用的估算：（输入 + 输出 token、成本（价格未知为 None）、未校准的输入估算）。"""
         raw_input = _estimate(request.get('messages')) + _tool_tokens(request.get('tools'))
         input_tokens = math.ceil(raw_input * self._node.calibration)
-        output_tokens = _output_allowance(llm, request)
+        output_tokens = _output_allowance(llm, request, self._node.output_seen)
         price = self._tree._price(llm, None)  # pyright: ignore[reportPrivateUsage]
         cost = None if price is None else price.cost_of(input_tokens, output_tokens, 0)
         return input_tokens + output_tokens, cost, raw_input
 
     def admit(self, llm: object, request: Mapping[str, Any]) -> _Ticket:
-        """按估算预占；放不进剩余就 `BudgetExhausted`。预占与检查之间没有挂起点。"""
+        """按估算预占；放不进剩余就 `BudgetExhausted`（只因为兄弟在飞的估算放不下时是 `_Contended`，
+        交给 `admit_waiting` 等）。预占与检查之间没有挂起点。"""
         tokens, cost, raw_input = self.estimate(llm, request)
         node = self._node
-        room = _room(node, 'tokens')
-        if room is not None and tokens > room:
-            raise _not_admitted(node.agent_id, 'tokens', tokens, room)
-        room_cost = _room(node, 'cost')
-        if room_cost is not None and (cost is None or cost > room_cost):
-            raise _not_admitted(node.agent_id, 'cost', cost, room_cost)
         if self._out(WALL):
             raise _not_admitted(node.agent_id, WALL, None, 0)
+        if _room(node, 'cost') is not None and cost is None:
+            self._tree._report_unpriced(llm)  # pyright: ignore[reportPrivateUsage]
+            raise _unpriced(node.agent_id, llm)
+        wanted: tuple[tuple[str, Amount | None], ...] = (('tokens', tokens), ('cost', cost))
+        for dim, want in wanted:
+            room = _room(node, dim)
+            if room is None or want is None or want <= room:
+                continue
+            if want <= cast(Amount, _room(node, dim, node)):
+                raise _Contended
+            raise _not_admitted(node.agent_id, dim, want, room)
         node.pending['tokens'] = node.pending['tokens'] + tokens
         node.pending['cost'] = node.pending['cost'] + (cost or Decimal(0))
         return _Ticket(tokens=tokens, cost=cost, raw_input=raw_input)
+
+    async def admit_waiting(self, llm: object, request: Mapping[str, Any]) -> _Ticket:
+        """`admit`，但兄弟在飞的估算挡着时等它们回来再试（至多 `_CONTENTION_WAIT` 秒，不过截止
+        时刻）。一次虚高的在飞估算不能把并发的兄弟挤成收尾或停下。"""
+        deadline = self._tree.now() + _CONTENTION_WAIT
+        if self._node.deadline is not None:
+            deadline = min(deadline, self._node.deadline)
+        while True:
+            try:
+                return self.admit(llm, request)
+            except _Contended:
+                pass
+            left = deadline - self._tree.now()
+            if left <= 0:
+                raise _not_admitted(self._node.agent_id, 'tokens', None, 0) from None
+            signal = self._tree._release_signal()  # pyright: ignore[reportPrivateUsage]
+            try:
+                async with asyncio.timeout(left):
+                    await signal.wait()
+            except TimeoutError:
+                pass
 
     def release(self, ticket: _Ticket) -> None:
         node = self._node
         node.pending['tokens'] = node.pending['tokens'] - ticket.tokens
         node.pending['cost'] = node.pending['cost'] - (ticket.cost or Decimal(0))
+        self._tree._notify()  # pyright: ignore[reportPrivateUsage]
 
     def settle(
         self, ticket: _Ticket | None, llm: object, request: Mapping[str, Any], reply: object
@@ -571,6 +712,8 @@ class BudgetAccount:
         if output_tokens is None:
             output_tokens = _estimate([reply])
             estimated = True
+        else:
+            self._node.output_seen = max(self._node.output_seen, output_tokens)
         cached = min(reported.get('cached_input_tokens') or 0, input_tokens)
         price = self._tree._price(llm, platform)  # pyright: ignore[reportPrivateUsage]
         cost = None if price is None else price.cost_of(input_tokens, output_tokens, cached)
@@ -638,7 +781,7 @@ class BudgetAccount:
 
     # ---- 追加 ----
 
-    def grant(self, extra: Budget) -> None:
+    def _grant(self, extra: Budget) -> None:
         """宿主追加：钱从树外来，所以这个节点与链上每一个有上限的祖先（含池）在那一维上同加。"""
         for node in self._node.chain():
             for dim in _ADDITIVE:
@@ -706,7 +849,7 @@ def _tool_tokens(tools: object) -> int:
         return 0
 
 
-def _output_allowance(llm: object, request: Mapping[str, Any]) -> int:
+def _output_allowance(llm: object, request: Mapping[str, Any], seen: int = 0) -> int:
     config = getattr(llm, 'config', None)
     defaults = getattr(config, 'request_args', None)
     sources: list[Mapping[str, object]] = [request]
@@ -717,6 +860,8 @@ def _output_allowance(llm: object, request: Mapping[str, Any]) -> int:
             value = _count(source.get(key))
             if value:
                 return value
+    if seen:
+        return min(max(2 * seen, _OUTPUT_FLOOR), OUTPUT_ALLOWANCE)
     return OUTPUT_ALLOWANCE
 
 
@@ -727,6 +872,18 @@ def _model_of(llm: object) -> str | None:
 
 def _who(parent_id: str | None) -> str:
     return 'Runtime 级预算' if parent_id is None else f'agent {parent_id} 的预算'
+
+
+def _unpriced(agent_id: str | None, llm: object) -> PriceUnknown:
+    who = 'Runtime 级预算' if agent_id is None else f'agent {agent_id}'
+    model = _model_of(llm) or '<没有 config.model>'
+    error = PriceUnknown(
+        expected=f'{who} 设了成本上限，这次调用的模型有价格',
+        received=f'模型 {model} 不在价格表里，算不出这次调用要花多少',
+        next_action=f'在 .syndica.yaml 的 prices: 里给 {model} 写三档单价，或换一个有价格的模型',
+    )
+    error.dimension = 'cost'
+    return error
 
 
 def _zero_request(dim: str) -> BudgetRefused:
@@ -757,7 +914,7 @@ def _not_admitted(
     agent_id: str | None, dim: str, wanted: Amount | None, room: Amount
 ) -> BudgetExhausted:
     who = 'Runtime 级预算' if agent_id is None else f'agent {agent_id}'
-    asked = '价格未知' if wanted is None else f'估算要 {wanted}'
+    asked = '等不到在飞的调用回来' if wanted is None else f'估算要 {wanted}'
     error = BudgetExhausted(
         expected=f'这次模型调用放得进 {who} 剩下的 {dim}',
         received=f'{asked}，只剩 {room}',

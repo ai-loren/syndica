@@ -43,8 +43,11 @@ class SessionStore(Protocol):
         ...
 
     async def archive(self, sid: str, record: RedactedSessionRecord) -> int:
-        """把当前内容归档成一份只增的历史副本，返回这次的归档序号（当前最大值 +1，不回填空洞），并把
-        live 记录的 `SessionMeta.archived` 前移。只收脱敏过的记录。"""
+        """把当前内容归档成一份历史副本，返回这次的归档序号（当前最大值 +1，不回填空洞），并把
+        live 记录的 `SessionMeta.archived` 前移。只收脱敏过的记录。
+
+        实现可以只留最近若干份（内置的两个留 20 份：每次压缩归档一份完整前像，跑几天的会话会一直长
+        下去）；删掉的序号 `read_archived` 交回 None，且序号永不复用。"""
         ...
 
     async def list_metas(

@@ -125,21 +125,25 @@ def _kept_originals(
 
     乱序 / 重复会在这里报：按值的 `in` 对它们无感——两个相等的受保护块用一块就「满足」，摘要把任务
     挪到当前轮之后也照过（评审 M3）。
+
+    从后往前对、每块取能取的最晚那一个：两条相等的块（同样一句「继续」）里留下的那条对的是后一条——
+    后一条正是受保护的当前输入，从前往前对会把它判成丢了。
     """
-    cursor = 0
+    cursor = len(before)
     matched: set[int] = set()
     derived: list[bool] = []
-    for block in kept:
-        index = next((i for i in range(cursor, len(before)) if before[i] == block), None)
+    for block in reversed(kept):
+        index = next((i for i in range(cursor - 1, -1, -1) if before[i] == block), None)
         if index is None:
-            # cursor 之后找不到：要么是真衍生块，要么乱序 / 重复的原块（它等于 cursor 之前的某块）。
+            # cursor 之前找不到：要么是真衍生块，要么乱序 / 重复的原块（它等于 cursor 之后的某块）。
             if any(before[i] == block for i in range(len(before))):
                 raise _refuse('kept 里的原块按 before 的下标严格递增', '留下的原块乱序或重复')
             derived.append(True)
         else:
             matched.add(index)
-            cursor = index + 1
+            cursor = index
             derived.append(False)
+    derived.reverse()
     return matched, derived
 
 
@@ -299,6 +303,19 @@ def _materialize(
     return kept, dropped
 
 
+def _validate_strategy_args(name: str, min_keep_turns: object, max_output_chars: object) -> None:
+    for name_, value in (
+        ('min_keep_turns', min_keep_turns),
+        ('max_output_chars', max_output_chars),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ConfigError(
+                expected=f'{name} 的 {name_} 是 >= 1 的整数',
+                received=f'{name_}={value!r}',
+                next_action=f'给 {name_} 一个正整数；最近一轮都不留，压缩之后就没有当前输入',
+            )
+
+
 def _floor_start(blocks: Sequence[ContextBlock], min_keep_turns: int) -> int:
     exchanges = _turn_bounds(blocks)
     if not exchanges:
@@ -311,6 +328,7 @@ class RuleBasedCompaction:
     N 轮都塞不下时才截断其中的超长工具 / assistant 输出（spec §8.8）。"""
 
     def __init__(self, *, min_keep_turns: int = 2, max_output_chars: int = 4000) -> None:
+        _validate_strategy_args(type(self).__name__, min_keep_turns, max_output_chars)
         self._min_keep_turns = min_keep_turns
         self._max_output_chars = max_output_chars
 
@@ -344,6 +362,7 @@ class GoalDirectedCompaction:
     消息）推，相当于把全部生效的 Rubric 都当成未满足——宁可多留。"""
 
     def __init__(self, *, min_keep_turns: int = 2, max_output_chars: int = 4000) -> None:
+        _validate_strategy_args(type(self).__name__, min_keep_turns, max_output_chars)
         self._min_keep_turns = min_keep_turns
         self._max_output_chars = max_output_chars
 
@@ -504,7 +523,7 @@ def _protected_indices(blocks: Sequence[ContextBlock]) -> frozenset[int]:
         for index, block in enumerate(blocks)
         if kind_of(block) in (HistoryKind.ENV_FACT, HistoryKind.RESUME_NOTE)
     }
-    for kind in (HistoryKind.GOAL, HistoryKind.RUBRIC):
+    for kind in (HistoryKind.GOAL, HistoryKind.RUBRIC, HistoryKind.BUDGET):
         latest = [index for index, block in enumerate(blocks) if kind_of(block) is kind]
         if latest:
             protected.add(latest[-1])

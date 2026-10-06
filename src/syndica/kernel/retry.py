@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from syndica import __version__
-from syndica.kernel.budget_tree import BudgetExhausted
+from syndica.kernel.budget_tree import BudgetExhausted, PriceUnknown
 from syndica.kernel.context import ContextBlock
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.hooks import HookResult, HooksCenter, Junction
@@ -143,11 +143,15 @@ class _RetryPlugin:
         for attempt in range(1, self._attempts + 1):
             await self._sleep(self._backoff_seconds)
             try:
-                with llm_attempt(self._original, request) as traced:
+                async with llm_attempt(self._original, request) as traced:
                     response = await self._original.create(messages, **call_kwargs)
                     traced.observe(response)
             except asyncio.CancelledError:
                 raise
+            except PriceUnknown as exc:
+                # 这个模型没有价格、在成本上限下用不了：换下一个候选，不是预算耗尽。
+                self._record_failure(error, f'original retry {attempt}', exc)
+                continue
             except BudgetExhausted:
                 raise
             except Exception as exc:
@@ -157,11 +161,14 @@ class _RetryPlugin:
         for name, candidate in self._fallbacks:
             await self._sleep(self._backoff_seconds)
             try:
-                with llm_attempt(candidate, request) as traced:
+                async with llm_attempt(candidate, request) as traced:
                     response = await candidate.create(messages, **call_kwargs)
                     traced.observe(response)
             except asyncio.CancelledError:
                 raise
+            except PriceUnknown as exc:
+                self._record_failure(error, f'fallback {name}', exc)
+                continue
             except BudgetExhausted:
                 raise
             except Exception as exc:

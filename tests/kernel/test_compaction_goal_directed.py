@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import pytest
+
 from syndica.kernel.compaction import (
     CompactionController,
     CompactionRequest,
+    CompactionResult,
     GoalDirectedCompaction,
     RuleBasedCompaction,
     apply_compaction,
     traj_tokens,
 )
 from syndica.kernel.context import ContextBlock, ToolCall
+from syndica.kernel.errors import ConfigError
 from syndica.kernel.history_blocks import HistoryKind, signed_block
 
 _FILLER = ' lorem' * 30
@@ -206,3 +210,28 @@ def test_the_controller_passes_its_needed_provider_into_the_request() -> None:
         strategy=GoalDirectedCompaction(), threshold_tokens=100, target_tokens=50
     )
     assert bare.build_request([]).needed == ()
+
+
+@pytest.mark.parametrize('strategy', [GoalDirectedCompaction, RuleBasedCompaction])
+@pytest.mark.parametrize(
+    ('arg', 'value'),
+    [('min_keep_turns', 0), ('min_keep_turns', True), ('max_output_chars', 0)],
+)
+def test_strategy_arguments_must_be_positive_integers(
+    strategy: type[GoalDirectedCompaction | RuleBasedCompaction], arg: str, value: object
+) -> None:
+    with pytest.raises(ConfigError) as caught:
+        strategy(**{arg: value})  # type: ignore[arg-type]
+    assert arg in caught.value.expected and strategy.__name__ in caught.value.expected
+
+
+def test_dropping_an_earlier_copy_of_the_protected_input_is_not_a_lost_protected_block() -> None:
+    blocks = [
+        ContextBlock(role='user', content='continue'),
+        ContextBlock(role='assistant', content='first'),
+        ContextBlock(role='user', content='continue'),
+        ContextBlock(role='assistant', content='second'),
+    ]
+    request = CompactionRequest(blocks=blocks, budget_tokens=10_000, protected=frozenset({2}))
+    kept = apply_compaction(request, CompactionResult(kept=[blocks[2], blocks[3]]))
+    assert [b.content for b in kept] == ['continue', 'second']

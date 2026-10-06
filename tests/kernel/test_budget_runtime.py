@@ -237,7 +237,7 @@ async def test_a_delegated_child_gets_half_of_what_its_parent_has_left() -> None
         parent_view = runtime._budget_of(root)  # pyright: ignore[reportPrivateUsage]
     finally:
         await runtime.shutdown()
-    assert seen[0] is not None and seen[0].limit.turns == 10
+    assert seen[0] is not None and seen[0].limit.turns == 9
     assert parent_view is not None and parent_view.used.turns == 3
 
 
@@ -548,7 +548,7 @@ async def test_concurrent_agents_cannot_jointly_overrun_the_pool() -> None:
 
 
 async def test_a_companion_spends_the_served_agents_tokens_but_not_its_turns() -> None:
-    from syndica.kernel.agent import SERVED, _Served  # pyright: ignore[reportPrivateUsage]
+    from syndica.kernel.agent import _SERVED, _Served  # pyright: ignore[reportPrivateUsage]
     from syndica.kernel.budget_tree import BudgetTree
     from syndica.kernel.companion import run_companion
     from syndica.kernel.tracing import _Tracing  # pyright: ignore[reportPrivateUsage]
@@ -561,7 +561,7 @@ async def test_a_companion_spends_the_served_agents_tokens_but_not_its_turns() -
     served._attach_budget(account)  # pyright: ignore[reportPrivateUsage]
     tracer = _Events()
     tracing = _Tracing(tracer)
-    token = SERVED.set(_Served(served, account, tracing))
+    token = _SERVED.set(_Served(served, account, tracing))
     try:
         companion = _Reporting([ScriptedTurn(content='{"ok": true}')], usage=(300, 50))
         with tracing.span(SpanKind.TURN, (served.agent_id, 1), name='turn', agent_id='x') as turn:
@@ -569,7 +569,7 @@ async def test_a_companion_spends_the_served_agents_tokens_but_not_its_turns() -
                 name='OutputVerifier', llm=companion, system_prompt='judge', task='look'
             )
     finally:
-        SERVED.reset(token)
+        _SERVED.reset(token)
     view = account.view()
     assert result.reply == '{"ok": true}'
     assert (view.used.tokens, view.used.turns) == (350, 0)

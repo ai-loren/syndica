@@ -204,6 +204,16 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'budget.disposition': 'str',
         # 伴生 Agent 的 agent span 上：它替谁干活。
         'agent.serves': 'str',
+        # 长程（事件上）：量到的进度、回退的条、停滞了几轮、漂移检查的两层结论、策略交回的动作。
+        'progress.satisfied': 'int',
+        'progress.mandatory': 'int',
+        'progress.pending_human': 'int',
+        'progress.regressed': 'str[]',
+        'progress.stalled_turns': 'int',
+        'drift.anchored': 'bool',
+        'drift.confirmed': 'bool?',
+        'strategy.hook': 'str',
+        'strategy.move': 'str',
     }
 )
 
@@ -216,6 +226,10 @@ ATTRIBUTE_DOMAINS: Mapping[str, frozenset[str]] = MappingProxyType(
         'verdict.status': frozenset({'pass', 'partial', 'block', 'unverified'}),
         'compaction.trigger': frozenset({'threshold', 'overflow'}),
         'budget.disposition': frozenset({'graceful_wrapup', 'hard_stop', 'ask_human'}),
+        'strategy.hook': frozenset(
+            {'on_progress_stall', 'on_budget_low', 'on_goal_drift', 'should_stop'}
+        ),
+        'strategy.move': frozenset({'continue', 'nudge', 'wrap_up', 'remind', 'stop'}),
         'tool.outcome': frozenset(
             {
                 'ok',

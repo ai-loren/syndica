@@ -85,7 +85,13 @@ from typing import Any, cast
 
 from syndica.kernel.acceptance import OutcomeKind, Verdict, VerdictStatus, most_severe
 from syndica.kernel.budget import Budget, BudgetView, Exhaustion
-from syndica.kernel.budget_tree import BudgetAccount, BudgetExhausted, granted_dims, seconds
+from syndica.kernel.budget_tree import (
+    BudgetAccount,
+    BudgetExhausted,
+    PriceUnknown,
+    granted_dims,
+    seconds,
+)
 from syndica.kernel.compaction import (
     CompactionController,
     apply_compaction,
@@ -105,7 +111,7 @@ from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
 from syndica.kernel.danger import DangerJudge, DangerPolicy, Disposition, validate_danger_options
 from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError
 from syndica.kernel.events import Event, EventBus
-from syndica.kernel.history_blocks import HistoryKind, signed_block
+from syndica.kernel.history_blocks import HistoryKind, has_block, signed_block
 from syndica.kernel.hooks import (
     ExtensionJunction,
     HookCallback,
@@ -118,6 +124,7 @@ from syndica.kernel.hooks.center import EXTENSION_TAINT
 from syndica.kernel.hooks.installing import Installer
 from syndica.kernel.ids import assigned_agent_id
 from syndica.kernel.llm import LLM, ContextOverflowError
+from syndica.kernel.long_horizon_seam import LongHorizonBlock, LongHorizonController
 from syndica.kernel.plugins import Plugin, install_plugins
 from syndica.kernel.protocols.artifact import ArtifactStore
 from syndica.kernel.tool import Tool, validate_tool_names
@@ -421,6 +428,7 @@ def _unpaired_calls(blocks: list[ContextBlock]) -> list[ToolCall]:
 
 _ABORT_AFTER_LLM_WHY = '中止在模型已经产出之后、任何工具执行之前被兑现，本批调用就此停下。'
 _BUDGET_WRAP_WHY = '预算用完了，这是收尾的一轮：内核不再执行工具调用，本批调用就此停下。'
+_FINAL_WHY = '强制验收条都已满足，这一轮只交付最终回答：内核不再执行工具调用，本批调用就此停下。'
 _WRAP_UP_TEXT = (
     '预算快用完了（{dims}）：这是最后一轮，这一轮里的工具调用不会被执行。'
     '直接把已经完成的部分整理成最终回答交付，写清哪些还没做完、做到了哪一步。'
@@ -440,7 +448,7 @@ class _Served:
 # 此刻在替谁干活：`_run` 在整个周期里设好，伴生运行器据此把伴生的预算与 trace 接到被服务的 Agent
 # 上。伴生跑在被服务 Agent 的驱动任务里（验收 hook 内），读得到它；派出去的子 Agent 在自己的 `_run`
 # 里覆盖。
-SERVED: ContextVar[_Served | None] = ContextVar('syndica_served_agent', default=None)
+_SERVED: ContextVar[_Served | None] = ContextVar('syndica_served_agent', default=None)
 
 
 def _render_budget(view: BudgetView, heading: str) -> str:
@@ -600,6 +608,12 @@ class BaseAgent:
         self._serves: str | None = None
         # 本 Agent 派出过几个伴生：伴生 id 由（本 Agent、伴生名、第几个）派生，span id 因此稳定。
         self._companions = 0
+        # 长程控制器（可选）：长程 Module 经 `_attach_long_horizon` 装上（spec §8.2–§8.6）。
+        self._long_horizon: LongHorizonController | None = None
+        # 这一轮只交付最终回答（`should_stop` 在完成判据成立时被兑现）：工具调用不执行。
+        self._finalizing = False
+        # 最近一次停在预算上，是因为模型没有价格（设了成本上限时）：伴生据此报 price_unknown。
+        self._unpriced = False
 
     def install_runtime_tools(self, tools: Mapping[str, Tool]) -> None:
         """装上由驱动方提供的工具（spec §5.6 的编排五件套走这条路）。
@@ -840,6 +854,10 @@ class BaseAgent:
         模型调用之前调它（§7.6）：任务已在轨迹里，第一轮就看得到投影结果。"""
         self._rubrics = inject
 
+    def _attach_long_horizon(self, controller: LongHorizonController) -> None:
+        """装上长程控制器（长程 Module 调）。它只交回要追加的块与几个请求，署名与信任由内核定。"""
+        self._long_horizon = controller
+
     def _attach_budget(self, account: BudgetAccount) -> None:
         """装上预算（Runtime 在 spawn 时调；伴生运行器装被服务 Agent 的伴生那一份）。"""
         self._budget = account
@@ -865,7 +883,7 @@ class BaseAgent:
         self._aux_calls += 1
         request = {'messages': messages, **kwargs}
         with self._tracing.llm_call(self.agent_id, -self._aux_calls, self._budget):
-            with llm_attempt(self.options.llm, request) as attempt:
+            async with llm_attempt(self.options.llm, request) as attempt:
                 reply = await self.options.llm.create(messages, **kwargs)
                 attempt.observe(reply)
                 return reply
@@ -1034,11 +1052,11 @@ class BaseAgent:
             budget = self._budget
             if budget is not None:
                 budget.begin_cycle()
-            served = SERVED.set(_Served(self, budget, self._tracing))
+            served = _SERVED.set(_Served(self, budget, self._tracing))
             try:
                 return await self._cycle_body(query, trust, span.attributes)
             finally:
-                SERVED.reset(served)
+                _SERVED.reset(served)
                 if budget is not None:
                     budget.end_cycle()
                     if budget.limited:
@@ -1141,9 +1159,16 @@ class BaseAgent:
             stopped = await self._budget_turn(ctx, tool_defs)
             if stopped is not None:
                 return stopped
+        self._finalizing = False
+        if self._long_horizon is not None:
+            for block in await self._long_horizon.before_model(ctx, turn):
+                self._append_long_horizon(ctx, block)
+            self._finalizing = self._long_horizon.final_requested() and not self._wrapping
         # turn 开始就做阈值 / 主动压缩（§8.8 主路径）：注入之后（新输入成了受保护的「当前输入」）、
         # 模型调用之前，消息驱动的 Agent（每轮一次回复、无工具）也会压，而非只靠超限兜底（H3）。
-        await self._maybe_compact(ctx, trigger='threshold')
+        # 收尾轮不压：摘要压缩是一次辅助调用，花的是留给收尾那次调用的预算。
+        if not self._wrapping:
+            await self._maybe_compact(ctx, trigger='threshold')
 
         await self._emit('turn_start', {'turn': turn})
         await self._hooks._dispatch(Junction.TURN_START, ctx=ctx, turn=turn)  # pyright: ignore[reportPrivateUsage]
@@ -1151,6 +1176,7 @@ class BaseAgent:
         try:
             response = await self._one_llm_call(ctx, tool_defs)
         except BudgetExhausted as refused:
+            self._unpriced = isinstance(refused, PriceUnknown)
             await self._stop_for_budget(ctx, (refused.dimension,), self._disposition())
             await self._end_turn(ctx, turn, None)
             return StopReason.BUDGET
@@ -1175,6 +1201,15 @@ class BaseAgent:
             return StopReason.ABORTED
 
         ctx.append(response)
+        if self._finalizing and response.tool_calls:
+            self._executor.append_unexecuted(
+                ctx,
+                response.tool_calls,
+                why=_FINAL_WHY,
+                origin=(self.agent_id, self._cycle, turn),
+            )
+            await self._end_turn(ctx, turn, response)
+            return None
         if self._wrapping:
             if response.tool_calls:
                 self._executor.append_unexecuted(
@@ -1183,7 +1218,7 @@ class BaseAgent:
                     why=_BUDGET_WRAP_WHY,
                     origin=(self.agent_id, self._cycle, turn),
                 )
-            else:
+            if response.content:
                 await self._propose_completion(ctx, response, turn, send_back=False)
             await self._stop_for_budget(ctx, self._wrap_dims, Exhaustion.GRACEFUL_WRAPUP)
             await self._end_turn(ctx, turn, response)
@@ -1200,6 +1235,12 @@ class BaseAgent:
             if sent_back:
                 await self._end_turn(ctx, turn, response)
                 return None
+            if self._long_horizon is not None:
+                more = await self._long_horizon.after_completion(ctx, turn)
+                if more is not None:
+                    self._append_long_horizon(ctx, more)
+                    await self._end_turn(ctx, turn, response)
+                    return None
             ctx.stop_reason = StopReason.COMPLETED
             await self._end_turn(ctx, turn, response)
             return StopReason.COMPLETED
@@ -1254,6 +1295,24 @@ class BaseAgent:
         )
         return True
 
+    def _append_long_horizon(self, ctx: Context, block: LongHorizonBlock) -> None:
+        """控制器交回的块由内核署名追加；信任取控制器给的与主轨迹溯源里最严的（计划 P1 B3：策略
+        转述的 Goal、Rubric、裁决与漂移理由都可能来自不可信内容，不能借一块策略文字洗成可信）。"""
+        if has_block(ctx.current_traj, block.key):
+            return
+        trust = strictest_trust(block.trust, provenance_of(ctx))
+        ctx.append(signed_block(block.kind, block.text, key=block.key, trust=trust))
+
+    def _estimate_unpriced(self, budget: BudgetAccount) -> bool:
+        """成本那一维停下，是不是因为这个模型根本没有价格（不是钱花完了）。"""
+        if not budget.cost_capped:
+            return False
+        _, cost, _ = budget.estimate(self.options.llm, {'messages': []})
+        if cost is None:
+            budget.tree._report_unpriced(self.options.llm)  # pyright: ignore[reportPrivateUsage]
+            return True
+        return False
+
     def _disposition(self) -> Exhaustion:
         budget = self._budget
         if budget is None or budget.companion:
@@ -1285,14 +1344,18 @@ class BaseAgent:
         budget = cast(BudgetAccount, self._budget)
         disposition = self._disposition()
         move, dims = self._budget_move(ctx, tool_defs)
+        if move == 'normal' and self._long_horizon and self._long_horizon.wrap_up_requested():
+            move, dims = 'wrap_up', ('strategy',)
         if move != 'normal' and disposition is Exhaustion.ASK_HUMAN:
             if self._asked != budget.generation:
                 self._asked = budget.generation
-                if await self._ask_for_budget(budget):
-                    move, dims = self._budget_move(ctx, tool_defs)
+                await self._ask_for_budget(budget)
+                # 问人可能等上好几分钟：不论人追加没有，都按此刻重判（同池的兄弟可能已经花掉了）。
+                move, dims = self._budget_move(ctx, tool_defs)
         if move == 'wrap_up' and disposition is Exhaustion.HARD_STOP:
             move = 'normal'
         if move == 'stop':
+            self._unpriced = 'cost' in dims and self._estimate_unpriced(budget)
             await self._stop_for_budget(ctx, dims, disposition)
             return StopReason.BUDGET
         budget.take_turn()
@@ -1371,7 +1434,7 @@ class BaseAgent:
                 self.agent_id,
             )
             return False
-        budget.grant(extra)
+        budget._grant(extra)  # pyright: ignore[reportPrivateUsage]
         self._tracing.event('budget.granted', {'budget.dimensions': granted_dims(extra)})
         return True
 
@@ -1549,7 +1612,7 @@ class BaseAgent:
         messages = request['messages']
         kwargs = {key: value for key, value in request.items() if key != 'messages'}
         try:
-            with llm_attempt(self.options.llm, request) as attempt:
+            async with llm_attempt(self.options.llm, request) as attempt:
                 reply = await self.options.llm.create(messages, **kwargs)
                 attempt.observe(reply)
                 return reply, False

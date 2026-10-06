@@ -133,6 +133,15 @@ def _next_step(child_id: str, reason: StopReason | None) -> str:
     )
 
 
+def _last_reply(ctx: Context) -> str | None:
+    """最后一条 assistant 块自己的文字；它没有文字（只有工具调用）时 None。"""
+    for block in reversed(ctx.current_traj):
+        if block.role == 'assistant':
+            content = block.content
+            return content if isinstance(content, str) and content.strip() else None
+    return None
+
+
 def _delivered(child_id: str, ctx: Context) -> ToolResult:
     """把子 Agent 的终局翻译成模型看得懂的一段话。
 
@@ -159,6 +168,9 @@ def _delivered(child_id: str, ctx: Context) -> ToolResult:
     if reason is StopReason.COMPLETED and text is not None:
         suffix = '' if verdict is None else f'\n\n（验收裁决：{verdict.status.value}）'
         return ToolResult(output=f'agent {child_id} 交回:\n{text}{suffix}', meta=meta, trust=trust)
+    if reason is StopReason.BUDGET:
+        # 只认收尾那一轮自己的文字：那一轮只有工具调用时，更早的一段旧回复不是「已完成的部分」。
+        text = _last_reply(ctx)
     if reason is StopReason.BUDGET and text is not None:
         # 预算耗尽默认收尾交付（spec §8.4）：它最后那段就是已完成的部分，丢在这里收尾就白做了。
         suffix = '' if verdict is None else f'（验收裁决：{verdict.status.value}）'

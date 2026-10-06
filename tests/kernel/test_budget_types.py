@@ -22,19 +22,19 @@ from syndica.kernel.long_horizon import BudgetMove, DriftMove, ProgressSnapshot,
 
 
 @pytest.mark.parametrize(
-    'field',
+    ('field', 'anchor'),
     [
-        {'tokens': True},
-        {'tokens': -1},
-        {'tokens': 1.5},
-        {'turns': '3'},
-        {'turns': -2},
-        {'cost': 1.5},
-        {'cost': Decimal('-1')},
-        {'cost': Decimal('NaN')},
-        {'wall_clock_s': True},
-        {'wall_clock_s': -1.0},
-        {'wall_clock_s': math.inf},
+        ({'tokens': True}, 'yes / no'),
+        ({'tokens': -1}, '非负的 tokens'),
+        ({'tokens': 1.5}, '传一个整数 tokens'),
+        ({'turns': '3'}, '传一个整数 turns'),
+        ({'turns': -2}, '非负的 turns'),
+        ({'cost': 1.5}, "Decimal('1.50')"),
+        ({'cost': Decimal('-1')}, '>= 0 的有限 cost'),
+        ({'cost': Decimal('NaN')}, '>= 0 的有限 cost'),
+        ({'wall_clock_s': True}, '传一个数字 wall_clock_s'),
+        ({'wall_clock_s': -1.0}, '不限就传 None'),
+        ({'wall_clock_s': math.inf}, '不限就传 None'),
     ],
     ids=[
         'bool_tokens',
@@ -50,10 +50,13 @@ from syndica.kernel.long_horizon import BudgetMove, DriftMove, ProgressSnapshot,
         'infinite_seconds',
     ],
 )
-def test_a_budget_rejects_values_that_would_silently_mean_something_else(field: object) -> None:
+def test_a_budget_rejects_values_that_would_silently_mean_something_else(
+    field: dict[str, object], anchor: str
+) -> None:
     # YAML 1.1 把 yes 读成 True、True 在比较里等于 1；浮点金额会把 0.1 变成 0.1000…055（AGENTS）。
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError) as caught:
         Budget(**field)  # type: ignore[arg-type]
+    assert anchor in caught.value.next_action
 
 
 def test_a_budget_with_no_dimension_set_is_unlimited() -> None:
@@ -151,7 +154,14 @@ def test_a_platform_specific_price_wins_over_the_bare_model_name() -> None:
 def test_the_fallback_is_asked_with_the_same_platform() -> None:
     table = StaticPrices({}, fallback=StaticPrices({'gemini:m': _TWO}))
     assert table.price_of('m', 'gemini') is _TWO
-    assert table.price_of('m') is None
+    assert table.price_of('m', 'openrouter') is None
+
+
+def test_without_a_platform_the_dearest_platform_entry_is_the_estimate() -> None:
+    table = StaticPrices({'openrouter:m': _ONE, 'gemini:m': _TWO, 'gemini:other': _ONE})
+    assert table.price_of('m') is _TWO
+    assert table.price_of('other') is _ONE
+    assert table.price_of('missing') is None
 
 
 async def _ask(agent_id: str, view: BudgetView) -> Budget | None:

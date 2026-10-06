@@ -215,6 +215,12 @@ class StaticPrices:
         found = None if platform is None else self._prices.get(f'{platform}:{model}')
         if found is None:
             found = self._prices.get(model)
+        if found is None and platform is None:
+            # 还不知道哪个平台作答（准入、spawn 时）：按这个模型在各平台里最贵的那一份估，宁可多估。
+            suffix = f':{model}'
+            listed = [p for key, p in self._prices.items() if key.endswith(suffix)]
+            if listed:
+                found = max(listed, key=lambda p: (p.output, p.input, p.cached_input))
         if found is not None:
             return found
         return None if self._fallback is None else self._fallback.price_of(model, platform)

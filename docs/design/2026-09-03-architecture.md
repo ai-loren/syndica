@@ -961,7 +961,7 @@ class Budget:
 ```
 
 - **父子预算树** —— 子 Agent 从父 Agent 的预算中切分，不得超额。这样"多 Agent 并行 + 双伴生验收"三重放大不会失控
-  - 宿主给 `Runtime(budget=BudgetPolicy(root=Budget(...), on_exhausted=..., prices=..., ask_human=...))`；`spawn(budget=)` 显式切，不给就切父此刻能给的一半（轮次向上取整），顶层 Agent 直接从 Runtime 的池里取
+  - 宿主给 `Runtime(budget=BudgetPolicy(root=Budget(...), on_exhausted=..., prices=..., ask_human=...))`；`spawn(budget=)` 显式切，不给就切父此刻能给的一半（轮次向上取整；父是 Agent 时先留下自己收尾的一轮再对半），顶层 Agent 直接从 Runtime 的池里取
   - 切分即**预留**：活着的子 Agent 各自占着的额度之和永远不超过父；子 Agent 一个周期结束时缩到实际占用、余量回父，下个周期再从父那里至多切回一半——做完的子 Agent 以 zombie 留着随时可唤醒，不能一直按住父的额度。唤醒记在被唤醒者这一支血统的账上，一点都切不出来就拒收消息
   - 伴生调用的 token 与成本记在被服务的 Agent 上，不占它的轮次；每一次模型调用（主轮、重试、轮换、辅助调用、伴生）都在发出之前按估算准入、回来之后按实报记账，越界只剩估算误差
   - 耗尽：一次调用都放不下就停在 `budget`；这一次放得下、下一次放不下，这一轮就是收尾轮（工具定义照发，这一轮的工具调用不执行，打回不生效）

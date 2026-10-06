@@ -25,7 +25,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from syndica.kernel.agent import SERVED, AgentOptions, BaseAgent
+from syndica.kernel.agent import (
+    _SERVED,  # pyright: ignore[reportPrivateUsage]
+    AgentOptions,
+    BaseAgent,
+)
 from syndica.kernel.context import StopReason, TrustLevel, provenance_of
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
@@ -48,6 +52,8 @@ class CompanionResult:
     turns: int
     provenance: TrustLevel = TrustLevel.TRUSTED
     stop_reason: StopReason | None = None
+    # 停在预算上是因为模型没有价格（设了成本上限）：验收报 price_unknown，而不是「钱花完了」。
+    unpriced: bool = False
 
 
 def read_only_tools(portal: Portal | None) -> dict[str, Tool]:
@@ -71,7 +77,7 @@ async def run_companion(
 ) -> CompanionResult:
     """跑一个伴生 Agent，交回它最终那条 assistant 文本。`task` 是渲染好的受限视图（只含该伴生该看的
     那部分主 Agent 历史）；`trust` 应反映视图内容（主 Agent 读过不可信内容时视图不可信，§12.2）。"""
-    served = SERVED.get()
+    served = _SERVED.get()
     token = None
     if served is not None:
         served.agent._companions += 1  # pyright: ignore[reportPrivateUsage]
@@ -107,6 +113,7 @@ async def run_companion(
         turns=agent._current_turn,  # pyright: ignore[reportPrivateUsage]
         provenance=provenance_of(ctx),
         stop_reason=ctx.stop_reason,
+        unpriced=agent._unpriced,  # pyright: ignore[reportPrivateUsage]
     )
 
 

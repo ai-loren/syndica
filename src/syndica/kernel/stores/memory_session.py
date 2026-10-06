@@ -9,6 +9,9 @@ from syndica.kernel.errors import ContractViolation
 from syndica.kernel.session_redaction import RedactedContent, RedactedSessionRecord
 from syndica.kernel.session_types import SessionMeta, SessionRecord, SessionStatus
 
+# 每个会话只留最近这么多份归档：每次压缩归档一份完整前像（spec §8.8），跑几天的会话会一直长下去。
+_ARCHIVE_KEEP = 20
+
 __all__ = ['InMemorySessionStore']
 
 
@@ -53,6 +56,8 @@ class InMemorySessionStore:
         snapshot.meta.status = SessionStatus.ARCHIVED
         snapshot.meta.archived = seq
         history.append(snapshot)
+        # 只留最近的 ARCHIVE_KEEP 份：每次压缩归档一份完整前像，跑几天的会话会一直长下去。
+        del history[:-_ARCHIVE_KEEP]
         live = self._records.get(sid)
         if live is not None:
             live.meta.archived = seq
