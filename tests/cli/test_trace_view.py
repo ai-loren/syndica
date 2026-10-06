@@ -838,3 +838,22 @@ def test_long_horizon_events_are_listed_in_order_with_what_they_found():
 def test_a_trace_without_long_horizon_events_says_so():
     section = _section(render_show(_header(), [_agent(_LEAD, 'Lead', 0, 1)], []), '长程：')
     assert section == ['  （没有长程事件）']
+
+
+def test_a_refuted_drift_and_a_skipped_milestone_and_a_strategy_wrap_up_read_as_such():
+    lead = _agent(_LEAD, 'Lead', 0, 9)
+    events = (
+        SpanEvent('goal.drift', _ORIGIN + _S, {'drift.anchored': False, 'drift.confirmed': False}),
+        SpanEvent('progress.skipped', _ORIGIN + 2 * _S, {}),
+        SpanEvent('strategy.wrap_up', _ORIGIN + 3 * _S, {}),
+    )
+    lead = dataclasses.replace(lead, events=events)
+
+    section = _section(render_show(_header(), [lead], []), '长程：')
+
+    who = f'Lead {_LEAD[:8]}'
+    assert section == [
+        f'  {who}  goal.drift  语义比对否认',
+        f'  {who}  progress.skipped  预算不够跑里程碑验收，这一次没量',
+        f'  {who}  strategy.wrap_up  策略要求收尾，这一轮是最后一轮',
+    ]

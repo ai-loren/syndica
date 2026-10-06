@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from syndica.kernel.acceptance import Anchor, AnchorSource, Goal, Rubric, RubricKind, RubricStatus
 from syndica.kernel.context import ArtifactRef, ContextBlock, ToolCall
-from syndica.kernel.drift import action_terms, anchor_terms, anchored
+from syndica.kernel.drift import action_terms, anchor_terms, anchored, call_lines
 
 
 def _call(name: str, **arguments: object) -> ContextBlock:
@@ -78,3 +80,44 @@ def test_english_arguments_anchor_to_a_chinese_goal_through_the_path() -> None:
 def test_no_actions_or_no_anchors_is_not_suspicious() -> None:
     assert anchored(frozenset(), frozenset({'report'}))
     assert anchored(frozenset({'weather'}), frozenset())
+
+
+@pytest.mark.parametrize(
+    'argument', ['content', 'new_string', 'old_string', 'text', 'body', 'patch', 'diff', 'answer']
+)
+def test_each_written_content_argument_is_left_out(argument: str) -> None:
+    block = _call('Tool', path='notes.txt', **{argument: 'weather forecast for paris'})
+    assert action_terms([block]) == {'notes', 'txt'}
+
+
+def test_list_valued_arguments_count() -> None:
+    assert action_terms([_call('Read', paths=['reports/quarterly.md', 'data/sales.csv'])]) == {
+        'reports',
+        'quarterly',
+        'data',
+        'sales',
+        'csv',
+    }
+
+
+def test_a_rubric_anchor_quote_contributes_its_own_words() -> None:
+    rubric = Rubric(
+        id='R1',
+        statement='has a table',
+        kind=RubricKind.CHECKABLE,
+        anchors=(Anchor(AnchorSource.USER_MESSAGE, 'msg:2', 'competitor margins'),),
+    )
+    assert {'competitor', 'margins'} <= anchor_terms(Goal(intent='g'), [rubric])
+
+
+def test_the_judge_sees_tool_names_and_arguments_but_never_written_content() -> None:
+    lines = call_lines(
+        [
+            _call('Write', path='reports/q.md', content='SECRET' * 100),
+            _call('Bash', command='x' * 500),
+        ],
+        line_chars=60,
+    )
+    assert lines[0] == '- Write {"path": "reports/q.md"}'
+    assert lines[1].startswith('- Bash {"command": "xxx') and lines[1].endswith('…')
+    assert len(lines[1]) == 61

@@ -390,7 +390,9 @@ are not part of the recorded turns.
 
 `modules: [acceptance, long-horizon]` adds the long-horizon loop (spec §8.2–§8.6) for the agent that
 has the goal; it needs `acceptance` because progress is only ever measured by the verifier, never
-taken from the agent's own account. Every `long_horizon_progress_every` turns (default 10) a
+taken from the agent's own account (with `acceptance_outcome` off, only the drift and low-budget
+checks run). Milestone checks and the semantic drift check are skipped when the budget cannot fit
+them alongside the agent's own next calls. Every `long_horizon_progress_every` turns (default 10) a
 milestone check counts the satisfied mandatory rubrics; a rubric that was satisfied and is now
 unmet is reported as a regression. When `long_horizon_stall_turns` turns (default 20) pass without
 progress, when the budget left drops below `long_horizon_budget_low_percent`, or when the last

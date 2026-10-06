@@ -17,6 +17,7 @@ from syndica.kernel.acceptance import Goal, Rubric, Verdict, VerdictStatus
 from syndica.kernel.budget import BudgetView
 
 __all__ = [
+    'MESSAGE_LIMIT',
     'BaselineStrategy',
     'BudgetAction',
     'BudgetMove',
@@ -145,6 +146,9 @@ class LongHorizonStrategy(Protocol):
     async def should_stop(self, ctx: LongHorizonContext) -> StopDecision: ...
 
 
+# 策略交回的一段话进历史的上限：它进了历史，也就进了此后每次请求的前缀。契约按它断言，Module
+# 按它截断。
+MESSAGE_LIMIT = 2000
 _NAMED = 10
 
 

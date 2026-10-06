@@ -627,6 +627,16 @@ class BudgetAccount:
             return 'wrap_up', tuple(wrap)
         return 'normal', ()
 
+    def fits(self, tokens: int, cost: Decimal | None) -> bool:
+        """自己此刻落定的余量放得下这么多 tokens 与成本吗（不限的维恒放得下；成本未知而设了成本
+        上限的放不下）。"""
+        node = self._node
+        room = _room(node, 'tokens', node)
+        if room is not None and room < tokens:
+            return False
+        room_cost = _room(node, 'cost', node)
+        return room_cost is None or (cost is not None and room_cost >= cost)
+
     # ---- 记账 ----
 
     def take_turn(self) -> None:

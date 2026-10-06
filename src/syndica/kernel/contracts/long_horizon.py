@@ -30,6 +30,7 @@ from syndica.kernel.acceptance import (
 from syndica.kernel.budget import Budget, BudgetView, Usage
 from syndica.kernel.contracts.base import ContractSuite
 from syndica.kernel.long_horizon import (
+    MESSAGE_LIMIT,
     BudgetAction,
     BudgetMove,
     DriftAction,
@@ -44,8 +45,6 @@ from syndica.kernel.long_horizon import (
 )
 
 __all__ = ['MESSAGE_LIMIT', 'LongHorizonStrategyContract']
-
-MESSAGE_LIMIT = 2000
 
 _ANCHOR = (Anchor(AnchorSource.USER_MESSAGE, 'msg:1', 'quarterly report'),)
 _GOAL = Goal(intent='写一份季度报告 reports/quarterly.md，包含营收表格', anchors=_ANCHOR)

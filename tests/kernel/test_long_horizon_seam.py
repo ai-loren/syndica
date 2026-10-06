@@ -53,11 +53,15 @@ class _Busy:
 
 class _Probe:
     def __init__(
-        self, act: Callable[[BaseAgent, Context, int], Sequence[LongHorizonBlock]]
+        self,
+        act: Callable[[BaseAgent, Context, int], Sequence[LongHorizonBlock]],
+        *,
+        final_at: int | None = None,
     ) -> None:
         self.asked: list[int] = []
         self.agent: BaseAgent | None = None
         self._act = act
+        self._final_at = final_at
 
     def wrap_up_requested(self) -> bool:
         return False
@@ -68,7 +72,10 @@ class _Probe:
         return self._act(self.agent, ctx, turn)
 
     def final_requested(self) -> bool:
-        return False
+        return bool(self.asked) and self.asked[-1] == self._final_at
+
+    async def record_verdict(self, ctx: Context, turn: int) -> None:
+        return None
 
     async def after_completion(self, ctx: Context, turn: int) -> LongHorizonBlock | None:
         return None
@@ -184,3 +191,23 @@ async def test_a_controller_block_after_untrusted_output_is_untrusted() -> None:
     ctx, _ = await _run(Budget(turns=4), probe)
     blocks = [b for b in ctx.current_traj if kind_of(b) is HistoryKind.STRATEGY]
     assert blocks and all(b.trust is TrustLevel.UNTRUSTED for b in blocks)
+
+
+def _answer(ctx: Context, call_id: str) -> str:
+    return str(next(b for b in ctx.current_traj if b.tool_call_id == call_id).content)
+
+
+async def test_a_final_answer_turn_does_not_carry_over_into_a_wrap_up_turn() -> None:
+    probe = _Probe(_nothing, final_at=1)
+    ctx, _ = await _run(Budget(turns=2), probe)
+    assert '强制验收条都已满足' in _answer(ctx, 'e1')
+    assert '预算用完了' in _answer(ctx, 'e2')
+    assert ctx.stop_reason is StopReason.BUDGET
+
+
+async def test_a_recheck_wrap_up_wins_over_a_final_answer_offered_in_the_same_turn() -> None:
+    probe = _Probe(_spend_leaving(1.5, at_turn=2), final_at=2)
+    ctx, llm = await _run(Budget(tokens=200_000), probe)
+    assert '预算用完了' in _answer(ctx, 'e2')
+    assert ctx.stop_reason is StopReason.BUDGET
+    assert llm.calls == 2

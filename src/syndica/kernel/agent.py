@@ -440,6 +440,8 @@ _BACKGROUND_STOPPED: Mapping[StopReason | None, str] = {
     StopReason.ABORTED: '被中止了',
     StopReason.ERROR: '这个周期出错停下了',
 }
+_STRATEGY_DIMS = ('strategy',)
+_STRATEGY_WRAP_WHY = '长程策略要求收尾，这是最后一轮：内核不再执行工具调用，本批调用就此停下。'
 _STRATEGY_WRAP_TEXT = (
     '长程策略判断该收尾了：这是最后一轮，这一轮里的工具调用不会被执行。'
     '直接把已经完成的部分整理成最终回答交付，写清哪些还没做完、做到了哪一步。'
@@ -1185,6 +1187,11 @@ class BaseAgent:
                 stopped = await self._recheck_budget(ctx, tool_defs)
                 if stopped is not None:
                     return stopped
+            # 控制器可能跑了里程碑验收、语义比对与几次策略调用：期间到达的中止在模型调用之前兑现。
+            if await self._gate.check_abort():
+                ctx.stop_reason = StopReason.ABORTED
+                await self._end_turn(ctx, turn, None)
+                return StopReason.ABORTED
         # turn 开始就做阈值 / 主动压缩（§8.8 主路径）：注入之后（新输入成了受保护的「当前输入」）、
         # 模型调用之前，消息驱动的 Agent（每轮一次回复、无工具）也会压，而非只靠超限兜底（H3）。
         # 收尾轮不压：摘要压缩是一次辅助调用，花的是留给收尾那次调用的预算。
@@ -1232,15 +1239,21 @@ class BaseAgent:
             await self._end_turn(ctx, turn, response)
             return None
         if self._wrapping:
+            by_strategy = self._wrap_dims == _STRATEGY_DIMS
             if response.tool_calls:
                 self._executor.append_unexecuted(
                     ctx,
                     response.tool_calls,
-                    why=_BUDGET_WRAP_WHY,
+                    why=_STRATEGY_WRAP_WHY if by_strategy else _BUDGET_WRAP_WHY,
                     origin=(self.agent_id, self._cycle, turn),
                 )
             if response.content:
                 await self._propose_completion(ctx, response, turn, send_back=False)
+            if by_strategy:
+                # 策略要的收尾是一次交付，不是预算用完：预算还在，收下的消息照常处理。
+                ctx.stop_reason = StopReason.COMPLETED
+                await self._end_turn(ctx, turn, response)
+                return StopReason.COMPLETED
             await self._stop_for_budget(ctx, self._wrap_dims, Exhaustion.GRACEFUL_WRAPUP)
             await self._end_turn(ctx, turn, response)
             return StopReason.BUDGET
@@ -1306,6 +1319,8 @@ class BaseAgent:
         if self._by_floored(authors.wrote.get('verdict', ()), authors.wrote.get('send_back', ())):
             verdict = replace(verdict, trust=TrustLevel.UNTRUSTED)
         ctx.verdict = verdict
+        if self._long_horizon is not None:
+            await self._long_horizon.record_verdict(ctx, turn)
         sent_back = send_back and any(
             value is True for value in outcome.history.get('send_back', [])
         )
@@ -1392,12 +1407,22 @@ class BaseAgent:
             return Exhaustion.GRACEFUL_WRAPUP
         return budget.tree.policy.on_exhausted
 
-    def _budget_move(
-        self, ctx: Context, tool_defs: list[dict[str, Any]], *, count_turn: bool = True
-    ) -> tuple[str, tuple[str, ...]]:
+    def _companion_headroom(self, ctx: Context, calls: int) -> bool:
+        """预算还放得下 `calls` 次与主调用一样大的伴生调用、外加这一次与下一次主调用吗（伴生花不掉
+        留给收尾那次调用的预算）。tokens 与成本都不限时恒真。"""
+        budget = self._budget
+        if budget is None or not budget.metered:
+            return True
+        tokens, cost = self._call_estimate(
+            ctx, [tool.schema for tool in self.options.tools.values()]
+        )
+        times = calls + 2
+        return budget.fits(tokens * times, None if cost is None else cost * times)
+
+    def _call_estimate(
+        self, ctx: Context, tool_defs: list[dict[str, Any]]
+    ) -> tuple[int, Decimal | None]:
         budget = cast(BudgetAccount, self._budget)
-        if not budget.metered:
-            return budget.plan_turn(0, Decimal(0), self._last_turn_s, count_turn=count_turn)
         # 估算沿用上一次请求的 SP 块：SP 本该逐轮字节一致（§5.2），为估算再拼一次只会多调一次。
         system_block = self._last_system or ContextBlock(
             role='system', content=self.get_system_prompt()
@@ -1406,6 +1431,15 @@ class BaseAgent:
         pending = [_BUDGET_BLOCK_SAMPLE, _BUDGET_BLOCK_SAMPLE]
         request = {'messages': [system_block, *ctx.current_traj, *pending], 'tools': tool_defs}
         tokens, cost, _ = budget.estimate(self.options.llm, request)
+        return tokens, cost
+
+    def _budget_move(
+        self, ctx: Context, tool_defs: list[dict[str, Any]], *, count_turn: bool = True
+    ) -> tuple[str, tuple[str, ...]]:
+        budget = cast(BudgetAccount, self._budget)
+        if not budget.metered:
+            return budget.plan_turn(0, Decimal(0), self._last_turn_s, count_turn=count_turn)
+        tokens, cost = self._call_estimate(ctx, tool_defs)
         return budget.plan_turn(tokens, cost, self._last_turn_s, count_turn=count_turn)
 
     async def _budget_turn(
@@ -1424,7 +1458,7 @@ class BaseAgent:
             self._enter_wrap_up(ctx, dims, _WRAP_UP_TEXT.format(dims=' / '.join(dims)))
         elif self._long_horizon is not None and self._long_horizon.wrap_up_requested():
             # 策略要收尾（`on_budget_low` 交回 WRAP_UP）：预算还够，所以不问人，hard_stop 也照收。
-            self._enter_wrap_up(ctx, ('strategy',), _STRATEGY_WRAP_TEXT)
+            self._enter_wrap_up(ctx, _STRATEGY_DIMS, _STRATEGY_WRAP_TEXT)
         return None
 
     async def _budget_decision(
@@ -1472,7 +1506,10 @@ class BaseAgent:
                 key=f'budget:{self.agent_id}:wrap:{self._cycle}:{self._current_turn}',
             )
         )
-        self._tracing.event('budget.wrap_up', {'budget.dimensions': list(dims)})
+        if dims == _STRATEGY_DIMS:
+            self._tracing.event('strategy.wrap_up', {})
+        else:
+            self._tracing.event('budget.wrap_up', {'budget.dimensions': list(dims)})
 
     def _announce_budget(self, ctx: Context, budget: BudgetAccount) -> None:
         """预算注入历史（spec §8.4：Agent 可感知，不进 SP）：第一轮一块，剩余跨过 50% / 25% / 10% 时

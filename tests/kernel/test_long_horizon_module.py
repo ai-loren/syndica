@@ -108,27 +108,49 @@ class _Router:
         outcomes: Callable[[int], object] = lambda _: _outcomes(R1='unconfirmed'),
         drift: Callable[[int], dict[str, object]] = lambda _: {'on_track': False, 'reason': 'r'},
         projection: dict[str, object] = _PROJECTION,
+        max_tokens: int | None = None,
     ) -> None:
-        self.config = LLMConfig(provider='scripted', model='m')
+        self.config = LLMConfig(
+            provider='scripted',
+            model='m',
+            request_args={} if max_tokens is None else {'max_tokens': max_tokens},
+        )
         self._main = main
         self._outcomes = outcomes
         self._drift = drift
         self._projection = projection
         self.calls: list[str] = []
         self.drift_tasks: list[str] = []
+        self.outcome_gate: asyncio.Event | None = None
+        self.drift_gate: asyncio.Event | None = None
+        self.outcome_usage: int | None = None
+        self.drift_usage: int | None = None
 
     async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        # 真的模型调用会让出事件循环：几个 Agent 因此交替前进，而不是一个跑完另一个才开始。
+        await asyncio.sleep(0)
         system = str(messages[0].content) if messages and messages[0].role == 'system' else ''
         if system.startswith('你是验收标准（Rubric）投影器'):
             self.calls.append('projection')
             return _reply(json.dumps(self._projection))
         if system.startswith('你是结果验收器'):
             self.calls.append('outcome')
+            if self.outcome_gate is not None:
+                await self.outcome_gate.wait()
             verdict = self._outcomes(self.calls.count('outcome') - 1)
-            return _reply(verdict if isinstance(verdict, str) else json.dumps(verdict))
+            reply = _reply(verdict if isinstance(verdict, str) else json.dumps(verdict))
+            if self.outcome_usage is not None:
+                reply.extra['usage'] = {'input_tokens': self.outcome_usage, 'output_tokens': 10}
+            return reply
         if system.startswith('你判断一个 Agent'):
             self.calls.append('drift')
             self.drift_tasks.append(str(messages[-1].content))
+            if self.drift_gate is not None:
+                await self.drift_gate.wait()
+            if self.drift_usage is not None:
+                reply = _reply(json.dumps(self._drift(self.calls.count('drift') - 1)))
+                reply.extra['usage'] = {'input_tokens': self.drift_usage, 'output_tokens': 10}
+                return reply
             return _reply(json.dumps(self._drift(self.calls.count('drift') - 1)))
         self.calls.append('main')
         return self._main(self.calls.count('main') - 1)
@@ -142,10 +164,10 @@ def _reply(text: str) -> ContextBlock:
     )
 
 
-def _echo(arguments: dict[str, str], n: int) -> ContextBlock:
+def _echo(arguments: dict[str, Any], n: int, *, call_id: str | None = None) -> ContextBlock:
     return ContextBlock(
         role='assistant',
-        tool_calls=[ToolCall(id=f'e{n}', name='Echo', arguments=json.dumps(arguments))],
+        tool_calls=[ToolCall(id=call_id or f'e{n}', name='Echo', arguments=json.dumps(arguments))],
         extra={'usage': {'input_tokens': 50, 'output_tokens': 10}},
     )
 
@@ -393,16 +415,14 @@ async def test_a_strategy_wrap_up_ends_on_the_next_turn_without_asking_anyone(
         await runtime.shutdown()
     wraps = [b for b in ctx.current_traj if '长程策略判断该收尾了' in str(b.content)]
     assert len(wraps) == 1
-    assert ctx.stop_reason is StopReason.BUDGET
+    assert ctx.stop_reason is StopReason.COMPLETED
     assert asked == []
     assert llm.calls.count('main') == 11
 
 
 async def test_a_wrap_up_requested_in_a_finished_cycle_does_not_leak_into_the_next() -> None:
-    llm = _Router(
-        lambda n: _reply(f'answer {n}'),
-        outcomes=lambda _: _outcomes(R1='satisfied', R2='satisfied'),
-    )
+    steps = [_echo(_ON_GOAL, 0), _reply('answer'), _echo(_ON_GOAL, 2), _reply('answer again')]
+    llm = _Router(lambda n: steps[n], outcomes=_passing)
     runtime = _runtime(
         {'long_horizon_budget_low_percent': 99},
         strategy=_WrapsUp(),
@@ -411,11 +431,16 @@ async def test_a_wrap_up_requested_in_a_finished_cycle_does_not_leak_into_the_ne
     try:
         agent_id, first = await _run(runtime, llm)
         assert first.stop_reason is StopReason.COMPLETED
+        assert first.verdict is not None and first.verdict.status.value == 'pass'
+        cut = len(first.current_traj)
         assert (await runtime.send(agent_id, 'one more thing')).ok
         ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
     finally:
         await runtime.shutdown()
-    assert not any('长程策略判断该收尾了' in str(b.content) for b in ctx.current_traj)
+    later = ctx.current_traj[cut:]
+    assert not any('长程策略判断该收尾了' in str(b.content) for b in later)
+    assert _tool_answer_of(ctx, 'e2') == 'wrote 3 rows of revenue'
+    assert _strategy_blocks(ctx, 'final') == []
     assert ctx.stop_reason is StopReason.COMPLETED
 
 
@@ -521,7 +546,10 @@ async def test_an_agent_without_a_goal_is_left_alone() -> None:
 @pytest.mark.parametrize(
     ('flags', 'anchor'),
     [
-        ({'acceptance_outcome': False, 'long_horizon_progress_every': 2}, 'acceptance_outcome'),
+        (
+            {'long_horizon_progress_every': 5, 'long_horizon_stall_turns': 3},
+            'long_horizon_progress_every',
+        ),
         ({'long_horizon_stall_turns': 3}, 'long_horizon_progress_every'),
     ],
 )
@@ -580,7 +608,13 @@ async def test_long_horizon_events_are_recorded_in_the_trace() -> None:
     finally:
         await runtime.shutdown()
     await recorder.finish()
-    names = {event.name for span in await store.spans(recorder.trace_id) for event in span.events}
+    events = [event for span in await store.spans(recorder.trace_id) for event in span.events]
+    names = {event.name for event in events}
+    [first, *_] = [event for event in events if event.name == 'progress.measured']
+    assert (
+        first.attributes['progress.satisfied'],
+        first.attributes['progress.mandatory'],
+    ) == (1, 2)
     assert {
         'progress.measured',
         'progress.regressed',
@@ -750,3 +784,887 @@ async def test_asking_twice_over_the_same_last_batch_counts_it_once() -> None:
     llm = controller._agent.options.llm
     [task] = llm.drift_tasks
     assert task.count('weather in paris') == 1
+
+
+# ---- 评审处置（阶段二 + 三）----
+
+
+def _passing(n: int) -> dict[str, object]:
+    return _outcomes(R1='satisfied', R2='satisfied')
+
+
+async def test_a_pass_in_a_finished_cycle_offers_no_final_turn_in_the_next() -> None:
+    steps = [_echo(_ON_GOAL, 0), _reply('done'), _echo(_ON_GOAL, 2), _reply('done again')]
+    llm = _Router(lambda n: steps[n], outcomes=_passing)
+    runtime = _runtime({'long_horizon_progress_every': 2})
+    try:
+        agent_id, first = await _run(runtime, llm)
+        assert first.verdict is not None and first.verdict.status.value == 'pass'
+        assert (await runtime.send(agent_id, 'add a chart too')).ok
+        ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    assert _strategy_blocks(ctx, 'final') == []
+    assert _tool_answer_of(ctx, 'e2') == 'wrote 3 rows of revenue'
+
+
+def _tool_answer_of(ctx: Any, call_id: str) -> str:
+    return str(next(b for b in ctx.current_traj if b.tool_call_id == call_id).content)
+
+
+async def test_a_milestone_that_would_eat_the_wrap_up_is_skipped() -> None:
+    llm = _Router(_works(40), outcomes=lambda _: _outcomes(R1='unconfirmed'))
+    llm.outcome_usage = 8500
+    runtime = _runtime(
+        {'long_horizon_progress_every': 3, 'long_horizon_stall_turns': 3},
+        budget=BudgetPolicy(root=Budget(tokens=3000)),
+    )
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    traj = ctx.current_traj
+    [wrap] = [i for i, b in enumerate(traj) if '最后一轮' in str(b.content)]
+    assert ctx.stop_reason is StopReason.BUDGET
+    assert any(b.role == 'assistant' for b in traj[wrap:])
+    assert 'outcome' not in llm.calls
+
+
+async def test_a_semantic_check_that_would_eat_the_wrap_up_is_skipped() -> None:
+    llm = _Router(_works(40, _OFF_GOAL), max_tokens=64)
+    llm.drift_usage = 8500
+    runtime = _runtime(
+        {
+            'acceptance_rubrics': False,
+            'long_horizon_drift_window': 2,
+            'long_horizon_semantic_drift': True,
+        },
+        budget=BudgetPolicy(root=Budget(tokens=1000)),
+    )
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    traj = ctx.current_traj
+    [wrap] = [i for i, b in enumerate(traj) if '最后一轮' in str(b.content)]
+    assert any(b.role == 'assistant' for b in traj[wrap:])
+    assert 'drift' not in llm.calls
+
+
+async def test_a_reused_tool_call_id_does_not_blind_the_drift_window() -> None:
+    steps = [_echo(_ON_GOAL, 0, call_id='call_0')] + [
+        _echo(_OFF_GOAL, n, call_id='call_0') for n in range(1, 6)
+    ]
+    llm = _Router(lambda n: steps[n] if n < len(steps) else _reply('done'))
+    runtime = _runtime({'long_horizon_drift_window': 2})
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert _turns_of(_strategy_blocks(ctx, 'drift')) == [5, 7]
+
+
+async def test_a_strategy_wrap_up_does_not_drop_a_message_that_arrived_meanwhile() -> None:
+    holder: dict[str, Any] = {}
+
+    async def main(n: int) -> ContextBlock:
+        if n == 1:
+            await holder['runtime'].send(holder['agent'], 'one more thing')
+        return _echo(_ON_GOAL, n) if n < 1 else _reply(f'answer {n}')
+
+    class _AsyncRouter(_Router):
+        async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+            system = str(messages[0].content) if messages and messages[0].role == 'system' else ''
+            if system == 'SP':
+                self.calls.append('main')
+                return await main(self.calls.count('main') - 1)
+            return await super().create(messages, **kwargs)
+
+    llm = _AsyncRouter(lambda n: _reply('unused'))
+    runtime = _runtime(
+        {'long_horizon_budget_low_percent': 99},
+        strategy=_WrapsUp(),
+        budget=BudgetPolicy(root=Budget(turns=50)),
+    )
+    holder['runtime'] = runtime
+    try:
+        agent_id = await runtime.spawn(
+            _factory(llm), query='do the report', exit_mode=ExitMode.IDLE
+        )
+        holder['agent'] = agent_id
+        for _ in range(200):
+            agent = runtime._table.get(agent_id)  # pyright: ignore[reportPrivateUsage]
+            if (
+                agent is not None
+                and any('one more thing' in str(b.content) for b in agent.context.current_traj)
+                and llm.calls.count('main') >= 3
+            ):
+                break
+            await asyncio.sleep(0.01)
+        agent = runtime._table.get(agent_id)  # pyright: ignore[reportPrivateUsage]
+        assert agent is not None
+        traj = agent.context.current_traj
+    finally:
+        await runtime.shutdown()
+    assert any('one more thing' in str(b.content) for b in traj)
+    assert llm.calls.count('main') >= 3
+
+
+async def test_a_strategy_wrap_up_requested_before_a_human_grant_is_dropped() -> None:
+    asked: list[str] = []
+
+    async def grant(agent_id: str, view: BudgetView) -> Budget | None:
+        asked.append(agent_id)
+        return Budget(turns=10)
+
+    llm = _Router(_works(4))
+    runtime = _runtime(
+        {'long_horizon_budget_low_percent': 50},
+        strategy=_WrapsUp(),
+        budget=BudgetPolicy(
+            root=Budget(turns=2), on_exhausted=Exhaustion.ASK_HUMAN, ask_human=grant
+        ),
+    )
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert asked
+    assert not any('长程策略判断该收尾了' in str(b.content) for b in ctx.current_traj)
+    assert ctx.stop_reason is StopReason.COMPLETED
+
+
+async def test_a_regression_between_two_sent_back_completions_is_reported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def regressing(n: int) -> dict[str, object]:
+        if n == 0:
+            return _outcomes(R1='satisfied', R2='unconfirmed')
+        return _outcomes(R1='unmet', R2='unconfirmed')
+
+    steps = [_echo(_ON_GOAL, 0), _reply('first try'), _reply('second try'), _reply('third')]
+    llm = _Router(lambda n: steps[n], outcomes=regressing)
+    runtime = _runtime(
+        {'acceptance_outcome_partial_retries': 1, 'acceptance_outcome_block_retries': 1}
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger='syndica.kernel.long_horizon_module'):
+            await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert any(r.args and ['R1'] in cast(tuple[object, ...], r.args) for r in caplog.records)
+
+
+async def test_no_milestone_runs_on_the_first_turn_of_a_new_cycle() -> None:
+    steps = [_echo(_ON_GOAL, 0), _echo(_ON_GOAL, 1), _echo(_ON_GOAL, 2), _reply('done')]
+    steps += [_echo(_ON_GOAL, 4), _reply('done again')]
+    llm = _Router(lambda n: steps[n])
+    runtime = _runtime({'long_horizon_progress_every': 2})
+    try:
+        agent_id, _ = await _run(runtime, llm)
+        before = len(llm.calls)
+        assert (await runtime.send(agent_id, 'more')).ok
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    assert llm.calls[before] == 'main'
+
+
+async def test_every_source_a_strategy_reads_can_make_its_text_untrusted() -> None:
+    from syndica.kernel.acceptance import (
+        Anchor,
+        AnchorSource,
+        Goal,
+        Rubric,
+        RubricKind,
+        derive_verdict,
+    )
+
+    runtime, controller, _ = await _controller_with_goal(TrustLevel.TRUSTED)
+    anchors = (Anchor(AnchorSource.USER_MESSAGE, 'msg:goal', 'quarterly report'),)
+    trusted_goal = Goal(intent=_GOAL)
+    rubric = Rubric(id='R1', statement='s', kind=RubricKind.CHECKABLE, anchors=anchors)
+    try:
+        text_trust = controller._text_trust
+        assert text_trust(trusted_goal, [rubric]) is TrustLevel.TRUSTED
+        assert (
+            text_trust(Goal(intent=_GOAL, trust=TrustLevel.UNTRUSTED), [rubric])
+            is TrustLevel.UNTRUSTED
+        )
+        untrusted_rubric = Rubric(
+            id='R1',
+            statement='s',
+            kind=RubricKind.CHECKABLE,
+            anchors=anchors,
+            trust=TrustLevel.UNTRUSTED,
+        )
+        assert text_trust(trusted_goal, [rubric, untrusted_rubric]) is TrustLevel.UNTRUSTED
+        controller._verdict = derive_verdict([rubric], {}, trust=TrustLevel.UNTRUSTED)
+        assert text_trust(trusted_goal, [rubric]) is TrustLevel.UNTRUSTED
+        controller._verdict = None
+        controller._drift_trust = TrustLevel.UNTRUSTED
+        assert text_trust(trusted_goal, [rubric]) is TrustLevel.UNTRUSTED
+    finally:
+        await runtime.shutdown()
+
+
+class _Says(BaselineStrategy):
+    """每个钩子都交回一段给定的话。"""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    async def on_progress_stall(self, ctx: LongHorizonContext) -> StallAction:
+        return StallAction(StallMove.NUDGE, self.text)
+
+    async def on_budget_low(self, ctx: LongHorizonContext) -> BudgetAction:
+        return BudgetAction(BudgetMove.CONTINUE, self.text)
+
+    async def on_goal_drift(self, ctx: LongHorizonContext) -> Any:
+        from syndica.kernel.long_horizon import DriftAction
+
+        return DriftAction(DriftMove.REMIND, self.text)
+
+    async def should_stop(self, ctx: LongHorizonContext) -> StopDecision:
+        return StopDecision(False, self.text)
+
+
+@pytest.mark.parametrize('trusted', [False, True])
+async def test_an_untrusted_strategys_budget_and_drift_text_is_untrusted(trusted: bool) -> None:
+    llm = _Router(_works(14, _OFF_GOAL))
+    runtime = _runtime(
+        {'long_horizon_budget_low_percent': 50, 'long_horizon_drift_window': 2},
+        strategy=_Says('keep at it'),
+        trusted=trusted,
+        budget=BudgetPolicy(root=Budget(turns=20)),
+    )
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    expected = TrustLevel.TRUSTED if trusted else TrustLevel.UNTRUSTED
+    [budget_block] = _strategy_blocks(ctx, 'budget')
+    drift_blocks = _strategy_blocks(ctx, 'drift')
+    assert budget_block.trust is expected
+    assert drift_blocks and all(b.trust is expected for b in drift_blocks)
+
+
+async def test_a_final_offer_built_on_an_untrusted_milestone_is_untrusted() -> None:
+    from syndica.kernel.acceptance import derive_verdict
+    from syndica.kernel.context import Context
+    from syndica.kernel.long_horizon_module import _Milestone  # pyright: ignore[reportPrivateUsage]
+
+    runtime, controller, agent_id = await _controller_with_goal(TrustLevel.TRUSTED)
+    try:
+        from syndica.kernel.acceptance import Anchor, AnchorSource, OutcomeKind, RubricOutcome
+
+        rubrics = await controller._module.acceptance.store.rubrics(agent_id)
+        evidence = (Anchor(AnchorSource.USER_MESSAGE, 'reply', 'done'),)
+        verdict = derive_verdict(
+            rubrics,
+            {'R1': RubricOutcome('R1', OutcomeKind.SATISFIED, evidence)},
+            trust=TrustLevel.UNTRUSTED,
+        )
+        controller._verdict = verdict
+        controller._ledger.latest = __import__(
+            'syndica.kernel.long_horizon', fromlist=['ProgressSnapshot']
+        ).ProgressSnapshot(satisfied=('R1',), mandatory=('R1',), measured_turn=1)
+        controller._milestone = _Milestone(controller._cycle, ('R1',), verdict)
+        controller._module.strategy = _AlwaysStop()
+        ctx = Context()
+        ctx.append(ContextBlock(role='user', content='go'))
+        blocks: list[Any] = []
+        goal = await controller._module.acceptance.store.get_goal(agent_id)
+        await controller._stop_check(ctx, 2, goal, rubrics, blocks)
+    finally:
+        await runtime.shutdown()
+    [final] = blocks
+    assert final.trust is TrustLevel.UNTRUSTED
+
+
+@pytest.mark.parametrize('hook', ['budget', 'drift', 'continue'])
+async def test_every_strategy_text_is_clipped_before_it_enters_history(hook: str) -> None:
+    from syndica.kernel.long_horizon import MESSAGE_LIMIT
+
+    flags: dict[str, Any] = {
+        'budget': {'long_horizon_budget_low_percent': 50},
+        'drift': {'long_horizon_drift_window': 2},
+        'continue': {'long_horizon_max_continuations': 1},
+    }[hook]
+    main = _works(14, _OFF_GOAL) if hook != 'continue' else (lambda n: _reply(f'attempt {n}'))
+    llm = _Router(main)
+    runtime = _runtime(
+        flags,
+        strategy=_Says('x' * (MESSAGE_LIMIT + 500)),
+        trusted=True,
+        budget=BudgetPolicy(root=Budget(turns=20)),
+    )
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    [first, *_] = _strategy_blocks(ctx, hook)
+    assert str(first.content).startswith('x' * MESSAGE_LIMIT + '…')
+
+
+async def test_a_restated_goal_is_clipped_and_the_judge_never_sees_written_content() -> None:
+    from syndica.kernel.long_horizon import MESSAGE_LIMIT
+
+    long_goal = 'write the quarterly report ' + 'with every detail ' * 400
+    acceptance = AcceptanceModule(goal=long_goal)
+    module = LongHorizonModule(acceptance)
+    runtime = Runtime(
+        modules=[acceptance, module],
+        flags={**_QUIET, 'long_horizon_drift_window': 2, 'long_horizon_semantic_drift': True},
+    )
+    secret_body = 'BODY' * 3000
+    llm = _Router(
+        lambda n: _echo({'query': 'weather', 'content': secret_body}, n) if n < 3 else _reply('d'),
+        drift=lambda _: {'on_track': False, 'reason': 'r'},
+    )
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    [reminder, *_] = _strategy_blocks(ctx, 'drift')
+    assert len(str(reminder.content)) <= 2 * (MESSAGE_LIMIT + 1)
+    assert llm.drift_tasks and all('BODY' not in task for task in llm.drift_tasks)
+    assert all(len(task) < 2 * MESSAGE_LIMIT + 5000 for task in llm.drift_tasks)
+
+
+class _BadText(BaselineStrategy):
+    async def on_progress_stall(self, ctx: LongHorizonContext) -> StallAction:
+        return StallAction(StallMove.NUDGE, 42)  # type: ignore[arg-type]
+
+
+class _BadStop(BaselineStrategy):
+    async def should_stop(self, ctx: LongHorizonContext) -> StopDecision:
+        return StopDecision(1, 'go on')  # type: ignore[arg-type]
+
+
+async def test_a_strategy_text_that_is_not_a_string_is_refused(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    llm = _Router(_works(6))
+    runtime = _runtime(
+        {'long_horizon_progress_every': 2, 'long_horizon_stall_turns': 2}, strategy=_BadText()
+    )
+    try:
+        with caplog.at_level(logging.ERROR, logger='syndica.kernel.long_horizon_module'):
+            _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert ctx.stop_reason is StopReason.COMPLETED
+    assert _strategy_blocks(ctx, 'stall') == []
+    assert any('不是 str' in r.getMessage() for r in caplog.records)
+
+
+async def test_a_stop_decision_that_is_not_a_bool_is_refused(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    llm = _Router(lambda n: _reply(f'attempt {n}'))
+    runtime = _runtime({'long_horizon_max_continuations': 2}, strategy=_BadStop())
+    try:
+        with caplog.at_level(logging.ERROR, logger='syndica.kernel.long_horizon_module'):
+            _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert _strategy_blocks(ctx, 'continue') == []
+    assert any('不是 bool' in r.getMessage() for r in caplog.records)
+
+
+class _Declines(BaselineStrategy):
+    async def should_stop(self, ctx: LongHorizonContext) -> StopDecision:
+        return StopDecision(False)
+
+
+async def test_no_final_turn_when_the_strategy_declines_and_no_continuation_without_a_reason() -> (
+    None
+):
+    llm = _Router(_works(5), outcomes=_passing)
+    runtime = _runtime(
+        {'long_horizon_progress_every': 2, 'long_horizon_max_continuations': 2},
+        strategy=_Declines(),
+        trusted=True,
+    )
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert _strategy_blocks(ctx, 'final') == []
+    assert _strategy_blocks(ctx, 'continue') == []
+
+
+async def test_after_a_final_turn_later_tool_calls_run_again() -> None:
+    steps = [_echo(_ON_GOAL, 0), _echo(_ON_GOAL, 1), _echo(_ON_GOAL, 2), _echo(_ON_GOAL, 3)]
+    steps += [_reply('done')]
+    llm = _Router(lambda n: steps[n], outcomes=_passing)
+    runtime = _runtime({'long_horizon_progress_every': 2})
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert _turns_of(_strategy_blocks(ctx, 'final')) == [3]
+    assert '强制验收条都已满足' in _tool_answer_of(ctx, 'e2')
+    assert _tool_answer_of(ctx, 'e3') == 'wrote 3 rows of revenue'
+
+
+async def test_a_milestone_pass_in_each_cycle_offers_a_final_turn_in_each() -> None:
+    steps = [_echo(_ON_GOAL, 0), _echo(_ON_GOAL, 1), _reply('done')]
+    steps += [_echo(_ON_GOAL, 3), _echo(_ON_GOAL, 4), _reply('done again')]
+    llm = _Router(lambda n: steps[n], outcomes=_passing)
+    runtime = _runtime({'long_horizon_progress_every': 2})
+    try:
+        agent_id, _ = await _run(runtime, llm)
+        assert (await runtime.send(agent_id, 'and the appendix')).ok
+        ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    assert len(_strategy_blocks(ctx, 'final')) == 2
+
+
+async def test_regression_stall_and_drift_are_published_on_the_event_bus() -> None:
+    def regressing(n: int) -> dict[str, object]:
+        return _outcomes(R1='satisfied') if n == 0 else _outcomes(R1='unmet')
+
+    llm = _Router(_works(8, _OFF_GOAL), outcomes=regressing)
+    runtime = _runtime(
+        {
+            'long_horizon_progress_every': 2,
+            'long_horizon_stall_turns': 2,
+            'long_horizon_drift_window': 2,
+        }
+    )
+    events = runtime.events.subscribe()
+    kinds: list[str] = []
+    try:
+        await _run(runtime, llm)
+        while True:
+            try:
+                event = await asyncio.wait_for(events.__anext__(), 0.05)
+            except (TimeoutError, StopAsyncIteration):
+                break
+            kinds.append(event.kind)
+    finally:
+        events.close()
+        await runtime.shutdown()
+    assert {'progress_regressed', 'progress_stalled', 'goal_drift'} <= set(kinds)
+
+
+async def test_falling_back_to_every_checkable_rubric_is_warned_about_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    projection = json.loads(json.dumps(_PROJECTION))
+    for rubric in projection['rubrics']:
+        rubric['mandatory'] = False
+    llm = _Router(_works(6), projection=projection)
+    runtime = _runtime({'long_horizon_progress_every': 2})
+    try:
+        with caplog.at_level(logging.WARNING, logger='syndica.kernel.long_horizon_module'):
+            await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    warnings = [r for r in caplog.records if 'mandatory' in r.getMessage()]
+    assert len(warnings) == 1
+
+
+async def test_the_drift_window_forgets_turns_older_than_the_window() -> None:
+    steps = [_echo(_ON_GOAL, 0)] + [_echo(_OFF_GOAL, n) for n in range(1, 9)]
+    llm = _Router(lambda n: steps[n] if n < len(steps) else _reply('done'))
+    runtime = _runtime({'long_horizon_drift_window': 3})
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert _strategy_blocks(ctx, 'drift')
+
+
+async def test_two_goal_agents_keep_separate_ledgers_and_drift_windows() -> None:
+    stuck = _Router(_works(8, _OFF_GOAL))
+    fine = _Router(_works(8, _ON_GOAL), outcomes=_passing)
+    runtime = _runtime(
+        {
+            'long_horizon_progress_every': 2,
+            'long_horizon_stall_turns': 2,
+            'long_horizon_drift_window': 2,
+        }
+    )
+    try:
+        first = await runtime.spawn(
+            _factory(stuck), query='do the report', exit_mode=ExitMode.ZOMBIE
+        )
+        second = await runtime.spawn(
+            _factory(fine), query='do the report', exit_mode=ExitMode.ZOMBIE
+        )
+        stuck_ctx = await asyncio.wait_for(runtime.wait(first), _TIMEOUT)
+        fine_ctx = await asyncio.wait_for(runtime.wait(second), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    assert _strategy_blocks(stuck_ctx, 'stall') and _strategy_blocks(stuck_ctx, 'drift')
+    assert not _strategy_blocks(fine_ctx, 'drift')
+    assert not _strategy_blocks(fine_ctx, 'stall')
+
+
+async def test_a_milestone_on_an_untrusted_trajectory_gives_an_untrusted_verdict() -> None:
+    llm = _Router(_works(4), outcomes=_passing)
+    runtime = _runtime({'long_horizon_progress_every': 2})
+    try:
+        agent_id = await runtime.spawn(
+            _factory(llm), query='do the report', query_trust=TrustLevel.UNTRUSTED
+        )
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        agent = runtime._table.get(agent_id)  # pyright: ignore[reportPrivateUsage]
+        assert agent is not None
+        milestone = agent._long_horizon._milestone  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runtime.shutdown()
+    assert milestone is not None and milestone.verdict.trust is TrustLevel.UNTRUSTED
+
+
+def _hangs_forever(event: asyncio.Event) -> Any:
+    class _Hanging(BaselineStrategy):
+        async def on_progress_stall(self, ctx: LongHorizonContext) -> StallAction:
+            event.set()
+            await asyncio.Event().wait()
+            raise AssertionError('unreachable')
+
+    return _Hanging()
+
+
+async def _kill_when(runtime: Runtime, agent_id: str, event: asyncio.Event, llm: _Router) -> int:
+    await asyncio.wait_for(event.wait(), _TIMEOUT)
+    calls = llm.calls.count('main')
+    await runtime.kill(agent_id)
+    await asyncio.sleep(0.05)
+    return calls
+
+
+@pytest.mark.parametrize('where', ['strategy', 'milestone', 'judge', 'store'])
+async def test_a_kill_during_controller_work_stops_the_agent_there(where: str) -> None:
+    reached = asyncio.Event()
+    llm = _Router(_works(20, _OFF_GOAL))
+    flags: dict[str, Any] = {}
+    strategy = None
+    acceptance_store = None
+    if where == 'strategy':
+        strategy = _hangs_forever(reached)
+        flags = {'long_horizon_progress_every': 2, 'long_horizon_stall_turns': 2}
+    elif where == 'milestone':
+        llm.outcome_gate = asyncio.Event()
+        flags = {'long_horizon_progress_every': 2}
+    elif where == 'judge':
+        llm.drift_gate = asyncio.Event()
+        flags = {'long_horizon_drift_window': 2, 'long_horizon_semantic_drift': True}
+    else:
+        from syndica.kernel.stores.memory_rubric import InMemoryRubricStore
+
+        class _HangingStore(InMemoryRubricStore):
+            reads = 0
+
+            async def rubrics(self, scope: str, *, include_proposed: bool = False) -> Any:
+                type(self).reads += 1
+                if type(self).reads > 3:
+                    reached.set()
+                    await asyncio.Event().wait()
+                return await super().rubrics(scope, include_proposed=include_proposed)
+
+        acceptance_store = _HangingStore()
+        flags = {'long_horizon_drift_window': 2}
+    acceptance = AcceptanceModule(goal=_GOAL, store=acceptance_store)
+    module = LongHorizonModule(acceptance, strategy=strategy, trusted_strategy=True)
+    runtime = Runtime(modules=[acceptance, module], flags={**_QUIET, **flags})
+    try:
+        agent_id = await runtime.spawn(_factory(llm), query='do the report')
+        if where in ('milestone', 'judge'):
+            for _ in range(200):
+                if ('outcome' if where == 'milestone' else 'drift') in llm.calls:
+                    reached.set()
+                    break
+                await asyncio.sleep(0.01)
+        before = await _kill_when(runtime, agent_id, reached, llm)
+        after = llm.calls.count('main')
+    finally:
+        await runtime.shutdown()
+    assert after == before
+
+
+async def test_a_judge_that_hangs_is_cut_off_and_the_window_still_goes_to_the_strategy() -> None:
+    llm = _Router(_works(4, _OFF_GOAL))
+    llm.drift_gate = asyncio.Event()
+    runtime = _runtime(
+        {
+            'long_horizon_drift_window': 2,
+            'long_horizon_semantic_drift': True,
+            'acceptance_verifier_timeout': 1,
+        }
+    )
+    try:
+        _, ctx = await asyncio.wait_for(_run(runtime, llm), 10)
+    finally:
+        await runtime.shutdown()
+    assert _strategy_blocks(ctx, 'drift')
+
+
+async def test_an_abort_during_controller_work_lands_before_the_next_model_call() -> None:
+    holder: dict[str, Any] = {}
+
+    class _AbortsMeanwhile(BaselineStrategy):
+        async def on_progress_stall(self, ctx: LongHorizonContext) -> StallAction:
+            holder['calls'] = holder['llm'].calls.count('main')
+            await holder['runtime'].abort(holder['agent'])
+            return StallAction(StallMove.NUDGE, 'try again')
+
+    llm = _Router(_works(20))
+    runtime = _runtime(
+        {'long_horizon_progress_every': 2, 'long_horizon_stall_turns': 2},
+        strategy=_AbortsMeanwhile(),
+        trusted=True,
+    )
+    holder.update(runtime=runtime, llm=llm)
+    try:
+        agent_id = await runtime.spawn(_factory(llm), query='do the report')
+        holder['agent'] = agent_id
+        ctx = await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    assert ctx.stop_reason is StopReason.ABORTED
+    assert llm.calls.count('main') == holder['calls']
+
+
+class _TimesOutInside(BaselineStrategy):
+    async def on_progress_stall(self, ctx: LongHorizonContext) -> StallAction:
+        raise TimeoutError('upstream http timeout')
+
+
+async def test_a_strategys_own_timeout_is_not_reported_as_hanging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    llm = _Router(_works(6))
+    runtime = _runtime(
+        {'long_horizon_progress_every': 2, 'long_horizon_stall_turns': 2},
+        strategy=_TimesOutInside(),
+    )
+    try:
+        with caplog.at_level(logging.ERROR, logger='syndica.kernel.long_horizon_module'):
+            await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    [first, *_] = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert 'upstream http timeout' in first and '秒内没有交回' not in first
+    assert 'BaselineStrategy' in first
+
+
+async def test_without_outcome_checks_progress_is_off_with_one_warning_and_drift_still_runs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    llm = _Router(_works(6, _OFF_GOAL))
+    runtime = _runtime(
+        {
+            'acceptance_outcome': False,
+            'long_horizon_progress_every': 2,
+            'long_horizon_stall_turns': 2,
+            'long_horizon_drift_window': 2,
+        }
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger='syndica.kernel.long_horizon_module'):
+            _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert 'outcome' not in llm.calls
+    assert _strategy_blocks(ctx, 'drift') and not _strategy_blocks(ctx, 'stall')
+    assert len([r for r in caplog.records if 'acceptance_outcome' in r.getMessage()]) == 1
+
+
+async def test_an_explicit_baseline_strategy_is_as_trusted_as_the_default() -> None:
+    llm = _Router(_works(6))
+    runtime = _runtime(
+        {'long_horizon_progress_every': 2, 'long_horizon_stall_turns': 2},
+        strategy=BaselineStrategy(),
+    )
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    [first, *_] = _strategy_blocks(ctx, 'stall')
+    assert first.trust is TrustLevel.TRUSTED
+
+
+def test_the_regression_warning_and_a_sync_strategy_say_what_to_do() -> None:
+    import inspect as _inspect
+
+    import syndica.kernel.long_horizon_module as source
+
+    text = _inspect.getsource(source)
+    assert '看 trace 里这一轮前后的改动' in text
+    with pytest.raises(ConfigError) as caught:
+
+        class _Sync(BaselineStrategy):
+            def on_budget_low(self, ctx: LongHorizonContext) -> BudgetAction:  # type: ignore[override]
+                return BudgetAction(BudgetMove.CONTINUE)
+
+        LongHorizonModule(AcceptanceModule(), strategy=cast(Any, _Sync()))
+    assert 'BaselineStrategy' in caught.value.next_action
+
+
+def test_the_contract_and_the_module_share_one_length_limit() -> None:
+    import syndica.kernel.contracts.long_horizon as contract
+    import syndica.kernel.long_horizon as protocol
+
+    assert contract.MESSAGE_LIMIT is protocol.MESSAGE_LIMIT
+
+
+async def test_a_milestone_checks_file_evidence_through_the_workspace(tmp_path: Any) -> None:
+    from syndica.kernel.local_workspace import LocalWorkspace
+    from syndica.kernel.workspace_router import WorkspaceRouter
+
+    root = tmp_path / 'ws'
+    (root / 'reports').mkdir(parents=True)
+    (root / 'reports' / 'quarterly.md').write_text('# Q3\nquarterly totals: 42\n', encoding='utf-8')
+    router = WorkspaceRouter(LocalWorkspace(str(root), shell='/bin/sh', env={}))
+
+    def from_file(n: int) -> dict[str, object]:
+        evidence = [
+            {'source': 'file', 'locator': 'reports/quarterly.md', 'quote': 'quarterly totals'}
+        ]
+        return {
+            'outcomes': [
+                {'rubric_id': rid, 'result': 'satisfied', 'evidence': evidence}
+                for rid in ('R1', 'R2')
+            ],
+            'reason': 'checked',
+        }
+
+    llm = _Router(_works(5), outcomes=from_file)
+    acceptance = AcceptanceModule(goal=_GOAL)
+    module = LongHorizonModule(acceptance)
+    runtime = Runtime(
+        modules=[acceptance, module],
+        flags={**_QUIET, 'long_horizon_progress_every': 2},
+        workspace=router,
+    )
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert _turns_of(_strategy_blocks(ctx, 'final')) == [3]
+
+
+async def _stop_check_blocks(milestone_cycle: int, denominator: tuple[str, ...]) -> list[Any]:
+    from syndica.kernel.acceptance import (
+        Anchor,
+        AnchorSource,
+        OutcomeKind,
+        RubricOutcome,
+        derive_verdict,
+    )
+    from syndica.kernel.context import Context
+    from syndica.kernel.long_horizon import ProgressSnapshot
+    from syndica.kernel.long_horizon_module import _Milestone  # pyright: ignore[reportPrivateUsage]
+
+    runtime, controller, agent_id = await _controller_with_goal(TrustLevel.TRUSTED)
+    try:
+        rubrics = await controller._module.acceptance.store.rubrics(agent_id)
+        evidence = (Anchor(AnchorSource.USER_MESSAGE, 'reply', 'done'),)
+        verdict = derive_verdict(
+            rubrics, {'R1': RubricOutcome('R1', OutcomeKind.SATISFIED, evidence)}
+        )
+        controller._ledger.latest = ProgressSnapshot(
+            satisfied=('R1',), mandatory=('R1',), measured_turn=1
+        )
+        controller._milestone = _Milestone(milestone_cycle, denominator, verdict)
+        controller._module.strategy = _AlwaysStop()
+        ctx = Context()
+        ctx.append(ContextBlock(role='user', content='go'))
+        blocks: list[Any] = []
+        goal = await controller._module.acceptance.store.get_goal(agent_id)
+        await controller._stop_check(ctx, 2, goal, rubrics, blocks)
+    finally:
+        await runtime.shutdown()
+    return blocks
+
+
+async def test_a_milestone_counts_for_the_final_offer_only_in_its_own_cycle_and_rubric_set() -> (
+    None
+):
+    assert len(await _stop_check_blocks(0, ('R1',))) == 1
+    assert await _stop_check_blocks(-1, ('R1',)) == []
+    assert await _stop_check_blocks(0, ('R1', 'R9')) == []
+
+
+@pytest.mark.parametrize('check', ['stall', 'budget'])
+async def test_stall_and_budget_text_built_on_an_untrusted_verdict_is_untrusted(check: str) -> None:
+    from syndica.kernel.acceptance import derive_verdict
+    from syndica.kernel.context import Context
+
+    runtime, controller, agent_id = await _controller_with_goal(TrustLevel.TRUSTED)
+    try:
+        rubrics = await controller._module.acceptance.store.rubrics(agent_id)
+        goal = await controller._module.acceptance.store.get_goal(agent_id)
+        controller._verdict = derive_verdict(rubrics, {}, trust=TrustLevel.UNTRUSTED)
+        controller._module.strategy = _Says('keep going')
+        ctx = Context()
+        ctx.append(ContextBlock(role='user', content='go'))
+        blocks: list[Any] = []
+        if check == 'stall':
+            controller._stall = 1
+            controller._ledger._measured_since = True  # pyright: ignore[reportPrivateUsage]
+            controller._ledger.latest = __import__(
+                'syndica.kernel.long_horizon', fromlist=['ProgressSnapshot']
+            ).ProgressSnapshot(mandatory=('R1',), measured_turn=1)
+            await controller._stall_check(ctx, 5, goal, rubrics, blocks)
+        else:
+
+            class _LowBudget:
+                companion = False
+                limited = True
+                generation = 0
+
+                def fraction_left(self) -> float:
+                    return 0.1
+
+                def view(self) -> None:
+                    return None
+
+            controller._low = 50
+            controller._agent._budget = _LowBudget()  # pyright: ignore[reportPrivateUsage]
+            await controller._budget_check(ctx, 5, goal, rubrics, blocks)
+            controller._agent._budget = None  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runtime.shutdown()
+    [block] = blocks
+    assert block.trust is TrustLevel.UNTRUSTED
+
+
+async def test_a_judge_prompt_stays_bounded_however_many_calls_the_window_holds() -> None:
+    def batch(n: int) -> ContextBlock:
+        if n >= 3:
+            return _reply('done')
+        calls = [
+            ToolCall(id=f'b{n}-{i}', name='Echo', arguments=json.dumps({'query': 'weather ' * 80}))
+            for i in range(30)
+        ]
+        return ContextBlock(
+            role='assistant',
+            tool_calls=calls,
+            extra={'usage': {'input_tokens': 50, 'output_tokens': 10}},
+        )
+
+    llm = _Router(batch)
+    runtime = _runtime({'long_horizon_drift_window': 2, 'long_horizon_semantic_drift': True})
+    try:
+        await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert llm.drift_tasks and all(len(task) < 4000 + 3000 for task in llm.drift_tasks)
+
+
+async def test_a_partial_verdict_with_an_empty_reason_buys_no_continuation() -> None:
+    llm = _Router(lambda n: _reply(f'attempt {n}'))
+    runtime = _runtime({'long_horizon_max_continuations': 2}, strategy=_Says(''), trusted=True)
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert _strategy_blocks(ctx, 'continue') == []
+    assert llm.calls.count('main') == 1

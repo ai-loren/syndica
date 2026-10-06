@@ -454,6 +454,8 @@ _WITHHELD: tuple[str, ...] = (
     'action_terms',
     'anchor_terms',
     'anchored',
+    'call_lines',
+    'denominator_ids',
     'LongHorizonStrategy',
     'ProgressSnapshot',
     'StallAction',

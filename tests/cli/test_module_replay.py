@@ -615,3 +615,14 @@ def test_an_untrusted_config_named_inside_the_workspace_is_named_in_the_refusal(
 
     assert isinstance(outcome, str) and 'team.yaml' in outcome and '还没被信任' in outcome
     assert point.loads == 0
+
+
+@pytest.mark.parametrize('name', ['long-horizon', 'background'])
+def test_replay_refuses_to_rebuild_a_module_whose_runs_write_no_replay_document(name: str):
+    from syndica.runner import replay as replay_module
+
+    builder = replay_module._builtin_modules(cast(Any, None), '')[name]  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(replay_module.ModulesNotRebuilt) as caught:
+        builder()
+    assert name in caught.value.expected
+    assert '原始 run 的 trace' in caught.value.next_action

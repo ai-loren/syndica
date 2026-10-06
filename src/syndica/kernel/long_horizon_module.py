@@ -1,13 +1,16 @@
 """长程 Module（spec §8.2–§8.7）：进度账本、停滞、漂移、预算低，交给可插拔的策略决定怎么纠偏。
 
-只作用于有 Goal 的 Agent（验收 Module 只给根协调者定 Goal）；进度只来自验收裁决（完成时的 L3，加上每
-`long_horizon_progress_every` 轮一次的里程碑 L3），所以依赖验收 Module 并要求 `acceptance_outcome`
-开着。
+只作用于有 Goal 的 Agent（验收 Module 只给根协调者定 Goal）；进度只来自验收裁决（每次完成提议的裁
+决，加上每 `long_horizon_progress_every` 轮一次的里程碑 L3），所以依赖验收 Module；
+`acceptance_outcome` 关着时不量进度（里程碑与停滞关掉，记一次 WARNING），只剩漂移与预算低的纠偏。
 
-策略交回的文字由内核署名追加，信任取下限与主轨迹溯源里最严的：下限只对内核的 `BaselineStrategy` 是可
-信，别的策略缺省不可信（第三方策略与第三方 Skill 一样，「宿主装了」不等于「宿主读过每一行」），宿主
-用 `trusted_strategy=True` 声明可信。策略抛出、挂住或交回不认识的东西都失败开放（这一处不纠偏）并记
-ERROR；取消照常上抛。
+策略写下的文字由内核署名追加，信任取下限、Goal、每条 Rubric、最近的裁决、漂移比对的结论里最严的（内
+核再与主轨迹溯源取最严）：策略读的是它们，转述出来的不能比它们可信。下限只对内核的
+`BaselineStrategy` 是可信，别的策略缺省不可信（第三方策略与第三方 Skill 一样，「宿主装了」不等于「宿
+主读过每一行」），宿主用 `trusted_strategy=True` 声明可信——声明的是代码，不是它读到的数据。
+
+里程碑与语义比对是伴生调用：只在预算还放得下它们、外加这一次与下一次主调用时才跑，花不掉留给收尾那次
+调用的预算。策略抛出、挂住或交回不认识的东西都失败开放（这一处不纠偏）并记 ERROR；取消照常上抛。
 """
 
 from __future__ import annotations
@@ -27,15 +30,17 @@ from syndica.kernel.companion import run_companion
 from syndica.kernel.context import (
     Context,
     ContextBlock,
+    StopReason,
     TrustLevel,
     provenance_of,
     strictest_trust,
 )
-from syndica.kernel.drift import action_terms, anchor_terms, anchored
+from syndica.kernel.drift import action_terms, anchor_terms, anchored, call_lines
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.history_blocks import HistoryKind
 from syndica.kernel.hooks import HooksCenter
 from syndica.kernel.long_horizon import (
+    MESSAGE_LIMIT,
     BaselineStrategy,
     BudgetAction,
     BudgetMove,
@@ -51,7 +56,7 @@ from syndica.kernel.long_horizon import (
 )
 from syndica.kernel.long_horizon_seam import LongHorizonBlock
 from syndica.kernel.modules import FlagDeclaration, FlagValue, RuntimeModule
-from syndica.kernel.progress import ProgressLedger, ProgressRecord
+from syndica.kernel.progress import ProgressLedger, denominator_ids
 from syndica.kernel.verifiers import (
     _evidence_corpus,  # pyright: ignore[reportPrivateUsage]
     render_transcript,
@@ -69,8 +74,11 @@ logger = logging.getLogger(__name__)
 
 # 一次策略调用的上限：策略在每轮模型调用之前被问，挂住就挂住这一轮。
 _STRATEGY_TIMEOUT = 30.0
-# 策略交回的一段话进历史的上限：它每次都进前缀，一段失控的长文本每轮都要付钱。
-_MESSAGE_CHARS = 2000
+# 交给语义比对的动作：每行与合计的上限（正文早已滤掉，剩下的仍可能是很长的参数）。
+_JUDGE_LINE_CHARS = 300
+_JUDGE_TOTAL_CHARS = 4000
+# 语义比对至多两轮：判一次，必要时再答一次。
+_JUDGE_TURNS = 2
 _ACTIONS: Mapping[str, type] = {
     'on_progress_stall': StallAction,
     'on_budget_low': BudgetAction,
@@ -96,6 +104,15 @@ class _TurnActions:
     terms: frozenset[str] = frozenset()
     lines: tuple[str, ...] = ()
     trust: TrustLevel = TrustLevel.TRUSTED
+
+
+@dataclass(frozen=True)
+class _Milestone:
+    """这个周期里最近一次里程碑：在哪个周期、按哪组分母量的、裁决是什么。"""
+
+    cycle: int
+    denominator: tuple[str, ...]
+    verdict: Verdict
 
 
 def _last_batch(blocks: Sequence[ContextBlock]) -> tuple[ContextBlock, ...]:
@@ -134,8 +151,9 @@ class _Controller:
         self._scope = agent.agent_id
         router = runtime.workspace
         self._portal = None if router is None else router.reader_for(agent.agent_id)
-        self._every = cast(int, flags['long_horizon_progress_every'])
-        self._stall = cast(int, flags['long_horizon_stall_turns'])
+        measuring = bool(flags['acceptance_outcome'])
+        self._every = cast(int, flags['long_horizon_progress_every']) if measuring else 0
+        self._stall = cast(int, flags['long_horizon_stall_turns']) if measuring else 0
         self._low = cast(int, flags['long_horizon_budget_low_percent'])
         self._window = cast(int, flags['long_horizon_drift_window'])
         self._semantic = bool(flags['long_horizon_semantic_drift'])
@@ -144,14 +162,17 @@ class _Controller:
         self._verifier_timeout = float(cast(int, flags['acceptance_verifier_timeout']))
         self._ledger = ProgressLedger()
         self._verdict: Verdict | None = None
+        self._milestone: _Milestone | None = None
+        self._unmeasured = 0
         self._recent: deque[_TurnActions] = deque(maxlen=max(self._window, 1))
-        self._counted: tuple[str, ...] = ()
+        self._counted: ContextBlock | None = None
         self._asked_before = False
         self._last_stall: int | None = None
         self._last_drift = 0
         self._drift: DriftReport | None = None
+        self._drift_trust = TrustLevel.TRUSTED
         self._low_generation: int | None = None
-        self._wrap_cycle: int | None = None
+        self._wrap: tuple[int, int | None] | None = None
         self._final = False
         self._final_offered = False
         self._cycle = 0
@@ -161,10 +182,13 @@ class _Controller:
     # ---- 内核问的几处 ----
 
     def wrap_up_requested(self) -> bool:
-        """策略要的收尾只对提出它的那个周期有效：那个周期没再开下一轮就结束了，被叫醒的下一个周期
-        不能一上来就收尾。"""
-        wrap_cycle, self._wrap_cycle = self._wrap_cycle, None
-        return wrap_cycle is not None and wrap_cycle == self._agent._cycle  # pyright: ignore[reportPrivateUsage]
+        """策略要的收尾只对提出它的那个周期、那一代预算有效：那个周期没再开下一轮就结束了，被叫醒的
+        下一个周期不能一上来就收尾；人追加了预算（代数变了），也不能拿追加之前的判断收尾。"""
+        wrap, self._wrap = self._wrap, None
+        if wrap is None:
+            return False
+        cycle, generation = wrap
+        return cycle == self._agent._cycle and generation == self._generation()  # pyright: ignore[reportPrivateUsage]
 
     def final_requested(self) -> bool:
         final, self._final = self._final, False
@@ -176,16 +200,25 @@ class _Controller:
             self._cycle = cycle
             self._continuations = 0
             self._final_offered = False
+            self._unmeasured = 0
         actions = self._actions_since_last_turn(ctx)
         loaded = await self._load()
         if loaded is None:
             return ()
         goal, rubrics = loaded
         blocks: list[LongHorizonBlock] = []
-        if self._every and turn > 1 and (turn - 1) % self._every == 0:
-            verdict = await self._milestone(ctx, rubrics)
-            if verdict is not None:
-                await self._record(verdict, rubrics, turn)
+        if self._every and self._unmeasured >= self._every:
+            # 按这个周期里离上一次量度过了几轮排，不按绝对轮号：轮号跨周期接着数，按轮号排的里程碑
+            # 会落在新周期的第一轮——模型还没读新消息，量的正是上一次完成刚量过的东西。
+            self._unmeasured = 0
+            if self._agent._companion_headroom(ctx, self._verifier_turns):  # pyright: ignore[reportPrivateUsage]
+                verdict = await self._milestone_check(ctx, rubrics)
+                if verdict is not None:
+                    await self._record(verdict, rubrics, turn, milestone=True)
+                    self._milestone = _Milestone(self._cycle, denominator_ids(rubrics), verdict)
+            else:
+                self._event('progress.skipped', {})
+        self._unmeasured += 1
         await self._stall_check(ctx, turn, goal, rubrics, blocks)
         await self._budget_check(ctx, turn, goal, rubrics, blocks)
         await self._drift_check(ctx, turn, goal, rubrics, actions, blocks)
@@ -193,30 +226,47 @@ class _Controller:
         return blocks
 
     def _actions_since_last_turn(self, ctx: Context) -> _TurnActions:
-        """上一轮做了什么。同一批调用只算一次：上一轮的模型调用没交回东西时，末尾那批还是更早那一轮的。"""
+        """上一轮做了什么。同一批调用只算一次：上一轮的模型调用没交回东西时，末尾那批还是更早那一轮
+        的。按块对象认，不按调用 id，也不按内容相等：有的 provider 每次回复都从同一个 id 编起，
+        模型再发一次同样的调用就是两个相等的块。压缩换过的块会被多算一次，只多不漏。"""
         batch = _last_batch(ctx.current_traj)
-        ids = tuple(call.id for call in batch[0].tool_calls) if batch else ()
-        if not ids or ids == self._counted:
+        if not batch:
             return _TurnActions()
-        self._counted = ids
-        lines = tuple(f'- {call.name} {call.arguments}' for call in batch[0].tool_calls)
-        return _TurnActions(action_terms(batch), lines, _strictest(block.trust for block in batch))
+        head = batch[0]
+        if head is self._counted:
+            return _TurnActions()
+        self._counted = head
+        return _TurnActions(
+            action_terms(batch),
+            call_lines(batch, line_chars=_JUDGE_LINE_CHARS),
+            _strictest(block.trust for block in batch),
+        )
+
+    async def record_verdict(self, ctx: Context, turn: int) -> None:
+        """每次完成提议的裁决都进账本，打回的也进：打回的那几次正是最该看出回退的时候。"""
+        verdict = ctx.verdict
+        if verdict is None:
+            return
+        loaded = await self._load()
+        if loaded is None:
+            return
+        _, rubrics = loaded
+        await self._record(verdict, rubrics, turn, milestone=False)
 
     async def after_completion(self, ctx: Context, turn: int) -> LongHorizonBlock | None:
         verdict = ctx.verdict
         if verdict is None:
             return None
-        loaded = await self._load()
-        if loaded is None:
-            return None
-        goal, rubrics = loaded
-        await self._record(verdict, rubrics, turn)
         # 「接着干」只在验收打回用完之后（走到这里说明没被打回）、只对 partial / block：unverified
         # 是验收器没能判，接着干只是在一个坏掉的验收器上烧预算。
         if verdict.status not in (VerdictStatus.PARTIAL, VerdictStatus.BLOCK):
             return None
         if self._continuations >= self._max_continuations:
             return None
+        loaded = await self._load()
+        if loaded is None:
+            return None
+        goal, rubrics = loaded
         decision = await self._ask('should_stop', self._context(ctx, turn, goal, rubrics))
         if not isinstance(decision, StopDecision) or decision.stop or not decision.reason.strip():
             return None
@@ -225,10 +275,14 @@ class _Controller:
             HistoryKind.STRATEGY,
             _clipped(decision.reason),
             key=f'strategy:{self._scope}:continue:{self._cycle}:{turn}',
-            trust=strictest_trust(self._module.floor, verdict.trust),
+            trust=strictest_trust(self._text_trust(goal, rubrics), verdict.trust),
         )
 
     # ---- 判据 ----
+
+    def _generation(self) -> int | None:
+        budget = self._agent._budget  # pyright: ignore[reportPrivateUsage]
+        return None if budget is None else budget.generation
 
     async def _load(self) -> tuple[Goal, tuple[Rubric, ...]] | None:
         store = self._module.acceptance.store
@@ -240,14 +294,14 @@ class _Controller:
         except Exception as exc:
             logger.warning(
                 '期望: 读到 %s 的 Goal 与 Rubric。 实际: %s。 下一步: 这一轮不做长程判定；'
-                '查 .syndica/rubrics。',
+                '查宿主交给 AcceptanceModule 的 Rubric 库。',
                 self._scope,
                 type(exc).__name__,
             )
             return None
         return goal, rubrics
 
-    async def _milestone(self, ctx: Context, rubrics: Sequence[Rubric]) -> Verdict | None:
+    async def _milestone_check(self, ctx: Context, rubrics: Sequence[Rubric]) -> Verdict | None:
         """里程碑 L3（spec §8.7）：按 Rubric 逐条查一次此刻的证据。没有生效的 checkable 条就不
         量。"""
         if not any(
@@ -274,19 +328,22 @@ class _Controller:
             return None
 
     async def _record(
-        self, verdict: Verdict, rubrics: Sequence[Rubric], turn: int
-    ) -> ProgressRecord:
+        self, verdict: Verdict, rubrics: Sequence[Rubric], turn: int, *, milestone: bool
+    ) -> None:
         self._verdict = verdict
-        record = self._ledger.record(verdict, rubrics, turn)
-        snapshot = record.snapshot
+        record = self._ledger.record(verdict, rubrics, turn, milestone=milestone)
         if record.fallback and not self._warned_fallback:
             self._warned_fallback = True
             logger.warning(
                 '期望: agent %s 有强制的 checkable 验收条可以量进度。'
                 ' 实际: 一条都没有，进度改按全部生效的 checkable 条算。'
-                ' 下一步: 在 .syndica/rubrics 里把关键的条标成 mandatory。',
+                ' 下一步: 把关键的验收条标成 mandatory。',
                 self._scope,
             )
+        if not record.measured:
+            return
+        self._unmeasured = 0
+        snapshot = record.snapshot
         self._event(
             'progress.measured',
             {
@@ -305,7 +362,6 @@ class _Controller:
             )
             self._event('progress.regressed', {'progress.regressed': list(record.regressed)})
             await self._emit('progress_regressed', {'rubrics': list(record.regressed)})
-        return record
 
     async def _stall_check(
         self,
@@ -316,6 +372,10 @@ class _Controller:
         blocks: list[LongHorizonBlock],
     ) -> None:
         if not self._stall:
+            return
+        latest = self._ledger.latest
+        if latest is not None and latest.complete:
+            # 强制条都满足了就没有「进度」可停滞：剩下的是交付，归 `should_stop`。
             return
         stalled = self._ledger.stalled_turns(turn)
         if stalled is None or stalled < self._stall:
@@ -333,7 +393,7 @@ class _Controller:
                     HistoryKind.STRATEGY,
                     _clipped(action.message),
                     key=f'strategy:{self._scope}:stall:{turn}',
-                    trust=self._module.floor,
+                    trust=self._text_trust(goal, rubrics),
                 )
             )
 
@@ -358,14 +418,14 @@ class _Controller:
         if not isinstance(action, BudgetAction):
             return
         if action.move is BudgetMove.WRAP_UP:
-            self._wrap_cycle = self._cycle
+            self._wrap = (self._cycle, budget.generation)
         if action.message:
             blocks.append(
                 LongHorizonBlock(
                     HistoryKind.STRATEGY,
                     _clipped(action.message),
                     key=f'strategy:{self._scope}:budget:{budget.generation}',
-                    trust=self._module.floor,
+                    trust=self._text_trust(goal, rubrics),
                 )
             )
 
@@ -391,34 +451,48 @@ class _Controller:
         done = frozenset[str]().union(*(entry.terms for entry in window))
         if anchored(done, anchor_terms(goal, rubrics)):
             self._drift = DriftReport(self._window, anchored=True)
+            self._drift_trust = TrustLevel.TRUSTED
             return
-        confirmed, reason = None, ''
-        if self._semantic:
-            confirmed, reason = await self._semantic_check(goal, window)
+        confirmed, reason, trust = None, '', TrustLevel.TRUSTED
+        if self._semantic and self._agent._companion_headroom(ctx, _JUDGE_TURNS):  # pyright: ignore[reportPrivateUsage]
+            confirmed, reason, trust = await self._semantic_check(goal, window)
         self._drift = DriftReport(self._window, anchored=False, confirmed=confirmed, reason=reason)
+        self._drift_trust = trust
         self._event('goal.drift', {'drift.anchored': False, 'drift.confirmed': confirmed})
         await self._emit('goal_drift', {'confirmed': confirmed})
         if confirmed is False:
             return
         action = await self._ask('on_goal_drift', self._context(ctx, turn, goal, rubrics))
         if isinstance(action, DriftAction) and action.move is DriftMove.REMIND:
-            # 重申的是 Goal 原文，信任随 Goal：复述出来的是「用户要什么」的第二个版本（P1 L8）。
-            text = f'{_clipped(action.message)}\n{goal.intent}' if action.message else goal.intent
+            # 重申的是 Goal 原文（P1 L8），截到与策略文字同一个上限：每个窗口都重申一次，整份任务
+            # 原文每次都进前缀太贵。
+            restated = _clipped(goal.intent)
+            text = f'{_clipped(action.message)}\n{restated}' if action.message else restated
             blocks.append(
                 LongHorizonBlock(
                     HistoryKind.STRATEGY,
                     text,
                     key=f'strategy:{self._scope}:drift:{turn}',
-                    trust=strictest_trust(self._module.floor, goal.trust),
+                    trust=self._text_trust(goal, rubrics),
                 )
             )
 
     async def _semantic_check(
         self, goal: Goal, window: Sequence[_TurnActions]
-    ) -> tuple[bool | None, str]:
-        """第二层：一次伴生比对。失败开放成「不确认漂移」（None）；结论的信任随伴生读到的东西。"""
-        actions = '\n'.join(line for entry in window for line in entry.lines)
-        task = f'目标：{goal.intent}\n\n最近的动作：\n{actions or "（没有工具调用）"}'
+    ) -> tuple[bool | None, str, TrustLevel]:
+        """第二层：一次伴生比对。交回（是否确认漂移、理由、结论的信任）。失败时不确认（None），
+        这一窗口按锚点检查的「可疑」交给策略。结论的信任随伴生读到的东西：目标、动作，以及它自己
+        的溯源。"""
+        lines: list[str] = []
+        used = 0
+        for line in (line for entry in window for line in entry.lines):
+            if used + len(line) > _JUDGE_TOTAL_CHARS:
+                lines.append('…（更早的动作略去）')
+                break
+            lines.append(line)
+            used += len(line)
+        actions = '\n'.join(lines)
+        task = f'目标：{_clipped(goal.intent)}\n\n最近的动作：\n{actions or "（没有工具调用）"}'
         trust = strictest_trust(goal.trust, _strictest(entry.trust for entry in window))
         try:
             async with asyncio.timeout(self._verifier_timeout):
@@ -427,26 +501,36 @@ class _Controller:
                     llm=self._agent.options.llm,
                     system_prompt=_DRIFT_PROMPT,
                     task=task,
-                    max_turns=2,
+                    max_turns=_JUDGE_TURNS,
                     trust=trust,
                 )
-            text = result.reply.strip()
-            data = cast(object, json.loads(text[text.find('{') : text.rfind('}') + 1]))
         except Exception as exc:
             logger.warning(
-                '期望: 漂移的语义比对给出结论。 实际: %s。 下一步: 这一次不确认漂移；'
-                '反复出现就关掉 long_horizon_semantic_drift 或换模型。',
+                '期望: 漂移的语义比对给出结论。 实际: %s。 下一步: 这一窗口按锚点检查的可疑结论'
+                '交给策略；反复出现就关掉 long_horizon_semantic_drift 或换模型。',
                 type(exc).__name__,
             )
-            return None, ''
+            return None, '', trust
+        trust = strictest_trust(trust, result.provenance)
+        if result.stop_reason is StopReason.BUDGET:
+            logger.warning(
+                '期望: 漂移的语义比对给出结论。 实际: 预算不够它跑完。 下一步: 这一窗口按锚点检查的'
+                '可疑结论交给策略；要它照常跑就给这个 Agent 留出预算。'
+            )
+            return None, '', trust
+        text = result.reply.strip()
+        try:
+            data = cast(object, json.loads(text[text.find('{') : text.rfind('}') + 1]))
+        except ValueError:
+            data = None
         if not isinstance(data, dict):
-            return None, ''
+            return None, '', trust
         verdict = cast(dict[str, object], data)
         on_track = verdict.get('on_track')
         reason = verdict.get('reason')
         if not isinstance(on_track, bool):
-            return None, ''
-        return (not on_track), (reason if isinstance(reason, str) else '')
+            return None, '', trust
+        return (not on_track), (reason if isinstance(reason, str) else ''), trust
 
     async def _stop_check(
         self,
@@ -456,13 +540,16 @@ class _Controller:
         rubrics: Sequence[Rubric],
         blocks: list[LongHorizonBlock],
     ) -> None:
-        """跑到一半的里程碑判了 pass、强制条也都满足：问策略要不要停。要停就安排一轮最终回答，而不是
-        立刻停——此刻最后一块可能还是一批工具结果，立刻停下就没有回答。每个周期只提一次。"""
+        """这个周期里的一次里程碑判了 pass、按此刻的分母强制条也都满足：问策略要不要停。要停就安排
+        一轮最终回答，而不是立刻停——此刻最后一块可能还是一批工具结果，立刻停下就没有回答。每个周期
+        只提一次。只认这个周期的里程碑：上一个周期完成时的 pass 说的是上一个请求。"""
+        milestone = self._milestone
         latest = self._ledger.latest
-        verdict = self._verdict
-        if self._final_offered or latest is None or not latest.complete:
+        if self._final_offered or milestone is None or latest is None or not latest.complete:
             return
-        if verdict is None or verdict.status is not VerdictStatus.PASS:
+        if milestone.cycle != self._cycle or milestone.denominator != denominator_ids(rubrics):
+            return
+        if milestone.verdict.status is not VerdictStatus.PASS:
             return
         decision = await self._ask('should_stop', self._context(ctx, turn, goal, rubrics))
         if not isinstance(decision, StopDecision) or not decision.stop:
@@ -474,9 +561,18 @@ class _Controller:
                 HistoryKind.STRATEGY,
                 '强制验收条都已满足：这一轮直接给出最终回答，交代交付了什么；不要再调用工具。',
                 key=f'strategy:{self._scope}:final:{turn}',
-                trust=strictest_trust(self._module.floor, verdict.trust),
+                trust=self._text_trust(goal, rubrics),
             )
         )
+
+    def _text_trust(self, goal: Goal, rubrics: Sequence[Rubric]) -> TrustLevel:
+        """策略写下的文字的信任（计划 P1 B3）：下限、Goal、每条 Rubric、最近的裁决、漂移比对的结论
+        里最严的。策略读的就是这些，它转述出来的不能比它们可信。"""
+        trust = strictest_trust(self._module.floor, goal.trust)
+        trust = strictest_trust(trust, _strictest(rubric.trust for rubric in rubrics))
+        if self._verdict is not None:
+            trust = strictest_trust(trust, self._verdict.trust)
+        return strictest_trust(trust, self._drift_trust)
 
     # ---- 策略 ----
 
@@ -491,7 +587,8 @@ class _Controller:
             turn=turn,
             goal=goal,
             rubrics=tuple(rubrics),
-            progress=self._ledger.latest or ProgressSnapshot(),
+            # 还没量到过：分母是知道的，只是一条都还没有满足的证据。
+            progress=self._ledger.latest or ProgressSnapshot(mandatory=denominator_ids(rubrics)),
             budget=None if budget is None else budget.view(),
             stalled_turns=0 if stalled is None else stalled,
             drift=self._drift,
@@ -501,11 +598,15 @@ class _Controller:
     async def _ask(self, hook: str, snapshot: LongHorizonContext) -> object:
         strategy = self._module.strategy
         expected = _ACTIONS[hook]
+        deadline = asyncio.timeout(_STRATEGY_TIMEOUT)
         try:
-            async with asyncio.timeout(_STRATEGY_TIMEOUT):
+            async with deadline:
                 action = await getattr(strategy, hook)(snapshot)
-        except TimeoutError:
-            _report_strategy(strategy, hook, f'{_STRATEGY_TIMEOUT} 秒内没有交回')
+        except TimeoutError as exc:
+            if deadline.expired():
+                _report_strategy(strategy, hook, f'{_STRATEGY_TIMEOUT:g} 秒内没有交回')
+            else:
+                _report_strategy(strategy, hook, f'抛出 TimeoutError: {exc}')
             return None
         except Exception as exc:
             _report_strategy(strategy, hook, f'抛出 {type(exc).__name__}: {exc}')
@@ -559,7 +660,7 @@ def _malformed(hook: str, action: object) -> str | None:
 
 
 def _clipped(text: str) -> str:
-    return text if len(text) <= _MESSAGE_CHARS else text[:_MESSAGE_CHARS] + '…'
+    return text if len(text) <= MESSAGE_LIMIT else text[:MESSAGE_LIMIT] + '…'
 
 
 def _report_strategy(strategy: object, hook: str, what: str) -> None:
@@ -601,14 +702,22 @@ class LongHorizonModule(RuntimeModule):
         self.strategy: LongHorizonStrategy = (
             strategy if strategy is not None else BaselineStrategy()
         )
-        self.floor = (
-            TrustLevel.TRUSTED if strategy is None or trusted_strategy else TrustLevel.UNTRUSTED
-        )
+        baseline = strategy is None or type(strategy) is BaselineStrategy
+        self.floor = TrustLevel.TRUSTED if baseline or trusted_strategy else TrustLevel.UNTRUSTED
+        warned: list[bool] = []
 
         def plugin_factory(
             runtime: Runtime, agent: BaseAgent, flags: Mapping[str, FlagValue]
         ) -> _NoHooks:
             _validate_flags(flags)
+            if not flags['acceptance_outcome'] and not warned:
+                warned.append(True)
+                logger.warning(
+                    '期望: 长程的进度靠 L3 验收量（acceptance_outcome 开着）。'
+                    ' 实际: acceptance_outcome 关着，里程碑与停滞检测都不跑，'
+                    '只剩漂移与预算低的纠偏。'
+                    ' 下一步: 要量进度就打开 acceptance_outcome。'
+                )
             agent._attach_long_horizon(_Controller(self, runtime, agent, flags))  # pyright: ignore[reportPrivateUsage]
             return _NoHooks()
 
@@ -675,16 +784,9 @@ def _validate_strategy(strategy: object) -> None:
 
 
 def _validate_flags(flags: Mapping[str, FlagValue]) -> None:
-    if not flags['acceptance_outcome'] and (
-        flags['long_horizon_progress_every'] or flags['long_horizon_stall_turns']
-    ):
-        raise ConfigError(
-            expected='长程的进度靠 L3 验收：acceptance_outcome 开着',
-            received='acceptance_outcome 是 false，而 long_horizon_progress_every / '
-            'long_horizon_stall_turns 要量进度',
-            next_action='打开 acceptance_outcome，或把这两个 Flag 设成 0（只要漂移与预算低的纠偏）',
-        )
-    if flags['long_horizon_stall_turns'] and not flags['long_horizon_progress_every']:
+    every = cast(int, flags['long_horizon_progress_every'])
+    stall = cast(int, flags['long_horizon_stall_turns'])
+    if stall and not every:
         raise ConfigError(
             expected='停滞检测要隔几轮量一次进度',
             received=(
@@ -695,4 +797,11 @@ def _validate_flags(flags: Mapping[str, FlagValue]) -> None:
                 '给 long_horizon_progress_every 一个不大于 long_horizon_stall_turns 的正数，'
                 '或把 long_horizon_stall_turns 设成 0'
             ),
+        )
+    if stall and every > stall:
+        raise ConfigError(
+            expected='两次量度之间隔的轮数不大于停滞的判据',
+            received=f'long_horizon_progress_every={every} 大于 long_horizon_stall_turns={stall}：'
+            '停滞会拿同一次量度一再触发',
+            next_action='把 long_horizon_progress_every 调到不大于 long_horizon_stall_turns',
         )

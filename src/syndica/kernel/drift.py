@@ -13,10 +13,10 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import cast
 
 from syndica.kernel.acceptance import Goal, Rubric, RubricStatus
-from syndica.kernel.context import ContextBlock
+from syndica.kernel.context import ContextBlock, ToolCall
 from syndica.kernel.lexical import terms
 
-__all__ = ['action_terms', 'anchor_terms', 'anchored']
+__all__ = ['action_terms', 'anchor_terms', 'anchored', 'call_lines']
 
 # 这些参数装的是要写下的正文，不是「在动哪里」：不进动作的词面。
 _CONTENT_ARGUMENTS = frozenset(
@@ -34,8 +34,38 @@ def _values(value: object) -> Iterable[str]:
     elif isinstance(value, list | tuple):
         for item in cast(Sequence[object], value):
             yield from _values(item)
-    elif isinstance(value, int | float) and not isinstance(value, bool):
-        yield str(value)
+
+
+def _without_content(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: _without_content(item)
+            for key, item in cast(Mapping[object, object], value).items()
+            if key not in _CONTENT_ARGUMENTS
+        }
+    if isinstance(value, list | tuple):
+        return [_without_content(item) for item in cast(Sequence[object], value)]
+    return value
+
+
+def _arguments(call: ToolCall) -> object:
+    try:
+        return cast(object, json.loads(call.arguments or '{}'))
+    except (TypeError, ValueError):
+        return call.arguments
+
+
+def call_lines(blocks: Sequence[ContextBlock], *, line_chars: int) -> tuple[str, ...]:
+    """交给语义比对的动作：工具名与参数（正文除外，与词面单位同一个视图），每行截到
+    `line_chars`。"""
+    lines: list[str] = []
+    for block in blocks:
+        for call in block.tool_calls:
+            shown = _without_content(_arguments(call))
+            text = shown if isinstance(shown, str) else json.dumps(shown, ensure_ascii=False)
+            line = f'- {call.name} {text}'
+            lines.append(line if len(line) <= line_chars else line[:line_chars] + '…')
+    return tuple(lines)
 
 
 def action_terms(blocks: Sequence[ContextBlock]) -> frozenset[str]:
@@ -43,11 +73,7 @@ def action_terms(blocks: Sequence[ContextBlock]) -> frozenset[str]:
     found: set[str] = set()
     for block in blocks:
         for call in block.tool_calls:
-            try:
-                arguments = cast(object, json.loads(call.arguments or '{}'))
-            except (TypeError, ValueError):
-                arguments = call.arguments
-            for text in _values(arguments):
+            for text in _values(_arguments(call)):
                 found |= terms(text)
         for artifact in block.artifacts:
             found |= terms(artifact.path)

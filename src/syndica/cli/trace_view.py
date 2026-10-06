@@ -106,7 +106,15 @@ def _budget_events(spans: Sequence[Span], labels: Mapping[str, str]) -> list[str
 
 
 _LONG_HORIZON_EVENTS = frozenset(
-    {'progress.measured', 'progress.regressed', 'progress.stalled', 'goal.drift', 'strategy.action'}
+    {
+        'progress.measured',
+        'progress.regressed',
+        'progress.stalled',
+        'progress.skipped',
+        'goal.drift',
+        'strategy.action',
+        'strategy.wrap_up',
+    }
 )
 
 
@@ -123,6 +131,10 @@ def _long_horizon_detail(name: str, attributes: Mapping[str, object]) -> str:
         return '回退：' + '、'.join(str(item) for item in listed)
     if name == 'progress.stalled':
         return f'{attributes.get("progress.stalled_turns")} 轮没有进展'
+    if name == 'progress.skipped':
+        return '预算不够跑里程碑验收，这一次没量'
+    if name == 'strategy.wrap_up':
+        return '策略要求收尾，这一轮是最后一轮'
     if name == 'goal.drift':
         confirmed = attributes.get('drift.confirmed')
         return {True: '语义比对确认', False: '语义比对否认'}.get(
