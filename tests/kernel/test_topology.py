@@ -24,6 +24,7 @@ _SLOT_FIELDS = [
     'extra_tools',
     'budget',
     'metadata',
+    'isolation',
 ]
 
 
@@ -52,6 +53,7 @@ def test_defaults_are_on_demand_lazy_zombie() -> None:
     assert slot.extra_tools == ()
     assert slot.budget is None
     assert dict(slot.metadata) == {}
+    assert slot.isolation == 'shared'
 
 
 def test_singleton_eager_keyed_lazy_and_on_demand_manual_construct() -> None:

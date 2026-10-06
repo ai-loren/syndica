@@ -49,6 +49,7 @@ topologies:
         extra_tools: [Grep]
         budget: {turns: 7}
         metadata: {lane: review}
+        isolation: snapshot
 """,
     )
 
@@ -69,6 +70,7 @@ topologies:
     assert topology.slots[1].extra_tools == ('Grep',)
     assert topology.slots[1].budget == {'turns': 7}
     assert topology.slots[1].metadata == {'lane': 'review'}
+    assert (topology.slots[0].isolation, topology.slots[1].isolation) == ('shared', 'snapshot')
 
 
 def test_minimal_config_uses_builtin_agents_and_no_topologies(tmp_path: Path) -> None:

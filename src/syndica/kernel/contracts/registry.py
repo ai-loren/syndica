@@ -301,6 +301,22 @@ class AgentRegistryContract(ContractSuite):
         await registry.register(_info('child', parent_id='root'))
         assert await registry.children_of('root') == ['child']
 
+    async def test_children_of_and_parent_id_describe_the_same_tree(
+        self, registry: AgentRegistry
+    ) -> None:
+        # 后代只有一个定义（`parent_id`）：授权沿它往上走，级联沿 `children_of` 往下走，两边对不上
+        # 就会有一个 Agent 停得了却拆不掉，或拆得掉却停不了。
+        tree = {'r': None, 'a': 'r', 'b': 'r', 'c': 'a', 'd': 'a', 'e': 'c', 'loose': None}
+        for agent_id, parent in tree.items():
+            await registry.register(_info(agent_id, parent_id=parent))
+        await registry.unregister('d')
+        del tree['d']
+        for agent_id in tree:
+            listed = sorted(await registry.children_of(agent_id))
+            assert listed == sorted(child for child, parent in tree.items() if parent == agent_id)
+            info = await registry.get(agent_id)
+            assert info is not None and info.parent_id == tree[agent_id]
+
     async def test_children_of_unknown_agent_returns_empty(self, registry: AgentRegistry) -> None:
         assert await registry.children_of('missing') == []
 

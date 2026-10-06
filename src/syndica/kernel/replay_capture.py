@@ -141,6 +141,7 @@ def _topology_document(topology: Topology) -> dict[str, object]:
                 'extra_tools': list(slot.extra_tools),
                 'budget': None if slot.budget is None else dict(slot.budget),
                 'metadata': dict(slot.metadata),
+                **({} if slot.isolation == 'shared' else {'isolation': slot.isolation}),
             }
             for slot in topology.slots
         ]
@@ -621,6 +622,14 @@ class ReplayCapture:
             if not isinstance(slot, Mapping):
                 continue
             body = cast(Mapping[str, object], slot)
+            if 'isolation' in body:
+                shown = self._redactor.redact(str(body.get('name')))
+                raise Unreplayable(
+                    expected='拓扑槽都在共享工作区里干活（回放不记工作区的样子）',
+                    received=f'槽 {shown!r} 声明了 isolation={body["isolation"]!r}：'
+                    '每个周期的拷贝与合并冲突取决于当时的工作区',
+                    next_action='这类 run 回放不出来；这个 trace 不写回放文档，结构照常记录',
+                )
             tools = body.get('extra_tools')
             for index, tool in enumerate(
                 cast(list[object], tools if isinstance(tools, list) else [])

@@ -296,6 +296,7 @@ _RUNTIME_INIT: tuple[tuple[str, str, bool], ...] = (
     ('redactor', 'KEYWORD_ONLY', True),
     ('artifacts', 'KEYWORD_ONLY', True),
     ('budget', 'KEYWORD_ONLY', True),
+    ('keep_finished_children', 'KEYWORD_ONLY', True),
 )
 _RUNTIME_SPAWN: tuple[tuple[str, str, bool], ...] = (
     ('self', 'POSITIONAL_OR_KEYWORD', False),

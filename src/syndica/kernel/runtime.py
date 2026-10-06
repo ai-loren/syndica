@@ -113,6 +113,7 @@ import asyncio
 import copy
 import functools
 import inspect
+import itertools
 import json
 import logging
 import time
@@ -246,6 +247,7 @@ class _SlotSpawn:
     key: str
     per_caller: bool
     installer: Installer | None
+    isolation: str = 'shared'
 
 
 _SLOT_SPAWN: ContextVar[_SlotSpawn | None] = ContextVar('syndica_slot_spawn', default=None)
@@ -597,6 +599,15 @@ def _orchestration_name_clash(name: str, clashes: list[str]) -> ConfigError:
     )
 
 
+def _reaped_reason(agent_id: str, keep: int) -> str:
+    return (
+        f'期望: agent {agent_id!r} 还在，可以接着交给它。'
+        f' 实际: 它做完、结果交回之后被回收了——每个父 Agent 只留最近结束的 {keep} 个子 Agent。'
+        ' 下一步: 它交回的结论在你自己的轨迹里；还要接着做就用 Delegate 派一个新的，'
+        '把需要的上下文写进任务里。'
+    )
+
+
 def _cannot_fork_from(fork_from: str) -> ContractViolation:
     return ContractViolation(
         expected=f'分叉源 {fork_from!r} 的实例在本进程手里，它的轨迹才拷得到',
@@ -770,6 +781,10 @@ class _Slot:
     # 与停在挂起门上的 PAUSED 是同一个取值，而只有后者收得到唤醒边沿。读它与改它都是同步的，
     # 因此控制面在一段不含 await 的代码里读到的答案与驱动任务此刻的位置严格一致。
     parked_on_mailbox: int = 0
+    # 拓扑槽声明的隔离：每个周期在共享工作区的一份拷贝里干活、周期结束时合并（`shared` 就不隔离）。
+    cycle_isolation: str = 'shared'
+    # 上个周期合并留下的话（冲突、副本还留着），连同合并那一刻它的溯源：下个周期开头注入。
+    merge_note: tuple[str, TrustLevel] | None = None
     # 这个 Agent 的事件循环在工具调用之外派的活、发的消息数到第几个了（M3 D10）。放在这里而不是驱动
     # 任务里：zombie 被唤醒时换一个驱动任务，序号要接着数，否则两次唤醒的第一个撞成同一个键。
     issued: dict[str, int] = field(default_factory=dict[str, int])
@@ -1063,9 +1078,30 @@ class Runtime:
         redactor: Redactor | None = None,
         artifacts: ArtifactStore | None = None,
         budget: BudgetPolicy | None = None,
+        keep_finished_children: int = 8,
     ) -> None:
         # 校验在建任何东西之前：一张错的角色表换来的应当是一次什么都没发生的拒绝。
         validate_agent_factories(agents or {})
+        if (
+            isinstance(cast(object, keep_finished_children), bool)
+            or not isinstance(cast(object, keep_finished_children), int)
+            or keep_finished_children < 1
+        ):
+            raise ConfigError(
+                expected='keep_finished_children 是 >= 1 的整数',
+                received=f'keep_finished_children={keep_finished_children!r}',
+                next_action=(
+                    '给一个正整数（缺省 8）：每个父 Agent 至多留这么多个做完、结果已交回的子 Agent'
+                ),
+            )
+        self._keep_finished = keep_finished_children
+        # D-46 的回收账：进 zombie 的先后、结果被派活等待取走过的子 Agent、此刻有几个等待指着它、
+        # 已经回收掉的 id（再被寻址时说清它去哪了）。
+        self._finish_order: dict[str, int] = {}
+        self._finish_counter = itertools.count()
+        self._collected: set[str] = set()
+        self._await_count: dict[str, int] = {}
+        self._reaped: set[str] = set()
         if budget is not None and not isinstance(cast(object, budget), BudgetPolicy):
             raise ConfigError(
                 expected='budget 是 BudgetPolicy 或省略（不限）',
@@ -1368,6 +1404,8 @@ class Runtime:
                 received=f'收到 {type(budget).__name__}',
                 next_action='写成 budget=Budget(turns=..., tokens=...)',
             )
+        if parent_id is not None:
+            await self._reap_finished(parent_id)
         # 切不出来的在任何副作用之前拒绝；真正的切分在注册之后、驱动任务起跑之前那段同步代码里重算。
         planned, _ = self._budget.split(parent_id, budget)
         query_trust = self._from_listed_module(query_trust)
@@ -1614,6 +1652,7 @@ class Runtime:
             factory=factory,
             flags=agent_flags,
             installer=runs_as,
+            cycle_isolation='shared' if slot_spawn is None else slot_spawn.isolation,
         )
         seed = None if query is None else _Seed(text=query, trust=query_trust)
         task = asyncio.create_task(self._drive(agent_id, agent, seed), name=f'agent:{agent_id}')
@@ -2060,6 +2099,7 @@ class Runtime:
                 continue
             await self._oscillate(agent_id, new=AgentStatus.RUNNING)
             slot.gate.begin_cycle()
+            self._isolate_cycle(agent_id, agent, slot)
             slot.control.enter_run()
             try:
                 if seed is None:
@@ -2068,6 +2108,9 @@ class Runtime:
                     await agent.run(seed.text, trust=seed.trust)
             finally:
                 slot.control.leave_run()
+            # 只在周期正常结束时合并：被取消或抛出的周期做到一半，副本留着，不把半截的改动写回共享
+            # 工作区（留着的副本也让回收不碰它）。
+            await self._merge_cycle(agent_id, agent, slot)
             seed = None
             # 预算耗尽这条路无条件退出，即便还有已收下的输入：没有轮次可用，再开一个周期只会
             # 被同一条消息反复唤醒又立刻返回。丢下的那些由 `_finish` 记成 ERROR。
@@ -2077,6 +2120,56 @@ class Runtime:
                 agent_id, slot
             ):
                 return
+
+    def _isolate_cycle(self, agent_id: str, agent: BaseAgent, slot: _Slot) -> None:
+        """槽声明了隔离：这个周期在共享工作区此刻的一份拷贝里干活。上个周期合并留下的话与隔离的
+        事实按周期键注入历史（不进 SP：它随周期而变）；上次合并没能删掉的副本接着用，不另拷一份。"""
+        router = self._workspace
+        if slot.cycle_isolation == 'shared' or router is None:
+            return
+        copy = router.isolated(agent_id)
+        if copy is None:
+            copy = router.isolate(agent_id, slot.cycle_isolation)
+        cycle = agent._cycle + 1  # pyright: ignore[reportPrivateUsage]
+        if slot.merge_note is not None:
+            text, trust = slot.merge_note
+            slot.merge_note = None
+            agent.context.append(
+                signed_block(
+                    HistoryKind.ENV_FACT,
+                    f'（环境）上个周期结束时的合并：{text}',
+                    key=f'isolation:{agent_id}:merge:{cycle}',
+                    trust=trust,
+                )
+            )
+        if copy is not None:
+            agent.context.append(
+                signed_block(HistoryKind.ENV_FACT, copy.fact(), key=f'isolation:{agent_id}:{cycle}')
+            )
+
+    async def _merge_cycle(self, agent_id: str, agent: BaseAgent, slot: _Slot) -> None:
+        router = self._workspace
+        if slot.cycle_isolation == 'shared' or router is None or router.isolated(agent_id) is None:
+            return
+        trust = provenance_of(agent.context)
+        try:
+            report = await router.merge_isolated(agent_id)
+        except Exception as exc:
+            logger.error(
+                '期望: 把 agent %s 这个周期的隔离副本合并回共享工作区。'
+                ' 实际: 合并失败：%s: %s；副本留着，下个周期接着在它里面干活。'
+                ' 下一步: 查工作区与副本的状态；要放弃这些改动就 despawn 它。',
+                agent_id,
+                type(exc).__name__,
+                exc,
+            )
+            slot.merge_note = (
+                '合并失败，你上个周期的改动还在隔离副本里、没有进共享工作区。',
+                trust,
+            )
+            return
+        if report.conflicts or report.kept:
+            slot.merge_note = (report.summary(), trust)
 
     async def _has_unhandled_input(self, agent_id: str, slot: _Slot) -> bool:
         """还有已经收下、却还没被处理的输入吗？
@@ -2140,6 +2233,8 @@ class Runtime:
             return
         if not await self._switch(agent_id, new=AgentStatus.ZOMBIE, allowed=_LIVE_STATUSES):
             await self._report_lost_zombie(agent_id)
+            return
+        self._finish_order[agent_id] = next(self._finish_counter)
 
     async def _report_abandoned_input(self, agent_id: str, slot: _Slot) -> None:
         """摘队列之前，把「拿过 ok=True 收据、却不会再被处理」的输入记下来。
@@ -2186,9 +2281,20 @@ class Runtime:
         `ctx.stop_reason` 上是 ERROR，被取消的运行没有 stop_reason。
         """
         task = self._table.get_task(agent_id)
-        if task is not None:
-            await asyncio.wait({task})
-        return self._finished_context(agent_id)
+        self._await_count[agent_id] = self._await_count.get(agent_id, 0) + 1
+        try:
+            if task is not None:
+                await asyncio.wait({task})
+            return self._finished_context(agent_id)
+        finally:
+            self._release_awaited(agent_id)
+
+    def _release_awaited(self, agent_id: str) -> None:
+        left = self._await_count.get(agent_id, 0) - 1
+        if left > 0:
+            self._await_count[agent_id] = left
+        else:
+            self._await_count.pop(agent_id, None)
 
     def _finished_context(self, agent_id: str, driver: asyncio.Task[Any] | None = None) -> Context:
         """一个事件循环已经停下的 Agent 的轨迹。`wait` 与 `_wait_in_turn` 的共同出口。
@@ -2371,6 +2477,16 @@ class Runtime:
             return result
 
     async def _waited_in_turn(self, slot: _Slot, target_id: str) -> _InTurnWaitResult:
+        self._await_count[target_id] = self._await_count.get(target_id, 0) + 1
+        try:
+            result = await self._waited_in_turn_once(slot, target_id)
+        finally:
+            self._release_awaited(target_id)
+        if result.state is WaitState.ANSWERED:
+            self._collected.add(target_id)
+        return result
+
+    async def _waited_in_turn_once(self, slot: _Slot, target_id: str) -> _InTurnWaitResult:
         token = _WaitToken()
         previous = slot.delegation
         slot.delegation = token
@@ -2456,6 +2572,10 @@ class Runtime:
         trust = self._from_listed_module(trust)
         key = self._message_key(agent_id, correlation_id)
         if await self.registry.get(agent_id) is None:
+            if agent_id in self._reaped:
+                return DeliveryResult(
+                    ok=False, reason=_reaped_reason(agent_id, self._keep_finished)
+                )
             return DeliveryResult(
                 ok=False,
                 reason=(
@@ -2544,6 +2664,9 @@ class Runtime:
                 agent_id,
             )
             return False
+        # 叫醒的是一个又要干活的 Agent：它这一轮的结果还没人取走，回收账上不再算它做完了。
+        self._finish_order.pop(agent_id, None)
+        self._collected.discard(agent_id)
         if not await self._switch(agent_id, new=AgentStatus.IDLE, allowed=(AgentStatus.ZOMBIE,)):
             logger.error(
                 '期望: agent %s 在注册表里是 idle 或 zombie，可由本进程重开事件循环。'
@@ -3284,6 +3407,75 @@ class Runtime:
             frontier = following
         return found
 
+    async def _reap_finished(self, parent_id: str) -> None:
+        """派活树的回收（D-46）：`parent_id` 结束了的子 Agent 超过 `keep_finished_children` 时，按
+        进 zombie 的先后拆掉最早的那些（预算随拆除结算进父）。在给它挂新子之前做：树只在这时长大。
+
+        只收结果已经交回给父的（派活等待取走过）、整棵子树都是 zombie、没有留着的隔离副本、此刻也
+        没有等待指着它的子 Agent：别的情况下拆掉它会丢掉还活着的后代、没合并的改动，或让一次正在
+        取结果的等待撞空。宿主自己 spawn 的子 Agent 从不被取走结果，因此从不被回收。拆不掉的记
+        WARNING、跳过——回收是收拾，不能让这次 spawn 失败。
+        """
+        if self._closed or parent_id in self._doomed:
+            return
+        finished = [
+            child
+            for child in await self.registry.children_of(parent_id)
+            if child in self._collected and child in self._finish_order
+        ]
+        reapable = [child for child in finished if await self._reapable(child)]
+        reapable.sort(key=lambda child: self._finish_order[child])
+        for child in reapable[: max(len(reapable) - self._keep_finished, 0)]:
+            try:
+                await self.despawn(child)
+            except Exception as exc:
+                logger.warning(
+                    '期望: 回收 agent %s 的子 Agent %s（它做完了、结果已交回）。'
+                    ' 实际: 拆除失败：%s: %s。'
+                    ' 下一步: 它留在注册表里，不影响这次 spawn；反复出现就查注册表与工作区。',
+                    parent_id,
+                    child,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            self._reaped.add(child)
+            self._finish_order.pop(child, None)
+            self._collected.discard(child)
+
+    async def _reapable(self, agent_id: str) -> bool:
+        for member in (agent_id, *await self._descendants(agent_id)):
+            info = await self.registry.get(member)
+            if info is None or info.status is not AgentStatus.ZOMBIE:
+                return False
+            if self._await_count.get(member):
+                return False
+            if self._workspace is not None and self._workspace.isolated(member) is not None:
+                return False
+        return True
+
+    def _reaped_text(self, agent_id: str) -> str | None:
+        """这个 id 是被回收掉的就交回说明（期望 / 实际 / 下一步），否则 None。"""
+        return _reaped_reason(agent_id, self._keep_finished) if agent_id in self._reaped else None
+
+    async def _is_descendant(self, agent_id: str, ancestor: str) -> bool:
+        """`agent_id` 在不在 `ancestor` 的子树里：沿 `parent_id` 往上走，O(深度)，不必列出整棵子树。
+
+        后代只有一个定义——注册表条目上的 `parent_id`。`children_of` 是它的反查，级联沿反查往下走；
+        两个方向说的是同一棵树由注册表契约钉住。`seen` 防的是远端注册表里被别的进程写出的环。
+        """
+        seen = {agent_id}
+        current = agent_id
+        while True:
+            info = await self.registry.get(current)
+            parent = None if info is None else info.parent_id
+            if parent is None or parent in seen:
+                return False
+            if parent == ancestor:
+                return True
+            seen.add(parent)
+            current = parent
+
     async def wait_for(self, agent_id: str, waiter: Waiter) -> WaitResult:
         """代表一个正在干活的 Agent 等一条匹配的答复（spec §4.2，供工具使用）。
 
@@ -3792,12 +3984,24 @@ class Runtime:
             existing = self._owned_alias(slot, alias)
             if existing is not None:
                 return existing
+        if slot.isolation != 'shared' and (
+            self._workspace is None or not self._workspace.can_isolate
+        ):
+            raise ConfigError(
+                expected=f'槽 {slot.name!r} 的 isolation={slot.isolation!r} 用在能隔离的工作区上',
+                received='这个 Runtime 没有工作区路由，或它的路由没有隔离器',
+                next_action=(
+                    'Runtime(workspace=WorkspaceRouter(..., isolator=LocalIsolator(...)))；'
+                    '或者把这个槽的 isolation 改回 shared'
+                ),
+            )
         token = _SLOT_SPAWN.set(
             _SlotSpawn(
                 slot.name,
                 key or '',
                 per_caller=slot.cardinality == 'on-demand',
                 installer=self._agent_installers[slot.agent],
+                isolation=slot.isolation,
             )
         )
         try:

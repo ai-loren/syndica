@@ -82,6 +82,7 @@ _SLOT_KEYS = frozenset(
         'extra_tools',
         'budget',
         'metadata',
+        'isolation',
     }
 )
 

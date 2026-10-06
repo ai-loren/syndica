@@ -16,6 +16,7 @@ from typing import cast
 from syndica.kernel.agent_types import ExitMode
 from syndica.kernel.catalog import AgentCatalog
 from syndica.kernel.errors import ConfigError
+from syndica.kernel.isolation import ISOLATIONS
 
 __all__ = ['AgentSlot', 'Topology']
 
@@ -34,6 +35,10 @@ class AgentSlot:
     """一个拓扑槽。字段顺序是公开契约，新字段只能追加。
 
     `extra_tools` 是要并上的工具名，不是替换清单里已有的名字。名字是否存在留到 occupy。
+
+    `isolation` 是这个槽在工作区里的位置（结构，不是行为）：`worktree` / `snapshot` 让占着它的
+    Agent 每个周期在共享工作区此刻的一份拷贝里干活，周期结束时合并回去，冲突在下一个周期开头告诉
+    它。每个周期拷一次：工作区大时这份开销按周期付。
     """
 
     name: str
@@ -46,6 +51,7 @@ class AgentSlot:
     extra_tools: tuple[str, ...] = ()
     budget: Mapping[str, int | None] | None = None
     metadata: Mapping[str, object] = field(default_factory=_empty_metadata)
+    isolation: str = 'shared'
 
     def __post_init__(self) -> None:
         _nonblank_str(self.name, 'name')
@@ -56,6 +62,7 @@ class AgentSlot:
         _check_key_field(self.cardinality, self.key_field)
         _reject_eager_without_singleton(self.cardinality, self.boot)
         _require_exit_mode(self.exit_mode)
+        _require_choice(self.isolation, 'isolation', ISOLATIONS)
         object.__setattr__(self, 'extra_tools', _extra_tools(self.extra_tools))
         object.__setattr__(self, 'budget', _budget(self.budget))
         object.__setattr__(self, 'metadata', _metadata(self.metadata))

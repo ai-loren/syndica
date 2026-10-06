@@ -244,6 +244,7 @@ def test_the_topology_is_exactly_one_root_singleton_orchestrator_slot():
             'extra_tools': [],
             'budget': None,
             'metadata': {},
+            'isolation': 'shared',
         }
     ]
 

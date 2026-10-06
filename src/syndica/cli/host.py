@@ -2071,6 +2071,7 @@ class RuntimeCliHost:
                         'extra_tools': list(slot.extra_tools),
                         'budget': None if slot.budget is None else dict(slot.budget),
                         'metadata': dict(slot.metadata),
+                        'isolation': slot.isolation,
                     }
                     for slot in topology.slots
                 ],

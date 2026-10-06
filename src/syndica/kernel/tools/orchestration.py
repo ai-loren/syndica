@@ -32,10 +32,11 @@
 件事模型应对得了（改用 `SendMessage`、或把它报给父 Agent），上抛则会打断整批调用、把调用者这次
 run 打成 ERROR——而 `QueryAgent` 对同一个目标答的是「一切正常」。
 
-**本模块读 `Runtime` 上四个带下划线的接缝**（`_wait_in_turn` / `_factory_of` / `_provenance_of` /
-`_descendants`）。它们刻意不进公开面：加一个公开方法不是破坏性变更，去掉一个是，所以先私有、真有
-第三方要再放出来。这些工具与 `Runtime` 同在内核里，因此每个读点单独豁免 `reportPrivateUsage`，
-而不是整文件关掉它——关掉之后，此后任何一处真正不该有的私有访问都不会再有人出声。
+**本模块读 `Runtime` 上五个带下划线的接缝**（`_wait_in_turn` / `_factory_of` /
+`_provenance_of` / `_is_descendant` / `_reaped_text`）。它们刻意不进公开面：加一个公开方法不是
+破坏性变更，去掉一个是，所以先私有、真有第三方要再放出来。这些工具与 `Runtime` 同在内核里，
+因此每个读点单独豁免 `reportPrivateUsage`，而不是整文件关掉它——关掉之后，此后任何一处真正不该
+有的私有访问都不会再有人出声。
 
 **子 Agent 的 `agent_id` 必须进 `output`，不能只进 `meta`。** `meta` 落在 block 的 `extra` 里、
 不进模型上下文，只放那里等于模型拿不到 id：它于是既不能让这个 ZOMBIE 带着上下文继续干，也不能
@@ -512,10 +513,12 @@ class QueryAgent(_AgentTool):
         """
         info = await self._runtime.find(agent_id)
         if info is None:
+            reaped = self._runtime._reaped_text(agent_id)  # pyright: ignore[reportPrivateUsage]
             # 两条路的 meta 键必须一样：少一个键，读 `meta['children']` 的 surface 在这条路上撞
             # KeyError。「在不在」由 `status is None` 回答。
             return ToolResult(
-                output=(
+                output=reaped
+                or (
                     f'期望: agent {agent_id!r} 在注册表里。'
                     ' 实际: 没有这个条目——它从未存在，或已被销毁。'
                     ' 下一步: 核对 id（Delegate / Fork 交回的那一个）；'
@@ -565,17 +568,16 @@ class KillAgent(_AgentTool):
                 )
             )
         if await self._runtime.find(agent_id) is None:
+            reaped = self._runtime._reaped_text(agent_id)  # pyright: ignore[reportPrivateUsage]
             return ToolResult(
                 output=(
                     f'期望: agent {agent_id!r} 在注册表里。'
-                    ' 实际: 没有这个条目，它已经不在了。'
-                    ' 下一步: 核对 id；已经不在的 Agent 不需要再终止一次。'
+                    ' 实际: 没有这个条目，它已经不在了'
+                    + ('（做完之后被回收了）' if reaped else '')
+                    + '。 下一步: 核对 id；已经不在的 Agent 不需要再终止一次。'
                 )
             )
-        descendants = await self._runtime._descendants(  # pyright: ignore[reportPrivateUsage]
-            self._agent_id
-        )
-        if agent_id not in descendants:
+        if not await self._runtime._is_descendant(agent_id, self._agent_id):  # pyright: ignore[reportPrivateUsage]
             return ToolResult(
                 output=(
                     '期望: KillAgent 的目标是你派出去的 Agent'
