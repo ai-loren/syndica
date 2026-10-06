@@ -147,6 +147,7 @@ from syndica.kernel import (
     Context,
     ContractViolation,
     DangerPolicy,
+    DeliveryResult,
     ExecResult,
     Exhaustion,
     ExitMode,
@@ -192,6 +193,7 @@ from syndica.kernel import (
 from syndica.kernel.acceptance import RubricStatus, Verdict, VerdictStatus
 from syndica.kernel.acceptance_module import AcceptanceModule
 from syndica.kernel.background_module import BackgroundModule
+from syndica.kernel.budget import AskHuman
 from syndica.kernel.compaction_module import CompactionModule
 from syndica.kernel.long_horizon_module import LongHorizonModule
 from syndica.kernel.memory_module import MemoryModule
@@ -1432,6 +1434,36 @@ class _PendingExport:
     complete: bool
 
 
+async def answer_request(
+    runtime: Runtime, agent_id: str, request_id: str, text: str
+) -> DeliveryResult:
+    """答一个人机请求（确认、提问）。chat 与服务面共用：只有 sender='human'、trust=TRUSTED 的答复
+    算数；activate=False——不能为了交一个答复把已经结束的 Agent 叫醒。"""
+    return await runtime.send(
+        agent_id,
+        text,
+        activate=False,
+        sender='human',
+        correlation_id=request_id,
+        trust=TrustLevel.TRUSTED,
+    )
+
+
+@dataclass
+class SessionParts:
+    """装好的一个会话（`assemble_session`）：谁来驱动它（chat 的泵、服务面的 WebSocket）由调用方
+    定。"""
+
+    runtime: Runtime
+    workspace: WorkspaceRouter
+    environment: AgentEnvironment
+    agent_id: str
+    subscription: Subscription
+    recording: Recording
+    redactor: Redactor
+    lock: SessionLock | None = None
+
+
 @dataclass
 class _ChatSession:
     config: str
@@ -2091,6 +2123,51 @@ class RuntimeCliHost:
     def doctor(self, config: str, *, verify: bool = False) -> CliOutcome:
         return self._runner.run(self._doctor(config, verify=verify))
 
+    @property
+    def workspace_root(self) -> Path:
+        return self._workspace_root
+
+    def trusted_config(self, path: str) -> CliConfig:
+        """读配置并做信任检查（工作区里的要被信任过；没信任过而又没有终端可问时三件套拒绝）。"""
+        return self._trusted_config(path)
+
+    def config_digest(self, path: str) -> str | None:
+        """配置此刻的摘要（与信任存储记的是同一种）；工作区里没有这个文件时 None。"""
+        file = self._workspace_root / path
+        if not file.is_file():
+            return None
+        return self._snapshot(file).digest
+
+    def redactor_for(self, config: CliConfig) -> Redactor:
+        return host_redactor(self._environ, config.redaction_rules)
+
+    def model_checks(self, config: CliConfig) -> list[dict[str, object]]:
+        """逐个建配置里用到的模型：缺 key 之类的问题在这里就报出来，而不是建会话时才炸。"""
+        checks: list[dict[str, object]] = []
+        for name in _model_names(config):
+            try:
+                self._model_factory(name)
+            except SyndicaError as error:
+                checks.append(
+                    {
+                        'name': f'model {name}',
+                        'ok': False,
+                        'expected': error.expected,
+                        'received': error.received,
+                        'next_action': error.next_action,
+                    }
+                )
+            else:
+                checks.append({'name': f'model {name}', 'ok': True})
+        return checks
+
+    async def remove_session(self, sid: str) -> None:
+        """删一份落盘的会话（先抢会话锁，抢不到三件套拒绝）。"""
+        root = session_root(self._workspace_root)
+        kept = rubric_root(self._workspace_root)
+        rubrics = FileRubricStore(kept) if kept.is_dir() else None
+        await _sessions_rm(FileSessionStore(root), root, sid, rubrics)
+
     def open_chat(
         self,
         config: str,
@@ -2570,6 +2647,7 @@ class RuntimeCliHost:
         cost: Decimal | None = None,
         wall_clock_s: float | None = None,
         on_exhausted: str | None = None,
+        ask_human: AskHuman | None = None,
     ) -> BudgetPolicy:
         """这次 run / chat 的根预算（spec §8.4）：`--max-*` 管整棵派活树，子 Agent 从父的剩余里切。
         价格先查 `.syndica.yaml` 的 prices:，再查 backend 的默认值；设了成本上限时在 stderr 说清价格
@@ -2598,7 +2676,9 @@ class RuntimeCliHost:
             ),
             on_exhausted=disposition,
             prices=prices,
-            ask_human=self._ask_budget if disposition is Exhaustion.ASK_HUMAN else None,
+            ask_human=(
+                (ask_human or self._ask_budget) if disposition is Exhaustion.ASK_HUMAN else None
+            ),
         )
 
     async def _ask_budget(self, agent_id: str, view: BudgetView) -> Budget | None:
@@ -2648,13 +2728,11 @@ class RuntimeCliHost:
             if answer == '' and eof_action == 'abort':
                 await runtime.abort(event.agent_id)
                 continue
-            delivered = await runtime.send(
+            delivered = await answer_request(
+                runtime,
                 event.agent_id,
+                cast(str, event.payload['request_id']),
                 'reject' if answer == '' else answer.rstrip('\r\n'),
-                activate=False,
-                sender='human',
-                correlation_id=cast(str, event.payload['request_id']),
-                trust=TrustLevel.TRUSTED,
             )
             if not delivered.ok:
                 raise RuntimeError(delivered.reason or 'human response delivery failed')
@@ -2776,7 +2854,57 @@ class RuntimeCliHost:
         goal: str | None = None,
         on_exhausted: str | None = None,
     ) -> str:
-        config = self._trusted_config(path)
+        parts = await self.assemble_session(
+            path,
+            max_turns=max_turns,
+            trace=trace,
+            argv=argv,
+            trusted_output=trusted_output,
+            resume=resume,
+            goal=goal,
+            on_exhausted=on_exhausted,
+        )
+        pump = asyncio.create_task(
+            self._event_pump(parts.runtime, parts.subscription),
+            name='cli-chat-human-events',
+        )
+        self._sessions[parts.agent_id] = _ChatSession(
+            config=path,
+            runtime=parts.runtime,
+            workspace=parts.workspace,
+            environment=parts.environment,
+            agent_id=parts.agent_id,
+            subscription=parts.subscription,
+            pump=pump,
+            recording=parts.recording,
+            redactor=parts.redactor,
+            lock=parts.lock,
+        )
+        return parts.agent_id
+
+    async def assemble_session(
+        self,
+        path: str,
+        *,
+        max_turns: int | None,
+        trace: str | None,
+        argv: Sequence[str],
+        trusted_output: Sequence[str],
+        resume: str | None = None,
+        goal: str | None = None,
+        on_exhausted: str | None = None,
+        tokens: int | None = None,
+        cost: Decimal | None = None,
+        wall_clock_s: float | None = None,
+        ask_human: AskHuman | None = None,
+        role: str = 'Orchestrator',
+        config: CliConfig | None = None,
+    ) -> SessionParts:
+        """装好一个会话：chat 与服务面共用这一份，安全件（信任、环境白名单、开发模式的拦截、脱敏、
+        会话锁）只有一处。订阅在 spawn 之前取，交回的订阅里没有漏掉的人机请求。`config` 是服务面在
+        启动时信任过的那份快照：给了就不再读文件。"""
+        if config is None:
+            config = self._trusted_config(path)
         if resume is not None:
             # 恢复一份不存在的会话要在起 trace 录制 / 开工作区 / 建模型之前就失败（评审 M6）；也把
             # 「没这个会话」与后面「角色没登记」两类原因分开。
@@ -2788,7 +2916,15 @@ class RuntimeCliHost:
                     '用 sessions list 看现有会话 id；id 是根 Agent 的 id',
                 )
         catalog = config.catalog
-        budget = self._budget_policy(config, turns=max_turns, on_exhausted=on_exhausted)
+        budget = self._budget_policy(
+            config,
+            turns=max_turns,
+            tokens=tokens,
+            cost=cost,
+            wall_clock_s=wall_clock_s,
+            on_exhausted=on_exhausted,
+            ask_human=ask_human,
+        )
         recording, redactor = await self._start_recording(config, trace, argv, path, chat=True)
         try:
             workspace, environment = self._open_workspace(config)
@@ -2797,7 +2933,6 @@ class RuntimeCliHost:
             raise
         runtime: Runtime | None = None
         subscription: Subscription | None = None
-        pump: asyncio.Task[None] | None = None
         session_lock: SessionLock | None = None
         try:
             tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
@@ -2844,10 +2979,6 @@ class RuntimeCliHost:
                 budget=budget,
             )
             subscription = runtime.events.subscribe()
-            pump = asyncio.create_task(
-                self._event_pump(runtime, subscription),
-                name='cli-chat-human-events',
-            )
             if resume is not None:
                 # 先加锁再恢复：挡住另一个进程同时续同一份会话（last-writer 会丢一段工作，B-01）。
                 session_lock = acquire_session_lock(session_root(self._workspace_root), resume)
@@ -2859,12 +2990,10 @@ class RuntimeCliHost:
                     )
                 agent_id = resume
             else:
-                factory = runtime.agent_factory('Orchestrator')
+                factory = runtime.agent_factory(role)
                 if factory is None:
-                    catalog.get('Orchestrator')
-                    raise AssertionError(
-                        'catalog.get returned without an Orchestrator runtime factory'
-                    )
+                    catalog.get(role)
+                    raise AssertionError(f'catalog.get returned without a {role} runtime factory')
                 agent_id = await runtime.spawn(factory, exit_mode=ExitMode.ZOMBIE, session=True)
                 # 新建的会话也持锁（sid 刚生成、必不冲突）：第二个进程想续 / 跑这份活会话会被挡住
                 # （评审 H2——否则一个在跑的 chat 不持锁，另一端 resume 就把它的轨迹盖掉）。
@@ -2872,27 +3001,22 @@ class RuntimeCliHost:
                     session_lock = acquire_session_lock(
                         session_root(self._workspace_root), agent_id
                     )
-            self._sessions[agent_id] = _ChatSession(
-                config=path,
+            return SessionParts(
                 runtime=runtime,
                 workspace=workspace,
                 environment=environment,
                 agent_id=agent_id,
                 subscription=subscription,
-                pump=pump,
                 recording=recording,
                 redactor=redactor,
                 lock=session_lock,
             )
-            return agent_id
         except BaseException as exc:
             try:
                 if session_lock is not None:
                     session_lock.release()
                 if runtime is not None:
                     await runtime.shutdown()
-                if pump is not None:
-                    await asyncio.gather(pump, return_exceptions=True)
                 if subscription is not None:
                     subscription.close()
                 await workspace.close()
@@ -2900,6 +3024,29 @@ class RuntimeCliHost:
                 environment.remove()
                 await self._finish_recording(recording, exc, redactor)
             raise
+
+    async def close_session(
+        self,
+        parts: SessionParts | _ChatSession,
+        failure: BaseException | None,
+        *,
+        pump: asyncio.Task[None] | None = None,
+    ) -> None:
+        """收尾一个会话：存盘（`shutdown`）、关工作区、删临时环境、放锁、收 trace。chat 与服务面
+        共用。"""
+        try:
+            await parts.runtime.shutdown()
+            # Runtime 关了，泵即使收到答复也送不出去；它可能正等着人敲回车，不取消就一直等。
+            if pump is not None:
+                pump.cancel()
+                await asyncio.gather(pump, return_exceptions=True)
+            parts.subscription.close()
+            await parts.workspace.close()
+        finally:
+            parts.environment.remove()
+            if parts.lock is not None:
+                parts.lock.release()
+            await self._finish_recording(parts.recording, failure, parts.redactor)
 
     async def _run_session(
         self, session: _ChatSession, prompt: str, *, fail_without_text: bool = False
@@ -3008,22 +3155,11 @@ class RuntimeCliHost:
         for session in sessions:
             # 读人类输入的泵失败时，它的异常在那一轮已经交给了调用方；收尾再抛一次会让后面的
             # 工作区与临时目录都不再被收拾。
-            try:
-                await session.runtime.shutdown()
-                # Runtime 关了，泵即使收到答复也送不出去；它可能正等着人敲回车，不取消就一直等。
-                session.pump.cancel()
-                await asyncio.gather(session.pump, return_exceptions=True)
-                session.subscription.close()
-                await session.workspace.close()
-            finally:
-                session.environment.remove()
-                if session.lock is not None:
-                    session.lock.release()
-                await self._finish_recording(
-                    session.recording,
-                    KeyboardInterrupt() if interrupted else session.failure,
-                    session.redactor,
-                )
+            await self.close_session(
+                session,
+                KeyboardInterrupt() if interrupted else session.failure,
+                pump=session.pump,
+            )
 
     def _describe_run(
         self,

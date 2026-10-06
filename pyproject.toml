@@ -15,6 +15,11 @@ syndica = "syndica.__main__:entrypoint"
 dev = ["httpx>=0.27", "pytest>=8.0", "pytest-asyncio>=0.24", "pytest-timeout>=2.3", "ruff>=0.6", "pyright>=1.1"]
 openai = ["httpx>=0.27"]
 otel = ["httpx>=0.27"]
+server = [
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+    "websockets>=13",
+]
 
 [build-system]
 requires = ["hatchling"]

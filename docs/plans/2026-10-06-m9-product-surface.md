@@ -325,3 +325,21 @@ class SessionHandle(Protocol):          # 只暴露内核公开类型与不透�
     同一工作区共用一份 `FileTaint`。**M18** 子树持久化改派到无名去处：写明去处（v1 之后）、用户可见后果与同步改的行。
     **M19** 新 kind 与闭集 `KINDS`：索引收 `KINDS` 加已装处理器声明的类别。**M20** 私有字段守卫写法 AST 做不到：改成三条
     规则 + 范围证明。**M21** `time_ns` 的时钟与「时间线与 trace 一致」的比较：Runtime 的时钟、`compare=False`、比较对象写明。
+- **P2（阶段零与一的实现，2026-10-06）** 与 P1 的出入，逐条：
+  - `message_appended` 由 `Context` 上的同步观察者发（追加与压缩重写是轨迹仅有的两个入口），块按（代，位置）
+    认；Fork 播种与会话恢复不发 `transcript_reset`，而是 spawn 里构造的 Agent 先攒着轨迹事件、`create_task`
+    之后先发 `agent_spawned` 再放出——spawn 在登记之后仍可能回滚，回滚了就什么都不发。`transcript_reset`
+    只剩压缩一个来源。
+  - 不加 `pty_created` / `pty_exited`：Agent 的终端只由 Terminal 工具建，句柄在它的结果块 `tool_meta` 里，
+    `message_appended` 已经带着；`tool_call_finished` 只带结局与 `background_id`，输出在结果块里。
+  - `Event.time_ns` 由总线按墙钟打（Runtime 没有可注入的时钟），`compare=False`；E2E 的「时间线与 trace 一致」
+    按 id 比，不按时刻。
+  - 场景格式的 `expect.events` 只比对 v1–v4 定义时的 13 种事件并重新编号（`SCENARIO_EVENT_KINDS`）：否则内核
+    每加一种事件，用户写好、录好的场景全部失败；序号连续性仍对完整的流检查。
+  - 建会话的请求体不收 `title`：`SessionMeta.title` 在全仓没有写入方，收下了也存不住。
+  - server 进程的日志经脱敏 handler 写盘；握手之后 stdout / stderr 接到 `/dev/null`，不把原始 stderr 灌进日志
+    （那是一条不经脱敏的新落盘路径）。`up` 在已有 server 时拒绝，不发新码；要新码就 `down` 再 `up`。
+  - 写入点守卫认得 Starlette 的响应构造与 WebSocket 发送，`server/outbound` 的三个出口算脱敏输出；登录响应、
+    静态文件、SSE 流与 `_Guard` 的转发在白名单里写明理由。
+  - 变异时出现过两处没还原的源码（WebSocket 回帧、待答表的摘除），单文件的 sha256 校验没报。此后每轮变异前后
+    对整个 `src` 树做 sha256 比对。

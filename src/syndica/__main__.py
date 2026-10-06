@@ -420,6 +420,56 @@ async def _export_trace(
     return await exporter.export(store, trace_id)
 
 
+def build_host(io: CliIO, workspace_root: Path) -> RuntimeCliHost:
+    """CLI 与 server 用同一个宿主：模型、价格、回放、导出、信任都在这里接一次。"""
+    from syndica.cli.host import RuntimeCliHost
+    from syndica.cli.modules import installed_entry_points
+    from syndica.cli.trust import real_trust_gate
+
+    return RuntimeCliHost(
+        io=io,
+        model_factory=_configured_model,
+        workspace_root=workspace_root,
+        replayer=_replay_document,
+        exporter=_export_trace,
+        entry_points=installed_entry_points,
+        trust=real_trust_gate(),
+        prices=_default_prices(),
+    )
+
+
+class _ServerControl:
+    """`up` / `down` / `status`：server 依赖（starlette、uvicorn）只在用到时才导入。"""
+
+    def __init__(self, io: CliIO) -> None:
+        self._io = io
+
+    def up(
+        self, config: str, *, port: int, foreground: bool, open_browser: bool
+    ) -> str | CliOutcome:
+        from syndica.serve import up
+
+        return up(
+            self._io,
+            Path.cwd(),
+            os.environ,
+            config=config,
+            port=port,
+            foreground=foreground,
+            open_browser=open_browser,
+        )
+
+    def down(self) -> str | CliOutcome:
+        from syndica.serve import down
+
+        return down(Path.cwd(), os.environ)
+
+    def status(self) -> str | CliOutcome:
+        from syndica.serve import status
+
+        return status(Path.cwd(), os.environ)
+
+
 class _LazyHost:
     def __init__(self, io: CliIO) -> None:
         self._io = io
@@ -427,20 +477,7 @@ class _LazyHost:
 
     def _get(self) -> RuntimeCliHost:
         if self._host is None:
-            from syndica.cli.host import RuntimeCliHost
-            from syndica.cli.modules import installed_entry_points
-            from syndica.cli.trust import real_trust_gate
-
-            self._host = RuntimeCliHost(
-                io=self._io,
-                model_factory=_configured_model,
-                workspace_root=Path.cwd(),
-                replayer=_replay_document,
-                exporter=_export_trace,
-                entry_points=installed_entry_points,
-                trust=real_trust_gate(),
-                prices=_default_prices(),
-            )
+            self._host = build_host(self._io, Path.cwd())
         return self._host
 
     def run_request(self, request: RunRequest) -> str | CliOutcome:
@@ -500,7 +537,7 @@ def entrypoint() -> None:
     host = _LazyHost(io)
     code = EXIT_INTERRUPTED
     try:
-        code = main(host=host, io=io)
+        code = main(host=host, io=io, server=_ServerControl(io))
     except KeyboardInterrupt:
         # main 正在打印第一次 Ctrl-C 的说明时又按了一次：照样不打 traceback。
         code = EXIT_INTERRUPTED

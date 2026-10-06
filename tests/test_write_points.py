@@ -46,6 +46,8 @@ _ANCHORS = (
     'kernel/local_workspace.py',
     'kernel/redaction.py',
     'runner/scenario.py',
+    'serve.py',
+    'server/app.py',
 )
 # 刻意放行的写入与外发：按文件、按写法逐条写死，计数也算。白名单是文件而不是目录：同一目录里的新
 # 文件、同一文件里多出来的一处都会变红。
@@ -85,6 +87,21 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
     'kernel/tools/local.py': ('write_text',),
     # 信任存储：配置文件的绝对路径与它们的摘要，不含密钥；写在工作区之外（M4 D15）。
     'cli/trust.py': ('write_text',),
+    # server 进程：握手之后把 stdout / stderr 接到 /dev/null（什么都不写）；监听套接字上发出的每个
+    # 载荷都经 server/outbound；状态文件只有 pid、端口、进程 nonce 与工作区路径，写在工作区之外。
+    'serve.py': ('os.dup2', 'os.dup2', 'socket.socket', 'write_text'),
+    # 前端产物是随包发布的静态文件；登录响应只含 server 刚铸的令牌，脱敏器改它一个字节它就用不了；
+    # SSE 的流由 sse_frame 逐帧产出；`_Guard` 转发的是应用已经经出口编码好的消息，只追加常量响应头，
+    # 另一处是常量的 websocket.close。
+    'server/app.py': (
+        'FileResponse positional',
+        'Response positional',
+        'StreamingResponse positional',
+        'send positional',
+        'send positional',
+    ),
+    # 出口本身：`encoded` 先把每个字符串叶子脱敏再截断。
+    'server/outbound.py': ('Response positional',),
 }
 
 _CONTENT_METHODS = frozenset({'write_text', 'write_bytes'})
@@ -157,6 +174,12 @@ _MODE_LETTERS = frozenset('rwxabtU+')
 # `http.client` 的 `request(method, url, body)`、`urllib` 的 `Request(url, data)` 与
 # `urlopen(url, data)`。
 _OUTBOUND_BODY_FROM: dict[str, int] = {
+    'FileResponse': 0,
+    'HTMLResponse': 0,
+    'JSONResponse': 0,
+    'PlainTextResponse': 0,
+    'Response': 0,
+    'StreamingResponse': 0,
     'Request': 1,
     'build_request': 2,
     'patch': 1,
@@ -170,9 +193,13 @@ _OUTBOUND_BODY_FROM: dict[str, int] = {
     'urlopen': 1,
 }
 # `.send(x)` 只有一个位置参数时是套接字或 websocket 的发送；`Runtime.send(to, content)` 有两个。
-_OUTBOUND = frozenset({*_OUTBOUND_BODY_FROM, 'send'})
+_OUTBOUND = frozenset({*_OUTBOUND_BODY_FROM, 'send', 'send_bytes', 'send_json', 'send_text'})
 # 按位置给的正文只在认得出是 HTTP 的调用上看：`put(key, value)`、`post(item)` 这类名字在别处多得是。
-_HTTP_MODULES = frozenset({'aiohttp', 'http', 'httpx', 'requests', 'urllib'})
+_HTTP_MODULES = frozenset({'aiohttp', 'http', 'httpx', 'requests', 'starlette', 'urllib'})
+# WebSocket 连接对象上的发送：对象不是从模块里取的，按方法名认。
+_WEBSOCKET_SENDS = frozenset({'send_bytes', 'send_json', 'send_text'})
+# server 的外发出口：每个字符串叶子先脱敏再截断（`server/outbound.py`，由它自己的用例钉住）。
+_SERVER_EXITS = frozenset({'encoded', 'json_response', 'sse_frame'})
 _HTTP_METHODS = frozenset({'DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'})
 _SOCKET_SENDS = frozenset({'sendall', 'sendmsg', 'sendto'})
 _OUTBOUND_BODIES = ('body', 'content', 'data', 'files', 'json')
@@ -359,6 +386,9 @@ class _Checker:
         if self.resolve(func) in _TRANSFORMS:
             return bool(node.args) and self.safe_content(node.args[0])
         if isinstance(func, ast.Name):
+            target = self.resolve(func)
+            if target is not None and target[0] == 'syndica.server.outbound':
+                return target[1] in _SERVER_EXITS
             return any(self.from_redaction(func, name) for name in _REDACTION_NAMES)
         if not isinstance(func, ast.Attribute) or func.attr not in _REDACTION_NAMES:
             return False
@@ -419,7 +449,7 @@ class _Checker:
             and str(first.value).upper() in _HTTP_METHODS
         ):
             return list(call.args[2:])
-        if name in _SOCKET_SENDS:
+        if name in _SOCKET_SENDS or name in _WEBSOCKET_SENDS:
             return list(call.args[:1])
         return list(call.args) if name == 'send' and len(call.args) == 1 else []
 

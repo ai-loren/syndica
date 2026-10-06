@@ -1,0 +1,1597 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Syndica",
+    "version": "1",
+    "description": "syndica 0.0.0 的 HTTP / SSE / WebSocket 面。标 x-syndica-stability: provisional 的字段来自内核里 M12 才冻结的类型，形状仍可能变。"
+  },
+  "paths": {
+    "/api/v1/health": {
+      "get": {
+        "summary": "进程 nonce 与版本；公开",
+        "responses": {
+          "200": {
+            "description": "进程 nonce 与版本；公开",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/login": {
+      "post": {
+        "summary": "一次性登录码换会话令牌",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "一次性登录码换会话令牌",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/doctor": {
+      "get": {
+        "summary": "逐项自检（缺 key、配置改过）",
+        "responses": {
+          "200": {
+            "description": "逐项自检（缺 key、配置改过）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DoctorReport"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/roles": {
+      "get": {
+        "summary": "可以建会话的角色",
+        "responses": {
+          "200": {
+            "description": "可以建会话的角色",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Roles"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "summary": "落盘的与打开着的会话",
+        "responses": {
+          "200": {
+            "description": "落盘的与打开着的会话",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "summary": "建会话，交回快照",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSession"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "建会话，交回快照",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Snapshot"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/resume": {
+      "post": {
+        "summary": "打开落盘的会话",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "打开落盘的会话",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Snapshot"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/close": {
+      "post": {
+        "summary": "关闭（存盘、放锁）",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "关闭（存盘、放锁）"
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}": {
+      "delete": {
+        "summary": "关闭并删除落盘的会话",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "关闭并删除落盘的会话"
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/snapshot": {
+      "get": {
+        "summary": "快照，带 as_of",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "快照，带 as_of",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Snapshot"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/events": {
+      "get": {
+        "summary": "会话事件流（SSE）",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`text/event-stream`；每帧 `id: <epoch>:<seq>`、`event: <种类>`、`data:` 是 EventEnvelope；`reset` 帧没有 id，收到后重取快照",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "summary": "全局事件流（SSE）",
+        "responses": {
+          "200": {
+            "description": "`text/event-stream`；每帧 `id: <epoch>:<seq>`、`event: <种类>`、`data:` 是 EventEnvelope；`reset` 帧没有 id，收到后重取快照",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AgentNode": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "parent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Id"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "name",
+          "parent_id",
+          "status"
+        ],
+        "title": "AgentNode",
+        "type": "object"
+      },
+      "ArtifactOut": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "mime": {
+            "title": "Mime",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          },
+          "producer": {
+            "title": "Producer",
+            "type": "string"
+          },
+          "is_deliverable": {
+            "title": "Is Deliverable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "path",
+          "kind",
+          "mime",
+          "version",
+          "producer",
+          "is_deliverable"
+        ],
+        "title": "ArtifactOut",
+        "type": "object"
+      },
+      "Block": {
+        "additionalProperties": false,
+        "properties": {
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "trust": {
+            "enum": [
+              "trusted",
+              "untrusted"
+            ],
+            "title": "Trust",
+            "type": "string"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "tool_calls": {
+            "items": {
+              "$ref": "#/components/schemas/ToolCallOut"
+            },
+            "title": "Tool Calls",
+            "type": "array"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Call Id"
+          },
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactOut"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "tool_meta": {
+            "additionalProperties": true,
+            "title": "Tool Meta",
+            "type": "object"
+          }
+        },
+        "required": [
+          "role",
+          "text",
+          "trust",
+          "kind",
+          "tool_calls",
+          "tool_call_id",
+          "artifacts",
+          "tool_meta"
+        ],
+        "title": "Block",
+        "type": "object"
+      },
+      "BudgetRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "tokens": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tokens"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "十进制金额字符串，例如 \"0.50\"",
+            "title": "Cost"
+          },
+          "wall_clock_s": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Wall Clock S"
+          },
+          "turns": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turns"
+          }
+        },
+        "title": "BudgetRequest",
+        "type": "object"
+      },
+      "CreateSession": {
+        "additionalProperties": false,
+        "properties": {
+          "role": {
+            "default": "Orchestrator",
+            "title": "Role",
+            "type": "string"
+          },
+          "budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BudgetRequest"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "title": "CreateSession",
+        "type": "object"
+      },
+      "DoctorCheck": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "expected": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expected"
+          },
+          "received": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Received"
+          },
+          "next_action": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Next Action"
+          }
+        },
+        "required": [
+          "name",
+          "ok"
+        ],
+        "title": "DoctorCheck",
+        "type": "object"
+      },
+      "DoctorReport": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/DoctorCheck"
+            },
+            "title": "Checks",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "checks"
+        ],
+        "title": "DoctorReport",
+        "type": "object"
+      },
+      "ErrorBody": {
+        "additionalProperties": false,
+        "properties": {
+          "expected": {
+            "title": "Expected",
+            "type": "string"
+          },
+          "received": {
+            "title": "Received",
+            "type": "string"
+          },
+          "next_action": {
+            "title": "Next Action",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected",
+          "received",
+          "next_action"
+        ],
+        "title": "ErrorBody",
+        "type": "object"
+      },
+      "EventEnvelope": {
+        "additionalProperties": false,
+        "description": "SSE 一条事件的 data：`event:` 行是种类，`id:` 行是 `<epoch>:<seq>`。",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent Id"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "time_ns": {
+            "default": 0,
+            "title": "Time Ns",
+            "type": "integer"
+          },
+          "sid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sid"
+          },
+          "seq": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Seq"
+          }
+        },
+        "title": "EventEnvelope",
+        "type": "object"
+      },
+      "Health": {
+        "additionalProperties": false,
+        "properties": {
+          "nonce": {
+            "title": "Nonce",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "nonce",
+          "version"
+        ],
+        "title": "Health",
+        "type": "object"
+      },
+      "LoginRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "LoginRequest",
+        "type": "object"
+      },
+      "LoginResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "LoginResponse",
+        "type": "object"
+      },
+      "PendingRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "confirmation",
+              "user_input",
+              "user_question",
+              "budget"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "kind",
+          "agent_id"
+        ],
+        "title": "PendingRequest",
+        "type": "object"
+      },
+      "Roles": {
+        "additionalProperties": false,
+        "properties": {
+          "roles": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Roles",
+            "type": "array"
+          }
+        },
+        "required": [
+          "roles"
+        ],
+        "title": "Roles",
+        "type": "object"
+      },
+      "RpcReply": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Result"
+          }
+        },
+        "required": [
+          "id",
+          "ok"
+        ],
+        "title": "RpcReply",
+        "type": "object"
+      },
+      "RpcRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "op": {
+            "enum": [
+              "auth",
+              "send",
+              "answer",
+              "abort",
+              "grant",
+              "budget_answer"
+            ],
+            "title": "Op",
+            "type": "string"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Id"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "title": "RpcRequest",
+        "type": "object"
+      },
+      "SessionList": {
+        "additionalProperties": false,
+        "properties": {
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/SessionSummary"
+            },
+            "title": "Sessions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "title": "SessionList",
+        "type": "object"
+      },
+      "SessionSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "sid": {
+            "title": "Sid",
+            "type": "string"
+          },
+          "agent": {
+            "title": "Agent",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "turns": {
+            "title": "Turns",
+            "type": "integer"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "number"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "number"
+          },
+          "live": {
+            "title": "Live",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "sid",
+          "agent",
+          "status",
+          "turns",
+          "created_at",
+          "updated_at",
+          "live"
+        ],
+        "title": "SessionSummary",
+        "type": "object"
+      },
+      "Snapshot": {
+        "additionalProperties": false,
+        "properties": {
+          "sid": {
+            "title": "Sid",
+            "type": "string"
+          },
+          "root_id": {
+            "title": "Root Id",
+            "type": "string"
+          },
+          "as_of": {
+            "title": "As Of",
+            "type": "string"
+          },
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/AgentNode"
+            },
+            "title": "Agents",
+            "type": "array"
+          },
+          "transcripts": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Transcript"
+            },
+            "title": "Transcripts",
+            "type": "object"
+          },
+          "budget": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget",
+            "x-syndica-stability": "provisional"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress",
+            "x-syndica-stability": "provisional"
+          },
+          "pending": {
+            "items": {
+              "$ref": "#/components/schemas/PendingRequest"
+            },
+            "title": "Pending",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sid",
+          "root_id",
+          "as_of",
+          "agents",
+          "transcripts",
+          "budget",
+          "progress",
+          "pending"
+        ],
+        "title": "Snapshot",
+        "type": "object"
+      },
+      "ToolCallOut": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "arguments": {
+            "title": "Arguments",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "arguments"
+        ],
+        "title": "ToolCallOut",
+        "type": "object"
+      },
+      "Transcript": {
+        "additionalProperties": false,
+        "properties": {
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "blocks": {
+            "items": {
+              "$ref": "#/components/schemas/Block"
+            },
+            "title": "Blocks",
+            "type": "array"
+          }
+        },
+        "required": [
+          "generation",
+          "blocks"
+        ],
+        "title": "Transcript",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "x-syndica-events": {
+    "agent_end": {
+      "type": "object",
+      "required": [
+        "stop_reason"
+      ],
+      "properties": {
+        "stop_reason": {}
+      },
+      "additionalProperties": true
+    },
+    "agent_error": {
+      "type": "object",
+      "required": [
+        "error_type",
+        "expected",
+        "received",
+        "next_action"
+      ],
+      "properties": {
+        "error_type": {},
+        "expected": {},
+        "received": {},
+        "next_action": {}
+      },
+      "additionalProperties": true
+    },
+    "agent_removed": {
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "additionalProperties": true
+    },
+    "agent_spawned": {
+      "type": "object",
+      "required": [
+        "parent_id",
+        "name"
+      ],
+      "properties": {
+        "parent_id": {},
+        "name": {}
+      },
+      "additionalProperties": true
+    },
+    "agent_start": {
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "additionalProperties": true
+    },
+    "agent_status": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {}
+      },
+      "additionalProperties": true
+    },
+    "artifact_registered": {
+      "type": "object",
+      "required": [
+        "ref"
+      ],
+      "properties": {
+        "ref": {}
+      },
+      "additionalProperties": true
+    },
+    "budget_changed": {
+      "type": "object",
+      "required": [
+        "view"
+      ],
+      "properties": {
+        "view": {}
+      },
+      "additionalProperties": true
+    },
+    "budget_exhausted": {
+      "type": "object",
+      "required": [
+        "dimensions",
+        "disposition"
+      ],
+      "properties": {
+        "dimensions": {},
+        "disposition": {}
+      },
+      "additionalProperties": true
+    },
+    "budget_question": {
+      "type": "object",
+      "required": [
+        "request_id",
+        "view"
+      ],
+      "properties": {
+        "request_id": {},
+        "view": {}
+      },
+      "additionalProperties": true
+    },
+    "budget_question_resolved": {
+      "type": "object",
+      "required": [
+        "request_id"
+      ],
+      "properties": {
+        "request_id": {}
+      },
+      "additionalProperties": true
+    },
+    "compaction": {
+      "type": "object",
+      "required": [
+        "trigger",
+        "blocks_before",
+        "blocks_after",
+        "tokens_before",
+        "tokens_after"
+      ],
+      "properties": {
+        "trigger": {},
+        "blocks_before": {},
+        "blocks_after": {},
+        "tokens_before": {},
+        "tokens_after": {}
+      },
+      "additionalProperties": true
+    },
+    "goal_drift": {
+      "type": "object",
+      "required": [
+        "confirmed"
+      ],
+      "properties": {
+        "confirmed": {}
+      },
+      "additionalProperties": true
+    },
+    "human_request_resolved": {
+      "type": "object",
+      "required": [
+        "request_id",
+        "outcome"
+      ],
+      "properties": {
+        "request_id": {},
+        "outcome": {}
+      },
+      "additionalProperties": true
+    },
+    "message_appended": {
+      "type": "object",
+      "required": [
+        "generation",
+        "index",
+        "block"
+      ],
+      "properties": {
+        "generation": {},
+        "index": {},
+        "block": {}
+      },
+      "additionalProperties": true
+    },
+    "progress_regressed": {
+      "type": "object",
+      "required": [
+        "rubrics"
+      ],
+      "properties": {
+        "rubrics": {}
+      },
+      "additionalProperties": true
+    },
+    "progress_stalled": {
+      "type": "object",
+      "required": [
+        "turns"
+      ],
+      "properties": {
+        "turns": {}
+      },
+      "additionalProperties": true
+    },
+    "reset": {
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "additionalProperties": true
+    },
+    "session_closed": {
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "additionalProperties": true
+    },
+    "session_opened": {
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "additionalProperties": true
+    },
+    "tool_call_finished": {
+      "type": "object",
+      "required": [
+        "tool_call_id",
+        "outcome"
+      ],
+      "properties": {
+        "tool_call_id": {},
+        "outcome": {}
+      },
+      "additionalProperties": true
+    },
+    "tool_call_started": {
+      "type": "object",
+      "required": [
+        "tool_call_id",
+        "name",
+        "arguments"
+      ],
+      "properties": {
+        "tool_call_id": {},
+        "name": {},
+        "arguments": {}
+      },
+      "additionalProperties": true
+    },
+    "tool_confirmation_requested": {
+      "type": "object",
+      "required": [
+        "request_id",
+        "tool_call_id",
+        "tool_name",
+        "arguments",
+        "verdict",
+        "untrusted"
+      ],
+      "properties": {
+        "request_id": {},
+        "tool_call_id": {},
+        "tool_name": {},
+        "arguments": {},
+        "verdict": {},
+        "untrusted": {}
+      },
+      "additionalProperties": true
+    },
+    "transcript_reset": {
+      "type": "object",
+      "required": [
+        "generation",
+        "reason"
+      ],
+      "properties": {
+        "generation": {},
+        "reason": {}
+      },
+      "additionalProperties": true
+    },
+    "turn_end": {
+      "type": "object",
+      "required": [
+        "turn"
+      ],
+      "properties": {
+        "turn": {}
+      },
+      "additionalProperties": true
+    },
+    "turn_start": {
+      "type": "object",
+      "required": [
+        "turn"
+      ],
+      "properties": {
+        "turn": {}
+      },
+      "additionalProperties": true
+    },
+    "user_input_requested": {
+      "type": "object",
+      "required": [
+        "request_id",
+        "question"
+      ],
+      "properties": {
+        "request_id": {},
+        "question": {}
+      },
+      "additionalProperties": true
+    },
+    "user_question_requested": {
+      "type": "object",
+      "required": [
+        "request_id",
+        "question",
+        "options"
+      ],
+      "properties": {
+        "request_id": {},
+        "question": {},
+        "options": {}
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-syndica-rpc": {
+    "path": "/api/v1/sessions/{sid}/rpc",
+    "first_frame": "auth",
+    "request": {
+      "$ref": "#/components/schemas/RpcRequest"
+    },
+    "reply": {
+      "$ref": "#/components/schemas/RpcReply"
+    },
+    "ops": {
+      "abort": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "type": "string"
+          }
+        }
+      },
+      "answer": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "auth": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        }
+      },
+      "budget_answer": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BudgetRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "grant": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "type": "string"
+          },
+          "budget": {
+            "$ref": "#/components/schemas/BudgetRequest"
+          }
+        }
+      },
+      "send": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

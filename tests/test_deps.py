@@ -296,4 +296,13 @@ def test_every_top_level_entry_of_the_real_package_is_classified():
         for entry in os.scandir(package)
         if entry.name != '__pycache__' and (entry.is_dir() or entry.name.endswith('.py'))
     }
-    assert names == {'__init__', '__main__', 'backends', 'cli', 'kernel', 'runner'}
+    assert names == {
+        '__init__',
+        '__main__',
+        'backends',
+        'cli',
+        'kernel',
+        'runner',
+        'serve',
+        'server',
+    }

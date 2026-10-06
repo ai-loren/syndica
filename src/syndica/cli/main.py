@@ -41,6 +41,9 @@ _COMMANDS = frozenset(
         'artifacts',
         'config',
         'doctor',
+        'up',
+        'down',
+        'status',
         'version',
         'trace',
     }
@@ -147,6 +150,44 @@ class CliIO:
     stderr: TextIO
 
 
+class ServerControl(Protocol):
+    """`up` / `down` / `status`：由组合根实现（server 是另一个 surface，CLI 不 import 它）。"""
+
+    def up(
+        self, config: str, *, port: int, foreground: bool, open_browser: bool
+    ) -> str | CliOutcome: ...
+
+    def down(self) -> str | CliOutcome: ...
+
+    def status(self) -> str | CliOutcome: ...
+
+
+def _server_command(
+    namespace: argparse.Namespace, server: ServerControl | None, streams: CliIO
+) -> int:
+    if server is None:
+        _write(
+            streams.stderr,
+            '期望: 从 syndica 命令行入口运行 up / down / status\n'
+            '实际: 这个入口没有接上 server 控制\n'
+            '下一步: 用安装好的 syndica 命令（或 python -m syndica）运行',
+        )
+        return 2
+    if namespace.command == 'up':
+        return _host_call(
+            lambda: server.up(
+                namespace.config,
+                port=namespace.port,
+                foreground=namespace.foreground,
+                open_browser=not namespace.no_open,
+            ),
+            streams,
+        )
+    if namespace.command == 'down':
+        return _host_call(server.down, streams)
+    return _host_call(server.status, streams)
+
+
 class CliHost(Protocol):
     """Runtime behavior injected behind the dependency-light router."""
 
@@ -196,6 +237,18 @@ class _ArgumentParser(argparse.ArgumentParser):
             f'实际: {message}\n'
             f'下一步: 运行 {self.prog} --help 查看可用参数',
         )
+
+
+def _port(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            'must be a port number 0-65535 (0 = pick a free one)'
+        ) from exc
+    if not 0 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError('must be a port number 0-65535 (0 = pick a free one)')
+    return parsed
 
 
 def _positive_int(value: str) -> int:
@@ -368,6 +421,12 @@ def _parser() -> _ArgumentParser:
         action='store_true',
         help='自检之后在 Agent 的环境里逐条跑 workspace.verify，任一条失败退出 1',
     )
+    up = commands.add_parser('up', help='在本机起 Web 服务，打印一次性登录链接')
+    up.add_argument('--port', type=_port, default=0, help='监听端口；不给就由系统挑一个空闲的')
+    up.add_argument('--foreground', action='store_true', help='在前台跑，Ctrl-C 停')
+    up.add_argument('--no-open', action='store_true', help='不自动打开浏览器')
+    commands.add_parser('down', help='停掉这个工作区的 Web 服务（会话先存盘）')
+    commands.add_parser('status', help='这个工作区的 Web 服务在不在跑')
     commands.add_parser('version')
     trace = commands.add_parser('trace')
     trace_actions = trace.add_subparsers(dest='action', required=True)
@@ -594,11 +653,12 @@ def main(
     argv: Sequence[str] | None = None,
     host: CliHost | None = None,
     io: CliIO | None = None,
+    server: ServerControl | None = None,
 ) -> int:
     """Route one CLI invocation."""
     streams = io or CliIO(stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
     try:
-        return _route(list(sys.argv[1:] if argv is None else argv), host, streams)
+        return _route(list(sys.argv[1:] if argv is None else argv), host, streams, server)
     except KeyboardInterrupt:
         # `run --handoff` 的 Ctrl-C 在宿主里处理并写明停在哪；到这里的是普通 run、chat、强制退出，
         # 以及落在宿主交回结论与打印之间的按键——那时命令已经做完，所以只能说「可能」。
@@ -610,7 +670,12 @@ def main(
         return EXIT_INTERRUPTED
 
 
-def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
+def _route(
+    received: list[str],
+    host: CliHost | None,
+    streams: CliIO,
+    server: ServerControl | None = None,
+) -> int:
     first = _first_positional(received)
     if first is not None and first.startswith('-') and first not in {'-h', '--help'}:
         _write(
@@ -672,6 +737,8 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
     if namespace.command == 'version':
         _write(streams.stdout, f'syndica {__version__}')
         return 0
+    if namespace.command in ('up', 'down', 'status'):
+        return _server_command(namespace, server, streams)
     if namespace.command == 'memory':
         if host is None:
             _write(

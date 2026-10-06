@@ -3,10 +3,15 @@
 import os
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
+import pytest
+
+from syndica.cli import host as host_module
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO, main
 from syndica.cli.trust import NO_TRUST_GATE
+from syndica.kernel import Runtime
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 
 
@@ -129,3 +134,51 @@ def test_run_session_resumes_one_shot_across_processes(tmp_path: Path) -> None:
     )
     assert code == 0
     assert 'resumed answer' in stdout
+
+
+def test_a_resume_takes_the_session_lock_before_it_revives_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cli(tmp_path, _done(), ['run', 'go', '--agent', 'Worker'])
+    [sid] = _session_ids(tmp_path)
+    order: list[str] = []
+    real_lock = host_module.acquire_session_lock
+    real_ensure = Runtime.ensure_active
+
+    def lock(root: Path, name: str) -> Any:
+        order.append(f'lock {name}')
+        return real_lock(root, name)
+
+    async def ensure(self: Runtime, agent_id: str) -> bool:
+        order.append(f'ensure_active {agent_id}')
+        return await real_ensure(self, agent_id)
+
+    monkeypatch.setattr(host_module, 'acquire_session_lock', lock)
+    monkeypatch.setattr(Runtime, 'ensure_active', ensure)
+    code, _, stderr = _cli(tmp_path, _done('again'), ['sessions', 'resume', sid], stdin='hi\n')
+    assert code == 0, stderr
+    assert order[:2] == [f'lock {sid}', f'ensure_active {sid}']
+
+
+def test_a_new_chat_locks_the_session_id_its_spawn_returned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    real_lock = host_module.acquire_session_lock
+    real_spawn = Runtime.spawn
+
+    def lock(root: Path, name: str) -> Any:
+        order.append(f'lock {name}')
+        return real_lock(root, name)
+
+    async def spawn(self: Runtime, *args: Any, **kwargs: Any) -> str:
+        agent_id = await real_spawn(self, *args, **kwargs)
+        order.append(f'spawn {agent_id}')
+        return agent_id
+
+    monkeypatch.setattr(host_module, 'acquire_session_lock', lock)
+    monkeypatch.setattr(Runtime, 'spawn', spawn)
+    code, _, stderr = _cli(tmp_path, _done('hello'), ['chat'], stdin='hi\n')
+    assert code == 0, stderr
+    [sid] = _session_ids(tmp_path)
+    assert order == [f'spawn {sid}', f'lock {sid}']

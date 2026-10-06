@@ -759,9 +759,9 @@ def test_module_entrypoint_doctor_builds_the_openai_composition_without_network(
     assert completed.stderr == ''
 
 
-# doctor 的 env 行：固定白名单里宿主实际有的，加宿主自己设的四个；任何 *_KEY 都不在里面。
+# doctor 的 env 行：固定白名单里宿主实际有的，加宿主自己设的那几个；任何 *_KEY 都不在里面。
 _HOST_SET = ['GIT_TERMINAL_PROMPT', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GH_CONFIG_DIR']
-_HOST_SET += ['GH_TOKEN', 'GH_ENTERPRISE_TOKEN', 'SYNDICA_TRUST_STORE']
+_HOST_SET += ['GH_TOKEN', 'GH_ENTERPRISE_TOKEN', 'SYNDICA_TRUST_STORE', 'SYNDICA_AGENT_ENV']
 _FIXED = ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR']
 _FIXED += ['XDG_CACHE_HOME', 'UV_CACHE_DIR']
 _EXPECTED_AGENT_ENV = [name for name in _FIXED if name in os.environ] + _HOST_SET

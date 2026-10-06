@@ -18,6 +18,7 @@ from types import MappingProxyType
 from syndica.kernel import ConfigError
 
 __all__ = [
+    'AGENT_MARKER',
     'FIXED_PASS_ENV',
     'HOST_SET_ENV',
     'AgentEnvironment',
@@ -48,6 +49,7 @@ HOST_SET_ENV: tuple[str, ...] = (
     'GH_TOKEN',
     'GH_ENTERPRISE_TOKEN',
     'SYNDICA_TRUST_STORE',
+    'SYNDICA_AGENT_ENV',
 )
 # 这些名字会让 Agent 的 git 重新用上配置、凭证、别的仓库或别的可执行文件，`pass_env` 同样不收。
 _GIT_REOPENERS = re.compile(
@@ -61,6 +63,7 @@ _GIT_CONFIG = '[safe]\n\tbareRepository = explicit\n'
 # gh 就用它、认证失败，Agent 失手调 gh 不会在远端留下任何效果。刻意去钥匙串里取（`gh auth token
 # --user`、`security find-generic-password`）挡不住，见 D5。
 _NO_GH_LOGIN = 'syndica-agent-has-no-github-login'
+AGENT_MARKER = 'SYNDICA_AGENT_ENV'
 
 
 def valid_env_name(name: str) -> bool:
@@ -124,6 +127,9 @@ def agent_environment(
             'GH_ENTERPRISE_TOKEN': _NO_GH_LOGIN,
             # Agent 里嵌套起来的 syndica 把信任记在这次 run 的临时目录里，碰不到用户的信任存储。
             'SYNDICA_TRUST_STORE': str(scratch / 'trusted.json'),
+            # 嵌套起来的 syndica 认得自己在 Agent 里：`up` / `down` 据此拒绝——起 server 就是给自己
+            # 发一份人的登录码，停 server 就是掐断人的会话。
+            AGENT_MARKER: '1',
         }
     )
     return AgentEnvironment(values=MappingProxyType(values), scratch=scratch)

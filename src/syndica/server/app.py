@@ -1,0 +1,529 @@
+"""HTTP / SSE / WebSocket 路由。
+
+处理器只经 server 自己的 Protocol 与内核公开类型做事；交出去的每个载荷都经 `outbound`（先脱敏再
+截断）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any, TypeVar
+
+from pydantic import BaseModel, ValidationError
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import FileResponse, Response, StreamingResponse
+from starlette.routing import Route, WebSocketRoute
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.websockets import WebSocket, WebSocketDisconnect
+
+from syndica.kernel import Budget, Redactor, SyndicaError
+from syndica.server.auth import SECURITY_HEADERS, Credentials, check_host, check_origin
+from syndica.server.errors import ApiError, error_body
+from syndica.server.live import Live, LiveSession
+from syndica.server.models import (
+    BudgetRequest,
+    CreateSession,
+    DoctorReport,
+    ErrorBody,
+    Health,
+    LoginRequest,
+    LoginResponse,
+    Roles,
+    RpcReply,
+    RpcRequest,
+    SessionList,
+    SessionSummary,
+    Snapshot,
+)
+from syndica.server.outbound import encoded, json_response, sse_frame
+
+__all__ = ['MAX_STREAMS', 'ServerSettings', 'create_app']
+
+logger = logging.getLogger(__name__)
+
+MAX_STREAMS = 16
+_AUTH_TIMEOUT_S = 5.0
+_ModelT = TypeVar('_ModelT', bound=BaseModel)
+_Handler = Callable[[Request], Awaitable[Response]]
+
+
+class ServerSettings:
+    def __init__(
+        self, *, port: int, nonce: str, version: str, static_dir: Path | None = None
+    ) -> None:
+        self.port = port
+        self.nonce = nonce
+        self.version = version
+        self.static_dir = static_dir
+
+
+class _Guard:
+    """每个请求的 Host 检查与安全响应头。纯 ASGI：不经 BaseHTTPMiddleware，SSE 的流照常一块块走。"""
+
+    def __init__(self, app: ASGIApp, settings: ServerSettings, redactor: Redactor) -> None:
+        self._app = app
+        self._settings = settings
+        self._redactor = redactor
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope['type'] not in ('http', 'websocket'):
+            await self._app(scope, receive, send)
+            return
+        headers = {
+            key.decode('latin-1'): value.decode('latin-1') for key, value in scope['headers']
+        }
+        try:
+            check_host(headers.get('host'), self._settings.port)
+            check_origin(headers.get('origin'), self._settings.port)
+        except ApiError as error:
+            if scope['type'] == 'websocket':
+                await send({'type': 'websocket.close', 'code': 4403})
+                return
+            response = Response(
+                encoded(error_body(error), self._redactor),
+                status_code=error.status,
+                media_type='application/json',
+                headers=SECURITY_HEADERS,
+            )
+            await response(scope, receive, send)
+            return
+
+        async def with_headers(message: Message) -> None:
+            if message['type'] == 'http.response.start':
+                existing = {key.lower() for key, _ in message.get('headers', [])}
+                extra = [
+                    (key.lower().encode(), value.encode())
+                    for key, value in SECURITY_HEADERS.items()
+                    if key.lower().encode() not in existing
+                ]
+                message = {**message, 'headers': [*message.get('headers', []), *extra]}
+            await send(message)
+
+        await self._app(scope, receive, with_headers)
+
+
+def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -> ASGIApp:
+    host_redactor = live.assembly.redactor()
+    streams = _StreamLimit()
+
+    def guarded(handler: _Handler, *, public: bool = False) -> _Handler:
+        async def run(request: Request) -> Response:
+            try:
+                if not public:
+                    credentials.require(request.headers.get('authorization'))
+                return await handler(request)
+            except ApiError as error:
+                return _error(error, host_redactor)
+            except SyndicaError as error:
+                return _error(ApiError.of(400, error), host_redactor)
+            except Exception:
+                logger.exception('期望: 处理器正常返回。 实际: 抛出未预期的异常。 下一步: 看栈。')
+                return _error(
+                    ApiError(
+                        500,
+                        expected='server 正常处理这个请求',
+                        received='处理时抛出了未预期的异常（细节在 server 日志里）',
+                        next_action='看 syndica status 给出的日志文件；问题复现时附上它报告',
+                    ),
+                    host_redactor,
+                )
+
+        return run
+
+    async def health(_: Request) -> Response:
+        return json_response(
+            Health(nonce=settings.nonce, version=settings.version).model_dump(), host_redactor
+        )
+
+    async def login(request: Request) -> Response:
+        body = await _body(request, LoginRequest)
+        token = credentials.exchange(body.code)
+        # 只含 server 刚铸的令牌、不含任何用户数据，不经脱敏器：令牌被改一个字节就用不了。
+        return Response(LoginResponse(token=token).model_dump_json(), media_type='application/json')
+
+    async def doctor(_: Request) -> Response:
+        checks = live.assembly.doctor()
+        report = DoctorReport(ok=all(check.get('ok') for check in checks), checks=checks)  # pyright: ignore[reportArgumentType]
+        return json_response(report.model_dump(), host_redactor)
+
+    async def roles(_: Request) -> Response:
+        return json_response(Roles(roles=live.assembly.roles()).model_dump(), host_redactor)
+
+    async def list_sessions(_: Request) -> Response:
+        stored = {meta['sid']: meta for meta in await live.assembly.list_sessions()}
+        rows = [
+            SessionSummary.model_validate({**meta, 'live': sid in live.sessions}).model_dump()
+            for sid, meta in stored.items()
+        ]
+        for sid in live.sessions:
+            if sid not in stored:
+                rows.append(_unsaved(live.sessions[sid]).model_dump())
+        return json_response(SessionList(sessions=rows).model_dump(), host_redactor)  # pyright: ignore[reportArgumentType]
+
+    async def create_session(request: Request) -> Response:
+        body = await _body(request, CreateSession, empty_ok=True)
+        budget = body.budget or BudgetRequest()
+        session = await live.open_session(
+            resume=None,
+            role=body.role,
+            tokens=budget.tokens,
+            cost=_decimal(budget.cost),
+            wall_clock_s=budget.wall_clock_s,
+            turns=budget.turns,
+        )
+        return await _snapshot(session, status=201)
+
+    async def resume_session(request: Request) -> Response:
+        sid = request.path_params['sid']
+        session = await live.open_session(resume=sid, role='Orchestrator')
+        return await _snapshot(session)
+
+    async def close_session(request: Request) -> Response:
+        await live.close(request.path_params['sid'])
+        return Response(status_code=204)
+
+    async def remove_session(request: Request) -> Response:
+        sid = request.path_params['sid']
+        await live.close(sid)
+        await live.assembly.remove_session(sid)
+        return Response(status_code=204)
+
+    async def snapshot(request: Request) -> Response:
+        return await _snapshot(live.get(request.path_params['sid']))
+
+    async def _snapshot(session: LiveSession, *, status: int = 200) -> Response:
+        state = Snapshot.model_validate(await session.snapshot())
+        return json_response(state.model_dump(), session.handle.redactor(), status=status)
+
+    async def session_events(request: Request) -> Response:
+        session = live.get(request.path_params['sid'])
+        return _sse(request, session.stream.epoch, session.stream.follow, session.handle.redactor())
+
+    async def global_events(request: Request) -> Response:
+        return _sse(request, live.stream.epoch, live.stream.follow, host_redactor)
+
+    def _sse(
+        request: Request,
+        epoch: str,
+        follow: Callable[[str | None], AsyncIterator[Any]],
+        redactor: Redactor,
+    ) -> Response:
+        streams.take()
+        last = request.headers.get('last-event-id') or request.query_params.get('last_event_id')
+
+        async def frames() -> AsyncIterator[str]:
+            live.attach()
+            try:
+                async for item in follow(last):
+                    yield sse_frame(epoch, item, redactor)
+            finally:
+                live.detach()
+                streams.give()
+
+        return StreamingResponse(
+            frames(),
+            media_type='text/event-stream',
+            headers={'X-Accel-Buffering': 'no'},
+        )
+
+    async def rpc(websocket: WebSocket) -> None:
+        sid = websocket.path_params['sid']
+        if not streams.available():
+            await websocket.close(code=1013)
+            return
+        await websocket.accept()
+        streams.take()
+        try:
+            await _rpc_session(websocket, sid)
+        finally:
+            streams.give()
+
+    async def _rpc_session(websocket: WebSocket, sid: str) -> None:
+        try:
+            async with asyncio.timeout(_AUTH_TIMEOUT_S):
+                first = await websocket.receive_text()
+        except (TimeoutError, WebSocketDisconnect):
+            await _close(websocket, 4401)
+            return
+        frame = _frame(first)
+        if frame is None or frame.op != 'auth' or not credentials.valid(_extra(frame).get('token')):
+            await _close(websocket, 4401)
+            return
+        session = live.sessions.get(sid)
+        if session is None:
+            await _close(websocket, 4404)
+            return
+        redactor = session.handle.redactor()
+        await websocket.send_text(encoded(RpcReply(id=frame.id, ok=True).model_dump(), redactor))
+        live.attach()
+        try:
+            while True:
+                try:
+                    raw = await websocket.receive_text()
+                except WebSocketDisconnect:
+                    return
+                reply = await _dispatch(session, raw)
+                await websocket.send_text(encoded(reply.model_dump(), redactor))
+        finally:
+            live.detach()
+
+    routes = [
+        Route('/api/v1/health', guarded(health, public=True), methods=['GET']),
+        Route('/api/v1/login', guarded(login, public=True), methods=['POST']),
+        Route('/api/v1/doctor', guarded(doctor), methods=['GET']),
+        Route('/api/v1/roles', guarded(roles), methods=['GET']),
+        Route('/api/v1/sessions', guarded(list_sessions), methods=['GET']),
+        Route('/api/v1/sessions', guarded(create_session), methods=['POST']),
+        Route('/api/v1/sessions/{sid}/resume', guarded(resume_session), methods=['POST']),
+        Route('/api/v1/sessions/{sid}/close', guarded(close_session), methods=['POST']),
+        Route('/api/v1/sessions/{sid}', guarded(remove_session), methods=['DELETE']),
+        Route('/api/v1/sessions/{sid}/snapshot', guarded(snapshot), methods=['GET']),
+        Route('/api/v1/sessions/{sid}/events', guarded(session_events), methods=['GET']),
+        Route('/api/v1/events', guarded(global_events), methods=['GET']),
+        WebSocketRoute('/api/v1/sessions/{sid}/rpc', rpc),
+        Route('/{path:path}', _static(settings.static_dir, host_redactor), methods=['GET']),
+    ]
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: Starlette) -> AsyncGenerator[None]:
+        try:
+            yield
+        finally:
+            await live.shutdown()
+
+    app = Starlette(routes=routes, lifespan=lifespan)
+    return _Guard(app, settings, host_redactor)
+
+
+class _StreamLimit:
+    def __init__(self) -> None:
+        self._open = 0
+
+    def available(self) -> bool:
+        return self._open < MAX_STREAMS
+
+    def take(self) -> None:
+        if not self.available():
+            raise ApiError(
+                429,
+                expected=f'同时开着的事件流与 WebSocket 不超过 {MAX_STREAMS} 个',
+                received=f'已经开着 {self._open} 个',
+                next_action='关掉多余的标签页；每个标签页开一个事件流',
+            )
+        self._open += 1
+
+    def give(self) -> None:
+        self._open -= 1
+
+
+async def _dispatch(session: LiveSession, raw: str) -> RpcReply:
+    frame = _frame(raw)
+    if frame is None:
+        return RpcReply(id=None, ok=False, error=ErrorBody.model_validate(_bad_frame(raw)))
+    try:
+        result = await _run_op(session, frame)
+    except ApiError as error:
+        return RpcReply(id=frame.id, ok=False, error=ErrorBody.model_validate(error_body(error)))
+    except SyndicaError as error:
+        body = error_body(ApiError.of(400, error))
+        return RpcReply(id=frame.id, ok=False, error=ErrorBody.model_validate(body))
+    return RpcReply(id=frame.id, ok=True, result=result)
+
+
+async def _run_op(session: LiveSession, frame: RpcRequest) -> dict[str, Any] | None:
+    extra = _extra(frame)
+    handle = session.handle
+    if frame.op == 'send':
+        target = _text(extra, 'target', default=handle.root_id)
+        delivered = await handle.deliver(target, _text(extra, 'text'))
+        if not delivered.ok:
+            raise ApiError(
+                409,
+                expected=f'把消息交给 agent {target}',
+                received=delivered.reason or '内核没有给出原因',
+                next_action='重取会话快照看它现在的状态，或换一个对象',
+            )
+        return {'message_id': delivered.message_id}
+    if frame.op == 'answer':
+        await session.answer(_text(extra, 'request_id'), _text(extra, 'text'))
+        return None
+    if frame.op == 'abort':
+        await handle.abort(_text(extra, 'agent_id', default=handle.root_id))
+        return None
+    if frame.op == 'grant':
+        budget = _budget(_model(BudgetRequest, extra.get('budget')))
+        view = handle.grant(_text(extra, 'agent_id', default=handle.root_id), budget)
+        return {'view': view}
+    if frame.op == 'budget_answer':
+        raw = extra.get('budget')
+        session.answer_budget(
+            _text(extra, 'request_id'),
+            None if raw is None else _budget(_model(BudgetRequest, raw)),
+        )
+        return None
+    raise ApiError(
+        400,
+        expected='连接认证之后的帧是 send / answer / abort / grant / budget_answer 之一',
+        received=f'op={frame.op!r}',
+        next_action='换成上面列出的操作',
+    )
+
+
+def _frame(raw: str) -> RpcRequest | None:
+    try:
+        return RpcRequest.model_validate_json(raw)
+    except ValidationError:
+        return None
+
+
+def _extra(frame: RpcRequest) -> dict[str, Any]:
+    return dict(frame.model_extra or {})
+
+
+def _bad_frame(raw: str) -> dict[str, str]:
+    return {
+        'expected': 'JSON 对象 {"op": ..., "id": ..., ...}，op 是已知操作之一',
+        'received': f'收到 {raw[:200]!r}',
+        'next_action': '按 OpenAPI 文档 x-syndica-rpc 里的帧格式发送',
+    }
+
+
+def _text(extra: dict[str, Any], key: str, *, default: str | None = None) -> str:
+    value = extra.get(key, default)
+    if not isinstance(value, str) or not value:
+        raise ApiError(
+            422,
+            expected=f'帧里有非空字符串字段 {key!r}',
+            received=f'{key}={value!r}',
+            next_action=f'补上 {key} 再发',
+        )
+    return value
+
+
+def _model(model: type[_ModelT], value: object) -> _ModelT:
+    try:
+        return model.model_validate(value)
+    except ValidationError as error:
+        raise ApiError(
+            422,
+            expected=f'{model.__name__} 形状的 JSON',
+            received='; '.join(
+                f'{".".join(str(part) for part in issue["loc"]) or "(根)"}: {issue["msg"]}'
+                for issue in error.errors()
+            ),
+            next_action='按 OpenAPI 文档改好请求体再发',
+        ) from error
+
+
+async def _body(request: Request, model: type[_ModelT], *, empty_ok: bool = False) -> _ModelT:
+    raw = await request.body()
+    if not raw and empty_ok:
+        return model()
+    try:
+        value = json.loads(raw)
+    except ValueError as error:
+        raise ApiError(
+            400,
+            expected=f'请求体是 {model.__name__} 形状的 JSON',
+            received='请求体不是合法的 JSON',
+            next_action='发 Content-Type: application/json 的请求体',
+        ) from error
+    return _model(model, value)
+
+
+def _decimal(raw: str | None) -> Decimal | None:
+    if raw is None:
+        return None
+    try:
+        amount = Decimal(raw)
+    except InvalidOperation as error:
+        raise ApiError(
+            422,
+            expected='cost 是十进制金额字符串，例如 "0.50"',
+            received=f'cost={raw!r}',
+            next_action='写成十进制数字的字符串',
+        ) from error
+    if not amount.is_finite() or amount <= 0:
+        raise ApiError(
+            422,
+            expected='cost 是大于 0 的有限金额',
+            received=f'cost={raw!r}',
+            next_action='给一个正数，或省略这一维表示不限',
+        )
+    return amount
+
+
+def _budget(request: BudgetRequest) -> Budget:
+    return Budget(
+        tokens=request.tokens,
+        cost=_decimal(request.cost),
+        wall_clock_s=request.wall_clock_s,
+        turns=request.turns,
+    )
+
+
+def _unsaved(session: LiveSession) -> SessionSummary:
+    return SessionSummary(
+        sid=session.sid,
+        agent='',
+        status='active',
+        turns=0,
+        created_at=0.0,
+        updated_at=0.0,
+        live=True,
+    )
+
+
+def _error(error: ApiError, redactor: Redactor) -> Response:
+    # `received` 常常回显调用方给的值（Host 头、request_id、帧的原文）：同样先脱敏。
+    return json_response(error_body(error), redactor, status=error.status)
+
+
+async def _close(websocket: WebSocket, code: int) -> None:
+    with contextlib.suppress(RuntimeError):
+        await websocket.close(code=code)
+
+
+def _static(root: Path | None, redactor: Redactor) -> _Handler:
+    async def serve(request: Request) -> Response:
+        path = request.path_params.get('path', '')
+        if path.startswith('api/'):
+            return _error(
+                ApiError(
+                    404,
+                    expected='/api/v1 下已有的路由',
+                    received=f'没有 /{path}',
+                    next_action='看 docs/reference/openapi.json 里列出的路径',
+                ),
+                redactor,
+            )
+        if root is None or not (root / 'index.html').is_file():
+            return _error(
+                ApiError(
+                    503,
+                    expected='随包发布的前端构建产物（syndica/server/static/index.html）',
+                    received='包里没有前端产物',
+                    next_action=(
+                        '重新安装 syndica[server]；从源码运行的开发者先跑 scripts/check_web.sh'
+                    ),
+                ),
+                redactor,
+            )
+        return FileResponse(_static_file(root, path))
+
+    return serve
+
+
+def _static_file(root: Path, path: str) -> Path:
+    """路径解析后必须仍在产物目录里：`..` 与符号链接都不能把请求带到包外的文件。"""
+    candidate = (root / path).resolve()
+    if path and candidate.is_file() and candidate.is_relative_to(root.resolve()):
+        return candidate
+    return root / 'index.html'
