@@ -353,6 +353,16 @@ class _Controller:
                 'progress.pending_human': len(snapshot.pending_human),
             },
         )
+        await self._emit(
+            'progress_measured',
+            {
+                'satisfied': list(snapshot.satisfied),
+                'mandatory': list(snapshot.mandatory),
+                'pending_human': list(snapshot.pending_human),
+                'measured_turn': snapshot.measured_turn,
+                'verdict': verdict.status.value,
+            },
+        )
         if record.regressed:
             # 回退是警报（spec §8.3）：此前满足的强制条现在被判 UNMET。
             logger.warning(

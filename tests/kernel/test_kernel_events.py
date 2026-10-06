@@ -133,6 +133,13 @@ def test_the_kernel_event_table_is_exact():
         'compaction': ('trigger', 'blocks_before', 'blocks_after', 'tokens_before', 'tokens_after'),
         'budget_exhausted': ('dimensions', 'disposition'),
         'budget_changed': ('view',),
+        'progress_measured': (
+            'satisfied',
+            'mandatory',
+            'pending_human',
+            'measured_turn',
+            'verdict',
+        ),
         'progress_regressed': ('rubrics',),
         'progress_stalled': ('turns',),
         'goal_drift': ('confirmed',),

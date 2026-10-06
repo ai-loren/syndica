@@ -13,10 +13,22 @@ from typing import Any, Protocol
 
 from syndica.kernel import Budget, DeliveryResult, Redactor, Subscription
 
-__all__ = ['AskBudget', 'SessionAssembly', 'SessionHandle']
+__all__ = ['AskBudget', 'SessionAssembly', 'SessionHandle', 'Terminal']
 
 AskBudget = Callable[[str, Mapping[str, Any]], Awaitable[Budget | None]]
 """预算耗尽、按 `ask_human` 处置时问人：（agent id，预算视图的纯数据）→ 追加的额度或 None。"""
+
+
+class Terminal(Protocol):
+    """人的终端（一个 PTY）。`read` 交回空字节表示 shell 已经退出。"""
+
+    async def read(self) -> bytes: ...
+
+    def write(self, data: bytes) -> None: ...
+
+    def resize(self, cols: int, rows: int) -> None: ...
+
+    async def close(self) -> None: ...
 
 
 class SessionHandle(Protocol):
@@ -52,6 +64,41 @@ class SessionHandle(Protocol):
 
     def redactor(self) -> Redactor: ...
 
+    def trace_id(self) -> str | None:
+        """这个会话正在写的 trace；没在记录时 None。"""
+        ...
+
+    def flags(self) -> list[dict[str, Any]]: ...
+
+    async def artifact_list(self) -> list[dict[str, Any]]: ...
+
+    async def artifact_versions(self, artifact_id: str) -> list[dict[str, Any]]: ...
+
+    async def artifact_content(self, artifact_id: str, version: str) -> tuple[bytes, str]:
+        """（原文，登记的 mime）。"""
+        ...
+
+    async def artifact_preview(self, artifact_id: str, version: str) -> str: ...
+
+    async def artifact_diff(self, artifact_id: str, old: str, new: str) -> dict[str, Any]: ...
+
+    async def artifact_feedback(
+        self, artifact_id: str, version: str, text: str, lines: tuple[int, int] | None
+    ) -> dict[str, Any] | None:
+        """人对产物的反馈落成提议的 Rubric；锚点重开不了时交回 None。"""
+        ...
+
+    async def rubrics(self) -> dict[str, Any]: ...
+
+    async def activate_rubric(self, rubric_id: str) -> None: ...
+
+    def open_terminal(self, cols: int, rows: int) -> Terminal: ...
+
+    async def agent_screen(self, handle: str, since: int, wait: float) -> dict[str, Any]:
+        """Agent 终端从 `since` 起的输出（去掉了控制序列）：`text`、`end`、`running`、
+        `exit_code`。"""
+        ...
+
     async def close(self, failure: BaseException | None) -> None: ...
 
 
@@ -81,6 +128,14 @@ class SessionAssembly(Protocol):
     async def remove_session(self, sid: str) -> None: ...
 
     def roles(self) -> list[str]: ...
+
+    def topologies(self) -> list[dict[str, Any]]: ...
+
+    async def traces(self) -> list[dict[str, Any]]: ...
+
+    async def trace(self, trace_id: str) -> dict[str, Any]:
+        """一份 trace 的分析（`kernel.trace_analysis`）。"""
+        ...
 
     def doctor(self) -> list[dict[str, Any]]:
         """逐项检查：每项 `name`、`ok`，失败的另有 `expected` / `received` / `next_action`。"""

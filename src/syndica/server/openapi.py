@@ -14,18 +14,29 @@ from pydantic import BaseModel
 from syndica import __version__
 from syndica.kernel.events import KERNEL_EVENTS
 from syndica.server.models import (
+    ArtifactDiff,
+    ArtifactList,
+    ArtifactPreview,
+    ArtifactVersions,
     CreateSession,
     DoctorReport,
     ErrorBody,
     EventEnvelope,
+    FeedbackRequest,
+    FeedbackResult,
+    FlagList,
     Health,
     LoginRequest,
     LoginResponse,
     Roles,
     RpcReply,
     RpcRequest,
+    RubricList,
     SessionList,
     Snapshot,
+    TopologyList,
+    TraceAnalysis,
+    TraceList,
 )
 
 __all__ = ['PATHS', 'SERVER_EVENTS', 'openapi']
@@ -48,6 +59,59 @@ PATHS: tuple[
     ('get', '/api/v1/sessions/{sid}/snapshot', None, 200, Snapshot, True, '快照，带 as_of'),
     ('get', '/api/v1/sessions/{sid}/events', None, 200, None, True, '会话事件流（SSE）'),
     ('get', '/api/v1/events', None, 200, None, True, '全局事件流（SSE）'),
+    ('get', '/api/v1/topologies', None, 200, TopologyList, True, '配置里的拓扑'),
+    ('get', '/api/v1/traces', None, 200, TraceList, True, '工作区里的 trace'),
+    ('get', '/api/v1/traces/{trace_id}', None, 200, TraceAnalysis, True, '一份 trace 的分析'),
+    ('get', '/api/v1/sessions/{sid}/trace', None, 200, TraceAnalysis, True, '这个会话的 trace'),
+    ('get', '/api/v1/sessions/{sid}/flags', None, 200, FlagList, True, '这个会话解析后的 Flag'),
+    ('get', '/api/v1/sessions/{sid}/artifacts', None, 200, ArtifactList, True, '产物索引'),
+    (
+        'get',
+        '/api/v1/sessions/{sid}/artifacts/versions',
+        None,
+        200,
+        ArtifactVersions,
+        True,
+        '一个产物的版本（?id=）',
+    ),
+    (
+        'get',
+        '/api/v1/sessions/{sid}/artifacts/content',
+        None,
+        200,
+        None,
+        True,
+        '一个版本的原文（?id=&version=）：附件、octet-stream、沙箱化；'
+        '登记的 mime 在 X-Syndica-Mime',
+    ),
+    (
+        'get',
+        '/api/v1/sessions/{sid}/artifacts/preview',
+        None,
+        200,
+        ArtifactPreview,
+        True,
+        '一个版本的预览（?id=&version=）',
+    ),
+    (
+        'get',
+        '/api/v1/sessions/{sid}/artifacts/diff',
+        None,
+        200,
+        ArtifactDiff,
+        True,
+        '两个版本的语义 diff（?id=&old=&new=）',
+    ),
+    (
+        'post',
+        '/api/v1/sessions/{sid}/artifacts/feedback',
+        FeedbackRequest,
+        201,
+        FeedbackResult,
+        True,
+        '对产物的反馈，落成提议的 Rubric',
+    ),
+    ('get', '/api/v1/sessions/{sid}/rubrics', None, 200, RubricList, True, 'Goal 与 Rubric'),
 )
 
 # server 自己发的事件种类（不在内核事件表里）与各自 payload 里必有的键。
@@ -68,6 +132,7 @@ _RPC_OPS: dict[str, dict[str, Any]] = {
         'agent_id': {'type': 'string'},
         'budget': {'$ref': _REF.format(model='BudgetRequest')},
     },
+    'activate_rubric': {'rubric_id': {'type': 'string'}},
     'budget_answer': {
         'request_id': {'type': 'string'},
         'budget': {'anyOf': [{'$ref': _REF.format(model='BudgetRequest')}, {'type': 'null'}]},
@@ -75,6 +140,17 @@ _RPC_OPS: dict[str, dict[str, Any]] = {
 }
 
 _MODELS: tuple[type[BaseModel], ...] = (
+    ArtifactDiff,
+    ArtifactList,
+    ArtifactPreview,
+    ArtifactVersions,
+    FeedbackRequest,
+    FeedbackResult,
+    FlagList,
+    RubricList,
+    TopologyList,
+    TraceAnalysis,
+    TraceList,
     CreateSession,
     DoctorReport,
     ErrorBody,
@@ -172,6 +248,12 @@ def openapi() -> dict[str, Any]:
             'securitySchemes': {'bearer': {'type': 'http', 'scheme': 'bearer'}},
         },
         'x-syndica-events': _events(),
+        'x-syndica-pty': {
+            'human': '/api/v1/sessions/{sid}/pty：第一帧 {"op":"auth","token","cols","rows"}；'
+            '之后发 {"op":"input","data"} 或 {"op":"resize","cols","rows"}，收二进制的终端输出',
+            'agent': '/api/v1/sessions/{sid}/agent-pty/{handle}：第一帧 auth；之后只收 '
+            '{"text","running","exit_code"}（脱敏后的整行，只读）',
+        },
         'x-syndica-rpc': {
             'path': '/api/v1/sessions/{sid}/rpc',
             'first_frame': 'auth',

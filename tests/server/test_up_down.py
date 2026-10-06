@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -176,3 +177,47 @@ def test_a_state_file_whose_server_is_gone_is_reported_and_removed(tmp_path: Pat
     result = serve.status(workspace, environ)
     assert result.exit_code == 3
     assert not paths.state.exists()
+
+
+def test_down_stops_gracefully_with_a_stream_open_and_the_session_saved(
+    tmp_path: Path, workspace: Path
+):
+    import threading
+
+    environ = _environ(tmp_path)
+    started = _syndica(workspace, environ, 'up', '--no-open')
+    assert started.returncode == 0, started.stderr
+    match = re.search(r'http://127\.0\.0\.1:(\d+)/#login=([A-Za-z0-9_-]+)', started.stdout)
+    assert match is not None
+    port, token = int(match.group(1)), _login(int(match.group(1)), match.group(2))
+    request = urllib.request.Request(
+        f'http://127.0.0.1:{port}/api/v1/sessions',
+        data=b'{"role": "Worker"}',
+        headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {token}'},
+        method='POST',
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        sid = json.loads(response.read())['sid']
+    ended = threading.Event()
+
+    def read_stream() -> None:
+        stream = urllib.request.Request(
+            f'http://127.0.0.1:{port}/api/v1/events', headers={'Authorization': f'Bearer {token}'}
+        )
+        try:
+            with urllib.request.urlopen(stream, timeout=30) as response:
+                while response.read(1024):
+                    pass
+        except Exception:
+            pass
+        ended.set()
+
+    reader = threading.Thread(target=read_stream, daemon=True)
+    reader.start()
+    began = time.monotonic()
+    stopped = _syndica(workspace, environ, 'down')
+    assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+    assert '已停止' in stopped.stdout
+    assert time.monotonic() - began < serve._GRACEFUL_S - 1  # pyright: ignore[reportPrivateUsage]
+    assert ended.wait(5)
+    assert (workspace / '.syndica' / 'sessions' / sid / 'record.json').is_file()

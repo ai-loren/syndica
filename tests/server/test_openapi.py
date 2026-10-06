@@ -53,9 +53,16 @@ def test_the_documented_paths_are_exactly_the_routes_the_app_serves():
         if isinstance(route, Route) and route.path != '/{path:path}'
         for method in (route.methods or set()) - {'HEAD'}
     }
-    sockets = [route.path for route in routes if isinstance(route, WebSocketRoute)]  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
+    sockets = sorted(route.path for route in routes if isinstance(route, WebSocketRoute))  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
     assert served == {(method, path) for method, path, *_ in PATHS}
-    assert sockets == [openapi()['x-syndica-rpc']['path']]
+    assert sockets == sorted(
+        [
+            openapi()['x-syndica-rpc']['path'],
+            '/api/v1/sessions/{sid}/pty',
+            '/api/v1/sessions/{sid}/agent-pty/{handle}',
+        ]
+    )
+    assert all(path in json.dumps(openapi()['x-syndica-pty']) for path in sockets[:2])
 
 
 def test_every_event_kind_a_client_can_receive_has_a_schema():

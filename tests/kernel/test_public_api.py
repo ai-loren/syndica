@@ -377,6 +377,7 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 #   `parse_scenario_document` 用就够了。
 # - `RequestFingerprints` 与 `arguments_digest`：回放（runner）用它们对自己的请求与执行的参数取与
 #   记录时同样的指纹；宿主不需要它们就能记录与回放。
+# - `analyze_trace`：服务面把一份 trace 交给前端核对时间线用的纯数据分析；CLI 的文字视图另有渲染。
 # - `block_payload` / `budget_payload` / `artifact_payload` / `plain_data`：内核对象的纯数据表示，
 #   事件 payload 用它们；宿主读的是事件里已经算好的那一份，快照由宿主装配自己调。M12 定。
 # - `KERNEL_EVENTS` 与 `SCENARIO_EVENT_KINDS`：经子模块承诺。前者是内核事件种类与必有键的表，
@@ -458,6 +459,7 @@ _WITHHELD: tuple[str, ...] = (
     'drain_cancelled',
     'drop_cut_end',
     'drop_cut_start',
+    'analyze_trace',
     'artifact_payload',
     'block_payload',
     'budget_payload',

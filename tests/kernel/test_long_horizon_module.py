@@ -1716,3 +1716,36 @@ async def test_a_milestone_that_would_outlast_the_deadline_is_skipped_for_the_wr
     assert any(
         '最后一轮' in str(b.content) for b in ctx.current_traj if kind_of(b) is HistoryKind.BUDGET
     )
+
+
+async def test_each_measured_progress_is_published_with_the_rubric_ids() -> None:
+    def regressing(n: int) -> dict[str, object]:
+        return _outcomes(R1='satisfied') if n == 0 else _outcomes(R1='unmet')
+
+    llm = _Router(_works(8, _OFF_GOAL), outcomes=regressing)
+    runtime = _runtime({'long_horizon_progress_every': 2})
+    events = runtime.events.subscribe()
+    measured: list[dict[str, object]] = []
+    try:
+        await _run(runtime, llm)
+        while True:
+            try:
+                event = await asyncio.wait_for(events.__anext__(), 0.05)
+            except (TimeoutError, StopAsyncIteration):
+                break
+            if event.kind == 'progress_measured':
+                measured.append(event.payload)
+    finally:
+        events.close()
+        await runtime.shutdown()
+    assert len(measured) >= 2
+    assert 'R1' in measured[0]['satisfied']  # pyright: ignore[reportOperatorIssue]
+    assert 'R1' not in measured[1]['satisfied']  # pyright: ignore[reportOperatorIssue]
+    assert all('R1' in payload['mandatory'] for payload in measured)  # pyright: ignore[reportOperatorIssue]
+    assert all(isinstance(payload['measured_turn'], int) for payload in measured)
+    assert {payload['verdict'] for payload in measured} <= {
+        'pass',
+        'partial',
+        'block',
+        'unverified',
+    }

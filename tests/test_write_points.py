@@ -91,15 +91,20 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
     # 载荷都经 server/outbound；状态文件只有 pid、端口、进程 nonce 与工作区路径，写在工作区之外。
     'serve.py': ('os.dup2', 'os.dup2', 'socket.socket', 'write_text'),
     # 前端产物是随包发布的静态文件；登录响应只含 server 刚铸的令牌，脱敏器改它一个字节它就用不了；
-    # SSE 的流由 sse_frame 逐帧产出；`_Guard` 转发的是应用已经经出口编码好的消息，只追加常量响应头，
-    # 另一处是常量的 websocket.close。
+    # 产物下载是人取回自己工作区里的文件（同在磁盘上打开，按附件、沙箱化交出）；SSE 的流由
+    # sse_frame 逐帧产出；`_Guard` 转发的是应用已经经出口编码好的消息，只追加常量响应头，另一处是
+    # 常量的 websocket.close；人的终端把人自己 shell 的输出原样回给本机已认证的人（同终端模拟器）。
     'server/app.py': (
         'FileResponse positional',
+        'Response positional',
         'Response positional',
         'StreamingResponse positional',
         'send positional',
         'send positional',
+        'send_bytes positional',
     ),
+    # 人的终端：写进伪终端主端的是人敲下的输入，shell 的输出接在从端上。
+    'cli/assembly.py': ('os.write', 'subprocess stderr', 'subprocess stdout'),
     # 出口本身：`encoded` 先把每个字符串叶子脱敏再截断。
     'server/outbound.py': ('Response positional',),
 }

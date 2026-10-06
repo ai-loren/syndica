@@ -13,7 +13,8 @@ import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
+from urllib.parse import quote
 
 from pydantic import BaseModel, ValidationError
 from starlette.applications import Starlette
@@ -28,19 +29,30 @@ from syndica.server.auth import SECURITY_HEADERS, Credentials, check_host, check
 from syndica.server.errors import ApiError, error_body
 from syndica.server.live import Live, LiveSession
 from syndica.server.models import (
+    ArtifactDiff,
+    ArtifactList,
+    ArtifactPreview,
+    ArtifactVersions,
     BudgetRequest,
     CreateSession,
     DoctorReport,
     ErrorBody,
+    FeedbackRequest,
+    FeedbackResult,
+    FlagList,
     Health,
     LoginRequest,
     LoginResponse,
     Roles,
     RpcReply,
     RpcRequest,
+    RubricList,
     SessionList,
     SessionSummary,
     Snapshot,
+    TopologyList,
+    TraceAnalysis,
+    TraceList,
 )
 from syndica.server.outbound import encoded, json_response, sse_frame
 
@@ -50,6 +62,8 @@ logger = logging.getLogger(__name__)
 
 MAX_STREAMS = 16
 _AUTH_TIMEOUT_S = 5.0
+# Agent 终端镜像里一行攒到这么长还没换行就照样发出去：不能为了等换行无限攒。
+_PTY_LINE_CAP = 16_384
 _ModelT = TypeVar('_ModelT', bound=BaseModel)
 _Handler = Callable[[Request], Awaitable[Response]]
 
@@ -202,6 +216,105 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
         state = Snapshot.model_validate(await session.snapshot())
         return json_response(state.model_dump(), session.handle.redactor(), status=status)
 
+    async def topologies(_: Request) -> Response:
+        listing = TopologyList(topologies=live.assembly.topologies())
+        return json_response(listing.model_dump(), host_redactor)
+
+    async def traces(_: Request) -> Response:
+        rows = await live.assembly.traces()
+        return json_response(TraceList.model_validate({'traces': rows}).model_dump(), host_redactor)
+
+    async def trace(request: Request) -> Response:
+        analysis = await live.assembly.trace(request.path_params['trace_id'])
+        return json_response(TraceAnalysis.model_validate(analysis).model_dump(), host_redactor)
+
+    async def session_trace(request: Request) -> Response:
+        session = live.get(request.path_params['sid'])
+        trace_id = session.handle.trace_id()
+        if trace_id is None:
+            raise ApiError(
+                404,
+                expected='这个会话在写 trace',
+                received='它没有在记录（trace.level 是 off，或 trace 目录写不进去）',
+                next_action='在 .syndica.yaml 里把 trace.level 设成 structure 或更高，重启 server',
+            )
+        analysis = await live.assembly.trace(trace_id)
+        return json_response(
+            TraceAnalysis.model_validate(analysis).model_dump(), session.handle.redactor()
+        )
+
+    async def flags(request: Request) -> Response:
+        session = live.get(request.path_params['sid'])
+        listing = FlagList.model_validate({'flags': session.handle.flags()})
+        return json_response(listing.model_dump(), session.handle.redactor())
+
+    async def artifacts(request: Request) -> Response:
+        session = live.get(request.path_params['sid'])
+        listing = ArtifactList.model_validate({'artifacts': await session.handle.artifact_list()})
+        return json_response(listing.model_dump(), session.handle.redactor())
+
+    async def artifact_versions(request: Request) -> Response:
+        session = live.get(request.path_params['sid'])
+        versions = await session.handle.artifact_versions(_query(request, 'id'))
+        listing = ArtifactVersions.model_validate({'versions': versions})
+        return json_response(listing.model_dump(), session.handle.redactor())
+
+    async def artifact_content(request: Request) -> Response:
+        session = live.get(request.path_params['sid'])
+        artifact_id = _query(request, 'id')
+        data, mime = await session.handle.artifact_content(artifact_id, _query(request, 'version'))
+        name = artifact_id.rsplit(':', 1)[-1].rsplit('/', 1)[-1] or 'artifact'
+        # 人取回自己工作区里的文件，同在磁盘上打开它：不脱敏。不可信的字节不能在这个源上执行：
+        # 一律当附件、按 octet-stream 交出、沙箱化，登记的 mime 只放在旁边的头里给前端挑显示方式。
+        return Response(
+            data,
+            media_type='application/octet-stream',
+            headers={
+                'Content-Disposition': f"attachment; filename*=UTF-8''{quote(name)}",
+                'Content-Security-Policy': "sandbox; default-src 'none'",
+                'X-Syndica-Mime': mime,
+            },
+        )
+
+    async def artifact_preview(request: Request) -> Response:
+        session = live.get(request.path_params['sid'])
+        text = await session.handle.artifact_preview(
+            _query(request, 'id'), _query(request, 'version')
+        )
+        return json_response(ArtifactPreview(text=text).model_dump(), session.handle.redactor())
+
+    async def artifact_diff(request: Request) -> Response:
+        session = live.get(request.path_params['sid'])
+        diff = await session.handle.artifact_diff(
+            _query(request, 'id'), _query(request, 'old'), _query(request, 'new')
+        )
+        return json_response(
+            ArtifactDiff.model_validate(diff).model_dump(), session.handle.redactor()
+        )
+
+    async def artifact_feedback(request: Request) -> Response:
+        session = live.get(request.path_params['sid'])
+        body = await _body(request, FeedbackRequest)
+        lines = None
+        if body.start_line is not None:
+            end = body.end_line or body.start_line
+            if end < body.start_line:
+                raise ApiError(
+                    422,
+                    expected='end_line 不小于 start_line',
+                    received=f'start_line={body.start_line}，end_line={end}',
+                    next_action='把行范围写成从小到大',
+                )
+            lines = (body.start_line, end)
+        rubric = await session.handle.artifact_feedback(body.id, body.version, body.text, lines)
+        result = FeedbackResult.model_validate({'rubric': rubric})
+        return json_response(result.model_dump(), session.handle.redactor(), status=201)
+
+    async def rubrics(request: Request) -> Response:
+        session = live.get(request.path_params['sid'])
+        listing = RubricList.model_validate(await session.handle.rubrics())
+        return json_response(listing.model_dump(), session.handle.redactor())
+
     async def session_events(request: Request) -> Response:
         session = live.get(request.path_params['sid'])
         return _sse(request, session.stream.epoch, session.stream.follow, session.handle.redactor())
@@ -245,21 +358,31 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
         finally:
             streams.give()
 
-    async def _rpc_session(websocket: WebSocket, sid: str) -> None:
+    async def _authenticated(
+        websocket: WebSocket, sid: str
+    ) -> tuple[RpcRequest, LiveSession] | None:
+        """第一帧必须在时限内认证；认证不过、会话没打开都关掉连接，交回 None。"""
         try:
             async with asyncio.timeout(_AUTH_TIMEOUT_S):
                 first = await websocket.receive_text()
         except (TimeoutError, WebSocketDisconnect):
             await _close(websocket, 4401)
-            return
+            return None
         frame = _frame(first)
         if frame is None or frame.op != 'auth' or not credentials.valid(_extra(frame).get('token')):
             await _close(websocket, 4401)
-            return
+            return None
         session = live.sessions.get(sid)
         if session is None:
             await _close(websocket, 4404)
+            return None
+        return frame, session
+
+    async def _rpc_session(websocket: WebSocket, sid: str) -> None:
+        authenticated = await _authenticated(websocket, sid)
+        if authenticated is None:
             return
+        frame, session = authenticated
         redactor = session.handle.redactor()
         await websocket.send_text(encoded(RpcReply(id=frame.id, ok=True).model_dump(), redactor))
         live.attach()
@@ -274,6 +397,104 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
         finally:
             live.detach()
 
+    async def human_pty(websocket: WebSocket) -> None:
+        if not streams.available():
+            await websocket.close(code=1013)
+            return
+        await websocket.accept()
+        streams.take()
+        try:
+            await _human_pty(websocket, websocket.path_params['sid'])
+        finally:
+            streams.give()
+
+    async def _human_pty(websocket: WebSocket, sid: str) -> None:
+        authenticated = await _authenticated(websocket, sid)
+        if authenticated is None:
+            return
+        frame, session = authenticated
+        extra = _extra(frame)
+        terminal = session.handle.open_terminal(
+            _size(extra.get('cols'), 100), _size(extra.get('rows'), 30)
+        )
+        live.attach()
+
+        async def output() -> None:
+            while chunk := await terminal.read():
+                # 人自己的 shell，原样回给本机已认证的人（同终端模拟器）：不脱敏。
+                await websocket.send_bytes(chunk)
+            await _close(websocket, 1000)
+
+        pumping = asyncio.create_task(output())
+        try:
+            while True:
+                try:
+                    message = json.loads(await websocket.receive_text())
+                except (WebSocketDisconnect, RuntimeError):
+                    return
+                except ValueError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                fields = cast('dict[str, Any]', message)
+                if fields.get('op') == 'input' and isinstance(fields.get('data'), str):
+                    terminal.write(str(fields['data']).encode())
+                elif fields.get('op') == 'resize':
+                    terminal.resize(_size(fields.get('cols'), 100), _size(fields.get('rows'), 30))
+        finally:
+            pumping.cancel()
+            await terminal.close()
+            live.detach()
+
+    async def agent_pty(websocket: WebSocket) -> None:
+        if not streams.available():
+            await websocket.close(code=1013)
+            return
+        await websocket.accept()
+        streams.take()
+        try:
+            await _agent_pty(
+                websocket, websocket.path_params['sid'], websocket.path_params['handle']
+            )
+        finally:
+            streams.give()
+
+    async def _agent_pty(websocket: WebSocket, sid: str, handle: str) -> None:
+        """Agent 终端的只读镜像：没有写入面——第二个写入方会绕过 Terminal 工具「半行不发」的不变式，
+        危险判定就看不到整行。按整行脱敏再发：一个密钥可能跨两次读，只脱半截认不出来。"""
+        authenticated = await _authenticated(websocket, sid)
+        if authenticated is None:
+            return
+        _, session = authenticated
+        redactor = session.handle.redactor()
+        live.attach()
+        since, pending = 0, ''
+        try:
+            while True:
+                try:
+                    screen = await session.handle.agent_screen(handle, since, 1.0)
+                except SyndicaError as error:
+                    body = {'error': error_body(ApiError.of(404, error))}
+                    await websocket.send_text(encoded(body, redactor))
+                    return
+                since = int(screen['end'])
+                text = pending + str(screen['text'])
+                running = bool(screen['running'])
+                cut = text.rfind('\n') + 1
+                if not running or len(text) > _PTY_LINE_CAP:
+                    cut = len(text)
+                ready, pending = text[:cut], text[cut:]
+                if ready or not running:
+                    frame = {'text': ready, 'running': running, 'exit_code': screen['exit_code']}
+                    await websocket.send_text(encoded(frame, redactor))
+                if not running:
+                    return
+        except WebSocketDisconnect:
+            return
+        finally:
+            live.detach()
+            await _close(websocket, 1000)
+
     routes = [
         Route('/api/v1/health', guarded(health, public=True), methods=['GET']),
         Route('/api/v1/login', guarded(login, public=True), methods=['POST']),
@@ -287,7 +508,33 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
         Route('/api/v1/sessions/{sid}/snapshot', guarded(snapshot), methods=['GET']),
         Route('/api/v1/sessions/{sid}/events', guarded(session_events), methods=['GET']),
         Route('/api/v1/events', guarded(global_events), methods=['GET']),
+        Route('/api/v1/topologies', guarded(topologies), methods=['GET']),
+        Route('/api/v1/traces', guarded(traces), methods=['GET']),
+        Route('/api/v1/traces/{trace_id}', guarded(trace), methods=['GET']),
+        Route('/api/v1/sessions/{sid}/trace', guarded(session_trace), methods=['GET']),
+        Route('/api/v1/sessions/{sid}/flags', guarded(flags), methods=['GET']),
+        Route('/api/v1/sessions/{sid}/artifacts', guarded(artifacts), methods=['GET']),
+        Route(
+            '/api/v1/sessions/{sid}/artifacts/versions',
+            guarded(artifact_versions),
+            methods=['GET'],
+        ),
+        Route(
+            '/api/v1/sessions/{sid}/artifacts/content', guarded(artifact_content), methods=['GET']
+        ),
+        Route(
+            '/api/v1/sessions/{sid}/artifacts/preview', guarded(artifact_preview), methods=['GET']
+        ),
+        Route('/api/v1/sessions/{sid}/artifacts/diff', guarded(artifact_diff), methods=['GET']),
+        Route(
+            '/api/v1/sessions/{sid}/artifacts/feedback',
+            guarded(artifact_feedback),
+            methods=['POST'],
+        ),
+        Route('/api/v1/sessions/{sid}/rubrics', guarded(rubrics), methods=['GET']),
         WebSocketRoute('/api/v1/sessions/{sid}/rpc', rpc),
+        WebSocketRoute('/api/v1/sessions/{sid}/pty', human_pty),
+        WebSocketRoute('/api/v1/sessions/{sid}/agent-pty/{handle}', agent_pty),
         Route('/{path:path}', _static(settings.static_dir, host_redactor), methods=['GET']),
     ]
 
@@ -361,6 +608,9 @@ async def _run_op(session: LiveSession, frame: RpcRequest) -> dict[str, Any] | N
         budget = _budget(_model(BudgetRequest, extra.get('budget')))
         view = handle.grant(_text(extra, 'agent_id', default=handle.root_id), budget)
         return {'view': view}
+    if frame.op == 'activate_rubric':
+        await handle.activate_rubric(_text(extra, 'rubric_id'))
+        return None
     if frame.op == 'budget_answer':
         raw = extra.get('budget')
         session.answer_budget(
@@ -370,7 +620,10 @@ async def _run_op(session: LiveSession, frame: RpcRequest) -> dict[str, Any] | N
         return None
     raise ApiError(
         400,
-        expected='连接认证之后的帧是 send / answer / abort / grant / budget_answer 之一',
+        expected=(
+            '连接认证之后的帧是 send / answer / abort / grant / budget_answer / '
+            'activate_rubric 之一'
+        ),
         received=f'op={frame.op!r}',
         next_action='换成上面列出的操作',
     )
@@ -527,3 +780,21 @@ def _static_file(root: Path, path: str) -> Path:
     if path and candidate.is_file() and candidate.is_relative_to(root.resolve()):
         return candidate
     return root / 'index.html'
+
+
+def _query(request: Request, name: str) -> str:
+    value = request.query_params.get(name)
+    if not value:
+        raise ApiError(
+            422,
+            expected=f'查询参数 {name!r} 非空',
+            received=f'{name}={value!r}',
+            next_action=f'在地址里带上 ?{name}=…',
+        )
+    return value
+
+
+def _size(value: object, default: int) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 1000:
+        return value
+    return default

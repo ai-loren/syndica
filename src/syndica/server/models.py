@@ -10,7 +10,22 @@ from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
     'AgentNode',
+    'ArtifactDiff',
+    'ArtifactList',
     'ArtifactOut',
+    'ArtifactPreview',
+    'ArtifactSummary',
+    'ArtifactVersions',
+    'FeedbackRequest',
+    'FeedbackResult',
+    'FlagList',
+    'FlagOut',
+    'RubricList',
+    'RubricOut',
+    'TopologyList',
+    'TraceAnalysis',
+    'TraceList',
+    'TraceRow',
     'Block',
     'BudgetRequest',
     'CreateSession',
@@ -105,6 +120,92 @@ class ArtifactOut(_Model):
     is_deliverable: bool
 
 
+class ArtifactSummary(ArtifactOut):
+    versions: int
+
+
+class ArtifactList(_Model):
+    artifacts: list[ArtifactSummary]
+
+
+class ArtifactVersions(_Model):
+    versions: list[ArtifactOut]
+
+
+class ArtifactPreview(_Model):
+    text: str
+
+
+class ArtifactDiff(_Model):
+    summary: str
+    changed: bool
+    unified: str
+
+
+class FeedbackRequest(_Model):
+    id: str
+    version: str
+    text: str = Field(min_length=1)
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+
+
+class RubricOut(_Model):
+    id: str
+    statement: str
+    kind: str
+    status: str
+    origin: str
+
+
+class FeedbackResult(_Model):
+    rubric: RubricOut | None
+
+
+class RubricList(_Model):
+    goal: str | None
+    rubrics: list[RubricOut]
+
+
+class TraceRow(_Model):
+    trace_id: str
+    started_ns: int
+    ended_ns: int | None
+    status: str | None
+
+
+class TraceList(_Model):
+    traces: list[TraceRow]
+
+
+class TraceAnalysis(_Model):
+    trace_id: str
+    status: str | None
+    started_ns: int
+    ended_ns: int | None
+    agents: list[dict[str, Any]]
+    tool_calls: list[dict[str, Any]]
+    spawns: list[dict[str, Any]]
+    llm_calls: int
+    tokens: int
+
+
+class FlagOut(_Model):
+    key: str
+    value: Any
+    default: Any
+    description: str
+    choices: list[Any]
+
+
+class FlagList(_Model):
+    flags: list[FlagOut]
+
+
+class TopologyList(_Model):
+    topologies: list[dict[str, Any]]
+
+
 class Block(_Model):
     role: str
     text: str
@@ -172,7 +273,7 @@ class EventEnvelope(_Model):
 class RpcRequest(_Model):
     model_config = ConfigDict(extra='allow')
 
-    op: Literal['auth', 'send', 'answer', 'abort', 'grant', 'budget_answer']
+    op: Literal['auth', 'send', 'answer', 'abort', 'grant', 'budget_answer', 'activate_rubric']
     id: str | int | None = None
 
 

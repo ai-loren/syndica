@@ -11,10 +11,51 @@ from typing import Any
 import httpx
 import uvicorn
 
-from syndica.kernel import Budget, DeliveryResult, Event, EventBus, RuleRedactor, Subscription
+from syndica.kernel import (
+    Budget,
+    ConfigError,
+    DeliveryResult,
+    Event,
+    EventBus,
+    RuleRedactor,
+    Subscription,
+)
 from syndica.server import Credentials, Live, ServerSettings, create_app
 
 SECRET = 'sekrit-value-123456'
+
+
+ARTIFACT: dict[str, Any] = {
+    'id': 'file:report.html',
+    'path': 'report.html',
+    'kind': 'document',
+    'mime': 'text/html',
+    'version': 'sha256:old',
+    'producer': 'worker',
+    'is_deliverable': False,
+}
+CONTENT = b'<script>fetch("/api/v1/sessions")</script>'
+
+
+class FakeTerminal:
+    def __init__(self, cols: int, rows: int) -> None:
+        self.size = (cols, rows)
+        self.written: list[bytes] = []
+        self.output: asyncio.Queue[bytes] = asyncio.Queue()
+        self.closed = False
+
+    async def read(self) -> bytes:
+        return await self.output.get()
+
+    def write(self, data: bytes) -> None:
+        self.written.append(data)
+        self.output.put_nowait(b'echo:' + data)
+
+    def resize(self, cols: int, rows: int) -> None:
+        self.size = (cols, rows)
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class FakeHandle:
@@ -28,6 +69,10 @@ class FakeHandle:
         self.granted: list[tuple[str, Budget]] = []
         self.closed: list[BaseException | None] = []
         self.deliver_ok = True
+        self.trace: str | None = 'trace-1'
+        self.calls: list[tuple[Any, ...]] = []
+        self.terminals: list[FakeTerminal] = []
+        self.screens: dict[str, list[str]] = {}
 
     @property
     def sid(self) -> str:
@@ -87,6 +132,71 @@ class FakeHandle:
     def redactor(self) -> RuleRedactor:
         return RuleRedactor(secrets=(SECRET,))
 
+    def trace_id(self) -> str | None:
+        return self.trace
+
+    def flags(self) -> list[dict[str, Any]]:
+        return [
+            {'key': 'x', 'value': f'v {SECRET}', 'default': 1, 'description': 'd', 'choices': []}
+        ]
+
+    async def artifact_list(self) -> list[dict[str, Any]]:
+        return [{**ARTIFACT, 'versions': 2}]
+
+    async def artifact_versions(self, artifact_id: str) -> list[dict[str, Any]]:
+        self.calls.append(('versions', artifact_id))
+        return [ARTIFACT, {**ARTIFACT, 'version': 'sha256:new'}]
+
+    async def artifact_content(self, artifact_id: str, version: str) -> tuple[bytes, str]:
+        self.calls.append(('content', artifact_id, version))
+        return CONTENT, 'text/html'
+
+    async def artifact_preview(self, artifact_id: str, version: str) -> str:
+        return f'<script>alert(1)</script> {SECRET}'
+
+    async def artifact_diff(self, artifact_id: str, old: str, new: str) -> dict[str, Any]:
+        self.calls.append(('diff', artifact_id, old, new))
+        return {'summary': '1 行不同', 'changed': True, 'unified': f'-a\n+{SECRET}'}
+
+    async def artifact_feedback(
+        self, artifact_id: str, version: str, text: str, lines: tuple[int, int] | None
+    ) -> dict[str, Any] | None:
+        self.calls.append(('feedback', artifact_id, version, text, lines))
+        return {
+            'id': 'feedback-1',
+            'statement': text,
+            'kind': 'judgment',
+            'status': 'proposed',
+            'origin': 'feedback',
+        }
+
+    async def rubrics(self) -> dict[str, Any]:
+        return {'goal': 'g', 'rubrics': []}
+
+    async def activate_rubric(self, rubric_id: str) -> None:
+        self.calls.append(('activate', rubric_id))
+
+    def open_terminal(self, cols: int, rows: int) -> FakeTerminal:
+        terminal = FakeTerminal(cols, rows)
+        self.terminals.append(terminal)
+        return terminal
+
+    async def agent_screen(self, handle: str, since: int, wait: float) -> dict[str, Any]:
+        if handle == 'missing':
+            raise ConfigError(expected='a terminal', received='none', next_action='list them')
+        chunks = self.screens.get(handle, [])
+        index = since
+        if index >= len(chunks):
+            await asyncio.sleep(wait)
+            return {'text': '', 'end': index, 'running': False, 'exit_code': 0, 'truncated': False}
+        return {
+            'text': chunks[index],
+            'end': index + 1,
+            'running': True,
+            'exit_code': None,
+            'truncated': False,
+        }
+
     async def close(self, failure: BaseException | None) -> None:
         self.closed.append(failure)
         await self.bus.close()
@@ -131,6 +241,38 @@ class FakeAssembly:
 
     def doctor(self) -> list[dict[str, Any]]:
         return self.checks
+
+    def topologies(self) -> list[dict[str, Any]]:
+        return [
+            {'name': 'team', 'slots': [{'name': 'lead', 'agent': 'Orchestrator', 'is_root': True}]}
+        ]
+
+    async def traces(self) -> list[dict[str, Any]]:
+        return [{'trace_id': 'trace-1', 'started_ns': 1, 'ended_ns': None, 'status': None}]
+
+    async def trace(self, trace_id: str) -> dict[str, Any]:
+        if trace_id != 'trace-1':
+            raise ConfigError(expected='a trace', received='none', next_action='list them')
+        return {
+            'trace_id': trace_id,
+            'status': None,
+            'started_ns': 1,
+            'ended_ns': None,
+            'agents': [],
+            'tool_calls': [
+                {
+                    'call_id': 'c1',
+                    'name': 'Bash',
+                    'agent_id': 'a1',
+                    'outcome': 'ok',
+                    'start_ns': 2,
+                    'end_ns': 3,
+                }
+            ],
+            'spawns': [],
+            'llm_calls': 1,
+            'tokens': 15,
+        }
 
 
 @dataclass

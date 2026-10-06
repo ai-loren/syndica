@@ -47,6 +47,8 @@ __all__ = ['down', 'serve_main', 'status', 'up']
 
 _HANDSHAKE_TIMEOUT_S = 60.0
 _STOP_TIMEOUT_S = 15.0
+# 流关掉之后仍不结束的连接最多再等这么久：之后 uvicorn 取消它们，会话照样在 lifespan 里存盘。
+_GRACEFUL_S = 5
 _DEPENDENCIES = ('starlette', 'uvicorn', 'websockets')
 
 
@@ -399,12 +401,32 @@ def _serve(
             os.dup2(quiet, sys.stdout.fileno())
             os.dup2(quiet, sys.stderr.fileno())
             os.close(quiet)
-        server = uvicorn.Server(
-            uvicorn.Config(app, log_level='warning', lifespan='on', ws='websockets-sansio')
+
+        class _Server(uvicorn.Server):
+            """收到退出信号时先结束事件流，再走 uvicorn 的优雅关闭（会话随后在 lifespan 里存盘、
+            放锁）。"""
+
+            loop: asyncio.AbstractEventLoop | None = None
+
+            def handle_exit(self, sig: int, frame: Any) -> None:
+                super().handle_exit(sig, frame)
+                if self.loop is not None:
+                    self.loop.call_soon_threadsafe(live.end_streams)
+
+        server = _Server(
+            uvicorn.Config(
+                app,
+                log_level='warning',
+                lifespan='on',
+                ws='websockets-sansio',
+                timeout_graceful_shutdown=_GRACEFUL_S,
+            )
         )
 
         async def run() -> None:
-            asyncio.get_running_loop().set_default_executor(DaemonExecutor())
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(DaemonExecutor())
+            server.loop = loop
             await server.serve(sockets=[sock])
 
         asyncio.run(run())

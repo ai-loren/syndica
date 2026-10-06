@@ -343,3 +343,15 @@ class SessionHandle(Protocol):          # 只暴露内核公开类型与不透�
     静态文件、SSE 流与 `_Guard` 的转发在白名单里写明理由。
   - 变异时出现过两处没还原的源码（WebSocket 回帧、待答表的摘除），单文件的 sha256 校验没报。此后每轮变异前后
     对整个 `src` 树做 sha256 比对。
+- **P3（阶段二至四，2026-10-07）**
+  - `syndica down` 在有页面开着时会挂满 15 秒再被强制结束：uvicorn 的优雅关闭要等在飞的响应结束，SSE 响应不会自己
+    结束，而关流只在之后的 lifespan 里。收到退出信号时先结束事件流（`Live.end_streams`），优雅关闭另有 5 秒上限。
+  - 进度没有公开读法：长程 Module 量到进度时发内核事件 `progress_measured`，server 按 Agent 缓存最近一次，快照从这里取。
+  - trace 的 JSON 分析是内核纯函数 `kernel/trace_analysis.py`；CLI 的文字视图没有改写成复用它（只读同一份 span 与边，
+    改写只换来回归风险）。
+  - 产物原文一律按附件、octet-stream、沙箱化交出，登记的 mime 放在 `X-Syndica-Mime`；前端只对图片按它包成 blob 显示。
+  - 人的终端用 `/bin/sh -i`、Agent 的环境变量：人的登录 shell 会读 rc 文件，rc 里 export 的密钥就回来了。关闭时连同
+    前台进程组一起结束（作业控制下前台作业不在 shell 的组里）。
+  - 反馈的锚点 locator 以 `msg:` 开头、引文至少 4 个非空白字符（验收的锚点规则）；选中的行太短就只锚反馈本身。
+  - E2E 在脚本化的 OpenAI 兼容端点上起真的 `syndica up`；离线模拟不切断已建立的流，用例里从页面中止在飞请求；
+    acceptance 在这条路上不产出裁决，`unverified` 的展示由拦截事件流注入一帧 `agent_end` 来测。

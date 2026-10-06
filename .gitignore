@@ -35,3 +35,8 @@ node_modules/
 
 # sdd scratch
 .superpowers/
+
+# Playwright
+web/test-results/
+web/playwright-report/
+web/e2e/.state/

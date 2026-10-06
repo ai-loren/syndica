@@ -433,6 +433,483 @@
           }
         ]
       }
+    },
+    "/api/v1/topologies": {
+      "get": {
+        "summary": "配置里的拓扑",
+        "responses": {
+          "200": {
+            "description": "配置里的拓扑",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopologyList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/traces": {
+      "get": {
+        "summary": "工作区里的 trace",
+        "responses": {
+          "200": {
+            "description": "工作区里的 trace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraceList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/traces/{trace_id}": {
+      "get": {
+        "summary": "一份 trace 的分析",
+        "responses": {
+          "200": {
+            "description": "一份 trace 的分析",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraceAnalysis"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/trace": {
+      "get": {
+        "summary": "这个会话的 trace",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "这个会话的 trace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraceAnalysis"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/flags": {
+      "get": {
+        "summary": "这个会话解析后的 Flag",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "这个会话解析后的 Flag",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlagList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/artifacts": {
+      "get": {
+        "summary": "产物索引",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "产物索引",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/artifacts/versions": {
+      "get": {
+        "summary": "一个产物的版本（?id=）",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "一个产物的版本（?id=）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactVersions"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/artifacts/content": {
+      "get": {
+        "summary": "一个版本的原文（?id=&version=）：附件、octet-stream、沙箱化；登记的 mime 在 X-Syndica-Mime",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "一个版本的原文（?id=&version=）：附件、octet-stream、沙箱化；登记的 mime 在 X-Syndica-Mime"
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/artifacts/preview": {
+      "get": {
+        "summary": "一个版本的预览（?id=&version=）",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "一个版本的预览（?id=&version=）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactPreview"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/artifacts/diff": {
+      "get": {
+        "summary": "两个版本的语义 diff（?id=&old=&new=）",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "两个版本的语义 diff（?id=&old=&new=）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactDiff"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/artifacts/feedback": {
+      "post": {
+        "summary": "对产物的反馈，落成提议的 Rubric",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "对产物的反馈，落成提议的 Rubric",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedbackResult"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/sessions/{sid}/rubrics": {
+      "get": {
+        "summary": "Goal 与 Rubric",
+        "parameters": [
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Goal 与 Rubric",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RubricList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -471,6 +948,47 @@
           "status"
         ],
         "title": "AgentNode",
+        "type": "object"
+      },
+      "ArtifactDiff": {
+        "additionalProperties": false,
+        "properties": {
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "changed": {
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "unified": {
+            "title": "Unified",
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "changed",
+          "unified"
+        ],
+        "title": "ArtifactDiff",
+        "type": "object"
+      },
+      "ArtifactList": {
+        "additionalProperties": false,
+        "properties": {
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactSummary"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "artifacts"
+        ],
+        "title": "ArtifactList",
         "type": "object"
       },
       "ArtifactOut": {
@@ -515,6 +1033,86 @@
           "is_deliverable"
         ],
         "title": "ArtifactOut",
+        "type": "object"
+      },
+      "ArtifactPreview": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "ArtifactPreview",
+        "type": "object"
+      },
+      "ArtifactSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "mime": {
+            "title": "Mime",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          },
+          "producer": {
+            "title": "Producer",
+            "type": "string"
+          },
+          "is_deliverable": {
+            "title": "Is Deliverable",
+            "type": "boolean"
+          },
+          "versions": {
+            "title": "Versions",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "path",
+          "kind",
+          "mime",
+          "version",
+          "producer",
+          "is_deliverable",
+          "versions"
+        ],
+        "title": "ArtifactSummary",
+        "type": "object"
+      },
+      "ArtifactVersions": {
+        "additionalProperties": false,
+        "properties": {
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactOut"
+            },
+            "title": "Versions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "versions"
+        ],
+        "title": "ArtifactVersions",
         "type": "object"
       },
       "Block": {
@@ -828,6 +1426,127 @@
         "title": "EventEnvelope",
         "type": "object"
       },
+      "FeedbackRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          },
+          "text": {
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          },
+          "start_line": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Start Line"
+          },
+          "end_line": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "End Line"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "text"
+        ],
+        "title": "FeedbackRequest",
+        "type": "object"
+      },
+      "FeedbackResult": {
+        "additionalProperties": false,
+        "properties": {
+          "rubric": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RubricOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "rubric"
+        ],
+        "title": "FeedbackResult",
+        "type": "object"
+      },
+      "FlagList": {
+        "additionalProperties": false,
+        "properties": {
+          "flags": {
+            "items": {
+              "$ref": "#/components/schemas/FlagOut"
+            },
+            "title": "Flags",
+            "type": "array"
+          }
+        },
+        "required": [
+          "flags"
+        ],
+        "title": "FlagList",
+        "type": "object"
+      },
+      "FlagOut": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value"
+          },
+          "default": {
+            "title": "Default"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "choices": {
+            "items": {},
+            "title": "Choices",
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "value",
+          "default",
+          "description",
+          "choices"
+        ],
+        "title": "FlagOut",
+        "type": "object"
+      },
       "Health": {
         "additionalProperties": false,
         "properties": {
@@ -985,7 +1704,8 @@
               "answer",
               "abort",
               "grant",
-              "budget_answer"
+              "budget_answer",
+              "activate_rubric"
             ],
             "title": "Op",
             "type": "string"
@@ -1010,6 +1730,69 @@
           "op"
         ],
         "title": "RpcRequest",
+        "type": "object"
+      },
+      "RubricList": {
+        "additionalProperties": false,
+        "properties": {
+          "goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal"
+          },
+          "rubrics": {
+            "items": {
+              "$ref": "#/components/schemas/RubricOut"
+            },
+            "title": "Rubrics",
+            "type": "array"
+          }
+        },
+        "required": [
+          "goal",
+          "rubrics"
+        ],
+        "title": "RubricList",
+        "type": "object"
+      },
+      "RubricOut": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "statement": {
+            "title": "Statement",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "origin": {
+            "title": "Origin",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "statement",
+          "kind",
+          "status",
+          "origin"
+        ],
+        "title": "RubricOut",
         "type": "object"
       },
       "SessionList": {
@@ -1171,6 +1954,164 @@
           "arguments"
         ],
         "title": "ToolCallOut",
+        "type": "object"
+      },
+      "TopologyList": {
+        "additionalProperties": false,
+        "properties": {
+          "topologies": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Topologies",
+            "type": "array"
+          }
+        },
+        "required": [
+          "topologies"
+        ],
+        "title": "TopologyList",
+        "type": "object"
+      },
+      "TraceAnalysis": {
+        "additionalProperties": false,
+        "properties": {
+          "trace_id": {
+            "title": "Trace Id",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "started_ns": {
+            "title": "Started Ns",
+            "type": "integer"
+          },
+          "ended_ns": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended Ns"
+          },
+          "agents": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Agents",
+            "type": "array"
+          },
+          "tool_calls": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Tool Calls",
+            "type": "array"
+          },
+          "spawns": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Spawns",
+            "type": "array"
+          },
+          "llm_calls": {
+            "title": "Llm Calls",
+            "type": "integer"
+          },
+          "tokens": {
+            "title": "Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trace_id",
+          "status",
+          "started_ns",
+          "ended_ns",
+          "agents",
+          "tool_calls",
+          "spawns",
+          "llm_calls",
+          "tokens"
+        ],
+        "title": "TraceAnalysis",
+        "type": "object"
+      },
+      "TraceList": {
+        "additionalProperties": false,
+        "properties": {
+          "traces": {
+            "items": {
+              "$ref": "#/components/schemas/TraceRow"
+            },
+            "title": "Traces",
+            "type": "array"
+          }
+        },
+        "required": [
+          "traces"
+        ],
+        "title": "TraceList",
+        "type": "object"
+      },
+      "TraceRow": {
+        "additionalProperties": false,
+        "properties": {
+          "trace_id": {
+            "title": "Trace Id",
+            "type": "string"
+          },
+          "started_ns": {
+            "title": "Started Ns",
+            "type": "integer"
+          },
+          "ended_ns": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended Ns"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          }
+        },
+        "required": [
+          "trace_id",
+          "started_ns",
+          "ended_ns",
+          "status"
+        ],
+        "title": "TraceRow",
         "type": "object"
       },
       "Transcript": {
@@ -1372,6 +2313,24 @@
       },
       "additionalProperties": true
     },
+    "progress_measured": {
+      "type": "object",
+      "required": [
+        "satisfied",
+        "mandatory",
+        "pending_human",
+        "measured_turn",
+        "verdict"
+      ],
+      "properties": {
+        "satisfied": {},
+        "mandatory": {},
+        "pending_human": {},
+        "measured_turn": {},
+        "verdict": {}
+      },
+      "additionalProperties": true
+    },
     "progress_regressed": {
       "type": "object",
       "required": [
@@ -1515,6 +2474,10 @@
       "additionalProperties": true
     }
   },
+  "x-syndica-pty": {
+    "human": "/api/v1/sessions/{sid}/pty：第一帧 {\"op\":\"auth\",\"token\",\"cols\",\"rows\"}；之后发 {\"op\":\"input\",\"data\"} 或 {\"op\":\"resize\",\"cols\",\"rows\"}，收二进制的终端输出",
+    "agent": "/api/v1/sessions/{sid}/agent-pty/{handle}：第一帧 auth；之后只收 {\"text\",\"running\",\"exit_code\"}（脱敏后的整行，只读）"
+  },
   "x-syndica-rpc": {
     "path": "/api/v1/sessions/{sid}/rpc",
     "first_frame": "auth",
@@ -1529,6 +2492,14 @@
         "type": "object",
         "properties": {
           "agent_id": {
+            "type": "string"
+          }
+        }
+      },
+      "activate_rubric": {
+        "type": "object",
+        "properties": {
+          "rubric_id": {
             "type": "string"
           }
         }

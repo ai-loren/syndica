@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
@@ -20,6 +21,7 @@ from syndica.cli.main import CliIO
 from syndica.cli.session_lock import acquire_session_lock
 from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import ConfigError, ScriptedLLM, ScriptedTurn, ToolCall
+from syndica.kernel.stores.file_rubric import FileRubricStore
 from syndica.server import Live
 from syndica.server.outbound import encoded
 
@@ -213,5 +215,116 @@ async def test_a_config_broken_after_start_does_not_stop_new_sessions(tmp_path: 
     try:
         session = await live.open_session(resume=None, role='Worker')
         assert session.sid
+    finally:
+        await live.shutdown()
+
+
+def _write(path: str, content: str, call_id: str) -> ScriptedTurn:
+    return ScriptedTurn(
+        tool_calls=[
+            ToolCall(
+                id=call_id,
+                name='Write',
+                arguments=json.dumps({'path': path, 'content': content}),
+            )
+        ]
+    )
+
+
+async def test_artifacts_written_in_a_session_can_be_previewed_diffed_and_given_feedback(
+    tmp_path: Path,
+):
+    (tmp_path / '.syndica.yaml').write_text('version: 1\nmodules: [acceptance]\n')
+    script = [
+        _write('report.md', '# 报告\n第一版\n', 'w1'),
+        _write('report.md', f'# 报告\n第二版 {_KEY}\n结论\n', 'w2'),
+        ScriptedTurn(content='done'),
+    ]
+    assembly, _ = _assembly(tmp_path, lambda _: ScriptedLLM(list(script)))
+    live = Live(assembly)
+    try:
+        session = await live.open_session(resume=None, role='Worker')
+        await session.handle.deliver(session.handle.root_id, 'go')
+        await _finished(live, session.sid)
+        handle: Any = session.handle
+        [listed] = await handle.artifact_list()
+        assert (listed['id'], listed['versions']) == ('file:report.md', 2)
+        old, new = [row['version'] for row in await handle.artifact_versions('file:report.md')]
+        assert '第一版' in await handle.artifact_preview('file:report.md', old)
+        diff = await handle.artifact_diff('file:report.md', old, new)
+        assert diff['changed'] is True and '+结论' in diff['unified']
+        assert _KEY not in encoded(diff, handle.redactor())
+        content, mime = await handle.artifact_content('file:report.md', new)
+        assert content.decode().startswith('# 报告') and mime == 'text/markdown'
+        with pytest.raises(ConfigError):
+            await handle.artifact_feedback('file:report.md', new, '太短', None)
+        rubric = await handle.artifact_feedback('file:report.md', new, '结论要给出具体数字', (2, 3))
+        assert rubric is not None and rubric['status'] == 'proposed'
+        store = FileRubricStore(tmp_path / '.syndica' / 'rubrics')
+        [proposed] = await store.rubrics(session.sid, include_proposed=True)
+        assert [anchor.locator for anchor in proposed.anchors][1:] == ['report.md#L2-L3']
+        await handle.activate_rubric(rubric['id'])
+        [stored] = (await handle.rubrics())['rubrics']
+        assert (stored['id'], stored['status']) == (rubric['id'], 'active')
+        with pytest.raises(ConfigError):
+            await handle.activate_rubric(rubric['id'])
+    finally:
+        await live.shutdown()
+
+
+async def test_the_human_terminal_runs_in_the_agent_environment_and_is_gone_after_close(
+    tmp_path: Path,
+):
+    assembly, _ = _assembly(tmp_path, lambda _: ScriptedLLM([]))
+    live = Live(assembly)
+    try:
+        session = await live.open_session(resume=None, role='Worker')
+        handle: Any = session.handle
+        terminal = handle.open_terminal(80, 24)
+        terminal.write(b'echo key=[$OPENAI_API_KEY] marker=[$SYNDICA_AGENT_ENV] done=yes\n')
+        seen = b''
+        for _ in range(100):
+            seen += await asyncio.wait_for(terminal.read(), 5)
+            if b'done=yes' in seen and b'marker=[1]' in seen:
+                break
+        assert b'key=[]' in seen and b'marker=[1]' in seen
+        assert _KEY.encode() not in seen
+        pid = terminal._process.pid  # pyright: ignore[reportPrivateUsage]
+        terminal.write(b"trap '' HUP; sleep 3017\n")
+        await asyncio.sleep(0.5)
+        assert _sleeping('3017')
+    finally:
+        await live.shutdown()
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    for _ in range(50):
+        if not _sleeping('3017'):
+            break
+        await asyncio.sleep(0.1)
+    assert not _sleeping('3017')
+
+
+def _sleeping(seconds: str) -> bool:
+    found = subprocess.run(['pgrep', '-f', f'sleep {seconds}'], capture_output=True, text=True)
+    return bool(found.stdout.strip())
+
+
+async def test_the_session_trace_lists_the_tool_calls_the_event_stream_showed(tmp_path: Path):
+    live, entries = await _run_one(
+        tmp_path, [_bash('echo hi', 'c-trace'), ScriptedTurn(content='ok')]
+    )
+    try:
+        session = next(iter(live.sessions.values()))
+        trace_id = session.handle.trace_id()  # pyright: ignore[reportAttributeAccessIssue]
+        assert trace_id is not None
+        analysis = await live.assembly.trace(trace_id)  # pyright: ignore[reportAttributeAccessIssue]
+        streamed = [
+            entry['payload']['tool_call_id']
+            for entry in entries
+            if entry['kind'] == 'tool_call_started'
+        ]
+        assert streamed == ['c-trace']
+        assert [call['call_id'] for call in analysis['tool_calls']] == streamed
+        assert any(row['trace_id'] == trace_id for row in await live.assembly.traces())  # pyright: ignore[reportAttributeAccessIssue]
     finally:
         await live.shutdown()

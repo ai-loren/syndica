@@ -60,6 +60,8 @@ class LiveSession:
         self.sid = handle.sid
         self.stream = Stream()
         self.pending: dict[str, Pending] = {}
+        # 每个 Agent 最近一次量到的进度：进度只经事件出来，快照从这里取。
+        self.progress: dict[str, dict[str, Any]] = {}
         self._dropped = 0
         self._tasks: set[asyncio.Task[None]] = set()
         self._pump = asyncio.create_task(self._run(), name=f'server-pump:{self.sid}')
@@ -83,6 +85,8 @@ class LiveSession:
                 self._spawn(self._decline(pending))
         elif event.kind == 'human_request_resolved':
             self.pending.pop(str(payload.get('request_id')), None)
+        elif event.kind == 'progress_measured':
+            self.progress[event.agent_id] = payload
         self.publish(
             event.kind,
             {
@@ -180,6 +184,7 @@ class LiveSession:
             'root_id': self.handle.root_id,
             'as_of': as_of,
             **state,
+            'progress': dict(self.progress) or None,
             'pending': [pending.view() for pending in self.pending.values()],
         }
 
@@ -298,6 +303,13 @@ class Live:
             await session.close()
         finally:
             self.stream.append('session_closed', {'sid': sid})
+
+    def end_streams(self) -> None:
+        """让每条事件流交完缓冲就结束。server 收到退出信号时先调它：uvicorn 的优雅关闭要等在飞的
+        响应结束，而 SSE 响应不会自己结束，不先关流，关机就一直等到被强制结束。"""
+        self.stream.close()
+        for session in self.sessions.values():
+            session.stream.close()
 
     async def shutdown(self) -> None:
         if self._timer is not None:
