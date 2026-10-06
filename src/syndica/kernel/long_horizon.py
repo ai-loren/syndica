@@ -13,10 +13,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from syndica.kernel.acceptance import Goal, Rubric, Verdict
+from syndica.kernel.acceptance import Goal, Rubric, Verdict, VerdictStatus
 from syndica.kernel.budget import BudgetView
 
 __all__ = [
+    'BaselineStrategy',
     'BudgetAction',
     'BudgetMove',
     'DriftAction',
@@ -67,7 +68,8 @@ class BudgetAction:
 
 @dataclass(frozen=True)
 class DriftAction:
-    """确认漂移之后怎么办。`REMIND` 追加 `message` 重申 Goal。"""
+    """确认漂移之后怎么办。`REMIND` 让长程 Module 把 Goal 原文（带它自己的信任）重新注入一次，
+    `message` 是附在前面的一句说明——策略不复述 Goal：复述出来的是「用户要什么」的第二个版本。"""
 
     move: DriftMove
     message: str = ''
@@ -141,3 +143,44 @@ class LongHorizonStrategy(Protocol):
     async def on_goal_drift(self, ctx: LongHorizonContext) -> DriftAction: ...
 
     async def should_stop(self, ctx: LongHorizonContext) -> StopDecision: ...
+
+
+_NAMED = 10
+
+
+class BaselineStrategy:
+    """基线策略（spec §8.6）：停滞时请 Agent 换条路或说明卡在哪；预算低时先保住核心交付物；漂移时
+    重申 Goal 原文；完成判据成立（强制条全满足且裁决 pass）时停。别的范式写成另一个策略交给长程
+    Module，与它过同一份契约。"""
+
+    async def on_progress_stall(self, ctx: LongHorizonContext) -> StallAction:
+        done, total = len(ctx.progress.satisfied), len(ctx.progress.mandatory)
+        return StallAction(
+            StallMove.NUDGE,
+            f'已经连续 {ctx.stalled_turns} 轮没有新的验收条被满足（{done}/{total}）。'
+            '换一条路试试；如果卡住了，用一两句话说明卡在哪、缺什么。',
+        )
+
+    async def on_budget_low(self, ctx: LongHorizonContext) -> BudgetAction:
+        return BudgetAction(
+            BudgetMove.CONTINUE,
+            '预算剩得不多了：先保住核心交付物、确认它们能交付，放弃锦上添花的部分。',
+        )
+
+    async def on_goal_drift(self, ctx: LongHorizonContext) -> DriftAction:
+        return DriftAction(DriftMove.REMIND, '最近几轮的动作锚不回这次的目标。原样的目标如下：')
+
+    async def should_stop(self, ctx: LongHorizonContext) -> StopDecision:
+        verdict = ctx.verdict
+        if ctx.progress.complete and verdict is not None and verdict.status is VerdictStatus.PASS:
+            return StopDecision(True, '强制验收条全部满足，裁决是 pass')
+        missing = sorted(set(ctx.progress.mandatory) - set(ctx.progress.satisfied))
+        if not missing:
+            return StopDecision(False)
+        # 这段话进历史、也就进了此后每次请求的前缀：条目再多也只点名前几条。
+        named = '、'.join(missing[:_NAMED])
+        more = f' 等 {len(missing)} 条' if len(missing) > _NAMED else ''
+        return StopDecision(
+            False,
+            f'还有 {len(missing)} 条强制验收条没满足（{named}{more}）：接着把它们做完再交付。',
+        )

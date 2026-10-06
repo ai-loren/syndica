@@ -433,6 +433,10 @@ _WRAP_UP_TEXT = (
     '预算快用完了（{dims}）：这是最后一轮，这一轮里的工具调用不会被执行。'
     '直接把已经完成的部分整理成最终回答交付，写清哪些还没做完、做到了哪一步。'
 )
+_STRATEGY_WRAP_TEXT = (
+    '长程策略判断该收尾了：这是最后一轮，这一轮里的工具调用不会被执行。'
+    '直接把已经完成的部分整理成最终回答交付，写清哪些还没做完、做到了哪一步。'
+)
 _BUDGET_BLOCK_SAMPLE = ContextBlock(
     role='user', content=_WRAP_UP_TEXT.format(dims='tokens / cost / turns / wall_clock_s')
 )
@@ -1160,10 +1164,16 @@ class BaseAgent:
             if stopped is not None:
                 return stopped
         self._finalizing = False
-        if self._long_horizon is not None:
+        # 收尾轮不问长程控制器：里程碑验收与语义比对都是伴生调用，花的是留给收尾那次调用的预算。
+        if self._long_horizon is not None and not self._wrapping:
             for block in await self._long_horizon.before_model(ctx, turn):
                 self._append_long_horizon(ctx, block)
-            self._finalizing = self._long_horizon.final_requested() and not self._wrapping
+            self._finalizing = self._long_horizon.final_requested()
+            if self._budget is not None:
+                # 控制器的伴生花在判定之后：重判一次，放不下这次调用就停、只放得下这一次就收尾。
+                stopped = await self._recheck_budget(ctx, tool_defs)
+                if stopped is not None:
+                    return stopped
         # turn 开始就做阈值 / 主动压缩（§8.8 主路径）：注入之后（新输入成了受保护的「当前输入」）、
         # 模型调用之前，消息驱动的 Agent（每轮一次回复、无工具）也会压，而非只靠超限兜底（H3）。
         # 收尾轮不压：摘要压缩是一次辅助调用，花的是留给收尾那次调用的预算。
@@ -1320,11 +1330,11 @@ class BaseAgent:
         return budget.tree.policy.on_exhausted
 
     def _budget_move(
-        self, ctx: Context, tool_defs: list[dict[str, Any]]
+        self, ctx: Context, tool_defs: list[dict[str, Any]], *, count_turn: bool = True
     ) -> tuple[str, tuple[str, ...]]:
         budget = cast(BudgetAccount, self._budget)
         if not budget.metered:
-            return budget.plan_turn(0, Decimal(0), self._last_turn_s)
+            return budget.plan_turn(0, Decimal(0), self._last_turn_s, count_turn=count_turn)
         # 估算沿用上一次请求的 SP 块：SP 本该逐轮字节一致（§5.2），为估算再拼一次只会多调一次。
         system_block = self._last_system or ContextBlock(
             role='system', content=self.get_system_prompt()
@@ -1333,7 +1343,7 @@ class BaseAgent:
         pending = [_BUDGET_BLOCK_SAMPLE, _BUDGET_BLOCK_SAMPLE]
         request = {'messages': [system_block, *ctx.current_traj, *pending], 'tools': tool_defs}
         tokens, cost, _ = budget.estimate(self.options.llm, request)
-        return budget.plan_turn(tokens, cost, self._last_turn_s)
+        return budget.plan_turn(tokens, cost, self._last_turn_s, count_turn=count_turn)
 
     async def _budget_turn(
         self, ctx: Context, tool_defs: list[dict[str, Any]]
@@ -1342,36 +1352,64 @@ class BaseAgent:
         下，这一轮就是收尾轮；否则照常。`ask_human` 先问一次人（同一次耗尽只问一次），人追加了就重
         判；`hard_stop` 不收尾，用到放不下为止。照常与收尾的这一轮计一轮。"""
         budget = cast(BudgetAccount, self._budget)
+        move, dims = await self._budget_decision(ctx, tool_defs)
+        if move == 'stop':
+            return await self._stop_at_turn_start(ctx, dims)
+        budget.take_turn()
+        self._announce_budget(ctx, budget)
+        if move == 'wrap_up':
+            self._enter_wrap_up(ctx, dims, _WRAP_UP_TEXT.format(dims=' / '.join(dims)))
+        elif self._long_horizon is not None and self._long_horizon.wrap_up_requested():
+            # 策略要收尾（`on_budget_low` 交回 WRAP_UP）：预算还够，所以不问人，hard_stop 也照收。
+            self._enter_wrap_up(ctx, ('strategy',), _STRATEGY_WRAP_TEXT)
+        return None
+
+    async def _budget_decision(
+        self, ctx: Context, tool_defs: list[dict[str, Any]], *, count_turn: bool = True
+    ) -> tuple[str, tuple[str, ...]]:
+        budget = cast(BudgetAccount, self._budget)
         disposition = self._disposition()
-        move, dims = self._budget_move(ctx, tool_defs)
-        if move == 'normal' and self._long_horizon and self._long_horizon.wrap_up_requested():
-            move, dims = 'wrap_up', ('strategy',)
+        move, dims = self._budget_move(ctx, tool_defs, count_turn=count_turn)
         if move != 'normal' and disposition is Exhaustion.ASK_HUMAN:
             if self._asked != budget.generation:
                 self._asked = budget.generation
                 await self._ask_for_budget(budget)
                 # 问人可能等上好几分钟：不论人追加没有，都按此刻重判（同池的兄弟可能已经花掉了）。
-                move, dims = self._budget_move(ctx, tool_defs)
+                move, dims = self._budget_move(ctx, tool_defs, count_turn=count_turn)
         if move == 'wrap_up' and disposition is Exhaustion.HARD_STOP:
             move = 'normal'
+        return move, dims
+
+    async def _stop_at_turn_start(self, ctx: Context, dims: tuple[str, ...]) -> StopReason:
+        budget = cast(BudgetAccount, self._budget)
+        self._unpriced = 'cost' in dims and self._estimate_unpriced(budget)
+        await self._stop_for_budget(ctx, dims, self._disposition())
+        return StopReason.BUDGET
+
+    async def _recheck_budget(
+        self, ctx: Context, tool_defs: list[dict[str, Any]]
+    ) -> StopReason | None:
+        if self._wrapping:
+            return None
+        move, dims = await self._budget_decision(ctx, tool_defs, count_turn=False)
         if move == 'stop':
-            self._unpriced = 'cost' in dims and self._estimate_unpriced(budget)
-            await self._stop_for_budget(ctx, dims, disposition)
-            return StopReason.BUDGET
-        budget.take_turn()
-        self._announce_budget(ctx, budget)
+            return await self._stop_at_turn_start(ctx, dims)
         if move == 'wrap_up':
-            self._wrapping = True
-            self._wrap_dims = dims
-            ctx.append(
-                signed_block(
-                    HistoryKind.BUDGET,
-                    _WRAP_UP_TEXT.format(dims=' / '.join(dims)),
-                    key=f'budget:{self.agent_id}:wrap:{self._cycle}:{self._current_turn}',
-                )
-            )
-            self._tracing.event('budget.wrap_up', {'budget.dimensions': list(dims)})
+            self._finalizing = False
+            self._enter_wrap_up(ctx, dims, _WRAP_UP_TEXT.format(dims=' / '.join(dims)))
         return None
+
+    def _enter_wrap_up(self, ctx: Context, dims: tuple[str, ...], text: str) -> None:
+        self._wrapping = True
+        self._wrap_dims = dims
+        ctx.append(
+            signed_block(
+                HistoryKind.BUDGET,
+                text,
+                key=f'budget:{self.agent_id}:wrap:{self._cycle}:{self._current_turn}',
+            )
+        )
+        self._tracing.event('budget.wrap_up', {'budget.dimensions': list(dims)})
 
     def _announce_budget(self, ctx: Context, budget: BudgetAccount) -> None:
         """预算注入历史（spec §8.4：Agent 可感知，不进 SP）：第一轮一块，剩余跨过 50% / 25% / 10% 时

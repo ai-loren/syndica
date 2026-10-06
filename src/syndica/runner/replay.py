@@ -161,6 +161,7 @@ def _builtin_modules(llm: _ReplayLLM, fallbacks: str) -> dict[str, Callable[[], 
         'compaction': CompactionModule,
         'memory': MemoryModule,
         'acceptance': _acceptance_not_rebuilt,
+        'long-horizon': _long_horizon_not_rebuilt,
     }
 
 
@@ -171,6 +172,18 @@ def _acceptance_not_rebuilt() -> RuntimeModule:
         received='它的伴生调用（投影、L2 / L3、反馈提议）不在录制的轮次里，回放答不了它们',
         next_action=(
             '装了 acceptance 的 run 不写回放文档，这份文档是手写或改过的；用原始 run 的 trace 排查'
+        ),
+    )
+
+
+def _long_horizon_not_rebuilt() -> RuntimeModule:
+    """长程 Module 要与验收一起装，里程碑验收与语义比对同样是伴生调用，不在录制轮次里。"""
+    raise ModulesNotRebuilt(
+        expected='回放重建这份文档记着的内置 Module long-horizon',
+        received='它的里程碑验收与漂移比对是伴生调用，不在录制的轮次里，回放答不了它们',
+        next_action=(
+            '装了 long-horizon 的 run 不写回放文档，这份文档是手写或改过的；'
+            '用原始 run 的 trace 排查'
         ),
     )
 

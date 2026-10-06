@@ -361,7 +361,7 @@ workspaces agents operate on to avoid this.
 exist and where they come from without importing any of them, and marks those whose code is inside
 the workspace. `syndica modules show <name>` imports a module to show its manifest; when its code
 is inside the workspace, the configuration must enable it and be confirmed first. Besides the built-in `retry`,
-`prefix-drift`, `compaction`, `memory` and `acceptance`, it can name a third-party module installed under the `syndica.modules` entry-point
+`prefix-drift`, `compaction`, `memory`, `acceptance` and `long-horizon`, it can name a third-party module installed under the `syndica.modules` entry-point
 group. Its entry point is a callable `factory(host: ModuleHost) -> RuntimeModule`; the entry-point
 name must equal the module's name, and its flag keys must start with the module name, hyphens
 turned into underscores (`example` gives `example_`, `git-notes` gives `git_notes_`), and must not
@@ -387,6 +387,20 @@ rubric only a human can judge stays `unverified`). With `acceptance_feedback`, a
 you becomes a proposed rubric; it counts only after `syndica sessions activate <session> <id>`.
 Runs with acceptance installed do not write a replay document, because the verifiers' model calls
 are not part of the recorded turns.
+
+`modules: [acceptance, long-horizon]` adds the long-horizon loop (spec §8.2–§8.6) for the agent that
+has the goal; it needs `acceptance` because progress is only ever measured by the verifier, never
+taken from the agent's own account. Every `long_horizon_progress_every` turns (default 10) a
+milestone check counts the satisfied mandatory rubrics; a rubric that was satisfied and is now
+unmet is reported as a regression. When `long_horizon_stall_turns` turns (default 20) pass without
+progress, when the budget left drops below `long_horizon_budget_low_percent`, or when the last
+`long_horizon_drift_window` turns of tool calls share no words with the goal and rubrics, a
+strategy decides what to tell the agent; the built-in one suggests a different approach, says to
+secure the core deliverable, or restates the goal verbatim. `long_horizon_semantic_drift` (off by
+default) asks the model to confirm suspected drift first. When a milestone passes with every
+mandatory rubric satisfied the agent is asked for its final answer, and after a `partial` or
+`block` verdict the strategy may send it back up to `long_horizon_max_continuations` times per
+cycle. The events appear under `长程：` in `syndica trace show`.
 
 Writing a module: the entry point returns a `RuntimeModule`, and the kernel checks the following
 when it loads one.

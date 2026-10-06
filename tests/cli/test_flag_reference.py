@@ -65,6 +65,12 @@ def test_the_reference_document_matches_an_independent_golden():
         '`acceptance_feedback`',
         '`acceptance_verifier_timeout`',
         '`acceptance_verifier_max_turns`',
+        '`long_horizon_progress_every`',
+        '`long_horizon_stall_turns`',
+        '`long_horizon_budget_low_percent`',
+        '`long_horizon_drift_window`',
+        '`long_horizon_semantic_drift`',
+        '`long_horizon_max_continuations`',
     ]
     by_key = {row[0]: row for row in rows}
     assert by_key['`untrusted_high_risk`'] == [
@@ -88,6 +94,13 @@ def test_the_reference_document_matches_an_independent_golden():
     assert by_key['`acceptance_outcome`'][1:5] == ['`acceptance`', 'bool', '`false`', '—']
     assert by_key['`acceptance_output_retries`'][2:5] == ['int', '`1`', '≥ 0']
     assert by_key['`acceptance_verifier_timeout`'][2:5] == ['int', '`300`', '≥ 1']
+    assert by_key['`long_horizon_semantic_drift`'][1:5] == [
+        '`long-horizon`',
+        'bool',
+        '`false`',
+        '—',
+    ]
+    assert by_key['`long_horizon_budget_low_percent`'][2:5] == ['int', '`20`', '0 到 99']
 
 
 def _module(name: str, *keys: str) -> RuntimeModule:

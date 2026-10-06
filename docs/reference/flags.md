@@ -30,3 +30,9 @@
 | `acceptance_feedback` | `acceptance` | bool | `false` | — | — | 把 Goal 之后人发来的消息提议成 proposed Rubric，人确认后才生效 |
 | `acceptance_verifier_timeout` | `acceptance` | int | `300` | ≥ 1 | — | 一次验收（L2 + L3 合计）或投影的时限，秒；超时放行并标 unverified |
 | `acceptance_verifier_max_turns` | `acceptance` | int | `8` | ≥ 1 | — | 每个伴生 Agent（投影、L2、L3、反馈提议）各自的轮次上限 |
+| `long_horizon_progress_every` | `long-horizon` | int | `10` | ≥ 0 | — | 每隔几轮跑一次里程碑 L3 量进度；0 = 只在完成时量 |
+| `long_horizon_stall_turns` | `long-horizon` | int | `20` | ≥ 0 | — | 连续几轮没有新的验收条被满足就算停滞、请策略纠偏；0 = 不检测 |
+| `long_horizon_budget_low_percent` | `long-horizon` | int | `20` | 0 到 99 | — | 预算剩不到百分之几时问策略怎么分配；0 = 不问 |
+| `long_horizon_drift_window` | `long-horizon` | int | `8` | ≥ 0 | — | 每隔几轮检查一次最近的动作还锚不锚得回 Goal；0 = 不检查 |
+| `long_horizon_semantic_drift` | `long-horizon` | bool | `false` | — | — | 锚点检查可疑时再做一次语义比对确认（一次伴生调用） |
+| `long_horizon_max_continuations` | `long-horizon` | int | `3` | ≥ 0 | — | 验收没过、打回也用完之后，策略最多让 Agent 接着干几次（每个周期） |

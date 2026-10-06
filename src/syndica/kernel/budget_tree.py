@@ -587,14 +587,16 @@ class BudgetAccount:
         return self._companion
 
     def plan_turn(
-        self, tokens: int, cost: Decimal | None, last_turn_s: float
+        self, tokens: int, cost: Decimal | None, last_turn_s: float, *, count_turn: bool = True
     ) -> tuple[str, tuple[str, ...]]:
         """轮开始时的判定：`stop`（一次调用都放不下了）、`wrap_up`（这一次放得下、下一次放不下——这一轮
-        就是收尾轮）或 `normal`，连同触发它的那几维。`tokens` / `cost` 是下一次调用的估算。"""
+        就是收尾轮）或 `normal`，连同触发它的那几维。`tokens` / `cost` 是下一次调用的估算。
+        `count_turn=False` 用于这一轮已经计过之后的重判：轮次那一维已经判过，再判会把刚扣掉的这一轮
+        当成少了一轮。"""
         node = self._node
         stop: list[str] = []
         wrap: list[str] = []
-        if not self._companion:
+        if not self._companion and count_turn:
             turns = _room(node, 'turns', node)
             if turns is not None:
                 if turns <= 0:

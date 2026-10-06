@@ -796,3 +796,45 @@ def test_budget_events_are_listed_with_their_dimensions_and_disposition():
 def test_a_trace_without_budget_events_says_so():
     section = _section(render_show(_header(), [_agent(_LEAD, 'Lead', 0, 1)], []), '预算：')
     assert section == ['  （没有预算事件）']
+
+
+def test_long_horizon_events_are_listed_in_order_with_what_they_found():
+    lead = _agent(_LEAD, 'Lead', 0, 9)
+    events = (
+        SpanEvent(
+            'progress.measured',
+            _ORIGIN + _S,
+            {'progress.satisfied': 1, 'progress.mandatory': 3, 'progress.pending_human': 2},
+        ),
+        SpanEvent('progress.regressed', _ORIGIN + 2 * _S, {'progress.regressed': ['R2', 'R1']}),
+        SpanEvent('progress.stalled', _ORIGIN + 3 * _S, {'progress.stalled_turns': 20}),
+        SpanEvent(
+            'goal.drift', _ORIGIN + 4 * _S, {'drift.anchored': False, 'drift.confirmed': None}
+        ),
+        SpanEvent(
+            'goal.drift', _ORIGIN + 5 * _S, {'drift.anchored': False, 'drift.confirmed': True}
+        ),
+        SpanEvent(
+            'strategy.action',
+            _ORIGIN + 6 * _S,
+            {'strategy.hook': 'on_progress_stall', 'strategy.move': 'nudge'},
+        ),
+    )
+    lead = dataclasses.replace(lead, events=events)
+
+    section = _section(render_show(_header(), [lead], []), '长程：')
+
+    who = f'Lead {_LEAD[:8]}'
+    assert section == [
+        f'  {who}  progress.measured  1/3 条满足，2 条待人判',
+        f'  {who}  progress.regressed  回退：R2、R1',
+        f'  {who}  progress.stalled  20 轮没有进展',
+        f'  {who}  goal.drift  锚点检查可疑（没做语义比对）',
+        f'  {who}  goal.drift  语义比对确认',
+        f'  {who}  strategy.action  on_progress_stall → nudge',
+    ]
+
+
+def test_a_trace_without_long_horizon_events_says_so():
+    section = _section(render_show(_header(), [_agent(_LEAD, 'Lead', 0, 1)], []), '长程：')
+    assert section == ['  （没有长程事件）']

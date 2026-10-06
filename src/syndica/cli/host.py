@@ -192,6 +192,7 @@ from syndica.kernel import (
 from syndica.kernel.acceptance import RubricStatus, Verdict, VerdictStatus
 from syndica.kernel.acceptance_module import AcceptanceModule
 from syndica.kernel.compaction_module import CompactionModule
+from syndica.kernel.long_horizon_module import LongHorizonModule
 from syndica.kernel.memory_module import MemoryModule
 from syndica.kernel.memory_redaction import redacted_memory_sections
 from syndica.kernel.memory_types import MemoryScope
@@ -433,6 +434,8 @@ def _optional_builtin(name: str) -> RuntimeModule:
         return MemoryModule()
     if name == 'acceptance':
         return AcceptanceModule()
+    if name == 'long-horizon':
+        return LongHorizonModule(AcceptanceModule())
     return PrefixDriftModule()
 
 
@@ -1740,15 +1743,27 @@ class RuntimeCliHost:
                 f'modules 是 {list(names)!r}，没有 acceptance',
                 '在配置的 modules 里加上 acceptance（并按需打开 acceptance_* Flag），或去掉 --goal',
             )
+        if 'long-horizon' in names and 'acceptance' not in names:
+            raise _config_error(
+                'modules 里的 long-horizon 与 acceptance 一起启用：长程的进度只来自验收',
+                f'modules 是 {list(names)!r}，没有 acceptance',
+                '在 modules 里加上 acceptance 并打开 acceptance_outcome，或去掉 long-horizon',
+            )
         entries = {entry.name: entry for entry in discovered}
         redactor = host_redactor(self._environ, config.redaction_rules)
         host = ModuleHost(
             workspace_root=self._workspace_root, environment=environment, redactor=redactor
         )
+        built = {
+            name: self._builtin_module(name, redactor, goal)
+            for name in names
+            if name in OPTIONAL_BUILTINS and name != 'long-horizon'
+        }
+        if 'long-horizon' in names:
+            # 长程读的是同一个验收 Module 的 Goal、Rubric 与 L3：另建一个就读不到这次 run 的。
+            built['long-horizon'] = LongHorizonModule(cast(AcceptanceModule, built['acceptance']))
         return tuple(
-            self._builtin_module(name, redactor, goal)
-            if name in OPTIONAL_BUILTINS
-            else load_module(entries[name], host, redactor)
+            built[name] if name in built else load_module(entries[name], host, redactor)
             for name in names
         )
 

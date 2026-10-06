@@ -105,6 +105,45 @@ def _budget_events(spans: Sequence[Span], labels: Mapping[str, str]) -> list[str
     return lines or ['  （没有预算事件）']
 
 
+_LONG_HORIZON_EVENTS = frozenset(
+    {'progress.measured', 'progress.regressed', 'progress.stalled', 'goal.drift', 'strategy.action'}
+)
+
+
+def _long_horizon_detail(name: str, attributes: Mapping[str, object]) -> str:
+    if name == 'progress.measured':
+        detail = (
+            f'{attributes.get("progress.satisfied")}/{attributes.get("progress.mandatory")} 条满足'
+        )
+        pending = attributes.get('progress.pending_human')
+        return f'{detail}，{pending} 条待人判' if pending else detail
+    if name == 'progress.regressed':
+        ids = attributes.get('progress.regressed')
+        listed = cast(list[object], ids) if isinstance(ids, list) else []
+        return '回退：' + '、'.join(str(item) for item in listed)
+    if name == 'progress.stalled':
+        return f'{attributes.get("progress.stalled_turns")} 轮没有进展'
+    if name == 'goal.drift':
+        confirmed = attributes.get('drift.confirmed')
+        return {True: '语义比对确认', False: '语义比对否认'}.get(
+            cast(bool, confirmed), '锚点检查可疑（没做语义比对）'
+        )
+    return f'{attributes.get("strategy.hook")} → {attributes.get("strategy.move")}'
+
+
+def _long_horizon_events(spans: Sequence[Span], labels: Mapping[str, str]) -> list[str]:
+    """长程 Module 的事件：量到的进度、回退、停滞、漂移、策略交回的动作。"""
+    lines: list[str] = []
+    for span in sorted(spans, key=lambda item: item.start_ns):
+        for event in span.events:
+            if event.name not in _LONG_HORIZON_EVENTS:
+                continue
+            who = labels.get(span.agent_id, _short(span.agent_id))
+            detail = _long_horizon_detail(event.name, event.attributes)
+            lines.append(f'  {who}  {event.name}  {one_line(detail)}'.rstrip())
+    return lines or ['  （没有长程事件）']
+
+
 def render_list(rows: Sequence[TraceRow], *, unreadable: int = 0) -> str:
     """`unreadable` 是头读不进来、因而不在 `rows` 里的 trace 目录有几个。"""
     skipped = (
@@ -161,6 +200,9 @@ def render_show(header: TraceHeader, spans: Sequence[Span], edges: Sequence[Caus
         '',
         '预算：',
         *_budget_events(spans, labels),
+        '',
+        '长程：',
+        *_long_horizon_events(spans, labels),
         '',
         'Module：',
         *_modules(spans, labels, header.schema),
