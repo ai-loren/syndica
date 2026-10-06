@@ -1518,7 +1518,10 @@ def test_the_digest_of_a_ruleset_is_stable_across_releases():
 # 黄金语料的摘要，按 RULES_VERSION 记。内置规则或 `encode_redacted` 的行为一变，摘要就变：升
 # RULES_VERSION，把新摘要记在新版本下。只改了语料（加样例）而规则没变时，换掉当前版本的摘要、不升
 # 版本。
-_GOLDEN = {1: 'a3fbd53e1ede0eb782e1975f9a9afdb0642b97d8cd61e874d34a9ad25911ebef'}
+_GOLDEN = {
+    1: 'a3fbd53e1ede0eb782e1975f9a9afdb0642b97d8cd61e874d34a9ad25911ebef',
+    2: '95d78f4ac4e73d055d0feab66fb7a01c5898e0c69d4daad87e9067e4efcce4bc',
+}
 
 
 def _golden_outputs() -> list[str]:
@@ -1545,6 +1548,8 @@ def _golden_outputs() -> list[str]:
         f'docker run --env=API_KEY={_AWS_SECRET} img',
         'version_key=1.2.3-alpha.4567890',
         "key='llm_retry_attempts'",
+        json.dumps({'command': f'export DB_PASSWORD="{_STRIPE}" && run'}),
+        json.dumps({'command': f'curl -H "Authorization: Bearer {token}" https://x'}),
     ]
     structures: list[object] = [
         {'env': {'STRIPE_KEY': _STRIPE, 'EDITOR': 'vim'}, 'headers': [['Authorization', token]]},
@@ -1871,3 +1876,32 @@ def test_a_prepared_structure_keeps_kernel_identifiers_a_user_rule_would_change(
     assert json.loads(text) == {'key': ['tool_call', agent_id]}
     with pytest.raises(ContractViolation):
         encode_prepared({'key': ['tool_call', agent_id]}, redactor)
+
+
+@pytest.mark.parametrize(
+    'template',
+    [
+        '{{"command": "export DB_PASSWORD=\\"{}\\" && run"}}',
+        '{{"body": "{{\\"api_key\\": \\"{}\\"}}"}}',
+        "{{'command': 'export DB_PASSWORD=\\'{}\\''}}",
+    ],
+)
+def test_a_quoted_assignment_inside_an_encoded_string_is_replaced(template: str):
+    redacted = _redactor().redact(template.format(_STRIPE))
+
+    assert redacted == template.format(_placeholder('secret.named_assignment'))
+
+
+@pytest.mark.parametrize(
+    'template',
+    [
+        '{{"command": "curl -H \\"Authorization: Bearer {}\\" https://x"}}',
+        '{{"headers": "{{\\"Authorization\\": \\"Bearer {}\\"}}"}}',
+    ],
+)
+def test_an_authorization_header_inside_an_encoded_string_is_replaced(template: str):
+    credential = _run(_ALNUM, 24, 12)
+
+    redacted = _redactor().redact(template.format(credential))
+
+    assert redacted == template.format(_placeholder('secret.authorization_header'))

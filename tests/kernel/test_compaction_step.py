@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
+from syndica.kernel.budget import Budget, BudgetPolicy
 from syndica.kernel.compaction import (
     CompactionController,
     CompactionRequest,
@@ -21,8 +22,9 @@ from syndica.kernel.compaction import (
 from syndica.kernel.context import ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import Event, EventBus
-from syndica.kernel.hooks import HooksCenter
+from syndica.kernel.hooks import HookResult, HooksCenter, Junction
 from syndica.kernel.llm import ContextOverflowError, ScriptedLLM, ScriptedTurn
+from syndica.kernel.runtime import Runtime
 from syndica.kernel.tool import Tool, ToolResult
 
 
@@ -441,3 +443,76 @@ async def test_a_failed_archive_does_not_stop_the_overflow_fallback() -> None:
     agent._attach_archive(failing)  # pyright: ignore[reportPrivateUsage]
     ctx = await agent.run('go')
     assert ctx.current_traj[-1].content == 'recovered'
+
+
+@pytest.mark.parametrize('turns', [3, 4])
+async def test_an_overflow_on_the_wrap_up_turn_is_retried_in_that_turn(turns: int) -> None:
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        script = [
+            _call('c1'),
+            _call('c2'),
+            ScriptedTurn(raises=_overflow()),
+            ScriptedTurn(content='recovered'),
+        ]
+        agent = BaseAgent(
+            AgentOptions(
+                name='Worker',
+                llm=ScriptedLLM(script),
+                tools={'Echo': _Echo()},
+                system_prompt='SP',
+                max_turns=None,
+            ),
+            hooks=hooks,
+            events=events,
+        )
+        agent._attach_compaction(  # pyright: ignore[reportPrivateUsage]
+            CompactionController(
+                strategy=RuleBasedCompaction(min_keep_turns=1),
+                threshold_tokens=10_000,
+                target_tokens=20,
+            )
+        )
+        return agent
+
+    runtime = Runtime(budget=BudgetPolicy(root=Budget(turns=turns)))
+    try:
+        agent_id = await runtime.spawn(build, query='go')
+        ctx = await asyncio.wait_for(runtime.wait(agent_id), 5)
+    finally:
+        await runtime.shutdown()
+    assert ctx.current_traj[-1].content == 'recovered'
+
+
+async def test_an_overflow_on_the_wrap_up_turn_is_not_retried_when_nothing_was_compacted() -> None:
+    llm = ScriptedLLM(
+        [
+            _call('c1'),
+            _call('c2'),
+            ScriptedTurn(raises=_overflow()),
+            ScriptedTurn(raises=_overflow()),
+            ScriptedTurn(content='never'),
+        ]
+    )
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = BaseAgent(
+            AgentOptions(
+                name='Worker', llm=llm, tools={'Echo': _Echo()}, system_prompt='SP', max_turns=None
+            ),
+            hooks=hooks,
+            events=events,
+        )
+
+        async def skip(**_: Any) -> HookResult:
+            return HookResult(skip=True)
+
+        agent.register_hook(Junction.CONTEXT_OVERFLOW, skip)
+        return agent
+
+    runtime = Runtime(budget=BudgetPolicy(root=Budget(turns=3)))
+    try:
+        agent_id = await runtime.spawn(build, query='go')
+        await asyncio.wait_for(runtime.wait(agent_id), 5)
+    finally:
+        await runtime.shutdown()
+    assert len(llm.calls) == 3

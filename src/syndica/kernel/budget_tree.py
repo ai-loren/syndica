@@ -115,6 +115,7 @@ class _Node:
         'pending',
         'running',
         'started',
+        'woken',
     )
 
     def __init__(
@@ -147,6 +148,8 @@ class _Node:
         self.calibration = 1.0
         # 报过的最大输出 token：校准没写 max_tokens 时的输出余量。
         self.output_seen = 0
+        # send 收下叫醒它的消息时已经把这次唤醒的额度长回来了：周期开始时不再长。
+        self.woken = False
 
     def chain(self) -> Iterator[_Node]:
         node: _Node | None = self
@@ -532,15 +535,43 @@ class BudgetAccount:
         if self._companion:
             return
         node = self._node
-        if node.parent is not None and not node.running:
-            for dim in _ADDITIVE:
-                # 一次至多拿走父此刻能给的一半：同时被叫醒的几个兄弟各自长回整个 cap 时，先到的
-                # 两个就把父分光了，后到的一个周期都开不了。
-                grow = _wake_grant(node, dim)
-                if grow > 0:
-                    granted = cast(Amount, _capacity(node.parent, grow, dim, commit=True))
-                    node.limit[dim] = cast(Amount, node.limit[dim]) + granted
+        if not node.woken:
+            self._grow_for_wake()
+        node.woken = False
         node.running = True
+
+    def _grow_for_wake(self) -> None:
+        node = self._node
+        if node.parent is None or node.running:
+            return
+        for dim in _ADDITIVE:
+            # 一次至多拿走父此刻能给的一半：同时被叫醒的几个兄弟各自长回整个 cap 时，先到的两个
+            # 就把父分光了，后到的一个周期都开不了。
+            grow = _wake_grant(node, dim)
+            if grow > 0:
+                granted = cast(Amount, _capacity(node.parent, grow, dim, commit=True))
+                node.limit[dim] = cast(Amount, node.limit[dim]) + granted
+
+    def reserve_wake(self) -> None:
+        """`send` 收下一条要叫醒它的消息时，这次唤醒长回来的额度就定下来（与周期开始时同一个数）。
+        留到周期开始再长，发消息的父接着跑的那一轮会先把它花掉，回执「它会读到」就成了谎话。"""
+        node = self._node
+        if self._companion or node.running or node.woken:
+            return
+        self._grow_for_wake()
+        node.woken = True
+
+    def release_wake(self) -> None:
+        """叫醒没成（投递失败）：预先长回来的还给父。"""
+        node = self._node
+        if not node.woken or node.running:
+            return
+        node.woken = False
+        for dim in _ADDITIVE:
+            spent = _spent(node, dim)
+            if node.limit[dim] is not None and spent is not None:
+                node.limit[dim] = spent
+        self._tree._notify()  # pyright: ignore[reportPrivateUsage]
 
     def end_cycle(self) -> None:
         if self._companion:

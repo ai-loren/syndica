@@ -612,6 +612,7 @@ class BaseAgent:
         self._wrap_dims: tuple[str, ...] = ()
         # 上一轮的耗时（秒）：wall clock 按它预测下一轮能不能在截止时刻之前跑完。
         self._last_turn_s = 0.0
+        self._overflow_compacted = False
         self._last_system: ContextBlock | None = None
         # 问过人的追加代数：同一次耗尽只问一次，人不追加就按收尾处置，不是每一轮都问。
         self._asked: int | None = None
@@ -1203,7 +1204,12 @@ class BaseAgent:
         await self._hooks._dispatch(Junction.TURN_START, ctx=ctx, turn=turn)  # pyright: ignore[reportPrivateUsage]
 
         try:
+            self._overflow_compacted = False
             response = await self._one_llm_call(ctx, tool_defs)
+            if response is None and self._wrapping and self._overflow_compacted:
+                # 收尾轮没有下一轮：超限压缩压下去了就在这一轮里用压缩后的轨迹重试一次（被拒的那次
+                # 没有计费），否则这唯一一轮交付就被压缩吃掉了。
+                response = await self._one_llm_call(ctx, tool_defs)
         except BudgetExhausted as refused:
             self._unpriced = isinstance(refused, PriceUnknown)
             await self._stop_for_budget(ctx, (refused.dimension,), self._disposition())
@@ -1249,6 +1255,8 @@ class BaseAgent:
                     origin=(self.agent_id, self._cycle, turn),
                 )
             if response.content:
+                if not response.tool_calls and self._background_outstanding():
+                    await self._settle_background(ctx)
                 await self._propose_completion(ctx, response, turn, send_back=False)
             if by_strategy:
                 # 策略要的收尾是一次交付，不是预算用完：预算还在，收下的消息照常处理。
@@ -1269,8 +1277,7 @@ class BaseAgent:
                     return None
                 # 最后一轮：没有下一轮让模型读结果了。等在跑的都结束，结果注入并登记产物，模型已经
                 # 给出的这条答复照常收尾——停在轮次用完会把答复连同结果的产物一起丢掉。
-                await self._background.wait_idle()
-                await self._inject_background(ctx)
+                await self._settle_background(ctx)
             # Agent 判定完成：先过验收切点（§7.5）。打回则内核已追加反馈块，再做一轮。
             sent_back = await self._propose_completion(ctx, response, turn)
             # 验收可能跑上好一阵（L2 + L3 各有伴生轮次）：期间到达的中止要在这里兑现，否则通过的裁决
@@ -1343,6 +1350,25 @@ class BaseAgent:
             )
         )
         return True
+
+    def _background_outstanding(self) -> bool:
+        return self._background is not None and self._background.outstanding
+
+    async def _settle_background(self, ctx: Context) -> None:
+        """最后一轮交了最终回复、还有后台调用在跑：等它们都结束，结果注入并登记产物。有截止时刻时
+        至多等到截止时刻——等待不花 token 与轮次，墙钟是它唯一会耗掉的预算；到点还没结束的由周期
+        收尾取消。"""
+        calls = cast(BackgroundCalls, self._background)
+        left = None if self._budget is None else self._budget.view().remaining.wall_clock_s
+        if left is None:
+            await calls.wait_idle()
+        else:
+            try:
+                async with asyncio.timeout(left):
+                    await calls.wait_idle()
+            except TimeoutError:
+                pass
+        await self._inject_background(ctx)
 
     async def _inject_background(self, ctx: Context) -> None:
         """注入已经出结果的后台调用（spec §5.1 第 4 步），并登记它们交回的产物。"""
@@ -1811,6 +1837,7 @@ class BaseAgent:
             # 超限兜底（spec §8.8 第二条触发路径）：先让内核压缩步骤压一把，压下去了就本轮不产出、
             # 下一轮用压缩后的轨迹重试——走在 hook 之前，因为改写只能由内核做（§8.8）。
             if await self._maybe_compact(ctx, trigger='overflow', force=True):
+                self._overflow_compacted = True
                 return None
             outcome = await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
                 Junction.CONTEXT_OVERFLOW, ctx=ctx, request=request, error=exc

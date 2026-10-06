@@ -1700,6 +1700,15 @@ class ToolExecutor:
                 )
                 if outcome is ConfirmationOutcome.APPROVED:
                     execution_args = cast('dict[str, Any]', json.loads(request.arguments))
+                    # 问人的这段时间里同一段可并发的兄弟可能已经转到后台：批准的是没有后台调用在跑的
+                    # 那个状态，此刻不是了就照样拒绝。
+                    if self._background is not None and self._background.running:
+                        return (
+                            _background_running_result(call, self._background.running),
+                            'blocked',
+                            False,
+                            execution_args,
+                        )
                     # 问人与动作之间隔了一次等待：这段里脚本可能被改。批准前还可信、现在不可信的，
                     # 批准不作数（评审 F8）。
                     changed = [

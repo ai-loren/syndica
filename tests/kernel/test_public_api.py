@@ -446,6 +446,8 @@ _WITHHELD: tuple[str, ...] = (
     'BackgroundCall',
     'BackgroundCalls',
     'clip_head',
+    'credential_regions',
+    'orphan_key_tail',
     'clip_tail',
     'drain_cancelled',
     'drop_cut_end',

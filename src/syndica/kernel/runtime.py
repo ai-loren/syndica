@@ -1806,8 +1806,9 @@ class Runtime:
         if not self._budget.capped(parent_id, planned, 'cost'):
             return
         model = getattr(agent.options.llm.config, 'model', None)
-        prices = self._budget.policy.prices
-        if isinstance(model, str) and prices is not None and prices.price_of(model) is not None:
+        # 经预算树查：价格表抛出时与计量处一样按价格未知、记一条点名价格表的 ERROR，不让裸异常从
+        # spawn 冒出去。
+        if isinstance(model, str) and self._budget._price(agent.options.llm, None) is not None:  # pyright: ignore[reportPrivateUsage]
             return
         raise BudgetRefused(
             expected=f'设了成本上限时，agent {agent.options.name} 的模型有价格',
@@ -2663,6 +2664,9 @@ class Runtime:
                     '宿主可以先给它追加预算。'
                 ),
             )
+        if account is not None:
+            # 与上面的判定之间没有挂起点：判定「叫得醒」与定下这次唤醒的额度是同一刻。
+            account.reserve_wake()
         message = Message(
             sender=sender,
             receiver=agent_id,
@@ -2677,6 +2681,8 @@ class Runtime:
         delivered = None
         try:
             delivered = await self.broker.publish(agent_id, message)
+            if not delivered.ok and account is not None:
+                account.release_wake()
             if not delivered.ok and agent_id in self._doomed:
                 # broker 只知道邮箱没建起来；没建起来是因为它正在被拆，照实说。
                 delivered = DeliveryResult(ok=False, reason=_being_destroyed_reason(agent_id))

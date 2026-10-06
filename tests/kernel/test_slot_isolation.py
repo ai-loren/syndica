@@ -356,16 +356,36 @@ async def test_a_slot_copy_a_delegated_copy_was_cut_from_is_kept_until_that_copy
     assert any(child_id in str(b.content) for b in _facts(ctx))
 
 
-async def test_merging_a_copy_whose_base_copy_is_gone_is_refused(tmp_path: Path) -> None:
+async def test_a_copy_another_copy_was_cut_from_is_neither_merged_nor_discarded(
+    tmp_path: Path,
+) -> None:
     router, _ = _router(tmp_path)
     router.isolate('a', 'snapshot')
     router.adopt('c', 'a')
     router.isolate('c', 'snapshot')
+    for operation in (router.merge_isolated, router.discard_isolated):
+        with pytest.raises(ConfigError) as caught:
+            await operation('a')
+        assert 'c' in caught.value.received and 'c' in caught.value.next_action
+    assert router.isolated('a') is not None and router.isolated('c') is not None
+    await router.discard_isolated('c')
     await router.discard_isolated('a')
+
+
+async def test_merging_a_copy_whose_base_copy_is_gone_is_refused_and_its_work_kept(
+    tmp_path: Path,
+) -> None:
+    router, _ = _router(tmp_path)
+    router.isolate('a', 'snapshot')
+    router.adopt('c', 'a')
+    copy = router.isolate('c', 'snapshot')
+    assert copy is not None
+    (copy.location / 'report.md').write_text('child work\n', encoding='utf-8')
+    await router.release('a')
     with pytest.raises(ConfigError) as caught:
         await router.merge_isolated('c')
-    assert 'discard_isolated' in caught.value.next_action
-    assert router.isolated('c') is not None
+    assert str(copy.location) in caught.value.next_action
+    assert (copy.location / 'report.md').read_text(encoding='utf-8') == 'child work\n'
     await router.discard_isolated('c')
 
 
@@ -374,11 +394,11 @@ class _IsolatesOnce(LocalIsolator):
         super().__init__(shell='/bin/sh', env={})
         self.calls = 0
 
-    def isolate(self, root: Path, agent_id: str, requested: str) -> Any:
+    def isolate(self, root: Path, agent_id: str, requested: str, **options: Any) -> Any:
         self.calls += 1
         if self.calls > 1:
             raise OSError('No space left on device')
-        return super().isolate(root, agent_id, requested)
+        return super().isolate(root, agent_id, requested, **options)
 
 
 async def test_a_cycle_whose_copy_cannot_be_made_stops_with_error(
@@ -401,3 +421,64 @@ async def test_a_cycle_whose_copy_cannot_be_made_stops_with_error(
     assert llm.calls == 1
     logged = [cast(tuple[object, ...], r.args) for r in caplog.records if r.args]
     assert any(args[0] == agent_id and 'OSError' in args for args in logged)
+
+
+async def test_a_delegated_copy_survives_its_middle_agent_being_collected_first(
+    tmp_path: Path,
+) -> None:
+    router, root = _router(tmp_path)
+    gate = asyncio.Event()
+
+    def delegate(call_id: str, agent: str, query: str) -> ContextBlock:
+        arguments = json.dumps({'agent': agent, 'query': query, 'isolation': 'snapshot'})
+        return ContextBlock(
+            role='assistant',
+            tool_calls=[ToolCall(id=call_id, name='Delegate', arguments=arguments)],
+        )
+
+    parent_llm = _Script([delegate('d1', 'Middle', 'organise'), _say('parent done')])
+    middle_llm = _Script([delegate('d2', 'Child', 'write result.txt'), _say('middle stopped')])
+    child_llm = _Script([_write('w', 'result.txt', 'child work\n'), _say('child done')], {0: gate})
+
+    def role(name: str, llm: _Script, tools: dict[str, Any] | None = None) -> Any:
+        def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+            return BaseAgent(
+                AgentOptions(name=name, llm=llm, tools=tools or {}, system_prompt='SP'),  # type: ignore[arg-type]
+                hooks=hooks,
+                events=events,
+            )
+
+        return build
+
+    runtime = Runtime(
+        workspace=router,
+        orchestration=True,
+        agents={
+            'Middle': role('Middle', middle_llm),
+            'Child': role('Child', child_llm, {'Write': Write(router.portal())}),
+        },
+    )
+    try:
+        parent = await runtime.spawn(role('Parent', parent_llm), query='go')
+        middle = child = None
+        for _ in range(300):
+            info = await runtime.find(parent)
+            if info is not None and info.children:
+                middle = info.children[0]
+                found = await runtime.find(middle)
+                if found is not None and found.children:
+                    child = found.children[0]
+                    break
+            await asyncio.sleep(0.01)
+        assert middle is not None and child is not None
+        await runtime.abort(middle)
+        ctx = await asyncio.wait_for(runtime.wait(parent), _TIMEOUT)
+        gate.set()
+        await asyncio.wait_for(runtime.wait(child), _TIMEOUT)
+        collected = str(next(b.content for b in ctx.current_traj if b.tool_call_id == 'd1'))
+        await runtime.merge_isolated(child)
+        await runtime.merge_isolated(middle)
+    finally:
+        await runtime.shutdown()
+    assert '副本还留着' in collected
+    assert (root / 'result.txt').read_text(encoding='utf-8') == 'child work\n'

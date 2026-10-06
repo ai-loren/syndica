@@ -270,7 +270,8 @@ async def test_a_killed_call_keeps_its_input_estimate_and_gives_the_rest_back() 
     finally:
         await runtime.shutdown()
     used = view.used
-    assert used.input_tokens > 0 and used.output_tokens == 0 and used.estimated
+    assert 0 < used.input_tokens < 100
+    assert used.output_tokens == 0 and used.estimated
     assert view.remaining.tokens == 10_000 - used.input_tokens
 
 

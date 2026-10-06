@@ -686,3 +686,30 @@ def test_a_reply_from_an_unlisted_platform_does_not_exhaust_its_siblings() -> No
     first.settle(ticket, llm, request, reply)
     assert first.view().used.cost == Decimal('0.000015')
     assert sibling.plan_turn(*sibling.estimate(llm, request)[:2], 0.0)[0] == 'normal'
+
+
+def test_a_wake_reserved_when_the_message_is_taken_is_not_grown_again_at_the_cycle() -> None:
+    tree = _tree()
+    parent = tree.carve('p', None, Budget(turns=12))
+    child = tree.carve('c', 'p', Budget(turns=10))
+    _turns(child, 2)
+    child.end_cycle()
+    child.reserve_wake()
+    reserved = parent.view().remaining.turns
+    child.begin_cycle()
+    assert child.view().remaining.turns == 5
+    assert parent.view().remaining.turns == reserved == 5
+
+
+def test_a_wake_that_was_not_delivered_gives_its_reservation_back() -> None:
+    tree = _tree()
+    parent = tree.carve('p', None, Budget(turns=20))
+    child = tree.carve('c', 'p', Budget(turns=10))
+    _turns(child, 2)
+    child.end_cycle()
+    before = parent.view().remaining.turns
+    child.reserve_wake()
+    reserved = parent.view().remaining.turns
+    assert before is not None and reserved is not None and reserved < before
+    child.release_wake()
+    assert parent.view().remaining.turns == before

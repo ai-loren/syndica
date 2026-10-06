@@ -423,10 +423,12 @@ cycle. The events appear under `长程：` in `syndica trace show`.
 after N seconds to the background: the agent gets a placeholder with an id (`bg-1`) and keeps
 working, and the real result enters its history in a later turn, after the same post-tool hooks and
 trust rules as any other result. `QueryBackgroundTool` and `CancelBackgroundTool` look at or stop a
-call. An agent cannot finish while background calls are running: its final answer waits for them,
-and running out of budget or turns, an abort or a kill cancels them and records that their side
-effects are unknown. Calls approved by a human are never moved. Runs with background installed do
-not write a replay document.
+call. An agent cannot finish while background calls are running: its final answer waits for them
+(on the last turn, including a budget wrap-up, up to the wall-clock deadline), and an abort, a kill,
+or running out of budget or turns before an answer cancels them and records that their side effects
+are unknown. Only calls in the last segment of a batch are moved, calls approved by a human are
+never moved, and a call that needs approval is refused while background calls are running. Runs
+with background installed do not write a replay document.
 
 Writing a module: the entry point returns a `RuntimeModule`, and the kernel checks the following
 when it loads one.

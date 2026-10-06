@@ -179,7 +179,11 @@ class LocalIsolator:
         self._git = git
         self._scratch = scratch
 
-    def isolate(self, root: Path, agent_id: str, requested: str) -> IsolatedCopy:
+    def isolate(
+        self, root: Path, agent_id: str, requested: str, *, under: Path | None = None
+    ) -> IsolatedCopy:
+        """拷 `root`；副本建在 `under`（缺省 `root`）的 `.syndica/` 下。嵌套隔离时 `under` 给共享
+        根：建在出发的那份副本里面，合并、丢掉那份副本时就把后代的副本连同改动一起删了。"""
         if requested not in ('worktree', 'snapshot'):
             raise ConfigError(
                 expected='isolation 是 worktree 或 snapshot（shared 不建副本）',
@@ -191,7 +195,8 @@ class LocalIsolator:
             strategy = 'snapshot'
             note = '没有 git，worktree 退回快照：两边都改过的文件一律算冲突，不做三方合并。'
         files = _working_files(root)
-        location = root / '.syndica' / f'{strategy}s' / agent_id
+        home = root if under is None else under
+        location = home / '.syndica' / f'{strategy}s' / agent_id
         base_dir = location.with_name(f'{agent_id}.base') if strategy == 'worktree' else None
         # 先在旁边建好再整个换进来：拷到一半失败时不留半份副本，同一个 id 再隔离一次时也不会
         # 叠在旧副本上（旧副本里多出来的文件会被当成子 Agent 新建的合并回去）。
@@ -204,7 +209,7 @@ class LocalIsolator:
         executable: set[str] = set()
         ignore = location.parent / '.gitignore'
         # 任何一级是符号链接，副本就拷到了工作区之外，合并时又从那里读回来。
-        _require_real_directories(root, (root / '.syndica', location.parent))
+        _require_real_directories(home, (home / '.syndica', location.parent))
         try:
             location.parent.mkdir(parents=True, exist_ok=True)
             if not ignore.exists():

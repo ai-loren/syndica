@@ -408,3 +408,32 @@ async def test_a_child_the_host_despawns_leaves_the_reap_books() -> None:
     finally:
         await runtime.shutdown()
     assert books == (False, False)
+
+
+async def test_a_grandchild_woken_just_before_its_parent_is_destroyed_is_refused() -> None:
+    runtime = Runtime(keep_finished_children=1)
+    deliveries: list[bool] = []
+    try:
+        parent = await runtime.spawn(_agent(ScriptedLLM([]), 'Parent'))
+        llms = [_Hears() for _ in range(3)]
+        children = await _collected_children(runtime, parent, llms)
+        grandchild_llm = _Hears()
+        grandchild = await runtime.spawn(
+            _agent(grandchild_llm), query='sub-work', parent_id=children[0]
+        )
+        await asyncio.wait_for(runtime.wait(grandchild), _TIMEOUT)
+        grandchild_llm.gate.clear()
+        destroy = runtime.despawn
+
+        async def grandchild_woken_first(agent_id: str) -> None:
+            if agent_id == children[0] and not deliveries:
+                deliveries.append((await runtime.send(grandchild, 'URGENT: sub-fix')).ok)
+                await asyncio.sleep(0.01)
+            await destroy(agent_id)
+
+        runtime.despawn = grandchild_woken_first  # type: ignore[method-assign]
+        await runtime.spawn(_agent(ScriptedLLM([])), parent_id=parent)
+        await asyncio.sleep(0.05)
+    finally:
+        await runtime.shutdown()
+    assert deliveries == [False]

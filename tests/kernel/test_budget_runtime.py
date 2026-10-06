@@ -372,6 +372,25 @@ async def test_a_cost_cap_without_a_price_is_refused_at_spawn() -> None:
     assert listed == []
 
 
+async def test_a_price_table_that_raises_is_refused_at_spawn_like_an_unknown_price(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _Broken:
+        def price_of(self, model: str, platform: str | None = None) -> Prices | None:
+            raise KeyError(model)
+
+    runtime = Runtime(budget=BudgetPolicy(root=Budget(cost=Decimal('1')), prices=_Broken()))
+    try:
+        with caplog.at_level(logging.ERROR, logger='syndica.kernel.budget_tree'):
+            with pytest.raises(BudgetRefused) as caught:
+                await runtime.spawn(_factory(ScriptedLLM([])), query='go')
+    finally:
+        await runtime.shutdown()
+    assert 'prices' in caught.value.next_action
+    logged = [cast(tuple[object, ...], r.args) for r in caplog.records if r.args]
+    assert any(args[0] == '_Broken' for args in logged)
+
+
 async def test_a_priced_cost_cap_stops_the_run_within_budget() -> None:
     price = Prices(input=Decimal(1000), output=Decimal(1000), cached_input=Decimal(1000))
     llm = _Reporting([_echo(f'c{i}') for i in range(40)], usage=(100, 10))

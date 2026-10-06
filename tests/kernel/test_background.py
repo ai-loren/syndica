@@ -13,6 +13,7 @@ import pytest
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.background import BackgroundCalls
 from syndica.kernel.background_module import BackgroundModule
+from syndica.kernel.budget import Budget, BudgetPolicy
 from syndica.kernel.context import (
     ArtifactRef,
     Context,
@@ -1095,3 +1096,112 @@ async def test_cancelling_a_call_whose_finisher_never_ran_cancels_the_tool_too()
     await asyncio.sleep(0)
     assert work.cancelled()
     assert entry.task.cancelled()
+
+
+async def test_an_approved_call_is_refused_when_a_sibling_moved_while_the_human_decided() -> None:
+    class _SafeSlow(_Slow):
+        __tool_name__ = 'Migrate'
+
+        def is_concurrency_safe(self, args: Any) -> bool:
+            return True
+
+    class _SafeDeploy(_Deploy):
+        def is_concurrency_safe(self, args: Any) -> bool:
+            return True
+
+    slow, deploy = _SafeSlow(), _SafeDeploy()
+    calls = BackgroundCalls()
+
+    async def approve_after_a_moment(request: ConfirmationRequest) -> ConfirmationOutcome:
+        for _ in range(200):
+            if calls.running:
+                break
+            await asyncio.sleep(0.005)
+        return ConfirmationOutcome.APPROVED
+
+    executor = ToolExecutor(
+        tools={'Migrate': slow, 'Deploy': deploy}, hooks=HooksCenter(), policy=_ConfirmDeploy()
+    )
+    executor._configure_confirmation('agent-1', approve_after_a_moment)  # pyright: ignore[reportPrivateUsage]
+    executor._configure_background(calls, 1.0, _now)  # pyright: ignore[reportPrivateUsage]
+    ctx = Context()
+    try:
+        await executor.execute_tool_calls(
+            ctx,
+            [
+                ToolCall(id='m', name='Migrate', arguments='{}'),
+                ToolCall(id='d', name='Deploy', arguments='{}'),
+            ],
+        )
+    finally:
+        slow.release.set()
+    answer = next(str(b.content) for b in ctx.current_traj if b.tool_call_id == 'd')
+    assert deploy.ran == 0
+    assert 'bg-1' in answer and 'CancelBackgroundTool' in answer
+
+
+async def test_a_final_answer_on_the_budgets_wrap_up_turn_waits_for_the_result() -> None:
+    slow = _Slow()
+    llm = _ReleasesLater([slow], [_call('Slow', 's'), _say('done')], at=1)
+    runtime = _runtime(budget=BudgetPolicy(root=Budget(turns=2)))
+    try:
+        _, ctx = await _run(runtime, _factory(cast(Any, llm), {'Slow': slow}))
+    finally:
+        await runtime.shutdown()
+    assert not slow.cancelled
+    [block] = _background_blocks(ctx)
+    assert 'build finished' in str(block.content)
+    assert [b.content for b in ctx.current_traj if b.role == 'assistant'][-1] == 'done'
+
+
+async def test_waiting_on_the_wrap_up_turn_stops_at_the_deadline() -> None:
+    slow = _Slow()
+    llm = _Script([_call('Slow', 's'), _say('done')])
+    runtime = _runtime(budget=BudgetPolicy(root=Budget(turns=2, wall_clock_s=0.3)))
+    try:
+        _, ctx = await _run(runtime, _factory(llm, {'Slow': slow}))
+    finally:
+        await runtime.shutdown()
+    assert slow.cancelled
+    [block] = _background_blocks(ctx)
+    assert '被取消' in str(block.content)
+
+
+def test_a_result_whose_key_is_already_in_history_is_logged_as_lost(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from syndica.kernel.history_blocks import signed_block
+
+    agent = _factory(_Script([]), {})(HooksCenter(), EventBus())
+    calls = BackgroundCalls(history=lambda: agent.context.current_traj)
+    agent.context.append(
+        signed_block(
+            HistoryKind.BACKGROUND, 'an older result', key=f'background:{agent.agent_id}:bg-1'
+        )
+    )
+    entry = calls.start(ToolCall(id='s', name='Slow', arguments='{}'))
+    calls.finished(entry, ToolResult(output='the new result'))
+    with caplog.at_level(logging.ERROR, logger='syndica.kernel.agent'):
+        agent._append_background(agent.context, calls.take_ready())  # pyright: ignore[reportPrivateUsage]
+    [record] = [r for r in caplog.records if r.args]
+    assert cast(tuple[object, ...], record.args) == ('bg-1', 'Slow', agent.agent_id)
+    assert not any('the new result' in str(b.content) for b in agent.context.current_traj)
+
+
+async def test_a_finished_but_not_yet_injected_background_call_does_not_block_an_approval() -> None:
+    asked: list[str] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationOutcome:
+        asked.append(request.tool_name)
+        return ConfirmationOutcome.APPROVED
+
+    deploy = _Deploy()
+    calls = BackgroundCalls()
+    finished = calls.start(ToolCall(id='s', name='Slow', arguments='{}'))
+    calls.finished(finished, ToolResult(output='build finished'))
+    executor = ToolExecutor(tools={'Deploy': deploy}, hooks=HooksCenter(), policy=_ConfirmDeploy())
+    executor._configure_confirmation('agent-1', approve)  # pyright: ignore[reportPrivateUsage]
+    executor._configure_background(calls, 1.0, _now)  # pyright: ignore[reportPrivateUsage]
+    await executor.execute_tool_calls(Context(), [ToolCall(id='d', name='Deploy', arguments='{}')])
+    assert calls.outstanding and not calls.running
+    assert (asked, deploy.ran) == (['Deploy'], 1)

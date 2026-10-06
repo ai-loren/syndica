@@ -44,8 +44,10 @@ __all__ = [
     'RuleRedactor',
     'encode_assured',
     'encode_prepared',
+    'credential_regions',
     'encode_redacted',
     'looks_secret',
+    'orphan_key_tail',
     'redact_argv',
     'write_all',
     'write_redacted',
@@ -66,7 +68,7 @@ RULE_IDS: tuple[str, ...] = (
 )
 # 内置规则或 `encode_redacted` 的行为一变（同样的输入得出不同的结果）就加一：回放靠它判断记录时
 # 与回放时的规则是不是同一套，指纹按脱敏之后的内容算。
-RULES_VERSION = 1
+RULES_VERSION = 2
 
 # 名字按 `_`、`.`、`-` 切开后，任一词（不分大小写）落在这里就像装着密钥。按词而不是按子串：
 # `GIT_AUTHOR_NAME` 不是密钥，`SSH_AUTH_SOCK` 是。
@@ -178,18 +180,21 @@ _PUTTY_PRIVATE = re.compile(
 # 不是。组 1 是第一行密钥。
 _KEY_MATERIAL = re.compile(r'(?:[ \t]*\n[A-Za-z-]+: [^\n]*){0,8}\s*\n([A-Za-z0-9+/=]{16,})')
 _KEY_LINE = re.compile(r'^[A-Za-z0-9+/=]{40,}$', re.MULTILINE)
+_PUTTY_HEADER = re.compile(r'PuTTY-User-Key-File-\d+:|Private-Lines: \d')
+_PUTTY_MAC = re.compile(r'Private-MAC: [0-9A-Fa-f]*')
 # JSON 里转义过的换行：私钥块按换行认，`\n` 写成两个字符时它就认不出来了。
 _ESCAPED_NEWLINE = re.compile(r'\\n')
 # `Authorization` 的各种写法：前面不要求词界，`\r\n` 之后、`HTTP_AUTHORIZATION`、
 # `Proxy-Authorization` 都认；字典与 JSON 里带引号的键；`=`。凭证要像凭证（有数字、大写或
 # `+/=._-`），否则 `Authorization: token required` 会把 required 换掉。
 _AUTHORIZATION = re.compile(
-    r'((?i:Authorization)[\'"]?\s*[:=]\s*[\'"]?(?i:Bearer|token|Basic|Bot)\s+[\'"]?)'
+    r'((?i:Authorization)(?:\\?[\'"])?\s*[:=]\s*(?:\\?[\'"])?(?i:Bearer|token|Basic|Bot)\s+'
+    r'(?:\\?[\'"])?)'
     r'(?=[^\s\'"\\]{0,200}[0-9A-Z+/=._-])[^\s\'"\\]{8,}'
 )
 # 不带方案名、直接写凭证的 `Authorization: <key>`：凭证要过 `_credential_value`。
 _BARE_AUTHORIZATION = re.compile(
-    r'((?i:Authorization)[\'"]?\s*[:=]\s*[\'"]?)([^\s\'"\\]{16,4096}+)'
+    r'((?i:Authorization)(?:\\?[\'"])?\s*[:=]\s*(?:\\?[\'"])?)([^\s\'"\\]{16,4096}+)'
 )
 # URL 里的 `user:pass@`：用户名可以是空的（`redis://:pw@`），密码里可以有 `@`（取到最后一个）；
 # JSON 里转义过的 `https:\/\/` 也算。scheme 限长、前面不许紧贴字母数字：一长串 `a.a.a.` 的每个起点
@@ -203,16 +208,17 @@ _URL_USERINFO = re.compile(
 # `--env=API_KEY=值` 里外层的值于是到 `API_KEY` 就断了，里层的赋值才认得出来，`a=a=a=…` 也每个起点
 # 一步就失败。值后面紧跟 `(`、`[` 的是表达式不是值。名字与值都限长、不回溯：每个起点的尝试有上限。
 _ASSIGNMENT = re.compile(
-    r'(?:["\'](?P<quoted_name>[A-Za-z_][A-Za-z0-9_.-]{0,100}+)["\']\]?'
+    r'(?:\\?["\'](?P<quoted_name>[A-Za-z_][A-Za-z0-9_.-]{0,100}+)\\?["\']\]?'
     r'|(?<![A-Za-z0-9_.])(?P<name>[A-Za-z_][A-Za-z0-9_.-]{0,100}+))'
     r'[ \t]*(?::=|=>|[:=])[ \t]*'
-    r'(?:["\'](?P<quoted_value>[^"\'\\\s]{16,4096}+)["\']'
+    r'(?:\\?["\'](?P<quoted_value>[^"\'\\\s]{16,4096}+)\\?["\']'
     r'|(?P<value>[A-Za-z0-9+/_.~-]{16,4096}+={0,2})(?![(\[]))'
 )
 # Kubernetes / ECS 的环境变量表：名字与值分在两个字段里。
 _ENV_PAIR = re.compile(
-    r'name[\'"]?[ \t]*:[ \t]*[\'"]?(?P<name>[A-Za-z_][A-Za-z0-9_.-]{0,100}+)[\'"]?[ \t]*'
-    r'(?:,[ \t]*|\n[ \t-]*)[\'"]?value[\'"]?[ \t]*:[ \t]*[\'"]?(?P<value>[^\s"\'\\,}]{16,4096}+)'
+    r'name(?:\\?[\'"])?[ \t]*:[ \t]*(?:\\?[\'"])?(?P<name>[A-Za-z_][A-Za-z0-9_.-]{0,100}+)'
+    r'(?:\\?[\'"])?[ \t]*(?:,[ \t]*|\n[ \t-]*)(?:\\?[\'"])?value(?:\\?[\'"])?[ \t]*:[ \t]*'
+    r'(?:\\?[\'"])?(?P<value>[^\s"\'\\,}]{16,4096}+)'
 )
 # 「值像凭证」：没有固定格式的密钥（`.env` 里的 `sk_live_…`、AWS secret key）只能按形状认。门槛
 # 按「在 `src/` 与测试固定装置里零命中」定：只看名字与长度时，`key='llm_retry_attempts'` 这类写法
@@ -511,6 +517,60 @@ def _assignment_spans(view: str) -> list[_Span]:
         if looks_secret(hit.group('name')) and _credential_value(hit.group('value'), quoted=True):
             spans.append((hit.start('value'), hit.end('value'), 'secret.named_assignment'))
     return spans
+
+
+def credential_regions(text: str) -> list[tuple[int, int]]:
+    """内置规则认出一个凭证时用到的整段文字：私钥块从开头一行到结尾一行、`Authorization` 从键名起、
+    URL 从 scheme 起、名字像密钥的赋值从名字起、固定格式的密钥本身。截断落在这样一段里，留下的那截
+    缺了上下文就认不出来——`clipping` 据此把整段丢到刀口那一侧。宿主交进来的逐字值与用户规则不在
+    其中：截断的地方拿不到它们（逐字值靠 16 字符片段规则兜住）。"""
+    _require_text(text, 'credential_regions')
+    spaced = _ESCAPED_NEWLINE.sub(' \n', text)
+    regions = _key_blocks(spaced, _PEM, strict=False)
+    regions += _key_blocks(spaced, _RFC4716, strict=False)
+    regions += [(hit.start(), hit.end()) for hit in _PUTTY_PRIVATE.finditer(text)]
+    regions += [(hit.start(), hit.end()) for hit in _AUTHORIZATION.finditer(text)]
+    regions += [
+        (hit.start(), hit.end())
+        for hit in _BARE_AUTHORIZATION.finditer(text)
+        if _credential_value(hit.group(2), quoted=True)
+    ]
+    regions += [(hit.start(), hit.end()) for hit in _URL_USERINFO.finditer(text)]
+    regions += [(start, end) for start, end, _ in _format_spans(text)]
+    for hit in _ASSIGNMENT.finditer(text):
+        name = hit.group('quoted_name') or hit.group('name')
+        quoted = hit.group('quoted_value') is not None
+        value = hit.group('quoted_value' if quoted else 'value')
+        if looks_secret(name) and _credential_value(value, quoted=quoted):
+            regions.append((hit.start(), hit.end()))
+    regions += [
+        (hit.start(), hit.end())
+        for hit in _ENV_PAIR.finditer(text)
+        if looks_secret(hit.group('name')) and _credential_value(hit.group('value'), quoted=True)
+    ]
+    return regions
+
+
+def orphan_key_tail(text: str) -> int:
+    """`text` 开头是一个私钥块的后半（结尾那一行出现在任何开头那一行之前）时，交回结尾那一行之后的
+    位置，否则 0。只剩后半的私钥块没有开头那一行，规则认不出它。"""
+    _require_text(text, 'orphan_key_tail')
+    first_begin = min(
+        (hit.start() for marker in (_PEM[0], _RFC4716[0]) if (hit := marker.search(text))),
+        default=len(text),
+    )
+    putty = _PUTTY_HEADER.search(text)
+    first_begin = min(first_begin, len(text) if putty is None else putty.start())
+    ends = [
+        hit.end()
+        for marker in (_PEM[1], _RFC4716[1], _PUTTY_MAC)
+        if (hit := marker.search(text)) and hit.start() < first_begin
+    ]
+    if not ends:
+        return 0
+    end = max(ends)
+    newline = text.find('\n', end)
+    return len(text) if newline == -1 else newline + 1
 
 
 def _trimmed(span: _Span, blank: bytearray) -> _Span | None:

@@ -181,7 +181,9 @@ class WorkspaceRouter:
             )
         parent = self._parents.get(agent_id)
         base = self._workspace_of(parent)
-        copy = self._isolator.isolate(Path(base.root), agent_id, isolation)
+        copy = self._isolator.isolate(
+            Path(base.root), agent_id, isolation, under=Path(self._root.root)
+        )
         self._copies[agent_id] = copy
         self._base_owners[agent_id] = '' if parent is None else self.scope_of(parent)
         self._assigned[agent_id] = copy.workspace
@@ -241,6 +243,7 @@ class WorkspaceRouter:
                 received='它没有（没隔离过，或已经合并、丢弃）',
                 next_action='只对用 isolation=worktree / snapshot 起来、还没合并的 Agent 合并',
             )
+        self._refuse_with_dependents(agent_id, 'merge_isolated')
         base = self._base_of(agent_id)
         base_taint = self._taint_of(base)
         copied = self._copy_taints.get(agent_id)
@@ -288,7 +291,22 @@ class WorkspaceRouter:
 
     async def discard_isolated(self, agent_id: str) -> None:
         """丢掉 `agent_id` 的隔离副本（关掉它在副本里的进程）；没合并的改动会记一条警告。"""
+        self._refuse_with_dependents(agent_id, 'discard_isolated')
         await self._drop_copy(agent_id, unmerged_ok=False)
+
+    def _refuse_with_dependents(self, agent_id: str, operation: str) -> None:
+        dependents = self.based_on(agent_id)
+        if dependents:
+            raise ConfigError(
+                expected=f'{operation}({agent_id}) 时没有别的副本还建在它的副本上',
+                received=(
+                    f'agent {"、".join(dependents)} 的隔离副本是从它的副本拷出去的、还没合并回来；'
+                    '现在合并或丢掉它，它们的改动就合并不到任何地方'
+                ),
+                next_action=(
+                    f'先合并或丢掉 {"、".join(dependents)} 的副本，再对 {agent_id} {operation}'
+                ),
+            )
 
     async def release(self, agent_id: str) -> None:
         """Agent 不在了：丢掉它的副本，连同它在路由里记下的看过的版本与父子关系。"""
