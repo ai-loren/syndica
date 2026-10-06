@@ -193,7 +193,7 @@ def test_a_topology_run_hands_its_slot_the_same_environment_and_output_limit(
         'is_root: true, cardinality: singleton, boot: eager}\n',
         encoding='utf-8',
     )
-    flood = json.dumps({'command': "printf 'x%.0s' $(seq 1 30000)"})
+    flood = json.dumps({'command': "printf 'x %.0s' $(seq 1 15000)"})
     llm = ScriptedLLM(
         [
             ScriptedTurn(
@@ -217,7 +217,7 @@ def test_a_topology_run_hands_its_slot_the_same_environment_and_output_limit(
 
     assert answer == 'probed'
     assert _env_names(blocks['probe']) == run_names
-    assert flooded.count('x') == 10_000
+    assert flooded.count('x ') == 5_000
 
 
 def test_chat_removes_its_scratch_directory_when_the_host_closes(tmp_path: Path) -> None:
@@ -254,17 +254,17 @@ def test_run_and_doctor_leave_no_scratch_directory_behind(
 
 
 def test_the_cli_clips_each_bash_stream_at_ten_thousand_characters(tmp_path: Path) -> None:
-    output = _run_probe(tmp_path, _probing_llm("printf 'x%.0s' $(seq 1 30000)"))
+    output = _run_probe(tmp_path, _probing_llm("printf 'x %.0s' $(seq 1 15000)"))
     stdout = output.split('stdout:\n', 1)[1].split('\nstderr:\n', 1)[0]
 
     assert 'truncated: true' in output
     assert '截掉了' in stdout
-    assert stdout.count('x') == 10_000
+    assert stdout.count('x ') == 5_000
 
 
 def test_chat_clips_each_bash_stream_at_ten_thousand_characters_too(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    llm = _probing_llm("printf 'x%.0s' $(seq 1 30000)")
+    llm = _probing_llm("printf 'x %.0s' $(seq 1 15000)")
     host = _host(tmp_path, llm)
     try:
         target = host.open_chat(config)
@@ -273,7 +273,7 @@ def test_chat_clips_each_bash_stream_at_ten_thousand_characters_too(tmp_path: Pa
         host.close()
     stdout = _tool_output(llm).split('stdout:\n', 1)[1].split('\nstderr:\n', 1)[0]
 
-    assert stdout.count('x') == 10_000
+    assert stdout.count('x ') == 5_000
 
 
 def test_a_temporary_directory_inside_the_workspace_is_refused(

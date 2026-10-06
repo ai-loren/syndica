@@ -18,6 +18,7 @@ tracer 坏掉不改变 run：内核经 `_Tracing` 调它。同步调用里不可
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import logging
@@ -677,7 +678,10 @@ class _Attempt:
         if self._call is not None:
             self._call.in_flight = False
             if self._ticket is not None and self._call.account is not None:
-                self._call.account.release(cast('Any', self._ticket))
+                if isinstance(exc, asyncio.CancelledError):
+                    self._call.account.abandon(cast('Any', self._ticket), self._llm)
+                else:
+                    self._call.account.release(cast('Any', self._ticket))
                 self._ticket = None
         if self._span is None or self._call is None:
             return

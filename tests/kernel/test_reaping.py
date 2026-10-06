@@ -393,3 +393,18 @@ async def test_a_child_woken_while_its_siblings_are_judged_is_left_to_its_new_cy
     assert deliveries == [True]
     assert alive == [True, False, True]
     assert any('URGENT' in heard for heard in llms[0].heard)
+
+
+async def test_a_child_the_host_despawns_leaves_the_reap_books() -> None:
+    runtime = Runtime(keep_finished_children=2)
+    try:
+        parent = await runtime.spawn(_agent(ScriptedLLM([]), 'Parent'))
+        [child] = await _children(runtime, parent, 1, order=[0])
+        await runtime.despawn(child)
+        books = (
+            child in runtime._finish_order,  # pyright: ignore[reportPrivateUsage]
+            child in runtime._collected,  # pyright: ignore[reportPrivateUsage]
+        )
+    finally:
+        await runtime.shutdown()
+    assert books == (False, False)

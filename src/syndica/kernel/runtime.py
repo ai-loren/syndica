@@ -112,6 +112,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import functools
+import hashlib
 import inspect
 import itertools
 import json
@@ -2138,7 +2139,8 @@ class Runtime:
                 continue
             await self._oscillate(agent_id, new=AgentStatus.RUNNING)
             slot.gate.begin_cycle()
-            self._isolate_cycle(agent_id, agent, slot)
+            if not self._isolate_cycle(agent_id, agent, slot):
+                return
             slot.control.enter_run()
             try:
                 if seed is None:
@@ -2147,8 +2149,8 @@ class Runtime:
                     await agent.run(seed.text, trust=seed.trust)
             finally:
                 slot.control.leave_run()
-            # 只在周期正常结束时合并：被取消或抛出的周期做到一半，副本留着，不把半截的改动写回共享
-            # 工作区（留着的副本也让回收不碰它）。
+            # 返回了的周期都合并，被中止、预算或轮次用完的也一样：那是 Agent 收了尾的产物，留在
+            # 副本里等于宿主看不到。被取消或抛出的周期走不到这里，副本留着（回收也不碰它）。
             await self._merge_cycle(agent_id, agent, slot)
             seed = None
             # 预算耗尽这条路无条件退出，即便还有已收下的输入：没有轮次可用，再开一个周期只会
@@ -2160,15 +2162,29 @@ class Runtime:
             ):
                 return
 
-    def _isolate_cycle(self, agent_id: str, agent: BaseAgent, slot: _Slot) -> None:
-        """槽声明了隔离：这个周期在共享工作区此刻的一份拷贝里干活。上个周期合并留下的话与隔离的
-        事实按周期键注入历史（不进 SP：它随周期而变）；上次合并没能删掉的副本接着用，不另拷一份。"""
+    def _isolate_cycle(self, agent_id: str, agent: BaseAgent, slot: _Slot) -> bool:
+        """槽声明了隔离：这个周期在共享工作区此刻的一份拷贝里干活。上个周期合并留下的话按周期键注入
+        历史；隔离的事实按内容键注入，内容不变就只有一块（它受压缩保护，每个周期一块会无界增长）。
+        上次合并没能删掉的副本接着用，不另拷一份。拷不出来时交回 False：这个周期不开始、停在 ERROR，
+        不能拿上个周期的结论冒充这一次的。"""
         router = self._workspace
         if slot.cycle_isolation == 'shared' or router is None:
-            return
+            return True
         copy = router.isolated(agent_id)
         if copy is None:
-            copy = router.isolate(agent_id, slot.cycle_isolation)
+            try:
+                copy = router.isolate(agent_id, slot.cycle_isolation)
+            except Exception as exc:
+                agent.context.stop_reason = StopReason.ERROR
+                logger.error(
+                    '期望: 给 agent %s 这个周期拷一份隔离副本。 实际: 拷贝失败：%s: %s；'
+                    '这个周期没有开始，已经收下的输入没有处理。'
+                    ' 下一步: 查共享工作区与磁盘（空间、权限）；修好之后再给它发消息。',
+                    agent_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                return False
         cycle = agent._cycle + 1  # pyright: ignore[reportPrivateUsage]
         if slot.merge_note is not None:
             text, trust = slot.merge_note
@@ -2182,15 +2198,26 @@ class Runtime:
                 )
             )
         if copy is not None:
-            agent.context.append(
-                signed_block(HistoryKind.ENV_FACT, copy.fact(), key=f'isolation:{agent_id}:{cycle}')
-            )
+            fact = copy.fact()
+            key = f'isolation:{agent_id}:{hashlib.sha256(fact.encode("utf-8")).hexdigest()[:16]}'
+            if not has_block(agent.context.current_traj, key):
+                agent.context.append(signed_block(HistoryKind.ENV_FACT, fact, key=key))
+        return True
 
     async def _merge_cycle(self, agent_id: str, agent: BaseAgent, slot: _Slot) -> None:
         router = self._workspace
         if slot.cycle_isolation == 'shared' or router is None or router.isolated(agent_id) is None:
             return
         trust = provenance_of(agent.context)
+        dependents = router.based_on(agent_id)
+        if dependents:
+            slot.merge_note = (
+                f'没有合并：你派出去的 {"、".join(dependents)} 的隔离副本是从你的副本拷出去的、还没'
+                '合并回来，现在删掉你的副本，它们的改动就合并不到任何地方。你上个周期的改动还在你的'
+                '副本里，等它们合并回来之后的周期结束时再合并。',
+                trust,
+            )
+            return
         try:
             report = await router.merge_isolated(agent_id)
         except Exception as exc:
@@ -3149,6 +3176,9 @@ class Runtime:
             self._table.pop(agent_id)
             self._slots.pop(agent_id, None)
             self._budget.close(agent_id)
+            # 回收账只记活着的 Agent：宿主 despawn、EXIT 与级联拆掉的也要摘，否则长跑里只增不减。
+            self._finish_order.pop(agent_id, None)
+            self._collected.discard(agent_id)
             if self._workspace is not None:
                 await self._workspace.release(agent_id)
             if await self._has_traces(agent_id):

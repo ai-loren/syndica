@@ -152,9 +152,15 @@ def test_a_platform_specific_price_wins_over_the_bare_model_name() -> None:
 
 
 def test_the_fallback_is_asked_with_the_same_platform() -> None:
-    table = StaticPrices({}, fallback=StaticPrices({'gemini:m': _TWO}))
+    table = StaticPrices({}, fallback=StaticPrices({'gemini:m': _TWO, 'openrouter:m': _ONE}))
     assert table.price_of('m', 'gemini') is _TWO
-    assert table.price_of('m', 'openrouter') is None
+    assert table.price_of('m', 'openrouter') is _ONE
+
+
+def test_an_unlisted_platform_is_priced_at_the_dearest_listed_one() -> None:
+    table = StaticPrices({'alpha:m': _ONE, 'beta:m': _TWO})
+    assert table.price_of('m', 'gamma') is _TWO
+    assert table.price_of('missing', 'gamma') is None
 
 
 def test_without_a_platform_the_dearest_platform_entry_is_the_estimate() -> None:

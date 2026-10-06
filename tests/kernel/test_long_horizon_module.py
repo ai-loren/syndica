@@ -1685,3 +1685,34 @@ async def test_a_partial_verdict_with_an_empty_reason_buys_no_continuation() -> 
         await runtime.shutdown()
     assert _strategy_blocks(ctx, 'continue') == []
     assert llm.calls.count('main') == 1
+
+
+class _Clocked(_Router):
+    """每次主调用花 10 秒、每次结果验收花 200 秒（按注入的时钟）。"""
+
+    def __init__(self, clock: list[float], main: Callable[[int], ContextBlock]) -> None:
+        super().__init__(main)
+        self._clock = clock
+
+    async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        system = str(messages[0].content) if messages and messages[0].role == 'system' else ''
+        self._clock[0] += 200.0 if system.startswith('你是结果验收器') else 10.0
+        return await super().create(messages, **kwargs)
+
+
+async def test_a_milestone_that_would_outlast_the_deadline_is_skipped_for_the_wrap_up() -> None:
+    clock = [0.0]
+    llm = _Clocked(clock, _works(30))
+    runtime = _runtime(
+        {'long_horizon_progress_every': 2}, budget=BudgetPolicy(root=Budget(wall_clock_s=100.0))
+    )
+    runtime._budget._clock = lambda: clock[0]  # pyright: ignore[reportPrivateUsage]
+    try:
+        _, ctx = await _run(runtime, llm)
+    finally:
+        await runtime.shutdown()
+    assert 'outcome' not in llm.calls
+    assert ctx.stop_reason is StopReason.BUDGET
+    assert any(
+        '最后一轮' in str(b.content) for b in ctx.current_traj if kind_of(b) is HistoryKind.BUDGET
+    )

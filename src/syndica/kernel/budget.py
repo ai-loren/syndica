@@ -189,7 +189,9 @@ class PriceTable(Protocol):
 
 class StaticPrices:
     """按模型名查的价格表，可以接在另一张后面当覆盖：先查自己，查不到再问 `fallback`。键可以是
-    `平台:模型`（只对那个平台生效）或单独的模型名；两者都有时平台那一条优先。"""
+    `平台:模型`（只对那个平台生效）或单独的模型名；两者都有时平台那一条优先。作答的平台不知道、或
+    这张表里没列这个平台时，按这个模型在已列平台里最贵的那一份算：记成「价格未知」会让设了成本上限
+    的那一层（顶层 Agent 共用的池）从此按耗尽算，一次来自没列的平台的回复就停掉每一个兄弟。"""
 
     def __init__(self, prices: Mapping[str, Prices], *, fallback: PriceTable | None = None) -> None:
         for name, value in prices.items():
@@ -215,8 +217,7 @@ class StaticPrices:
         found = None if platform is None else self._prices.get(f'{platform}:{model}')
         if found is None:
             found = self._prices.get(model)
-        if found is None and platform is None:
-            # 还不知道哪个平台作答（准入、spawn 时）：按这个模型在各平台里最贵的那一份估，宁可多估。
+        if found is None:
             suffix = f':{model}'
             listed = [p for key, p in self._prices.items() if key.endswith(suffix)]
             if listed:

@@ -253,6 +253,21 @@ def _grow_settled(parent: _Node, caps: Mapping[str, Amount | None]) -> None:
                 parent.limit[dim] = limit + granted
 
 
+def _wake_grant(node: _Node, dim: str) -> Amount:
+    """一个在收尾态的节点被叫醒时能长回多少。与切分同一套规则：至多父此刻能给的一半，父是 Agent
+    时先给它自己留一轮——否则父把最后一轮让给被叫醒的子，拿回结果之后一轮都没有、交不出回答。
+    `send` 判「叫醒了能不能干活」与周期开始时真的长回来用的是同一个数，回执才不说谎。"""
+    cap, limit = node.cap[dim], node.limit[dim]
+    if cap is None or limit is None or cap <= limit or node.parent is None:
+        return _zero(dim)
+    whole = _capacity(node.parent, None, dim, commit=False)
+    if whole is None:
+        return cap - limit
+    if dim == 'turns' and node.parent.parent is not None:
+        whole = max(whole - 1, 0)
+    return min(cap - limit, _half(whole))
+
+
 def _returnable(node: _Node, dim: str) -> Amount:
     """正在跑的子节点做完会退回来的那部分（它的预留减去它真占着的）。"""
     total = _zero(dim)
@@ -468,6 +483,7 @@ class _Ticket:
     tokens: int
     cost: Decimal | None
     raw_input: int
+    input_tokens: int = 0
 
 
 class BudgetAccount:
@@ -518,16 +534,12 @@ class BudgetAccount:
         node = self._node
         if node.parent is not None and not node.running:
             for dim in _ADDITIVE:
-                cap, limit = node.cap[dim], node.limit[dim]
-                if cap is None or limit is None or cap <= limit:
-                    continue
-                # 与切分同一条规则：一次至多拿走父此刻能给的一半。同时被叫醒的几个兄弟各自长回整个
-                # cap 时，先到的两个就把父分光了，后到的一个周期都开不了。
-                whole = _capacity(node.parent, None, dim, commit=False)
-                grow = cap - limit if whole is None else min(cap - limit, _half(whole))
+                # 一次至多拿走父此刻能给的一半：同时被叫醒的几个兄弟各自长回整个 cap 时，先到的
+                # 两个就把父分光了，后到的一个周期都开不了。
+                grow = _wake_grant(node, dim)
                 if grow > 0:
                     granted = cast(Amount, _capacity(node.parent, grow, dim, commit=True))
-                    node.limit[dim] = limit + granted
+                    node.limit[dim] = cast(Amount, node.limit[dim]) + granted
         node.running = True
 
     def end_cycle(self) -> None:
@@ -569,11 +581,9 @@ class BudgetAccount:
             room = _room(node, dim)
             if room is None:
                 continue
-            cap, limit = node.cap[dim], node.limit[dim]
-            if not node.running and cap is not None and limit is not None and cap > limit:
-                assert node.parent is not None
-                room += cast(Amount, _capacity(node.parent, cap - limit, dim, commit=False))
-            elif node.running:
+            if not node.running:
+                room += _wake_grant(node, dim)
+            else:
                 # 正在跑的节点此刻的剩余可能都被它的子占着：子做完会退回来，不算用完。
                 room += _returnable(node, dim)
             if room <= 0:
@@ -627,10 +637,12 @@ class BudgetAccount:
             return 'wrap_up', tuple(wrap)
         return 'normal', ()
 
-    def fits(self, tokens: int, cost: Decimal | None) -> bool:
-        """自己此刻落定的余量放得下这么多 tokens 与成本吗（不限的维恒放得下；成本未知而设了成本
+    def fits(self, tokens: int, cost: Decimal | None, seconds: float = 0.0) -> bool:
+        """自己此刻落定的余量放得下这么多 tokens、成本与秒数吗（不限的维恒放得下；成本未知而设了成本
         上限的放不下）。"""
         node = self._node
+        if node.deadline is not None and node.deadline - self._tree.now() < seconds:
+            return False
         room = _room(node, 'tokens', node)
         if room is not None and room < tokens:
             return False
@@ -649,11 +661,14 @@ class BudgetAccount:
     def estimate(self, llm: object, request: Mapping[str, Any]) -> tuple[int, Decimal | None, int]:
         """一次调用的估算：（输入 + 输出 token、成本（价格未知为 None）、未校准的输入估算）。"""
         raw_input = _estimate(request.get('messages')) + _tool_tokens(request.get('tools'))
-        input_tokens = math.ceil(raw_input * self._node.calibration)
+        input_tokens = self._calibrated(raw_input)
         output_tokens = _output_allowance(llm, request, self._node.output_seen)
         price = self._tree._price(llm, None)  # pyright: ignore[reportPrivateUsage]
         cost = None if price is None else price.cost_of(input_tokens, output_tokens, 0)
         return input_tokens + output_tokens, cost, raw_input
+
+    def _calibrated(self, raw_input: int) -> int:
+        return math.ceil(raw_input * self._node.calibration)
 
     def admit(self, llm: object, request: Mapping[str, Any]) -> _Ticket:
         """按估算预占；放不进剩余就 `BudgetExhausted`（只因为兄弟在飞的估算放不下时是 `_Contended`，
@@ -675,7 +690,9 @@ class BudgetAccount:
             raise _not_admitted(node.agent_id, dim, want, room)
         node.pending['tokens'] = node.pending['tokens'] + tokens
         node.pending['cost'] = node.pending['cost'] + (cost or Decimal(0))
-        return _Ticket(tokens=tokens, cost=cost, raw_input=raw_input)
+        return _Ticket(
+            tokens=tokens, cost=cost, raw_input=raw_input, input_tokens=self._calibrated(raw_input)
+        )
 
     async def admit_waiting(self, llm: object, request: Mapping[str, Any]) -> _Ticket:
         """`admit`，但兄弟在飞的估算挡着时等它们回来再试（至多 `_CONTENTION_WAIT` 秒，不过截止
@@ -703,6 +720,15 @@ class BudgetAccount:
         node.pending['tokens'] = node.pending['tokens'] - ticket.tokens
         node.pending['cost'] = node.pending['cost'] - (ticket.cost or Decimal(0))
         self._tree._notify()  # pyright: ignore[reportPrivateUsage]
+
+    def abandon(self, ticket: _Ticket, llm: object) -> None:
+        """调用发出去之后被取消（超时、被杀）：放掉预占，按估算的输入记一笔、标 `estimated`。服务商
+        多半已经收下请求、按输入计费；什么都不记，超额就是「取消次数 × 一次调用」，没有上界。输出没
+        收到，不记。"""
+        self.release(ticket)
+        price = self._tree._price(llm, None)  # pyright: ignore[reportPrivateUsage]
+        cost = None if price is None else price.cost_of(ticket.input_tokens, 0, 0)
+        self.charge(Usage(input_tokens=ticket.input_tokens, cost=cost, estimated=True))
 
     def settle(
         self, ticket: _Ticket | None, llm: object, request: Mapping[str, Any], reply: object

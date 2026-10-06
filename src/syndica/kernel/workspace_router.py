@@ -70,8 +70,10 @@ class WorkspaceRouter:
         self._copies: dict[str, IsolatedCopy] = {}
         # 谁派生了谁：没有自己副本的 Agent 落在最近一个有副本的祖先那里，隔离于是可以嵌套。
         self._parents: dict[str, str] = {}
-        # 每份副本是从哪个工作区拷的（根，或父的副本），合并就回到哪里。
-        self._bases: dict[str, Workspace] = {}
+        # 每份副本是从谁的工作区拷的（空串是根，否则是那份副本的主人），合并就回到那里。记主人而不是
+        # 工作区对象：主人的副本会被合并删掉、也会在合并失败后换一个重开的工作区，记对象就会合并进
+        # 一个已经删掉或关掉的工作区，报告成功、一个字也没写进去。
+        self._base_owners: dict[str, str] = {}
         self._merging: set[str] = set()
         self._taint = taint
         self._copy_taints: dict[str, FileTaint] = {}
@@ -177,10 +179,11 @@ class WorkspaceRouter:
                 received='它已经有一份',
                 next_action='先 merge_isolated 或 discard_isolated 那一份',
             )
-        base = self._workspace_of(self._parents.get(agent_id))
+        parent = self._parents.get(agent_id)
+        base = self._workspace_of(parent)
         copy = self._isolator.isolate(Path(base.root), agent_id, isolation)
         self._copies[agent_id] = copy
-        self._bases[agent_id] = base
+        self._base_owners[agent_id] = '' if parent is None else self.scope_of(parent)
         self._assigned[agent_id] = copy.workspace
         base_taint = self._taint_of(base)
         if base_taint is not None:
@@ -200,6 +203,34 @@ class WorkspaceRouter:
     def isolated(self, agent_id: str) -> IsolatedCopy | None:
         return self._copies.get(agent_id)
 
+    def based_on(self, agent_id: str) -> list[str]:
+        """隔离副本建在 `agent_id` 那份副本上、还没合并的那些 Agent：在它们合并回来之前删掉这份
+        副本，它们的改动就合并不到任何地方。"""
+        return [other for other, owner in self._base_owners.items() if owner == agent_id]
+
+    def _base_of(self, agent_id: str) -> Workspace:
+        owner = self._base_owners.get(agent_id, '')
+        if not owner:
+            return self._root
+        base = self._copies.get(owner)
+        if base is None:
+            raise ConfigError(
+                expected=f'agent {agent_id} 的隔离副本合并回它出发的那份副本（agent {owner} 的）',
+                received='那份副本已经合并或丢弃，不在了',
+                next_action=(
+                    f'agent {agent_id} 的改动还在它自己的副本里'
+                    f'（{self._copies[agent_id].location}）；'
+                    '手动拿走需要的文件，再 discard_isolated 它'
+                ),
+            )
+        return base.workspace
+
+    def _reopen(self, agent_id: str, copy: IsolatedCopy) -> None:
+        old = id(copy.workspace)
+        cast(LocalIsolator, self._isolator).reopen(copy)
+        self._assigned[agent_id] = copy.workspace
+        self._writers = {key: span for key, span in self._writers.items() if key[0] != old}
+
     async def merge_isolated(self, agent_id: str) -> MergeReport:
         """把 `agent_id` 的隔离副本逐文件合并回根工作区，然后删掉副本；此后它的调用落在根上。
         合并写回的每个文件在版本层里记在这个 Agent 名下。"""
@@ -210,7 +241,7 @@ class WorkspaceRouter:
                 received='它没有（没隔离过，或已经合并、丢弃）',
                 next_action='只对用 isolation=worktree / snapshot 起来、还没合并的 Agent 合并',
             )
-        base = self._bases.get(agent_id, self._root)
+        base = self._base_of(agent_id)
         base_taint = self._taint_of(base)
         copied = self._copy_taints.get(agent_id)
 
@@ -235,6 +266,10 @@ class WorkspaceRouter:
             )
             report = await self._isolator.merge(copy, base.portal(), written)
             late = copy.changed_since_merge()
+        except BaseException:
+            # 副本留着，下次接着在它里面干活：关掉的工作区得重开，否则此后每条命令都报「已关闭」。
+            self._reopen(agent_id, copy)
+            raise
         finally:
             self._merging.discard(agent_id)
         if late:
@@ -246,6 +281,7 @@ class WorkspaceRouter:
             )
         if report.unsaved:
             # 有冲突的文件子 Agent 那份没能另存：删掉副本就是丢掉它唯一的一份。
+            self._reopen(agent_id, copy)
             return replace(report, kept=str(copy.location))
         await self._drop_copy(agent_id, unmerged_ok=True)
         return report
@@ -265,7 +301,7 @@ class WorkspaceRouter:
         copy = self._copies.pop(agent_id, None)
         self._assigned.pop(agent_id, None)
         self._copy_taints.pop(agent_id, None)
-        self._bases.pop(agent_id, None)
+        self._base_owners.pop(agent_id, None)
         if copy is None:
             return
         self._writers = {

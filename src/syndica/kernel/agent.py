@@ -1260,10 +1260,17 @@ class BaseAgent:
             return StopReason.BUDGET
         if not response.tool_calls:
             if self._background is not None and self._background.outstanding:
-                # 还有后台调用在跑：交不了最终回复。等到有结果（或没有在跑的了），下一轮把它注入。
-                await self._background.wait_for_change()
-                await self._end_turn(ctx, turn, response)
-                return None
+                max_turns = self.options.max_turns
+                if max_turns is None or turn < max_turns:
+                    # 还有后台调用在跑：交不了最终回复。等到有结果（或没有在跑的了），下一轮把它
+                    # 注入，模型读到结果再作答。
+                    await self._background.wait_for_change()
+                    await self._end_turn(ctx, turn, response)
+                    return None
+                # 最后一轮：没有下一轮让模型读结果了。等在跑的都结束，结果注入并登记产物，模型已经
+                # 给出的这条答复照常收尾——停在轮次用完会把答复连同结果的产物一起丢掉。
+                await self._background.wait_idle()
+                await self._inject_background(ctx)
             # Agent 判定完成：先过验收切点（§7.5）。打回则内核已追加反馈块，再做一轮。
             sent_back = await self._propose_completion(ctx, response, turn)
             # 验收可能跑上好一阵（L2 + L3 各有伴生轮次）：期间到达的中止要在这里兑现，否则通过的裁决
@@ -1399,15 +1406,24 @@ class BaseAgent:
                 continue
             result = entry.result
             if entry.state == 'done' and result is not None:
-                output = result.output if isinstance(result.output, str) else str(result.output)
+                heading = f'后台调用 {entry.id}（{entry.call.name}）结束了，结果如下：'
                 block = signed_block(
                     HistoryKind.BACKGROUND,
-                    f'后台调用 {entry.id}（{entry.call.name}）结束了，结果如下：\n{output}',
+                    f'{heading}\n{result.output}' if isinstance(result.output, str) else heading,
                     key=key,
                     trust=result.trust,
                 )
+                if not isinstance(result.output, str):
+                    # 多模态的输出原样带上，与同步跑完的调用一样；写成字符串模型就只看到一段 repr。
+                    block = replace(
+                        block, content=[{'type': 'text', 'text': heading}, *result.output]
+                    )
                 if result.artifacts:
                     block = replace(block, artifacts=list(result.artifacts))
+                if result.meta:
+                    block.extra['tool_meta'] = dict(result.meta)
+                # 进了历史就不再留：长跑里每次后台调用的完整输出都留在表里是无界增长。
+                entry.result = None
             else:
                 block = signed_block(
                     HistoryKind.BACKGROUND,
@@ -1443,15 +1459,18 @@ class BaseAgent:
 
     def _companion_headroom(self, ctx: Context, calls: int) -> bool:
         """预算还放得下 `calls` 次与主调用一样大的伴生调用、外加这一次与下一次主调用吗（伴生花不掉
-        留给收尾那次调用的预算）。tokens 与成本都不限时恒真。"""
+        留给收尾那次调用的预算）。墙钟按上一轮的耗时算，与收尾判定同一把尺子。没有上限时恒真。"""
         budget = self._budget
-        if budget is None or not budget.metered:
+        if budget is None or not budget.limited:
             return True
+        times = calls + 2
+        seconds = self._last_turn_s * times
+        if not budget.metered:
+            return budget.fits(0, None, seconds)
         tokens, cost = self._call_estimate(
             ctx, [tool.schema for tool in self.options.tools.values()]
         )
-        times = calls + 2
-        return budget.fits(tokens * times, None if cost is None else cost * times)
+        return budget.fits(tokens * times, None if cost is None else cost * times, seconds)
 
     def _call_estimate(
         self, ctx: Context, tool_defs: list[dict[str, Any]]

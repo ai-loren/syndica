@@ -35,6 +35,7 @@ from syndica.kernel.llm import LLMConfig
 from syndica.kernel.redaction import RuleRedactor
 from syndica.kernel.runtime import Runtime
 from syndica.kernel.stores import InMemorySessionStore
+from syndica.kernel.stores.memory_artifact import InMemoryArtifactStore
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tool_executor import ToolExecutor
 
@@ -991,3 +992,106 @@ async def test_a_host_error_drained_at_cycle_end_is_logged(
     assert ctx.stop_reason is StopReason.MAX_TURNS
     [record] = [r for r in caplog.records if r.args and 'bg-1' in cast(tuple[object, ...], r.args)]
     assert cast(tuple[object, ...], record.args)[1:3] == ('Misconfigured', 'ConfigError')
+
+
+class _Later(_Slow):
+    __tool_name__ = 'Later'
+
+
+class _ReleasesLater:
+    """第 `at` 次被问时安排放行（第二个工具晚一些）：模型交最终回复的时候后台调用还在跑。"""
+
+    def __init__(self, slows: list[_Slow], steps: list[ContextBlock], *, at: int) -> None:
+        self.inner = _Script(steps)
+        self.config = self.inner.config
+        self._slows = slows
+        self._at = at
+
+    async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        if len(self.inner.calls) == self._at:
+            loop = asyncio.get_running_loop()
+            for delay, slow in zip((0.02, 0.2), self._slows, strict=False):
+                loop.call_later(delay, slow.release.set)
+        return await self.inner.create(messages, **kwargs)
+
+
+@pytest.mark.parametrize('count', [1, 2])
+async def test_a_final_answer_on_the_last_turn_waits_for_every_result_and_still_completes(
+    count: int,
+) -> None:
+    store = InMemoryArtifactStore()
+    slows: list[_Slow] = [_Slow(), _Later()][:count]
+    steps = [_call(slow.name, f's{index}', job=f'job{index}') for index, slow in enumerate(slows)]
+    llm = _ReleasesLater(slows, [*steps, _say('FINAL: build shipped')], at=count)
+    runtime = _runtime(artifacts=store)
+    try:
+        _, ctx = await _run(
+            runtime,
+            _factory(cast(Any, llm), {slow.name: slow for slow in slows}, max_turns=count + 1),
+        )
+    finally:
+        await runtime.shutdown()
+    assert ctx.stop_reason is StopReason.COMPLETED
+    texts = [str(b.content) for b in _background_blocks(ctx)]
+    assert all(any(f'job{index} finished' in t for t in texts) for index in range(count))
+    assert [ref.path for ref in await store.list()] == ['out/build.log']
+    assert [b.content for b in ctx.current_traj if b.role == 'assistant'][-1] == (
+        'FINAL: build shipped'
+    )
+
+
+async def test_a_final_answer_before_the_last_turn_lets_the_model_read_the_result_first() -> None:
+    slow = _Slow()
+    llm = _ReleasesLater(
+        [slow], [_call('Slow', 's'), _say('early'), _say('FINAL: build shipped')], at=1
+    )
+    runtime = _runtime()
+    try:
+        _, ctx = await _run(runtime, _factory(cast(Any, llm), {'Slow': slow}, max_turns=5))
+    finally:
+        await runtime.shutdown()
+    assert ctx.stop_reason is StopReason.COMPLETED
+    assert any('build finished' in str(b.content) for b in llm.inner.calls[-1])
+
+
+class _Picture(_Slow):
+    __tool_name__ = 'Picture'
+
+    async def execute(self, job: str = 'build') -> ToolResult:
+        await self.release.wait()
+        return ToolResult(
+            output=[{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AAAA'}}],
+            meta={'width': 2},
+        )
+
+
+async def test_a_multimodal_result_keeps_its_parts_and_meta_and_leaves_the_table() -> None:
+    tool = _Picture()
+    llm = _Script([_call('Picture', 'p'), _call('Release', 'r'), _say('done')])
+    runtime = _runtime()
+    try:
+        agent_id, ctx = await _run(
+            runtime, _factory(llm, {'Picture': tool, 'Release': _Releases(tool)})
+        )
+        agent = runtime._table.get(agent_id)  # pyright: ignore[reportPrivateUsage]
+        entry = cast(Any, agent)._background.get('bg-1')
+    finally:
+        await runtime.shutdown()
+    [block] = _background_blocks(ctx)
+    content = cast(list[dict[str, Any]], block.content)
+    assert content[0]['type'] == 'text' and 'bg-1' in content[0]['text']
+    assert content[1]['type'] == 'image_url'
+    assert block.extra['tool_meta'] == {'width': 2}
+    assert entry.state == 'done' and entry.result is None
+
+
+async def test_cancelling_a_call_whose_finisher_never_ran_cancels_the_tool_too() -> None:
+    calls = BackgroundCalls()
+    work = cast('asyncio.Future[object]', asyncio.ensure_future(asyncio.sleep(30)))
+    entry = calls.start(ToolCall(id='s', name='Slow', arguments='{}'))
+    entry.work = work
+    entry.task = asyncio.create_task(asyncio.sleep(30))
+    calls.cancel(entry.id, 'test', report=True)
+    await asyncio.sleep(0)
+    assert work.cancelled()
+    assert entry.task.cancelled()

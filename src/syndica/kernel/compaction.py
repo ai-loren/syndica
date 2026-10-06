@@ -516,6 +516,7 @@ def _protected_indices(blocks: Sequence[ContextBlock]) -> frozenset[int]:
       Goal 改了、Rubric 集合变了都会追加替代块，被替代的旧块不再保护——留着它们模型会同时看见两份互相
       矛盾的要求（M7 评审 M6）；
     - 最后一条真实 user 消息（当前这一轮的输入）；
+    - 最后一条 assistant 块之后的后台结果（`BACKGROUND`）：模型还没读到过它们，压掉就是丢掉；
     - 第一条真实 user 消息（任务 / Goal 代理）——**只在没有 Goal 块时**兜底；有 Goal 块时此代理退役，
       否则 Goal 块会把真正的任务消息挤出保护集合（M7 评审 B2）。
 
@@ -530,6 +531,14 @@ def _protected_indices(blocks: Sequence[ContextBlock]) -> frozenset[int]:
         latest = [index for index, block in enumerate(blocks) if kind_of(block) is kind]
         if latest:
             protected.add(latest[-1])
+    last_reply = max(
+        (index for index, block in enumerate(blocks) if block.role == 'assistant'), default=-1
+    )
+    protected.update(
+        index
+        for index, block in enumerate(blocks)
+        if index > last_reply and kind_of(block) is HistoryKind.BACKGROUND
+    )
     has_goal = any(kind_of(block) is HistoryKind.GOAL for block in blocks)
     user_turns = [
         index

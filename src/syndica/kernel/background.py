@@ -138,6 +138,12 @@ class BackgroundCalls:
             self._changed.clear()
             await self._changed.wait()
 
+    async def wait_idle(self) -> None:
+        """等到没有在跑的。有结果待注入不算：那是电平，拿它当条件会在别的还在跑时空转。"""
+        while self.running:
+            self._changed.clear()
+            await self._changed.wait()
+
 
 def _highest_issued(blocks: Iterable[ContextBlock]) -> int:
     highest = 0

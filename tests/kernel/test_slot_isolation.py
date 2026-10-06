@@ -5,22 +5,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from syndica.kernel.agent import AgentOptions, BaseAgent
-from syndica.kernel.context import ContextBlock, ToolCall, TrustLevel
+from syndica.kernel.context import ContextBlock, StopReason, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.history_blocks import HistoryKind, kind_of
 from syndica.kernel.hooks import HooksCenter
-from syndica.kernel.isolation import LocalIsolator
+from syndica.kernel.isolation import LocalIsolator, MergeConflict, MergeReport
 from syndica.kernel.llm import LLMConfig
 from syndica.kernel.local_workspace import LocalWorkspace
 from syndica.kernel.runtime import Runtime
-from syndica.kernel.tools.local import Write
+from syndica.kernel.tools.local import Bash, Write
 from syndica.kernel.topology import AgentSlot, Topology
 from syndica.kernel.workspace_router import WorkspaceRouter
 
@@ -118,18 +120,19 @@ async def test_a_cycles_work_lands_in_the_shared_workspace_only_when_the_cycle_e
     assert after == 'mine\n'
 
 
-async def test_every_cycle_is_told_it_works_in_a_copy_under_its_own_key(tmp_path: Path) -> None:
+async def test_the_copy_fact_is_told_once_while_it_stays_the_same(tmp_path: Path) -> None:
     router, _ = _router(tmp_path)
-    llm = _Script([_say('one'), _say('two')])
+    llm = _Script([_say('one'), _say('two'), _say('three')])
     runtime, agent_id = await _slot_agent(router, llm)
     try:
         await _cycle(runtime, agent_id, 'first')
-        ctx = await _cycle(runtime, agent_id, 'second')
+        await _cycle(runtime, agent_id, 'second')
+        ctx = await _cycle(runtime, agent_id, 'third')
     finally:
         await runtime.shutdown()
-    keys = [str(b.extra['syndica.key']) for b in _facts(ctx)]
-    assert keys == [f'isolation:{agent_id}:1', f'isolation:{agent_id}:2']
-    assert all('隔离的工作副本' in str(b.content) for b in _facts(ctx))
+    [fact] = _facts(ctx)
+    assert '隔离的工作副本' in str(fact.content)
+    assert str(fact.extra['syndica.key']).startswith(f'isolation:{agent_id}:')
 
 
 async def test_a_conflict_is_reported_at_the_start_of_the_next_cycle_with_the_cycles_trust(
@@ -222,7 +225,179 @@ def test_the_capture_refuses_a_topology_with_an_isolated_slot() -> None:
             Topology(slots=(AgentSlot(name='a', agent='W', isolation='snapshot'),))
         )
     }
-    capture._refuse_redacted_slot_tools(shared)  # pyright: ignore[reportPrivateUsage]
+    capture._refuse_unreplayable_slots(shared)  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(Unreplayable) as caught:
-        capture._refuse_redacted_slot_tools(isolated)  # pyright: ignore[reportPrivateUsage]
+        capture._refuse_unreplayable_slots(isolated)  # pyright: ignore[reportPrivateUsage]
     assert 'isolation' in caught.value.received
+
+
+def _bash(call_id: str, command: str) -> ContextBlock:
+    arguments = json.dumps({'command': command})
+    return ContextBlock(
+        role='assistant', tool_calls=[ToolCall(id=call_id, name='Bash', arguments=arguments)]
+    )
+
+
+class _MergeOnceFails(LocalIsolator):
+    def __init__(self, *, how: str) -> None:
+        super().__init__(shell='/bin/sh', env={})
+        self._how = how
+        self._done = False
+
+    async def merge(self, copy: Any, parent: Any, written: Any) -> MergeReport:
+        if self._done:
+            return await super().merge(copy, parent, written)
+        self._done = True
+        if self._how == 'raises':
+            raise OSError('No space left on device')
+        report = await super().merge(copy, parent, written)
+        return replace(report, conflicts=(MergeConflict(path='a.txt', reason='both changed'),))
+
+
+@pytest.mark.parametrize('how', ['raises', 'keeps'])
+async def test_a_copy_kept_after_a_merge_still_runs_commands_next_cycle(
+    tmp_path: Path, how: str
+) -> None:
+    root = tmp_path / 'ws'
+    root.mkdir()
+    router = WorkspaceRouter(
+        LocalWorkspace(str(root), shell='/bin/sh', env={}), isolator=_MergeOnceFails(how=how)
+    )
+    llm = _Script(
+        [_bash('b1', 'echo one > a.txt'), _say('one'), _bash('b2', 'cat a.txt'), _say('two')]
+    )
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(
+                name='Worker',
+                llm=llm,  # type: ignore[arg-type]
+                tools={'Bash': Bash(router.portal())},
+                system_prompt='SP',
+            ),
+            hooks=hooks,
+            events=events,
+        )
+
+    runtime = Runtime(workspace=router)
+    slot = AgentSlot(name='w', agent='Worker', cardinality='singleton', isolation='snapshot')
+    await runtime.assemble(Topology(slots=(slot,)), {'Worker': build}, tools={})
+    agent_id = await runtime.occupy('w')
+    try:
+        await _cycle(runtime, agent_id, 'first')
+        ctx = await _cycle(runtime, agent_id, 'second')
+    finally:
+        await runtime.shutdown()
+    answer = str(next(b for b in ctx.current_traj if b.tool_call_id == 'b2').content)
+    assert 'one' in answer
+    assert '已关闭' not in answer
+
+
+async def test_a_slot_copy_a_delegated_copy_was_cut_from_is_kept_until_that_copy_merges(
+    tmp_path: Path,
+) -> None:
+    router, root = _router(tmp_path)
+    gate = asyncio.Event()
+    delegate = json.dumps({'agent': 'Child', 'query': 'write result.txt', 'isolation': 'snapshot'})
+    worker_llm = _Script(
+        [
+            ContextBlock(
+                role='assistant', tool_calls=[ToolCall(id='d', name='Delegate', arguments=delegate)]
+            ),
+            _say('a again'),
+        ]
+    )
+    child_llm = _Script([_write('w', 'result.txt', 'child work\n'), _say('child done')], {0: gate})
+
+    def worker(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(name='Worker', llm=worker_llm, system_prompt='SP'),  # type: ignore[arg-type]
+            hooks=hooks,
+            events=events,
+        )
+
+    def child(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        return BaseAgent(
+            AgentOptions(
+                name='Child',
+                llm=child_llm,  # type: ignore[arg-type]
+                tools={'Write': Write(router.portal())},
+                system_prompt='SP',
+            ),
+            hooks=hooks,
+            events=events,
+        )
+
+    runtime = Runtime(workspace=router, orchestration=True)
+    slot = AgentSlot(name='w', agent='Worker', isolation='snapshot')
+    await runtime.assemble(Topology(slots=(slot,)), {'Worker': worker, 'Child': child}, tools={})
+    agent_id = await runtime.occupy('w')
+    try:
+        assert (await runtime.send(agent_id, 'go')).ok
+        children: list[str] = []
+        for _ in range(300):
+            info = await runtime.find(agent_id)
+            children = [] if info is None else list(info.children)
+            if children:
+                break
+            await asyncio.sleep(0.01)
+        [child_id] = children
+        await runtime.abort(agent_id)
+        await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+        kept = router.isolated(agent_id) is not None
+        gate.set()
+        await asyncio.wait_for(runtime.wait(child_id), _TIMEOUT)
+        await runtime.merge_isolated(child_id)
+        ctx = await _cycle(runtime, agent_id, 'next')
+    finally:
+        await runtime.shutdown()
+    assert kept
+    assert (root / 'result.txt').read_text(encoding='utf-8') == 'child work\n'
+    assert any(child_id in str(b.content) for b in _facts(ctx))
+
+
+async def test_merging_a_copy_whose_base_copy_is_gone_is_refused(tmp_path: Path) -> None:
+    router, _ = _router(tmp_path)
+    router.isolate('a', 'snapshot')
+    router.adopt('c', 'a')
+    router.isolate('c', 'snapshot')
+    await router.discard_isolated('a')
+    with pytest.raises(ConfigError) as caught:
+        await router.merge_isolated('c')
+    assert 'discard_isolated' in caught.value.next_action
+    assert router.isolated('c') is not None
+    await router.discard_isolated('c')
+
+
+class _IsolatesOnce(LocalIsolator):
+    def __init__(self) -> None:
+        super().__init__(shell='/bin/sh', env={})
+        self.calls = 0
+
+    def isolate(self, root: Path, agent_id: str, requested: str) -> Any:
+        self.calls += 1
+        if self.calls > 1:
+            raise OSError('No space left on device')
+        return super().isolate(root, agent_id, requested)
+
+
+async def test_a_cycle_whose_copy_cannot_be_made_stops_with_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = tmp_path / 'ws'
+    root.mkdir()
+    router = WorkspaceRouter(
+        LocalWorkspace(str(root), shell='/bin/sh', env={}), isolator=_IsolatesOnce()
+    )
+    llm = _Script([_say('answer to one'), _say('answer to two')])
+    runtime, agent_id = await _slot_agent(router, llm)
+    try:
+        await _cycle(runtime, agent_id, 'one')
+        with caplog.at_level(logging.ERROR, logger='syndica.kernel.runtime'):
+            ctx = await _cycle(runtime, agent_id, 'two')
+    finally:
+        await runtime.shutdown()
+    assert ctx.stop_reason is StopReason.ERROR
+    assert llm.calls == 1
+    logged = [cast(tuple[object, ...], r.args) for r in caplog.records if r.args]
+    assert any(args[0] == agent_id and 'OSError' in args for args in logged)

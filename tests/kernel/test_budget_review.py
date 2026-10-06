@@ -257,7 +257,7 @@ async def test_a_failed_call_gives_its_estimate_back() -> None:
     assert view is not None and view.remaining.tokens == 10_000 - 15
 
 
-async def test_a_killed_call_gives_its_estimate_back() -> None:
+async def test_a_killed_call_keeps_its_input_estimate_and_gives_the_rest_back() -> None:
     hold = asyncio.Event()
     llm = _Usage(hold=hold, max_tokens=100)
     runtime = Runtime(budget=BudgetPolicy(root=Budget(tokens=10_000)))
@@ -269,7 +269,38 @@ async def test_a_killed_call_gives_its_estimate_back() -> None:
         view = runtime._budget.pool().view()  # pyright: ignore[reportPrivateUsage]
     finally:
         await runtime.shutdown()
-    assert view.remaining.tokens == 10_000
+    used = view.used
+    assert used.input_tokens > 0 and used.output_tokens == 0 and used.estimated
+    assert view.remaining.tokens == 10_000 - used.input_tokens
+
+
+async def test_every_timed_out_companion_call_is_charged() -> None:
+    from syndica.kernel.budget_tree import BudgetTree
+    from syndica.kernel.tracing import _Tracing, llm_attempt  # pyright: ignore[reportPrivateUsage]
+
+    class _Slow:
+        config = LLMConfig(provider='scripted', model='paid')
+
+        async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+            await asyncio.sleep(10)
+            return ContextBlock(role='assistant', content='late')
+
+    prices = StaticPrices({'paid': Prices(Decimal('1'), Decimal('1'), Decimal('0'))})
+    tree = BudgetTree(BudgetPolicy(root=Budget(tokens=100_000, cost=Decimal('1')), prices=prices))
+    account = tree.carve('a', None, Budget(tokens=100_000, cost=Decimal('1')))
+    llm = _Slow()
+    messages = [ContextBlock(role='user', content='x ' * 2000)]
+    tracing = _Tracing()
+    for turn in range(3):
+        with tracing.llm_call('a', turn, account.for_companion()):
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.01):
+                    async with llm_attempt(llm, {'messages': messages}):
+                        await llm.create(messages)
+    used = account.view().used
+    each = used.input_tokens // 3
+    assert each > 0 and used.input_tokens == 3 * each
+    assert used.cost is not None and used.cost > 0
 
 
 # ---- 收尾轮 ----

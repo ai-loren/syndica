@@ -244,6 +244,10 @@ class LocalIsolator:
             base_executable=frozenset(executable),
         )
 
+    def reopen(self, copy: IsolatedCopy) -> None:
+        """给一份合并时关掉、又要接着用的副本换一个打开的工作区。"""
+        copy.workspace = LocalWorkspace(str(copy.location), shell=self._shell, env=self._env)
+
     async def merge(
         self,
         copy: IsolatedCopy,

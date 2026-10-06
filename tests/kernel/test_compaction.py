@@ -89,6 +89,18 @@ def test_only_the_latest_goal_and_rubric_blocks_are_protected() -> None:
     assert blocks.index(old_goal) not in protected and blocks.index(old_rubric) not in protected
 
 
+def test_background_results_the_model_has_not_read_yet_are_protected() -> None:
+    seen = signed_block(HistoryKind.BACKGROUND, 'bg-1 finished: old build', key='background:a:bg-1')
+    unseen = [
+        signed_block(HistoryKind.BACKGROUND, f'bg-{n} finished', key=f'background:a:bg-{n}')
+        for n in (2, 3)
+    ]
+    blocks = [*_exchange('a'), seen, *_exchange('b'), *unseen]
+    protected = _protected_indices(blocks)
+    assert blocks.index(seen) not in protected
+    assert all(blocks.index(block) in protected for block in unseen)
+
+
 def test_a_goal_block_retires_the_first_user_proxy() -> None:
     # 没有 Goal 块时第一条真实 user 消息是 Goal 代理（受保护）；有了真的 Goal 块，这个代理退役，
     # 否则 Goal 块会把真正的任务消息挤出保护集合（评审 B2）。最后一条当前输入始终保护。

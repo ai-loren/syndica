@@ -338,7 +338,8 @@ class Delegate(_AgentTool):
         它冷启动、**看不到你的上下文**，所以用于需要独立视角的工作。
         已有 Agent 能继续同一工作时用 SendMessage，不要新建；
         要在你自己已有的结论之上并行推进就用 Fork；能直接做完的有界工作不该委派。
-        返回的第一行带着它的 agent_id——它做完之后仍然留在注册表里可寻址。
+        返回的第一行带着它的 agent_id——它做完之后仍可寻址，直到被回收
+        （你做完了的子 Agent 只留最近几个，更早的会被回收，寻址时会被告知）。
         isolation 为 worktree 或 snapshot 时它在共享工作区的一份拷贝里改，做完逐文件合并回来，
         冲突的文件另存成旁边的 .theirs；缺省 shared 直接改共享工作区。
         它的预算从你的剩余里切：turns / tokens 省略（0）时取你剩余的一半，切不出来就交回原因。
@@ -399,7 +400,8 @@ class Fork(_AgentTool):
         分身看得到你到此刻为止的轨迹，因此不必重复前提。
         要一个不受你的结论影响的独立视角就用 Delegate；
         已有 Agent 能继续同一工作时用 SendMessage，不要新建。
-        返回的第一行带着分身的 agent_id——它做完之后仍然留在注册表里可寻址。
+        返回的第一行带着分身的 agent_id——它做完之后仍可寻址，直到被回收
+        （你做完了的子 Agent 只留最近几个，更早的会被回收，寻址时会被告知）。
         isolation 为 worktree 或 snapshot 时分身在共享工作区的一份拷贝里改，做完逐文件合并回来，
         冲突的文件另存成旁边的 .theirs；缺省 shared 直接改共享工作区。
         分身的预算从你的剩余里切：turns / tokens 省略（0）时取你剩余的一半，切不出来就交回原因。
@@ -452,7 +454,7 @@ class SendMessage(_AgentTool):
     async def execute(self, agent_id: str, content: str, trigger: str = 'pending') -> ToolResult:
         """给一个**已有的** Agent 发一条消息，不等它回话；它没在跑就把它叫醒。
         已有 Agent 能继续同一工作时用这个，不要新建
-        ——新建会丢掉它已经攒下的全部上下文，而做完一件活的 Agent 仍然留在注册表里可寻址。
+        ——新建会丢掉它已经攒下的全部上下文，而做完一件活的 Agent 在被回收之前仍可寻址。
         要一个不受你影响的独立视角用 Delegate，要在你自己的结论之上并行推进用 Fork。
         agent_id: 收件人的 id（Delegate / Fork 交回的那一个）
         content: 消息正文；它看得到的只有这段话，所以要自带全部前提

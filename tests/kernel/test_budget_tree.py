@@ -186,20 +186,22 @@ def test_the_next_cycle_carves_the_cap_back_from_the_parent() -> None:
     assert parent.view().remaining.turns == 5
 
 
-def test_a_wake_gets_only_what_the_parent_still_has() -> None:
+def test_a_wake_gets_only_what_the_parent_can_spare_beyond_its_own_last_turn() -> None:
     tree = _tree()
     parent = tree.carve('p', None, Budget(turns=10))
     child = tree.carve('c', 'p', Budget(turns=5))
     _turns(child, 2)
     child.end_cycle()
-    _turns(parent, 7)
+    _turns(parent, 6)
     assert child.unwakeable() == ()
     child.begin_cycle()
     assert child.view().remaining.turns == 1
+    assert parent.view().remaining.turns == 1
     child.take_turn()
     child.end_cycle()
-    _turns(parent, 1)
     assert child.unwakeable() == ('turns',)
+    child.begin_cycle()
+    assert parent.view().remaining.turns == 1
 
 
 def test_a_wake_under_a_settled_parent_is_paid_by_the_nearest_running_ancestor() -> None:
@@ -218,6 +220,18 @@ def test_a_wake_under_a_settled_parent_is_paid_by_the_nearest_running_ancestor()
     assert middle.view().remaining.turns == 0
 
 
+def test_a_top_level_wake_takes_the_pools_last_turn_because_the_pool_answers_nothing() -> None:
+    tree = _tree(Budget(turns=6))
+    first = tree.carve('a', None, Budget(turns=4))
+    _turns(first, 2)
+    first.end_cycle()
+    other = tree.carve('b', None, Budget(turns=3))
+    _turns(other, 3)
+    assert first.unwakeable() == ()
+    first.begin_cycle()
+    assert first.view().remaining.turns == 1
+
+
 def test_siblings_woken_together_each_take_half_of_what_is_left_so_none_starves() -> None:
     tree = _tree()
     parent = tree.carve('p', None, Budget(turns=100))
@@ -230,8 +244,8 @@ def test_siblings_woken_together_each_take_half_of_what_is_left_so_none_starves(
     for kid in kids:
         kid.begin_cycle()
     left = [kid.view().remaining.turns for kid in kids]
-    assert left == [49, 24, 12]
-    assert parent.view().remaining.turns == 100 - (50 + 25 + 13)
+    assert left == [48, 24, 12]
+    assert parent.view().remaining.turns == 100 - (49 + 25 + 13)
 
 
 def test_a_lazily_started_child_reserves_nothing_until_its_first_cycle() -> None:
@@ -649,3 +663,26 @@ def test_a_zero_request_says_to_omit_it() -> None:
     with pytest.raises(BudgetRefused) as caught:
         tree.carve('c', 'p', Budget(tokens=0))
     assert '省略' in caught.value.next_action
+
+
+def test_a_reply_from_an_unlisted_platform_does_not_exhaust_its_siblings() -> None:
+    from syndica.kernel.llm import LLMConfig
+
+    class _LLM:
+        config = LLMConfig(provider='scripted', model='m')
+
+    prices = StaticPrices({'alpha:m': Prices(Decimal('1'), Decimal('1'), Decimal('0'))})
+    tree = BudgetTree(BudgetPolicy(root=Budget(cost=Decimal('10')), prices=prices))
+    first = tree.carve('a', None, None)
+    sibling = tree.carve('b', None, None)
+    llm = _LLM()
+    request = {'messages': [ContextBlock(role='user', content='hi')]}
+    ticket = first.admit(llm, request)
+    reply = ContextBlock(
+        role='assistant',
+        content='ok',
+        extra={'usage': {'input_tokens': 10, 'output_tokens': 5}, 'llm_route': 'beta'},
+    )
+    first.settle(ticket, llm, request, reply)
+    assert first.view().used.cost == Decimal('0.000015')
+    assert sibling.plan_turn(*sibling.estimate(llm, request)[:2], 0.0)[0] == 'normal'

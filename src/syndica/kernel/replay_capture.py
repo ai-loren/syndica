@@ -612,8 +612,9 @@ class ReplayCapture:
         }
         return document, identifiers
 
-    def _refuse_redacted_slot_tools(self, run: Mapping[str, object]) -> None:
-        """拓扑槽附加的工具同样按名字找：名字被脱敏换掉，回放装配时找不到它。"""
+    def _refuse_unreplayable_slots(self, run: Mapping[str, object]) -> None:
+        """拓扑槽回放不出来的两种情形：声明了隔离（每个周期的拷贝与合并取决于当时的工作区），或附加
+        的工具名被脱敏换掉（回放装配按名字找它，找不到）。"""
         topology = run.get('topology')
         if not isinstance(topology, Mapping):
             return
@@ -681,7 +682,7 @@ class ReplayCapture:
                         received=f'角色 {name!r} 的工具表第 {index} 项被一条脱敏规则换掉了',
                         next_action='收窄那条用户规则，别让它认得工具名；这个 trace 不写回放文档',
                     )
-        self._refuse_redacted_slot_tools(run)
+        self._refuse_unreplayable_slots(run)
         entry = cast(Mapping[str, object], run['entry'])
         allowed = 1 if entry.get('mode') in ('send', 'slot') else 0
         sent = [key for key in self.ids.issued if key[:2] == ('host', 'message')]
