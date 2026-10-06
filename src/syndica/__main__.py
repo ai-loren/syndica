@@ -465,11 +465,15 @@ class _LazyHost:
         trusted_output: Sequence[str] = (),
         resume: str | None = None,
         goal: str | None = None,
+        on_exhausted: str | None = None,
     ) -> str:
-        # 只在给了 --trust-module-output / --goal 时才传：没有这两个参数的宿主实现照样能开 chat。
+        # 只在给了 --trust-module-output / --goal / --on-exhausted 时才传：没有这几个参数的宿主实现
+        # 照样能开 chat。
         extra: dict[str, Any] = {'trusted_output': tuple(trusted_output)} if trusted_output else {}
         if goal is not None:
             extra['goal'] = goal
+        if on_exhausted is not None:
+            extra['on_exhausted'] = on_exhausted
         return self._get().open_chat(
             config, max_turns, trace=trace, argv=argv, resume=resume, **extra
         )

@@ -1190,6 +1190,33 @@ def test_module_host_forwards_the_goal_to_the_runtime_host(monkeypatch: pytest.M
     assert goals == ['ship the report']
 
 
+def test_module_host_forwards_on_exhausted_to_the_runtime_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import syndica.cli.host as host_module
+    from syndica.__main__ import _LazyHost  # pyright: ignore[reportPrivateUsage]
+
+    seen: list[object] = []
+
+    class RecordingHost:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def open_chat(self, config: str, max_turns: int | None = None, **kw: Any) -> str:
+            seen.append(kw.get('on_exhausted'))
+            return 'root-agent-id'
+
+        def close(self, *, interrupted: bool = False) -> None:
+            del interrupted
+
+    monkeypatch.setattr(host_module, 'RuntimeCliHost', RecordingHost)
+    lazy = _LazyHost(CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()))
+    lazy.open_chat('.syndica.yaml', on_exhausted='hard_stop')
+    lazy.open_chat('.syndica.yaml')
+    lazy.close()
+    assert seen == ['hard_stop', None]
+
+
 def test_memory_routes_list_and_forget_with_the_global_switch() -> None:
     host = _Host()
     io = CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO())
