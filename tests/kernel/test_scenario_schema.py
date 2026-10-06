@@ -413,7 +413,7 @@ def test_each_v2_form_is_accepted(path: tuple[Any, ...], value: object):
 
 
 _INVALID: list[tuple[str, tuple[Any, ...], object, str, str, str]] = [
-    ('version', ('version',), 4, '整数 1、2 或 3', 'version=4', 'version: 3'),
+    ('version', ('version',), 5, '整数 1、2、3 或 4', 'version=5', 'version: 4'),
     ('source-trace-id', ('source', 'trace_id'), 'XYZ', '32 个小写十六进制', 'XYZ', 'trace list'),
     ('source-config', ('source', 'config_sha256'), 'abc', 'sha256', 'abc', '不要截断'),
     ('source-argv', ('source', 'argv'), [1], '是字符串', '1', '带引号'),
@@ -758,7 +758,7 @@ _INVALID: list[tuple[str, tuple[Any, ...], object, str, str, str]] = [
         '问题过期',
     ),
     ('expect-missing', ('expect',), _DELETE, '必填键', "['expect']", '补齐'),
-    ('version-bool', ('version',), True, '整数 1、2 或 3', 'True', 'version: 2'),
+    ('version-bool', ('version',), True, '整数 1、2、3 或 4', 'True', 'version: 2'),
     (
         'payload-suffix',
         ('agents', 'Lead', 'frozen', 'system_prompt'),
@@ -1788,3 +1788,54 @@ def test_version_3_adds_exactly_these_keys_so_extending_it_needs_a_new_version()
         'module_version',
         'name',
     ]
+
+
+def _v4() -> dict[str, Any]:
+    document = _v2()
+    document['version'] = 4
+    document['host'] = {**document['host'], 'max_turns': None}
+    document['host']['root_budget'] = {'turns': 30, 'tokens': None, 'on_exhausted': 'hard_stop'}
+    return document
+
+
+def test_a_v4_document_carries_the_root_budget() -> None:
+    parsed = parse_scenario_document(_v4(), source='captured.json')
+    assert parsed.version == 4
+    assert parsed.host is not None
+    assert (
+        parsed.host.root_budget,
+        parsed.host.root_turns,
+        parsed.host.root_tokens,
+        parsed.host.on_exhausted,
+    ) == (True, 30, None, 'hard_stop')
+
+
+def test_a_v3_document_with_a_root_budget_is_told_to_say_version_4() -> None:
+    document = _v4()
+    document['version'] = 3
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(document, source='captured.json')
+    assert 'root_budget' in caught.value.received and '4' in caught.value.next_action
+
+
+@pytest.mark.parametrize(
+    ('budget', 'anchor'),
+    [
+        ({'turns': 30, 'on_exhausted': 'ask_human'}, 'graceful_wrapup / hard_stop'),
+        ({'turns': 0}, 'turns'),
+        ({'turns': 3, 'cost': '1'}, "'cost'"),
+    ],
+)
+def test_a_root_budget_replay_cannot_rebuild_is_refused(
+    budget: dict[str, Any], anchor: str
+) -> None:
+    document = _v4()
+    document['host']['root_budget'] = budget
+    with pytest.raises(ConfigError) as caught:
+        parse_scenario_document(document, source='captured.json')
+    assert anchor in str(caught.value)
+
+
+def test_a_document_without_a_root_budget_has_none() -> None:
+    parsed = parse_scenario_document(_v2(), source='captured.json')
+    assert parsed.host is not None and parsed.host.root_budget is False

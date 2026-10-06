@@ -746,3 +746,53 @@ def test_an_agent_without_acceptance_shows_no_verdict():
     timeline = _section(render_show(_header(), [_agent(_LEAD, 'Lead', 0, 5)], []), '时间线：')
 
     assert '验收' not in timeline[0]
+
+
+def test_the_timeline_shows_what_the_last_cycle_spent_against_its_limits():
+    lead = _agent(_LEAD, 'Lead', 0, 9, reason='budget')
+    lead.attributes.update(
+        {
+            'budget.input_tokens': 900,
+            'budget.output_tokens': 100,
+            'budget.cached_input_tokens': 0,
+            'budget.turns': 10,
+            'budget.cost': '0.02',
+            'budget.estimated': True,
+            'budget.limit_tokens': None,
+            'budget.limit_cost': '0.05',
+            'budget.limit_turns': 10,
+            'budget.limit_wall_clock_s': None,
+        }
+    )
+
+    timeline = _section(render_show(_header(), [lead], []), '时间线：')
+
+    assert timeline == [
+        f'  +0 ms → +9.0 s  Lead {_LEAD[:8]}  1 个工作周期  budget'
+        '  预算 轮次 10 / 10，token 1000，成本 0.02 / 0.05（含估算）'
+    ]
+
+
+def test_budget_events_are_listed_with_their_dimensions_and_disposition():
+    lead = _agent(_LEAD, 'Lead', 0, 9, reason='budget')
+    events = (
+        SpanEvent('budget.threshold', _ORIGIN + _S, {'budget.percent_left': 25}),
+        SpanEvent(
+            'budget.exhausted',
+            _ORIGIN + 2 * _S,
+            {'budget.dimensions': ['turns'], 'budget.disposition': 'graceful_wrapup'},
+        ),
+    )
+    lead = dataclasses.replace(lead, events=events)
+
+    section = _section(render_show(_header(), [lead], []), '预算：')
+
+    assert section == [
+        f'  Lead {_LEAD[:8]}  budget.threshold  25%',
+        f'  Lead {_LEAD[:8]}  budget.exhausted  turns graceful_wrapup',
+    ]
+
+
+def test_a_trace_without_budget_events_says_so():
+    section = _section(render_show(_header(), [_agent(_LEAD, 'Lead', 0, 1)], []), '预算：')
+    assert section == ['  （没有预算事件）']

@@ -241,7 +241,8 @@ automatically. Do not keep a key file inside a workspace that agents operate on:
 Free tiers limit requests, and every agent turn is one request. OpenRouter allows 50 free-model
 requests per day. Gemini limits requests per minute and per day for each model; your limits are
 listed in Google AI Studio, and daily quotas reset at midnight Pacific time. Delegated agents run
-their own turns, so keep `--max-turns` small; it caps every agent in the run. The step-by-step local
+their own turns, so keep `--max-turns` small; it is the budget of the whole agent tree, and each
+delegated agent gets a share of what its parent has left. The step-by-step local
 validation, including quota-aware commands and how to read 401 / 429 / 400 failures, is in
 [`docs/guides/2026-09-23-local-multi-agent-validation.md`](docs/guides/2026-09-23-local-multi-agent-validation.md).
 
@@ -446,17 +447,24 @@ than the development table are rejected. Replay rebuilds the same table for each
 
 Important current limits:
 
-- Milestone 1 executes `--max-turns`. `--max-turns N` caps every agent in the run — the root,
-  delegated and forked agents, and every topology slot — at N turns each, never loosening a
-  smaller role budget. Parent-to-child budget splitting arrives with the budget tree in
-  Milestone 8.
-- `--max-cost`, `--max-tokens`, and `--max-wall-clock` are parsed but fail explicitly until the
-  budget engine lands in Milestone 8.
+- `--max-turns`, `--max-tokens`, `--max-cost` and `--max-wall-clock` budget the whole agent tree
+  (default 200 turns). A delegated or forked agent's budget is carved from what its parent has
+  left — half of it unless `Delegate` / `Fork` ask for `turns` / `tokens` explicitly — and a finished
+  child gives its unused share back. A role's own `budget.turns` still caps that agent. Agents see
+  their budget in their history and through the `GetBudget` tool. When a budget runs out the agent
+  gets one wrap-up turn to deliver what it has (`--on-exhausted graceful_wrapup`, the default);
+  `hard_stop` uses every turn and stops, `ask_human` asks you for more turns first.
+- `--max-cost` needs prices: the backend knows only free models (`*:free`, `openrouter/free`);
+  give other models three per-million-token prices under `prices:` in `.syndica.yaml`. A run with
+  a cost cap and a model without a price is refused before it starts. Cache writes are not reported
+  by OpenAI-compatible endpoints, so cost can be slightly under-counted.
+- Runs with `--max-cost`, `--max-wall-clock` or `--on-exhausted ask_human` record a trace but no
+  replay document: those decisions depend on the host's prices, real time, or a person.
 - Failures of delegated agents are printed to stderr as `Runtime 错误` entries even when the
   root agent still answers. A run whose agent leaves no text answer (for example it ran out of
   turns while still calling tools) fails with exit code 1 instead of printing nothing.
-- In `chat`, an agent's turn count accumulates across messages; once it is used up, start a new
-  `chat`.
+- In `chat`, the budget accumulates across messages; once an agent has nothing left, messages to it
+  are refused and you need a new `chat`.
 - `chat` sessions are process-local.
 - Cross-process `--session` recovery and `syndica sessions ...` require the SessionStore planned
   for Milestone 6.
@@ -600,7 +608,7 @@ replayed nor exported.
 
 Set the level per run with `--trace` or for the project with `trace: {level: ...}` in
 `.syndica.yaml`; `chat` records at most `structure`. A `--topology` run records the topology as
-actually assembled (after `--max-turns` and `--no-write` rewrote it); replay assembles it through
+actually assembled (after `--no-write` rewrote it) and the run's root budget; replay assembles it through
 the same slot logic and enters through the root slot, so slot tools, budgets and stable ids match
 the original run. A run with a third-party module is replayable only if that module declares
 `replay_safe` or runs no code of its own (flags only). Replay rebuilds such a module only when the
@@ -656,7 +664,7 @@ unless the workspace backend sandboxes it.
 
 ```text
 syndica run <prompt>
-syndica chat [--max-turns <n>] [--trace <level>] [--trust-module-output <name>] [--goal <text>]
+syndica chat [--max-turns <n>] [--on-exhausted <mode>] [--trace <level>] [--trust-module-output <name>] [--goal <text>]
 syndica agents list | show <name>
 syndica topology list | show <name>
 syndica flags list | show <key>
@@ -678,10 +686,11 @@ syndica version
 --agent <name>
 --topology <name>
 --session <id>
---max-turns <n>           caps every agent in the run
---max-cost <amount>
---max-tokens <n>
+--max-turns <n>           turns for the whole agent tree (default 200)
+--max-cost <amount>       cost cap for the whole tree; prices come from `prices:` and the backend
+--max-tokens <n>          input + output tokens for the whole tree
 --max-wall-clock <seconds>
+--on-exhausted <mode>     graceful_wrapup (default) | hard_stop | ask_human
 --flag <key=value>        repeatable
 --goal <text>             what this run must deliver; needs the acceptance module
 --trust-module-output <name>  repeatable; this run treats that third-party module's output as trusted

@@ -36,6 +36,7 @@ from typing import Any, cast
 
 from syndica.kernel.context import ContextBlock, ToolCall
 from syndica.kernel.errors import ConfigError, ContractViolation, PayloadRefused
+from syndica.kernel.history_blocks import HistoryKind, kind_of
 from syndica.kernel.ids import IdSource
 from syndica.kernel.message import Message
 from syndica.kernel.protocols.trace import TraceStore
@@ -280,6 +281,10 @@ class RequestFingerprints:
             self._digest(params.get('tools', [])),
         ]
         for block in history:
+            # 预算块不进指纹：它写的是此刻还剩多少，而父的剩余取决于并发的子 Agent 此刻占着多少
+            # （预留随周期结算、随唤醒重切），回放不复现跨 Agent 的先后。它只说事实、不改变别的块。
+            if isinstance(block, ContextBlock) and kind_of(block) is HistoryKind.BUDGET:
+                continue
             key = _block_key(block)
             digest = None if key is None else self._blocks.get(key)
             if digest is None:

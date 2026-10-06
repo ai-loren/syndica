@@ -22,6 +22,7 @@ from collections.abc import Callable, Coroutine, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from functools import partial
 from pathlib import Path
 from textwrap import indent
@@ -136,15 +137,18 @@ from syndica.kernel import (
     LLM,
     AgentCatalog,
     AgentFactory,
-    AgentOptions,
     AgentSlot,
     AskUser,
     AskUserQuestion,
+    Budget,
+    BudgetPolicy,
+    BudgetView,
     ConfigError,
     Context,
     ContractViolation,
     DangerPolicy,
     ExecResult,
+    Exhaustion,
     ExitMode,
     FileSessionStore,
     FileTaint,
@@ -160,6 +164,7 @@ from syndica.kernel import (
     ModuleHost,
     Portal,
     PrefixDriftModule,
+    PriceTable,
     RetryModule,
     Runtime,
     RuntimeModule,
@@ -167,6 +172,7 @@ from syndica.kernel import (
     SessionMeta,
     SessionStore,
     SpanStatus,
+    StaticPrices,
     StopReason,
     Subscription,
     SyndicaError,
@@ -206,6 +212,9 @@ _RUNTIME_LOGGER = 'syndica.kernel.runtime'
 _OUTPUT_LIMIT = 10_000
 # Runtime 的装配：构造 Runtime 与写回放文档的宿主档案用同一份，回放按它重建。
 _ORCHESTRATION = True
+# 不给 --max-turns 时整棵派活树的轮数（计划 P1 H2）：每个子 Agent 至少切一轮，于是树的规模有界，且
+# 增长都能归因到切分。
+_DEFAULT_ROOT_TURNS = 200
 _CONFIRMATION_TIMEOUT = 300.0
 # Agent 的 Bash 用的 shell。HostFacts 把它告诉模型，两处必须是同一个值。
 _SHELL = '/bin/sh'
@@ -431,11 +440,6 @@ def _model_names(config: CliConfig) -> tuple[str, ...]:
     return tuple(dict.fromkeys(config.catalog.get(name).model for name in config.catalog.names()))
 
 
-def _role_turns(catalog: AgentCatalog, name: str) -> int | None:
-    manifest = catalog.get(name)
-    return AgentOptions.max_turns if manifest.budget is None else manifest.budget['turns']
-
-
 def _rebuilt(catalog: AgentCatalog, edit: Callable[[str, dict[str, object]], None]) -> AgentCatalog:
     """同一份目录的一份拷贝，每个角色的清单先交给 edit 改一遍。"""
     rebuilt = AgentCatalog()
@@ -450,23 +454,6 @@ def _rebuilt(catalog: AgentCatalog, edit: Callable[[str, dict[str, object]], Non
         # system_prompt 已是解析后的正文；留着 origin 会让它被当成相对路径再解析一次。
         rebuilt.load_mapping(data, source=replace(manifest.source, origin=None))
     return rebuilt
-
-
-def _turn_capped(catalog: AgentCatalog, max_turns: int | None) -> AgentCatalog:
-    """同一份目录，但每个角色的轮数预算都不超过 max_turns。
-
-    委派与分叉出来的子 Agent 都由目录里的工厂造出（拓扑的 assemble 也用它覆盖同名工厂），
-    所以上限必须落在角色上：只收紧根 Agent 时，一次委派会按角色预算（缺省 50 轮）跑满。
-    """
-    if max_turns is None:
-        return catalog
-    limit = max_turns
-
-    def cap(name: str, data: dict[str, object]) -> None:
-        role_limit = _role_turns(catalog, name)
-        data['budget'] = {'turns': limit if role_limit is None else min(role_limit, limit)}
-
-    return _rebuilt(catalog, cap)
 
 
 def _read_only(catalog: AgentCatalog) -> AgentCatalog:
@@ -586,7 +573,7 @@ _CUT_SHORT: dict[StopReason | None, str] = {
     ),
     StopReason.BUDGET: (
         '注意: Agent 的预算用完了，本次输出是它收尾时交出的那一段，未完成的部分写在里面；'
-        '需要做完就提高预算重试'
+        '需要做完就提高 --max-turns / --max-tokens / --max-cost / --max-wall-clock 重试'
     ),
     StopReason.ABORTED: '注意: Agent 被中止了，本次输出是它最后留下的一段文字，可能不完整',
 }
@@ -818,22 +805,44 @@ async def _sessions_rm(
     return f'已删除会话 {sid}'
 
 
+def _root_budget_record(policy: BudgetPolicy) -> dict[str, object]:
+    """回放文档 v4 的 `host.root_budget`：回放按它重建同一个根预算。成本与墙钟的 run 不写回放文档
+    （见 `_unreplayable_budget`），这里只记得下轮次与 token。"""
+    root = policy.root
+    return {
+        'turns': root.turns,
+        'tokens': root.tokens,
+        'on_exhausted': policy.on_exhausted.value,
+    }
+
+
+def _unreplayable_budget(request: RunRequest) -> str | None:
+    if request.max_cost is not None:
+        return '设了 --max-cost：成本的判定取决于宿主的价格表，回放文档不记它'
+    if request.max_wall_clock is not None:
+        return '设了 --max-wall-clock：墙钟预算的判定取决于真实时间，回放复现不了'
+    if request.on_exhausted == Exhaustion.ASK_HUMAN.value:
+        return '用了 --on-exhausted ask_human：人追加了多少不在回放文档里'
+    return None
+
+
+def _budget_line(view: BudgetView, reason: StopReason | None) -> str:
+    """run 结束时 stderr 上的那一行（spec §11.4：长跑的预算、进度、停止原因都可观测）。"""
+    used, limit = view.used, view.limit
+    turns = f'{used.turns} / {limit.turns}' if limit.turns is not None else f'{used.turns}'
+    tokens = f'输入 {used.input_tokens}（缓存命中 {used.cached_input_tokens}）'
+    tokens += f'、输出 {used.output_tokens}'
+    if limit.tokens is not None:
+        tokens += f'，上限 {limit.tokens}'
+    cost = '未知' if used.cost is None else str(used.cost)
+    if limit.cost is not None:
+        cost += f' / {limit.cost}'
+    estimated = '（含按字符估算的 token）' if used.estimated else ''
+    ended = '—' if reason is None else reason.value
+    return f'预算：轮次 {turns}；token {tokens}{estimated}；成本 {cost}；停止原因 {ended}'
+
+
 def _validated_request(request: RunRequest) -> dict[str, str]:
-    unsupported = [
-        name
-        for name, value in (
-            ('max_cost', request.max_cost),
-            ('max_tokens', request.max_tokens),
-            ('max_wall_clock', request.max_wall_clock),
-        )
-        if value is not None
-    ]
-    if unsupported:
-        raise _config_error(
-            '里程碑 1 只执行 max_turns 预算',
-            f'收到尚未实现的预算 {unsupported!r}',
-            '删除这些参数；cost / token / wall-clock 预算执行器属于里程碑 8',
-        )
     if request.agent is not None and request.topology is not None:
         raise _config_error(
             'run 只选择 --agent 或 --topology 之一',
@@ -865,39 +874,10 @@ def _assembled_topology(
             '所有 topology.slots 的 is_root 都是 false',
             '给要接收 CLI prompt 的 singleton 槽设置 is_root: true',
         )
-    topology = _with_turn_limit(topology, request.max_turns, config.catalog)
     if request.no_write:
         topology = _read_only_topology(topology)
     root = next(slot for slot in topology.slots if slot.name == roots[0].name)
     return topology, root
-
-
-def _with_turn_limit(
-    topology: Topology,
-    max_turns: int | None,
-    catalog: AgentCatalog,
-) -> Topology:
-    """每个槽都收紧到 max_turns。
-
-    `catalog` 必须是收紧之前的目录：角色预算收紧之后，槽上原本合法的更大预算会被 assemble 当成
-    放宽而拒绝；原本就在放宽的槽保持原样，让 assemble 照常报它。
-    """
-    if max_turns is None:
-        return topology
-    slots: list[AgentSlot] = []
-    for slot in topology.slots:
-        role_limit = _role_turns(catalog, slot.agent)
-        slot_limit = None if slot.budget is None else slot.budget['turns']
-        if slot.budget is not None and (
-            (slot_limit is None and role_limit is not None)
-            or (slot_limit is not None and role_limit is not None and slot_limit > role_limit)
-        ):
-            slots.append(slot)
-            continue
-        current = role_limit if slot.budget is None else slot_limit
-        tightened = max_turns if current is None else min(current, max_turns)
-        slots.append(replace(slot, budget=MappingProxyType({'turns': tightened})))
-    return Topology(slots=tuple(slots))
 
 
 def _read_only_topology(topology: Topology) -> Topology:
@@ -1481,8 +1461,15 @@ class RuntimeCliHost:
         exporter: TraceExporter | None = None,
         entry_points: EntryPointSource = no_entry_points,
         trust: TrustGate,
+        prices: PriceTable | None = None,
     ) -> None:
         self._io = io
+        # backend 给的默认价格（组合根交进来：surface 不 import backend）；`.syndica.yaml` 的
+        # prices: 排在它前面。
+        self._default_prices = prices
+        # 读 stdin 的只有一处在读：事件泵答问题与 ask_human 追加预算可能同时要一行。
+        self._stdin_lock = asyncio.Lock()
+        self._budget_explicit = False
         self._entry_points = entry_points
         self._trust = trust
         self._replayer = replayer
@@ -2090,6 +2077,7 @@ class RuntimeCliHost:
         trusted_output: Sequence[str] = (),
         resume: str | None = None,
         goal: str | None = None,
+        on_exhausted: str | None = None,
     ) -> str:
         with self._logging_to_stderr():
             return self._runner.run(
@@ -2101,6 +2089,7 @@ class RuntimeCliHost:
                     trusted_output=trusted_output,
                     resume=resume,
                     goal=goal,
+                    on_exhausted=on_exhausted,
                 )
             )
 
@@ -2519,6 +2508,9 @@ class RuntimeCliHost:
         notice = _CUT_SHORT.get(context.stop_reason)
         if notice is not None:
             self._warn(notice)
+        view = runtime._budget_of(agent_id)  # pyright: ignore[reportPrivateUsage]
+        if view is not None and (self._budget_explicit or context.stop_reason is StopReason.BUDGET):
+            self._warn(_budget_line(view, context.stop_reason))
         if context.verdict is not None:
             self._warn(_verdict_line(context.verdict))
         if 'acceptance' in runtime.modules:
@@ -2545,6 +2537,67 @@ class RuntimeCliHost:
                 f'（人确认后生效：syndica sessions activate {agent_id} {_rubric_line(rubric.id)}）'
             )
 
+    def _budget_policy(
+        self,
+        config: CliConfig,
+        *,
+        turns: int | None,
+        tokens: int | None = None,
+        cost: Decimal | None = None,
+        wall_clock_s: float | None = None,
+        on_exhausted: str | None = None,
+    ) -> BudgetPolicy:
+        """这次 run / chat 的根预算（spec §8.4）：`--max-*` 管整棵派活树，子 Agent 从父的剩余里切。
+        价格先查 `.syndica.yaml` 的 prices:，再查 backend 的默认值；设了成本上限时在 stderr 说清价格
+        从哪来——项目配置里的 0 价就能让 `--max-cost` 形同虚设，人得看得见。"""
+        # 只有人自己设了预算时才在 run 结束时打预算那一行（或者真停在了预算上）：缺省的 200 轮只是树
+        # 的规模上限，每次 run 都说一句是噪音。
+        self._budget_explicit = any(
+            value is not None for value in (turns, tokens, cost, wall_clock_s)
+        )
+        prices: PriceTable | None = self._default_prices
+        if config.prices:
+            prices = StaticPrices(dict(config.prices), fallback=self._default_prices)
+        if cost is not None:
+            listed = ', '.join(sorted(config.prices)) or '无'
+            self._warn(
+                f'成本上限 {cost}：价格先查 {config.source} 的 prices:（{listed}），'
+                '再查 backend 的默认价格（只认得免费模型）。'
+            )
+        disposition = Exhaustion(on_exhausted or Exhaustion.GRACEFUL_WRAPUP.value)
+        return BudgetPolicy(
+            root=Budget(
+                turns=_DEFAULT_ROOT_TURNS if turns is None else turns,
+                tokens=tokens,
+                cost=cost,
+                wall_clock_s=wall_clock_s,
+            ),
+            on_exhausted=disposition,
+            prices=prices,
+            ask_human=self._ask_budget if disposition is Exhaustion.ASK_HUMAN else None,
+        )
+
+    async def _ask_budget(self, agent_id: str, view: BudgetView) -> Budget | None:
+        """`--on-exhausted ask_human`：问人要不要给这个 Agent 追加轮数。回车或读不到 = 不追加
+        （收尾）。"""
+        spent = ' / '.join(view.exhausted) or '轮次'
+        self._prompt(
+            f'Agent {agent_id} 的预算快用完了（{spent}）。再给它几轮？'
+            '输入一个正整数，直接回车就让它收尾交付\n> '
+        )
+        async with self._stdin_lock:
+            answer = (await self._lines.next_line()).strip()
+        if not answer:
+            return None
+        try:
+            extra = int(answer)
+        except ValueError:
+            self._warn(f'没认出 {answer!r} 是正整数：按不追加处理，Agent 收尾交付。')
+            return None
+        if extra <= 0:
+            return None
+        return Budget(turns=extra)
+
     async def _event_pump(self, runtime: Runtime, subscription: Subscription) -> None:
         async for event in subscription:
             if event.kind == 'user_input_requested':
@@ -2566,7 +2619,8 @@ class RuntimeCliHost:
                 eof_action = 'reject'
             else:
                 continue
-            answer = await self._lines.next_line()
+            async with self._stdin_lock:
+                answer = await self._lines.next_line()
             if answer == '' and eof_action == 'abort':
                 await runtime.abort(event.agent_id)
                 continue
@@ -2696,6 +2750,7 @@ class RuntimeCliHost:
         trusted_output: Sequence[str],
         resume: str | None = None,
         goal: str | None = None,
+        on_exhausted: str | None = None,
     ) -> str:
         config = self._trusted_config(path)
         if resume is not None:
@@ -2708,7 +2763,8 @@ class RuntimeCliHost:
                     f'收到 session={resume!r}；没有这个会话',
                     '用 sessions list 看现有会话 id；id 是根 Agent 的 id',
                 )
-        catalog = _turn_capped(config.catalog, max_turns)
+        catalog = config.catalog
+        budget = self._budget_policy(config, turns=max_turns, on_exhausted=on_exhausted)
         recording, redactor = await self._start_recording(config, trace, argv, path, chat=True)
         try:
             workspace, environment = self._open_workspace(config)
@@ -2761,6 +2817,7 @@ class RuntimeCliHost:
                 ),
                 redactor=redactor if want_sessions else None,
                 artifacts=self._artifact_index(modules),
+                budget=budget,
             )
             subscription = runtime.events.subscribe()
             pump = asyncio.create_task(
@@ -2963,7 +3020,7 @@ class RuntimeCliHost:
         reason: str | None = None
         roles: dict[str, dict[str, object]] = {}
         role_policies: dict[str, DangerPolicy] = {}
-        reason = self._unreplayable_modules(modules, config)
+        reason = self._unreplayable_modules(modules, config) or _unreplayable_budget(request)
         if reason is None:
             try:
                 roles, role_policies = frozen_roles(catalog, factories, policy)
@@ -3059,7 +3116,7 @@ class RuntimeCliHost:
         stops: list[StopReason | None] | None,
         reports: list[str] | None,
     ) -> str:
-        catalog = _turn_capped(config.catalog, request.max_turns)
+        catalog = config.catalog
         prompt = _READ_ONLY_NOTICE + request.prompt if request.no_write else request.prompt
         workspace, environment = self._open_workspace(config)
         tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
@@ -3079,6 +3136,15 @@ class RuntimeCliHost:
                 )
                 untrusted = self._untrusted_output(config, request.trust_module_output)
                 assembled = _assembled_topology(config, request)
+                # 预算在建任何模型之前定下：写错的预算要在花钱之前就失败。
+                budget = self._budget_policy(
+                    config,
+                    turns=request.max_turns,
+                    tokens=request.max_tokens,
+                    cost=request.max_cost,
+                    wall_clock_s=request.max_wall_clock,
+                    on_exhausted=request.on_exhausted,
+                )
                 model_names = _model_names(config)
                 models: Mapping[str, LLM] = {
                     name: self._model_factory(name) for name in model_names
@@ -3131,6 +3197,7 @@ class RuntimeCliHost:
                         else None
                     ),
                     artifacts=self._artifact_index(modules),
+                    budget=budget,
                 )
                 if tracer is not None and tracer.level is not TraceLevel.STRUCTURE:
                     records = self._module_records(modules, config)
@@ -3142,7 +3209,8 @@ class RuntimeCliHost:
                             policy=policy,
                             output_limit=_OUTPUT_LIMIT,
                             facts=facts,
-                            max_turns=request.max_turns,
+                            max_turns=None,
+                            root_budget=_root_budget_record(budget),
                             no_write=request.no_write,
                             modules=modules,
                             orchestration=_ORCHESTRATION,

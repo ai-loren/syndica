@@ -73,7 +73,7 @@ __all__ = [
     'parse_scenario_document',
 ]
 
-SCENARIO_VERSIONS = (1, 2, 3)
+SCENARIO_VERSIONS = (1, 2, 3, 4)
 # 冻结角色的 `impl` 只认内核内置的类式角色：回放文档可能来自别人的仓库，任意 import 路径等于执行它。
 FROZEN_IMPLS = frozenset({'syndica.kernel.agents.orchestrator:Orchestrator'})
 # 触达外部世界、回放时按记录给出结局的工具；其余（派活、消息、人机）是内核，回放时真跑。捕获只记
@@ -181,6 +181,10 @@ _HOST = frozenset(
 )
 # v3 加上第三方 Module 的记录与结果被收紧的那份名单（M4 D13）。
 _V3_HOST = _HOST | frozenset({'module_records', 'untrusted_output_modules'})
+# v4 加上整棵派活树共用的根预算（M8）。v4 文档里 `max_turns` 不再写：轮数归根预算，子 Agent 从父切。
+_V4_HOST = _V3_HOST | frozenset({'root_budget'})
+_ROOT_BUDGET = frozenset({'turns', 'tokens', 'on_exhausted'})
+_REPLAYED_EXHAUSTION = ('graceful_wrapup', 'hard_stop')
 _MODULE_RECORD = frozenset({'name', 'module_version', 'distribution', 'distribution_version'})
 _DANGER = frozenset({'rules', 'table', 'policy'})
 # v3 加上逐个角色的处置（M4 D12）。v2 文档里出现它报「把 version 改成 3」而不是被当成未知键丢掉。
@@ -417,6 +421,11 @@ class HostProfile:
     no_write: bool = False
     modules: tuple[str, ...] | None = None
     orchestration: bool = _ORCHESTRATION
+    # v4：根预算（轮次、token）与耗尽时的处置；None 是不限（v1–v3 文档都是）。
+    root_turns: int | None = None
+    root_tokens: int | None = None
+    root_budget: bool = False
+    on_exhausted: str = 'graceful_wrapup'
     confirmation_timeout: float | None = _CONFIRMATION_TIMEOUT
     danger_roles: Mapping[str, DangerPolicySpec] = dataclasses.field(default_factory=_no_entries)
     module_records: tuple[ModuleRecord, ...] = ()
@@ -743,9 +752,10 @@ def _document(raw: object, source: str) -> ScenarioDocument:
     version = root.get('version')
     if type(version) is not int or version not in SCENARIO_VERSIONS:
         raise _error(
-            'scenario.version 是整数 1、2 或 3',
+            'scenario.version 是整数 1、2、3 或 4',
             f'收到 version={version!r}，类型是 {type(version).__name__}',
-            '写成 `version: 1`（手写脚本），或 `version: 2` / `version: 3`（回放文档）；'
+            '写成 `version: 1`（手写脚本），或 `version: 2` / `version: 3` / `version: 4`'
+            '（回放文档）；'
             '不要写 true、字符串或其他版本',
         )
     if version == 1:
@@ -1787,11 +1797,13 @@ def _ids(value: object) -> tuple[tuple[tuple[str | int, ...], str], ...]:
 
 
 def _host(value: object, version: int) -> HostProfile:
-    data = (
-        _mapping(value, 'host', allowed=_V3_HOST)
-        if version >= 3
-        else _mapping(value, 'host', allowed=_HOST, later=_V3_HOST, later_version=3)
-    )
+    if version >= 4:
+        data = _mapping(value, 'host', allowed=_V4_HOST)
+    elif version == 3:
+        data = _mapping(value, 'host', allowed=_V3_HOST, later=_V4_HOST, later_version=4)
+    else:
+        data = _mapping(value, 'host', allowed=_HOST, later=_V3_HOST, later_version=3)
+    root_budget = _root_budget(data['root_budget']) if 'root_budget' in data else None
     flags: dict[str, bool | int | str] = {}
     for key, item in _mapping(data.get('flags', {}), 'host.flags').items():
         if isinstance(item, float) or not isinstance(item, bool | int | str):
@@ -1858,7 +1870,22 @@ def _host(value: object, version: int) -> HostProfile:
         danger_roles=MappingProxyType(roles),
         module_records=records,
         untrusted_output_modules=untrusted,
+        **({} if root_budget is None else root_budget),
     )
+
+
+def _root_budget(value: object) -> dict[str, Any]:
+    data = _mapping(value, 'host.root_budget', allowed=_ROOT_BUDGET)
+    return {
+        'root_budget': True,
+        'root_turns': _optional_positive(data.get('turns'), 'host.root_budget.turns'),
+        'root_tokens': _optional_positive(data.get('tokens'), 'host.root_budget.tokens'),
+        'on_exhausted': _choice(
+            data.get('on_exhausted', 'graceful_wrapup'),
+            'host.root_budget.on_exhausted',
+            _REPLAYED_EXHAUSTION,
+        ),
+    }
 
 
 def _module_records(value: object, modules: tuple[str, ...] | None) -> tuple[ModuleRecord, ...]:

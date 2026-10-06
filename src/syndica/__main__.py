@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from syndica.cli.host import RuntimeCliHost
     from syndica.cli.trace_commands import Replayed
     from syndica.kernel import LLM, ScenarioDocument, TraceRecorder, TraceStore
+    from syndica.kernel.budget import PriceTable
     from syndica.kernel.redaction import Redactor
 
 _OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1'
@@ -250,6 +251,13 @@ def _require_generic_endpoint(name: str, model: str) -> None:
     )
 
 
+def _default_prices() -> PriceTable:
+    """backend 认得的默认价格（只有免费模型）；`.syndica.yaml` 的 prices: 由宿主排在它前面。"""
+    from syndica.backends.llm_openai import FreeTierPrices
+
+    return FreeTierPrices()
+
+
 def _configured_model(name: str) -> LLM:
     """角色清单里的模型名 → LLM。
 
@@ -431,6 +439,7 @@ class _LazyHost:
                 exporter=_export_trace,
                 entry_points=installed_entry_points,
                 trust=real_trust_gate(),
+                prices=_default_prices(),
             )
         return self._host
 

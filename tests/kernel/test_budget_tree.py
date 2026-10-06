@@ -198,6 +198,22 @@ def test_a_wake_under_a_settled_parent_is_paid_by_the_nearest_running_ancestor()
     assert middle.view().remaining.turns == 0
 
 
+def test_siblings_woken_together_each_take_half_of_what_is_left_so_none_starves() -> None:
+    tree = _tree()
+    parent = tree.carve('p', None, Budget(turns=100))
+    kids = []
+    for name in ('a', 'b', 'c'):
+        kid = tree.carve(name, 'p', None)
+        kid.take_turn()
+        kid.end_cycle()
+        kids.append(kid)
+    for kid in kids:
+        kid.begin_cycle()
+    left = [kid.view().remaining.turns for kid in kids]
+    assert left == [49, 24, 12]
+    assert parent.view().remaining.turns == 100 - (50 + 25 + 13)
+
+
 def test_a_lazily_started_child_reserves_nothing_until_its_first_cycle() -> None:
     tree = _tree()
     parent = tree.carve('p', None, Budget(turns=10))

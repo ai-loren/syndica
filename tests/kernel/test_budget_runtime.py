@@ -194,7 +194,7 @@ async def test_the_cycle_start_block_and_a_threshold_block_are_appended_not_inse
     finally:
         await runtime.shutdown()
     texts = _budget_blocks(traj)
-    assert texts[0].startswith('本周期开始时的预算')
+    assert texts[0].startswith('你的预算')
     assert any(text.startswith('预算提醒：最紧的那一维只剩不到 50%') for text in texts)
     for earlier, later in zip(llm.calls, llm.calls[1:], strict=False):
         assert later[: len(earlier)] == earlier

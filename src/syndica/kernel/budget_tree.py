@@ -11,9 +11,9 @@
   全部 `--max-turns`）；显式请求的顶层 Agent 照常切。
 - **周期收尾结算**：一个周期结束时 limit 缩到实际占用，余量回父——做完的子 Agent 以 zombie 留着可以
   再叫醒，不能让它一直按住父的额度。
-- **唤醒重切**：下个周期开始时 limit 长回 cap，从父的可用里取；父也在收尾态时沿祖先链往上取，直到
-  一个正在跑的祖先或池。这次唤醒于是记在被唤醒者这一支血统的账上；一点都取不到就是耗尽，`send`
-  据此拒收。
+- **唤醒重切**：下个周期开始时 limit 朝 cap 长回去，至多拿父此刻能给的一半（与切分同一条规则），
+  从父的可用里取；父也在收尾态时沿祖先链往上取，直到一个正在跑的祖先或池。这次唤醒于是记在被唤醒者
+  这一支血统的账上；一点都取不到就是耗尽，`send` 据此拒收。
 - **准入**：每次模型调用之前按估算预占（`pending`），调用回来后换成实报的消耗；放不进就
   `BudgetExhausted`。预占与检查之间没有挂起点，并发的兄弟不会一起越过同一个父；越界只剩估算误差。
 - **wall clock** 不可加：子的截止时刻取父的与自己请求的里早的那个；池的时钟从第一次 spawn 开始走。
@@ -177,23 +177,25 @@ def _room(node: _Node, dim: str) -> Amount | None:
     return None
 
 
-def _capacity(parent: _Node, want: Amount, dim: str, *, commit: bool) -> Amount:
-    """`parent` 还能再给一个子节点多少（至多 `want`）。`parent` 在收尾态时先从它自己的父那里
-    长回来。"""
+def _capacity(parent: _Node, want: Amount | None, dim: str, *, commit: bool) -> Amount | None:
+    """`parent` 还能再给一个子节点多少（至多 `want`；None = 能给多少给多少，整条链都不限时交回
+    None）。`parent` 在收尾态时先从它自己的父那里长回来。"""
     if parent.limit[dim] is None:
         if parent.parent is None:
             return want
         return _capacity(parent.parent, want, dim, commit=commit)
     available = _available(parent, dim)
     cap = parent.cap[dim]
-    if available < want and not parent.running and parent.parent is not None and cap is not None:
+    short = want is None or available < want
+    if short and not parent.running and parent.parent is not None and cap is not None:
         headroom = cap - cast(Amount, parent.limit[dim])
         if headroom > 0:
-            extra = _capacity(parent.parent, min(want - available, headroom), dim, commit=commit)
+            ask = headroom if want is None else min(want - available, headroom)
+            extra = cast(Amount, _capacity(parent.parent, ask, dim, commit=commit))
             if commit:
                 parent.limit[dim] = cast(Amount, parent.limit[dim]) + extra
             available += extra
-    return min(available, want)
+    return available if want is None else min(available, want)
 
 
 def _half(value: Amount) -> Amount:
@@ -415,8 +417,13 @@ class BudgetAccount:
                 cap, limit = node.cap[dim], node.limit[dim]
                 if cap is None or limit is None or cap <= limit:
                     continue
-                grown = _capacity(node.parent, cap - limit, dim, commit=True)
-                node.limit[dim] = limit + grown
+                # 与切分同一条规则：一次至多拿走父此刻能给的一半。同时被叫醒的几个兄弟各自长回整个
+                # cap 时，先到的两个就把父分光了，后到的一个周期都开不了。
+                whole = _capacity(node.parent, None, dim, commit=False)
+                grow = cap - limit if whole is None else min(cap - limit, _half(whole))
+                if grow > 0:
+                    granted = cast(Amount, _capacity(node.parent, grow, dim, commit=True))
+                    node.limit[dim] = limit + granted
         node.running = True
 
     def end_cycle(self) -> None:
@@ -455,7 +462,7 @@ class BudgetAccount:
             cap, limit = node.cap[dim], node.limit[dim]
             if not node.running and cap is not None and limit is not None and cap > limit:
                 assert node.parent is not None
-                room += _capacity(node.parent, cap - limit, dim, commit=False)
+                room += cast(Amount, _capacity(node.parent, cap - limit, dim, commit=False))
             if room <= 0:
                 out.append(dim)
         if self._out(WALL):

@@ -1256,3 +1256,15 @@ async def test_answers_are_listed_in_the_order_of_their_request_keys():
     document = await _synthetic(answered, [('host', 'spawn', 0)])
 
     assert [response['answer'] for response in document['responses']] == ['first', 'second']
+
+
+async def test_a_run_with_a_root_budget_is_written_as_version_4():
+    _, _, document = await _captured(
+        [ScriptedTurn('done')],
+        host={'root_budget': {'turns': 5, 'tokens': None, 'on_exhausted': 'graceful_wrapup'}},
+    )
+
+    assert document is not None
+    parsed = parse_scenario_document(document, source='replay.json')
+    assert parsed.version == 4
+    assert parsed.host is not None and parsed.host.root_turns == 5

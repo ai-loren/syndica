@@ -593,8 +593,9 @@ class BaseAgent:
         self._last_system: ContextBlock | None = None
         # 问过人的追加代数：同一次耗尽只问一次，人不追加就按收尾处置，不是每一轮都问。
         self._asked: int | None = None
-        # 本周期的预算提醒是否已经注入过周期起点那一块。
-        self._budget_cycle = 0
+        # 第一个周期注入过「你的预算」那一块没有：只在头一次注入，此后靠阈值提醒与 GetBudget——chat
+        # 的每条消息都是一个周期，每次都注入只是噪音。
+        self._budget_announced = False
         # 伴生 Agent 替谁干活（伴生运行器设）：它的 agent span 挂在当前 span 下、带 `agent.serves`。
         self._serves: str | None = None
         # 本 Agent 派出过几个伴生：伴生 id 由（本 Agent、伴生名、第几个）派生，span id 因此稳定。
@@ -1310,8 +1311,8 @@ class BaseAgent:
         return None
 
     def _announce_budget(self, ctx: Context, budget: BudgetAccount) -> None:
-        """预算注入历史（spec §8.4：Agent 可感知，不进 SP）：剩余跨过 50% / 25% / 10% 时一块，周期起
-        点一块；只写事实，「该怎么办」归长程策略。幂等键带 agent id（分叉出来的子 Agent 继承父的块与
+        """预算注入历史（spec §8.4：Agent 可感知，不进 SP）：第一轮一块，剩余跨过 50% / 25% / 10% 时
+        各一块；只写事实，「该怎么办」归长程策略。幂等键带 agent id（分叉出来的子 Agent 继承父的块与
         键）与追加代数（追加之后再跨同一个阈值要再提醒）。"""
         if budget.companion or not budget.limited:
             return
@@ -1320,12 +1321,12 @@ class BaseAgent:
             heading = f'预算提醒：最紧的那一维只剩不到 {threshold}%'
             key = f'budget:{self.agent_id}:{budget.generation}:{threshold}'
             self._tracing.event('budget.threshold', {'budget.percent_left': threshold})
-        elif self._budget_cycle != self._cycle:
-            heading = '本周期开始时的预算'
-            key = f'budget:{self.agent_id}:c{self._cycle}'
+        elif not self._budget_announced:
+            heading = '你的预算'
+            key = f'budget:{self.agent_id}:start'
         else:
             return
-        self._budget_cycle = self._cycle
+        self._budget_announced = True
         ctx.append(
             signed_block(HistoryKind.BUDGET, _render_budget(budget.view(), heading), key=key)
         )

@@ -9,6 +9,7 @@ import sys
 import tomllib
 from collections.abc import Sequence
 from dataclasses import asdict, replace
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -204,6 +205,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'max_cost': None,
         'max_tokens': None,
         'max_wall_clock': None,
+        'on_exhausted': None,
         'flags': (),
         'goal': None,
         'trust_module_output': (),
@@ -221,9 +223,10 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'topology': None,
         'session': None,
         'max_turns': 7,
-        'max_cost': 1.5,
+        'max_cost': Decimal('1.5'),
         'max_tokens': 4096,
         'max_wall_clock': 30.0,
+        'on_exhausted': None,
         'flags': ('retry_enabled=true', 'attempts=3'),
         'goal': None,
         'trust_module_output': (),

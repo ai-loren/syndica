@@ -8,6 +8,7 @@ import sys
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, NoReturn, Protocol, TextIO, cast
 
 from syndica import __version__
@@ -60,9 +61,10 @@ class RunRequest:
     topology: str | None = None
     session: str | None = None
     max_turns: int | None = None
-    max_cost: float | None = None
+    max_cost: Decimal | None = None
     max_tokens: int | None = None
     max_wall_clock: float | None = None
+    on_exhausted: str | None = None
     flags: tuple[str, ...] = ()
     goal: str | None = None
     trust_module_output: tuple[str, ...] = ()
@@ -226,6 +228,22 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _positive_decimal(value: str) -> Decimal:
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError('must be a finite positive amount') from exc
+    if not parsed.is_finite() or parsed <= 0:
+        raise argparse.ArgumentTypeError('must be a finite positive amount')
+    return parsed
+
+
+_EXHAUSTION_HELP = (
+    '预算用完时怎么办：graceful_wrapup（缺省，最后一轮收尾交付已完成的部分）/ hard_stop（用到放不下'
+    '为止，不收尾）/ ask_human（先问你要不要追加轮数；没人答就收尾）'
+)
+
+
 def _parser() -> _ArgumentParser:
     parser = _ArgumentParser(prog='syndica')
     parser.add_argument('--config', default='.syndica.yaml')
@@ -236,10 +254,16 @@ def _parser() -> _ArgumentParser:
     target.add_argument('--agent')
     target.add_argument('--topology')
     target.add_argument('--session')
-    run.add_argument('--max-turns', type=_positive_int)
-    run.add_argument('--max-cost', type=_positive_float)
-    run.add_argument('--max-tokens', type=_positive_int)
-    run.add_argument('--max-wall-clock', type=_positive_float)
+    run.add_argument(
+        '--max-turns',
+        type=_positive_int,
+        help='整棵派活树一共能用的轮数（子 Agent 从父的剩余里切）；不给是 200',
+    )
+    run.add_argument(
+        '--max-cost', type=_positive_decimal, help='整棵树的成本上限（价格见 prices:）'
+    )
+    run.add_argument('--max-tokens', type=_positive_int, help='整棵树的 token 上限（输入 + 输出）')
+    run.add_argument('--max-wall-clock', type=_positive_float, help='整个 run 的墙钟上限（秒）')
     run.add_argument('--flag', action='append', default=[])
     run.add_argument(
         '--no-write',
@@ -266,8 +290,17 @@ def _parser() -> _ArgumentParser:
         ),
     )
     chat = commands.add_parser('chat')
-    chat.add_argument('--max-turns', type=_positive_int)
+    chat.add_argument(
+        '--max-turns',
+        type=_positive_int,
+        help='这次 chat 一共能用的轮数（跨消息累计，子 Agent 从中切）；不给是 200',
+    )
     for command in (run, chat):
+        command.add_argument(
+            '--on-exhausted',
+            choices=('graceful_wrapup', 'hard_stop', 'ask_human'),
+            help=_EXHAUSTION_HELP,
+        )
         command.add_argument(
             '--goal',
             help=(
@@ -499,11 +532,15 @@ def _chat(
     trusted_output: Sequence[str] = (),
     resume: str | None = None,
     goal: str | None = None,
+    on_exhausted: str | None = None,
 ) -> int:
-    # 只在给了 --trust-module-output / --goal 时才传这两个参数：没有它们的宿主实现照样能开 chat。
+    # 只在给了 --trust-module-output / --goal / --on-exhausted 时才传这几个参数：没有它们的宿主实现
+    # 照样能开 chat。
     extra: dict[str, Any] = {'trusted_output': tuple(trusted_output)} if trusted_output else {}
     if goal is not None:
         extra['goal'] = goal
+    if on_exhausted is not None:
+        extra['on_exhausted'] = on_exhausted
     try:
         target = host.open_chat(config, max_turns, trace=trace, argv=argv, resume=resume, **extra)
     except Exception as exc:
@@ -737,6 +774,7 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
             argv=received,
             trusted_output=namespace.trust_module_output,
             goal=namespace.goal,
+            on_exhausted=namespace.on_exhausted,
         )
     request = RunRequest(
         prompt=' '.join(namespace.prompt),
@@ -748,6 +786,7 @@ def _route(received: list[str], host: CliHost | None, streams: CliIO) -> int:
         max_cost=namespace.max_cost,
         max_tokens=namespace.max_tokens,
         max_wall_clock=namespace.max_wall_clock,
+        on_exhausted=namespace.on_exhausted,
         flags=flags,
         goal=namespace.goal,
         trust_module_output=tuple(namespace.trust_module_output),

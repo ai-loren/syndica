@@ -136,10 +136,10 @@ def _document_text(workspace: Path) -> str:
     return asyncio.run(read())
 
 
-def test_a_replay_safe_module_is_recorded_in_a_version_3_document(tmp_path: Path):
+def test_a_replay_safe_module_is_recorded_in_a_version_4_document(tmp_path: Path):
     text, _ = _capture(tmp_path, _EntryPoint(_module(), _Dist()))
     document = json.loads(text)
-    assert document['version'] == 3
+    assert document['version'] == 4
     assert document['host']['module_records'] == [
         {
             'name': 'alpha',
@@ -435,11 +435,11 @@ def test_each_kind_of_code_a_module_runs_blocks_the_document_unless_replay_safe(
     assert '没声明 replay_safe' in stderr
 
 
-def test_a_module_whose_output_the_user_trusted_is_still_a_version_3_record(tmp_path: Path):
+def test_a_module_whose_output_the_user_trusted_is_still_a_version_4_record(tmp_path: Path):
     text, _ = _capture(tmp_path, _EntryPoint(_module(), _Dist()), trust_module_output=('alpha',))
     document = json.loads(text)
 
-    assert document['version'] == 3
+    assert document['version'] == 4
     assert [record['name'] for record in document['host']['module_records']] == ['alpha']
     assert 'untrusted_output_modules' not in document['host']
     result = _replayed(text, lambda record, host: _module()(host))

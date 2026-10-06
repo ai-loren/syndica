@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
@@ -32,6 +33,7 @@ from syndica.kernel import (
     TraceLevel,
     register_builtins,
 )
+from syndica.kernel.budget import Prices
 from syndica.kernel.hooks.junctions import MODULE_NAME
 from syndica.kernel.manifest import prompt_file
 from syndica.kernel.redaction import looks_secret
@@ -58,6 +60,7 @@ _ROOT_KEYS = frozenset(
         'danger',
         'modules',
         'flags',
+        'prices',
     }
 )
 _DANGER_KEYS = frozenset({'roles'})
@@ -182,6 +185,8 @@ class CliConfig:
     danger_roles: Mapping[str, RoleTightening] = field(default_factory=lambda: MappingProxyType({}))
     modules: tuple[str, ...] = ()
     flags: Mapping[str, bool | int | str] = field(default_factory=lambda: MappingProxyType({}))
+    # `prices:`：模型名（或 `平台:模型`）→ 三档单价（每百万 token）。排在 backend 的默认价格之前。
+    prices: Mapping[str, Prices] = field(default_factory=lambda: MappingProxyType({}))
 
 
 def load_config(path: str | Path) -> CliConfig:
@@ -233,6 +238,7 @@ def config_from_text(
         danger_roles=_danger(root.get('danger', {}), catalog),
         modules=_module_names(root.get('modules', ())),
         flags=_flags(root.get('flags', {})),
+        prices=_prices(root.get('prices', {})),
     )
 
 
@@ -247,6 +253,77 @@ def _flags(value: object) -> Mapping[str, bool | int | str]:
                 '照 syndica flags show <key> 的缺省值写；Flag 的取值只有这三种类型',
             )
     return MappingProxyType(dict(cast(Mapping[str, bool | int | str], entries)))
+
+
+_PRICE_KEYS = frozenset({'input', 'output', 'cached_input'})
+
+
+def _prices(value: object) -> Mapping[str, Prices]:
+    """`prices:` 的每一项是三档单价（每百万 token）；`cached_input` 省略时按 `input` 算（少算缓存的
+    便宜，不会把成本算低）。"""
+    if not isinstance(value, Mapping):
+        raise _config(
+            'prices 是「模型名 → {input, output, cached_input}」的映射',
+            f'收到 {type(value).__name__}',
+            "写成 prices: {'google/gemma-3-27b-it': {input: 0.1, output: 0.2}}",
+        )
+    table: dict[str, Prices] = {}
+    for model, entry in cast(Mapping[object, object], value).items():
+        if not isinstance(model, str) or not model.strip():
+            raise _config(
+                'prices 的键是模型名（非空字符串），或 平台:模型',
+                f'键 {model!r}',
+                '用模型配置里那个 model 名作键',
+            )
+        if not isinstance(entry, Mapping):
+            raise _config(
+                f'prices.{model} 是 {{input, output, cached_input}} 的映射',
+                f'收到 {type(entry).__name__}',
+                f'写成 prices.{model}: {{input: 0.1, output: 0.2}}（每百万 token 的价格）',
+            )
+        fields = cast(Mapping[object, object], entry)
+        extra = sorted(str(key) for key in fields if key not in _PRICE_KEYS)
+        missing = sorted({'input', 'output'} - set(cast(Mapping[str, object], fields)))
+        if extra or missing:
+            raise _config(
+                f'prices.{model} 有 input、output，可选 cached_input',
+                f'多出 {extra!r}，缺 {missing!r}',
+                '只写这三个键；价格是每百万 token 的金额',
+            )
+        amounts = {
+            key: _price_amount(fields[key], f'prices.{model}.{key}')
+            for key in ('input', 'output', 'cached_input')
+            if key in fields
+        }
+        amounts.setdefault('cached_input', amounts['input'])
+        table[model] = Prices(**amounts)
+    return MappingProxyType(table)
+
+
+def _price_amount(value: object, where: str) -> Decimal:
+    # bool 先于数字判：YAML 的 yes / no 会被读成布尔值，而 bool 是 int 的子类。
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        hint = '：YAML 的 yes / no 会被读成布尔值' if isinstance(value, bool) else ''
+        raise _config(
+            f'{where} 是一个非负金额（数字）',
+            f'收到 {value!r}（{type(value).__name__}{hint}）',
+            f'给 {where} 写一个数字，例如 0.15',
+        )
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise _config(
+            f'{where} 是一个非负金额（数字）',
+            f'收到 {value!r}',
+            f'给 {where} 写一个数字，例如 0.15',
+        ) from exc
+    if not amount.is_finite() or amount < 0:
+        raise _config(
+            f'{where} 是有限的非负金额',
+            f'收到 {value!r}',
+            f'给 {where} 写一个 >= 0 的数字',
+        )
+    return amount
 
 
 def _module_names(value: object) -> tuple[str, ...]:

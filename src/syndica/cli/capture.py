@@ -39,6 +39,7 @@ def host_profile(
     facts: HostFacts,
     max_turns: int | None,
     no_write: bool,
+    root_budget: Mapping[str, object] | None = None,
     modules: Sequence[RuntimeModule],
     orchestration: bool,
     confirmation_timeout: float | None,
@@ -63,6 +64,10 @@ def host_profile(
         'orchestration': orchestration,
         'confirmation_timeout': confirmation_timeout,
     }
+    # 根预算（M8）：整棵派活树共用的那一份。只在有时写，写了就是 v4 文档；旧文档的 max_turns 是
+    # 逐角色上限，回放照旧按它读。
+    if root_budget is not None:
+        profile['root_budget'] = dict(root_budget)
     # 只在有第三方 Module 时写：内置的按名字重建，不必记，没有第三方的 run 照旧写 v2。
     if module_records:
         profile['module_records'] = [dict(record) for record in module_records]

@@ -281,7 +281,7 @@ def test_a_topology_root_that_runs_out_of_turns_is_a_failed_run(tmp_path: Path):
 
     assert run.code == 1
     assert (run.matter['status'], run.matter['host_verify']) == ('run_failed', 'skipped')
-    assert '根 Agent 以 max_turns 结束' in run.stdout
+    assert '根 Agent 以 budget 结束' in run.stdout
 
 
 def test_a_verified_run_prints_the_handoff_once_and_writes_the_same_file(tmp_path: Path):
@@ -1411,7 +1411,7 @@ def test_a_root_that_runs_out_of_turns_is_a_failed_run_even_with_text(tmp_path: 
     )
 
     assert (run.code, run.matter['status']) == (1, 'run_failed')
-    assert '以 max_turns 结束' in run.stdout
+    assert '以 budget 结束' in run.stdout
 
 
 def test_a_root_aborted_by_end_of_input_is_a_failed_run(tmp_path: Path):

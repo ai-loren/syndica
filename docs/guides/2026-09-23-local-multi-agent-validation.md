@@ -71,8 +71,9 @@ unset OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY SYNDICA_LLM_ORDER
   如果该模型不可用，改用 OpenRouter 当前模型列表中标记为免费且支持 `tools` 的模型。
 - OpenRouter 免费档每天只有 50 次免费模型请求；Gemini 免费档按型号限制每分钟与每天的请求数（在
   Google AI Studio 里查看），日额度在太平洋时间午夜重置（北京时间夏令时 15:00、冬令时 16:00）。
-  每个 Agent 的每一轮就是一次请求。下面的命令都用 `--max-turns` 给**每个** Agent（含委派出去的
-  子 Agent）设了上限，按顺序跑完一遍大约 20 次请求。
+  每个 Agent 的每一轮就是一次请求。`--max-turns` 是**整棵派活树**一共能用的轮数（委派出去的子 Agent
+  从父 Agent 的剩余里切一半），所以它直接就是这条命令最多发多少次请求；下面的命令按顺序跑完一遍大约
+  25 次请求。
 - 如果只设置 `OPENROUTER_API_KEY` 而不设置 `OPENROUTER_MODEL`，Syndica 会默认使用
   `openrouter/free` 路由器；路由器更方便，但具体失败原因有时不如显式模型好诊断。
 - 要换轮换顺序或只用其中一个平台，设 `SYNDICA_LLM_ORDER`，例如 `openrouter,gemini` 或 `gemini`。
@@ -183,12 +184,13 @@ uv run python -m syndica run \
 ```bash
 uv run python -m syndica run \
   "不要修改文件。请严格按顺序执行三步。第一步：调用 Delegate，agent 填 Explorer，query 原样填写「只调用一次 Glob（pattern 用 *）列出仓库顶层条目，然后立刻用两三句话总结仓库结构，不要调用任何其他工具。」第二步：调用 Delegate，agent 填 Planner，query 原样填写「不要调用任何工具。Syndica 的里程碑 1 已完成，下一个里程碑是自举：让框架修改自己的代码并跑测试。直接写出三条下一阶段计划，每条一句话。」第三步：用中文汇总 Explorer 和 Planner 的结论后结束，不要再调用工具。" \
-  --max-turns 4
+  --max-turns 10
 ```
 
-`--max-turns 4` 同时限制 Orchestrator 和它委派出去的每个子 Agent，每个最多 4 轮；这条命令通常用 6 次
-请求。分工写死是因为免费模型拿到「调研仓库结构」这类开放任务时，常把轮数全用在调工具上、一直不给
-结论（M1 的 Agent 看不到自己还剩几轮）。
+`--max-turns 10` 是 Orchestrator 和它委派出去的子 Agent 一共的轮数：每次委派从 Orchestrator 的剩余
+里切一半给子 Agent，子 Agent 做完把没用完的退回去；这条命令通常用 6 次请求。分工写死是因为免费模型
+拿到「调研仓库结构」这类开放任务时，常把轮数全用在调工具上、一直不给结论；Agent 现在读得到自己还剩
+几轮（历史里的预算块与 `GetBudget`），预算快用完时最后一轮会收尾交付已完成的部分。
 
 符合预期：
 
@@ -222,8 +224,8 @@ uv run python -m syndica run \
 uv run python -m syndica chat --max-turns 6
 ```
 
-chat 里同一个 Agent 的轮数跨消息累计，`--max-turns 6` 是它整个会话的上限；用完后这条消息会提示
-「没有留下文字回答」，重开 chat 即可。
+chat 里的轮数跨消息累计，`--max-turns 6` 是整个会话（含委派出去的子 Agent）的上限；用完之后再发的
+消息会被拒收并说明原因，重开 chat 即可。
 
 进入后输入：
 

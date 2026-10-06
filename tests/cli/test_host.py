@@ -28,6 +28,7 @@ from syndica.kernel import (
     SyndicaError,
     ToolCall,
 )
+from syndica.kernel.history_blocks import kind_of
 from syndica.kernel.runtime import _DRIVING_AGENT  # pyright: ignore[reportPrivateUsage]
 
 
@@ -197,9 +198,7 @@ topologies:
     ('changes', 'needle'),
     [
         ({'session': 'old-session'}, 'sessions resume'),
-        ({'max_cost': 1.0}, 'max_cost'),
-        ({'max_tokens': 100}, 'max_tokens'),
-        ({'max_wall_clock': 10.0}, 'max_wall_clock'),
+        ({'max_cost': 1.0}, 'Decimal'),
         ({'flags': ('missing=1',)}, 'missing'),
         ({'flags': ('max_wait_seconds=nope',)}, 'int'),
         ({'flags': ('untrusted_high_risk=permit',)}, 'permit'),
@@ -367,7 +366,7 @@ def test_chat_session_reuses_one_agent_and_lists_the_current_target(
     assert target in active
     assert 'Orchestrator' in active
     assert len(llm.calls) == 2
-    assert [block.content for block in llm.calls[1] if block.role == 'user'] == [
+    assert [b.content for b in llm.calls[1] if b.role == 'user' and kind_of(b) is None] == [
         'first',
         'second',
     ]
@@ -1038,7 +1037,7 @@ agents:
         host.close()
 
     assert continued == 'child continued'
-    assert [block.content for block in worker_llm.calls[1] if block.role == 'user'] == [
+    assert [b.content for b in worker_llm.calls[1] if b.role == 'user' and kind_of(b) is None] == [
         'first child task',
         'continue directly',
     ]
@@ -1351,12 +1350,12 @@ def test_a_run_that_ends_without_any_text_fails_with_its_stop_reason(tmp_path: P
     finally:
         host.close()
 
-    assert 'max_turns' in excinfo.value.received
+    assert 'stop_reason=budget' in excinfo.value.received
     assert '--max-turns' in excinfo.value.next_action
     assert len(llm.calls) == 1
 
 
-def test_a_text_answer_cut_short_by_max_turns_is_flagged_on_stderr(tmp_path: Path) -> None:
+def test_a_text_answer_cut_short_by_the_budget_is_flagged_on_stderr(tmp_path: Path) -> None:
     llm = ScriptedLLM(
         [
             ScriptedTurn(
@@ -1373,26 +1372,25 @@ def test_a_text_answer_cut_short_by_max_turns_is_flagged_on_stderr(tmp_path: Pat
         host.close()
 
     assert output == 'partial'
-    assert 'max_turns' in stderr.getvalue()
+    assert '预算用完了' in stderr.getvalue()
+    assert '停止原因 budget' in stderr.getvalue()
     assert '--max-turns' in stderr.getvalue()
 
 
-def test_chat_reports_a_message_that_got_no_new_answer_instead_of_repeating_the_last_one(
-    tmp_path: Path,
-) -> None:
+def test_chat_refuses_a_message_to_an_agent_whose_budget_is_spent(tmp_path: Path) -> None:
     llm = ScriptedLLM([ScriptedTurn(content='first answer'), ScriptedTurn(content='never')])
     stderr = StringIO()
     host = _host(tmp_path, {'default': llm}, stderr)
     try:
         target = host.open_chat('.syndica.yaml', max_turns=1)
         first = host.run_request(RunRequest(prompt='first', session=target))
-        second = host.run_request(RunRequest(prompt='second', session=target))
+        with pytest.raises(ConfigError) as refused:
+            host.run_request(RunRequest(prompt='second', session=target))
     finally:
         host.close()
 
     assert first == 'first answer'
-    assert second == ''
-    assert 'max_turns' in stderr.getvalue()
+    assert 'turns' in refused.value.received and '追加预算' in refused.value.received
     assert len(llm.calls) == 1
 
 
@@ -1437,23 +1435,25 @@ agents:
     assert llm.calls[0][0].content == 'notes.md'
 
 
-def test_max_turns_caps_a_delegated_child_as_well_as_the_root(tmp_path: Path) -> None:
+def test_max_turns_is_shared_by_the_tree_and_a_child_gets_half_of_what_is_left(
+    tmp_path: Path,
+) -> None:
     root = _delegating('Worker', answer='root done')
     worker = _busy_child()
     host = _host(tmp_path, {'default': root, 'worker-model': worker}, StringIO())
     try:
-        output = host.run_request(RunRequest(prompt='go', config=str(_team(tmp_path)), max_turns=2))
+        output = host.run_request(RunRequest(prompt='go', config=str(_team(tmp_path)), max_turns=6))
     finally:
         host.close()
 
-    delegated = root.calls[1][-1].content
+    delegated = next(b for b in root.calls[1] if b.tool_call_id == 'delegate-1').content
     assert output == 'root done'
-    assert len(worker.calls) == 2
+    assert len(worker.calls) == 3
     assert isinstance(delegated, str)
-    assert '轮次预算' in delegated
+    assert '预算' in delegated and '用完' in delegated
 
 
-def test_max_turns_caps_delegated_children_in_a_topology_run(tmp_path: Path) -> None:
+def test_max_turns_is_shared_by_the_tree_in_a_topology_run(tmp_path: Path) -> None:
     config = _team(
         tmp_path,
         """
@@ -1472,13 +1472,13 @@ topologies:
     )
     try:
         output = host.run_request(
-            RunRequest(prompt='go', config=str(config), topology='team', max_turns=2)
+            RunRequest(prompt='go', config=str(config), topology='team', max_turns=6)
         )
     finally:
         host.close()
 
     assert output == 'lead done'
-    assert len(worker.calls) == 2
+    assert len(worker.calls) == 3
 
 
 def test_max_turns_tightens_explicit_slot_budgets_instead_of_breaking_assembly(
@@ -1506,16 +1506,16 @@ topologies:
     assert output == 'lead done'
 
 
-def test_chat_max_turns_caps_every_agent_in_the_session(tmp_path: Path) -> None:
+def test_chat_max_turns_is_shared_by_every_agent_in_the_session(tmp_path: Path) -> None:
     config = _team(tmp_path)
     root = _delegating('Worker', answer='root done')
     worker = _busy_child()
     host = _host(tmp_path, {'default': root, 'worker-model': worker}, StringIO())
     try:
-        target = host.open_chat(str(config), max_turns=2)
+        target = host.open_chat(str(config), max_turns=6)
         output = host.run_request(RunRequest(prompt='go', config=str(config), session=target))
     finally:
         host.close()
 
     assert output == 'root done'
-    assert len(worker.calls) == 2
+    assert len(worker.calls) == 3

@@ -63,12 +63,15 @@ from syndica.kernel import (
     AgentOptions,
     AgentStatus,
     BaseAgent,
+    Budget,
+    BudgetPolicy,
     CausalityEdge,
     ConfigError,
     ContextBlock,
     DangerJudge,
     Disposition,
     EventBus,
+    Exhaustion,
     HookResult,
     HooksCenter,
     HostFacts,
@@ -1686,6 +1689,7 @@ class _Replay:
                 untrusted_output_modules=[
                     name for name in self._host.untrusted_output_modules if name in rebuilt
                 ],
+                budget=_replayed_budget(self._host),
             )
             self._runtime = runtime
             subscription = runtime.events.subscribe()
@@ -2135,3 +2139,13 @@ def _workspace_contents(root: Path) -> dict[str, str]:
         except (OSError, UnicodeError):
             continue
     return contents
+
+
+def _replayed_budget(host: HostProfile) -> BudgetPolicy | None:
+    """v4 文档的根预算原样重建：轮次与 token 的判定只看轨迹与记录下来的 usage，回放走同一条路。"""
+    if not host.root_budget:
+        return None
+    return BudgetPolicy(
+        root=Budget(turns=host.root_turns, tokens=host.root_tokens),
+        on_exhausted=Exhaustion(host.on_exhausted),
+    )

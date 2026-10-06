@@ -40,6 +40,7 @@ class _Agent:
     cycles: int = 0
     stop_reason: str | None = None
     verdict: str | None = None
+    budget: str | None = None
     children: list[str] = field(default_factory=list[str])
     # 没有一个收了尾的工作周期：还在跑，或者 run 被强行打断（开着的 span 没写下来）。
     unfinished: bool = False
@@ -52,6 +53,56 @@ def _verdict_of(attributes: Mapping[str, object]) -> str | None:
         return None
     cause = attributes.get('verdict.unverified_cause')
     return one_line(f'{status}（{cause}）' if isinstance(cause, str) else status)
+
+
+def _budget_of(attributes: Mapping[str, object]) -> str | None:
+    """最后一个工作周期收尾时的预算：用了多少（含后代）/ 约束它的那一层的上限；没上限的维不写上
+    限。"""
+    turns = attributes.get('budget.turns')
+    if not isinstance(turns, int):
+        return None
+    tokens = _int(attributes.get('budget.input_tokens')) + _int(
+        attributes.get('budget.output_tokens')
+    )
+    parts = [
+        _used('轮次', turns, attributes.get('budget.limit_turns')),
+        _used('token', tokens, attributes.get('budget.limit_tokens')),
+    ]
+    cost = attributes.get('budget.cost')
+    parts.append(
+        _used(
+            '成本', cost if isinstance(cost, str) else '未知', attributes.get('budget.limit_cost')
+        )
+    )
+    limit_wall = attributes.get('budget.limit_wall_clock_s')
+    if isinstance(limit_wall, int):
+        parts.append(f'墙钟上限 {limit_wall} 秒')
+    estimated = '（含估算）' if attributes.get('budget.estimated') is True else ''
+    return '，'.join(parts) + estimated
+
+
+def _used(name: str, used: object, limit: object) -> str:
+    return f'{name} {used}' + (f' / {limit}' if isinstance(limit, int | str) else '')
+
+
+def _budget_events(spans: Sequence[Span], labels: Mapping[str, str]) -> list[str]:
+    """预算的事件：耗尽（哪几维、怎么处置的）、收尾轮、提醒、追加。"""
+    lines: list[str] = []
+    for span in sorted(spans, key=lambda item: item.start_ns):
+        for event in span.events:
+            if not event.name.startswith('budget.'):
+                continue
+            who = labels.get(span.agent_id, _short(span.agent_id))
+            dims = event.attributes.get('budget.dimensions')
+            detail = (
+                [' / '.join(str(dim) for dim in dims)] if isinstance(dims, list | tuple) else []
+            )
+            for key in ('budget.disposition', 'budget.percent_left'):
+                value = event.attributes.get(key)
+                if value is not None:
+                    detail.append(f'{value}%' if key == 'budget.percent_left' else str(value))
+            lines.append(f'  {who}  {event.name}  {one_line(" ".join(detail))}'.rstrip())
+    return lines or ['  （没有预算事件）']
 
 
 def render_list(rows: Sequence[TraceRow], *, unreadable: int = 0) -> str:
@@ -107,6 +158,9 @@ def render_show(header: TraceHeader, spans: Sequence[Span], edges: Sequence[Caus
         '',
         '时间线：',
         *_timeline(agents, labels, origin),
+        '',
+        '预算：',
+        *_budget_events(spans, labels),
         '',
         'Module：',
         *_modules(spans, labels, header.schema),
@@ -190,6 +244,7 @@ def _agents(spans: Sequence[Span], edges: Sequence[CausalityEdge]) -> dict[str, 
         reason = span.attributes.get('stop_reason')
         agent.stop_reason = reason if isinstance(reason, str) else None
         agent.verdict = _verdict_of(span.attributes)
+        agent.budget = _budget_of(span.attributes)
     for span in sorted(spans, key=lambda item: item.start_ns):
         # Module span 在 spawn 提交时就记了：一个还没跑过的 Agent 只有它们，不是一个没结束的 Agent。
         if span.kind is SpanKind.MODULE:
@@ -445,9 +500,10 @@ def _timeline(agents: Mapping[str, _Agent], labels: Mapping[str, str], origin: i
             continue
         ended = '没有说明停下的原因' if agent.stop_reason is None else one_line(agent.stop_reason)
         verdict = '' if agent.verdict is None else f'  验收 {agent.verdict}'
+        budget = '' if agent.budget is None else f'  预算 {one_line(agent.budget)}'
         lines.append(
             f'  +{_duration(agent.start_ns - origin)} → +{_duration(agent.end_ns - origin)}  '
-            f'{labels[agent.agent_id]}  {agent.cycles} 个工作周期  {ended}{verdict}'
+            f'{labels[agent.agent_id]}  {agent.cycles} 个工作周期  {ended}{verdict}{budget}'
         )
     return lines
 

@@ -474,7 +474,7 @@ def test_no_write_changes_only_which_tools_a_role_has(tmp_path: Path, role: str)
 
     assert _system_prompt(read_only, 0) == _system_prompt(normal, 0)
     kept = {'Read', 'Grep', 'Glob', 'Delegate', 'Fork', 'SendMessage', 'QueryAgent', 'KillAgent'}
-    kept |= {'AskUser', 'AskUserQuestion'}
+    kept |= {'AskUser', 'AskUserQuestion', 'GetBudget'}
     assert _tool_names(read_only, 0) == [name for name in _tool_names(normal, 0) if name in kept]
     if role == 'Surveyor':
         assert _tool_names(read_only, 0)[:3] == ['Read', 'Glob', 'Grep']

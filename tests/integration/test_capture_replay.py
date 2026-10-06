@@ -42,6 +42,7 @@ from syndica.kernel import (
     TrustLevel,
     parse_scenario_document,
 )
+from syndica.kernel.history_blocks import HistoryKind, kind_of
 from syndica.kernel.tracing import current_llm_call
 from syndica.runner.replay import ReplayResult, ReplayRunner
 
@@ -190,7 +191,8 @@ def _selectors(document: dict[str, Any]) -> dict[str, str]:
 
 def _blocks(blocks: Sequence[ContextBlock], redactor: RuleRedactor) -> list[tuple[object, ...]]:
     """逐块比的那几项：`role`、`content`（原始 run 那一侧按同一套规则脱敏）、`trust`、工具调用按
-    解析后的参数比；`extra` 不比。"""
+    解析后的参数比；`extra` 不比。预算块不比（与回放指纹同一条规则：它的数字取决于并发的子 Agent
+    此刻占着多少）。"""
 
     def text(value: object) -> object:
         return str(redactor.redact(value)) if isinstance(value, str) else value
@@ -204,6 +206,7 @@ def _blocks(blocks: Sequence[ContextBlock], redactor: RuleRedactor) -> list[tupl
             block.tool_call_id,
         )
         for block in blocks
+        if kind_of(block) is not HistoryKind.BUDGET
     ]
 
 
@@ -1552,7 +1555,7 @@ def test_a_topology_run_is_captured_with_its_slot_tools_and_budget_and_replays(
     assert replayed.reproduced, replayed.divergences
 
 
-def test_the_captured_topology_is_the_one_assembled_after_the_turn_cap(
+def test_max_turns_is_recorded_as_the_root_budget_and_leaves_the_slot_budgets_alone(
     tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
 ):
     config = tmp_path / 'syndica.yaml'
@@ -1565,10 +1568,17 @@ def test_the_captured_topology_is_the_one_assembled_after_the_turn_cap(
     )
     _, document = _trace(tmp_path)
 
-    assert document['topology']['slots'][0]['budget'] == {'turns': 1}
+    assert document['version'] == 4
+    assert document['topology']['slots'][0]['budget'] == {'turns': 2}
+    assert document['host']['root_budget'] == {
+        'turns': 1,
+        'tokens': None,
+        'on_exhausted': 'graceful_wrapup',
+    }
+    assert document['host']['max_turns'] is None
 
 
-def test_a_roles_artifact_kinds_are_captured_in_a_version_3_document(
+def test_a_roles_artifact_kinds_are_captured_in_a_version_4_document(
     tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
 ):
     config = tmp_path / 'syndica.yaml'
@@ -1588,7 +1598,7 @@ def test_a_roles_artifact_kinds_are_captured_in_a_version_3_document(
     replayed = _replayed(header, document)
 
     assert code == 0, stderr
-    assert document['version'] == 3
+    assert document['version'] == 4
     assert document['agents']['Worker']['frozen']['artifact_kinds'] == ['report']
     assert replayed.reproduced, replayed.divergences
 
@@ -1809,7 +1819,7 @@ def test_a_role_tightened_by_the_project_config_is_recorded_and_replays(
     replayed = _replayed(header, document)
 
     assert code == 0 and stdout.rstrip().endswith('done'), stderr
-    assert document['version'] == 3
+    assert document['version'] == 4
     roles = document['host']['danger']['roles']
     assert list(roles) == ['Worker']
     assert roles['Worker']['table']['shell.path_outside_workspace'] == 'block'
@@ -1819,7 +1829,7 @@ def test_a_role_tightened_by_the_project_config_is_recorded_and_replays(
     assert replayed.reproduced, replayed.divergences
 
 
-def test_a_run_without_role_tightening_writes_a_version_2_document(
+def test_a_cli_run_always_records_its_root_budget_in_a_version_4_document(
     tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
 ):
     code, _, stderr = _cli(
@@ -1828,7 +1838,8 @@ def test_a_run_without_role_tightening_writes_a_version_2_document(
     _, document = _trace(tmp_path)
 
     assert code == 0, stderr
-    assert document['version'] == 2
+    assert document['version'] == 4
+    assert document['host']['root_budget']['turns'] == 200
     assert 'roles' not in document['host']['danger']
 
 
@@ -1907,7 +1918,7 @@ def test_builtin_modules_enabled_by_the_project_config_install_in_order_and_repl
     assert replayed.reproduced, replayed.divergences
 
 
-def test_a_captured_topology_run_is_written_as_version_3(
+def test_a_captured_topology_run_is_written_as_version_4(
     tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
 ):
     config = tmp_path / 'syndica.yaml'
@@ -1920,10 +1931,10 @@ def test_a_captured_topology_run_is_written_as_version_3(
     )
     _, document = _trace(tmp_path)
 
-    assert document['version'] == 3
+    assert document['version'] == 4
 
 
-def test_a_role_allowed_no_turns_is_captured_as_version_3_and_replays(
+def test_a_role_allowed_no_turns_is_captured_as_version_4_and_replays(
     tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
 ):
     config = tmp_path / 'syndica.yaml'
@@ -1940,7 +1951,7 @@ def test_a_role_allowed_no_turns_is_captured_as_version_3_and_replays(
     )
     header, document = _trace(tmp_path)
 
-    assert document['version'] == 3
+    assert document['version'] == 4
     assert document['agents']['Worker']['frozen']['max_turns'] == 0
     replayed = _replayed(header, document)
     assert replayed.reproduced, replayed.divergences
@@ -2090,5 +2101,29 @@ def test_a_slot_entry_marked_untrusted_is_delivered_untrusted_in_the_replay(
     replayed = _replayed(header, document)
 
     [trajectory] = replayed.trajectories.values()
-    [entry] = [block for block in trajectory if block.role == 'user']
+    [entry] = [block for block in trajectory if block.role == 'user' and kind_of(block) is None]
     assert entry.trust is TrustLevel.UNTRUSTED
+
+
+def test_a_run_that_wraps_up_on_its_turn_budget_replays_the_same_way(
+    tmp_path: Path, snapshots: list[dict[str, list[ContextBlock]]]
+):
+    root: list[Step] = [
+        _calls(('c1', 'Bash', {'command': 'true'})),
+        _calls(('c2', 'Bash', {'command': 'true'})),
+        _say('never'),
+    ]
+    code, _, stderr = _cli(
+        tmp_path, _PerAgent(root), ['run', 'go', '--agent', 'Worker', '--max-turns', '2']
+    )
+    header, document = _trace(tmp_path)
+    replayed = _replayed(header, document)
+
+    assert code == 1, stderr
+    assert document['version'] == 4
+    assert replayed.reproduced, replayed.divergences
+    [trajectory] = replayed.trajectories.values()
+    [unexecuted] = [b for b in trajectory if b.role == 'tool' and b.tool_call_id == 'c2']
+    assert '预算用完' in str(unexecuted.content)
+    [original] = snapshots
+    assert _assert_same_trajectories(document, replayed, original) == {'Worker[0]'}

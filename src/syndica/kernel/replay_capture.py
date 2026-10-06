@@ -102,14 +102,18 @@ class _Wait:
 def _document_version(host: object, roles: object, topology: object = None) -> int:
     """写得下这份内容的最低版本：没用到 v3 的键与取值就写 2，旧版本的读者照样读得进。拓扑 run
     的槽入口在 v2 的读者那里是另一种进法（直接建角色、不经槽），读得进却回放不出，所以也写 3。"""
-    if topology is not None:
-        return 3
     profile: Mapping[str, object] = (
         cast(Mapping[str, object], host) if isinstance(host, Mapping) else {}
     )
+    if 'root_budget' in profile:
+        return 4
+    if topology is not None:
+        return 3
     danger = profile.get('danger')
     if isinstance(danger, Mapping) and 'roles' in cast(Mapping[str, object], danger):
         return 3
+    if 'root_budget' in profile:
+        return 4
     if 'module_records' in profile or 'untrusted_output_modules' in profile:
         return 3
     frozen = cast(Mapping[str, object], roles).values() if isinstance(roles, Mapping) else ()
