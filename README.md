@@ -8,7 +8,7 @@ acceptance criteria, and eventually training-data export.
 
 > Status: **pre-release**.
 >
-> Milestones 1 to 4 are complete on `main`. The project is still pre-v1.0, so public APIs may
+> Milestones 1 to 8 are complete on `main`. The project is still pre-v1.0, so public APIs may
 > change until the release boundary is frozen.
 
 ## Why Syndica Exists
@@ -117,6 +117,21 @@ Milestone 7 adds artifacts and acceptance (see the `acceptance` module under
 - Human feedback becomes a proposed rubric that a person activates.
 
 Milestone 7 audit: [`docs/audits/2026-10-05-m7-final-audit.md`](docs/audits/2026-10-05-m7-final-audit.md).
+
+Milestone 8 adds long-horizon control (see the `long-horizon` and `background` modules and the
+budget options under [Configuration](#configuration)):
+
+- A budget tree over turns, tokens, cost and wall clock: a child's budget is carved from its
+  parent's and given back when it finishes, and every model call is admitted against an estimate
+  first. When the budget runs out the agent gets one wrap-up turn by default; `GetBudget` and
+  reminders at 50, 25 and 10 percent keep it aware.
+- Progress measured from the acceptance verdicts (regressions are warnings), three independent stop
+  criteria (done, out of budget, stalled), and a zero-cost drift check against the goal and rubrics.
+- A pluggable long-horizon strategy with a contract suite; the kernel ships a baseline.
+- Goal-directed compaction, with the full pre-compaction history redacted and archived; slow tools
+  moved to the background; finished delegated agents reaped; isolated topology slots.
+
+Milestone 8 audit: [`docs/audits/2026-10-06-m8-final-audit.md`](docs/audits/2026-10-06-m8-final-audit.md).
 
 ## Install From Source
 
@@ -829,7 +844,7 @@ The v1.0 roadmap has 12 internal milestones:
 | 5 | Complete execution layer + provenance | Done |
 | 6 | State: sessions, compression, memory | Done |
 | 7 | Artifacts and acceptance | Done |
-| 8 | Long-horizon task control | Planned |
+| 8 | Long-horizon task control | Done |
 | 9 | HTTP/SSE/Web product surface | Planned |
 | 10 | MCP / ACP / A2A / OpenAI HTTP interop | Planned |
 | 11 | Training-data export | Planned |
