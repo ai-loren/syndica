@@ -957,6 +957,23 @@ def test_the_recorded_event_sequence_is_compared_when_the_document_states_it():
     assert divergence.where == 'expect.events'
 
 
+def test_a_document_stating_the_scenario_event_kinds_reproduces_with_dense_numbers():
+    document = _bash_run()
+    document['expect']['events'] = [
+        'agent_start',
+        'turn_start',
+        'turn_end',
+        'turn_start',
+        'turn_end',
+        'agent_end',
+    ]
+
+    result = _replay(document)
+
+    assert result.reproduced, result.divergences
+    assert [event.sequence for event in result.result.events] == [1, 2, 3, 4, 5, 6]
+
+
 def test_a_request_with_more_units_than_its_record_is_a_divergence(
     monkeypatch: pytest.MonkeyPatch,
 ):

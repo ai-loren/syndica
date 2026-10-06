@@ -127,12 +127,13 @@ def test_event_payload_defaults_to_empty_and_is_not_shared_between_instances():
     assert second.payload == {}
 
 
-def test_event_fields_append_sequence_after_the_existing_public_fields():
+def test_event_fields_append_sequence_and_time_after_the_existing_public_fields():
     assert [field.name for field in dataclasses.fields(Event)] == [
         'kind',
         'agent_id',
         'payload',
         'sequence',
+        'time_ns',
     ]
 
 

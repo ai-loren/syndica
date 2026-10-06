@@ -42,6 +42,7 @@ from syndica.kernel.danger import DangerRequest, Disposition
 from syndica.kernel.errors import ContractViolation
 from syndica.kernel.manifest import AgentManifest
 from syndica.kernel.scenario_schema import (
+    SCENARIO_EVENT_KINDS,
     ScenarioDocument,
     ScenarioError,
     ScenarioExpectation,
@@ -298,16 +299,22 @@ class ScenarioRunner:
         )
         subscription = runtime.events.subscribe()
         events: list[ScenarioEvent] = []
+        sequences: list[int] = []
         response_errors: list[ScenarioMismatch] = []
         response_index = 0
 
         async def collect() -> None:
             nonlocal response_index
             async for event in subscription:
+                sequences.append(event.sequence)
+                if event.kind not in SCENARIO_EVENT_KINDS:
+                    continue
                 selector = selector_by_id.get(event.agent_id, f'<unknown:{event.agent_id}>')
+                # 在比对的那批种类里重新编号：结果里的序号与场景格式定义时一致，不随内核新增
+                # 种类出现空洞。
                 events.append(
                     ScenarioEvent(
-                        sequence=event.sequence,
+                        sequence=len(events) + 1,
                         kind=event.kind,
                         agent=selector,
                         payload=MappingProxyType(dict(event.payload)),
@@ -405,6 +412,7 @@ class ScenarioRunner:
                 runtime,
                 selector_by_id,
                 events,
+                sequences,
                 errors,
                 subscription,
                 root,
@@ -486,6 +494,7 @@ class ScenarioRunner:
         runtime: Runtime,
         selector_by_id: Mapping[str, str],
         events: list[ScenarioEvent],
+        sequences: list[int],
         errors: Mapping[str, str],
         subscription: Subscription,
         root: Path,
@@ -525,7 +534,6 @@ class ScenarioRunner:
                 received=f'EventBus subscription dropped={subscription.dropped}',
                 next_action='缩短单轮事件突发，或为 ScenarioRunner 提供足够大的 EventBus 缓冲',
             )
-        sequences = [event.sequence for event in events]
         if sequences != list(range(1, len(sequences) + 1)):
             raise ScenarioMismatch(
                 expected='事件 sequence 从 1 开始连续递增且不重复',

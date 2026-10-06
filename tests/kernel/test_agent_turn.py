@@ -742,7 +742,7 @@ async def test_each_agent_gets_its_own_id_so_a_shared_stream_can_tell_them_apart
         await bus.close()
         delivered = await asyncio.wait_for(_collect(events), timeout=_TIMEOUT)
     ids = [event.agent_id for event in delivered]
-    assert ids == [first.agent_id] * 4 + [second.agent_id] * 4
+    assert ids == [first.agent_id] * 6 + [second.agent_id] * 6
 
 
 def test_the_agent_id_is_a_full_uuid4_hex_string():
@@ -1033,13 +1033,24 @@ async def test_turn_events_reach_a_subscriber_in_order():
         delivered = await asyncio.wait_for(_collect(events), timeout=_TIMEOUT)
         assert events.dropped == 0
     assert [event.kind for event in delivered] == [
+        'message_appended',
         'agent_start',
         'turn_start',
+        'message_appended',
+        'tool_call_started',
+        'tool_call_finished',
+        'message_appended',
         'turn_end',
         'turn_start',
+        'message_appended',
         'turn_end',
         'agent_end',
     ]
+    assert [
+        (event.payload['index'], event.payload['block']['role'])
+        for event in delivered
+        if event.kind == 'message_appended'
+    ] == [(0, 'user'), (1, 'assistant'), (2, 'tool'), (3, 'assistant')]
     assert {event.agent_id for event in delivered} == {agent.agent_id}
 
 

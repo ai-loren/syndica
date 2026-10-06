@@ -48,6 +48,7 @@ __all__ = [
     'FROZEN_IMPLS',
     'REPLAYED_TOOLS',
     'RULE_PARAMETERS',
+    'SCENARIO_EVENT_KINDS',
     'SCENARIO_VERSIONS',
     'DangerPolicySpec',
     'DangerRuleSpec',
@@ -74,6 +75,25 @@ __all__ = [
 ]
 
 SCENARIO_VERSIONS = (1, 2, 3, 4)
+# `expect.events` 比对的事件种类：场景格式 v1–v4 定义时内核发的那 13 种。之后加的种类不进比对，
+# 否则内核每多发一种事件，用户已经写好、录好的场景就全部失败；要比对新种类得升场景格式版本。
+SCENARIO_EVENT_KINDS = frozenset(
+    {
+        'agent_start',
+        'turn_start',
+        'turn_end',
+        'agent_end',
+        'agent_error',
+        'compaction',
+        'budget_exhausted',
+        'progress_regressed',
+        'progress_stalled',
+        'goal_drift',
+        'user_input_requested',
+        'user_question_requested',
+        'tool_confirmation_requested',
+    }
+)
 # 冻结角色的 `impl` 只认内核内置的类式角色：回放文档可能来自别人的仓库，任意 import 路径等于执行它。
 FROZEN_IMPLS = frozenset({'syndica.kernel.agents.orchestrator:Orchestrator'})
 # 触达外部世界、回放时按记录给出结局的工具；其余（派活、消息、人机）是内核，回放时真跑。捕获只记

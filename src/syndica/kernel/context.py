@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from syndica.kernel.errors import ContractViolation
 
@@ -82,9 +82,18 @@ class ContextBlock:
     extra: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
+class _TrajectoryObserver(Protocol):
+    def appended(self, generation: int, index: int, block: ContextBlock) -> None: ...
+
+    def replaced(self, generation: int) -> None: ...
+
+
 class Context:
     def __init__(self) -> None:
         self._blocks: list[ContextBlock] = []
+        # 第几代轨迹：整段重写一次加一。块的位置只在同一代里稳定，外面按（代，位置）认块。
+        self._generation = 0
+        self._observer: _TrajectoryObserver | None = None
         self.stop_reason: StopReason | None = None
         # 本周期的验收裁决（§7.5；COMPLETION_PROPOSED 给出、内核记下）。每个周期开始清空：上一周期的
         # PASS 不能冒充这一周期的结论（评审 H2）。随 `_finish` 的快照一起被 Delegate 读到。
@@ -112,11 +121,20 @@ class Context:
                 ),
             )
         self._blocks.append(block)
+        if self._observer is not None:
+            self._observer.appended(self._generation, len(self._blocks) - 1, block)
+
+    def _observe(self, observer: _TrajectoryObserver) -> None:
+        """Agent 挂上的观察者：每次追加与整段重写都同步告诉它，中间没有挂起点。"""
+        self._observer = observer
 
     def _replace_traj(self, blocks: Sequence[ContextBlock]) -> None:
         """整段重写轨迹（压缩走的内核接口，spec §8.8）。**不是 append**：压缩改历史，不逐块追加
         （那会插进一次调用与它结果之间、被 provider 拒），也不让 hook 就地改。只内核压缩步骤调。"""
         self._blocks[:] = list(blocks)
+        self._generation += 1
+        if self._observer is not None:
+            self._observer.replaced(self._generation)
 
 
 # 此刻在跑的这次工具调用的溯源结论（执行器在 `tool.execute` 期间设）。工具写下的文件版本记成它：

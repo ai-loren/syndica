@@ -111,7 +111,7 @@ from syndica.kernel.context import (
 )
 from syndica.kernel.control import NullTurnGate, TurnGate, TurnGateDecision
 from syndica.kernel.danger import DangerJudge, DangerPolicy, Disposition, validate_danger_options
-from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError
+from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError, SyndicaError
 from syndica.kernel.events import Event, EventBus
 from syndica.kernel.history_blocks import HistoryKind, has_block, signed_block
 from syndica.kernel.hooks import (
@@ -142,6 +142,7 @@ from syndica.kernel.tracing import (
     _Tracing,  # pyright: ignore[reportPrivateUsage]
     llm_attempt,
 )
+from syndica.kernel.transcript import artifact_payload, block_payload, budget_payload
 
 __all__ = ['AgentOptions', 'BaseAgent']
 
@@ -537,6 +538,54 @@ def _skipped_response(result: object) -> ContextBlock:
     return result
 
 
+class _TranscriptEvents:
+    """把轨迹的每次变化同步发成事件（spec §9.1：事件以内核为准，SSE 只是出口）。同步投递：追加与
+    它的事件之间没有挂起点，事件的顺序就是块在轨迹里的顺序。"""
+
+    def __init__(self, agent_id: str, events: EventBus, *, held: bool) -> None:
+        self._agent_id = agent_id
+        self._events = events
+        self._held: list[Event] | None = [] if held else None
+
+    def appended(self, generation: int, index: int, block: ContextBlock) -> None:
+        payload = {'generation': generation, 'index': index, 'block': block_payload(block)}
+        self._publish(Event('message_appended', self._agent_id, payload))
+
+    def replaced(self, generation: int) -> None:
+        payload = {'generation': generation, 'reason': 'compaction'}
+        self._publish(Event('transcript_reset', self._agent_id, payload))
+
+    def release(self) -> None:
+        held, self._held = self._held, None
+        for event in held or ():
+            self._events._publish(event)  # pyright: ignore[reportPrivateUsage]
+
+    def _publish(self, event: Event) -> None:
+        if self._held is not None:
+            self._held.append(event)
+        else:
+            self._events._publish(event)  # pyright: ignore[reportPrivateUsage]
+
+
+def _error_payload(exc: Exception) -> dict[str, str]:
+    """`agent_error` 的三件套：宿主不必挂进全局 logger 就能告诉人这个周期为什么停在 ERROR。"""
+    if isinstance(exc, SyndicaError):
+        return {
+            'error_type': type(exc).__name__,
+            'expected': exc.expected,
+            'received': exc.received,
+            'next_action': exc.next_action,
+        }
+    return {
+        'error_type': type(exc).__name__,
+        'expected': '这个周期正常跑完',
+        'received': f'{type(exc).__name__}: {exc}',
+        'next_action': (
+            '看宿主日志或 trace 里这个 Agent 的 agent span 拿到完整的栈，修好之后再发一条消息'
+        ),
+    }
+
+
 class BaseAgent:
     """一个 Agent 的 turn 循环。
 
@@ -554,7 +603,8 @@ class BaseAgent:
         # `Runtime.spawn` 在调用工厂之前从 id 源取好的那个（M3 D10）；不经 spawn 构造时照旧 uuid4。
         # 全量 hex 而非截断：id 撞车不是软失败——AgentRegistry.register 拒绝重复 id，撞上的那个 Agent
         # 直接注册不进去。
-        self.agent_id: str = assigned_agent_id() or uuid.uuid4().hex
+        assigned = assigned_agent_id()
+        self.agent_id: str = assigned or uuid.uuid4().hex
         # 本 Agent 自己的一层，外层是宿主交来的那个中心。两层合成一条链，本层在前（spec §5.3）。
         self._module_hooks = hooks
         self._hooks = HooksCenter(outer=hooks)
@@ -567,7 +617,11 @@ class BaseAgent:
             policy=options.danger_policy,
             max_concurrency=options.max_tool_concurrency,
         )
+        self._executor._attach_events(self._publish_now)  # pyright: ignore[reportPrivateUsage]
         self._context = Context()
+        # spawn 里构造的先攒着：spawn 还可能回滚，轨迹事件要等 `agent_spawned` 之后才放出去。
+        self._transcript = _TranscriptEvents(self.agent_id, events, held=assigned is not None)
+        self._context._observe(self._transcript)  # pyright: ignore[reportPrivateUsage]
         self._current_turn = 0
         # 第几个工作周期（每次 `run` 一个）：agent span 与工具调用的稳定键带着它（M3 D3 / D10）。
         self._cycle = 0
@@ -1107,11 +1161,11 @@ class BaseAgent:
         # 不再发事件。
         try:
             stop_reason = await self._run_turns(ctx)
-        except Exception:
+        except Exception as exc:
             ctx.stop_reason = StopReason.ERROR
             attributes['stop_reason'] = StopReason.ERROR.value
             await self._hooks._dispatch(Junction.AGENT_ERROR, ctx=ctx)  # pyright: ignore[reportPrivateUsage]
-            await self._emit('agent_error', {})
+            await self._emit('agent_error', _error_payload(exc))
             raise
         attributes['stop_reason'] = stop_reason.value
         ending: dict[str, object] = {'stop_reason': stop_reason.value}
@@ -1693,6 +1747,7 @@ class BaseAgent:
                     is_deliverable=given.is_deliverable and delivered,
                 )
                 await store.register(ref)
+                await self._emit('artifact_registered', {'ref': artifact_payload(ref)})
                 await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
                     Junction.ARTIFACT_REGISTERED, ctx=ctx, artifact=ref
                 )
@@ -1727,6 +1782,8 @@ class BaseAgent:
         """turn 的可观测数据在 turn_end 切点之后才冻结，切点自身的耗时也计入（spec §5.1）。"""
         await self._hooks._dispatch(Junction.TURN_END, ctx=ctx, turn=turn, message=message)  # pyright: ignore[reportPrivateUsage]
         await self._emit('turn_end', {'turn': turn})
+        if self._budget is not None:
+            await self._emit('budget_changed', {'view': budget_payload(self._budget.view())})
 
     async def _one_llm_call(
         self, ctx: Context, tool_defs: list[dict[str, Any]]
@@ -1877,3 +1934,6 @@ class BaseAgent:
 
     async def _emit(self, kind: str, payload: dict[str, Any]) -> None:
         await self._events.emit(Event(kind=kind, agent_id=self.agent_id, payload=payload))
+
+    def _publish_now(self, kind: str, payload: dict[str, Any]) -> None:
+        self._events._publish(Event(kind=kind, agent_id=self.agent_id, payload=payload))  # pyright: ignore[reportPrivateUsage]

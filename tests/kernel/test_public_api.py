@@ -377,6 +377,10 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 #   `parse_scenario_document` 用就够了。
 # - `RequestFingerprints` 与 `arguments_digest`：回放（runner）用它们对自己的请求与执行的参数取与
 #   记录时同样的指纹；宿主不需要它们就能记录与回放。
+# - `block_payload` / `budget_payload` / `artifact_payload` / `plain_data`：内核对象的纯数据表示，
+#   事件 payload 用它们；宿主读的是事件里已经算好的那一份，快照由宿主装配自己调。M12 定。
+# - `KERNEL_EVENTS` 与 `SCENARIO_EVENT_KINDS`：经子模块承诺。前者是内核事件种类与必有键的表，
+#   SSE 出口按它生成每种事件的 schema；后者是场景格式比对的那批种类。
 # - `encode_prepared`：recorder 写回放文档用的编码（各项已在自己的上下文里脱敏）；宿主写自己的
 #   持久化内容用 `encode_redacted`。
 # - 回放文档的账本（`ReplayCapture`、`RecordingIds`、`Unreplayable`）：宿主经 `TraceRecorder.ids` 与
@@ -392,7 +396,9 @@ _PROMISED_VIA_SUBMODULE: dict[str, tuple[str, ...]] = {
     'syndica.kernel.isolation': ('IsolatedCopy',),
     'syndica.kernel.file_taint': ('TaintAware',),
     'syndica.kernel.tool_executor': ('ToolOutcomeObserver',),
+    'syndica.kernel.events': ('KERNEL_EVENTS',),
     'syndica.kernel.scenario_schema': (
+        'SCENARIO_EVENT_KINDS',
         'DangerPolicySpec',
         'DangerRuleSpec',
         'FrozenRole',
@@ -452,6 +458,12 @@ _WITHHELD: tuple[str, ...] = (
     'drain_cancelled',
     'drop_cut_end',
     'drop_cut_start',
+    'artifact_payload',
+    'block_payload',
+    'budget_payload',
+    'plain_data',
+    'KERNEL_EVENTS',
+    'SCENARIO_EVENT_KINDS',
     'BackgroundModule',
     'QueryBackgroundTool',
     'CancelBackgroundTool',

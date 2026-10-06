@@ -187,6 +187,8 @@ class ConfirmationRequest:
     arguments: str
     verdict: DangerVerdict
     request_ref: tuple[str | int, ...] | None = None
+    # 这次调用的参数可溯源到不可信内容（spec §12.2）：人批准之前要看得到这一点。
+    untrusted: bool = False
 
 
 class _ConfirmationRuntime(Protocol):
@@ -229,6 +231,7 @@ class MailboxConfirmationHandler:
                 'level': request.verdict.level.value,
                 'reason': request.verdict.reason,
             },
+            'untrusted': request.untrusted,
         }
         # 这次请求的稳定键（`wait_for` 随后用同一个键登记它）：回放按键给出人的答复（M3 D10）。
         # 字段名不能像密钥名（`key`、`*_key`）：落盘前的逐叶脱敏会把它下面的 agent id 换掉。
@@ -242,19 +245,30 @@ class MailboxConfirmationHandler:
             request.agent_id,
             Confirmation(timeout=self._timeout, tool_call_id=request.request_id),
         )
-        if waited.state is WaitState.TIMEOUT:
-            return ConfirmationOutcome.TIMEOUT
-        if waited.state is WaitState.PREEMPTED:
-            return ConfirmationOutcome.PREEMPTED
-        if waited.state is WaitState.ABORTED:
-            return ConfirmationOutcome.ABORTED
-        answer = waited.message
-        if answer is None or answer.sender != 'human' or answer.trust is not TrustLevel.TRUSTED:
-            return ConfirmationOutcome.REJECTED
-        decision = answer.content.strip().lower()
-        return (
-            ConfirmationOutcome.APPROVED if decision == 'approve' else ConfirmationOutcome.REJECTED
+        outcome = _confirmation_outcome(waited)
+        # 了结事件让宿主撤下还挂着的确认：没人等的答复会作为一条可信的人类消息进下一轮。
+        await runtime.events.emit(
+            Event(
+                kind='human_request_resolved',
+                agent_id=request.agent_id,
+                payload={'request_id': request.request_id, 'outcome': outcome.value},
+            )
         )
+        return outcome
+
+
+def _confirmation_outcome(waited: WaitResult) -> ConfirmationOutcome:
+    if waited.state is WaitState.TIMEOUT:
+        return ConfirmationOutcome.TIMEOUT
+    if waited.state is WaitState.PREEMPTED:
+        return ConfirmationOutcome.PREEMPTED
+    if waited.state is WaitState.ABORTED:
+        return ConfirmationOutcome.ABORTED
+    answer = waited.message
+    if answer is None or answer.sender != 'human' or answer.trust is not TrustLevel.TRUSTED:
+        return ConfirmationOutcome.REJECTED
+    decision = answer.content.strip().lower()
+    return ConfirmationOutcome.APPROVED if decision == 'approve' else ConfirmationOutcome.REJECTED
 
 
 # 命令词之前可以出现的环境变量赋值（`FOO=1 rm -rf x`，bash 还收 `FOO+=1 rm -rf x`）。

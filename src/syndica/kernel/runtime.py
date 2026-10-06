@@ -151,6 +151,7 @@ from syndica.kernel.danger import (
 from syndica.kernel.driving import _DRIVING_AGENT  # pyright: ignore[reportPrivateUsage]
 from syndica.kernel.errors import ConfigError, ContractViolation
 from syndica.kernel.events import (
+    Event,
     EventBus,
     _why_copying_failed,  # pyright: ignore[reportPrivateUsage]
 )
@@ -206,6 +207,7 @@ from syndica.kernel.tracing import (
     back_in_spans,
     outside_any_span,
 )
+from syndica.kernel.transcript import budget_payload
 from syndica.kernel.waiting import Reply, Waiter, WaitResult, WaitState, correlation_of
 from syndica.kernel.workspace_router import WorkspaceRouter
 
@@ -1694,6 +1696,11 @@ class Runtime:
         seed = None if query is None else _Seed(text=query, trust=query_trust)
         task = asyncio.create_task(self._drive(agent_id, agent, seed), name=f'agent:{agent_id}')
         self._table.set_task(agent_id, task)
+        # 与 create_task 在同一段同步代码里：驱动任务的第一次追加排在派生事件与播种的块之后。
+        self.events._publish(  # pyright: ignore[reportPrivateUsage]
+            Event('agent_spawned', agent_id, {'parent_id': parent_id, 'name': agent.options.name})
+        )
+        agent._transcript.release()  # pyright: ignore[reportPrivateUsage]
         # 派生边在任务建好之后：put 与 create_task 之间一句别的都不放。终点是它在这里的第一个周期
         # ——工厂交回的可能是一个已经跑过几个周期的 Agent。
         self._tracing.spawned(agent_id, agent._cycle + 1)  # pyright: ignore[reportPrivateUsage]
@@ -1878,6 +1885,9 @@ class Runtime:
             'budget.granted',
             {'agent.id': agent_id, 'budget.dimensions': granted_dims(extra)},
         )
+        self.events._publish(  # pyright: ignore[reportPrivateUsage]
+            Event('budget_changed', agent_id, {'view': budget_payload(account.view())})
+        )
 
     def _install_slot_tools(
         self, agent: BaseAgent, role_tools: frozenset[str], module_tools: Mapping[str, str]
@@ -2044,6 +2054,9 @@ class Runtime:
         ):
             await self._report_lost_takeover(agent_id)
             return
+        await self.events.emit(
+            Event('agent_status', agent_id, {'status': AgentStatus.RUNNING.value})
+        )
         slot.owned = True
         cancelled = False
         try:
@@ -2276,6 +2289,8 @@ class Runtime:
         """
         for expected in (new, *allowed):
             if await self.registry.compare_and_set_status(agent_id, expected=expected, new=new):
+                if expected is not new:
+                    await self.events.emit(Event('agent_status', agent_id, {'status': new.value}))
                 return True
         return False
 
@@ -3209,6 +3224,7 @@ class Runtime:
             if not teardown.reported:
                 teardown.reported = True
                 self._tracing.event('agent.despawned', {'agent.id': agent_id})
+                await self.events.emit(Event('agent_removed', agent_id))
                 # 切点在拆除自己的出处里、在任何 span 之外跑：取得到收据的可以是几条并发拆除中的
                 # 任何一条（despawn、级联、EXIT 收尾、kill 的收尾），hook 派的活按调用方取键、记在
                 # 调用方的 span 上，就随谁先到而变（M3 D10 / D3）。一个 Agent 至多消失一次，计数

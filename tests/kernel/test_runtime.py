@@ -1944,7 +1944,11 @@ async def test_the_pause_gate_sits_between_a_waiting_message_and_starting_the_cy
     assert await _status(runtime, agent_id) is AgentStatus.IDLE
     assert [message.content for message in await broker.consume(agent_id)] == ['wake up']
     await runtime.shutdown()
-    assert [event.kind async for event in subscription] == []
+    assert [(event.kind, event.payload.get('status')) async for event in subscription] == [
+        ('agent_spawned', None),
+        ('agent_status', 'running'),
+        ('agent_status', 'idle'),
+    ]
 
 
 async def test_an_abort_taken_between_cycles_drops_that_cycles_input_and_goes_back_to_waiting():

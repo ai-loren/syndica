@@ -8,6 +8,11 @@
    `from syndica.backends.llm_openai import …` 就把这条承诺推翻，而它看起来完全无害。
 3. backend 之间互不依赖，且 backend 不得 import surface。
 
+组合根（`__main__`、`serve`）不属于任何一层：它们 import 一切、把 surface 与 backend 装在一起，
+所以反过来任何组件都不得 import 组合根——否则 `server → serve → cli` 就把规则 2 绕过去了。
+包下的每个顶层模块都必须属于已知的组件或组合根：一个没分类的新顶层模块不受任何一条规则约束，
+校验器对它是瞎的，因此当场报出来。
+
 相对导入先按导入方所在的包解析成绝对模块路径，再套用以上规则。
 
 两处已知盲区：动态导入（`importlib.import_module('syndica.backends.x')`）看不见；
@@ -29,6 +34,8 @@ PACKAGE = 'syndica'
 KERNEL = 'kernel'
 BACKENDS = 'backends'
 SURFACES = frozenset({'cli', 'server', 'runner'})
+ROOTS = frozenset({'__main__', 'serve'})
+KNOWN = SURFACES | ROOTS | {KERNEL, BACKENDS}
 FORBIDDEN_FROM_KERNEL = SURFACES | {BACKENDS}
 FORBIDDEN_KERNEL_EXTERNALS = frozenset({'yaml'})
 
@@ -113,6 +120,13 @@ def _imported_components(modules: list[tuple[str, ...]]) -> set[tuple[str, ...]]
 
 def _violation(rel: Path, owner: tuple[str, ...], imported: tuple[str, ...]) -> str | None:
     owner_top, imported_top = owner[0], imported[0]
+    if imported_top in ROOTS and owner_top not in ROOTS:
+        return (
+            f'{rel}: {owner_top!r} imports composition root {imported_top!r}. '
+            f'组合根（{", ".join(sorted(ROOTS))}）只能被入口调用，不能被任何组件 import：'
+            f'它 import 一切，经它中转就绕过了 spec §3.2 的全部方向规则。'
+            f' 把需要的东西改成由组合根注入（参数或 Protocol），不要反向 import。'
+        )
     if owner_top == KERNEL and imported_top in FORBIDDEN_FROM_KERNEL:
         return (
             f'{rel}: kernel imports {imported_top!r}. '
@@ -156,6 +170,14 @@ def check(root: Path) -> list[str]:
         if not owner:
             continue
         rel = path.relative_to(package_root)
+        if owner[0] not in KNOWN:
+            violations.append(
+                f'{rel}: top-level module {owner[0]!r} belongs to no known component. '
+                f'期望包下每个顶层模块都属于 {", ".join(sorted(KNOWN))} 之一；没分类的模块不受'
+                f'任何方向规则约束。 把它挪进对应组件，或在 scripts/check_deps.py 里给它分类'
+                f'（同时改 spec §3.2）。'
+            )
+            continue
         modules = _imported_modules(path, package_root)
         if owner[0] == KERNEL:
             forbidden = sorted(

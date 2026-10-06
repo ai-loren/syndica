@@ -99,6 +99,7 @@ def test_confirmation_public_values_and_field_order_are_exact() -> None:
         'arguments',
         'verdict',
         'request_ref',
+        'untrusted',
     ]
 
 
@@ -198,6 +199,7 @@ async def test_mailbox_handler_preserves_each_unanswered_state(
             'level': 'none',
             'reason': NO_RULE_MATCHED.reason,
         },
+        'untrusted': False,
     }
     assert runtime.waiters[0][0] == 'agent-1'
     assert runtime.waiters[0][1].tool_call_id == 'nonce-1'

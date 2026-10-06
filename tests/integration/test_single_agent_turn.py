@@ -97,12 +97,29 @@ async def test_agent_calls_tool_then_answers():
 
     events: list[Event] = [event async for event in subscription]
     assert [event.kind for event in events] == [
+        'agent_spawned',
+        'agent_status',
+        'message_appended',
         'agent_start',
         'turn_start',
+        'message_appended',
+        'tool_call_started',
+        'tool_call_finished',
+        'message_appended',
         'turn_end',
+        'budget_changed',
         'turn_start',
+        'message_appended',
         'turn_end',
+        'budget_changed',
         'agent_end',
+        'agent_status',
     ]
     assert {event.agent_id for event in events} == {agent_id}
-    assert events[-1].payload == {'stop_reason': 'completed'}
+    assert [event.payload for event in events if event.kind == 'agent_end'] == [
+        {'stop_reason': 'completed'}
+    ]
+    assert [event.payload['status'] for event in events if event.kind == 'agent_status'] == [
+        'running',
+        'zombie',
+    ]

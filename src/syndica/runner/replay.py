@@ -121,6 +121,7 @@ from syndica.kernel.memory_module import MemoryModule
 from syndica.kernel.redaction import Redactor, RuleRedactor
 from syndica.kernel.scenario_schema import (
     REPLAYED_TOOLS,
+    SCENARIO_EVENT_KINDS,
     DangerRuleSpec,
     HostAction,
     HostProfile,
@@ -1367,9 +1368,12 @@ class _Replay:
     async def _answer(self, runtime: Runtime, subscription: Subscription) -> list[ScenarioEvent]:
         events: list[ScenarioEvent] = []
         async for event in subscription:
+            if event.kind not in SCENARIO_EVENT_KINDS:
+                continue
+            # 在比对的那批种类里重新编号：结果里的序号与场景格式定义时一致。
             events.append(
                 ScenarioEvent(
-                    sequence=event.sequence,
+                    sequence=len(events) + 1,
                     kind=event.kind,
                     agent=self._selector(event.agent_id),
                     payload=MappingProxyType(dict(event.payload)),

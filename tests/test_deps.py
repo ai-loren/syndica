@@ -240,3 +240,60 @@ def test_sources_are_read_as_utf_8_regardless_of_locale(tmp_path):
     result = _run_checker('--root', str(tmp_path / 'src'), env=C_LOCALE)
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'UnicodeDecodeError' not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ('owner', 'source'),
+    [
+        ('server/app.py', 'from syndica.serve import build\n'),
+        ('server/app.py', 'from syndica import serve\n'),
+        ('kernel/entry.py', 'from syndica.__main__ import main\n'),
+        ('cli/host.py', 'import syndica.serve\n'),
+        ('backends/alpha/client.py', 'from syndica.__main__ import main\n'),
+    ],
+)
+def test_a_component_importing_a_composition_root_is_caught(tmp_path, owner, source):
+    module = tmp_path / 'src' / 'syndica' / owner
+    module.parent.mkdir(parents=True)
+    module.write_text(source)
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert owner in result.stdout
+    assert 'composition root' in result.stdout
+    assert '注入' in result.stdout
+
+
+def test_a_composition_root_may_import_another_root_and_every_component(tmp_path):
+    package = tmp_path / 'src' / 'syndica'
+    package.mkdir(parents=True)
+    (package / '__main__.py').write_text(
+        'from syndica.serve import build\n'
+        'from syndica.cli import main\n'
+        'from syndica.backends.alpha import x\n'
+    )
+    (package / 'serve.py').write_text(
+        'from syndica.server import app\nfrom syndica.cli import main\n'
+    )
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('relative', ['web.py', 'web/assets.py', 'shared/util.py'])
+def test_an_unclassified_top_level_module_is_caught(tmp_path, relative):
+    module = tmp_path / 'src' / 'syndica' / relative
+    module.parent.mkdir(parents=True)
+    module.write_text('')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert relative in result.stdout
+    assert 'scripts/check_deps.py' in result.stdout
+
+
+def test_every_top_level_entry_of_the_real_package_is_classified():
+    package = REPO_ROOT / 'src' / 'syndica'
+    names = {
+        entry.name.removesuffix('.py')
+        for entry in os.scandir(package)
+        if entry.name != '__pycache__' and (entry.is_dir() or entry.name.endswith('.py'))
+    }
+    assert names == {'__init__', '__main__', 'backends', 'cli', 'kernel', 'runner'}

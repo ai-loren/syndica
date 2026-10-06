@@ -753,9 +753,13 @@ class ToolExecutor:
         self._background: BackgroundCalls | None = None
         self._background_after = 0.0
         self._background_timer: Callable[[float], Awaitable[None]] = asyncio.sleep
+        self._publish: Callable[[str, dict[str, Any]], None] | None = None
 
     def _attach_tracing(self, tracing: _Tracing) -> None:
         self._tracing = tracing
+
+    def _attach_events(self, publish: Callable[[str, dict[str, Any]], None]) -> None:
+        self._publish = publish
 
     def _tool_span(self, key: ToolCallKey, call: ToolCall) -> _Span:
         """一次调用的 span。每个追加结果块的地方各有一个（D2），包括没执行的、恢复时补上的。
@@ -1180,40 +1184,53 @@ class ToolExecutor:
         结局说的是这次执行，不是结果块：同段的兄弟被取消时整段的结果块都不落，已经跑完的这一次
         仍记它自己的结局，恢复时补上的那块另有一个 `interrupted` 的 span。
         """
-        if key is None:
-            result, _ = await self._execute_in_scope(
-                ctx,
-                call,
-                provenance,
-                execution_gate,
-                confirmation_lock,
-                siblings_external=siblings_external,
-                traced=None,
+        if self._publish is not None:
+            self._publish(
+                'tool_call_started',
+                {'tool_call_id': call.id, 'name': call.name, 'arguments': call.arguments},
             )
-            return result
-        token = entering_tool_call(key)
+        finished: dict[str, Any] = {'tool_call_id': call.id, 'outcome': 'cancelled'}
         try:
-            with self._tool_span(key, call) as span:
-                try:
-                    result, outcome = await self._execute_in_scope(
-                        ctx,
-                        call,
-                        provenance,
-                        execution_gate,
-                        confirmation_lock,
-                        siblings_external=siblings_external,
-                        traced=(key, span),
-                    )
-                except _JudgeFailure:
-                    span.attributes['tool.outcome'] = 'judge_failed'
-                    raise
-                except Exception:
-                    span.attributes['tool.outcome'] = 'aborted'
-                    raise
-                span.attributes['tool.outcome'] = outcome
+            if key is None:
+                result, finished['outcome'] = await self._execute_in_scope(
+                    ctx,
+                    call,
+                    provenance,
+                    execution_gate,
+                    confirmation_lock,
+                    siblings_external=siblings_external,
+                    traced=None,
+                )
                 return result
+            token = entering_tool_call(key)
+            try:
+                with self._tool_span(key, call) as span:
+                    try:
+                        result, outcome = await self._execute_in_scope(
+                            ctx,
+                            call,
+                            provenance,
+                            execution_gate,
+                            confirmation_lock,
+                            siblings_external=siblings_external,
+                            traced=(key, span),
+                        )
+                    except _JudgeFailure:
+                        span.attributes['tool.outcome'] = finished['outcome'] = 'judge_failed'
+                        raise
+                    except Exception:
+                        span.attributes['tool.outcome'] = finished['outcome'] = 'aborted'
+                        raise
+                    span.attributes['tool.outcome'] = finished['outcome'] = outcome
+                    background_id = result.meta.get('background_id')
+                    if outcome == 'backgrounded' and isinstance(background_id, str):
+                        finished['background_id'] = background_id
+                    return result
+            finally:
+                leaving_tool_call(token)
         finally:
-            leaving_tool_call(token)
+            if self._publish is not None:
+                self._publish('tool_call_finished', finished)
 
     async def _execute_in_scope(
         self,
@@ -1677,7 +1694,9 @@ class ToolExecutor:
                     args,
                 )
             request = (
-                self._confirmation_request(call, args, verdict)
+                self._confirmation_request(
+                    call, args, verdict, untrusted=provenance is TrustLevel.UNTRUSTED
+                )
                 if self._confirmation is not None and self._confirmation_agent_id is not None
                 else None
             )
@@ -1772,6 +1791,8 @@ class ToolExecutor:
         call: ToolCall,
         args: dict[str, Any],
         verdict: DangerVerdict,
+        *,
+        untrusted: bool,
     ) -> ConfirmationRequest:
         agent_id = self._confirmation_agent_id
         if agent_id is None:
@@ -1803,4 +1824,5 @@ class ToolExecutor:
             arguments=arguments,
             verdict=verdict,
             request_ref=peek_key('request'),
+            untrusted=untrusted,
         )

@@ -11,16 +11,17 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import time
 import weakref
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Any, Self
 
 from syndica.kernel.errors import ConfigError, ContractViolation
 
-__all__ = ['Event', 'EventBus', 'Subscription']
+__all__ = ['KERNEL_EVENTS', 'Event', 'EventBus', 'Subscription']
 
 
 def validate_positive_int(value: object, field: str) -> int:
@@ -70,6 +71,46 @@ class Event:
     agent_id: str
     payload: dict[str, Any] = field(default_factory=dict[str, Any])
     sequence: int = 0
+    # 墙钟纳秒，总线投递时打；0 是未知。不参与相等比较：同一件事两次运行的时刻不同。
+    time_ns: int = field(default=0, compare=False)
+
+
+# 内核自己发的事件种类与各自 payload 里必有的键。宿主与 Module 可以发别的种类；SSE 出口按这张表
+# 给每种内核事件生成 schema，所以内核新增一种事件必须同时在这里加一行。
+KERNEL_EVENTS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        'agent_start': (),
+        'agent_end': ('stop_reason',),
+        'agent_error': ('error_type', 'expected', 'received', 'next_action'),
+        'turn_start': ('turn',),
+        'turn_end': ('turn',),
+        'compaction': ('trigger', 'blocks_before', 'blocks_after', 'tokens_before', 'tokens_after'),
+        'budget_exhausted': ('dimensions', 'disposition'),
+        'budget_changed': ('view',),
+        'progress_regressed': ('rubrics',),
+        'progress_stalled': ('turns',),
+        'goal_drift': ('confirmed',),
+        'user_input_requested': ('request_id', 'question'),
+        'user_question_requested': ('request_id', 'question', 'options'),
+        'tool_confirmation_requested': (
+            'request_id',
+            'tool_call_id',
+            'tool_name',
+            'arguments',
+            'verdict',
+            'untrusted',
+        ),
+        'human_request_resolved': ('request_id', 'outcome'),
+        'message_appended': ('generation', 'index', 'block'),
+        'transcript_reset': ('generation', 'reason'),
+        'tool_call_started': ('tool_call_id', 'name', 'arguments'),
+        'tool_call_finished': ('tool_call_id', 'outcome'),
+        'agent_spawned': ('parent_id', 'name'),
+        'agent_status': ('status',),
+        'agent_removed': (),
+        'artifact_registered': ('ref',),
+    }
+)
 
 
 def _require_unassigned_sequence(event: Event) -> None:
@@ -233,13 +274,20 @@ class EventBus:
         就不能既进内存队列又出 SSE，静默降级成一条残缺的可观测记录更糟。拷贝只发生一次、在投递
         之前，因此要么所有订阅者都收到，要么谁都没收到。
         """
+        self._publish(event)
+
+    def _publish(self, event: Event) -> None:
+        """`emit` 的同步本体。轨迹的观察者在 `Context.append` 里调它：追加与它的事件之间不能有
+        挂起点，否则别的任务在两者之间发的事件会排到这一块前面，而客户端按事件顺序重建轨迹。"""
         # 无订阅者、总线已关闭时也照样拷：否则 payload 合不合约要看当时有没有人在听，一个确定
         # 的编程错误会退化成只在特定时序下现身的 heisenbug。
         _require_unassigned_sequence(event)
         snapshot = _snapshot(event)
         if self._closed:
             return
-        snapshot = replace(snapshot, sequence=self._next_sequence)
+        snapshot = replace(
+            snapshot, sequence=self._next_sequence, time_ns=snapshot.time_ns or time.time_ns()
+        )
         self._next_sequence += 1
         # 必须先快照订阅者集合：缓冲满时被挤掉的那条事件在 append 里当场回收，它 payload 的
         # __del__ 于是运行在本循环中途，而 __del__ 里 subscribe / close 会改动 _buffers——直接
