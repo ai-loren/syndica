@@ -72,6 +72,10 @@ class LoginResponse(_Model):
 
 
 class BudgetRequest(_Model):
+    # strict：宽松模式把 true 收成 1、"3" 收成 3、1.0 收成 1，转换在内核的 Budget 看到值之前就做完，
+    # 内核那道「拒 bool」的检查于是从不触发——`{"turns": true}` 静默变成 1 轮的预算。
+    model_config = ConfigDict(extra='forbid', strict=True)
+
     tokens: int | None = Field(default=None, ge=1)
     cost: str | None = Field(default=None, description='十进制金额字符串，例如 "0.50"')
     wall_clock_s: float | None = Field(default=None, gt=0)
@@ -122,6 +126,13 @@ class ArtifactOut(_Model):
 
 class ArtifactSummary(ArtifactOut):
     versions: int
+    note: str = Field(
+        default='',
+        description=(
+            '最近一次 Deliver 时模型写的说明（不可信的自由文本，按文本显示）；'
+            '这个 server 进程里没交付过就是空串'
+        ),
+    )
 
 
 class ArtifactList(_Model):

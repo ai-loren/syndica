@@ -194,6 +194,12 @@ def releasing_agent_id(token: Token[_Assignment | None]) -> None:
     _ASSIGNED.reset(token)
 
 
+def spawning() -> bool:
+    """此刻是不是在 `Runtime.spawn` 调工厂的那段里：在这里构造的 Agent 一律先攒着轨迹事件，spawn
+    只放出它交回、并且登记成功的那一个。"""
+    return _ASSIGNED.get() is not None
+
+
 def assigned_agent_id() -> str | None:
     """取走 spawn 设下的 id：只有第一个构造的 Agent 拿到它，同一个工厂（以及它起的任务）再构造的拿
     各自的。"""

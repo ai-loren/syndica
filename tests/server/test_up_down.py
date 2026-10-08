@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -135,6 +136,23 @@ def test_up_and_down_refuse_inside_an_agent_environment(
     assert not (tmp_path / 'config' / 'syndica' / 'servers').exists()
 
 
+def test_the_server_module_entry_refuses_inside_an_agent_environment(
+    tmp_path: Path, workspace: Path
+):
+    environ = {**_environ(tmp_path), 'SYNDICA_AGENT_ENV': '1'}
+    result = subprocess.run(
+        [sys.executable, '-m', 'syndica.serve', '--foreground'],
+        cwd=workspace,
+        env=environ,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 2
+    assert 'Agent' in result.stderr and 'login' not in result.stdout
+    assert not (tmp_path / 'config' / 'syndica' / 'servers').exists()
+
+
 def test_a_port_in_use_is_reported_with_three_parts(tmp_path: Path, workspace: Path):
     import socket
 
@@ -177,6 +195,35 @@ def test_a_state_file_whose_server_is_gone_is_reported_and_removed(tmp_path: Pat
     result = serve.status(workspace, environ)
     assert result.exit_code == 3
     assert not paths.state.exists()
+
+
+def test_a_server_that_holds_its_lock_but_does_not_answer_keeps_its_state_file(
+    tmp_path: Path, workspace: Path
+):
+    environ = _environ(tmp_path)
+    paths = serve._Paths.of(workspace, environ)  # pyright: ignore[reportPrivateUsage]
+    paths.make()
+    paths.state.write_text(json.dumps({'pid': os.getpid(), 'port': 9, 'nonce': 'live'}))
+    held = os.open(paths.lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = serve.status(workspace, environ)
+        with pytest.raises(ConfigError) as refused:
+            serve.up(
+                serve.CliIO(stdin=None, stdout=None, stderr=None),  # type: ignore[arg-type]
+                workspace,
+                environ,
+                config='.syndica.yaml',
+                port=0,
+                foreground=False,
+                open_browser=False,
+            )
+    finally:
+        os.close(held)
+    assert result.exit_code == 1
+    assert str(os.getpid()) in result.output and 'syndica down' in result.output
+    assert paths.state.exists()
+    assert '已经有一个在跑' in refused.value.received
 
 
 def test_down_stops_gracefully_with_a_stream_open_and_the_session_saved(

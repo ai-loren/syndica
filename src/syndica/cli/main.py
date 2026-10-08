@@ -73,6 +73,7 @@ class RunRequest:
     trust_module_output: tuple[str, ...] = ()
     no_write: bool = False
     handoff: bool = False
+    verdict_exit: bool = False
     git_mode: str | None = None
     trace: str | None = None
     argv: tuple[str, ...] = ()
@@ -324,6 +325,14 @@ def _parser() -> _ArgumentParser:
         help=(
             '只读 run：Agent 只能用 Read、Grep、Glob 与派活、问人的工具，不会改动工作区；'
             '不能与 --session 同用'
+        ),
+    )
+    run.add_argument(
+        '--verdict-exit',
+        action='store_true',
+        help=(
+            '用验收裁决当退出码：pass 10、partial 11、block 12、unverified 13。'
+            '没装 acceptance 就退出 2。130、1 和交接被拒的 3 优先于这些码'
         ),
     )
     run.add_argument(
@@ -859,6 +868,7 @@ def _route(
         trust_module_output=tuple(namespace.trust_module_output),
         no_write=namespace.no_write,
         handoff=namespace.handoff,
+        verdict_exit=namespace.verdict_exit,
         git_mode=namespace.git_mode,
         trace=namespace.trace,
         argv=tuple(received),

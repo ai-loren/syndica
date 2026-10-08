@@ -1171,6 +1171,12 @@ export interface components {
             is_deliverable: boolean;
             /** Versions */
             versions: number;
+            /**
+             * Note
+             * @description 最近一次 Deliver 时模型写的说明（不可信的自由文本，按文本显示）；这个 server 进程里没交付过就是空串
+             * @default
+             */
+            note: string;
         };
         /** ArtifactVersions */
         ArtifactVersions: {

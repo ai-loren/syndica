@@ -3,7 +3,7 @@
   "info": {
     "title": "Syndica",
     "version": "1",
-    "description": "syndica 0.0.0 的 HTTP / SSE / WebSocket 面。标 x-syndica-stability: provisional 的字段来自内核里 M12 才冻结的类型，形状仍可能变。"
+    "description": "syndica 的 HTTP / SSE / WebSocket 面。标 x-syndica-stability: provisional 的字段来自内核里 M12 才冻结的类型，形状仍可能变。"
   },
   "paths": {
     "/api/v1/health": {
@@ -1083,6 +1083,12 @@
           "versions": {
             "title": "Versions",
             "type": "integer"
+          },
+          "note": {
+            "default": "",
+            "description": "最近一次 Deliver 时模型写的说明（不可信的自由文本，按文本显示）；这个 server 进程里没交付过就是空串",
+            "title": "Note",
+            "type": "string"
           }
         },
         "required": [
@@ -2208,10 +2214,12 @@
     "artifact_registered": {
       "type": "object",
       "required": [
-        "ref"
+        "ref",
+        "note"
       ],
       "properties": {
-        "ref": {}
+        "ref": {},
+        "note": {}
       },
       "additionalProperties": true
     },
@@ -2481,6 +2489,7 @@
   "x-syndica-rpc": {
     "path": "/api/v1/sessions/{sid}/rpc",
     "first_frame": "auth",
+    "refusal": "三个 WebSocket 都一样：被拒时先收一帧 RpcReply（ok=false，error 是三件套），再按关闭码关闭。4401 没认证、4404 会话没打开、4408 等认证的连接太多被挤掉、1013 已认证的流与 WebSocket 满了",
     "request": {
       "$ref": "#/components/schemas/RpcRequest"
     },

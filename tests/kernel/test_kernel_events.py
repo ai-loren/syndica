@@ -17,6 +17,7 @@ from syndica.kernel import (
     Budget,
     BudgetPolicy,
     ConfigError,
+    ConfirmationRequest,
     ContextBlock,
     Disposition,
     EventBus,
@@ -35,13 +36,15 @@ from syndica.kernel import (
 )
 from syndica.kernel.budget import BudgetView, Usage
 from syndica.kernel.context import ArtifactRef, Context
-from syndica.kernel.danger import DangerRequest
+from syndica.kernel.danger import NO_RULE_MATCHED, DangerRequest
 from syndica.kernel.events import KERNEL_EVENTS, Event, Subscription
 from syndica.kernel.history_blocks import HistoryKind, signed_block
+from syndica.kernel.hooks import HookResult, Junction
 from syndica.kernel.runtime import AgentFactory
 from syndica.kernel.stores.memory_artifact import InMemoryArtifactStore
+from syndica.kernel.tool_executor import ToolExecutor
 from syndica.kernel.tools import AskUser
-from syndica.kernel.transcript import block_payload, budget_payload, plain_data
+from syndica.kernel.transcript import artifact_payload, block_payload, budget_payload, plain_data
 from syndica.kernel.waiting import UserInput
 
 _TIMEOUT = 2.0
@@ -161,7 +164,7 @@ def test_the_kernel_event_table_is_exact():
         'agent_spawned': ('parent_id', 'name'),
         'agent_status': ('status',),
         'agent_removed': (),
-        'artifact_registered': ('ref',),
+        'artifact_registered': ('ref', 'note'),
     }
 
 
@@ -239,11 +242,15 @@ async def test_a_spawned_agent_is_announced_before_its_seeded_and_first_blocks()
     events = [event for event in await _drain(runtime, subscription) if event.agent_id == agent_id]
     assert events[0].kind == 'agent_spawned'
     assert events[0].payload == {'parent_id': None, 'name': 'Worker'}
+    assert (events[1].kind, events[1].payload) == (
+        'transcript_reset',
+        {'generation': 0, 'reason': 'seeded', 'blocks': 1},
+    )
     assert [
         (event.payload['index'], event.payload['block']['text'])
         for event in events
         if event.kind == 'message_appended'
-    ] == [(0, 'seeded'), (1, 'go'), (2, 'done')]
+    ] == [(1, 'go'), (2, 'done')]
 
 
 class _RefusingRegistry(InMemoryAgentRegistry):
@@ -466,7 +473,14 @@ async def test_a_turn_end_and_a_host_grant_each_publish_the_budget_view():
 def test_a_budget_payload_writes_amounts_as_decimal_strings_and_unknown_as_none():
     view = BudgetView(
         limit=Budget(cost=Decimal('0.1'), turns=3),
-        used=Usage(input_tokens=5, output_tokens=2, cost=None, turns=1, estimated=True),
+        used=Usage(
+            input_tokens=5,
+            output_tokens=2,
+            cached_input_tokens=3,
+            cost=None,
+            turns=1,
+            estimated=True,
+        ),
         remaining=Budget(cost=Decimal('0.1'), turns=2),
         exhausted=('turns',),
     )
@@ -475,7 +489,7 @@ def test_a_budget_payload_writes_amounts_as_decimal_strings_and_unknown_as_none(
         'used': {
             'input_tokens': 5,
             'output_tokens': 2,
-            'cached_input_tokens': 0,
+            'cached_input_tokens': 3,
             'cost': None,
             'turns': 1,
             'estimated': True,
@@ -568,4 +582,161 @@ def test_tool_meta_keeps_only_what_json_can_carry():
         extra={'tool_meta': {'handle': 'pty-1', 'pair': (1, 2), 'live': object(), 3: 'x'}},
     )
     assert block_payload(block)['tool_meta'] == {'handle': 'pty-1', 'pair': [1, 2], 'live': None}
+    assert block_payload(block)['tool_call_id'] == 'c1'
     assert plain_data({'deep': [[[[[[[[[['x']]]]]]]]]]}) == {'deep': [[[[[[[None]]]]]]]}
+
+
+def test_a_deliverable_artifact_is_published_as_one():
+    ref = ArtifactRef(
+        id='file:a.md',
+        path='a.md',
+        kind='document',
+        mime='text/markdown',
+        version='v1',
+        producer='w',
+        is_deliverable=True,
+    )
+    assert artifact_payload(ref)['is_deliverable'] is True
+
+
+class _Blocked:
+    def __init__(self) -> None:
+        self.events = EventBus()
+
+    async def wait_for(self, agent_id: str, waiter: Any) -> WaitResult:
+        await asyncio.Event().wait()
+        raise AssertionError('unreachable')
+
+
+async def _cancelled(work: Any, runtime: _Blocked) -> list[Event]:
+    async with runtime.events.subscribe() as subscription:
+        task = asyncio.create_task(work)
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await runtime.events.close()
+        return [event async for event in subscription]
+
+
+async def test_a_cancelled_question_still_publishes_its_resolution():
+    runtime = _Blocked()
+    events = await _cancelled(AskUser(runtime, 'agent-1').execute('which?', timeout=60), runtime)  # pyright: ignore[reportArgumentType]
+    asked, resolved = events
+    assert (resolved.kind, resolved.payload) == (
+        'human_request_resolved',
+        {'request_id': asked.payload['request_id'], 'outcome': 'cancelled'},
+    )
+
+
+async def test_a_cancelled_confirmation_still_publishes_its_resolution():
+    runtime = _Blocked()
+    request = ConfirmationRequest(
+        request_id='nonce-1',
+        agent_id='agent-1',
+        tool_call_id='c1',
+        tool_name='Echo',
+        arguments='{}',
+        verdict=NO_RULE_MATCHED,
+    )
+    events = await _cancelled(MailboxConfirmationHandler().confirm(runtime, request), runtime)  # pyright: ignore[reportArgumentType]
+    assert [(event.kind, event.payload.get('outcome')) for event in events] == [
+        ('tool_confirmation_requested', None),
+        ('human_request_resolved', 'cancelled'),
+    ]
+
+
+async def test_forking_a_long_transcript_publishes_one_reset_and_drops_nothing():
+    runtime = Runtime()
+    subscription = runtime.events.subscribe()
+    seed = [ContextBlock(role='user', content=f'block {n}') for n in range(1500)]
+
+    def seeded(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        agent = _factory(ScriptedLLM([]))(hooks, events)
+        for block in seed:
+            agent.context.append(block)
+        return agent
+
+    parent = await runtime.spawn(seeded)
+    child = await runtime.spawn(_factory(ScriptedLLM([])), fork_from=parent, parent_id=parent)
+    events = await _drain(runtime, subscription)
+    assert subscription.dropped == 0
+    resets = [
+        (event.agent_id, event.payload['blocks'])
+        for event in events
+        if event.kind == 'transcript_reset'
+    ]
+    assert resets == [(parent, 1500), (child, 1500)]
+    assert [event for event in events if event.kind == 'message_appended'] == []
+
+
+async def test_only_the_agent_spawn_returns_is_announced_and_a_helper_built_first_is_not():
+    runtime = Runtime()
+    subscription = runtime.events.subscribe()
+    built: list[BaseAgent] = []
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        helper = _factory(ScriptedLLM([]), seed=ContextBlock(role='user', content='helper'))(
+            hooks, events
+        )
+        agent = _factory(ScriptedLLM([]), seed=ContextBlock(role='user', content='real'))(
+            hooks, events
+        )
+        built.extend([helper, agent])
+        return agent
+
+    agent_id = await runtime.spawn(build)
+    events = await _drain(runtime, subscription)
+    helper, agent = built
+    assert agent.agent_id == agent_id
+    assert [event for event in events if event.agent_id == helper.agent_id] == []
+    mine = [event.kind for event in events if event.agent_id == agent_id]
+    assert mine[:2] == ['agent_spawned', 'transcript_reset']
+
+
+async def test_a_spawn_that_rolls_back_publishes_nothing_for_a_helper_or_the_agent():
+    runtime = Runtime(registry=_RefusingRegistry())
+    subscription = runtime.events.subscribe()
+    built: list[BaseAgent] = []
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        helper = _factory(ScriptedLLM([]), seed=ContextBlock(role='user', content='h'))(
+            hooks, events
+        )
+        agent = _factory(ScriptedLLM([]), seed=ContextBlock(role='user', content='a'))(
+            hooks, events
+        )
+        built.extend([helper, agent])
+        return agent
+
+    with pytest.raises(ConfigError):
+        await runtime.spawn(build)
+    events = await _drain(runtime, subscription)
+    ids = {agent.agent_id for agent in built}
+    assert [event for event in events if event.agent_id in ids] == []
+
+
+class _Raises(Tool):
+    __tool_name__ = 'Raises'
+    __tool_command_args__ = ()
+
+    async def execute(self) -> ToolResult:
+        """Always fails."""
+        raise RuntimeError('boom')
+
+
+async def test_an_untraced_call_that_raises_is_reported_as_aborted():
+    published: list[tuple[str, dict[str, Any]]] = []
+    hooks = HooksCenter()
+
+    async def broken(**kwargs: Any) -> HookResult:
+        raise RuntimeError('hook broke')
+
+    hooks.register(Junction.PRE_TOOL_USE, broken)
+    executor = ToolExecutor(tools={'Raises': _Raises()}, hooks=hooks)
+    executor._attach_events(lambda kind, payload: published.append((kind, dict(payload))))  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RuntimeError):
+        await executor.execute_tool_calls(
+            Context(), [ToolCall(id='r1', name='Raises', arguments='{}')]
+        )
+    assert published[-1] == ('tool_call_finished', {'tool_call_id': 'r1', 'outcome': 'aborted'})

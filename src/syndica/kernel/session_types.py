@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
 
+from syndica.kernel.budget import Usage
 from syndica.kernel.context import ContextBlock
 
-__all__ = ['SessionMeta', 'SessionRecord', 'SessionStatus']
+__all__ = ['SessionBudget', 'SessionMeta', 'SessionRecord', 'SessionStatus']
 
 
 class SessionStatus(Enum):
@@ -42,6 +44,20 @@ class SessionMeta:
     updated_at: float = field(default_factory=time.time)
 
 
+@dataclass(frozen=True)
+class SessionBudget:
+    """可加维度的上限与已用。墙钟不在这里：每次打开会话都从新的截止时刻起算。
+
+    恢复时上限以这次 Runtime 的 `BudgetPolicy` 为准（给了新上限就换掉这里存的）；`used` 照旧续上。
+    没有这份记录的旧会话读成 None，从零开始。
+    """
+
+    tokens: int | None
+    cost: Decimal | None
+    turns: int | None
+    used: Usage
+
+
 @dataclass
 class SessionRecord:
     """一次会话的全部可序列化状态：元数据 + 根 Agent 的轨迹 + 入队时的前缀快照与 flags。"""
@@ -54,3 +70,5 @@ class SessionRecord:
     model: str = ''
     tools: list[str] = field(default_factory=list[str])
     flags: dict[str, bool | int | str] = field(default_factory=dict[str, bool | int | str])
+    # 可加维度的上限与已用。None：这份记录没记预算（旧格式，或这次运行没有可加上限也没有消耗）。
+    budget: SessionBudget | None = None

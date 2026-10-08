@@ -51,7 +51,7 @@ __all__ = [
     'write_handoff',
 ]
 
-SCHEMA = 'syndica.handoff/1'
+SCHEMA = 'syndica.handoff/2'
 # D15：Agent 改忽略规则就能让本该被忽略的文件（run 中途新建的 `.env`）变成「新改动」。
 BUILTIN_PROTECTED = ('**/.gitignore', '**/.gitattributes')
 _OWN = '.syndica'
@@ -205,14 +205,17 @@ def front_matter(
     git: str,
     protected_changed: Sequence[str],
     exit_code: int | None,
+    acceptance_verdict: str | None = None,
 ) -> str:
     changed = json.dumps(list(protected_changed), ensure_ascii=True)
+    acceptance = 'null' if acceptance_verdict is None else acceptance_verdict
     return (
         '---\n'
         f'schema: {SCHEMA}\n'
         f'status: {status}\n'
         f'host_verify: {host_verify}\n'
         f'reviewer_verdict: {verdict}\n'
+        f'acceptance_verdict: {acceptance}\n'
         f'git: {git}\n'
         f'protected_changed: {changed}\n'
         f'exit_code: {"null" if exit_code is None else exit_code}\n'

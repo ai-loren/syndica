@@ -13,6 +13,20 @@ export class Problem extends Error {
   }
 }
 
+/**
+ * server 从不注册 Service Worker。页面却被一个控制着：多半是 server 没在跑时，别的进程在同一个
+ * 端口上起过页面并注册了它，它会截下登录码与之后的每个 API 请求。这时不登录、不带令牌发请求。
+ */
+export function interceptedByServiceWorker(): Problem | null {
+  if (!('serviceWorker' in navigator) || !navigator.serviceWorker.controller) return null;
+  return new Problem(
+    0,
+    '这个页面不被任何 Service Worker 接管（Syndica 从不注册它）',
+    `页面被 ${navigator.serviceWorker.controller.scriptURL} 接管着，它能截下登录码与令牌`,
+    '在浏览器的站点设置里清除这个地址的站点数据，再从 syndica down / syndica up 新打印的链接打开',
+  );
+}
+
 export function token(): string | null {
   return localStorage.getItem(KEY);
 }

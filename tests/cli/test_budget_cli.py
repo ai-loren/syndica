@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
@@ -14,6 +15,7 @@ from syndica.cli.config import config_from_text
 from syndica.cli.host import (
     RuntimeCliHost,
     _unreplayable_budget,  # pyright: ignore[reportPrivateUsage]
+    _with_stored_limits,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.cli.main import (
     CliIO,
@@ -22,8 +24,17 @@ from syndica.cli.main import (
     _ParserExit,  # pyright: ignore[reportPrivateUsage]
 )
 from syndica.cli.trust import NO_TRUST_GATE
-from syndica.kernel import ConfigError, ContextBlock, LLMConfig, ScriptedLLM, ScriptedTurn, ToolCall
-from syndica.kernel.budget import Prices
+from syndica.kernel import (
+    ConfigError,
+    ContextBlock,
+    FileSessionStore,
+    LLMConfig,
+    ScriptedLLM,
+    ScriptedTurn,
+    SessionBudget,
+    ToolCall,
+)
+from syndica.kernel.budget import Budget, BudgetPolicy, Prices, Usage
 from syndica.kernel.budget_tree import BudgetRefused
 
 
@@ -112,6 +123,43 @@ def test_an_unknown_exhaustion_disposition_is_refused() -> None:
 
 
 # ---- 预算那一行 ----
+
+
+def test_resuming_without_a_new_limit_keeps_the_stored_one_and_its_usage(tmp_path: Path) -> None:
+    llm = ScriptedLLM([ScriptedTurn(content='one'), ScriptedTurn(content='two')])
+    host = _host(tmp_path, llm, stderr=StringIO())
+    try:
+        host.run_request(RunRequest(prompt='go', agent='Worker', max_turns=3))
+        store = FileSessionStore(tmp_path / '.syndica' / 'sessions')
+        [meta] = asyncio.run(store.list_metas())
+        host.run_request(RunRequest(prompt='again', session=meta.sid, allow_resume=True))
+    finally:
+        host.close()
+    record = asyncio.run(store.load(meta.sid))
+    assert record is not None and record.budget is not None
+    assert (record.budget.turns, record.budget.used.turns) == (3, 2)
+
+
+def test_a_new_limit_on_resume_replaces_the_stored_one() -> None:
+    stored = SessionBudget(tokens=50, cost=Decimal('1'), turns=3, used=Usage(turns=2))
+    policy = BudgetPolicy(root=Budget(turns=200))
+    kept = _with_stored_limits(policy, stored, turns=None, tokens=None, cost=None)
+    given = _with_stored_limits(
+        BudgetPolicy(root=Budget(turns=9, tokens=70)), stored, turns=9, tokens=70, cost=None
+    )
+    assert (kept.root.turns, kept.root.tokens, kept.root.cost) == (3, 50, Decimal('1'))
+    assert (given.root.turns, given.root.tokens, given.root.cost) == (9, 70, Decimal('1'))
+
+
+def test_verdict_exit_without_acceptance_is_exit_2(tmp_path: Path) -> None:
+    host = _host(tmp_path, ScriptedLLM([ScriptedTurn(content='done')]), stderr=StringIO())
+    try:
+        with pytest.raises(ConfigError) as caught:
+            host.run_request(RunRequest(prompt='go', verdict_exit=True))
+    finally:
+        host.close()
+    assert getattr(caught.value, 'exit_code', None) == 2
+    assert '--verdict-exit' in caught.value.next_action
 
 
 def test_a_run_without_a_budget_of_its_own_prints_no_budget_line(tmp_path: Path) -> None:

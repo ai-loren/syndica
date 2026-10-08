@@ -174,6 +174,8 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'artifact.path': 'str',
         'artifact.version': 'str',
         'artifact.trust': 'str',
+        # `Deliver` 时模型写的「这是什么 / 为什么交付它」：自由文本，照常过脱敏。
+        'artifact.note': 'str',
         'provenance.source': 'str',
         'provenance.trust': 'str',
         'verdict.status': 'str',
@@ -202,6 +204,9 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'budget.percent_left': 'int',
         'budget.dimensions': 'str[]',
         'budget.disposition': 'str',
+        # 宿主在周期之外追加预算的墙钟时刻（Unix 毫秒）：事件记在下一个周期的 agent span 上，span
+        # 的开始时刻不是追加发生的时刻。
+        'budget.granted_at_ms': 'int',
         # 伴生 Agent 的 agent span 上：它替谁干活。
         'agent.serves': 'str',
         # 长程（事件上）：量到的进度、回退的条、停滞了几轮、漂移检查的两层结论、策略交回的动作。

@@ -396,6 +396,12 @@ def _bad_arguments_result(call: ToolCall, tool: Tool, detail: str) -> ToolResult
     )
 
 
+def _note_background(finished: dict[str, Any], result: ToolResult) -> None:
+    background_id = result.meta.get('background_id')
+    if finished['outcome'] == 'backgrounded' and isinstance(background_id, str):
+        finished['background_id'] = background_id
+
+
 def _tool_raised_result(call: ToolCall, exc: BaseException, trust: TrustLevel) -> ToolResult:
     """`trust` 由调用方按工具会不会带进外部内容算（`_raised_trust`）：异常文字可以整份来自工具读到
     的外部内容，也可以只是参数的回显。"""
@@ -1192,15 +1198,23 @@ class ToolExecutor:
         finished: dict[str, Any] = {'tool_call_id': call.id, 'outcome': 'cancelled'}
         try:
             if key is None:
-                result, finished['outcome'] = await self._execute_in_scope(
-                    ctx,
-                    call,
-                    provenance,
-                    execution_gate,
-                    confirmation_lock,
-                    siblings_external=siblings_external,
-                    traced=None,
-                )
+                try:
+                    result, finished['outcome'] = await self._execute_in_scope(
+                        ctx,
+                        call,
+                        provenance,
+                        execution_gate,
+                        confirmation_lock,
+                        siblings_external=siblings_external,
+                        traced=None,
+                    )
+                except _JudgeFailure:
+                    finished['outcome'] = 'judge_failed'
+                    raise
+                except Exception:
+                    finished['outcome'] = 'aborted'
+                    raise
+                _note_background(finished, result)
                 return result
             token = entering_tool_call(key)
             try:
@@ -1222,9 +1236,7 @@ class ToolExecutor:
                         span.attributes['tool.outcome'] = finished['outcome'] = 'aborted'
                         raise
                     span.attributes['tool.outcome'] = finished['outcome'] = outcome
-                    background_id = result.meta.get('background_id')
-                    if outcome == 'backgrounded' and isinstance(background_id, str):
-                        finished['background_id'] = background_id
+                    _note_background(finished, result)
                     return result
             finally:
                 leaving_tool_call(token)

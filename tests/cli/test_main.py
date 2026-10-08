@@ -211,6 +211,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'trust_module_output': (),
         'no_write': False,
         'handoff': False,
+        'verdict_exit': False,
         'git_mode': None,
         'trace': None,
         'argv': ('write', 'the report'),
@@ -232,6 +233,7 @@ def test_default_and_explicit_run_share_one_request_shape() -> None:
         'trust_module_output': (),
         'no_write': True,
         'handoff': False,
+        'verdict_exit': False,
         'git_mode': None,
         'trace': None,
         'argv': (

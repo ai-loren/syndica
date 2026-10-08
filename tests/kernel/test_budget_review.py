@@ -682,7 +682,7 @@ async def test_granting_to_an_unknown_agent_is_refused_saying_how_to_check() -> 
 # ---- 会话与产物 ----
 
 
-async def test_a_resumed_session_starts_with_a_fresh_budget(tmp_path: Any) -> None:
+async def test_a_resumed_session_continues_the_used_budget(tmp_path: Any) -> None:
     from syndica.kernel.redaction import RuleRedactor
     from syndica.kernel.stores.file_session import FileSessionStore
 
@@ -712,7 +712,8 @@ async def test_a_resumed_session_starts_with_a_fresh_budget(tmp_path: Any) -> No
         view = second._budget.pool().view()  # pyright: ignore[reportPrivateUsage]
     finally:
         await second.shutdown()
-    assert view.used.turns == 0
+    assert view.used.turns == 1
+    assert view.limit.turns == 10
 
 
 @pytest.mark.parametrize('disposition', [Exhaustion.HARD_STOP, Exhaustion.GRACEFUL_WRAPUP])
@@ -836,7 +837,8 @@ async def test_running_out_of_budget_inside_a_retry_stops_for_budget_not_error()
     assert ctx.stop_reason is StopReason.BUDGET
 
 
-async def test_an_isolation_failure_hands_the_reservation_back(tmp_path: Any) -> None:
+@pytest.mark.parametrize('seam', ['stage_isolation', 'finish_isolation'])
+async def test_an_isolation_failure_hands_the_reservation_back(tmp_path: Any, seam: str) -> None:
     from syndica.kernel.isolation import LocalIsolator
     from syndica.kernel.local_workspace import LocalWorkspace
     from syndica.kernel.workspace_router import WorkspaceRouter
@@ -851,7 +853,13 @@ async def test_an_isolation_failure_hands_the_reservation_back(tmp_path: Any) ->
     def broken(*args: Any, **kwargs: Any) -> Any:
         raise OSError('copy failed')
 
-    router.isolate = broken  # type: ignore[method-assign]
+    async def broken_copy(*args: Any, **kwargs: Any) -> Any:
+        raise OSError('copy failed')
+
+    if seam == 'stage_isolation':
+        router.stage_isolation = broken_copy  # type: ignore[method-assign]
+    else:
+        router.finish_isolation = broken  # type: ignore[method-assign]
     runtime = Runtime(workspace=router, budget=BudgetPolicy(root=Budget(turns=10)))
     try:
         with pytest.raises(OSError):

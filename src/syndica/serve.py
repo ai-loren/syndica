@@ -50,6 +50,8 @@ _STOP_TIMEOUT_S = 15.0
 # 流关掉之后仍不结束的连接最多再等这么久：之后 uvicorn 取消它们，会话照样在 lifespan 里存盘。
 _GRACEFUL_S = 5
 _DEPENDENCIES = ('starlette', 'uvicorn', 'websockets')
+# server 事件循环默认执行器的线程数（硬约束 14：有界）。
+_BLOCKING_WORKERS = 8
 
 
 def up(
@@ -125,6 +127,13 @@ def status(workspace_root: Path, environ: Mapping[str, str]) -> CliOutcome:
     running = _running(paths)
     if running is None:
         return CliOutcome('这个工作区没有在跑的 Web 服务。用 syndica up 启动。', 3)
+    if not running['responding']:
+        return CliOutcome(
+            f'期望: 在跑的 Web 服务（pid {running["pid"]}）在 2 秒内答 /api/v1/health。\n'
+            '实际: 它持着 server 锁、还在跑，但这一刻没有答（多半是在打开一个大工作区的会话）。\n'
+            f'下一步: 过几秒再 syndica status；一直不答就看 {paths.log}，或 syndica down 停掉它。',
+            1,
+        )
     return CliOutcome(
         f'在跑：http://127.0.0.1:{running["port"]}/（pid {running["pid"]}）\n日志：{paths.log}',
         0,
@@ -205,10 +214,11 @@ def _alive(pid: int) -> bool:
 
 
 def _running(paths: _Paths) -> dict[str, Any] | None:
-    """状态文件指向的 server 还活着（`/health` 交出的 nonce 与状态文件里的一致）就交回它。
+    """状态文件指向的 server 还活着就交回它；`responding` 说它的 `/health` 这一刻答没答。
 
-    只看 pid 不够：pid 会被重用，端口也会被别的进程占上；nonce 对得上，才说明那个端口上就是写下这份
-    状态的那个进程。"""
+    活不活由 server 锁定：server 进程从启动到退出一直持着它。只看 `/health` 不行——一次会话打开
+    里的同步工作就能让它几秒不答，那时删掉状态文件，这个 server 就再也找不到、停不掉。只看 pid
+    也不行：pid 会被重用。锁空着才是真的没在跑，这时状态文件是上一次留下的，删掉。"""
     try:
         state = json.loads(paths.state.read_text(encoding='utf-8'))
     except (OSError, ValueError):
@@ -220,10 +230,31 @@ def _running(paths: _Paths) -> dict[str, Any] | None:
             health = json.loads(response.read())
     except Exception:
         health = {}
-    if not isinstance(health, dict) or health.get('nonce') != state.get('nonce'):  # pyright: ignore[reportUnknownMemberType]
-        paths.state.unlink(missing_ok=True)
-        return None
-    return state
+    if isinstance(health, dict) and health.get('nonce') == state.get('nonce'):  # pyright: ignore[reportUnknownMemberType]
+        return {**state, 'responding': True}
+    if _lock_held(paths):
+        return {**state, 'responding': False}
+    paths.state.unlink(missing_ok=True)
+    return None
+
+
+def _lock_held(paths: _Paths) -> bool:
+    """有进程持着这个工作区的 server 锁吗。只试一下，拿到了马上放掉。"""
+    try:
+        descriptor = os.open(paths.lock, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
 
 
 def _spawn(workspace_root: Path, paths: _Paths, config: str, port: int) -> dict[str, Any]:
@@ -275,8 +306,14 @@ def _spawn(workspace_root: Path, paths: _Paths, config: str, port: int) -> dict[
 
 
 def serve_main(argv: list[str]) -> int:
-    """server 进程本身。后台模式下，第一行 stdout 是给 `up` 的握手，之后 stdout 与 stderr 都进
-    日志。"""
+    """server 进程本身。后台模式下，第一行 stdout 是给 `up` 的握手；握手之后 stdout / stderr 接到
+    /dev/null，日志只经脱敏 handler 写。"""
+    # 这个入口照样会发一份人的登录码：与 up / down 一样在 Agent 环境里拒绝。
+    try:
+        _refuse_in_agent(os.environ, 'serve')
+    except ConfigError as error:
+        sys.stderr.write(f'{error.message}\n')
+        return 2
     parser = argparse.ArgumentParser(prog='syndica.serve')
     parser.add_argument('--config', default='.syndica.yaml')
     parser.add_argument('--port', type=int, default=0)
@@ -420,12 +457,15 @@ def _serve(
                 lifespan='on',
                 ws='websockets-sansio',
                 timeout_graceful_shutdown=_GRACEFUL_S,
+                # 不给 uvicorn 自己的日志配置：它的记录要传到根 logger、经脱敏 handler 进 server
+                # 日志。它自己的 handler 写 stderr，握手之后 stderr 是 /dev/null。
+                log_config=None,
             )
         )
 
         async def run() -> None:
             loop = asyncio.get_running_loop()
-            loop.set_default_executor(DaemonExecutor())
+            loop.set_default_executor(DaemonExecutor(workers=_BLOCKING_WORKERS))
             server.loop = loop
             await server.serve(sockets=[sock])
 

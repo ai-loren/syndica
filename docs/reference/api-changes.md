@@ -25,3 +25,15 @@
 - WebSocket：人的终端 `sessions/{sid}/pty`、Agent 终端的只读镜像 `sessions/{sid}/agent-pty/{handle}`
   （`x-syndica-pty`）；RPC 加 `activate_rubric`。
 - 事件：内核加 `progress_measured`；快照的 `progress` 是每个 Agent 最近一次量到的进度。
+
+## 2026-10-08 · `2bffe79d1f69` · WebSocket 的拒绝、交付说明、描述不带版本号（追加，不破坏）
+
+- WebSocket 被拒时先收一帧 `RpcReply`（`ok: false`，`error` 是三件套），再按关闭码关闭：4401 没认证、
+  4404 会话没打开、4408 等认证的连接太多被挤掉（新）、1013 已认证的流与 WebSocket 满了
+  （`x-syndica-rpc.refusal`）。没认证的连接不再占 16 个名额。
+- `reset` 只有一种形状：没有 `id:`，`data` 是 `{}`。内核总线丢过事件时发的 reset 也是这一种（此前那一种
+  带 id、带 `reason` / `dropped`，与这里写的契约不符）。
+- 预算请求体（建会话、`grant`、`budget_answer`）按严格类型校验：`true`、`"3"`、`1.0` 当整数都返回 422。
+- 事件 `artifact_registered` 加必有键 `note`（`Deliver` 时模型写的说明，没有是空串）；产物列表的每一项加
+  `note`（这个 server 进程里最近一次交付的说明）。都是不可信的自由文本，界面按文本显示。
+- `info.description` 不再带 syndica 的版本号；契约的版本是 `info.version`。

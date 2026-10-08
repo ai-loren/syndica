@@ -45,13 +45,27 @@ async def test_artifact_listing_versions_preview_and_diff_are_redacted_json():
         missing = await client.get(
             f'{base}/diff', params={'id': ARTIFACT['id']}, headers=server.login()
         )
-    assert listing.json() == {'artifacts': [{**ARTIFACT, 'versions': 2}]}
+    assert listing.json() == {'artifacts': [{**ARTIFACT, 'versions': 2, 'note': ''}]}
     assert [row['version'] for row in versions.json()['versions']] == ['sha256:old', 'sha256:new']
     assert preview.headers['content-type'] == 'application/json'
     assert preview.json()['text'].startswith('<script>') and SECRET not in preview.text
     assert diff.json()['changed'] is True and SECRET not in diff.text
     assert assembly.handles[0].calls[-1] == ('diff', ARTIFACT['id'], 'sha256:old', 'sha256:new')
     assert missing.status_code == 422 and 'old' in missing.json()['expected']
+
+
+async def test_the_latest_delivery_note_is_listed_with_the_artifact_and_redacted():
+    assembly = FakeAssembly()
+    async with running(assembly) as server, httpx.AsyncClient(base_url=server.base) as client:
+        await _session(client, server)
+        handle = assembly.handles[0]
+        await handle.emit('artifact_registered', ref=dict(ARTIFACT), note='first draft')
+        await handle.emit('artifact_registered', ref=dict(ARTIFACT), note=f'final, key {SECRET}')
+        await handle.emit('artifact_registered', ref=dict(ARTIFACT), note='')
+        await asyncio.sleep(0.05)
+        listing = await client.get('/api/v1/sessions/s0/artifacts', headers=server.login())
+    [row] = listing.json()['artifacts']
+    assert row['note'].startswith('final, key ') and SECRET not in listing.text
 
 
 async def test_artifact_content_is_a_sandboxed_attachment_that_never_executes():
@@ -183,8 +197,10 @@ async def test_a_terminal_socket_without_authentication_opens_no_terminal():
     async with running(assembly) as server, httpx.AsyncClient(base_url=server.base) as client:
         await _session(client, server)
         socket = await _socket(server.base, server.port, '/api/v1/sessions/s0/pty', 'wrong')
+        refusal = json.loads(await asyncio.wait_for(socket.recv(), 8))
         with pytest.raises(websockets.exceptions.ConnectionClosed):
             await asyncio.wait_for(socket.recv(), 8)
+    assert refusal['ok'] is False
     assert assembly.handles[0].terminals == []
 
 

@@ -120,6 +120,7 @@ import logging
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -128,6 +129,7 @@ from syndica.kernel.agent import _SERVED, BaseAgent  # pyright: ignore[reportPri
 from syndica.kernel.agent_types import AgentInfo, AgentStatus, ExitMode
 from syndica.kernel.budget import Budget, BudgetPolicy, BudgetView
 from syndica.kernel.budget_tree import BudgetRefused, BudgetTree, granted_dims
+from syndica.kernel.call_limit import wall_seconds_left
 from syndica.kernel.context import (
     Context,
     ContextBlock,
@@ -195,7 +197,7 @@ from syndica.kernel.protocols.artifact import ArtifactStore
 from syndica.kernel.protocols.session import SessionStore
 from syndica.kernel.redaction import Redactor, RuleRedactor
 from syndica.kernel.session_redaction import redacted_record
-from syndica.kernel.session_types import SessionMeta, SessionRecord, SessionStatus
+from syndica.kernel.session_types import SessionBudget, SessionMeta, SessionRecord, SessionStatus
 from syndica.kernel.stores import InMemoryAgentRegistry, InMemoryMessageBroker
 from syndica.kernel.tools import orchestration_tools
 from syndica.kernel.tools.budget import GetBudget
@@ -220,6 +222,8 @@ if TYPE_CHECKING:
 __all__ = ['AgentFactory', 'Runtime', 'validate_agent_factories']
 
 logger = logging.getLogger(__name__)
+# 隔离拷贝的线程上限。默认执行器不封顶，几个会话同时拷大工作区会把线程数拉到没有上界。
+_COPY_WORKERS = 2
 
 AgentFactory = Callable[[HooksCenter, EventBus], BaseAgent]
 _StoreT = TypeVar('_StoreT')
@@ -893,6 +897,17 @@ def _wait_ceiling(flags: Mapping[str, FlagValue]) -> float | None:
     return float(seconds) if type(seconds) is int and seconds > 0 else None
 
 
+def _tighten(timeout: float | None) -> float | None:
+    """人的等待与派活等待不超过墙钟还剩的时间。没设墙钟时原样交回。"""
+    left = wall_seconds_left()
+    if left is None:
+        return timeout
+    left = max(left, 0.0)
+    if timeout is None:
+        return left
+    return min(timeout, left)
+
+
 def _cannot_wait_for(agent_id: str, received: str) -> ContractViolation:
     return ContractViolation(
         expected=f'agent {agent_id!r} 的事件循环由本进程接管着，可以代表它等一条答复',
@@ -1149,6 +1164,11 @@ class Runtime:
             )
         # 预算树（spec §8.4）：缺省不限——树的规模由宿主的预算决定，内核不替宿主猜一个上限。
         self._budget = BudgetTree(budget)
+        self._carried: set[str] = set()
+        # 隔离拷贝不借用默认执行器：默认池不封顶，一次多会话的拷贝会把线程数拉到没有上界。
+        self._copy_pool = ThreadPoolExecutor(
+            max_workers=_COPY_WORKERS, thread_name_prefix='syndica-copy'
+        )
         validate_confirmation_handler(confirmation_handler)
         if sessions is not None and redactor is None:
             raise ConfigError(
@@ -1627,6 +1647,24 @@ class Runtime:
         # Agent 留在注册表里；拆除那一支交出一个级联刚刚注销掉的 agent_id 却报成功，留下一份属于
         # 不可寻址 Agent 的 Context，并让同一个 agent_id 先 `AGENT_DESPAWN` 后 `AGENT_SPAWN`。
         #
+        # 拷贝在复检之前：它会挂起，而最后一道守卫与 create_task 之间不能再有挂起点。线程只建临时
+        # 目录，换入留在守卫之后。
+        staged = None
+        if self._workspace is not None and isolation != 'shared':
+            self._workspace.adopt(agent_id, parent_id)
+            try:
+                staged = await self._workspace.stage_isolation(agent_id, isolation, self._copy_pool)
+            except BaseException:
+                await self._workspace.release(agent_id)
+                await self._rollback_unstarted_spawn(
+                    agent_id,
+                    agent,
+                    assembly_snapshot,
+                    runtime_added,
+                    registered=True,
+                    queue_attempted=True,
+                )
+                raise
         # 复检的是**后置条件**（我注册的那一条还在不在），不只是标志位：级联若在这段窗口里跑完，
         # 钉住早已撤掉，`_doomed` 那一问答「没在被拆」而它注销掉的正是这一条。两问合起来没有缝，
         # 因为能注销这个条目的级联必然先把它钉住、且钉住活到该级联自己结束：还在飞的被 `_doomed`
@@ -1648,6 +1686,9 @@ class Runtime:
             else:
                 agent._attach_budget(account)  # pyright: ignore[reportPrivateUsage]
         if refusal is not None:
+            if staged is not None and self._workspace is not None:
+                self._workspace.abandon_staged(staged)
+                await self._workspace.release(agent_id)
             await self._rollback_unstarted_spawn(
                 agent_id,
                 agent,
@@ -1657,17 +1698,18 @@ class Runtime:
                 queue_attempted=True,
             )
             raise refusal
-        if self._workspace is not None:
+        if self._workspace is not None and staged is None:
             self._workspace.adopt(agent_id, parent_id)
+        if self._workspace is not None:
             router = self._workspace
             agent._executor._configure_file_trust(  # pyright: ignore[reportPrivateUsage]
                 lambda path: router.script_trust(path)
             )
-        if isolation != 'shared':
+        if staged is not None:
             assert self._workspace is not None
-            # 同步建副本：最后一道守卫与 create_task 之间仍然没有挂起点。
+            # 换入是同步的：最后一道守卫与 create_task 之间仍然没有挂起点。
             try:
-                isolated = self._workspace.isolate(agent_id, isolation)
+                isolated = self._workspace.finish_isolation(staged)
             except BaseException:
                 await self._workspace.release(agent_id)
                 await self._rollback_unstarted_spawn(
@@ -1679,7 +1721,22 @@ class Runtime:
                     queue_attempted=True,
                 )
                 raise
-            if isolated is not None and query is not None:
+            if isolated is None:
+                await self._workspace.release(agent_id)
+                await self._rollback_unstarted_spawn(
+                    agent_id,
+                    agent,
+                    assembly_snapshot,
+                    runtime_added,
+                    registered=True,
+                    queue_attempted=True,
+                )
+                raise ConfigError(
+                    expected=f'agent {agent_id} 的隔离副本换进正式位置',
+                    received='这次拷贝的代号已经不是当前的，临时目录被丢掉了',
+                    next_action='不要对同一个 agent 并发建隔离副本；等上一次结束再 spawn',
+                )
+            if query is not None:
                 query = f'{isolated.fact()}\n\n{query}'
         # put 先于 create_task：put 被拒时还没有任务可泄漏。两者之间没有挂起点，任务因此不会在
         # set_task 之前就跑起来。
@@ -1881,13 +1938,32 @@ class Runtime:
                 next_action='用 find() 确认它还在；拆除之后再追加没有意义',
             )
         account._grant(extra)  # pyright: ignore[reportPrivateUsage]
-        self._tracing.event(
-            'budget.granted',
-            {'agent.id': agent_id, 'budget.dimensions': granted_dims(extra)},
-        )
+        granted: dict[str, AttributeValue] = {
+            'agent.id': agent_id,
+            'budget.dimensions': granted_dims(extra),
+            'budget.granted_at_ms': int(time.time() * 1000),
+        }
+        if self._tracing._current() is not None:  # pyright: ignore[reportPrivateUsage]
+            self._tracing.event('budget.granted', granted)
+        else:
+            # 宿主在周期之间追加：此刻没有开着的 span，记在这里就丢了（span 结束即落盘，之后追加的
+            # 事件被忽略）。挂到这个 Agent 下一个周期的 agent span 上，带着真实的追加时刻。
+            self._tracing.defer(agent_id, 'budget.granted', granted)
         self.events._publish(  # pyright: ignore[reportPrivateUsage]
             Event('budget_changed', agent_id, {'view': budget_payload(account.view())})
         )
+
+    def _report_unrecorded_grants(self, agent_id: str) -> None:
+        """追加之后这个 Agent 再没开过周期：trace 只在开着的 span 上收事件，这次追加在 trace 里
+        就没有记录。造一个周期 span 去挂它会让 trace 多出一个没跑过的周期，所以只在这里留痕。"""
+        dropped = self._tracing.drop_deferred(agent_id)
+        if dropped:
+            logger.warning(
+                '宿主给 agent %s 的 %d 次预算追加之后它没有再跑周期，trace 里没有这几次追加的记录；'
+                '追加后的上限已经在它的预算里，会话存盘时一并存下。',
+                agent_id,
+                dropped,
+            )
 
     def _install_slot_tools(
         self, agent: BaseAgent, role_tools: frozenset[str], module_tools: Mapping[str, str]
@@ -2153,7 +2229,7 @@ class Runtime:
                 continue
             await self._oscillate(agent_id, new=AgentStatus.RUNNING)
             slot.gate.begin_cycle()
-            if not self._isolate_cycle(agent_id, agent, slot):
+            if not await self._isolate_cycle(agent_id, agent, slot):
                 return
             slot.control.enter_run()
             try:
@@ -2176,18 +2252,21 @@ class Runtime:
             ):
                 return
 
-    def _isolate_cycle(self, agent_id: str, agent: BaseAgent, slot: _Slot) -> bool:
+    async def _isolate_cycle(self, agent_id: str, agent: BaseAgent, slot: _Slot) -> bool:
         """槽声明了隔离：这个周期在共享工作区此刻的一份拷贝里干活。上个周期合并留下的话按周期键注入
         历史；隔离的事实按内容键注入，内容不变就只有一块（它受压缩保护，每个周期一块会无界增长）。
         上次合并没能删掉的副本接着用，不另拷一份。拷不出来时交回 False：这个周期不开始、停在 ERROR，
-        不能拿上个周期的结论冒充这一次的。"""
+        不能拿上个周期的结论冒充这一次的。文件字节在线程里拷，合并仍在事件循环上。"""
         router = self._workspace
         if slot.cycle_isolation == 'shared' or router is None:
             return True
         copy = router.isolated(agent_id)
         if copy is None:
             try:
-                copy = router.isolate(agent_id, slot.cycle_isolation)
+                staged = await router.stage_isolation(
+                    agent_id, slot.cycle_isolation, self._copy_pool
+                )
+                copy = None if staged is None else router.finish_isolation(staged)
             except Exception as exc:
                 agent.context.stop_reason = StopReason.ERROR
                 logger.error(
@@ -2197,6 +2276,15 @@ class Runtime:
                     agent_id,
                     type(exc).__name__,
                     exc,
+                )
+                return False
+            if copy is None:
+                agent.context.stop_reason = StopReason.ERROR
+                logger.error(
+                    '期望: 给 agent %s 这个周期换入隔离副本。'
+                    ' 实际: 这次拷贝的代号已经不是当前的，临时目录被丢掉了，这个周期没有开始。'
+                    ' 下一步: 不要对同一个 agent 并发建隔离副本。',
+                    agent_id,
                 )
                 return False
         cycle = agent._cycle + 1  # pyright: ignore[reportPrivateUsage]
@@ -2211,11 +2299,10 @@ class Runtime:
                     trust=trust,
                 )
             )
-        if copy is not None:
-            fact = copy.fact()
-            key = f'isolation:{agent_id}:{hashlib.sha256(fact.encode("utf-8")).hexdigest()[:16]}'
-            if not has_block(agent.context.current_traj, key):
-                agent.context.append(signed_block(HistoryKind.ENV_FACT, fact, key=key))
+        fact = copy.fact()
+        key = f'isolation:{agent_id}:{hashlib.sha256(fact.encode("utf-8")).hexdigest()[:16]}'
+        if not has_block(agent.context.current_traj, key):
+            agent.context.append(signed_block(HistoryKind.ENV_FACT, fact, key=key))
         return True
 
     async def _merge_cycle(self, agent_id: str, agent: BaseAgent, slot: _Slot) -> None:
@@ -2505,7 +2592,24 @@ class Runtime:
             model=agent.options.llm.config.model,
             tools=list(agent.options.tools),
             flags=dict(info.flags),
+            budget=self._session_budget(),
         )
+
+    def _session_budget(self) -> SessionBudget | None:
+        """可加维度的上限与已用。墙钟不写进去：恢复时从新的截止时刻起算。什么都没限制、也没花过
+        就省略，旧的「从零开始」读法保持不变。"""
+        view = self._budget.pool().view()
+        limit, used = view.limit, view.used
+        idle = (
+            used.input_tokens == 0
+            and used.output_tokens == 0
+            and used.cached_input_tokens == 0
+            and used.turns == 0
+            and (used.cost is None or used.cost == 0)
+        )
+        if idle and limit.tokens is None and limit.cost is None and limit.turns is None:
+            return None
+        return SessionBudget(tokens=limit.tokens, cost=limit.cost, turns=limit.turns, used=used)
 
     async def _wait_in_turn(self, agent_id: str, target_id: str) -> _InTurnWaitResult:
         """代表一个正在干活的 Agent 等另一个 Agent 的事件循环结束（供编排工具使用）。
@@ -2588,7 +2692,7 @@ class Runtime:
                 # （取消它会让此后的 `interrupt` 静默落空）。
                 await asyncio.wait(
                     {target, token.raised},
-                    timeout=_wait_ceiling(slot.flags),
+                    timeout=_tighten(_wait_ceiling(slot.flags)),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             # 「被等的那一方结束了没有」只判这一次，两条路（等过与没等过）因此给出同一个答案，
@@ -2897,6 +3001,13 @@ class Runtime:
             )
             await self.despawn(resumed_id)
             return False
+        # 上限是这次 Runtime 的 BudgetPolicy（宿主没给新上限时由它照存的那份来定）；已用续上。墙钟
+        # 不在记录里，carve 时已经按这次的 wall_clock_s 从现在起算了截止时刻。同一个 Runtime 里
+        # 第二次恢复同一个会话时，记录里的已用已经包括第一次续上的那份与它之后的消耗——后者随拆除
+        # 记进了池，再加一遍就是重复计费。
+        if record.budget is not None and sid not in self._carried:
+            self._carried.add(sid)
+            self._budget.carry(resumed_id, record.budget.used)
         self._warn_on_prefix_drift(resumed_id, record)
         return True
 
@@ -3196,6 +3307,7 @@ class Runtime:
             await self.registry.unregister(agent_id)
             self._table.pop(agent_id)
             self._slots.pop(agent_id, None)
+            self._report_unrecorded_grants(agent_id)
             self._budget.close(agent_id)
             # 回收账只记活着的 Agent：宿主 despawn、EXIT 与级联拆掉的也要摘，否则长跑里只增不减。
             self._finish_order.pop(agent_id, None)
@@ -3741,6 +3853,7 @@ class Runtime:
                 return WaitResult(state=token.raised.result())
             ceiling = _wait_ceiling(slot.flags)
             timeout = waiter.timeout if ceiling is None else min(waiter.timeout, ceiling)
+            timeout = cast(float, _tighten(timeout))
             return await self._awaited(agent_id, correlation, timeout, token)
         except asyncio.CancelledError:
             cancelled = True
@@ -4275,6 +4388,8 @@ class Runtime:
         # 的 _finish 不存盘，而 Agent 仍在实例表、轨迹已终态——读的是最终状态，不与在跑的驱动抢读，
         # 异步 store 也不会把半途快照盖掉干净那份。
         await self._checkpoint_all_sessions()
+        for agent_id in list(self._table.agent_ids()):
+            self._report_unrecorded_grants(agent_id)
         await self.hooks._dispatch(Junction.RUNTIME_SHUTDOWN)  # pyright: ignore[reportPrivateUsage]
         failures: list[BaseException] = []
         try:
@@ -4285,6 +4400,7 @@ class Runtime:
             try:
                 await self.events.close()
             finally:
+                self._copy_pool.shutdown(wait=False, cancel_futures=True)
                 self._report_tracer_failures()
         if not failures:
             return

@@ -7,13 +7,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import posixpath
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from concurrent.futures import Executor
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from syndica.kernel.context import TrustLevel, call_trust, strictest_trust
 from syndica.kernel.driving import driving_agent
@@ -38,6 +40,17 @@ from syndica.kernel.workspace import (
 __all__ = ['WorkspaceRouter']
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _Staged:
+    """线程里已经拷好、还没换进正式位置、也还没改路由表的一份副本。"""
+
+    agent_id: str
+    parent_id: str | None
+    prepared: Any
+    generation: int
+
 
 _Seen = tuple[str | None, str]
 
@@ -157,10 +170,66 @@ class WorkspaceRouter:
     def isolate(self, agent_id: str, isolation: str) -> IsolatedCopy | None:
         """给 `agent_id` 建隔离副本并把它此后的调用路由过去；`shared` 什么都不做、交回 None。
 
-        同步：副本必须在这个 Agent 的第一个周期之前就位，而 `spawn` 在那之前不能有挂起点。它驱动
-        的任务里另起的任务继承驱动身份，于是同样落在这份副本上。"""
-        if isolation == 'shared':
+        这一条在调用方的线程里同步做完。Runtime 用 `stage_isolation` / `finish_isolation`：文件
+        字节在 Runtime 自己的线程池里拷，换入和路由表的改动留在事件循环上。"""
+        if not self._wants_copy(agent_id, isolation):
             return None
+        parent = self._parents.get(agent_id)
+        base = self._workspace_of(parent)
+        copy = cast(LocalIsolator, self._isolator).isolate(
+            Path(base.root), agent_id, isolation, under=Path(self._root.root)
+        )
+        self._install_copy(agent_id, copy, parent, base)
+        return copy
+
+    async def stage_isolation(
+        self, agent_id: str, isolation: str, pool: Executor
+    ) -> _Staged | None:
+        """在 `pool` 里把工作区拷到临时目录。`shared` 交回 None。取消时那一代号作废，临时目录
+        在拷贝线程结束时删掉，不会再被换进来。"""
+        if not self._wants_copy(agent_id, isolation):
+            return None
+        isolator = cast(LocalIsolator, self._isolator)
+        parent = self._parents.get(agent_id)
+        base = self._workspace_of(parent)
+        generation = isolator.begin(agent_id)
+        root = Path(base.root)
+        under = Path(self._root.root)
+        loop = asyncio.get_running_loop()
+        copying = loop.run_in_executor(
+            pool, isolator.prepare, root, agent_id, isolation, generation, under
+        )
+        try:
+            # shield：取消这次等待时不连带取消 `copying`。被取消的 future 不再交出线程的结果，
+            # 线程却照样把临时目录建完，那份目录就再没人删。
+            prepared = await asyncio.shield(copying)
+        except asyncio.CancelledError:
+            isolator.supersede(agent_id, generation)
+            copying.add_done_callback(lambda fut: _drop_stale(isolator, fut))
+            raise
+        return _Staged(
+            agent_id=agent_id, parent_id=parent, prepared=prepared, generation=generation
+        )
+
+    def finish_isolation(self, staged: _Staged) -> IsolatedCopy | None:
+        """换进正式位置并改路由表。代号已经不是当前的就删掉临时目录，交回 None，路由表不动。"""
+        isolator = cast(LocalIsolator, self._isolator)
+        copy = isolator.commit(staged.prepared)
+        if copy is None:
+            return None
+        parent = staged.parent_id
+        base = self._workspace_of(parent)
+        self._install_copy(staged.agent_id, copy, parent, base)
+        return copy
+
+    def abandon_staged(self, staged: _Staged) -> None:
+        isolator = cast(LocalIsolator, self._isolator)
+        isolator.supersede(staged.agent_id, staged.generation)
+        isolator.drop(staged.prepared)
+
+    def _wants_copy(self, agent_id: str, isolation: str) -> bool:
+        if isolation == 'shared':
+            return False
         if isolation not in ISOLATIONS:
             raise ConfigError(
                 expected=f'isolation 是 {" / ".join(ISOLATIONS)} 之一',
@@ -179,11 +248,11 @@ class WorkspaceRouter:
                 received='它已经有一份',
                 next_action='先 merge_isolated 或 discard_isolated 那一份',
             )
-        parent = self._parents.get(agent_id)
-        base = self._workspace_of(parent)
-        copy = self._isolator.isolate(
-            Path(base.root), agent_id, isolation, under=Path(self._root.root)
-        )
+        return True
+
+    def _install_copy(
+        self, agent_id: str, copy: IsolatedCopy, parent: str | None, base: Workspace
+    ) -> None:
         self._copies[agent_id] = copy
         self._base_owners[agent_id] = '' if parent is None else self.scope_of(parent)
         self._assigned[agent_id] = copy.workspace
@@ -194,7 +263,6 @@ class WorkspaceRouter:
             for path, version in copy.base.items():
                 copied.wrote(path, version, base_taint.trust_of(path, version))
             self._copy_taints[agent_id] = copied
-        return copy
 
     def adopt(self, agent_id: str, parent_id: str | None) -> None:
         """记下 `agent_id` 由 `parent_id` 派生：它没有自己的副本时，落在父（或更上面的祖先）的副本
@@ -604,6 +672,15 @@ class WorkspaceRouter:
         for copy in list(self._copies.values()):
             await copy.workspace.close()
         await self._root.portal().close()
+
+
+def _drop_stale(isolator: LocalIsolator, fut: asyncio.Future[Any]) -> None:
+    if fut.cancelled():
+        return
+    error = fut.exception()
+    if error is not None:
+        return
+    isolator.drop_if_stale(fut.result())
 
 
 class _ArtifactTracing(Protocol):

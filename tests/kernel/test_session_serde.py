@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
+from syndica.kernel.budget import Usage
 from syndica.kernel.context import ArtifactRef, ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.session_serde import (
@@ -12,7 +15,7 @@ from syndica.kernel.session_serde import (
     record_from_json,
     record_to_json,
 )
-from syndica.kernel.session_types import SessionMeta, SessionRecord, SessionStatus
+from syndica.kernel.session_types import SessionBudget, SessionMeta, SessionRecord, SessionStatus
 
 
 def _record() -> SessionRecord:
@@ -140,3 +143,36 @@ def test_a_disallowed_role_is_refused() -> None:
     content[0]['role'] = 'root'
     with pytest.raises(ConfigError):
         record_from_json(data)
+
+
+def test_a_record_without_a_budget_reads_as_none() -> None:
+    data = record_to_json(_record())
+    assert 'budget' not in data
+    assert record_from_json(data).budget is None
+
+
+def test_budget_limits_and_usage_round_trip_as_decimals() -> None:
+    before = _record()
+    before.budget = SessionBudget(
+        tokens=100,
+        cost=Decimal('1.50'),
+        turns=4,
+        used=Usage(
+            input_tokens=8,
+            output_tokens=2,
+            cached_input_tokens=3,
+            cost=Decimal('0.25'),
+            turns=1,
+            estimated=True,
+        ),
+    )
+    after = record_from_json(record_to_json(before))
+    assert after.budget == before.budget
+
+
+def test_a_budget_whose_cost_is_not_a_decimal_string_is_refused() -> None:
+    data = record_to_json(_record())
+    data['budget'] = {'tokens': 1, 'cost': 1.5, 'turns': 1, 'used': {'turns': 0}}
+    with pytest.raises(ConfigError) as caught:
+        record_from_json(data)
+    assert 'cost' in caught.value.received

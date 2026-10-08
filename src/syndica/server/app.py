@@ -61,6 +61,8 @@ __all__ = ['MAX_STREAMS', 'ServerSettings', 'create_app']
 logger = logging.getLogger(__name__)
 
 MAX_STREAMS = 16
+# 同时在等认证的 WebSocket 上限；与 MAX_STREAMS 分开记，见 `_Handshakes`。
+MAX_HANDSHAKES = 32
 _AUTH_TIMEOUT_S = 5.0
 # Agent 终端镜像里一行攒到这么长还没换行就照样发出去：不能为了等换行无限攒。
 _PTY_LINE_CAP = 16_384
@@ -126,6 +128,7 @@ class _Guard:
 def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -> ASGIApp:
     host_redactor = live.assembly.redactor()
     streams = _StreamLimit()
+    handshakes = _Handshakes()
 
     def guarded(handler: _Handler, *, public: bool = False) -> _Handler:
         async def run(request: Request) -> Response:
@@ -250,7 +253,11 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
 
     async def artifacts(request: Request) -> Response:
         session = live.get(request.path_params['sid'])
-        listing = ArtifactList.model_validate({'artifacts': await session.handle.artifact_list()})
+        items = [
+            {**item, 'note': session.notes.get(str(item.get('id')), '')}
+            for item in await session.handle.artifact_list()
+        ]
+        listing = ArtifactList.model_validate({'artifacts': items})
         return json_response(listing.model_dump(), session.handle.redactor())
 
     async def artifact_versions(request: Request) -> Response:
@@ -346,43 +353,60 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
             headers={'X-Accel-Buffering': 'no'},
         )
 
-    async def rpc(websocket: WebSocket) -> None:
-        sid = websocket.path_params['sid']
-        if not streams.available():
-            await websocket.close(code=1013)
-            return
+    async def _socket(
+        websocket: WebSocket,
+        body: Callable[[WebSocket, RpcRequest, LiveSession], Awaitable[None]],
+    ) -> None:
+        """WebSocket 的共同入口：先认证、再占流的名额。没认证的连接只占握手名额（满了挤掉最早的
+        那个），不占人的 16 个：同一用户的进程不带令牌也连得上本机端口，让它们占着人的名额，人就打
+        不开事件流与确认通道。"""
         await websocket.accept()
-        streams.take()
+        handshakes.admit(websocket)
         try:
-            await _rpc_session(websocket, sid)
+            authenticated = await _authenticated(websocket, websocket.path_params['sid'])
+        finally:
+            handshakes.leave(websocket)
+        if authenticated is None:
+            return
+        frame, session = authenticated
+        if not streams.try_take():
+            await _refuse(websocket, 1013, frame.id, streams.refusal(), host_redactor)
+            return
+        try:
+            await body(websocket, frame, session)
         finally:
             streams.give()
+
+    async def rpc(websocket: WebSocket) -> None:
+        await _socket(websocket, _rpc_session)
 
     async def _authenticated(
         websocket: WebSocket, sid: str
     ) -> tuple[RpcRequest, LiveSession] | None:
-        """第一帧必须在时限内认证；认证不过、会话没打开都关掉连接，交回 None。"""
+        """第一帧必须在时限内认证；认证不过、会话没打开都发一帧三件套再关掉连接，交回 None。"""
         try:
             async with asyncio.timeout(_AUTH_TIMEOUT_S):
                 first = await websocket.receive_text()
-        except (TimeoutError, WebSocketDisconnect):
-            await _close(websocket, 4401)
+        except (TimeoutError, WebSocketDisconnect, RuntimeError):
+            await _refuse(websocket, 4401, None, _unauthenticated(), host_redactor)
             return None
         frame = _frame(first)
         if frame is None or frame.op != 'auth' or not credentials.valid(_extra(frame).get('token')):
-            await _close(websocket, 4401)
+            await _refuse(
+                websocket,
+                4401,
+                None if frame is None else frame.id,
+                _unauthenticated(),
+                host_redactor,
+            )
             return None
         session = live.sessions.get(sid)
         if session is None:
-            await _close(websocket, 4404)
+            await _refuse(websocket, 4404, frame.id, _no_session(sid), host_redactor)
             return None
         return frame, session
 
-    async def _rpc_session(websocket: WebSocket, sid: str) -> None:
-        authenticated = await _authenticated(websocket, sid)
-        if authenticated is None:
-            return
-        frame, session = authenticated
+    async def _rpc_session(websocket: WebSocket, frame: RpcRequest, session: LiveSession) -> None:
         redactor = session.handle.redactor()
         await websocket.send_text(encoded(RpcReply(id=frame.id, ok=True).model_dump(), redactor))
         live.attach()
@@ -398,21 +422,9 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
             live.detach()
 
     async def human_pty(websocket: WebSocket) -> None:
-        if not streams.available():
-            await websocket.close(code=1013)
-            return
-        await websocket.accept()
-        streams.take()
-        try:
-            await _human_pty(websocket, websocket.path_params['sid'])
-        finally:
-            streams.give()
+        await _socket(websocket, _human_pty)
 
-    async def _human_pty(websocket: WebSocket, sid: str) -> None:
-        authenticated = await _authenticated(websocket, sid)
-        if authenticated is None:
-            return
-        frame, session = authenticated
+    async def _human_pty(websocket: WebSocket, frame: RpcRequest, session: LiveSession) -> None:
         extra = _extra(frame)
         terminal = session.handle.open_terminal(
             _size(extra.get('cols'), 100), _size(extra.get('rows'), 30)
@@ -447,25 +459,12 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
             live.detach()
 
     async def agent_pty(websocket: WebSocket) -> None:
-        if not streams.available():
-            await websocket.close(code=1013)
-            return
-        await websocket.accept()
-        streams.take()
-        try:
-            await _agent_pty(
-                websocket, websocket.path_params['sid'], websocket.path_params['handle']
-            )
-        finally:
-            streams.give()
+        await _socket(websocket, _agent_pty)
 
-    async def _agent_pty(websocket: WebSocket, sid: str, handle: str) -> None:
+    async def _agent_pty(websocket: WebSocket, frame: RpcRequest, session: LiveSession) -> None:
         """Agent 终端的只读镜像：没有写入面——第二个写入方会绕过 Terminal 工具「半行不发」的不变式，
         危险判定就看不到整行。按整行脱敏再发：一个密钥可能跨两次读，只脱半截认不出来。"""
-        authenticated = await _authenticated(websocket, sid)
-        if authenticated is None:
-            return
-        _, session = authenticated
+        handle = websocket.path_params['handle']
         redactor = session.handle.redactor()
         live.attach()
         since, pending = 0, ''
@@ -485,8 +484,8 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
                     cut = len(text)
                 ready, pending = text[:cut], text[cut:]
                 if ready or not running:
-                    frame = {'text': ready, 'running': running, 'exit_code': screen['exit_code']}
-                    await websocket.send_text(encoded(frame, redactor))
+                    piece = {'text': ready, 'running': running, 'exit_code': screen['exit_code']}
+                    await websocket.send_text(encoded(piece, redactor))
                 if not running:
                     return
         except WebSocketDisconnect:
@@ -550,24 +549,84 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
 
 
 class _StreamLimit:
+    """已认证的事件流与 WebSocket 的名额。检查与占用在同一次调用里：分成两步、中间隔一个
+    await，几个并发的连接就能都过了检查。"""
+
     def __init__(self) -> None:
         self._open = 0
 
-    def available(self) -> bool:
-        return self._open < MAX_STREAMS
+    def refusal(self) -> ApiError:
+        return ApiError(
+            429,
+            expected=f'同时开着的事件流与 WebSocket 不超过 {MAX_STREAMS} 个',
+            received=f'已经开着 {self._open} 个',
+            next_action='关掉多余的标签页；每个标签页开一个事件流',
+        )
+
+    def try_take(self) -> bool:
+        if self._open >= MAX_STREAMS:
+            return False
+        self._open += 1
+        return True
 
     def take(self) -> None:
-        if not self.available():
-            raise ApiError(
-                429,
-                expected=f'同时开着的事件流与 WebSocket 不超过 {MAX_STREAMS} 个',
-                received=f'已经开着 {self._open} 个',
-                next_action='关掉多余的标签页；每个标签页开一个事件流',
-            )
-        self._open += 1
+        if not self.try_take():
+            raise self.refusal()
 
     def give(self) -> None:
         self._open -= 1
+
+
+class _Handshakes:
+    """还没认证的 WebSocket。满了就关掉最早的那个：认证不需要等，人的页面一连上就发认证帧，
+    被挤掉的只会是一直不认证的那些。"""
+
+    def __init__(self) -> None:
+        self._waiting: list[WebSocket] = []
+
+    def admit(self, websocket: WebSocket) -> None:
+        self._waiting.append(websocket)
+        while len(self._waiting) > MAX_HANDSHAKES:
+            oldest = self._waiting.pop(0)
+            asyncio.get_running_loop().create_task(_close(oldest, 4408))
+
+    def leave(self, websocket: WebSocket) -> None:
+        with contextlib.suppress(ValueError):
+            self._waiting.remove(websocket)
+
+
+def _unauthenticated() -> ApiError:
+    return ApiError(
+        401,
+        expected='连接后 5 秒内第一帧是 {"op": "auth", "token": <登录换来的令牌>}',
+        received='没有收到认证帧，或令牌不对',
+        next_action=(
+            '从 syndica up 打印的链接重新打开页面；server 重启过就 syndica down 再 syndica up'
+        ),
+    )
+
+
+def _no_session(sid: str) -> ApiError:
+    return ApiError(
+        404,
+        expected=f'会话 {sid} 在这个 server 里开着',
+        received='没有开着这个会话',
+        next_action='先 POST /api/v1/sessions 或 /resume 打开它，再连接',
+    )
+
+
+async def _refuse(
+    websocket: WebSocket,
+    code: int,
+    frame_id: str | int | None,
+    error: ApiError,
+    redactor: Redactor,
+) -> None:
+    """拒绝之前先发一帧三件套：关闭码与 123 字节的关闭原因装不下「期望 / 实际 / 下一步」。"""
+    reply = RpcReply(id=frame_id, ok=False, error=ErrorBody.model_validate(error_body(error)))
+    with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+        await websocket.send_text(encoded(reply.model_dump(), redactor))
+    await _close(websocket, code)
 
 
 async def _dispatch(session: LiveSession, raw: str) -> RpcReply:
@@ -580,6 +639,19 @@ async def _dispatch(session: LiveSession, raw: str) -> RpcReply:
         return RpcReply(id=frame.id, ok=False, error=ErrorBody.model_validate(error_body(error)))
     except SyndicaError as error:
         body = error_body(ApiError.of(400, error))
+        return RpcReply(id=frame.id, ok=False, error=ErrorBody.model_validate(body))
+    except Exception:
+        # 别的异常（store 抛的 KeyError 之类）不能拆掉整条连接：客户端在等这一帧的回复，人的确认
+        # 通道也在这条连接上。细节只进 server 日志（经脱敏 handler），不回显给客户端。
+        logger.exception('WebSocket 操作 %s 抛出了未预期的异常', frame.op)
+        body = error_body(
+            ApiError(
+                500,
+                expected=f'操作 {frame.op} 完成',
+                received='server 内部出错，细节在 server 日志里',
+                next_action='重取快照确认状态，再试一次；反复出现就带着 server 日志报告',
+            )
+        )
         return RpcReply(id=frame.id, ok=False, error=ErrorBody.model_validate(body))
     return RpcReply(id=frame.id, ok=True, result=result)
 
@@ -643,7 +715,8 @@ def _extra(frame: RpcRequest) -> dict[str, Any]:
 def _bad_frame(raw: str) -> dict[str, str]:
     return {
         'expected': 'JSON 对象 {"op": ..., "id": ..., ...}，op 是已知操作之一',
-        'received': f'收到 {raw[:200]!r}',
+        # 不在这里截：截断必须在脱敏之后，而脱敏在出口（`encoded` 先脱敏再按字段截）。
+        'received': f'收到 {raw!r}',
         'next_action': '按 OpenAPI 文档 x-syndica-rpc 里的帧格式发送',
     }
 

@@ -8,7 +8,7 @@ import pytest
 
 from syndica.kernel.context import ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.errors import ContractViolation
-from syndica.kernel.redaction import RuleRedactor
+from syndica.kernel.redaction import RedactionRule, RuleRedactor
 from syndica.kernel.session_redaction import (
     RedactedContent,
     RedactedSessionRecord,
@@ -107,6 +107,46 @@ def test_nested_multimodal_text_is_redacted_but_base64_is_kept() -> None:
     source = parts[3]['source']  # type: ignore[index]
     assert source['data'] == blob  # base64 原样保留
     assert source['type'] == 'base64'
+
+
+def test_tool_meta_free_text_is_redacted_and_identifiers_are_kept() -> None:
+    meta = {
+        'stdout': f'KEY={_SECRET}\n',
+        'stderr': f'warn {_SECRET}',
+        'note': f'report with {_SECRET}',
+        'nested': {'lines': [f'x {_SECRET}']},
+        'exit_code': 0,
+        'agent_id': 'a' * 32,
+        'handle': 'pty-1',
+        'background_id': 'bg-1',
+    }
+    block = ContextBlock(
+        role='tool',
+        content='done',
+        tool_call_id='c1',
+        extra={'tool_meta': meta, 'message_id': 'm1'},
+    )
+    # 用户规则认得一段十六进制与 bg-N：标识照样不能被它换掉，恢复要靠 agent_id 点名失效的子 Agent。
+    redactor = RuleRedactor(
+        secrets=[_SECRET],
+        rules=[
+            RedactionRule(rule_id='custom.hex', pattern='a{32}'),
+            RedactionRule(rule_id='custom.bg', pattern='bg-[0-9]+'),
+        ],
+    )
+    wrapped = redacted_record(SessionRecord(meta=SessionMeta(sid='s1'), content=[block]), redactor)
+    kept = wrapped.record.content[0].extra
+    assert _SECRET not in repr(kept)
+    assert kept['message_id'] == 'm1'
+    assert {
+        key: kept['tool_meta'][key] for key in ('exit_code', 'agent_id', 'handle', 'background_id')
+    } == {
+        'exit_code': 0,
+        'agent_id': 'a' * 32,
+        'handle': 'pty-1',
+        'background_id': 'bg-1',
+    }
+    assert block.extra['tool_meta']['stdout'] == f'KEY={_SECRET}\n'
 
 
 def test_the_wrappers_reject_direct_construction() -> None:

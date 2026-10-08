@@ -394,11 +394,18 @@ class _IsolatesOnce(LocalIsolator):
         super().__init__(shell='/bin/sh', env={})
         self.calls = 0
 
-    def isolate(self, root: Path, agent_id: str, requested: str, **options: Any) -> Any:
+    def prepare(
+        self,
+        root: Path,
+        agent_id: str,
+        requested: str,
+        generation: int,
+        under: Path | None = None,
+    ) -> Any:
         self.calls += 1
         if self.calls > 1:
             raise OSError('No space left on device')
-        return super().isolate(root, agent_id, requested, **options)
+        return super().prepare(root, agent_id, requested, generation, under)
 
 
 async def test_a_cycle_whose_copy_cannot_be_made_stops_with_error(

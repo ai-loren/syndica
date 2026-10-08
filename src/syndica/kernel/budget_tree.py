@@ -428,6 +428,13 @@ class BudgetTree:
     def pool(self) -> BudgetAccount:
         return BudgetAccount(self, self._root)
 
+    def carry(self, agent_id: str, used: Usage) -> None:
+        """把上一次会话的已用记到恢复出来的那个 Agent 名下：它自己的视图、池的余量与下一次存盘
+        都看得到。上限仍是这次的 `BudgetPolicy`；墙钟的截止时刻不动。"""
+        node = self._nodes.get(agent_id)
+        if node is not None:
+            node.own = node.own + used
+
     def parent_of(self, agent_id: str) -> str | None:
         node = self._nodes.get(agent_id)
         if node is None or node.parent is None:

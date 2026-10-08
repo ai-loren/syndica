@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, loginFromHash, Problem, token } from './api';
+import { api, forget, interceptedByServiceWorker, loginFromHash, Problem, token } from './api';
 import { Agents } from './components/Agents';
 import { Artifacts } from './components/Artifacts';
 import { Budget } from './components/Budget';
@@ -32,7 +32,7 @@ function replyProblem(reply: RpcReply): Problem {
 }
 
 export function App() {
-  const [phase, setPhase] = useState<'loading' | 'login' | 'expired' | 'ready'>('loading');
+  const [phase, setPhase] = useState<'loading' | 'login' | 'expired' | 'blocked' | 'ready'>('loading');
   const [problem, setProblem] = useState<unknown>(null);
   const [doctor, setDoctor] = useState<Report | null>(null);
   const [sessions, setSessions] = useState<Summary[]>([]);
@@ -100,6 +100,13 @@ export function App() {
 
   useEffect(() => {
     void (async () => {
+      const intercepted = interceptedByServiceWorker();
+      if (intercepted) {
+        forget();
+        setProblem(intercepted);
+        setPhase('blocked');
+        return;
+      }
       try {
         await loginFromHash();
       } catch (error) {
@@ -199,6 +206,7 @@ export function App() {
     : 0;
 
   if (phase === 'loading') return <p className="loading">加载中…</p>;
+  if (phase === 'blocked') return <ProblemBox problem={problem} />;
   if (phase === 'login' || phase === 'expired') return <LoginHelp expired={phase === 'expired'} />;
   return (
     <div className={`app drawer-${drawer}`}>

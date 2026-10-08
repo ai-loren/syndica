@@ -2286,6 +2286,7 @@ def _free_text_keys() -> list[str]:
 def test_the_free_text_attributes_are_exactly_these():
     assert _free_text_keys() == [
         'agent.role',
+        'artifact.note',
         'artifact.path',
         'budget.dimensions',
         'compaction.note',

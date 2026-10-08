@@ -93,6 +93,14 @@ from syndica.kernel.budget_tree import (
     granted_dims,
     seconds,
 )
+from syndica.kernel.call_limit import (
+    WRAP_UP_GRACE_S,
+    BudgetDeadline,
+    arm_wrap_grace,
+    bind_wall_clock,
+    reset_wall_clock,
+    reset_wrap_grace,
+)
 from syndica.kernel.clipping import clip_head
 from syndica.kernel.compaction import (
     CompactionController,
@@ -124,7 +132,7 @@ from syndica.kernel.hooks import (
 )
 from syndica.kernel.hooks.center import EXTENSION_TAINT
 from syndica.kernel.hooks.installing import Installer
-from syndica.kernel.ids import assigned_agent_id
+from syndica.kernel.ids import assigned_agent_id, spawning
 from syndica.kernel.llm import LLM, ContextOverflowError
 from syndica.kernel.long_horizon_seam import LongHorizonBlock, LongHorizonController
 from syndica.kernel.plugins import Plugin, install_plugins
@@ -407,6 +415,18 @@ def _isolated(block: ContextBlock) -> ContextBlock:
     )
 
 
+def _delivery_note(block: ContextBlock) -> str:
+    """`Deliver` 在结果的 meta 里交回的 note；读不出或不是字符串就当没写。"""
+    try:
+        meta = block.extra.get('tool_meta')
+    except Exception:
+        return ''
+    if not isinstance(meta, dict):
+        return ''
+    note = cast('dict[str, object]', meta).get('note')
+    return note if isinstance(note, str) else ''
+
+
 def _mark_failed(ctx: Context) -> None:
     """给最近一条 user / tool block 打失败标记（spec §5.1 第 8 步）。
 
@@ -556,9 +576,16 @@ class _TranscriptEvents:
         self._publish(Event('transcript_reset', self._agent_id, payload))
 
     def release(self) -> None:
+        """spawn 提交之后调。播种的块（Fork、恢复、工厂里追加的）不逐块重发：长轨迹一口气发几千条会
+        把每个订阅者的缓冲挤爆。发一条 `transcript_reset`，客户端照它从快照重取。"""
         held, self._held = self._held, None
-        for event in held or ():
-            self._events._publish(event)  # pyright: ignore[reportPrivateUsage]
+        if held:
+            payload = {
+                'generation': held[-1].payload['generation'],
+                'reason': 'seeded',
+                'blocks': len(held),
+            }
+            self._events._publish(Event('transcript_reset', self._agent_id, payload))  # pyright: ignore[reportPrivateUsage]
 
     def _publish(self, event: Event) -> None:
         if self._held is not None:
@@ -619,8 +646,8 @@ class BaseAgent:
         )
         self._executor._attach_events(self._publish_now)  # pyright: ignore[reportPrivateUsage]
         self._context = Context()
-        # spawn 里构造的先攒着：spawn 还可能回滚，轨迹事件要等 `agent_spawned` 之后才放出去。
-        self._transcript = _TranscriptEvents(self.agent_id, events, held=assigned is not None)
+        # spawn 的工厂里构造的先攒着：spawn 还可能回滚，工厂也可能先构造别的 Agent 再交回这一个。
+        self._transcript = _TranscriptEvents(self.agent_id, events, held=spawning())
         self._context._observe(self._transcript)  # pyright: ignore[reportPrivateUsage]
         self._current_turn = 0
         # 第几个工作周期（每次 `run` 一个）：agent span 与工具调用的稳定键带着它（M3 D3 / D10）。
@@ -1120,13 +1147,16 @@ class BaseAgent:
             attributes=attributes,
             detached=self._serves is None,
         ) as span:
+            self._tracing.flush_deferred(self.agent_id)
             budget = self._budget
             if budget is not None:
                 budget.begin_cycle()
             served = _SERVED.set(_Served(self, budget, self._tracing))
+            wall = bind_wall_clock(self._wall_left)
             try:
                 return await self._cycle_body(query, trust, span.attributes)
             finally:
+                reset_wall_clock(wall)
                 await self._close_background()
                 _SERVED.reset(served)
                 if budget is not None:
@@ -1203,7 +1233,11 @@ class BaseAgent:
                 agent_id=self.agent_id,
                 attributes={'turn': turn},
             ):
-                stop_reason = await self._one_turn(ctx, turn, decision, tool_defs)
+                try:
+                    stop_reason = await self._one_turn(ctx, turn, decision, tool_defs)
+                except BudgetDeadline:
+                    await self._stop_for_budget(ctx, ('wall_clock_s',), self._disposition())
+                    return StopReason.BUDGET
             if self._budget is not None and began is not None:
                 self._last_turn_s = self._budget.tree.now() - began
             if stop_reason is not None:
@@ -1267,6 +1301,12 @@ class BaseAgent:
         except BudgetExhausted as refused:
             self._unpriced = isinstance(refused, PriceUnknown)
             await self._stop_for_budget(ctx, (refused.dimension,), self._disposition())
+            await self._end_turn(ctx, turn, None)
+            return StopReason.BUDGET
+        except BudgetDeadline:
+            # 在飞的模型调用到了墙钟。不是 abort：abort 会拆掉这一轮已经配对的工具，而这里要停在
+            # BUDGET，已经发出去的请求按估算的输入记在预算上。
+            await self._stop_for_budget(ctx, ('wall_clock_s',), self._disposition())
             await self._end_turn(ctx, turn, None)
             return StopReason.BUDGET
         if response is None:
@@ -1531,6 +1571,12 @@ class BaseAgent:
             return True
         return False
 
+    def _wall_left(self) -> float | None:
+        budget = self._budget
+        if budget is None:
+            return None
+        return budget.view().remaining.wall_clock_s
+
     def _disposition(self) -> Exhaustion:
         budget = self._budget
         if budget is None or budget.companion:
@@ -1738,6 +1784,7 @@ class BaseAgent:
         scope = self._artifact_scope() if self._artifact_scope is not None else ''
         for block in ctx.current_traj[pre:]:
             delivered = names.get(block.tool_call_id or '') == 'Deliver'
+            note = _delivery_note(block) if delivered else ''
             for given in block.artifacts:
                 normal = posixpath.normpath(given.path)
                 ref = replace(
@@ -1747,7 +1794,20 @@ class BaseAgent:
                     is_deliverable=given.is_deliverable and delivered,
                 )
                 await store.register(ref)
-                await self._emit('artifact_registered', {'ref': artifact_payload(ref)})
+                if ref.is_deliverable:
+                    # 交付记录：产物索引只存路径与版本（落盘不经脱敏，见 FileArtifactStore），
+                    # 模型写的 note 只进 trace 与事件，这两处的出口都先脱敏。
+                    self._tracing.event(
+                        'artifact.delivered',
+                        {
+                            'artifact.path': ref.path,
+                            'artifact.version': ref.version,
+                            'artifact.note': note,
+                        },
+                    )
+                await self._emit(
+                    'artifact_registered', {'ref': artifact_payload(ref), 'note': note}
+                )
                 await self._hooks._dispatch(  # pyright: ignore[reportPrivateUsage]
                     Junction.ARTIFACT_REGISTERED, ctx=ctx, artifact=ref
                 )
@@ -1885,11 +1945,14 @@ class BaseAgent:
         """递交请求，交回（响应，它是不是被收紧的 Module 给的替身）；None 表示超窗已被插件处理。"""
         messages = request['messages']
         kwargs = {key: value for key, value in request.items() if key != 'messages'}
+        grace = arm_wrap_grace(WRAP_UP_GRACE_S) if self._wrapping else None
         try:
             async with llm_attempt(self.options.llm, request) as attempt:
                 reply = await self.options.llm.create(messages, **kwargs)
                 attempt.observe(reply)
                 return reply, False
+        except BudgetDeadline:
+            raise
         except ContextOverflowError as exc:
             # 超限兜底（spec §8.8 第二条触发路径）：先让内核压缩步骤压一把，压下去了就本轮不产出、
             # 下一轮用压缩后的轨迹重试——走在 hook 之前，因为改写只能由内核做（§8.8）。
@@ -1909,6 +1972,9 @@ class BaseAgent:
             raise
         except Exception as exc:
             return await self._substituted(ctx, request, exc)
+        finally:
+            if grace is not None:
+                reset_wrap_grace(grace)
 
     async def _substituted(
         self, ctx: Context, request: dict[str, Any], error: Exception

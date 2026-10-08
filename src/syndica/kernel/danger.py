@@ -241,19 +241,24 @@ class MailboxConfirmationHandler:
         await runtime.events.emit(
             Event(kind='tool_confirmation_requested', agent_id=request.agent_id, payload=payload)
         )
-        waited = await runtime.wait_for(
-            request.agent_id,
-            Confirmation(timeout=self._timeout, tool_call_id=request.request_id),
-        )
-        outcome = _confirmation_outcome(waited)
-        # 了结事件让宿主撤下还挂着的确认：没人等的答复会作为一条可信的人类消息进下一轮。
-        await runtime.events.emit(
-            Event(
-                kind='human_request_resolved',
-                agent_id=request.agent_id,
-                payload={'request_id': request.request_id, 'outcome': outcome.value},
+        resolved = 'cancelled'
+        try:
+            waited = await runtime.wait_for(
+                request.agent_id,
+                Confirmation(timeout=self._timeout, tool_call_id=request.request_id),
             )
-        )
+            outcome = _confirmation_outcome(waited)
+            resolved = outcome.value
+        finally:
+            # 了结事件让宿主撤下还挂着的确认：没人等的答复会作为一条可信的人类消息进下一轮。等待被
+            # 取消时同样要发，所以在 finally 里同步投递。
+            runtime.events._publish(  # pyright: ignore[reportPrivateUsage]
+                Event(
+                    kind='human_request_resolved',
+                    agent_id=request.agent_id,
+                    payload={'request_id': request.request_id, 'outcome': resolved},
+                )
+            )
         return outcome
 
 

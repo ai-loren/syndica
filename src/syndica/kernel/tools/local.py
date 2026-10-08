@@ -10,11 +10,12 @@ from __future__ import annotations
 import math
 import posixpath
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import replace
 from typing import cast
 
 from syndica.kernel.artifacts import KINDS
+from syndica.kernel.call_limit import wall_seconds_left
 from syndica.kernel.clipping import clip_head, clip_tail
 from syndica.kernel.context import ArtifactRef, TrustLevel
 from syndica.kernel.driving import driving_agent
@@ -218,6 +219,10 @@ def _reported(
     )
 
 
+# 与后台取消同一句：到点停下，不声称命令没产生副作用，也不声称它做完了。
+_BUDGET_STOPPED = '到预算截止时刻停下，副作用未知：它可能已经做了一部分。需要它的结果就重新发起。'
+
+
 def _valid_timeout(value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ConfigError(
@@ -335,8 +340,12 @@ class Deliver(Tool):
     __tool_command_args__ = ()
     __tool_external_input__ = False
 
-    def __init__(self, portal: Portal) -> None:
+    def __init__(
+        self, portal: Portal, *, kinds: Callable[[], Collection[str]] | None = None
+    ) -> None:
         self._portal = portal
+        # 每次调用再取：处理器可以在工具建好之后才装上。
+        self._kinds = kinds if kinds is not None else (lambda: KINDS)
 
     async def execute(self, path: str, note: str = '', kind: str = '') -> ToolResult:
         """把一个已经写出的文件标记为交付物。验收只看交付物，不查临时脚本 / 中间数据，所以这是
@@ -353,11 +362,12 @@ class Deliver(Tool):
             return ToolResult(
                 output=f'交付失败：{path} 不存在。先写出这个文件再 Deliver，或检查路径是否写对。'
             )
-        if kind and kind not in KINDS:
+        accepted = frozenset(self._kinds())
+        if kind and kind not in accepted:
             # 模型自选的 kind 决定交给哪个处理器做 L1：放任自由文本就能把交付物绕过严格的处理器。
             return ToolResult(
                 output=(
-                    f'交付失败：kind={kind!r} 不认识。期望 {", ".join(sorted(KINDS))} 之一；'
+                    f'交付失败：kind={kind!r} 不认识。期望 {", ".join(sorted(accepted))} 之一；'
                     '拿不准就留空，按扩展名推断。'
                 )
             )
@@ -462,15 +472,23 @@ class Bash(Tool):
                     output=f'后台命令已启动，handle={handle}',
                     meta={'handle': handle},
                 )
-            result = await self._portal.run(command, timeout=timeout, cwd=cwd)
+            left = wall_seconds_left()
+            clamped = left is not None and left < float(timeout)
+            limit = float(timeout) if not clamped else cast(float, left)
+            if clamped and limit <= 0:
+                return ToolResult(output=_BUDGET_STOPPED, trust=TrustLevel.UNTRUSTED)
+            result = await self._portal.run(command, timeout=limit, cwd=cwd)
         except ConfigError as exc:
             return _told(exc)
-        note = (
-            f'命令超时：运行超过 {float(timeout):g} 秒，已终止整个进程组；'
-            '下面是终止前收到的输出。\n'
-            if result.timed_out
-            else ''
-        )
+        if result.timed_out and clamped:
+            note = _BUDGET_STOPPED + '\n'
+        else:
+            note = (
+                f'命令超时：运行超过 {float(timeout):g} 秒，已终止整个进程组；'
+                '下面是终止前收到的输出。\n'
+                if result.timed_out
+                else ''
+            )
         return _reported(result, self._output_limit, meta={}, note=note)
 
 
@@ -720,11 +738,17 @@ class Terminal(Tool):
         self._pending[handle] = text[end + 1 :] if end >= 0 else pending + text
 
 
-def local_tools(portal: Portal, *, output_limit: int | None = None) -> dict[str, Tool]:
+def local_tools(
+    portal: Portal,
+    *,
+    output_limit: int | None = None,
+    artifact_kinds: Callable[[], Collection[str]] | None = None,
+) -> dict[str, Tool]:
     """按固定顺序交出本地工具。后续任务只追加键，不改已有键的相对顺序。
 
     `output_limit` 是 Bash、BashOutput 与 Terminal 每条输出、Glob 与 Grep 每次结果最多展示的
-    字符数，None 是不截断。
+    字符数，None 是不截断。`artifact_kinds` 交回 `Deliver` 收的产物类别（宿主装了处理器时传它们
+    声明的类别），不给就只收内核的基础类别。
     """
     limit = _valid_output_limit(output_limit)
     read = Read(portal)
@@ -736,7 +760,7 @@ def local_tools(portal: Portal, *, output_limit: int | None = None) -> dict[str,
     bash_output = BashOutput(portal, output_limit=limit)
     kill_bash = KillBash(portal)
     terminal = Terminal(portal, output_limit=limit)
-    deliver = Deliver(portal)
+    deliver = Deliver(portal, kinds=artifact_kinds)
     return {
         read.name: read,
         write.name: write,

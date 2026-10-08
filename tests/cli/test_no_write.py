@@ -6,6 +6,7 @@ import json
 import sys
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -225,8 +226,8 @@ def test_a_new_tool_outside_the_whitelist_is_left_out_too(
     deployed: list[str] = []
     real = host_module.local_tools
 
-    def with_deploy(portal: Portal, *, output_limit: int | None = None) -> dict[str, Tool]:
-        return {**real(portal, output_limit=output_limit), 'Deploy': _Deploy(deployed)}
+    def with_deploy(portal: Portal, **options: Any) -> dict[str, Tool]:
+        return {**real(portal, **options), 'Deploy': _Deploy(deployed)}
 
     monkeypatch.setattr(host_module, 'local_tools', with_deploy)
     config = (
@@ -414,8 +415,8 @@ def test_a_new_tool_added_by_a_slot_is_left_out_too(
     deployed: list[str] = []
     real = host_module.local_tools
 
-    def with_deploy(portal: Portal, *, output_limit: int | None = None) -> dict[str, Tool]:
-        return {**real(portal, output_limit=output_limit), 'Deploy': _Deploy(deployed)}
+    def with_deploy(portal: Portal, **options: Any) -> dict[str, Tool]:
+        return {**real(portal, **options), 'Deploy': _Deploy(deployed)}
 
     monkeypatch.setattr(host_module, 'local_tools', with_deploy)
     config = (

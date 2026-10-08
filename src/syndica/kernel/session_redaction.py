@@ -79,13 +79,35 @@ def _redact_text(value: object, redactor: Redactor) -> object:
     return value
 
 
+# 工具 meta 里内核或工具自己生成的标识：原样留。恢复靠 `agent_id` 点名失效的子 Agent，脱敏规则认得
+# 一段十六进制就会把它换成占位符。
+_META_IDENTIFIERS = frozenset(
+    {'agent_id', 'background_id', 'handle', 'message_id', 'request_id', 'state', 'status'}
+)
+
+
+def _redact_meta(meta: object, redactor: Redactor) -> object:
+    """`extra['tool_meta']` 是工具交回的 `ToolResult.meta`：`Bash` 把整段 stdout / stderr 放在这里，
+    `Deliver` 放模型写的 note。它与块正文一样会落盘，不脱敏就是命令输出里的密钥原样进会话文件。"""
+    if not isinstance(meta, dict):
+        return _redact_text(meta, redactor)
+    return {
+        key: (value if key in _META_IDENTIFIERS else _redact_text(value, redactor))
+        for key, value in cast('dict[str, object]', meta).items()
+    }
+
+
 def _redact_block(block: ContextBlock, redactor: Redactor) -> ContextBlock:
+    extra = block.extra
+    if 'tool_meta' in extra:
+        extra = {**extra, 'tool_meta': _redact_meta(extra['tool_meta'], redactor)}
     return replace(
         block,
         content=_redact_text(block.content, redactor),
         tool_calls=[
             replace(call, arguments=redactor.redact(call.arguments)) for call in block.tool_calls
         ],
+        extra=extra,
     )
 
 

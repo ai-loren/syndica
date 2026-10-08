@@ -99,6 +99,29 @@ def test_the_final_verdict_is_reported_on_stderr(tmp_path: Path) -> None:
     assert '验收：unverified；没能验证（no_active_rubrics）' in stderr
 
 
+def test_verdict_exit_maps_the_final_verdict_to_its_exit_code(tmp_path: Path) -> None:
+    config = _config(tmp_path, '  acceptance_outcome: true\n')
+    llm = ScriptedLLM([ScriptedTurn(content='done')])
+    code, stdout, stderr = _cli(tmp_path, llm, _run(config, '--verdict-exit'))
+    assert stdout == 'done\n'
+    assert '验收：unverified' in stderr
+    assert code == 13
+
+
+def test_verdict_exit_does_not_hide_a_failed_run(tmp_path: Path) -> None:
+    config = _config(tmp_path, '  acceptance_outcome: true\n')
+    code, _, stderr = _cli(tmp_path, ScriptedLLM([]), _run(config, '--verdict-exit'))
+    assert code == 1, stderr
+
+
+def test_verdict_exit_without_acceptance_exits_2_through_main(tmp_path: Path) -> None:
+    config = tmp_path / '.syndica.yaml'
+    config.write_text('version: 1\n', encoding='utf-8')
+    code, _, stderr = _cli(tmp_path, ScriptedLLM([]), _run(str(config), '--verdict-exit'))
+    assert code == 2
+    assert '--verdict-exit' in stderr and 'acceptance' in stderr
+
+
 def test_a_goal_without_the_acceptance_module_is_refused(tmp_path: Path) -> None:
     config = tmp_path / '.syndica.yaml'
     config.write_text('version: 1\n', encoding='utf-8')

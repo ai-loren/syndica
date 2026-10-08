@@ -10,7 +10,7 @@ export interface EventPayloads {
   agent_spawned: { parent_id: unknown; name: unknown; [key: string]: unknown };
   agent_start: {  [key: string]: unknown };
   agent_status: { status: unknown; [key: string]: unknown };
-  artifact_registered: { ref: unknown; [key: string]: unknown };
+  artifact_registered: { ref: unknown; note: unknown; [key: string]: unknown };
   budget_changed: { view: unknown; [key: string]: unknown };
   budget_exhausted: { dimensions: unknown; disposition: unknown; [key: string]: unknown };
   budget_question: { request_id: unknown; view: unknown; [key: string]: unknown };

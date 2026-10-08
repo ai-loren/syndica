@@ -125,7 +125,7 @@ from syndica.kernel.session_redaction import (
     redacted_content,
     redacted_record,
 )
-from syndica.kernel.session_types import SessionMeta, SessionRecord, SessionStatus
+from syndica.kernel.session_types import SessionBudget, SessionMeta, SessionRecord, SessionStatus
 from syndica.kernel.stores import (
     FileSessionStore,
     FileTraceStore,
@@ -293,6 +293,7 @@ __all__ = [
     'ScenarioDocument',
     'ScriptedLLM',
     'ScriptedTurn',
+    'SessionBudget',
     'SessionMeta',
     'SessionRecord',
     'SessionStatus',

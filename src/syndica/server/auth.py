@@ -79,7 +79,10 @@ class Credentials:
                 401,
                 expected='请求带 Authorization: Bearer <登录后拿到的令牌>',
                 received='没有令牌，或令牌不是这个 server 进程发的（server 重启后旧令牌作废）',
-                next_action='在终端运行 syndica up 拿新的登录链接并用它打开页面',
+                next_action=(
+                    '在终端运行 syndica down 再 syndica up，用新打印的登录链接打开页面'
+                    '（server 在跑时 syndica up 不再发新链接）'
+                ),
             )
 
 

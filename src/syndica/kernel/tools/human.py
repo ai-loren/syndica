@@ -146,16 +146,20 @@ class _HumanTool(Tool):
         if key is not None:
             payload['request_ref'] = list(key)
         await self._runtime.events.emit(Event(kind=kind, agent_id=self._agent_id, payload=payload))
-        result = await self._runtime.wait_for(self._agent_id, waiter)
-        # 了结事件让宿主撤下还挂着的提问：多个客户端开着同一个会话时，没答的那个不会再交一次答复，
-        # 而没人等的答复会作为一条可信的人类消息进下一轮。
-        await self._runtime.events.emit(
-            Event(
-                kind='human_request_resolved',
-                agent_id=self._agent_id,
-                payload={'request_id': waiter.request_id, 'outcome': result.state.value},
+        outcome = 'cancelled'
+        try:
+            result = await self._runtime.wait_for(self._agent_id, waiter)
+            outcome = result.state.value
+        finally:
+            # 了结事件让宿主撤下还挂着的提问：没人等的答复会作为一条可信的人类消息进下一轮。等待被
+            # 取消（kill、级联拆除）时同样要发，所以在 finally 里同步投递。
+            self._runtime.events._publish(  # pyright: ignore[reportPrivateUsage]
+                Event(
+                    kind='human_request_resolved',
+                    agent_id=self._agent_id,
+                    payload={'request_id': waiter.request_id, 'outcome': outcome},
+                )
             )
-        )
         if result.state is not WaitState.ANSWERED:
             return _unanswered(waiter.request_id, result.state)
         return _answered(waiter.request_id, result)

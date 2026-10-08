@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 ISOLATIONS: Final = ('shared', 'worktree', 'snapshot')
 # 任何一层叫这两个名字的目录都不拷：`.git` 是用户的历史，`.syndica` 是宿主的记录与别的副本。
 _SKIPPED = frozenset({'.git', '.syndica'})
-# 拷贝在事件循环里同步做（隔离必须在子 Agent 的第一个周期之前就位，而那之前不能有挂起点）。
+# 文件字节在线程里拷到带代号的临时目录；`os.replace` 回到事件循环，而且只在代号仍是当前的时候做。
+# 合并留在事件循环上：它要写父工作区，和别的 Agent 的写入共用同一把顺序。
 _MAX_FILES = 5000
 _MAX_BYTES = 200 * 1024 * 1024
 _MERGE_TIMEOUT = 30.0
@@ -146,6 +147,23 @@ class IsolatedCopy:
             shutil.rmtree(self.base_dir, ignore_errors=True)
 
 
+@dataclass(frozen=True)
+class _Prepared:
+    """线程里建好、还没换进正式位置的一份副本。"""
+
+    agent_id: str
+    generation: int
+    strategy: str
+    note: str
+    location: Path
+    base_dir: Path | None
+    building: tuple[tuple[Path, Path], ...]
+    base: dict[str, str]
+    executable: frozenset[str]
+    shell: str
+    env: dict[str, str]
+
+
 class LocalIsolator:
     """本地工作区的隔离。`git` 是 git 可执行文件的绝对路径，没有就是 None（内核不读 PATH，由宿主
     找好交进来）；`scratch` 是工作区之外的一个目录，三方合并的临时文件建在它下面——`git merge-file`
@@ -178,12 +196,44 @@ class LocalIsolator:
         self._env = dict(env)
         self._git = git
         self._scratch = scratch
+        # 每个 Agent 当前这一次隔离的代号。线程里的拷贝回来时对不上，就删掉临时目录。
+        self._generation: dict[str, int] = {}
+
+    def begin(self, agent_id: str) -> int:
+        generation = self._generation.get(agent_id, 0) + 1
+        self._generation[agent_id] = generation
+        return generation
+
+    def supersede(self, agent_id: str, generation: int) -> None:
+        """这份拷贝作废。只动自己那一代号：后来开始的下一次隔离不受影响。"""
+        if self._generation.get(agent_id) == generation:
+            self._generation[agent_id] = generation + 1
 
     def isolate(
         self, root: Path, agent_id: str, requested: str, *, under: Path | None = None
     ) -> IsolatedCopy:
-        """拷 `root`；副本建在 `under`（缺省 `root`）的 `.syndica/` 下。嵌套隔离时 `under` 给共享
-        根：建在出发的那份副本里面，合并、丢掉那份副本时就把后代的副本连同改动一起删了。"""
+        """同步拷贝。Runtime 走 `prepare` / `commit`：文件字节在线程里，换入在事件循环上。"""
+        generation = self.begin(agent_id)
+        prepared = self.prepare(root, agent_id, requested, generation, under=under)
+        copy = self.commit(prepared)
+        if copy is None:
+            raise ConfigError(
+                expected=f'agent {agent_id} 这次隔离的代号仍是当前的',
+                received=f'代号 {generation} 在拷贝期间被后来的一次隔离换掉了',
+                next_action='等当前这次隔离结束再隔离；不要对同一个 agent 并发 isolate',
+            )
+        return copy
+
+    def prepare(
+        self,
+        root: Path,
+        agent_id: str,
+        requested: str,
+        generation: int,
+        under: Path | None = None,
+    ) -> _Prepared:
+        """把 `root` 拷到带 `generation` 的临时目录。可以在线程里跑：不改路由器的状态，也不
+        `os.replace` 进正式位置。拷贝中途消失的文件按不存在处理，不报 ERROR。"""
         if requested not in ('worktree', 'snapshot'):
             raise ConfigError(
                 expected='isolation 是 worktree 或 snapshot（shared 不建副本）',
@@ -198,30 +248,30 @@ class LocalIsolator:
         home = root if under is None else under
         location = home / '.syndica' / f'{strategy}s' / agent_id
         base_dir = location.with_name(f'{agent_id}.base') if strategy == 'worktree' else None
-        # 先在旁边建好再整个换进来：拷到一半失败时不留半份副本，同一个 id 再隔离一次时也不会
-        # 叠在旧副本上（旧副本里多出来的文件会被当成子 Agent 新建的合并回去）。
+        # 临时目录带代号：两次隔离叠在同一个 `.building` 上，后完成的会换进先完成的半份。
         building = [
-            (folder, folder.with_name(f'.{folder.name}.building'))
+            (folder, folder.with_name(f'.{folder.name}.building-{generation}'))
             for folder in (location, base_dir)
             if folder is not None
         ]
         base: dict[str, str] = {}
         executable: set[str] = set()
         ignore = location.parent / '.gitignore'
-        # 任何一级是符号链接，副本就拷到了工作区之外，合并时又从那里读回来。
         _require_real_directories(home, (home / '.syndica', location.parent))
         try:
             location.parent.mkdir(parents=True, exist_ok=True)
             if not ignore.exists():
-                # 副本在用户的工作区里：不让它们出现在 `git status` 里，也不被宿主的自动提交带走。
                 ignore.write_text('*\n', encoding='ascii')
             for _, scratch in building:
                 shutil.rmtree(scratch, ignore_errors=True)
                 scratch.mkdir(parents=True)
             for relative in files:
                 source = root / relative
-                data = source.read_bytes()
-                mode = source.stat().st_mode & 0o777
+                try:
+                    data = source.read_bytes()
+                    mode = source.stat().st_mode & 0o777
+                except FileNotFoundError:
+                    continue
                 base[relative] = _version(data)
                 if mode & 0o111:
                     executable.add(relative)
@@ -230,24 +280,56 @@ class LocalIsolator:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)
                     os.chmod(target, mode)
-            for folder, scratch in building:
-                shutil.rmtree(folder, ignore_errors=True)
-                os.replace(scratch, folder)
         except BaseException:
             for _, scratch in building:
                 shutil.rmtree(scratch, ignore_errors=True)
             raise
-        workspace = LocalWorkspace(str(location), shell=self._shell, env=self._env)
-        return IsolatedCopy(
+        return _Prepared(
             agent_id=agent_id,
+            generation=generation,
             strategy=strategy,
+            note=note,
             location=location,
             base_dir=base_dir,
+            building=tuple(building),
             base=base,
-            workspace=workspace,
-            note=note,
-            base_executable=frozenset(executable),
+            executable=frozenset(executable),
+            shell=self._shell,
+            env=dict(self._env),
         )
+
+    def commit(self, prepared: _Prepared) -> IsolatedCopy | None:
+        """在事件循环上把临时目录换进正式位置。代号已经不是当前的就删掉临时目录，交回 None。"""
+        if self._generation.get(prepared.agent_id) != prepared.generation:
+            self.drop(prepared)
+            return None
+        try:
+            for folder, scratch in prepared.building:
+                shutil.rmtree(folder, ignore_errors=True)
+                os.replace(scratch, folder)
+        except BaseException:
+            self.drop(prepared)
+            raise
+        return IsolatedCopy(
+            agent_id=prepared.agent_id,
+            strategy=prepared.strategy,
+            location=prepared.location,
+            base_dir=prepared.base_dir,
+            base=prepared.base,
+            workspace=LocalWorkspace(
+                str(prepared.location), shell=prepared.shell, env=prepared.env
+            ),
+            note=prepared.note,
+            base_executable=prepared.executable,
+        )
+
+    def drop(self, prepared: _Prepared) -> None:
+        for _, scratch in prepared.building:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def drop_if_stale(self, prepared: _Prepared) -> None:
+        if self._generation.get(prepared.agent_id) != prepared.generation:
+            self.drop(prepared)
 
     def reopen(self, copy: IsolatedCopy) -> None:
         """给一份合并时关掉、又要接着用的副本换一个打开的工作区。"""
@@ -456,8 +538,12 @@ def _working_files(root: Path) -> list[str]:
             path = Path(folder) / name
             if name in _SKIPPED or path.is_symlink() or not path.is_file():
                 continue
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                continue
             files.append(path.relative_to(root).as_posix())
-            total += path.stat().st_size
+            total += size
             if len(files) > _MAX_FILES or total > _MAX_BYTES:
                 raise ConfigError(
                     expected=(

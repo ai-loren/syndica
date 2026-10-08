@@ -117,6 +117,11 @@ export function Artifacts(props: {
             <span className="meta">
               {artifact.is_deliverable ? '交付物' : '中间产物'} · {artifact.versions} 个版本
             </span>
+            {artifact.note && (
+              <p className="note untrusted" data-testid="artifact-note">
+                交付说明（模型写的）：{artifact.note}
+              </p>
+            )}
           </li>
         ))}
       </ul>

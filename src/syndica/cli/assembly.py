@@ -35,6 +35,7 @@ from syndica.kernel import (
     ConfigError,
     DeliveryResult,
     FileSessionStore,
+    FileTaint,
     FileTraceStore,
     Redactor,
     Runtime,
@@ -42,7 +43,6 @@ from syndica.kernel import (
     WorkspaceRouter,
 )
 from syndica.kernel.acceptance_inject import meaningful_quote
-from syndica.kernel.artifacts import ArtifactHandlers
 from syndica.kernel.feedback import propose_feedback_rubric
 from syndica.kernel.stores.file_artifact import FileArtifactStore
 from syndica.kernel.stores.file_rubric import FileRubricStore
@@ -157,14 +157,16 @@ class ServerSession:
 
     async def artifact_preview(self, artifact_id: str, version: str) -> str:
         ref = await self._ref(artifact_id, version)
-        preview = await ArtifactHandlers().for_(ref).preview(ref, _Reader(self._parts.workspace))
+        preview = await self._host.artifact_handlers.for_(ref).preview(
+            ref, _Reader(self._parts.workspace)
+        )
         return preview.text
 
     async def artifact_diff(self, artifact_id: str, old: str, new: str) -> dict[str, Any]:
         before = await self._ref(artifact_id, old)
         after = await self._ref(artifact_id, new)
         reader = _Reader(self._parts.workspace)
-        diff = await ArtifactHandlers().for_(after).semantic_diff(before, after, reader)
+        diff = await self._host.artifact_handlers.for_(after).semantic_diff(before, after, reader)
         lines = difflib.unified_diff(
             (await reader.read(before)).splitlines(),
             (await reader.read(after)).splitlines(),
@@ -275,6 +277,9 @@ class ServerAssembly:
         self._config = config
         self._digest = host.config_digest(path)
         self._redactor = host.redactor_for(config)
+        # 进程里所有会话共用一份，基线在 server 启动时取：每个会话各取一份基线，A 会话从不可信
+        # 内容写下的文件就进了之后才打开的 B 会话的基线，B 读到它时是可信的（硬约束 14）。
+        self._taint = FileTaint(host.workspace_root)
 
     def redactor(self) -> Redactor:
         return self._redactor
@@ -307,6 +312,7 @@ class ServerAssembly:
             ask_human=ask_human,
             role=role,
             config=self._config,
+            taint=self._taint,
         )
         return ServerSession(self._host, parts)
 
@@ -369,7 +375,22 @@ class ServerAssembly:
 
     def doctor(self) -> list[dict[str, Any]]:
         checks: list[dict[str, Any]] = [{'name': 'config', 'ok': True}]
-        if self._host.config_digest(self._path) != self._digest:
+        try:
+            digest = self._host.config_digest(self._path)
+        except ConfigError as error:
+            # 改坏了的配置不影响在跑的 server（它用启动时的快照）：如实报这一项，其余照常检查。
+            checks[0] = {
+                'name': 'config',
+                'ok': False,
+                'expected': f'{self._path} 是一份能读的配置，且与 server 启动时信任的那份一致',
+                'received': f'文件在 server 启动之后改过，现在读不出来：{error.received}',
+                'next_action': (
+                    f'{error.next_action}；改好之后用 syndica config trust 信任新的摘要，'
+                    '再 syndica down 与 syndica up 重启 server'
+                ),
+            }
+            digest = self._digest
+        if digest != self._digest:
             checks[0] = {
                 'name': 'config',
                 'ok': False,

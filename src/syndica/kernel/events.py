@@ -115,7 +115,7 @@ KERNEL_EVENTS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         'agent_spawned': ('parent_id', 'name'),
         'agent_status': ('status',),
         'agent_removed': (),
-        'artifact_registered': ('ref',),
+        'artifact_registered': ('ref', 'note'),
     }
 )
 

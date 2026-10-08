@@ -530,6 +530,35 @@ def test_modules_show_imports_workspace_code_once_the_config_enabling_it_is_trus
     assert json.loads(out)['description'] == 'git helpers'
 
 
+def test_module_code_edited_after_trust_but_before_its_import_is_refused_by_the_pins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _planted_in_the_workspace(tmp_path, monkeypatch)
+    (workspace / '.syndica.yaml').write_text('version: 1\nmodules: [gitflow]\n', encoding='utf-8')
+    store = JsonTrustStore(tmp_path / 'outside' / 'trusted.json')
+    planted = workspace / '.venv' / 'site' / 'gitflow_mod.py'
+    original = RuntimeCliHost._trusted_config  # pyright: ignore[reportPrivateUsage]
+
+    def trusted_then_edited(self: RuntimeCliHost, path: str) -> Any:
+        config = original(self, path)
+        planted.write_text(
+            'from pathlib import Path\nPath(__file__).with_name("EDITED").write_text("x")\n',
+            encoding='utf-8',
+        )
+        return config
+
+    monkeypatch.setattr(RuntimeCliHost, '_trusted_config', trusted_then_edited)
+    code, _, err = _inspect(
+        workspace,
+        ['run', 'go'],
+        trust=TrustGate(store_for=lambda _: store),
+        stdin=_Tty('y\n'),
+    )
+    assert code != 0
+    assert '看过新的内容再确认' in err
+    assert not (workspace / '.venv' / 'site' / 'EDITED').exists()
+
+
 def test_a_distribution_with_a_broken_entry_points_file_is_one_bad_row_not_a_broken_cli(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

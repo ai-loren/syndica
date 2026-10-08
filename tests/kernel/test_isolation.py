@@ -7,7 +7,9 @@ import hashlib
 import logging
 import os
 import shutil
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -970,3 +972,116 @@ def test_a_grandchild_of_an_isolated_agent_shares_its_scope(
     router.adopt('beta', 'alpha')
     router.adopt('gamma', 'beta')
     assert (router.scope_of('gamma'), router.scope_of('root-agent')) == ('alpha', '')
+
+
+def test_a_file_that_disappears_during_the_copy_is_absent_not_an_error(
+    root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = Path.read_bytes
+
+    def flaky(self: Path) -> bytes:
+        if self.name == 'notes.md':
+            raise FileNotFoundError(self)
+        return original(self)
+
+    monkeypatch.setattr(Path, 'read_bytes', flaky)
+    copy = _isolator(tmp_path).isolate(root, 'alpha', 'snapshot')
+    assert 'notes.md' not in copy.base
+    assert 'src/app.py' in copy.base
+    assert not (copy.location / 'notes.md').exists()
+    assert (copy.location / 'src' / 'app.py').is_file()
+
+
+async def test_a_cancelled_copy_leaves_no_scratch_and_no_route(
+    root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local = LocalWorkspace(str(root), shell='/bin/sh', env={})
+    isolator = _isolator(tmp_path)
+    routed = WorkspaceRouter(
+        local, versions=VersionStore(root, redactor=RuleRedactor()), isolator=isolator
+    )
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original = LocalIsolator.prepare
+
+    def blocking(self: LocalIsolator, *args: Any, **kwargs: Any) -> Any:
+        started.set()
+        release.wait(2)
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(LocalIsolator, 'prepare', blocking)
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        task = asyncio.create_task(routed.stage_isolation('alpha', 'snapshot', pool))
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if not list((root / '.syndica' / 'snapshots').glob('.alpha.building-*')):
+                break
+        assert list((root / '.syndica' / 'snapshots').glob('.alpha.building-*')) == []
+        assert routed.isolated('alpha') is None
+        monkeypatch.setattr(LocalIsolator, 'prepare', original)
+        staged = await routed.stage_isolation('alpha', 'snapshot', pool)
+        assert staged is not None and routed.finish_isolation(staged) is not None
+    finally:
+        release.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+        await routed.close()
+
+
+def test_a_superseded_copy_is_deleted_instead_of_installed(root: Path, tmp_path: Path) -> None:
+    isolator = _isolator(tmp_path)
+    generation = isolator.begin('alpha')
+    prepared = isolator.prepare(root, 'alpha', 'snapshot', generation)
+    scratches = [scratch for _, scratch in prepared.building]
+    isolator.supersede('alpha', generation)
+    assert isolator.commit(prepared) is None
+    assert all(not scratch.exists() for scratch in scratches)
+
+
+async def test_the_copy_runs_off_the_event_loop(
+    root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local = LocalWorkspace(str(root), shell='/bin/sh', env={})
+    routed = WorkspaceRouter(
+        local,
+        versions=VersionStore(root, redactor=RuleRedactor()),
+        isolator=_isolator(tmp_path),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    original = LocalIsolator.prepare
+
+    def blocking(self: LocalIsolator, *args: Any, **kwargs: Any) -> Any:
+        started.set()
+        assert release.wait(2)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(LocalIsolator, 'prepare', blocking)
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        task = asyncio.create_task(routed.stage_isolation('alpha', 'snapshot', pool))
+        for _ in range(200):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+        release.set()
+        staged = await asyncio.wait_for(task, _TIMEOUT)
+        assert staged is not None
+        copy = routed.finish_isolation(staged)
+        assert copy is not None
+        assert (copy.location / 'src' / 'app.py').is_file()
+    finally:
+        release.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        await routed.close()

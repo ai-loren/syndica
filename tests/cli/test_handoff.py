@@ -371,10 +371,11 @@ def test_the_front_matter_has_fixed_keys_in_order_and_ascii_values():
 
     assert text == (
         '---\n'
-        'schema: syndica.handoff/1\n'
+        'schema: syndica.handoff/2\n'
         'status: verified\n'
         'host_verify: passed\n'
         'reviewer_verdict: pass\n'
+        'acceptance_verdict: null\n'
         'git: pending\n'
         'protected_changed: [".gitignore", "docs/\\u4e2d\\u6587.md"]\n'
         'exit_code: null\n'

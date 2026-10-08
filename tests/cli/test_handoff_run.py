@@ -292,10 +292,11 @@ def test_a_verified_run_prints_the_handoff_once_and_writes_the_same_file(tmp_pat
     (path,) = run.files
     assert run.code == 0
     assert run.matter == {
-        'schema': 'syndica.handoff/1',
+        'schema': 'syndica.handoff/2',
         'status': 'verified',
         'host_verify': 'passed',
         'reviewer_verdict': 'pass',
+        'acceptance_verdict': 'null',
         'git': 'declined',
         'protected_changed': '[]',
         'exit_code': '0',
@@ -305,16 +306,60 @@ def test_a_verified_run_prints_the_handoff_once_and_writes_the_same_file(tmp_pat
         'status',
         'host_verify',
         'reviewer_verdict',
+        'acceptance_verdict',
         'git',
         'protected_changed',
         'exit_code',
     ]
     assert path.read_text(encoding='utf-8') == run.stdout
-    assert run.stdout.count('schema: syndica.handoff/1') == 1
+    assert run.stdout.count('schema: syndica.handoff/2') == 1
     assert f'交接文件：{path}' in run.stderr
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert (root / '.syndica' / '.gitignore').read_text(encoding='utf-8') == '*\n'
     assert '- `??` src/new.py\n' in run.stdout
+
+
+def _with_acceptance(config: Path) -> Path:
+    text = config.read_text(encoding='utf-8')
+    config.write_text(
+        text + 'modules: [acceptance]\nflags:\n  acceptance_outcome: true\n', encoding='utf-8'
+    )
+    return config
+
+
+def test_the_acceptance_verdict_is_its_own_front_matter_field(tmp_path: Path):
+    root = _workspace(tmp_path)
+    config = _with_acceptance(_config(tmp_path, verify=['true']))
+
+    run = _run(tmp_path, _reviewed(), config=config, root=root)
+
+    assert (run.matter['reviewer_verdict'], run.matter['acceptance_verdict']) == (
+        'pass',
+        'unverified',
+    )
+    assert run.code == 0
+
+
+def test_verdict_exit_fills_only_an_otherwise_zero_handoff_exit_code(tmp_path: Path):
+    root = _workspace(tmp_path)
+    config = _with_acceptance(_config(tmp_path, verify=['true']))
+
+    run = _run(
+        tmp_path, _reviewed(), config=config, root=root, extra=('--handoff', '--verdict-exit')
+    )
+
+    assert (run.code, run.matter['exit_code']) == (13, '13')
+
+
+def test_verdict_exit_does_not_replace_a_failed_verification(tmp_path: Path):
+    root = _workspace(tmp_path)
+    config = _with_acceptance(_config(tmp_path, verify=['false']))
+
+    run = _run(
+        tmp_path, _reviewed(), config=config, root=root, extra=('--handoff', '--verdict-exit')
+    )
+
+    assert (run.code, run.matter['exit_code']) == (1, '1')
 
 
 def test_a_failing_verify_command_fails_verification_and_exits_1(tmp_path: Path):
@@ -789,7 +834,7 @@ def test_under_handoff_questions_go_to_stderr_and_stdout_has_only_the_handoff(tm
 
     assert 'Which option?' in run.stderr
     assert 'Which option?' not in run.stdout
-    assert run.stdout.startswith('---\nschema: syndica.handoff/1\n')
+    assert run.stdout.startswith('---\nschema: syndica.handoff/2\n')
 
 
 def test_questions_in_an_ordinary_run_are_escaped(tmp_path: Path):
@@ -854,7 +899,7 @@ def test_a_symlinked_syndica_directory_is_refused_and_the_handoff_still_printed(
     assert '交接文件没写成' in run.stderr
     assert '实际: 它是符号链接' in run.stderr
     assert '下一步: 删掉它再跑' in run.stderr
-    assert run.stdout.startswith('---\nschema: syndica.handoff/1\n')
+    assert run.stdout.startswith('---\nschema: syndica.handoff/2\n')
     assert run.matter['exit_code'] == '1'
     assert list(outside.iterdir()) == []
 
@@ -904,7 +949,7 @@ def test_a_handoff_path_the_agent_blocked_with_a_file_still_prints_the_handoff(t
 
     assert run.code == 1
     assert '实际: 它不是目录' in run.stderr
-    assert run.stdout.startswith('---\nschema: syndica.handoff/1\n')
+    assert run.stdout.startswith('---\nschema: syndica.handoff/2\n')
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason='root 不受文件权限约束')

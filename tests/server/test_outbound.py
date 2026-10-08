@@ -13,20 +13,34 @@ _REDACTOR = RuleRedactor(secrets=(_SECRET,))
 
 
 def test_every_string_leaf_is_redacted_and_keys_are_kept():
-    value = {'a': [f'x {_SECRET}', {'b': _SECRET}], 'n': 3, 'none': None, 'flag': True}
+    value = {
+        'a': [f'x {_SECRET}', {'b': _SECRET}],
+        't': (_SECRET, 'plain'),
+        'n': 3,
+        'none': None,
+        'flag': True,
+    }
     assert redacted(value, _REDACTOR) == {
         'a': ['x [REDACTED:secret.env_value]', {'b': '[REDACTED:secret.env_value]'}],
+        't': ['[REDACTED:secret.env_value]', 'plain'],
         'n': 3,
         'none': None,
         'flag': True,
     }
 
 
+# 含 `=` 的密钥：截断在凭证字符之外的地方下刀，`=` 之后就是一刀。先截后脱敏的话，`=` 之前的那半截
+# 留在输出里，脱敏器已经认不出它。
+_SPLITTABLE = 'hunter2-alpha=hunter2-bravo-charlie'
+
+
 def test_a_secret_across_the_cut_is_redacted_before_the_field_is_clipped():
-    text = 'x' * (FIELD_LIMIT - 5) + ' ' + _SECRET
-    out = redacted(text, _REDACTOR)
-    assert _SECRET[:5] not in out
+    redactor = RuleRedactor(secrets=(_SPLITTABLE,))
+    cut = _SPLITTABLE.index('=') + 1
+    text = 'x' * (FIELD_LIMIT - cut) + ' ' + _SPLITTABLE
+    out = redacted(text, redactor)
     assert len(out) <= FIELD_LIMIT
+    assert not any(_SPLITTABLE[start : start + 4] in out for start in range(len(_SPLITTABLE) - 3))
 
 
 def test_each_exit_redacts():

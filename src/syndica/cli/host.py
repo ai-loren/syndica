@@ -170,6 +170,7 @@ from syndica.kernel import (
     Runtime,
     RuntimeModule,
     SafetyModule,
+    SessionBudget,
     SessionMeta,
     SessionStore,
     SpanStatus,
@@ -192,6 +193,7 @@ from syndica.kernel import (
 )
 from syndica.kernel.acceptance import RubricStatus, Verdict, VerdictStatus
 from syndica.kernel.acceptance_module import AcceptanceModule
+from syndica.kernel.artifacts import ArtifactHandlers
 from syndica.kernel.background_module import BackgroundModule
 from syndica.kernel.budget import AskHuman
 from syndica.kernel.compaction_module import CompactionModule
@@ -608,6 +610,42 @@ def _after_message(context: Context, message_id: str | None) -> int:
             if block.role == 'user' and block.extra.get('message_id') == message_id:
                 return index + 1
     return len(context.current_traj)
+
+
+class _UnusableOption(ConfigError):
+    """给的选项与配置合不上：CLI 以 2 退出，与参数解析错误同一类。"""
+
+    exit_code = 2
+
+
+def _with_stored_limits(
+    policy: BudgetPolicy,
+    stored: SessionBudget,
+    *,
+    turns: int | None,
+    tokens: int | None,
+    cost: Decimal | None,
+) -> BudgetPolicy:
+    """恢复会话时，人这次没给的那一维沿用会话里存的上限；给了的换掉它。不然每次恢复都退回缺省的
+    200 轮，`--max-turns 10` 起的会话续几次就没有上限了。墙钟不存，每次恢复从新的截止时刻起算。"""
+    root = policy.root
+    return replace(
+        policy,
+        root=replace(
+            root,
+            turns=root.turns if turns is not None or stored.turns is None else stored.turns,
+            tokens=root.tokens if tokens is not None else stored.tokens,
+            cost=root.cost if cost is not None else stored.cost,
+        ),
+    )
+
+
+_VERDICT_EXIT = {'pass': 10, 'partial': 11, 'block': 12, 'unverified': 13}
+
+
+def _verdict_exit_code(status: str | None) -> int:
+    """没拿到裁决时按 unverified：验收开了却没有四值之一，不能当成通过。"""
+    return _VERDICT_EXIT.get(status or '', 13)
 
 
 def _config_error(expected: str, received: str, next_action: str) -> ConfigError:
@@ -1526,6 +1564,10 @@ class RuntimeCliHost:
         self._announced: set[tuple[str, str]] = set()
         # `--handoff` 下 stdout 只有交接文件，问人的提示改走 stderr。
         self._prompts_to_stderr = False
+        self._acceptance_verdict: str | None = None
+        # 一份处理器注册表：L1 验收、`Deliver` 收的类别、服务面的预览与 diff 都查它。各自建一份，
+        # 宿主装的处理器就只在其中一处生效。
+        self._artifact_handlers = ArtifactHandlers()
 
     def trace(self, request: TraceRequest) -> str | CliOutcome:
         """`syndica trace ...`：读 `.syndica/traces`（与记录同样核对；还没有时当作空的，不建）。
@@ -1750,10 +1792,14 @@ class RuntimeCliHost:
             with self._logging_to_stderr():
                 return self._runner.run(self._run_chat_request(request))
         with self._logging_to_stderr():
+            self._acceptance_verdict = None
             if request.handoff:
                 self._sigint_before = signal.getsignal(signal.SIGINT)
                 return self._runner.run(self._run_handoff(request, flags))
-            return self._runner.run(self._run_request(request, flags))
+            text = self._runner.run(self._run_request(request, flags))
+            if request.verdict_exit:
+                return CliOutcome(text, _verdict_exit_code(self._acceptance_verdict))
+            return text
 
     @contextmanager
     def _logging_to_stderr(self) -> Generator[None, None, None]:
@@ -1766,12 +1812,23 @@ class RuntimeCliHost:
             root.removeHandler(handler)
 
     def _configured_modules(
-        self, config: CliConfig, environment: Mapping[str, str], *, goal: str | None = None
+        self,
+        config: CliConfig,
+        environment: Mapping[str, str],
+        *,
+        goal: str | None = None,
+        verdict_exit: bool = False,
     ) -> tuple[RuntimeModule, ...]:
         """配置里启用的 Module，按写的次序。第三方的在这里才 import：调用方拿到的 config 已经过了
         信任确认。`goal` 是 `--goal`，交给验收 Module。"""
         discovered = discover(self._entry_points)
         names = validated_modules(config.modules, discovered)
+        if verdict_exit and 'acceptance' not in names:
+            raise _UnusableOption(
+                expected='--verdict-exit 与 modules 里的 acceptance 一起用',
+                received=f'modules 是 {list(names)!r}，没有 acceptance',
+                next_action='在配置的 modules 里加上 acceptance，或去掉 --verdict-exit',
+            )
         if goal is not None and 'acceptance' not in names:
             raise _config_error(
                 '--goal 与 modules 里的 acceptance 一起用：Goal 是验收对照的权威',
@@ -1819,6 +1876,7 @@ class RuntimeCliHost:
                 store=FileRubricStore(rubric_root(self._workspace_root)),
                 redactor=redactor,
                 goal=goal,
+                handlers=self._artifact_handlers,
             )
         return _optional_builtin(name)
 
@@ -2126,6 +2184,10 @@ class RuntimeCliHost:
     @property
     def workspace_root(self) -> Path:
         return self._workspace_root
+
+    @property
+    def artifact_handlers(self) -> ArtifactHandlers:
+        return self._artifact_handlers
 
     def trusted_config(self, path: str) -> CliConfig:
         """读配置并做信任检查（工作区里的要被信任过；没信任过而又没有终端可问时三件套拒绝）。"""
@@ -2504,11 +2566,13 @@ class RuntimeCliHost:
         store.put(snapshot.path, snapshot.digest)
         return f'已信任 {one_line(str(snapshot.path))}（摘要 {snapshot.digest}）'
 
-    def _open_workspace(self, config: CliConfig) -> tuple[WorkspaceRouter, AgentEnvironment]:
+    def _open_workspace(
+        self, config: CliConfig, *, taint: FileTaint | None = None
+    ) -> tuple[WorkspaceRouter, AgentEnvironment]:
         """run、chat、doctor 共用的入口：Agent 在哪条路径上都拿到同一份环境与同一个路由。
 
-        路由总带着文件污点（打开这一刻取基线）；`workspace.versions` 打开时（缺省）再接版本层与
-        隔离。git 与临时目录由宿主找好交给内核：内核不读 PATH 与 TMPDIR。"""
+        路由总带着文件污点（没给 `taint` 就在打开这一刻取基线）；`workspace.versions` 打开时
+        （缺省）再接版本层与隔离。git 与临时目录由宿主找好交给内核：内核不读 PATH 与 TMPDIR。"""
         environment = agent_environment(
             self._environ, config.workspace.pass_env, workspace_root=self._workspace_root
         )
@@ -2519,7 +2583,7 @@ class RuntimeCliHost:
                 env=environment.values,
                 private=_PRIVATE,
             )
-            taint = FileTaint(self._workspace_root)
+            taint = FileTaint(self._workspace_root) if taint is None else taint
             if not config.workspace.versions:
                 return WorkspaceRouter(local, taint=taint), environment
             git = shutil.which('git', path=self._environ.get('PATH'))
@@ -2613,6 +2677,7 @@ class RuntimeCliHost:
         if view is not None and (self._budget_explicit or context.stop_reason is StopReason.BUDGET):
             self._warn(_budget_line(view, context.stop_reason))
         if context.verdict is not None:
+            self._acceptance_verdict = context.verdict.status.value
             self._warn(_verdict_line(context.verdict))
         if 'acceptance' in runtime.modules:
             await self._announce_proposals(agent_id)
@@ -2744,7 +2809,11 @@ class RuntimeCliHost:
         workspace, environment = self._open_workspace(config)
         failed = False
         try:
-            tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
+            tools = local_tools(
+                workspace.portal(),
+                output_limit=_OUTPUT_LIMIT,
+                artifact_kinds=self._artifact_handlers.kinds,
+            )
             names = _model_names(config)
             models: Mapping[str, LLM] = {name: self._model_factory(name) for name in names}
             judge, policy = dev_danger_options(self._workspace_root)
@@ -2899,12 +2968,15 @@ class RuntimeCliHost:
         ask_human: AskHuman | None = None,
         role: str = 'Orchestrator',
         config: CliConfig | None = None,
+        taint: FileTaint | None = None,
     ) -> SessionParts:
         """装好一个会话：chat 与服务面共用这一份，安全件（信任、环境白名单、开发模式的拦截、脱敏、
         会话锁）只有一处。订阅在 spawn 之前取，交回的订阅里没有漏掉的人机请求。`config` 是服务面在
-        启动时信任过的那份快照：给了就不再读文件。"""
+        启动时信任过的那份快照：给了就不再读文件。`taint` 是服务面进程里这个工作区共用的那份文件
+        污点：每个会话各取一份基线，前一个会话从不可信内容写下的文件就成了后一个会话的可信基线。"""
         if config is None:
             config = self._trusted_config(path)
+        stored: SessionBudget | None = None
         if resume is not None:
             # 恢复一份不存在的会话要在起 trace 录制 / 开工作区 / 建模型之前就失败（评审 M6）；也把
             # 「没这个会话」与后面「角色没登记」两类原因分开。
@@ -2915,6 +2987,8 @@ class RuntimeCliHost:
                     f'收到 session={resume!r}；没有这个会话',
                     '用 sessions list 看现有会话 id；id 是根 Agent 的 id',
                 )
+            record = await store.load(resume)
+            stored = None if record is None else record.budget
         catalog = config.catalog
         budget = self._budget_policy(
             config,
@@ -2925,9 +2999,11 @@ class RuntimeCliHost:
             on_exhausted=on_exhausted,
             ask_human=ask_human,
         )
+        if stored is not None:
+            budget = _with_stored_limits(budget, stored, turns=max_turns, tokens=tokens, cost=cost)
         recording, redactor = await self._start_recording(config, trace, argv, path, chat=True)
         try:
-            workspace, environment = self._open_workspace(config)
+            workspace, environment = self._open_workspace(config, taint=taint)
         except BaseException as exc:
             await self._finish_recording(recording, exc, redactor)
             raise
@@ -2935,7 +3011,11 @@ class RuntimeCliHost:
         subscription: Subscription | None = None
         session_lock: SessionLock | None = None
         try:
-            tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
+            tools = local_tools(
+                workspace.portal(),
+                output_limit=_OUTPUT_LIMIT,
+                artifact_kinds=self._artifact_handlers.kinds,
+            )
             models: Mapping[str, LLM] = {
                 name: self._model_factory(name) for name in _model_names(config)
             }
@@ -3279,7 +3359,11 @@ class RuntimeCliHost:
         catalog = config.catalog
         prompt = _READ_ONLY_NOTICE + request.prompt if request.no_write else request.prompt
         workspace, environment = self._open_workspace(config)
-        tools = local_tools(workspace.portal(), output_limit=_OUTPUT_LIMIT)
+        tools = local_tools(
+            workspace.portal(),
+            output_limit=_OUTPUT_LIMIT,
+            artifact_kinds=self._artifact_handlers.kinds,
+        )
         try:
             with _CaptureRuntimeErrors() as runtime_errors:
                 # Module 与 Flag 先于模型定下：取值写错要在建任何模型之前就失败。
@@ -3288,7 +3372,10 @@ class RuntimeCliHost:
                     self._environ,
                     tools if request.no_write else None,
                     configured=self._configured_modules(
-                        config, environment.values, goal=request.goal
+                        config,
+                        environment.values,
+                        goal=request.goal,
+                        verdict_exit=request.verdict_exit,
                     ),
                 )
                 resolved = resolved_flags(
@@ -3676,6 +3763,7 @@ class RuntimeCliHost:
                 git=git_state,
                 protected_changed=protected_changed,
                 exit_code=exit_code,
+                acceptance_verdict=self._acceptance_verdict,
             )
             return render(matter, facts, git_section=section)
 
@@ -3749,6 +3837,9 @@ class RuntimeCliHost:
             exit_code = 3
         if interrupted is not None:
             exit_code = EXIT_INTERRUPTED
+        # 130、1、交接被拒的 3 都已经落在 exit_code 上；裁决码只填「本来是 0」的那一格。
+        if exit_code == 0 and request.verdict_exit:
+            exit_code = _verdict_exit_code(self._acceptance_verdict)
         final = document(result.state, exit_code, result.section)
         try:
             rewrite_handoff(root, path, final, redactor)

@@ -37,6 +37,7 @@ class Stream:
         self._ring: deque[Entry] = deque(maxlen=capacity)
         self._changed = asyncio.Event()
         self._closed = False
+        self._resets = 0
 
     @property
     def position(self) -> str:
@@ -54,6 +55,11 @@ class Stream:
         self._closed = True
         self._wake()
 
+    def reset(self) -> None:
+        """告诉此刻的每个读者先发一条 reset（重取快照）。reset 不是流里的一条事件，没有序号。"""
+        self._resets += 1
+        self._wake()
+
     def _wake(self) -> None:
         # 边沿信号：唤醒此刻在等的读者，再换一个新的事件给下一批。不能 set 了不清——那就成了电平，
         # 读者醒来发现没有新条目会立刻再醒，空转不让出。
@@ -65,7 +71,7 @@ class Stream:
         if last_event_id is None:
             return False, self._seq
         epoch, _, raw = last_event_id.partition(':')
-        if epoch != self.epoch or not raw.isdigit():
+        if epoch != self.epoch or not (raw.isascii() and raw.isdigit()):
             return True, self._seq
         seq = int(raw)
         oldest = self._ring[0].seq if self._ring else self._seq + 1
@@ -78,10 +84,14 @@ class Stream:
     ) -> AsyncIterator[Entry | str]:
         """从 `last_event_id` 之后开始交条目，中间穿插 `RESET` 与 `PING`。流关闭后结束。"""
         reset, after = self._after(last_event_id)
+        resets = self._resets
         if reset:
             yield RESET
         while True:
             changed = self._changed
+            if self._resets != resets:
+                resets = self._resets
+                yield RESET
             pending = [entry for entry in self._ring if entry.seq > after]
             if pending and pending[0].seq != after + 1:
                 # 读得太慢，要的那一条已经被挤出缓冲：先 reset，从此刻接着读。位置在交出 reset

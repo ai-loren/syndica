@@ -174,7 +174,7 @@ deferred items」。
 | M5 后续 | 大小写不敏感卷上 `readme.md` 对基线 `README.md` 判不可信、`cd ~` 的误报（收口 C10） | 接受 | 安全方向（误报不误放）；`resolve()` 不规范化大小写，信任在 Linux CI 与 macOS 之间可能不同 |
 | M6 后续 | 一次性辅助调用（摘要压缩、LLM 记忆整理）的完整回放：ReplayCapture 把不在任何一轮里的模型调用当 gap，这类 run 不写回放文档 | 后续（回放文档 v4） | 与 M5 的 C3 同属回放文档 v4 的 aux / 门槽位；此刻优雅降级（结构照常记录、记一条 warning），两类调用都 opt-in |
 | M6 后续 | 压缩前**完整前像**落 `SessionStore.archive`（spec §8.8「压缩前必须留快照」的完整形态） | 已修（M8，`1281454`） | 压缩前把当前记录脱敏后归档，trace 的压缩点记归档序号；内置 store 只留最近 20 份 |
-| M6 后续 | 多 Agent **子树**的持久化与恢复（子 Agent、broker 队列、租约） | M9 | 改派（M8 计划 P1 H6）：会话记录是公开格式；Fork / 槽 / 类式角色的子 Agent 从角色名重建不出来；邮箱只在 checkpoint 时存，崩溃会丢已确认的消息——与 M9 的多进程租约（#40）同一处定 |
+| M6 后续 | 多 Agent **子树**的持久化与恢复（子 Agent、broker 队列、租约） | v1 之后（多进程宿主） | 再改派（M9 计划阶段五）：M9 的 server 是单进程、持会话锁，根会话的恢复 M6 已有；Fork / 槽 / 类式角色的子 Agent 从角色名重建不出来，邮箱只在 checkpoint 时存——要一起定的是多进程的租约与接管（#40），v1 不引入多进程。用户可见的后果：`syndica down` 或崩溃后，在飞的子 Agent 与它们的邮箱丢失，恢复只有根对话加「子 Agent 未恢复」的说明 |
 | M6 后续 | `MemoryStore` / `MemoryStoreContract` 进公开面 | M12 | 先私有：`SessionStoreContract` 已发布，记忆契约未发布，第三方记忆后端暂无公开契约可照着自证；v1.0 冻结公开 API 时一起定 |
 | M6 后续 | LLM 记忆整理可能添油加醋（真实运行实测编造了源里没有的细节，且按源条目记为 trusted） | 接受，附缓解 | 整理 / 摘要提示已要求只保留源事实，重跑只剩源事实；M7 没有接验收器比对（每次整理多一次伴生调用、与验收主路径无关） |
 | M6 后续 | 恢复会话时安全 flags 取「当前或更严」（M6 阶段二 P28-M7），恢复提示列出失效的子 Agent id | 已修（M7） | 快照里更严的 `untrusted_high_risk` / `max_wait_seconds` 作为恢复出的 Agent 的覆盖值并记 warning；当前 Runtime 没声明的 key 不收；恢复提示点名 `tool_meta` 里记着的失效 Agent |
@@ -188,15 +188,15 @@ deferred items」。
 | M7 后续 | `RubricStore` / `ArtifactStore` 契约与验收 Module 进公开面 | M12 | 先私有（同 M6 的记忆）；v1.0 冻结公开 API 时一起定 |
 | M7 后续 | `encode_assured` 的调用方白名单（AST 守卫） | M12 | 产物索引存的路径 / kind 已收窄（kind 只收 `KINDS`、id 由内核派生）；守卫随公开面冻结一起补 |
 | M7 后续 | 只有根协调者有 Goal，子 Agent 的交付不单独验收 | 接受 | 由派活的一方验收；子 Agent 各付一份伴生太贵，需要时由宿主给子 Agent 一个 Goal（M8 的预算树之后再议） |
-| M7 后续 | 裁决的机器可读出口（退出码映射、交接文件字段） | M9 | trace 的 agent span 已带 `verdict.status` / `unverified_cause` / `needs_human` / `outcomes`，`trace export` 与 spans.jsonl 可读；CLI 只在 stderr 打一行 |
+| M7 后续 | 裁决的机器可读出口（退出码映射、交接文件字段） | 已修（M9） | `run --verdict-exit`：`pass` 10、`partial` 11、`block` 12、`unverified` 13，没装验收退出 2；130、1、交接被拒的 3 优先。交接文件加 `acceptance_verdict`（与读审查者标记行的 `reviewer_verdict` 分开），schema 升到 `syndica.handoff/2` |
 | M7 后续 | 文件 / 产物锚点钉到具体版本（§7.6「`spec.md:12 → protocol.md:88`」「`artifact:report.md#section-4`」） | 后续 | 投影的来源只有 Goal 与任务原文；`Anchor` 没有 version 字段，加它是公开类型的变更 |
-| M7 后续 | 处理器注册新 kind、`preview` / `semantic_diff` 的消费方、反馈带出产物定位、`Deliver.note` 落进交付记录 | M9 | L1 只用 `validate`；预览与语义 diff 的读者是界面 |
+| M7 后续 | 处理器注册新 kind、`preview` / `semantic_diff` 的消费方、反馈带出产物定位、`Deliver.note` 落进交付记录 | 已修（M9） | 一个会话一份处理器注册表，L1、`Deliver` 收的类别（基础类别加已装处理器声明的）、服务面的预览与 diff 共用；反馈带产物定位、落成提议的 Rubric、激活走人的门；`Deliver.note` 进 trace（`artifact.delivered`）与 `artifact_registered` 事件，产物索引仍不存自由文本。CLI 还没有装第三方处理器的入口（随 Module 的扩展点，M12） |
 | M7 后续 | Module 服务经 `runtime.send` 发的消息与宿主同一个 sender，会被当成人的反馈提议 | M12 | 提议仍要人 `sessions activate`；正面标记宿主消息要在 `Runtime.send` 上区分调用方，随宿主身份一起定 |
 | M7 后续 | 主 Agent 的整条回复恰好就是要求原文时，L3 仍把它算作证据 | 接受 | 「只回 DONE」这类要求的证据就是那一行；整行之外的复述已被拒 |
-| M8 后续 | 截止时刻到了打断正在跑的这一轮（工具超时与轮内等待按剩余时间收紧） | M9 | 墙钟在轮开始与每次准入处判，越界至多一轮的耗时；打断一个正在写的工具要有通用的工具内取消，被打断的副作用未知——与后台调用残留、M9 的租约接管同一种语义（M8 计划 P3 M5） |
-| M8 后续 | 预算按「这次调用」计，会话恢复从新预算开始 | M9 | 随子树持久化一起定（M8 计划 P1 H6） |
-| M8 后续 | 宿主在 span 之外追加预算时那条 trace 事件丢掉 | M9 | `_grant_budget` 私有到 M9 的宿主服务面定，届时挂到 Agent 的根 span |
-| M8 后续 | 隔离槽每个周期在事件循环上同步拷贝共享工作区（大工作区下其余 Agent 停顿数秒） | M9 | 与 spawn 时的快照隔离同一条路径；挪进线程要把路由器的状态改动与文件拷贝拆开。多会话并发时才咬人，随服务面一起做（M8 计划 P7） |
+| M8 后续 | 截止时刻到了打断正在跑的这一轮（工具超时与轮内等待按剩余时间收紧） | 已修（M9） | 在飞的模型调用到截止时刻由路由器取消，停在 BUDGET、按估算的输入计费，不换平台；收尾轮有 30 秒宽限。已经带超时的工具（`Bash`）拿 `min(自己的, 剩余)`，到点写明「到预算截止时刻停下，副作用未知」；人的等待与派活等待按剩余时间收紧。没有超时的工具不做通用的工具内取消 |
+| M8 后续 | 预算按「这次调用」计，会话恢复从新预算开始 | 已修（M9） | 可加的维度（tokens / cost / turns）按「上限 + 已用」存进会话记录，恢复时已用续上；这次没给新上限就沿用存的上限。墙钟不跨会话，每次打开从新的截止时刻起算 |
+| M8 后续 | 宿主在 span 之外追加预算时那条 trace 事件丢掉 | 已修（M9） | 追加挂到这个 Agent 下一个周期的 agent span 上，带真实的追加时刻（`budget.granted_at_ms`）；之后再没跑周期的，关机或拆除时记一条 WARNING（trace 里没有开着的 span 可挂） |
+| M8 后续 | 隔离槽每个周期在事件循环上同步拷贝共享工作区（大工作区下其余 Agent 停顿数秒） | 已修（M9） | 文件字节在 Runtime 自有的两线程池里拷到带代号的临时目录；换入与路由表的改动回到事件循环、代号仍是当前的才做；拷贝中途消失的文件按不存在处理；合并留在事件循环 |
 | M8 后续 | 长程策略协议、上下文、动作类型与契约、预算树的读写入口进公开面 | M12 | 与 Goal / Rubric / Verdict 一起冻结（M8 计划 P1 H5） |
 | M8 后续 | `Delegate` / `Fork` 后台化 | 后续 | 一个 Agent 的在轮等待只有一个槽，转到后台的派活会被下一次派活顶掉；要先把在轮等待按子 Agent 分槽 |
 | M8 后续 | 收尾轮里模型仍可能只发工具调用、不留文字（真实运行：成本上限紧到第一轮就是收尾轮时） | 后续 | 收尾轮照发工具定义以保前缀；CLI 照实说「收尾那一轮也没有留下文字」。provider 支持时可在收尾轮带 `tool_choice: none` |

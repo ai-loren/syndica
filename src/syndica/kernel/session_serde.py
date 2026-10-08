@@ -7,11 +7,13 @@ round-trip 全字段（含 `extra` 嵌套值、`artifacts`、`ToolCall` 次序�
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any, cast
 
+from syndica.kernel.budget import Usage
 from syndica.kernel.context import ArtifactRef, ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.errors import ConfigError
-from syndica.kernel.session_types import SessionMeta, SessionRecord, SessionStatus
+from syndica.kernel.session_types import SessionBudget, SessionMeta, SessionRecord, SessionStatus
 
 __all__ = [
     'SESSION_SCHEMA',
@@ -75,8 +77,32 @@ def _meta_to(meta: SessionMeta) -> dict[str, object]:
     }
 
 
-def record_to_json(record: SessionRecord) -> dict[str, object]:
+def _money(value: Decimal | None) -> str | None:
+    return None if value is None else format(value, 'f')
+
+
+def _usage_to(used: Usage) -> dict[str, object]:
     return {
+        'input_tokens': used.input_tokens,
+        'output_tokens': used.output_tokens,
+        'cached_input_tokens': used.cached_input_tokens,
+        'cost': _money(used.cost),
+        'turns': used.turns,
+        'estimated': used.estimated,
+    }
+
+
+def _budget_to(budget: SessionBudget) -> dict[str, object]:
+    return {
+        'tokens': budget.tokens,
+        'cost': _money(budget.cost),
+        'turns': budget.turns,
+        'used': _usage_to(budget.used),
+    }
+
+
+def record_to_json(record: SessionRecord) -> dict[str, object]:
+    body: dict[str, object] = {
         'schema': SESSION_SCHEMA,
         'meta': _meta_to(record.meta),
         'content': [_block_to(block) for block in record.content],
@@ -85,6 +111,11 @@ def record_to_json(record: SessionRecord) -> dict[str, object]:
         'tools': list(record.tools),
         'flags': dict(record.flags),
     }
+    # 旧记录没有这一键。写出 None 会让「没记预算」和「记了一份空预算」分不清，读回时也没法
+    # 把缺键当成从零开始。
+    if record.budget is not None:
+        body['budget'] = _budget_to(record.budget)
+    return body
 
 
 def meta_to_json(meta: SessionMeta) -> dict[str, object]:
@@ -244,4 +275,65 @@ def record_from_json(data: dict[str, Any]) -> SessionRecord:
         model=data.get('model', ''),
         tools=[str(tool) for tool in cast('list[object]', raw_tools)],
         flags=dict(cast('dict[str, Any]', raw_flags)),
+        budget=None if 'budget' not in data else _budget_from(data.get('budget')),
+    )
+
+
+def _count(value: object, field: str, *, allow_none: bool) -> int | None:
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _corrupt('budget', f'{field}={value!r}，要的是 >= 0 的整数')
+    return value
+
+
+def _decimal(value: object, field: str) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise _corrupt('budget', f'{field}={value!r}，要的是十进制字符串或 null')
+    try:
+        amount = Decimal(value)
+    except Exception:
+        raise _corrupt('budget', f'{field}={value!r} 不是十进制金额') from None
+    if not amount.is_finite() or amount < 0:
+        raise _corrupt('budget', f'{field}={value!r} 不是有限的非负金额')
+    return amount
+
+
+def _budget_from(data: object) -> SessionBudget:
+    if not isinstance(data, dict):
+        raise _corrupt('budget', f'budget 不是对象，是 {type(data).__name__}')
+    body = cast('dict[str, Any]', data)
+    used = body.get('used')
+    if not isinstance(used, dict):
+        raise _corrupt('budget', f'budget.used 不是对象，是 {type(used).__name__}')
+    spent = cast('dict[str, Any]', used)
+    try:
+        usage = Usage(
+            input_tokens=cast(
+                int, _count(spent.get('input_tokens', 0), 'used.input_tokens', allow_none=False)
+            ),
+            output_tokens=cast(
+                int, _count(spent.get('output_tokens', 0), 'used.output_tokens', allow_none=False)
+            ),
+            cached_input_tokens=cast(
+                int,
+                _count(
+                    spent.get('cached_input_tokens', 0),
+                    'used.cached_input_tokens',
+                    allow_none=False,
+                ),
+            ),
+            cost=_decimal(spent.get('cost', '0'), 'used.cost'),
+            turns=cast(int, _count(spent.get('turns', 0), 'used.turns', allow_none=False)),
+            estimated=spent.get('estimated') is True,
+        )
+    except ConfigError as exc:
+        raise _corrupt('budget', exc.received) from None
+    return SessionBudget(
+        tokens=_count(body.get('tokens'), 'tokens', allow_none=True),
+        cost=_decimal(body.get('cost'), 'cost'),
+        turns=_count(body.get('turns'), 'turns', allow_none=True),
+        used=usage,
     )

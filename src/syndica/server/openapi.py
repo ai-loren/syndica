@@ -11,7 +11,6 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from syndica import __version__
 from syndica.kernel.events import KERNEL_EVENTS
 from syndica.server.models import (
     ArtifactDiff,
@@ -237,8 +236,10 @@ def openapi() -> dict[str, Any]:
         'info': {
             'title': 'Syndica',
             'version': '1',
+            # 不写 syndica 的版本号：每次升版本都会改快照，逼出一条「什么都没变」的变更记录。契约的
+            # 版本是 info.version。
             'description': (
-                f'syndica {__version__} 的 HTTP / SSE / WebSocket 面。标 x-syndica-stability: '
+                'syndica 的 HTTP / SSE / WebSocket 面。标 x-syndica-stability: '
                 'provisional 的字段来自内核里 M12 才冻结的类型，形状仍可能变。'
             ),
         },
@@ -257,6 +258,11 @@ def openapi() -> dict[str, Any]:
         'x-syndica-rpc': {
             'path': '/api/v1/sessions/{sid}/rpc',
             'first_frame': 'auth',
+            'refusal': (
+                '三个 WebSocket 都一样：被拒时先收一帧 RpcReply（ok=false，error 是三件套），'
+                '再按关闭码关闭。4401 没认证、4404 会话没打开、4408 等认证的连接太多被挤掉、'
+                '1013 已认证的流与 WebSocket 满了'
+            ),
             'request': {'$ref': _REF.format(model='RpcRequest')},
             'reply': {'$ref': _REF.format(model='RpcReply')},
             'ops': {

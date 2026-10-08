@@ -17,6 +17,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
+from syndica.kernel.call_limit import BudgetDeadline, model_call_limit
 from syndica.kernel.context import ContextBlock
 from syndica.kernel.errors import ConfigError, ContractViolation, LLMResponseError, SyndicaError
 from syndica.kernel.llm import LLM, CachePrefixProvider, ContextOverflowError, LLMConfig
@@ -27,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 # 换一个平台也修不好的错误：请求本身不合法、调用方违约、超窗（归压缩处理）。把它们记成平台故障，
 # 会让一个坏请求把轮换里的每个平台都送进退避。
-_NOT_A_PLATFORM_FAILURE = (ConfigError, ContractViolation, ContextOverflowError)
+# BudgetDeadline 是墙钟到了，换平台也还是到了：记成平台故障会把轮换里每个平台都送进退避。
+_NOT_A_PLATFORM_FAILURE = (ConfigError, ContractViolation, ContextOverflowError, BudgetDeadline)
 _ERROR_PREVIEW = 300
 
 
@@ -190,6 +192,26 @@ def _checked_members(members: object) -> tuple[tuple[str, LLM], ...]:
     return tuple(checked)
 
 
+async def _create_within_budget(
+    llm: LLM, messages: list[ContextBlock], kwargs: dict[str, Any]
+) -> ContextBlock:
+    """有墙钟上限时到点取消，并交回 `BudgetDeadline` 而不是平台故障。
+
+    上限是调用开始时还剩的秒数（收尾轮已经加上宽限），用事件循环的时钟计，不跟路由器自己的退避
+    时钟比：两边的时钟可以不是同一只。没有上限就原样调用，provider 自己的超时照旧算平台故障。
+    """
+    limit = model_call_limit()
+    if limit is None:
+        return await llm.create(messages, **kwargs)
+    if limit <= 0:
+        raise BudgetDeadline()
+    try:
+        async with asyncio.timeout(limit):
+            return await llm.create(messages, **kwargs)
+    except TimeoutError:
+        raise BudgetDeadline() from None
+
+
 class ModelRouter:
     """按声明顺序轮换多个平台；一个平台失败就换下一个，并让它单独退避。
 
@@ -277,7 +299,7 @@ class ModelRouter:
                 if state.retry_at > self._clock():
                     continue
                 try:
-                    reply = await llm.create(messages, **kwargs)
+                    reply = await _create_within_budget(llm, messages, kwargs)
                 except _NOT_A_PLATFORM_FAILURE:
                     raise
                 except Exception as exc:

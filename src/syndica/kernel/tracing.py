@@ -28,6 +28,12 @@ from dataclasses import dataclass, field
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
+from syndica.kernel.call_limit import (
+    BudgetDeadline,
+    arm_model_call_limit,
+    reset_model_call_limit,
+    wrap_grace,
+)
 from syndica.kernel.errors import ContractViolation
 from syndica.kernel.trace import AttributeValue, CausalityEdge, EdgeKind, SpanKind, SpanStatus
 
@@ -337,6 +343,21 @@ class _Tracing:
         # 消息 id → 发送时的 span 与收件人。消费时取走；投递失败、收件人被销毁、它的邮箱随一次收尾
         # 被摘掉时丢掉，否则没人消费的消息会让这张表只增不减。
         self._sent_from: dict[str, tuple[str, str]] = {}
+        # 在任何 span 之外发生、要记在某个 Agent 下一个 agent span 上的事件。按 Agent 存，记一次就
+        # 取走：两个周期之间的一次追加只记在紧接着的那一个周期上。
+        self._deferred: dict[str, list[tuple[str, dict[str, AttributeValue]]]] = {}
+
+    def defer(self, agent_id: str, name: str, attributes: Mapping[str, AttributeValue]) -> None:
+        self._deferred.setdefault(agent_id, []).append((name, dict(attributes)))
+
+    def flush_deferred(self, agent_id: str) -> None:
+        """在 `agent_id` 刚开的 agent span 里调：把攒着的事件记上去。"""
+        for name, attributes in self._deferred.pop(agent_id, ()):
+            self.event(name, attributes)
+
+    def drop_deferred(self, agent_id: str) -> int:
+        """这个 Agent 不会再开 agent span 了：丢掉攒着的事件，交回丢了几条。"""
+        return len(self._deferred.pop(agent_id, ()))
 
     def call(self, step: str, invoke: Callable[[Tracer], object]) -> None:
         tracer = self.tracer
@@ -560,6 +581,7 @@ class _Attempt:
         self._span: _Span | None = None
         self._ticket: object = None
         self._admitted = False
+        self._limit_token: Token[float | None] | None = None
 
     def observe(self, reply: object) -> None:
         """把回复里 backend 报的事实记到这次的 span 上：哪个平台答的（`extra['llm_route']`）、同一次
@@ -653,20 +675,30 @@ class _Attempt:
         if call.account is not None and not self._admitted:
             # 放不进剩余预算时在这里抛 `BudgetExhausted`：调用不发出去、不开 span、不算一次尝试。
             self._ticket = call.account.admit(self._llm, self._request)
-        call.attempts += 1
-        attributes: dict[str, AttributeValue] = {'llm.attempt': call.attempts}
-        model = _model_of(self._llm)
-        if model is not None:
-            attributes['llm.model'] = model
-        self._span = call.tracing.span(
-            SpanKind.LLM_CALL,
-            (call.agent_id, call.turn, call.attempts),
-            name='llm',
-            agent_id=call.agent_id,
-            attributes=attributes,
-        )
-        self._span.__enter__()
-        call.in_flight = True
+        # 墙钟上限是给路由器的信号，不进请求字节：进了，前缀缓存每轮都失效。收尾轮的宽限已经
+        # 加在 grace 上。admit 抛了就到不了这里，信号不会留在这次失败的任务上。
+        left = None if call.account is None else call.account.view().remaining.wall_clock_s
+        seconds = None if left is None else left + wrap_grace()
+        self._limit_token = arm_model_call_limit(seconds)
+        try:
+            call.attempts += 1
+            attributes: dict[str, AttributeValue] = {'llm.attempt': call.attempts}
+            model = _model_of(self._llm)
+            if model is not None:
+                attributes['llm.model'] = model
+            self._span = call.tracing.span(
+                SpanKind.LLM_CALL,
+                (call.agent_id, call.turn, call.attempts),
+                name='llm',
+                agent_id=call.agent_id,
+                attributes=attributes,
+            )
+            self._span.__enter__()
+            call.in_flight = True
+        except BaseException:
+            reset_model_call_limit(self._limit_token)
+            self._limit_token = None
+            raise
         return self
 
     def __exit__(
@@ -677,8 +709,13 @@ class _Attempt:
     ) -> None:
         if self._call is not None:
             self._call.in_flight = False
+            if self._limit_token is not None:
+                reset_model_call_limit(self._limit_token)
+                self._limit_token = None
             if self._ticket is not None and self._call.account is not None:
-                if isinstance(exc, asyncio.CancelledError):
+                # 墙钟到了与被取消一样：请求多半已经发出去，按估算的输入记一笔。放掉预占却不记，
+                # 取消次数就没有上界。
+                if isinstance(exc, asyncio.CancelledError | BudgetDeadline):
                     self._call.account.abandon(cast('Any', self._ticket), self._llm)
                 else:
                     self._call.account.release(cast('Any', self._ticket))

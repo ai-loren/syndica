@@ -1205,3 +1205,16 @@ async def test_a_finished_but_not_yet_injected_background_call_does_not_block_an
     await executor.execute_tool_calls(Context(), [ToolCall(id='d', name='Deploy', arguments='{}')])
     assert calls.outstanding and not calls.running
     assert (asked, deploy.ran) == (['Deploy'], 1)
+
+
+async def test_the_finished_event_of_a_moved_call_names_its_background_id() -> None:
+    slow = _Slow()
+    llm = _Script([_call('Slow', 's'), _call('Release', 'r'), _say('done')])
+    runtime = _runtime()
+    events = runtime.events.subscribe()
+    try:
+        await _run(runtime, _factory(llm, {'Slow': slow, 'Release': _Releases(slow)}))
+    finally:
+        await runtime.shutdown()
+    finished = [e.payload async for e in events if e.kind == 'tool_call_finished']
+    assert {'tool_call_id': 's', 'outcome': 'backgrounded', 'background_id': 'bg-1'} in finished

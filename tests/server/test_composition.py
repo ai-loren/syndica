@@ -109,6 +109,41 @@ async def test_three_sessions_each_hold_their_session_lock(tmp_path: Path):
         acquire_session_lock(session_root(tmp_path), session.sid).release()
 
 
+def _read(path: str, call_id: str = 'r1') -> ScriptedTurn:
+    return ScriptedTurn(
+        tool_calls=[ToolCall(id=call_id, name='Read', arguments=json.dumps({'path': path}))]
+    )
+
+
+async def test_a_file_one_session_wrote_by_command_is_untrusted_in_a_later_session(tmp_path: Path):
+    scripts = _Scripts(
+        [_bash('echo planted > planted.md'), ScriptedTurn(content='done')],
+        [_read('planted.md'), ScriptedTurn(content='done')],
+    )
+    assembly, _ = _assembly(tmp_path, scripts)
+    live = Live(assembly)
+    try:
+        first = await live.open_session(resume=None, role='Worker')
+        assert (await first.handle.deliver(first.handle.root_id, 'go')).ok
+        await _finished(live, first.sid)
+        assert (tmp_path / 'planted.md').exists()
+        second = await live.open_session(resume=None, role='Worker')
+        assert (await second.handle.deliver(second.handle.root_id, 'go')).ok
+        entries = await _finished(live, second.sid)
+    finally:
+        await live.shutdown()
+    reads = [
+        entry['payload']['block']
+        for entry in entries
+        if entry['kind'] == 'message_appended'
+        and entry['payload']['block']['role'] == 'tool'
+        and entry['payload']['block']['tool_call_id'] == 'r1'
+    ]
+    assert [(block['trust'], 'planted' in block['text']) for block in reads] == [
+        ('untrusted', True)
+    ]
+
+
 async def test_a_git_write_from_a_server_session_is_blocked_by_dev_mode(tmp_path: Path):
     live, entries = await _run_one(
         tmp_path, [_bash('git commit -m x'), ScriptedTurn(content='done')]
@@ -157,6 +192,17 @@ async def test_a_config_edited_after_start_is_not_used_and_doctor_says_so(tmp_pa
     [config] = [check for check in assembly.doctor() if check['name'] == 'config']
     assert config['ok'] is False
     assert 'syndica down' in config['next_action']
+
+
+async def test_doctor_reports_a_config_broken_after_start_as_one_failing_check(tmp_path: Path):
+    (tmp_path / '.syndica.yaml').write_text('version: 1\n')
+    assembly, _ = _assembly(tmp_path, lambda _: ScriptedLLM([]))
+    (tmp_path / '.syndica.yaml').write_text('version: 99\n')
+    checks = assembly.doctor()
+    [config] = [check for check in checks if check['name'] == 'config']
+    assert config['ok'] is False
+    assert '读不出来' in config['received'] and 'syndica down' in config['next_action']
+    assert len(checks) > 1
 
 
 async def test_doctor_reports_a_model_that_cannot_be_built(tmp_path: Path):

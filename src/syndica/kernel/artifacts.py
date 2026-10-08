@@ -126,6 +126,11 @@ class ArtifactHandlers:
         for key in keys:
             self._by_key[key] = handler
 
+    def kinds(self) -> frozenset[str]:
+        """`Deliver` 收的类别：内核的基础类别，加上已装处理器声明的（不含通配 `*`）。处理器是宿主装
+        的代码，不是模型写的：模型只能在这张表里挑，挑不到严格处理器之外的去处。"""
+        return KINDS | {kind for kind, _ in self._by_key if kind != '*'}
+
     def for_(self, ref: ArtifactRef) -> ArtifactHandler:
         for key in ((ref.kind, ref.mime), (ref.kind, '*'), ('*', ref.mime), ('*', '*')):
             handler = self._by_key.get(key)
