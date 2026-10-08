@@ -3,7 +3,17 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { STATE, startFake, up } from './server';
 
-const YAML = 'version: 1\nmodules: [acceptance]\n';
+// 内置角色都没有 Terminal：Agent 终端的镜像要一个带它的角色才走得到。
+const YAML = [
+  'version: 1',
+  'modules: [acceptance]',
+  'agents:',
+  '  - name: Operator',
+  '    description: 在终端里跑交互式程序时用我',
+  '    system_prompt: 你在终端里跑交互式程序。',
+  '    tools: [Bash, Terminal]',
+  '',
+].join('\n');
 
 export default async function setup(): Promise<void> {
   mkdirSync(STATE, { recursive: true });

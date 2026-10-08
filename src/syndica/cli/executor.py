@@ -32,8 +32,11 @@ class DaemonExecutor(ThreadPoolExecutor):
         super().__init__(max_workers=1)
         self._jobs: queue.SimpleQueue[_Job] | None = None
         if workers is not None:
-            if isinstance(workers, bool) or workers < 1:
-                raise ValueError(f'workers 是 >= 1 的整数或 None；收到 {workers!r}')
+            if type(workers) is not int or workers < 1:
+                raise ValueError(
+                    f'DaemonExecutor 的 workers 期望 >= 1 的整数或 None；收到 {workers!r}。'
+                    '传一个正整数封顶线程数，或者不传（每个任务一个守护线程）'
+                )
             jobs: queue.SimpleQueue[_Job] = queue.SimpleQueue()
             self._jobs = jobs
             for index in range(workers):

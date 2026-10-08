@@ -425,6 +425,7 @@ _PROMISED_VIA_SUBMODULE: dict[str, tuple[str, ...]] = {
 _WITHHELD: tuple[str, ...] = (
     'ANY',
     'BudgetDeadline',
+    'CopyTicket',
     'WRAP_UP_GRACE_S',
     'arm_model_call_limit',
     'arm_wrap_grace',

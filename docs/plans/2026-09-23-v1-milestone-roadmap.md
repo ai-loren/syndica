@@ -51,6 +51,13 @@ OpenRouter 兜底，每个平台各自指数退避，spec 决策 #89）。
 按验收量进度直到 `pass`、慢命令转后台。子树持久化与截止时刻打断正在跑的一轮改派 M9。M8 的提交同样只按本地验证协议
 验证过。
 
+里程碑 9 已完成（2026-10-08），审计记录见 [`docs/audits/2026-10-08-m9-final-audit.md`](../audits/2026-10-08-m9-final-audit.md)：
+`syndica up` 起一个只在本机监听的服务，浏览器里建会话、发任务、看 Agent 树与事件流、处理工具确认与提问、预览产物与 diff
+并提反馈、看 trace / 预算 / 进度，窄屏可用；断线重连与刷新不丢事件，人的终端经 WebSocket，没有 key 时页面给三件套。前端产物
+随 Python 包发布。Playwright 在桌面与移动视口各跑 14 条（真的 `syndica up` 对脚本化的模型端点），免费模型经 UI 跑通了交付、
+确认弹窗与批准、时间线与 trace 一致。M8 留下的截止时刻打断、预算跨会话、追加预算的 trace 事件、隔离拷贝进线程与 M7 留下的
+裁决退出码、交付说明、处理器类别一并做完；子树持久化再改派到 v1 之后（多进程宿主）。M9 的提交同样只按本地验证协议验证过。
+
 当前主线约束：
 
 - 不重做 M1，不补 `Runtime.start` / `Junction.RUNTIME_START`。
@@ -103,7 +110,7 @@ uv run pytest -q
 | 6 | 状态 | 已完成 | 会话持久化与恢复（根对话）、§8.8 三种基线压缩 + 内核压缩步骤 + 三触发、§8.9 两层两阶段记忆（LLM 整理、根才写全局、不可信不进全局）、接进 CLI；审计见 `docs/audits/2026-10-05-m6-final-audit.md` |
 | 7 | 产物与验收 | 已完成 | 产物身份与版本 + 交付物、处理器注册、Goal / Rubric / 锚点规则、L1 / L2 / L3 验收 Module 与四值裁决、反馈升级（人确认）、接进 CLI；审计见 `docs/audits/2026-10-05-m7-final-audit.md` |
 | 8 | 长程任务 | 已完成 | 预算树（四维、预留 + 周期收尾结算 + 唤醒重切、单一准入与计量点、三档成本、伴生记账）与可感知预算（`GetBudget`、预算注入历史、`graceful_wrapup` 收尾轮）、`--max-*` 改为根预算；进度账本、停滞、漂移（锚点检查 + 可选语义比对）、可插拔长程策略（基线 + 随 wheel 的契约）与 `long-horizon` Module；目标导向型压缩与压缩前完整前像；后台工具、派活树回收、后代单一定义、拓扑槽隔离；审计见 `docs/audits/2026-10-06-m8-final-audit.md` |
-| 9 | 产品面 | 未开始 | HTTP/SSE/WebSocket + React |
+| 9 | 产品面 | 已完成 | `syndica up/status/down` 本机服务（REST、可续读的 SSE、WebSocket 的请求 / 答复 / 终端，OpenAPI 快照与变更记录）、随包发布的 React 界面（会话、时间线、Agent 树、确认与提问、产物预览 / diff / 反馈、预算 / 进度 / trace、终端、窄屏）、Playwright 桌面与移动 E2E；截止时刻打断在飞的调用、预算跨会话、`--verdict-exit`、隔离拷贝进线程；子树持久化改派到 v1 之后；审计见 `docs/audits/2026-10-08-m9-final-audit.md` |
 | 10 | 互操作 | 未开始 | MCP -> ACP -> A2A -> OpenAI HTTP |
 | 11 | 训练出口 | 未开始 | 中立轨迹与 SFT/偏好/RL 导出 |
 | 12 | 发布准备 | 未开始 | 英文文档、CI 矩阵、v1.0 发布 |

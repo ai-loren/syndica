@@ -22,7 +22,7 @@ from syndica.kernel.driving import _DRIVING_AGENT  # pyright: ignore[reportPriva
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.hooks import HooksCenter
-from syndica.kernel.isolation import LocalIsolator
+from syndica.kernel.isolation import CopyTicket, LocalIsolator
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.local_workspace import LocalWorkspace
 from syndica.kernel.redaction import RuleRedactor
@@ -131,6 +131,25 @@ async def test_a_task_started_inside_an_isolated_agent_still_lands_in_its_copy(
 
     assert (copy.location / 'side.md').exists()
     assert not (root / 'side.md').exists()
+
+
+async def test_the_host_reads_each_agents_terminal_in_the_workspace_that_agent_works_in(
+    router: WorkspaceRouter,
+) -> None:
+    router.isolate('alpha', 'snapshot')
+    router.adopt('bravo', None)
+    opened = {
+        agent: await _as(
+            agent, lambda agent=agent: router.pty_create(f'echo from-{agent}; sleep 5', cwd='.')
+        )
+        for agent in ('alpha', 'bravo')
+    }
+
+    for agent, handle in opened.items():
+        captured = await router.pty_capture_of(agent, handle, wait=2.0)
+        assert f'from-{agent}' in captured.text
+    with pytest.raises(ConfigError):
+        await router.pty_capture_of('bravo', opened['alpha'])
 
 
 async def test_merge_applies_edits_creations_and_deletions_the_parent_left_alone(
@@ -504,6 +523,30 @@ async def test_merging_an_agent_that_is_still_running_is_refused(router: Workspa
         release.set()
     finally:
         await runtime.shutdown()
+
+
+async def test_spawn_copies_in_the_runtimes_own_bounded_pool(
+    router: WorkspaceRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    threads: list[str] = []
+    real = LocalIsolator.prepare
+
+    def recording(self: LocalIsolator, *args: Any, **kwargs: Any) -> Any:
+        threads.append(threading.current_thread().name)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(LocalIsolator, 'prepare', recording)
+    runtime = Runtime(workspace=router)
+    try:
+        for _ in range(3):
+            agent_id = await runtime.spawn(
+                _writer(router, 'out.md', 'x'), query='go', isolation='snapshot'
+            )
+            await asyncio.wait_for(runtime.wait(agent_id), timeout=_TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    assert len(threads) == 3
+    assert all(name.startswith('syndica-copy') for name in threads), threads
 
 
 async def test_despawn_discards_the_copy(router: WorkspaceRouter) -> None:
@@ -992,6 +1035,24 @@ def test_a_file_that_disappears_during_the_copy_is_absent_not_an_error(
     assert (copy.location / 'src' / 'app.py').is_file()
 
 
+def test_a_file_that_disappears_between_listing_and_stat_is_absent_not_an_error(
+    root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (root / 'ghost.md').write_text('boo')
+    original = Path.is_file
+
+    def vanishing(self: Path) -> bool:
+        present = original(self)
+        if present and self.name == 'ghost.md':
+            self.unlink()
+        return present
+
+    monkeypatch.setattr(Path, 'is_file', vanishing)
+    copy = _isolator(tmp_path).isolate(root, 'alpha', 'snapshot')
+    assert 'ghost.md' not in copy.base
+    assert 'notes.md' in copy.base
+
+
 async def test_a_cancelled_copy_leaves_no_scratch_and_no_route(
     root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1036,6 +1097,52 @@ async def test_a_cancelled_copy_leaves_no_scratch_and_no_route(
         release.set()
         pool.shutdown(wait=True, cancel_futures=True)
         await routed.close()
+
+
+def test_a_copy_cancelled_after_its_loop_is_gone_still_removes_its_scratch(
+    root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    original = LocalIsolator.prepare
+
+    def blocking(self: LocalIsolator, *args: Any) -> Any:
+        started.set()
+        assert release.wait(5)
+        return original(self, *args)
+
+    monkeypatch.setattr(LocalIsolator, 'prepare', blocking)
+    pool = ThreadPoolExecutor(max_workers=1)
+
+    async def cancelled_while_copying() -> None:
+        routed = WorkspaceRouter(
+            LocalWorkspace(str(root), shell='/bin/sh', env={}),
+            versions=VersionStore(root, redactor=RuleRedactor()),
+            isolator=_isolator(tmp_path),
+        )
+        task = asyncio.create_task(routed.stage_isolation('alpha', 'snapshot', pool))
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await routed.close()
+
+    # 事件循环在拷贝线程拷完之前就结束了（Ctrl-C、关机）：线程自己负责删。
+    asyncio.run(cancelled_while_copying())
+    release.set()
+    pool.shutdown(wait=True)
+    assert list((root / '.syndica' / 'snapshots').glob('.alpha.building-*')) == []
+
+
+def test_a_copy_handed_over_before_the_cancel_is_removed_by_the_canceller(
+    root: Path, tmp_path: Path
+) -> None:
+    isolator = _isolator(tmp_path)
+    ticket = CopyTicket()
+    prepared = isolator.prepare(root, 'alpha', 'snapshot', isolator.begin('alpha'), None, ticket)
+    assert all(scratch.exists() for _, scratch in prepared.building)
+    ticket.cancel(isolator)
+    assert all(not scratch.exists() for _, scratch in prepared.building)
 
 
 def test_a_superseded_copy_is_deleted_instead_of_installed(root: Path, tmp_path: Path) -> None:

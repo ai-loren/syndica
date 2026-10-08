@@ -59,7 +59,7 @@ def test_the_documented_paths_are_exactly_the_routes_the_app_serves():
         [
             openapi()['x-syndica-rpc']['path'],
             '/api/v1/sessions/{sid}/pty',
-            '/api/v1/sessions/{sid}/agent-pty/{handle}',
+            '/api/v1/sessions/{sid}/agent-pty/{agent_id}/{handle}',
         ]
     )
     assert all(path in json.dumps(openapi()['x-syndica-pty']) for path in sockets[:2])

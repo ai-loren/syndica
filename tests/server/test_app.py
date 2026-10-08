@@ -15,6 +15,7 @@ from server_fakes import SECRET, FakeAssembly, FakeHandle, running, sse_events
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.typing import Origin
 
+from syndica.kernel import Event
 from syndica.server import MAX_STREAMS, Credentials
 from syndica.server.app import MAX_HANDSHAKES
 from syndica.server.auth import LOGIN_TTL_S
@@ -427,6 +428,34 @@ async def test_a_resolved_request_leaves_the_pending_table():
     assert assembly.handles[0].answers == []
 
 
+async def test_after_dropped_events_only_requests_of_waiting_agents_stay_pending():
+    assembly = FakeAssembly()
+    async with running(assembly) as server, httpx.AsyncClient(base_url=server.base) as client:
+        await client.post('/api/v1/sessions', headers=server.login(), json={})
+        handle = assembly.handles[0]
+        session = server.live.sessions['s0']
+        session._pump.cancel()  # pyright: ignore[reportPrivateUsage]
+        snapshot = await handle.snapshot()
+        snapshot['agents'] += [
+            {'agent_id': 'worker', 'name': 'Worker', 'parent_id': 's0', 'status': 'waiting'},
+            {'agent_id': 'gone', 'name': 'Worker', 'parent_id': 's0', 'status': 'idle'},
+        ]
+
+        async def waiting_state() -> dict[str, Any]:
+            return snapshot
+
+        handle.snapshot = waiting_state  # type: ignore[method-assign]
+        for agent_id, request_id in (('worker', 'r1'), ('gone', 'r2')):
+            request = {'request_id': request_id, 'tool_call_id': 'c', 'tool_name': 'Bash'}
+            session._observe(Event('tool_confirmation_requested', agent_id, request))  # pyright: ignore[reportPrivateUsage]
+        for turn in range(70):
+            await handle.emit('turn_start', turn=turn)
+        assert handle.subscription.dropped > 0
+        session._observe(await anext(handle.subscription))  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0.05)
+        assert sorted(session.pending) == ['r1']
+
+
 async def test_unattended_sessions_reject_confirmations_and_abort_questions():
     assembly = FakeAssembly()
     async with (
@@ -443,6 +472,26 @@ async def test_unattended_sessions_reject_confirmations_and_abort_questions():
         await asyncio.sleep(0.05)
     assert handle.answers == [('worker', 'r1', 'reject')]
     assert handle.aborted == ['asker', 'late']
+
+
+async def test_an_unattended_decline_does_not_answer_a_request_resolved_before_it_ran():
+    assembly = FakeAssembly()
+    async with (
+        running(assembly, grace_s=0.05) as server,
+        httpx.AsyncClient(base_url=server.base) as client,
+    ):
+        await client.post('/api/v1/sessions', headers=server.login(), json={})
+        server.live.attach()
+        server.live.detach()
+        await asyncio.sleep(0.2)
+        assert server.live.unattended is True
+        [session] = server.live.sessions.values()
+        payload = {'request_id': 'r9', 'tool_call_id': 'c9', 'tool_name': 'Bash'}
+        # 同一拍里先到请求、再到它的了结：无人值守的拒绝已经排上，但还没跑。
+        session._observe(Event('tool_confirmation_requested', 'worker', payload))  # pyright: ignore[reportPrivateUsage]
+        session._observe(Event('human_request_resolved', 'worker', {'request_id': 'r9'}))  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0.05)
+    assert assembly.handles[0].answers == []
 
 
 async def test_a_connected_client_keeps_requests_waiting():
@@ -543,6 +592,28 @@ async def test_an_unexpected_error_in_an_op_is_a_reply_and_the_socket_stays_open
     assert 'server 日志' in failed['error']['received']
     assert 'store lost the row' not in json.dumps(failed)
     assert later['ok'] is True
+
+
+async def test_a_binary_frame_is_a_bad_frame_not_a_dropped_connection():
+    assembly = FakeAssembly()
+    async with running(assembly) as server, httpx.AsyncClient(base_url=server.base) as client:
+        await client.post('/api/v1/sessions', headers=server.login(), json={})
+        socket = await _rpc(server.base, server.port, 's0', server.token)
+        await socket.send(b'\x00\x01')
+        refused = json.loads(await asyncio.wait_for(socket.recv(), 5))
+        later = await _call(socket, op='send', id=2, text='again')
+        await socket.close()
+        unauthenticated = await websockets.connect(
+            f'ws://127.0.0.1:{server.port}/api/v1/sessions/s0/rpc', origin=Origin(server.base)
+        )
+        await unauthenticated.send(b'\x00')
+        first = json.loads(await asyncio.wait_for(unauthenticated.recv(), 5))
+        with pytest.raises(ConnectionClosed) as closed:
+            await asyncio.wait_for(unauthenticated.recv(), 5)
+    assert refused['ok'] is False and '二进制' in refused['error']['received']
+    assert later['ok'] is True
+    assert first['ok'] is False
+    assert closed.value.rcvd is not None and closed.value.rcvd.code == 4401
 
 
 async def test_a_failed_delivery_is_reported_with_three_parts():
@@ -680,6 +751,27 @@ async def test_unauthenticated_websockets_do_not_take_the_humans_stream_slots():
     assert status == 200
 
 
+async def test_authenticated_websockets_beyond_the_stream_limit_are_refused():
+    assembly = FakeAssembly()
+    async with running(assembly) as server, httpx.AsyncClient(base_url=server.base) as client:
+        await client.post('/api/v1/sessions', headers=server.login(), json={})
+        held = [
+            await _rpc(server.base, server.port, 's0', server.token) for _ in range(MAX_STREAMS)
+        ]
+        extra = await websockets.connect(
+            f'ws://127.0.0.1:{server.port}/api/v1/sessions/s0/rpc', origin=Origin(server.base)
+        )
+        await extra.send(json.dumps({'op': 'auth', 'id': 0, 'token': server.token}))
+        reply = json.loads(await asyncio.wait_for(extra.recv(), 2))
+        with pytest.raises(ConnectionClosed) as closed:
+            await asyncio.wait_for(extra.recv(), 2)
+        for socket in held:
+            await socket.close()
+    assert reply['ok'] is False
+    assert str(MAX_STREAMS) in reply['error']['expected']
+    assert closed.value.rcvd is not None and closed.value.rcvd.code == 1013
+
+
 async def test_the_oldest_unauthenticated_handshake_is_closed_when_too_many_wait():
     assembly = FakeAssembly()
     async with running(assembly) as server, httpx.AsyncClient(base_url=server.base) as client:
@@ -803,6 +895,32 @@ async def test_resume_reuses_a_live_session_and_rm_removes_the_stored_one():
     assert removed.status_code == 204
     assert assembly.removed == ['stored']
     assert assembly.handles[0].closed == [None]
+
+
+async def test_resume_takes_a_budget_and_a_wall_clock_starts_fresh():
+    assembly = FakeAssembly()
+    budget = {'budget': {'wall_clock_s': 600.0, 'turns': 5}}
+    async with running(assembly) as server, httpx.AsyncClient(base_url=server.base) as client:
+        resumed = await client.post(
+            '/api/v1/sessions/stored/resume', headers=server.login(), json=budget
+        )
+    assert resumed.status_code == 200
+    [options] = assembly.opened
+    assert (options['wall_clock_s'], options['turns'], options['tokens']) == (600.0, 5, None)
+
+
+async def test_a_budget_for_a_session_that_is_already_open_is_refused_not_dropped():
+    assembly = FakeAssembly()
+    async with running(assembly) as server, httpx.AsyncClient(base_url=server.base) as client:
+        await client.post('/api/v1/sessions/stored/resume', headers=server.login())
+        refused = await client.post(
+            '/api/v1/sessions/stored/resume',
+            headers=server.login(),
+            json={'budget': {'wall_clock_s': 600.0}},
+        )
+    assert refused.status_code == 409
+    assert 'grant' in refused.json()['next_action']
+    assert len(assembly.opened) == 1
 
 
 async def test_an_error_that_echoes_the_callers_input_is_redacted():

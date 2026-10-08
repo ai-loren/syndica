@@ -221,6 +221,8 @@ def _reported(
 
 # 与后台取消同一句：到点停下，不声称命令没产生副作用，也不声称它做完了。
 _BUDGET_STOPPED = '到预算截止时刻停下，副作用未知：它可能已经做了一部分。需要它的结果就重新发起。'
+# 没起过的命令不能套上一句：「可能做了一部分」会让模型去查、去补一个不存在的副作用。
+_BUDGET_NOT_STARTED = '没有运行：预算截止时刻已经过了，这条命令没有启动，没有任何副作用。'
 
 
 def _valid_timeout(value: object) -> None:
@@ -476,7 +478,7 @@ class Bash(Tool):
             clamped = left is not None and left < float(timeout)
             limit = float(timeout) if not clamped else cast(float, left)
             if clamped and limit <= 0:
-                return ToolResult(output=_BUDGET_STOPPED, trust=TrustLevel.UNTRUSTED)
+                return ToolResult(output=_BUDGET_NOT_STARTED)
             result = await self._portal.run(command, timeout=limit, cwd=cwd)
         except ConfigError as exc:
             return _told(exc)

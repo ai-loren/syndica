@@ -209,13 +209,13 @@ async def test_the_agent_terminal_mirror_sends_whole_redacted_lines_and_ends_wit
     async with running(assembly) as server, httpx.AsyncClient(base_url=server.base) as client:
         await _session(client, server)
         half = len(SECRET) // 2
-        assembly.handles[0].screens['pty-1'] = [
+        assembly.handles[0].screens[('worker', 'pty-1')] = [
             f'token={SECRET[:half]}',
             f'{SECRET[half:]}\nnext ',
             'line\n',
         ]
         socket = await _socket(
-            server.base, server.port, '/api/v1/sessions/s0/agent-pty/pty-1', server.token
+            server.base, server.port, '/api/v1/sessions/s0/agent-pty/worker/pty-1', server.token
         )
         frames = []
         while True:
@@ -233,7 +233,7 @@ async def test_mirroring_a_terminal_that_does_not_exist_says_so():
     async with running(FakeAssembly()) as server, httpx.AsyncClient(base_url=server.base) as client:
         await _session(client, server)
         socket = await _socket(
-            server.base, server.port, '/api/v1/sessions/s0/agent-pty/missing', server.token
+            server.base, server.port, '/api/v1/sessions/s0/agent-pty/worker/missing', server.token
         )
         frame = json.loads(await asyncio.wait_for(socket.recv(), 5))
     assert frame['error']['next_action'] == 'list them'

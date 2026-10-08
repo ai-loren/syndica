@@ -87,6 +87,13 @@ class CreateSession(_Model):
     budget: BudgetRequest | None = None
 
 
+class ResumeSession(_Model):
+    """恢复时的预算。tokens / cost / turns 不给就沿用会话里存的上限；墙钟不存进会话，要限就每次打开
+    重给，从这一刻起算。"""
+
+    budget: BudgetRequest | None = None
+
+
 class SessionSummary(_Model):
     sid: str
     agent: str

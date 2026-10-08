@@ -54,6 +54,12 @@ _DEPENDENCIES = ('starlette', 'uvicorn', 'websockets')
 _BLOCKING_WORKERS = 8
 
 
+def _blocking_executor() -> DaemonExecutor:
+    """server 事件循环的默认执行器：线程数封顶。每个会话的文件读写、产物预览都经它，不封顶的话
+    并发的请求能把线程数拉到没有上界。"""
+    return DaemonExecutor(workers=_BLOCKING_WORKERS)
+
+
 def up(
     stdio: CliIO,
     workspace_root: Path,
@@ -260,8 +266,10 @@ def _lock_held(paths: _Paths) -> bool:
 def _spawn(workspace_root: Path, paths: _Paths, config: str, port: int) -> dict[str, Any]:
     paths.make()
     # stderr 不接进日志文件：那会把没脱敏的文字直接落盘。server 自己的日志经脱敏 handler 写。
+    # `-P`：`-m` 默认把当前目录放在 sys.path 最前，而当前目录是 Agent 能写的工作区根——Agent 写一个
+    # `uvicorn.py` 或 `syndica/`，它就跑进这个带着宿主全部环境（provider 的 key）与登录码的进程。
     process = subprocess.Popen(
-        [sys.executable, '-m', 'syndica.serve', '--config', config, '--port', str(port)],
+        [sys.executable, '-P', '-m', 'syndica.serve', '--config', config, '--port', str(port)],
         cwd=workspace_root,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -465,7 +473,7 @@ def _serve(
 
         async def run() -> None:
             loop = asyncio.get_running_loop()
-            loop.set_default_executor(DaemonExecutor(workers=_BLOCKING_WORKERS))
+            loop.set_default_executor(_blocking_executor())
             server.loop = loop
             await server.serve(sockets=[sock])
 

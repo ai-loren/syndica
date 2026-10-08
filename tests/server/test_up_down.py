@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -44,7 +45,7 @@ def _syndica(
     workspace: Path, environ: dict[str, str], *args: str
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, '-m', 'syndica', *args],
+        [sys.executable, '-P', '-m', 'syndica', *args],
         cwd=workspace,
         env=environ,
         capture_output=True,
@@ -125,6 +126,27 @@ def test_up_status_down_round_trip_without_leaving_a_credential_anywhere(
     assert after.returncode == 3
 
 
+@pytest.mark.parametrize('planted', ['uvicorn.py', 'syndica/__init__.py'])
+def test_the_server_process_never_imports_code_from_the_workspace_root(
+    tmp_path: Path, workspace: Path, planted: str
+):
+    marker = tmp_path / 'imported.json'
+    target = workspace / planted
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        'import json, os\n'
+        f'open({str(marker)!r}, "w").write(json.dumps({{"key": "OPENAI_API_KEY" in os.environ}}))\n'
+        'raise ImportError("planted")\n'
+    )
+    environ = _environ(tmp_path)
+    started = _syndica(workspace, environ, 'up', '--no-open')
+    try:
+        assert started.returncode == 0, started.stderr
+        assert not marker.exists(), marker.read_text()
+    finally:
+        _syndica(workspace, environ, 'down')
+
+
 @pytest.mark.parametrize('command', ['up', 'down'])
 def test_up_and_down_refuse_inside_an_agent_environment(
     tmp_path: Path, workspace: Path, command: str
@@ -140,16 +162,24 @@ def test_the_server_module_entry_refuses_inside_an_agent_environment(
     tmp_path: Path, workspace: Path
 ):
     environ = {**_environ(tmp_path), 'SYNDICA_AGENT_ENV': '1'}
-    result = subprocess.run(
+    process = subprocess.Popen(
         [sys.executable, '-m', 'syndica.serve', '--foreground'],
         cwd=workspace,
         env=environ,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=60,
+        start_new_session=True,
     )
-    assert result.returncode == 2
-    assert 'Agent' in result.stderr and 'login' not in result.stdout
+    try:
+        stdout, stderr = process.communicate(timeout=30)
+    finally:
+        # 拒绝一旦失效，这里起的是一个真的 server：不管断言怎样，进程都不能留下。
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    assert process.returncode == 2
+    assert 'Agent' in stderr and 'login' not in stdout
     assert not (tmp_path / 'config' / 'syndica' / 'servers').exists()
 
 
@@ -181,6 +211,29 @@ def test_missing_server_dependencies_point_at_the_extra(monkeypatch: pytest.Monk
     assert 'syndica[server]' in caught.value.next_action
 
 
+def test_the_server_runs_blocking_work_on_a_bounded_set_of_threads():
+    executor = serve._blocking_executor()  # pyright: ignore[reportPrivateUsage]
+    started = threading.Semaphore(0)
+    release = threading.Event()
+    names: set[str] = set()
+
+    def job() -> None:
+        names.add(threading.current_thread().name)
+        started.release()
+        release.wait(10)
+
+    futures = [executor.submit(job) for _ in range(20)]
+    try:
+        for _ in range(serve._BLOCKING_WORKERS):  # pyright: ignore[reportPrivateUsage]
+            assert started.acquire(timeout=5)
+        assert not started.acquire(timeout=0.3)
+    finally:
+        release.set()
+    for future in futures:
+        future.result(timeout=5)
+    assert len(names) == serve._BLOCKING_WORKERS  # pyright: ignore[reportPrivateUsage]
+
+
 def test_the_state_directory_must_be_outside_the_workspace(tmp_path: Path):
     with pytest.raises(ConfigError) as caught:
         serve._Paths.of(tmp_path, {'XDG_CONFIG_HOME': str(tmp_path / 'inside')})  # pyright: ignore[reportPrivateUsage]
@@ -198,8 +251,13 @@ def test_a_state_file_whose_server_is_gone_is_reported_and_removed(tmp_path: Pat
 
 
 def test_a_server_that_holds_its_lock_but_does_not_answer_keeps_its_state_file(
-    tmp_path: Path, workspace: Path
+    tmp_path: Path, workspace: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    def no_spawn(*_: object) -> dict[str, object]:
+        raise AssertionError('up 不该在已有 server 时再起一个')
+
+    # 判定一旦出错，up 会真的起一个 server 进程（继承真实的 HOME）：挡在这里，失败也不留进程。
+    monkeypatch.setattr(serve, '_spawn', no_spawn)
     environ = _environ(tmp_path)
     paths = serve._Paths.of(workspace, environ)  # pyright: ignore[reportPrivateUsage]
     paths.make()

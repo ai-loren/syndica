@@ -18,7 +18,7 @@ from syndica.kernel.errors import ConfigError
 from syndica.kernel.events import EventBus
 from syndica.kernel.history_blocks import HistoryKind, kind_of
 from syndica.kernel.hooks import HooksCenter
-from syndica.kernel.isolation import LocalIsolator, MergeConflict, MergeReport
+from syndica.kernel.isolation import CopyTicket, LocalIsolator, MergeConflict, MergeReport
 from syndica.kernel.llm import LLMConfig
 from syndica.kernel.local_workspace import LocalWorkspace
 from syndica.kernel.runtime import Runtime
@@ -401,11 +401,12 @@ class _IsolatesOnce(LocalIsolator):
         requested: str,
         generation: int,
         under: Path | None = None,
+        ticket: CopyTicket | None = None,
     ) -> Any:
         self.calls += 1
         if self.calls > 1:
             raise OSError('No space left on device')
-        return super().prepare(root, agent_id, requested, generation, under)
+        return super().prepare(root, agent_id, requested, generation, under, ticket)
 
 
 async def test_a_cycle_whose_copy_cannot_be_made_stops_with_error(

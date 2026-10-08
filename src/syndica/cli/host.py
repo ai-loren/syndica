@@ -1757,6 +1757,15 @@ class RuntimeCliHost:
     def run_request(self, request: RunRequest) -> str | CliOutcome:
         flags = _validated_request(request)
         if request.session is not None:
+            if request.verdict_exit:
+                # 续跑的那一路不带验收的退出码：静默丢掉它，CI 会把每一个裁决都看成 0。
+                raise _UnusableOption(
+                    expected='--verdict-exit 用于一次新的 run',
+                    received=f'同时收到 session={request.session!r}',
+                    next_action=(
+                        '去掉 --session 起一次新的 run；要看续跑之后的裁决，用 syndica trace show'
+                    ),
+                )
             if request.handoff:
                 raise _config_error(
                     '--handoff 用于一次新的 run',

@@ -5,8 +5,9 @@
 > **形状按阶段冻结**：各公开类型在其所属阶段结束、契约与用例落地时才算冻结。由 M12 才公开的内核类型序列化出来的
 > HTTP 模型标 `x-syndica-stability: provisional`，M12 仍可改（P1 H2）。
 
-**状态：计划已评审（P1），执行中。** 用户 2026-10-06 下达 `/goal 把 M9 都做完`，沿用 M4–M8 的节奏。CI 仍推迟到
-M1–M11 都做完之后，只按本地验证协议验证。
+**状态：已完成（P5，2026-10-09）。** 用户 2026-10-06 下达 `/goal 把 M9 都做完`，沿用 M4–M8 的节奏。CI 仍推迟到
+M1–M11 都做完之后，只按本地验证协议验证。收口审计见
+[`docs/audits/2026-10-08-m9-final-audit.md`](../audits/2026-10-08-m9-final-audit.md)。
 
 **Goal:** `syndica up` 起一个只在本机监听的服务，浏览器里能建会话、发任务、看 Agent 树与事件流、处理工具确认与
 AskUser、预览产物与 diff 并提反馈、看 trace / 预算 / 进度，窄屏可用；断线重连与刷新不丢事件；PTY 经 WebSocket 交互；
@@ -142,8 +143,8 @@ OpenAPI 由 pydantic 模型（kernel 已有的依赖）生成，不引 OpenAPI �
 - WebSocket `/api/v1/sessions/{sid}/rpc`：第一帧 `{"op":"auth","token"}`；之后 `{"op": "send" | "answer" | "abort" |
   "grant" | "budget_answer" | "activate_rubric", "id", ...}`，逐条回 `{"id", "ok", "error"?}`。**发消息只有这一条路**
   （REST 没有 POST messages，P1 M15）；`send` 可指向会话里任何活着的 Agent（缺省根），UI 始终显示当前对象。
-  `/api/v1/sessions/{sid}/pty`：人的终端（二进制帧，只在回环）；`/api/v1/sessions/{sid}/agent-pty/{handle}`：Agent
-  终端的**只读镜像**（脱敏后的去转义屏幕文本，按 Agent 路由）。
+  `/api/v1/sessions/{sid}/pty`：人的终端（二进制帧，只在回环）；`/api/v1/sessions/{sid}/agent-pty/{agent_id}/{handle}`：
+  Agent 终端的**只读镜像**（脱敏后的去转义屏幕文本，按 Agent 路由；路径里的 `agent_id` 见 P5）。
 - CLI：`syndica up [--port N] [--config PATH] [--foreground] [--no-open]`、`syndica down`、`syndica status`。
 
 ---
@@ -388,3 +389,30 @@ class SessionHandle(Protocol):          # 只暴露内核公开类型与不透�
     （`agent_id`、`handle`、`background_id` 等）原样留——恢复要靠 `agent_id` 点名失效的子 Agent。
   - 变异：阶段五 13 条、评审处置 15 条，全部变红；一条起初存活（标识原样留的那一半，测试用的脱敏器根本认不出
     `'a' * 32`），给用例加了认得十六进制的用户规则之后变红。
+- **P5（收口评审的处置，2026-10-09）** 评审（`/tmp/syndica-m9-closing-review.md`，1 B / 1 H / 5 M / 4 L）逐条：
+  - B-1 `syndica up` 起 server 用 `python -m`、工作目录是工作区根，而 `-m` 把当前目录放在 `sys.path` 最前：Agent 写一个
+    `uvicorn.py` 或 `syndica/`，它就在带着宿主全部环境（provider 的 key）与登录码的进程里跑。子进程加 `-P`，与
+    console script（`sys.path[0]` 是 bin 目录）同一种解析；用例在工作区根种下模块，断言 server 从没导入它。PTY 的
+    启动器同样是 `-c`，但它跑在 Agent 的环境里、接着就执行 Agent 的命令，不给它任何新能力。
+  - H-1 截止上限改为罩住整次轮换：入口一次 `asyncio.timeout(limit)`，退避要睡过截止时刻就直接交回
+    `BudgetDeadline`，不再每个平台各给一份上限。
+  - M-1 会话记录存的是这个会话根自己的子树用量，不是池的；M-2 `--verdict-exit` 与 `--session` 一起给退出码 2；
+    M-3 拷贝线程与取消方按 `CopyTicket` 交接临时目录，谁后到谁删，事件循环先没了也照样删；M-4 页内 `reset` 之后
+    重取快照并从它的 `as_of` 重开事件流（只换流、不换 RPC 连接），快照响应到达之前旧流交出的事件于是会被新流补发；
+    旧流停下之后同一块里剩下的帧也不再交出。
+  - M-5 存活的变异逐条补了单独施加即变红的用例：真实周期里的人的等待到截止时刻返回（同时钉住周期确实绑定了墙钟，
+    S16）、派活等待到截止时刻返回、`pass` 经 `main` 退出码 10、`_decline` 不答已经了结的请求、空闲但有上限的会话
+    存下上限、despawn 时报告没记进 trace 的追加、spawn 的拷贝在 Runtime 自己的池里、server 的阻塞执行器封顶（构造挪进
+    `serve._blocking_executor`，用例直接测它）、丢过事件之后只留在等的 Agent 名下的请求、已认证的 WebSocket 占名额、
+    列出之后 `stat` 之前消失的文件。M10 / M12 / S08 是等价变异，不补。
+  - L-1 二进制帧按坏帧回三件套；L-2 Agent 终端的镜像按 Agent 寻址：路径改成 `agent-pty/{agent_id}/{handle}`
+    （破坏，未发布过；`api-changes.md` 记了），宿主经 `WorkspaceRouter.pty_capture_of` 去那个 Agent 的工作区里读。
+    前端只列 Terminal 开的会话——后台 Bash 的 `tool_meta` 也有 handle，它不是终端。L-3 截止时刻已过、没起过的命令
+    单独一句「没有运行，没有任何副作用」，不再说「可能做了一部分」。L-4 恢复会话收可选的 `budget`：墙钟不存进会话，
+    服务面此前没有任何途径在恢复时再给一个；会话已经开着时带预算返回 409，不静默丢掉。
+  - 评审的 nit：`DaemonExecutor(workers=)` 拒绝非整数并写明该传什么。
+  - 评审跑测试时一条变异让旧版的用例起了真的 server（继承真实的 HOME），状态写进了用户的配置目录、进程一直挂着；
+    当前树里那条用例已经把 `_spawn` 换成响亮失败。收尾时杀掉了那个进程、删了那份状态。
+  - 变异：本轮 27 条（每条发现的修复至少一条，前端 2 条），全部变红；前端那 2 条要重新构建产物才看得见，按源码与
+    产物两份 sha256 还原。没有单独施加即变红的变异的两处：`sse.ts` 里停下之后不再交帧（窗口只在同一块里的剩余帧，
+    E2E 排不出来），`serve` 调 `_blocking_executor()` 的那一行（只靠读代码）。

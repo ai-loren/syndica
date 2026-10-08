@@ -1671,7 +1671,14 @@ class Runtime:
         # 按住，已经跑完的被这次 get 按住。顺序是**先带 await 的那一问、再读两个同步标志位**，
         # 于是最后一道守卫与 create_task 之间没有挂起点。
         refusal: ContractViolation | BudgetRefused | None = None
-        if await self.registry.get(agent_id) is None:
+        try:
+            vanished = await self.registry.get(agent_id) is None
+        except BaseException:
+            # 拷好、还没换进来的副本在这一步被取消（Ctrl-C、关机）：交给 ticket 删掉，不留临时目录。
+            if staged is not None and self._workspace is not None:
+                self._workspace.abandon_staged(staged)
+            raise
+        if vanished:
             refusal = _entry_vanished_during_spawn(agent_id, parent_id)
         elif self._closed:
             refusal = _already_shut_down()
@@ -2592,13 +2599,17 @@ class Runtime:
             model=agent.options.llm.config.model,
             tools=list(agent.options.tools),
             flags=dict(info.flags),
-            budget=self._session_budget(),
+            budget=self._session_budget(info.agent_id),
         )
 
-    def _session_budget(self) -> SessionBudget | None:
-        """可加维度的上限与已用。墙钟不写进去：恢复时从新的截止时刻起算。什么都没限制、也没花过
-        就省略，旧的「从零开始」读法保持不变。"""
-        view = self._budget.pool().view()
+    def _session_budget(self, agent_id: str) -> SessionBudget | None:
+        """这个会话根（含它的子树与恢复时续上的那份）的上限与已用。不取池的：一个 Runtime 里可以有
+        几个会话根，取池的话每份记录都存着全部的花费，恢复一个就把别的会话的也算进来。墙钟不写进
+        去：恢复时从新的截止时刻起算。什么都没限制、也没花过就省略，旧的「从零开始」读法保持不变。"""
+        account = self._budget.account(agent_id)
+        if account is None:
+            return None
+        view = account.view()
         limit, used = view.limit, view.used
         idle = (
             used.input_tokens == 0

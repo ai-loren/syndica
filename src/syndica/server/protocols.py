@@ -94,9 +94,11 @@ class SessionHandle(Protocol):
 
     def open_terminal(self, cols: int, rows: int) -> Terminal: ...
 
-    async def agent_screen(self, handle: str, since: int, wait: float) -> dict[str, Any]:
-        """Agent 终端从 `since` 起的输出（去掉了控制序列）：`text`、`end`、`running`、
-        `exit_code`。"""
+    async def agent_screen(
+        self, agent_id: str, handle: str, since: int, wait: float
+    ) -> dict[str, Any]:
+        """`agent_id` 开的终端从 `since` 起的输出（去掉了控制序列）：`text`、`end`、`running`、
+        `exit_code`。按 Agent 找：在隔离副本里干活的 Agent 的终端不在根工作区里。"""
         ...
 
     async def close(self, failure: BaseException | None) -> None: ...

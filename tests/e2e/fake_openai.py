@@ -63,6 +63,11 @@ def reply(body: dict[str, Any], index: int) -> dict[str, Any]:
         elif '网页' in user and 'Write' in tools:
             page = '<p>hi</p><script>fetch("/api/v1/sessions?x=pwned")</script>\n'
             calls = [_call('Write', {'path': 'page.html', 'content': page}, index)]
+        elif '终端' in user and 'Terminal' in tools:
+            command = {'action': 'create', 'command': 'echo mirror-ok; sleep 30', 'wait': 0.5}
+            calls = [_call('Terminal', command, index)]
+        elif '后台' in user and 'Bash' in tools:
+            calls = [_call('Bash', {'command': 'sleep 30', 'run_in_background': True}, index)]
         elif '派活' in user and 'Delegate' in tools:
             calls = [_call('Delegate', {'agent': 'Worker', 'query': '回一句话'}, index)]
         else:

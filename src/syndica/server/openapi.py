@@ -27,6 +27,7 @@ from syndica.server.models import (
     Health,
     LoginRequest,
     LoginResponse,
+    ResumeSession,
     Roles,
     RpcReply,
     RpcRequest,
@@ -52,7 +53,7 @@ PATHS: tuple[
     ('get', '/api/v1/roles', None, 200, Roles, True, '可以建会话的角色'),
     ('get', '/api/v1/sessions', None, 200, SessionList, True, '落盘的与打开着的会话'),
     ('post', '/api/v1/sessions', CreateSession, 201, Snapshot, True, '建会话，交回快照'),
-    ('post', '/api/v1/sessions/{sid}/resume', None, 200, Snapshot, True, '打开落盘的会话'),
+    ('post', '/api/v1/sessions/{sid}/resume', ResumeSession, 200, Snapshot, True, '打开落盘的会话'),
     ('post', '/api/v1/sessions/{sid}/close', None, 204, None, True, '关闭（存盘、放锁）'),
     ('delete', '/api/v1/sessions/{sid}', None, 204, None, True, '关闭并删除落盘的会话'),
     ('get', '/api/v1/sessions/{sid}/snapshot', None, 200, Snapshot, True, '快照，带 as_of'),
@@ -157,6 +158,7 @@ _MODELS: tuple[type[BaseModel], ...] = (
     Health,
     LoginRequest,
     LoginResponse,
+    ResumeSession,
     Roles,
     RpcReply,
     RpcRequest,
@@ -252,7 +254,8 @@ def openapi() -> dict[str, Any]:
         'x-syndica-pty': {
             'human': '/api/v1/sessions/{sid}/pty：第一帧 {"op":"auth","token","cols","rows"}；'
             '之后发 {"op":"input","data"} 或 {"op":"resize","cols","rows"}，收二进制的终端输出',
-            'agent': '/api/v1/sessions/{sid}/agent-pty/{handle}：第一帧 auth；之后只收 '
+            'agent': '/api/v1/sessions/{sid}/agent-pty/{agent_id}/{handle}：agent_id 是开这个'
+            '终端的 Agent（它的 Terminal 调用所在的那份记录）；第一帧 auth；之后只收 '
             '{"text","running","exit_code"}（脱敏后的整行，只读）',
         },
         'x-syndica-rpc': {

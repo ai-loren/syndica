@@ -233,8 +233,12 @@ class ServerSession:
         self._terminals.add(terminal)
         return terminal
 
-    async def agent_screen(self, handle: str, since: int, wait: float) -> dict[str, Any]:
-        capture = await self._parts.workspace.pty_capture(handle, since=since, wait=wait)
+    async def agent_screen(
+        self, agent_id: str, handle: str, since: int, wait: float
+    ) -> dict[str, Any]:
+        capture = await self._parts.workspace.pty_capture_of(
+            agent_id, handle, since=since, wait=wait
+        )
         return {
             'text': capture.text,
             'end': capture.end,

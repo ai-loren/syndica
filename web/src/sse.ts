@@ -55,6 +55,8 @@ export function follow(
       while (cut >= 0) {
         const frame = parse(buffer.slice(0, cut));
         buffer = buffer.slice(cut + 2);
+        // 停下之后同一块里剩下的帧不再交出：换成新流时它们会由新流从快照的 as_of 重新补发。
+        if (stopped) return;
         if (frame) {
           if (frame.id) last = frame.id;
           onFrame(frame);

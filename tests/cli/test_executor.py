@@ -63,3 +63,12 @@ def test_an_event_loop_closes_without_waiting_for_a_lookup_nobody_wants_any_more
         release.set()
 
     assert closing < 1.0
+
+
+@pytest.mark.parametrize('workers', [0, -1, True, 2.5, '4'])
+def test_a_worker_count_that_is_not_a_positive_integer_is_refused_with_what_to_pass(
+    workers: object,
+):
+    with pytest.raises(ValueError, match='正整数') as refused:
+        DaemonExecutor(workers=workers)  # type: ignore[arg-type]
+    assert repr(workers) in str(refused.value)

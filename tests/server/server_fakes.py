@@ -72,7 +72,7 @@ class FakeHandle:
         self.trace: str | None = 'trace-1'
         self.calls: list[tuple[Any, ...]] = []
         self.terminals: list[FakeTerminal] = []
-        self.screens: dict[str, list[str]] = {}
+        self.screens: dict[tuple[str, str], list[str]] = {}
 
     @property
     def sid(self) -> str:
@@ -181,10 +181,12 @@ class FakeHandle:
         self.terminals.append(terminal)
         return terminal
 
-    async def agent_screen(self, handle: str, since: int, wait: float) -> dict[str, Any]:
+    async def agent_screen(
+        self, agent_id: str, handle: str, since: int, wait: float
+    ) -> dict[str, Any]:
         if handle == 'missing':
             raise ConfigError(expected='a terminal', received='none', next_action='list them')
-        chunks = self.screens.get(handle, [])
+        chunks = self.screens.get((agent_id, handle), [])
         index = since
         if index >= len(chunks):
             await asyncio.sleep(wait)

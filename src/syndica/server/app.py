@@ -43,6 +43,7 @@ from syndica.server.models import (
     Health,
     LoginRequest,
     LoginResponse,
+    ResumeSession,
     Roles,
     RpcReply,
     RpcRequest,
@@ -199,7 +200,26 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
 
     async def resume_session(request: Request) -> Response:
         sid = request.path_params['sid']
-        session = await live.open_session(resume=sid, role='Orchestrator')
+        body = await _body(request, ResumeSession, empty_ok=True)
+        if body.budget is not None and sid in live.sessions:
+            raise ApiError(
+                409,
+                expected='带预算恢复的是一个还没打开的会话：预算只在打开时生效',
+                received=f'会话 {sid} 已经开着，这次给的预算不会生效',
+                next_action=(
+                    '不带 budget 再发一次拿到它；要追加用 WebSocket 的 grant，'
+                    '要换上限先关掉它再带预算恢复'
+                ),
+            )
+        budget = body.budget or BudgetRequest()
+        session = await live.open_session(
+            resume=sid,
+            role='Orchestrator',
+            tokens=budget.tokens,
+            cost=_decimal(budget.cost),
+            wall_clock_s=budget.wall_clock_s,
+            turns=budget.turns,
+        )
         return await _snapshot(session)
 
     async def close_session(request: Request) -> Response:
@@ -386,11 +406,11 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
         """第一帧必须在时限内认证；认证不过、会话没打开都发一帧三件套再关掉连接，交回 None。"""
         try:
             async with asyncio.timeout(_AUTH_TIMEOUT_S):
-                first = await websocket.receive_text()
+                first = await _text_frame(websocket)
         except (TimeoutError, WebSocketDisconnect, RuntimeError):
             await _refuse(websocket, 4401, None, _unauthenticated(), host_redactor)
             return None
-        frame = _frame(first)
+        frame = None if first is None else _frame(first)
         if frame is None or frame.op != 'auth' or not credentials.valid(_extra(frame).get('token')):
             await _refuse(
                 websocket,
@@ -413,10 +433,10 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
         try:
             while True:
                 try:
-                    raw = await websocket.receive_text()
+                    raw = await _text_frame(websocket)
                 except WebSocketDisconnect:
                     return
-                reply = await _dispatch(session, raw)
+                reply = _binary_frame() if raw is None else await _dispatch(session, raw)
                 await websocket.send_text(encoded(reply.model_dump(), redactor))
         finally:
             live.detach()
@@ -441,7 +461,10 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
         try:
             while True:
                 try:
-                    message = json.loads(await websocket.receive_text())
+                    text = await _text_frame(websocket)
+                    if text is None:
+                        continue
+                    message = json.loads(text)
                 except (WebSocketDisconnect, RuntimeError):
                     return
                 except ValueError:
@@ -464,14 +487,14 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
     async def _agent_pty(websocket: WebSocket, frame: RpcRequest, session: LiveSession) -> None:
         """Agent 终端的只读镜像：没有写入面——第二个写入方会绕过 Terminal 工具「半行不发」的不变式，
         危险判定就看不到整行。按整行脱敏再发：一个密钥可能跨两次读，只脱半截认不出来。"""
-        handle = websocket.path_params['handle']
+        agent_id, handle = websocket.path_params['agent_id'], websocket.path_params['handle']
         redactor = session.handle.redactor()
         live.attach()
         since, pending = 0, ''
         try:
             while True:
                 try:
-                    screen = await session.handle.agent_screen(handle, since, 1.0)
+                    screen = await session.handle.agent_screen(agent_id, handle, since, 1.0)
                 except SyndicaError as error:
                     body = {'error': error_body(ApiError.of(404, error))}
                     await websocket.send_text(encoded(body, redactor))
@@ -533,7 +556,7 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
         Route('/api/v1/sessions/{sid}/rubrics', guarded(rubrics), methods=['GET']),
         WebSocketRoute('/api/v1/sessions/{sid}/rpc', rpc),
         WebSocketRoute('/api/v1/sessions/{sid}/pty', human_pty),
-        WebSocketRoute('/api/v1/sessions/{sid}/agent-pty/{handle}', agent_pty),
+        WebSocketRoute('/api/v1/sessions/{sid}/agent-pty/{agent_id}/{handle}', agent_pty),
         Route('/{path:path}', _static(settings.static_dir, host_redactor), methods=['GET']),
     ]
 
@@ -627,6 +650,27 @@ async def _refuse(
     with contextlib.suppress(RuntimeError, WebSocketDisconnect):
         await websocket.send_text(encoded(reply.model_dump(), redactor))
     await _close(websocket, code)
+
+
+async def _text_frame(websocket: WebSocket) -> str | None:
+    """下一帧的文本；二进制帧交回 None。Starlette 的 `receive_text` 对二进制帧抛 `KeyError`，没接住
+    就是整条连接异常断开，人的确认通道随之断掉。"""
+    try:
+        return await websocket.receive_text()
+    except KeyError:
+        return None
+
+
+def _binary_frame() -> RpcReply:
+    body = error_body(
+        ApiError(
+            422,
+            expected='文本帧：JSON 对象 {"op": ..., "id": ..., ...}',
+            received='一帧二进制数据',
+            next_action='按 OpenAPI 文档 x-syndica-rpc 里的帧格式用文本帧发送',
+        )
+    )
+    return RpcReply(id=None, ok=False, error=ErrorBody.model_validate(body))
 
 
 async def _dispatch(session: LiveSession, raw: str) -> RpcReply:

@@ -12,6 +12,7 @@ import pytest
 
 from syndica.backends.llm_router import BackoffPolicy, MemberHealth, ModelRouter
 from syndica.kernel import LLM, ConfigError, ContractViolation, LLMConfig, LLMResponseError
+from syndica.kernel.call_limit import BudgetDeadline, arm_model_call_limit, reset_model_call_limit
 from syndica.kernel.context import ContextBlock
 from syndica.kernel.llm import CachePrefixProvider
 from syndica.kernel.llm.base import (
@@ -89,6 +90,55 @@ def _ask() -> list[ContextBlock]:
 
 def _retry_at(router: ModelRouter) -> dict[str, float]:
     return {health.name: health.retry_at for health in router.health()}
+
+
+class _SlowFailure:
+    """真睡一段再失败的平台：每次尝试都在单次上限之内失败。"""
+
+    def __init__(self, name: str, seconds: float, calls: list[str]) -> None:
+        self.config = LLMConfig(provider='fake', model=f'{name}-model')
+        self._name = name
+        self._seconds = seconds
+        self._calls = calls
+
+    async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        self._calls.append(self._name)
+        await asyncio.sleep(self._seconds)
+        raise _down()
+
+
+async def test_the_budget_deadline_bounds_the_whole_rotation_not_each_attempt() -> None:
+    calls: list[str] = []
+    router = ModelRouter(
+        [(name, _SlowFailure(name, 0.3, calls)) for name in ('a', 'b', 'c')],
+        policy=BackoffPolicy(base=2.0, factor=2.0, maximum=300.0, jitter=0.2, max_wait=120.0),
+    )
+    token = arm_model_call_limit(0.5)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        with pytest.raises(BudgetDeadline):
+            await router.create(_ask())
+    finally:
+        reset_model_call_limit(token)
+    assert loop.time() - started < 0.8
+    assert calls == ['a', 'b']
+
+
+async def test_a_backoff_that_would_end_after_the_budget_deadline_stops_instead_of_sleeping() -> (
+    None
+):
+    router, calls, clock = _router(
+        [('gemini', [_down(), 'late answer'])], retry_after=lambda _: 60.0
+    )
+    token = arm_model_call_limit(5.0)
+    try:
+        with pytest.raises(BudgetDeadline):
+            await router.create(_ask())
+    finally:
+        reset_model_call_limit(token)
+    assert calls == ['gemini']
+    assert clock.sleeps == []
 
 
 async def test_the_first_member_answers_and_the_rest_are_not_called() -> None:

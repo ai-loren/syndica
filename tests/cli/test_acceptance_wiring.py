@@ -108,10 +108,42 @@ def test_verdict_exit_maps_the_final_verdict_to_its_exit_code(tmp_path: Path) ->
     assert code == 13
 
 
+def test_verdict_exit_reports_a_pass_as_10_through_main(tmp_path: Path) -> None:
+    flags = '  acceptance_rubrics: true\n  acceptance_outcome: true\n'
+    config = _config(tmp_path, flags)
+    rubric = {
+        'id': 'R1',
+        'statement': 'the report has a section four',
+        'kind': 'checkable',
+        'anchors': [{'source': 'user_message', 'locator': 'msg:goal', 'quote': 'section four'}],
+    }
+    evidence = [{'source': 'user_message', 'locator': 'reply', 'quote': 'the report now has'}]
+    outcome = {'rubric_id': 'R1', 'result': 'satisfied', 'evidence': evidence}
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(content=json.dumps({'rubrics': [rubric]})),
+            ScriptedTurn(content='Final answer: the report now has a section four.'),
+            ScriptedTurn(content=json.dumps({'outcomes': [outcome], 'reason': 'checked'})),
+        ]
+    )
+    goal = 'ship a report with a section four'
+    code, _, stderr = _cli(tmp_path, llm, _run(config, '--goal', goal, '--verdict-exit'))
+    assert '验收：pass' in stderr
+    assert code == 10, stderr
+
+
 def test_verdict_exit_does_not_hide_a_failed_run(tmp_path: Path) -> None:
     config = _config(tmp_path, '  acceptance_outcome: true\n')
     code, _, stderr = _cli(tmp_path, ScriptedLLM([]), _run(config, '--verdict-exit'))
     assert code == 1, stderr
+
+
+def test_verdict_exit_with_a_session_is_refused_instead_of_dropped(tmp_path: Path) -> None:
+    config = _config(tmp_path, '  acceptance_outcome: true\n')
+    argv = ['--config', config, 'run', 'again', '--session', _SID, '--verdict-exit']
+    code, _, stderr = _cli(tmp_path, ScriptedLLM([]), argv)
+    assert code == 2
+    assert '--verdict-exit' in stderr and '--session' in stderr
 
 
 def test_verdict_exit_without_acceptance_exits_2_through_main(tmp_path: Path) -> None:

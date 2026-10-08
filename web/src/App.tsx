@@ -61,13 +61,12 @@ export function App() {
     setRoles(known.roles);
   }, []);
 
-  const attach = useCallback((snapshot: Snapshot) => {
+  // 快照与事件流必须成对：流从快照的 as_of 开始，快照之后的事件才不会被快照覆盖掉。reset 之后重取
+  // 快照也走这里——只换快照、不换流，快照响应到达之前旧流交出的事件会被它整个盖掉，其中可能就有
+  // 一条确认请求，弹窗于是永远不出现。
+  const restream = useCallback((snapshot: Snapshot) => {
     stream.current?.stop();
-    rpc.current?.close();
     setState((previous) => fromSnapshot(snapshot, previous ?? undefined));
-    setTarget((current) => (current && snapshot.agents.some((a) => a.agent_id === current) ? current : snapshot.root_id));
-    history.replaceState(null, '', `?session=${encodeURIComponent(snapshot.sid)}`);
-    rpc.current = new Rpc(snapshot.sid);
     stream.current = follow(
       `/api/v1/sessions/${encodeURIComponent(snapshot.sid)}/events`,
       snapshot.as_of,
@@ -75,6 +74,19 @@ export function App() {
       setConnected,
     );
   }, []);
+
+  const attach = useCallback(
+    (snapshot: Snapshot) => {
+      rpc.current?.close();
+      setTarget((current) =>
+        current && snapshot.agents.some((a) => a.agent_id === current) ? current : snapshot.root_id,
+      );
+      history.replaceState(null, '', `?session=${encodeURIComponent(snapshot.sid)}`);
+      rpc.current = new Rpc(snapshot.sid);
+      restream(snapshot);
+    },
+    [restream],
+  );
 
   const open = useCallback(
     async (sid: string) => {
@@ -137,9 +149,9 @@ export function App() {
   useEffect(() => {
     if (!sid || !stale) return;
     void api<Snapshot>(`/api/v1/sessions/${encodeURIComponent(sid)}/snapshot`)
-      .then((snapshot) => setState((previous) => fromSnapshot(snapshot, previous ?? undefined)))
+      .then(restream)
       .catch(fail);
-  }, [sid, stale, fail]);
+  }, [sid, stale, fail, restream]);
 
   async function call(op: string, fields: Record<string, unknown>): Promise<boolean> {
     if (!rpc.current) return false;

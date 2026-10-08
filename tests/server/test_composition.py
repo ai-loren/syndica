@@ -21,6 +21,7 @@ from syndica.cli.main import CliIO
 from syndica.cli.session_lock import acquire_session_lock
 from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import ConfigError, ScriptedLLM, ScriptedTurn, ToolCall
+from syndica.kernel.driving import _DRIVING_AGENT  # pyright: ignore[reportPrivateUsage]
 from syndica.kernel.stores.file_rubric import FileRubricStore
 from syndica.server import Live
 from syndica.server.outbound import encoded
@@ -348,6 +349,28 @@ async def test_the_human_terminal_runs_in_the_agent_environment_and_is_gone_afte
             break
         await asyncio.sleep(0.1)
     assert not _sleeping('3017')
+
+
+async def test_the_agent_terminal_mirror_finds_a_terminal_opened_inside_an_isolated_copy(
+    tmp_path: Path,
+):
+    assembly, _ = _assembly(tmp_path, lambda _: ScriptedLLM([]))
+    live = Live(assembly)
+    try:
+        session = await live.open_session(resume=None, role='Worker')
+        handle: Any = session.handle
+        router = handle._parts.workspace  # pyright: ignore[reportPrivateUsage]
+        assert router.isolate('alpha', 'snapshot') is not None
+
+        async def as_alpha() -> str:
+            _DRIVING_AGENT.set('alpha')
+            return await router.pty_create('echo from-the-copy; sleep 5', cwd='.')
+
+        opened = await asyncio.create_task(as_alpha())
+        screen = await handle.agent_screen('alpha', opened, 0, 2.0)
+    finally:
+        await live.shutdown()
+    assert 'from-the-copy' in screen['text']
 
 
 def _sleeping(seconds: str) -> bool:

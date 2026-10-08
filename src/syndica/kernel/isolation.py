@@ -16,6 +16,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,14 @@ from syndica.kernel.local_workspace import LocalWorkspace
 from syndica.kernel.versions import _require_real_directories  # pyright: ignore[reportPrivateUsage]
 from syndica.kernel.workspace import Portal, WriteConflict
 
-__all__ = ['ISOLATIONS', 'IsolatedCopy', 'LocalIsolator', 'MergeConflict', 'MergeReport']
+__all__ = [
+    'ISOLATIONS',
+    'CopyTicket',
+    'IsolatedCopy',
+    'LocalIsolator',
+    'MergeConflict',
+    'MergeReport',
+]
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +155,34 @@ class IsolatedCopy:
             shutil.rmtree(self.base_dir, ignore_errors=True)
 
 
+class CopyTicket:
+    """线程里那次拷贝与发起它的那一方之间的交接：两边谁后到，谁删临时目录。
+
+    不能靠事件循环上的回调删：取消常发生在 Ctrl-C 或关机，事件循环先没了，回调就再不会跑，一份
+    整个工作区大小的临时目录永远留在 `.syndica/` 下（它被 gitignore，没人看得见）。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._finished: _Prepared | None = None
+
+    def hand_over(self, prepared: _Prepared) -> bool:
+        """线程拷完时调。已经取消了就交回 False，线程自己删。"""
+        with self._lock:
+            if self._cancelled:
+                return False
+            self._finished = prepared
+            return True
+
+    def cancel(self, isolator: LocalIsolator) -> None:
+        """发起方不要这份拷贝了。线程已经交过来就在这里删，还没拷完就由线程拷完之后删。"""
+        with self._lock:
+            self._cancelled = True
+            finished, self._finished = self._finished, None
+        if finished is not None:
+            isolator.drop(finished)
+
+
 @dataclass(frozen=True)
 class _Prepared:
     """线程里建好、还没换进正式位置的一份副本。"""
@@ -231,6 +267,7 @@ class LocalIsolator:
         requested: str,
         generation: int,
         under: Path | None = None,
+        ticket: CopyTicket | None = None,
     ) -> _Prepared:
         """把 `root` 拷到带 `generation` 的临时目录。可以在线程里跑：不改路由器的状态，也不
         `os.replace` 进正式位置。拷贝中途消失的文件按不存在处理，不报 ERROR。"""
@@ -284,7 +321,7 @@ class LocalIsolator:
             for _, scratch in building:
                 shutil.rmtree(scratch, ignore_errors=True)
             raise
-        return _Prepared(
+        prepared = _Prepared(
             agent_id=agent_id,
             generation=generation,
             strategy=strategy,
@@ -297,6 +334,9 @@ class LocalIsolator:
             shell=self._shell,
             env=dict(self._env),
         )
+        if ticket is not None and not ticket.hand_over(prepared):
+            self.drop(prepared)
+        return prepared
 
     def commit(self, prepared: _Prepared) -> IsolatedCopy | None:
         """在事件循环上把临时目录换进正式位置。代号已经不是当前的就删掉临时目录，交回 None。"""
@@ -326,10 +366,6 @@ class LocalIsolator:
     def drop(self, prepared: _Prepared) -> None:
         for _, scratch in prepared.building:
             shutil.rmtree(scratch, ignore_errors=True)
-
-    def drop_if_stale(self, prepared: _Prepared) -> None:
-        if self._generation.get(prepared.agent_id) != prepared.generation:
-            self.drop(prepared)
 
     def reopen(self, copy: IsolatedCopy) -> None:
         """给一份合并时关掉、又要接着用的副本换一个打开的工作区。"""

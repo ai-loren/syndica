@@ -21,7 +21,13 @@ from syndica.kernel.context import TrustLevel, call_trust, strictest_trust
 from syndica.kernel.driving import driving_agent
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.file_taint import FileTaint
-from syndica.kernel.isolation import ISOLATIONS, IsolatedCopy, LocalIsolator, MergeReport
+from syndica.kernel.isolation import (
+    ISOLATIONS,
+    CopyTicket,
+    IsolatedCopy,
+    LocalIsolator,
+    MergeReport,
+)
 from syndica.kernel.tracing import current_span_id
 from syndica.kernel.versions import VersionStore
 from syndica.kernel.workspace import (
@@ -50,6 +56,7 @@ class _Staged:
     parent_id: str | None
     prepared: Any
     generation: int
+    ticket: CopyTicket
 
 
 _Seen = tuple[str | None, str]
@@ -185,8 +192,8 @@ class WorkspaceRouter:
     async def stage_isolation(
         self, agent_id: str, isolation: str, pool: Executor
     ) -> _Staged | None:
-        """在 `pool` 里把工作区拷到临时目录。`shared` 交回 None。取消时那一代号作废，临时目录
-        在拷贝线程结束时删掉，不会再被换进来。"""
+        """在 `pool` 里把工作区拷到临时目录。`shared` 交回 None。取消时那一代号作废，临时目录由
+        拷贝线程与这里按 `CopyTicket` 交接：谁后到谁删，事件循环先没了也照样删。"""
         if not self._wants_copy(agent_id, isolation):
             return None
         isolator = cast(LocalIsolator, self._isolator)
@@ -195,20 +202,25 @@ class WorkspaceRouter:
         generation = isolator.begin(agent_id)
         root = Path(base.root)
         under = Path(self._root.root)
+        ticket = CopyTicket()
         loop = asyncio.get_running_loop()
         copying = loop.run_in_executor(
-            pool, isolator.prepare, root, agent_id, isolation, generation, under
+            pool, isolator.prepare, root, agent_id, isolation, generation, under, ticket
         )
         try:
-            # shield：取消这次等待时不连带取消 `copying`。被取消的 future 不再交出线程的结果，
-            # 线程却照样把临时目录建完，那份目录就再没人删。
+            # shield：取消这次等待时不连带取消线程那一侧，交接由 ticket 管。
             prepared = await asyncio.shield(copying)
         except asyncio.CancelledError:
             isolator.supersede(agent_id, generation)
-            copying.add_done_callback(lambda fut: _drop_stale(isolator, fut))
+            ticket.cancel(isolator)
+            copying.add_done_callback(_retrieve)
             raise
         return _Staged(
-            agent_id=agent_id, parent_id=parent, prepared=prepared, generation=generation
+            agent_id=agent_id,
+            parent_id=parent,
+            prepared=prepared,
+            generation=generation,
+            ticket=ticket,
         )
 
     def finish_isolation(self, staged: _Staged) -> IsolatedCopy | None:
@@ -225,7 +237,7 @@ class WorkspaceRouter:
     def abandon_staged(self, staged: _Staged) -> None:
         isolator = cast(LocalIsolator, self._isolator)
         isolator.supersede(staged.agent_id, staged.generation)
-        isolator.drop(staged.prepared)
+        staged.ticket.cancel(isolator)
 
     def _wants_copy(self, agent_id: str, isolation: str) -> bool:
         if isolation == 'shared':
@@ -658,6 +670,14 @@ class WorkspaceRouter:
     async def pty_capture(self, handle: str, *, since: int = 0, wait: float = 0.0) -> PtyCapture:
         return await self._target().portal().pty_capture(handle, since=since, wait=wait)
 
+    async def pty_capture_of(
+        self, agent_id: str, handle: str, *, since: int = 0, wait: float = 0.0
+    ) -> PtyCapture:
+        """宿主读 `agent_id` 开的终端（只读镜像）。宿主代码不在驱动任务里，按 `driving_agent()`
+        路由会落到根工作区，而在隔离副本里干活的 Agent 的终端只在它那份副本里。"""
+        portal = self._workspace_of(agent_id).portal()
+        return await portal.pty_capture(handle, since=since, wait=wait)
+
     async def pty_resize(self, handle: str, *, cols: int, rows: int) -> None:
         await self._target().portal().pty_resize(handle, cols=cols, rows=rows)
 
@@ -674,13 +694,10 @@ class WorkspaceRouter:
         await self._root.portal().close()
 
 
-def _drop_stale(isolator: LocalIsolator, fut: asyncio.Future[Any]) -> None:
-    if fut.cancelled():
-        return
-    error = fut.exception()
-    if error is not None:
-        return
-    isolator.drop_if_stale(fut.result())
+def _retrieve(fut: asyncio.Future[Any]) -> None:
+    """取走被放弃的拷贝的异常：没人等它的结果，不取走会在回收时留一条「从没被取走的异常」。"""
+    if not fut.cancelled():
+        fut.exception()
 
 
 class _ArtifactTracing(Protocol):

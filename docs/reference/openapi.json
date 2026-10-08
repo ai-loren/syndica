@@ -219,6 +219,16 @@
             }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResumeSession"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "打开落盘的会话",
@@ -1630,6 +1640,25 @@
         "title": "PendingRequest",
         "type": "object"
       },
+      "ResumeSession": {
+        "additionalProperties": false,
+        "description": "恢复时的预算。tokens / cost / turns 不给就沿用会话里存的上限；墙钟不存进会话，要限就每次打开\n重给，从这一刻起算。",
+        "properties": {
+          "budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BudgetRequest"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "title": "ResumeSession",
+        "type": "object"
+      },
       "Roles": {
         "additionalProperties": false,
         "properties": {
@@ -2484,7 +2513,7 @@
   },
   "x-syndica-pty": {
     "human": "/api/v1/sessions/{sid}/pty：第一帧 {\"op\":\"auth\",\"token\",\"cols\",\"rows\"}；之后发 {\"op\":\"input\",\"data\"} 或 {\"op\":\"resize\",\"cols\",\"rows\"}，收二进制的终端输出",
-    "agent": "/api/v1/sessions/{sid}/agent-pty/{handle}：第一帧 auth；之后只收 {\"text\",\"running\",\"exit_code\"}（脱敏后的整行，只读）"
+    "agent": "/api/v1/sessions/{sid}/agent-pty/{agent_id}/{handle}：agent_id 是开这个终端的 Agent（它的 Terminal 调用所在的那份记录）；第一帧 auth；之后只收 {\"text\",\"running\",\"exit_code\"}（脱敏后的整行，只读）"
   },
   "x-syndica-rpc": {
     "path": "/api/v1/sessions/{sid}/rpc",

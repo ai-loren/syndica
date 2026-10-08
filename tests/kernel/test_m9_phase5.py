@@ -21,7 +21,8 @@ from syndica.kernel.call_limit import (
     model_call_limit,
     reset_wall_clock,
 )
-from syndica.kernel.context import ContextBlock, StopReason, ToolCall
+from syndica.kernel.context import ContextBlock, StopReason, ToolCall, TrustLevel
+from syndica.kernel.driving import driving_agent
 from syndica.kernel.events import EventBus, Subscription
 from syndica.kernel.hooks import HooksCenter
 from syndica.kernel.llm import LLMConfig, ScriptedLLM, ScriptedTurn
@@ -30,13 +31,17 @@ from syndica.kernel.redaction import RuleRedactor
 from syndica.kernel.runtime import AgentFactory, ExitMode, Runtime
 from syndica.kernel.stores.file_session import FileSessionStore
 from syndica.kernel.stores.memory_artifact import InMemoryArtifactStore
+from syndica.kernel.tool import Tool, ToolResult
+from syndica.kernel.tools import Delegate
 from syndica.kernel.tools.local import (
+    _BUDGET_NOT_STARTED,  # pyright: ignore[reportPrivateUsage]
     _BUDGET_STOPPED,  # pyright: ignore[reportPrivateUsage]
     Deliver,
     local_tools,
 )
 from syndica.kernel.trace import AttributeValue, SpanKind
 from syndica.kernel.tracing import NullTracer, span_id_of
+from syndica.kernel.waiting import UserInput, WaitState
 from syndica.kernel.workspace import ExecResult
 
 _TIMEOUT = 5.0
@@ -187,6 +192,34 @@ async def test_resuming_the_same_session_twice_in_one_runtime_counts_its_usage_o
     assert view.used.turns == 1
 
 
+async def test_each_session_root_records_only_its_own_usage(tmp_path: Any) -> None:
+    store = FileSessionStore(tmp_path / 'sessions')
+    runtime = Runtime(
+        sessions=store, redactor=RuleRedactor(), budget=BudgetPolicy(root=Budget(turns=20))
+    )
+    roots: list[str] = []
+    try:
+        for turns in (1, 2):
+            script = [
+                *(
+                    ScriptedTurn(tool_calls=[ToolCall(id=f'n{n}', name='Nope', arguments='{}')])
+                    for n in range(turns - 1)
+                ),
+                ScriptedTurn(content='done'),
+            ]
+            agent_id = await runtime.spawn(_factory(ScriptedLLM(script)), query='go', session=True)
+            await asyncio.wait_for(runtime.wait(agent_id), _TIMEOUT)
+            roots.append(agent_id)
+    finally:
+        await runtime.shutdown()
+    used = []
+    for agent_id in roots:
+        record = await store.load(agent_id)
+        assert record is not None and record.budget is not None
+        used.append(record.budget.used.turns)
+    assert used == [1, 2]
+
+
 async def test_shutdown_saves_the_estimated_cost_of_an_in_flight_call(tmp_path: Any) -> None:
     started = asyncio.Event()
 
@@ -219,7 +252,7 @@ async def test_shutdown_saves_the_estimated_cost_of_an_in_flight_call(tmp_path: 
     assert record.budget.turns == 10
 
 
-async def test_a_tool_that_already_has_a_timeout_stops_at_the_budget_deadline() -> None:
+async def test_a_command_past_the_deadline_is_not_started_and_says_nothing_ran() -> None:
     from syndica.kernel.tools.local import Bash
 
     portal = _Portal()
@@ -229,7 +262,8 @@ async def test_a_tool_that_already_has_a_timeout_stops_at_the_budget_deadline() 
     finally:
         reset_wall_clock(token)
     assert portal.timeouts == []
-    assert _BUDGET_STOPPED in result.output
+    assert result.output == _BUDGET_NOT_STARTED
+    assert result.trust is TrustLevel.TRUSTED
 
 
 async def test_a_clamped_timeout_uses_the_budget_wording_when_it_fires() -> None:
@@ -323,6 +357,105 @@ async def test_a_grant_never_followed_by_a_cycle_is_reported_at_shutdown(
     [record] = [r for r in caplog.records if 'trace 里没有' in r.getMessage()]
     assert record.levelno == logging.WARNING
     assert record.args == (agent_id, 1)
+
+
+async def test_a_grant_never_followed_by_a_cycle_is_reported_when_the_agent_is_despawned(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = Runtime(budget=BudgetPolicy(root=Budget(turns=10)))
+    try:
+        agent_id, _ = await asyncio.wait_for(
+            _drive(runtime, _factory(ScriptedLLM([ScriptedTurn(content='one')]))), _TIMEOUT
+        )
+        runtime._grant_budget(agent_id, Budget(turns=3))  # pyright: ignore[reportPrivateUsage]
+        runtime._grant_budget(agent_id, Budget(turns=2))  # pyright: ignore[reportPrivateUsage]
+        with caplog.at_level(logging.WARNING, logger='syndica.kernel.runtime'):
+            await runtime.despawn(agent_id)
+    finally:
+        with caplog.at_level(logging.WARNING, logger='syndica.kernel.runtime'):
+            await runtime.shutdown()
+    [record] = [r for r in caplog.records if 'trace 里没有' in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert record.args == (agent_id, 2)
+
+
+async def test_a_limited_session_that_has_not_run_yet_saves_its_limits(tmp_path: Any) -> None:
+    store = FileSessionStore(tmp_path / 'sessions')
+    runtime = Runtime(
+        sessions=store, redactor=RuleRedactor(), budget=BudgetPolicy(root=Budget(turns=10))
+    )
+    try:
+        agent_id = await runtime.spawn(_factory(ScriptedLLM([])), session=True)
+    finally:
+        await runtime.shutdown()
+    record = await store.load(agent_id)
+    assert record is not None and record.budget is not None
+    assert record.budget.turns == 10
+    assert record.budget.used.turns == 0
+
+
+class _AskHuman(Tool):
+    __tool_name__ = 'Ask'
+    __tool_command_args__ = ()
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+        self.states: list[WaitState] = []
+
+    async def execute(self) -> ToolResult:
+        """等人回话。"""
+        agent_id = driving_agent()
+        assert agent_id is not None
+        result = await self._runtime.wait_for(agent_id, UserInput(timeout=60))
+        self.states.append(result.state)
+        return ToolResult(output=result.state.value)
+
+
+async def test_a_human_wait_ends_at_the_wall_clock_deadline() -> None:
+    runtime = Runtime(budget=BudgetPolicy(root=Budget(wall_clock_s=0.5)))
+    ask = _AskHuman(runtime)
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(id='a1', name='Ask', arguments='{}')]),
+            ScriptedTurn(content='done'),
+        ]
+    )
+
+    def build(hooks: HooksCenter, events: EventBus) -> BaseAgent:
+        options = AgentOptions(name='Worker', llm=llm, tools={'Ask': ask}, system_prompt='SP')
+        return BaseAgent(options, hooks=hooks, events=events)
+
+    try:
+        await asyncio.wait_for(_drive(runtime, build), _TIMEOUT)
+    finally:
+        await runtime.shutdown()
+    assert ask.states == [WaitState.TIMEOUT]
+
+
+async def test_a_delegation_wait_ends_at_the_wall_clock_deadline() -> None:
+    class _Silent:
+        config = LLMConfig(provider='fake', model='silent')
+
+        async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+            await asyncio.Event().wait()
+            raise AssertionError('unreachable')
+
+    runtime = Runtime(agents={'Helper': _factory(_Silent())})
+    try:
+        parent, _ = await asyncio.wait_for(
+            _drive(runtime, _factory(ScriptedLLM([ScriptedTurn(content='idle')]))), _TIMEOUT
+        )
+        deadline = time.monotonic() + 0.3
+        token = bind_wall_clock(lambda: deadline - time.monotonic())
+        try:
+            result = await asyncio.wait_for(
+                Delegate(runtime, parent).execute(agent='Helper', query='x'), _TIMEOUT
+            )
+        finally:
+            reset_wall_clock(token)
+    finally:
+        await runtime.shutdown()
+    assert '这次等待以超时结束' in str(result.output)
 
 
 class _Slides:

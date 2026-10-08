@@ -285,7 +285,11 @@ export interface paths {
                 };
                 cookie?: never;
             };
-            requestBody?: never;
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["ResumeSession"];
+                };
+            };
             responses: {
                 /** @description 打开落盘的会话 */
                 200: {
@@ -1380,6 +1384,15 @@ export interface components {
             agent_id: string;
         } & {
             [key: string]: unknown;
+        };
+        /**
+         * ResumeSession
+         * @description 恢复时的预算。tokens / cost / turns 不给就沿用会话里存的上限；墙钟不存进会话，要限就每次打开
+         *     重给，从这一刻起算。
+         */
+        ResumeSession: {
+            /** @default null */
+            budget: components["schemas"]["BudgetRequest"] | null;
         };
         /** Roles */
         Roles: {

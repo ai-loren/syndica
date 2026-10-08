@@ -103,6 +103,52 @@ test('events that happen while offline arrive after reconnecting', async ({ page
   await expect(page.locator('.offline')).toBeHidden();
 });
 
+test('after a reset the stream restarts from the refetched snapshot', async ({ page }) => {
+  await openApp(page);
+  const sid = await newSession(page, 'Worker');
+  await send(page, '第一条');
+  await expect(page.locator('.block.assistant').last()).toContainText('收到：第一条', { timeout: 30_000 });
+  const positions: string[] = [];
+  page.on('response', async (response) => {
+    if (response.url().endsWith(`/api/v1/sessions/${sid}/snapshot`)) {
+      positions.push(((await response.json()) as { as_of: string }).as_of);
+    }
+  });
+  const resumedFrom: string[] = [];
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let first = true;
+  await page.route(`**/api/v1/sessions/${sid}/events`, async (route) => {
+    if (first) {
+      first = false;
+      await held;
+      await route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'event: reset\ndata: {}\n\n' });
+      return;
+    }
+    resumedFrom.push(route.request().headers()['last-event-id'] ?? '');
+    await route.continue();
+  });
+  await page.reload();
+  await expect.poll(() => positions.length).toBe(1);
+  // 页面看不见的这段时间里会话往前走：重取的快照的位置于是与第一次的不同。
+  const socket = new WebSocket(`${server.url.replace('http', 'ws')}/api/v1/sessions/${sid}/rpc`);
+  await new Promise<void>((resolve) => socket.addEventListener('open', () => resolve()));
+  const replies: unknown[] = [];
+  socket.addEventListener('message', (message) => replies.push(JSON.parse(String(message.data))));
+  socket.send(JSON.stringify({ op: 'auth', id: 0, token: storedToken() }));
+  socket.send(JSON.stringify({ op: 'send', id: 1, text: '第二条' }));
+  await expect.poll(() => replies.length).toBe(2);
+  socket.close();
+  await page.waitForTimeout(1500);
+  release();
+  await expect.poll(() => positions.length, { timeout: 10_000 }).toBe(2);
+  expect(positions[1]).not.toBe(positions[0]);
+  await expect.poll(() => resumedFrom, { timeout: 10_000 }).toContain(positions[1]);
+  await expect(page.locator('.block.assistant').last()).toContainText('收到：第二条', { timeout: 30_000 });
+});
+
 test('a refresh restores the session and its pending confirmation', async ({ page }) => {
   await openApp(page);
   await newSession(page, 'Worker');
@@ -143,6 +189,23 @@ test('the human terminal works over a websocket', async ({ page }) => {
   await page.keyboard.type('echo hello-$((40+2))');
   await page.keyboard.press('Enter');
   await expect(terminal.locator('.xterm-rows')).toContainText('hello-42', { timeout: 15_000 });
+});
+
+test("an agent's terminal is mirrored read-only and a background command is not listed as one", async ({
+  page,
+}) => {
+  await openApp(page);
+  await newSession(page, 'Operator');
+  await send(page, '后台跑一个');
+  await expect(page.locator('.block.assistant').last()).toContainText('完成', { timeout: 30_000 });
+  await send(page, '开一个终端');
+  await expect(page.locator('.block.assistant', { hasText: '完成' })).toHaveCount(2, { timeout: 30_000 });
+  await showPanel(page, '终端');
+  const tabs = page.locator('.terminals .tabs button');
+  await expect(tabs).toHaveCount(2);
+  await tabs.last().click();
+  await expect(page.locator('.agent-screen pre')).toContainText('mirror-ok', { timeout: 15_000 });
+  await expect(page.locator('.agent-screen .meta')).toContainText('运行中');
 });
 
 test('the chat stays usable in this viewport', async ({ page }) => {

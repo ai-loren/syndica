@@ -133,6 +133,19 @@ budget options under [Configuration](#configuration)):
 
 Milestone 8 audit: [`docs/audits/2026-10-06-m8-final-audit.md`](docs/audits/2026-10-06-m8-final-audit.md).
 
+Milestone 9 adds the product surface (see [Web UI](#web-ui)):
+
+- `syndica up / status / down`: a local server with REST, SSE event streams (resumable with
+  `Last-Event-ID`) and a WebSocket for requests, answers and terminals. The OpenAPI document is a
+  reviewed snapshot in `docs/reference/openapi.json`.
+- A React UI shipped inside the package (no Node needed): sessions, chat with untrusted labels, the
+  agent tree, the event timeline, confirmations and questions, artifacts with preview, diff and
+  feedback, budget, progress and trace panels, and a terminal. It also works on narrow screens.
+- A deadline now interrupts the model call in flight; budgets carry across resumed sessions;
+  `run --verdict-exit` turns the acceptance verdict into an exit code.
+
+Milestone 9 audit: [`docs/audits/2026-10-08-m9-final-audit.md`](docs/audits/2026-10-08-m9-final-audit.md).
+
 ## Install From Source
 
 The package is not published yet. Use an editable checkout:
@@ -702,9 +715,42 @@ assignments), and your own `redaction.rules`. Each match becomes `[REDACTED:<rul
 agent's file tools cannot read or write `.syndica/traces` or `.syndica/handoffs`; its shell can,
 unless the workspace backend sandboxes it.
 
+## Web UI
+
+The server is an optional extra: `uv sync --extra server` in a checkout, or
+`pip install 'syndica[server]'`.
+
+```bash
+syndica up          # starts the server for this workspace and prints a one-time login link
+syndica status      # where it runs; says so if it holds its lock but does not answer
+syndica down        # stops it; sessions are saved first
+```
+
+The login link is valid for two minutes and works once. The page keeps its token in the browser
+and sends it in a header, and the server never sets a cookie. Restarting the server invalidates
+the token, so run `syndica down` and `syndica up` again for a new link.
+
+What the server does and does not protect:
+
+- It listens on `127.0.0.1` only, checks the `Host` and `Origin` headers, and sends a strict CSP.
+  Artifact bytes are served as sandboxed attachments, never as pages on the server's origin. To use
+  it from another machine, forward the port over SSH. There is no remote mode.
+- `up`, `down` and `python -m syndica.serve` refuse to run inside an agent's command environment.
+  This stops mistakes, not a determined agent running as the same OS user: the browser stores the
+  token in its profile directory, which that user can read. The real boundary is a sandboxed
+  workspace backend.
+- The human terminal runs in the agent's environment (no host keys, temporary git config). It is
+  not a sandbox.
+- When no authenticated page has been connected for 30 seconds, pending confirmations are
+  rejected and pending questions are aborted, so an unattended agent can move on instead of
+  waiting.
+- In-flight sub-agents and their mailboxes are not persisted. After `down` or a crash, resuming
+  restores the root conversation and says which sub-agents were lost.
+
 ## CLI Reference
 
 ```text
+syndica up [--port <n>] [--foreground] [--no-open] | status | down
 syndica run <prompt>
 syndica chat [--max-turns <n>] [--on-exhausted <mode>] [--trace <level>] [--trust-module-output <name>] [--goal <text>]
 syndica agents list | show <name>
@@ -737,6 +783,7 @@ syndica version
 --goal <text>             what this run must deliver; needs the acceptance module
 --trust-module-output <name>  repeatable; this run treats that third-party module's output as trusted
 --no-write                read-only tools only
+--verdict-exit            exit 10 / 11 / 12 / 13 for pass / partial / block / unverified; needs acceptance
 --handoff                 host verification, a redacted handoff file, and the Git question
 --git-mode <mode>         commit | push | manual, answered in advance; requires --handoff
 --trace <level>           off | structure | replay | full (default: trace.level, then replay)
@@ -847,7 +894,7 @@ The v1.0 roadmap has 12 internal milestones:
 | 6 | State: sessions, compression, memory | Done |
 | 7 | Artifacts and acceptance | Done |
 | 8 | Long-horizon task control | Done |
-| 9 | HTTP/SSE/Web product surface | Planned |
+| 9 | HTTP/SSE/Web product surface | Done |
 | 10 | MCP / ACP / A2A / OpenAI HTTP interop | Planned |
 | 11 | Training-data export | Planned |
 | 12 | v1.0 release readiness | Planned |

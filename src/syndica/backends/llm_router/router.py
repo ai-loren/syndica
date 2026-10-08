@@ -192,26 +192,6 @@ def _checked_members(members: object) -> tuple[tuple[str, LLM], ...]:
     return tuple(checked)
 
 
-async def _create_within_budget(
-    llm: LLM, messages: list[ContextBlock], kwargs: dict[str, Any]
-) -> ContextBlock:
-    """有墙钟上限时到点取消，并交回 `BudgetDeadline` 而不是平台故障。
-
-    上限是调用开始时还剩的秒数（收尾轮已经加上宽限），用事件循环的时钟计，不跟路由器自己的退避
-    时钟比：两边的时钟可以不是同一只。没有上限就原样调用，provider 自己的超时照旧算平台故障。
-    """
-    limit = model_call_limit()
-    if limit is None:
-        return await llm.create(messages, **kwargs)
-    if limit <= 0:
-        raise BudgetDeadline()
-    try:
-        async with asyncio.timeout(limit):
-            return await llm.create(messages, **kwargs)
-    except TimeoutError:
-        raise BudgetDeadline() from None
-
-
 class ModelRouter:
     """按声明顺序轮换多个平台；一个平台失败就换下一个，并让它单独退避。
 
@@ -289,6 +269,24 @@ class ModelRouter:
         return None
 
     async def create(self, messages: list[ContextBlock], **kwargs: Any) -> ContextBlock:
+        """预算有墙钟上限时，整次轮换（每个平台的尝试、换平台、退避）共用一个截止时刻：到点交回
+        `BudgetDeadline` 而不是平台故障。上限是调用开始时还剩的秒数（收尾轮已经加上宽限）。只给每次
+        尝试各套一个上限，N 个平台各失败在上限之前就是 N 倍上限，退避还会睡过截止时刻、收下一个
+        迟到的回答。"""
+        limit = model_call_limit()
+        if limit is None:
+            return await self._rotate(messages, kwargs, budget_end=None)
+        if limit <= 0:
+            raise BudgetDeadline()
+        try:
+            async with asyncio.timeout(limit):
+                return await self._rotate(messages, kwargs, budget_end=self._clock() + limit)
+        except TimeoutError:
+            raise BudgetDeadline() from None
+
+    async def _rotate(
+        self, messages: list[ContextBlock], kwargs: dict[str, Any], *, budget_end: float | None
+    ) -> ContextBlock:
         deadline = self._clock() + self._policy.max_wait
         # 这次调用里被换掉的平台，按换掉的先后。主力平台在退避期里被跳过时不在这里：它失败的那一次
         # 已经记在当时那条回复上。
@@ -299,7 +297,7 @@ class ModelRouter:
                 if state.retry_at > self._clock():
                     continue
                 try:
-                    reply = await _create_within_budget(llm, messages, kwargs)
+                    reply = await llm.create(messages, **kwargs)
                 except _NOT_A_PLATFORM_FAILURE:
                     raise
                 except Exception as exc:
@@ -320,6 +318,10 @@ class ModelRouter:
                 default=math.inf,
             )
             now = self._clock()
+            # 退避的醒来时刻用路由器自己的时钟比（注入的时钟下也成立）；真实时间另由外层的
+            # `asyncio.timeout` 兜住。
+            if budget_end is not None and wake > budget_end:
+                raise BudgetDeadline()
             if wake > deadline:
                 raise self._exhausted(now)
             await self._sleep(max(0.0, wake - now))

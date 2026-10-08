@@ -37,3 +37,13 @@
 - 事件 `artifact_registered` 加必有键 `note`（`Deliver` 时模型写的说明，没有是空串）；产物列表的每一项加
   `note`（这个 server 进程里最近一次交付的说明）。都是不可信的自由文本，界面按文本显示。
 - `info.description` 不再带 syndica 的版本号；契约的版本是 `info.version`。
+
+## 2026-10-09 · `a623629bccf3` · Agent 终端镜像按 Agent 寻址（破坏）、恢复会话可带预算（追加）
+
+- `sessions/{sid}/agent-pty/{handle}` 改成 `sessions/{sid}/agent-pty/{agent_id}/{handle}`，旧路径不再
+  提供。`agent_id` 是开这个终端的 Agent：在隔离副本里干活的 Agent 的终端只在它那份副本里，只凭句柄的
+  旧路径一律去根工作区找，找不到。客户端从哪份记录里读到 Terminal 调用的 handle，就用那份记录的
+  `agent_id`。
+- `sessions/{sid}/resume` 收一个可选的请求体 `ResumeSession`（`budget`，与建会话同一套严格校验）。
+  tokens / cost / turns 不给就沿用会话里存的上限；墙钟不存进会话，要限就在每次恢复时给，从这一刻起算。
+  会话已经开着时带预算返回 409（预算只在打开时生效），不带预算照旧交回那个开着的会话。
