@@ -274,13 +274,17 @@ class AcpBridge:
 
     async def _on(self, event: Event) -> None:
         # 回答、结束与失败只认根：子 Agent 先结束会让这次提示提前返回，根的回答落到提示返回之后。
-        # 工具、确认与提问来自谁都推给编辑器，答复交回发起的那个 Agent。
-        if event.kind in _ROOT_ONLY and event.agent_id != self._agent_id:
+        # 工具（含它的结果块）、确认与提问来自谁都推给编辑器，答复交回发起的那个 Agent。
+        tool_result = event.kind == 'message_appended' and _is_tool_result(event.payload)
+        if event.kind in _ROOT_ONLY and event.agent_id != self._agent_id and not tool_result:
             return
         if not self._settled.is_set():
             # 被取消的那一轮还在收尾：它的输出与结束都不属于下一条提示。
             if event.kind in {'agent_end', 'agent_error'}:
                 self._settled.set()
+            return
+        if tool_result:
+            await self._tool_output(event.payload)
             return
         if event.kind == 'message_appended':
             await self._message(event.payload)
@@ -324,6 +328,15 @@ class AcpBridge:
             dimensions = cast(list[object], raw) if isinstance(raw, list) else []
             named = '、'.join(str(item) for item in dimensions) or '未知的一维'
             await self._emit.message(self._redact(f'预算用尽：{named}'))
+
+    async def _tool_output(self, payload: dict[str, Any]) -> None:
+        """工具结果块作为那次调用的 `raw_output` 交给编辑器：先脱敏再截断，截断可能切在密钥中间。"""
+        block = cast(dict[str, object], payload['block'])
+        tool_call_id = block.get('tool_call_id')
+        text = block.get('text')
+        if not isinstance(tool_call_id, str) or not tool_call_id or not isinstance(text, str):
+            return
+        await self._emit.tool(tool_call_id, '', '', '', _clip(self._redact(text)))
 
     async def _message(self, payload: dict[str, Any]) -> None:
         raw = payload.get('block')
@@ -664,7 +677,7 @@ class SyndicaAcp:
             update = ToolCallProgress(
                 session_update='tool_call_update',
                 tool_call_id=tool_call_id,
-                status=status,  # pyright: ignore[reportArgumentType]
+                status=status or None,  # pyright: ignore[reportArgumentType]
                 raw_output=raw_output or None,
             )
         await send(session_id=session_id, update=update)
@@ -781,6 +794,11 @@ class _Sink:
 
     async def permission(self, tool_call_id: str, name: str, arguments: str) -> str:
         return await self._agent.decide_permission(self._session_id, tool_call_id, name, arguments)
+
+
+def _is_tool_result(payload: dict[str, Any]) -> bool:
+    block = payload.get('block')
+    return isinstance(block, dict) and cast(dict[str, object], block).get('role') == 'tool'
 
 
 def _clip(text: str) -> str:

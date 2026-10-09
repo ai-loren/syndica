@@ -56,6 +56,7 @@ class _Emit:
         self.messages: list[str] = []
         self.users: list[str] = []
         self.tools: list[tuple[str, str, str, str]] = []
+        self.outputs: list[tuple[str, str]] = []
         self.permissions: list[tuple[str, str, str]] = []
 
     async def message(self, text: str) -> None:
@@ -67,8 +68,9 @@ class _Emit:
     async def tool(
         self, tool_call_id: str, name: str, status: str, raw_input: str, raw_output: str
     ) -> None:
-        del raw_output
         self.tools.append((tool_call_id, name, status, raw_input))
+        if raw_output:
+            self.outputs.append((tool_call_id, raw_output))
 
     async def permission(self, tool_call_id: str, name: str, arguments: str) -> str:
         self.permissions.append((tool_call_id, name, arguments))
@@ -148,6 +150,28 @@ async def test_a_childs_answer_and_end_neither_end_the_prompt_nor_reach_the_edit
         async with asyncio.timeout(_TIMEOUT):
             assert await prompt == 'end_turn'
         assert emit.messages == ['ROOT-FINAL']
+
+
+async def test_a_childs_tool_result_reaches_the_editor_as_that_calls_output() -> None:
+    async with _bridge() as (bridge, bus, runtime, emit):
+        prompt = await _submit(bridge, runtime, 'go')
+        await bus.emit(
+            Event(
+                'message_appended',
+                _CHILD,
+                {'block': {'role': 'tool', 'text': 'child saw ' + _SECRET, 'tool_call_id': 'c1'}},
+            )
+        )
+        await bus.emit(_said(_CHILD, 'CHILD-ANSWER'))
+        await _drain(bus, emit, 'mark-1')
+        [(call_id, output)] = emit.outputs
+        assert call_id == 'c1'
+        assert output.startswith('child saw [REDACTED')
+        assert _SECRET not in output
+        assert emit.messages == []
+        await bus.emit(_ended(_ROOT))
+        async with asyncio.timeout(_TIMEOUT):
+            assert await prompt == 'end_turn'
 
 
 async def test_a_childs_error_fails_neither_the_prompt_nor_the_session() -> None:

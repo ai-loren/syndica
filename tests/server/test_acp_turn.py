@@ -43,17 +43,21 @@ _CONFIG = (
 
 class _Recording(SyndicaAcp):
     def __init__(
-        self, open_turn: object, roles: tuple[tuple[str, str], ...] = (('Worker', '干活'),)
+        self,
+        open_turn: object,
+        roles: tuple[tuple[str, str], ...] = (('Worker', '干活'),),
+        redactor: RuleRedactor | None = None,
     ) -> None:
         super().__init__(
             roles,
             lambda _cwd: None,
             open_turn=open_turn,  # pyright: ignore[reportArgumentType]
-            redactor=RuleRedactor(),
+            redactor=redactor or RuleRedactor(),
         )
         self.messages: list[str] = []
         self.users: list[str] = []
         self.tools: list[tuple[str, str]] = []
+        self.outputs: list[tuple[str, str]] = []
         self.permissions: list[str] = []
         self.decision = 'approve'
         self.hold: asyncio.Event | None = None
@@ -76,8 +80,10 @@ class _Recording(SyndicaAcp):
         raw_input: str,
         raw_output: str,
     ) -> None:
-        del session_id, tool_call_id, raw_input, raw_output
+        del session_id, raw_input
         self.tools.append((name, status))
+        if raw_output:
+            self.outputs.append((tool_call_id, raw_output))
 
     async def _permission(
         self, session_id: str, tool_call_id: str, name: str, arguments: str
@@ -142,10 +148,76 @@ def test_a_scripted_read_is_a_tool_call_and_then_the_answer(tmp_path: Path) -> N
             assert result.stop_reason == 'end_turn'
             assert ('Read', 'in_progress') in agent.tools
             assert ('', 'completed') in agent.tools or ('Read', 'completed') in agent.tools
+            assert [call for call, _ in agent.outputs] == ['r1']
+            assert 'alpha marker' in agent.outputs[0][1]
             assert any('saw alpha' in text for text in agent.messages), agent.messages
             await agent.load_session(str(workspace), session_id)
             assert any('read notes' in text for text in agent.users)
             assert sum('saw alpha' in text for text in agent.messages) >= 2
+        finally:
+            stored = agent._sessions.get(session_id)  # pyright: ignore[reportPrivateUsage]
+            bridge = None if stored is None else stored.bridge
+            if bridge is not None:
+                await bridge.close()
+            for parts in opened:
+                await host.close_session(parts, None)  # pyright: ignore[reportArgumentType]
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
+def test_a_tool_output_reaches_the_editor_redacted_before_it_is_clipped(tmp_path: Path) -> None:
+    secret = 'sk-live-QuizWaltzVex9876JUMPfoxes'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    (workspace / 'notes.md').write_text('x' * 3_990 + secret + 'tail\n', encoding='utf-8')
+    config = workspace / '.syndica.yaml'
+    config.write_text(_CONFIG, encoding='utf-8')
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(id='r1', name='Read', arguments=json.dumps({'path': 'notes.md'}))
+                ]
+            ),
+            ScriptedTurn(content='done'),
+        ]
+    )
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
+        model_factory=lambda _: llm,
+        workspace_root=workspace,
+    )
+    opened: list[object] = []
+
+    async def open_turn(cwd: str, mode: str, servers: tuple[object, ...] = ()) -> TurnBinding:
+        del cwd, servers
+        parts = await host.assemble_session(
+            str(config),
+            max_turns=4,
+            trace=None,
+            argv=('syndica', 'acp'),
+            trusted_output=(),
+            role=mode,
+        )
+        opened.append(parts)
+        return TurnBinding(parts.runtime, parts.agent_id, parts.subscription)
+
+    agent = _Recording(open_turn, redactor=RuleRedactor(secrets=[secret]))
+
+    async def body() -> None:
+        session_id = ''
+        try:
+            session = await agent.new_session(str(workspace))
+            session_id = session.session_id
+            await agent.prompt(session_id, [TextContentBlock(type='text', text='read notes')])
+            [(call, output)] = agent.outputs
+            assert call == 'r1'
+            assert len(output) <= 4_000
+            assert secret[:8] not in output
         finally:
             stored = agent._sessions.get(session_id)  # pyright: ignore[reportPrivateUsage]
             bridge = None if stored is None else stored.bridge

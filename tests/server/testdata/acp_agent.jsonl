@@ -7,5 +7,6 @@
 {"from": "client", "message": {"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "SESSION", "prompt": [{"text": "read notes", "type": "text"}]}}}
 {"from": "agent", "message": {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "SESSION", "update": {"toolCallId": "TOOL_CALL", "title": "Read", "kind": "read", "status": "in_progress", "rawInput": "{\"path\": \"notes.md\"}", "sessionUpdate": "tool_call"}}}}
 {"from": "agent", "message": {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "SESSION", "update": {"toolCallId": "TOOL_CALL", "status": "completed", "sessionUpdate": "tool_call_update"}}}}
+{"from": "agent", "message": {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "SESSION", "update": {"toolCallId": "TOOL_CALL", "rawOutput": "alpha-marker", "sessionUpdate": "tool_call_update"}}}}
 {"from": "agent", "message": {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "SESSION", "update": {"content": {"text": "saw alpha-marker", "type": "text"}, "sessionUpdate": "agent_message_chunk"}}}}
 {"from": "agent", "message": {"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "end_turn"}}}
