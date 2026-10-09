@@ -894,9 +894,25 @@ There is no switch that marks an external tool or agent as trusted.
 in that process. Continue an OpenAI session with the `X-Syndica-Session` response header;
 Responses ids look like `resp_<session>_<n>` and are passed back as `previous_response_id`.
 
-A role can call out by setting `model: acp:<name>` or `model: a2a:<name>`. Project `.syndica.yaml`
-may only name those external objects. Secret-like environment names belong in the user-level
-`interop.yaml` next to the trust store (mode `0600`, variable names only, outside the workspace).
+A role can call out by setting `model: acp:<name>` or `model: a2a:<name>`. A hosted ACP agent only
+gets what its role declares: reading files needs `Read` in the role's `tools`, writing needs
+`Write`, a terminal needs `Bash`; `--no-write` and `danger.roles` apply to it as to any other agent.
+Protocol turns follow the root agent, so a delegated child's answer, end or error never closes the
+turn, and a child's server-side tool call is never handed to an OpenAI client.
+
+Project `.syndica.yaml` may only name external objects. Credentials live in the user-level
+`interop.yaml` next to the trust store (mode `0600`, variable names only, outside the workspace),
+and each entry pins where it may go:
+
+```yaml
+credentials:
+  a2a:researcher: {url: 'https://researcher.example/a2a/', bearer_env: RESEARCHER_TOKEN}
+  acp:gemini: {command: [npx, -y, '@google/gemini-cli', --acp], env: [GEMINI_API_KEY]}
+```
+
+The credential is handed over only when the project declares that object with exactly the pinned
+`url` or `command`; otherwise the object does not start. A bearer over `http://` is only sent to a
+loopback host.
 Version negotiation fails closed: MCP accepts only the five versions its SDK lists, ACP accepts
 protocol version 1, and A2A accepts only `1.0` and `0.3`. A missing `A2A-Version` header is
 rejected rather than treated as `0.3`.

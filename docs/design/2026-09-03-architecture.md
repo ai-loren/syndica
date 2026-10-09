@@ -1158,7 +1158,7 @@ CLI 的交互模式不经过 HTTP，因此**内核事件流必须首先是进程
 
 四个适配都映射到已有会话，不另写一套 Runtime。被调用的一面在 `syndica.server`：`syndica mcp`（stdio）与 `syndica up` 的 `/mcp`；`syndica acp`（stdio）；公开的 `/.well-known/agent-card.json` 与 `POST /a2a/`；`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`。调用外部的一面是三个互不依赖的 backend：MCP client、ACP client（角色写成 `model: acp:<name>`）、A2A client（角色写成 `model: a2a:<name>`）。组合根注入；surface 不 import backend；kernel 不 import 协议 SDK。
 
-外部内容一律不可信，没有「声明为可信」。高风险仍走危险判定；没人可问时拒绝。密钥只出现在工作区之外、权限 0600 的用户级 `interop.yaml`，而且那里只存变量名。项目 `.syndica.yaml` 的 `interop` 只按名字引用外部对象。协议错误是三件套，不回显异常原文。版本协商失败即拒绝：MCP 只收其 SDK 列出的五版，ACP 只收协议版本 1，A2A 只收 1.0 与 0.3——缺 `A2A-Version` 不按 0.3 收下。机器客户端的 Bearer 由 `syndica up --api-token` 打印一次，只在该进程的内存里。
+外部内容一律不可信，没有「声明为可信」。高风险仍走危险判定；没人可问时拒绝。协议的一轮只跟随根 Agent：派出去的子 Agent 先说话、先结束或出错，都不收掉这一轮。托管的 ACP Agent 只拿到所属角色的工具表与处置（读要 `Read`、写要 `Write`、终端要 `Bash`），`--no-write` 对它同样生效：`call_external` 不经 `PRE_TOOL_USE`，不收窄就绕过了只读 run 与角色白名单。密钥只出现在工作区之外、权限 0600 的用户级 `interop.yaml`，那里只存变量名，而且每一项钉住它能去的 `url` 或 `command`：项目 `.syndica.yaml` 只按名字引用外部对象，它声明的目的地与钉子逐字相同才交出凭证，否则不启动那个对象——项目配置不可信，它选的地址不能收到用户的凭证（与 OTLP 端点同一条理由）。`http://` 上的 Bearer 只给回环主机。协议错误是三件套，不回显异常原文。版本协商失败即拒绝：MCP 只收其 SDK 列出的五版，ACP 只收协议版本 1，A2A 只收 1.0 与 0.3——缺 `A2A-Version` 不按 0.3 收下。机器客户端的 Bearer 由 `syndica up --api-token` 打印一次，只在该进程的内存里。
 
 ### 9.4 Web UI
 

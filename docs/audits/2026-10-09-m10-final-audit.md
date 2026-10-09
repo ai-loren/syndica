@@ -2,7 +2,8 @@
 
 日期：2026-10-09
 范围：[M10 计划](../plans/2026-10-09-m10-interop.md) 的阶段零至七
-验证方式：本地验证协议（Actions 额度用完期间，见路线图「当前主线约束」）。实现在提交 `b1ec080` 里，没有推送。
+验证方式：本地验证协议（Actions 额度用完期间，见路线图「当前主线约束」）。实现在提交 `b1ec080` 里，评审处置在其后的
+几个提交里，都没有推送。
 
 ## 结论
 
@@ -48,7 +49,37 @@
 
 ## 收口对抗评审
 
-用户 2026-10-09 允许起子代理。第二方评审对 `b1ec080` 的结论与处置在这里补齐。
+用户 2026-10-09 允许起子代理。第二方评审（独立子代理，只在私有导出副本里实验）对 `b1ec080` 给出 2 Blocking /
+5 High / 若干 Medium，自己施加 68 条变异、35 条存活（去掉等价与假存活之后大部分是真缺口）。它也指出审计里有几条
+「已证明」测的是测试替身或死代码。处置分五条互不重叠的线并行做（各自一个 worktree），再由主线补跟进，计划决策日志
+P2：
+
+| 级别 | 发现 | 处置 | 提交 |
+|---|---|---|---|
+| Blocking | 三个会话适配不按根 Agent 过滤：子 Agent 的回答被当成这一轮的结果，子 Agent 先结束就收掉这一轮；OpenAI 把子 Agent 在服务端真跑的 `Bash` 当客户端工具调用交出去；ACP 的失败标记一旦置上永不清除 | 回答、结束与失败只认根；子 Agent 的提问与确认照样交给人、答复交回提问者；OpenAI 根出错不再挂住请求；每个适配一条派活用例 | `f88bb50` |
+| Blocking | 托管的 ACP Agent 拿到完整的本地工具与全局策略，`--no-write`、角色 `tools:`、`danger.roles` 都管不到它 | 按角色绑定工具表与处置，读 / 写 / 终端分别要 Read / Write / Bash，`--no-write` 下写与终端拒绝；真子进程的假 Agent 证明 | `0cee938` |
+| High | 凭证按名字绑定，目的地由项目配置决定；`http://` 也发 Bearer | 用户级凭证钉住 `url` / `command`，逐字相同才交出，不同就不启动；明文 Bearer 只给回环；抓包服务器证明攻击者地址零请求 | `990b815` |
+| High | A2A 真会话路径把异常原文回给对端 | 发送与取消路径都兜底，只留类型名；根出错只报类型 | `f88bb50`、`f16246b` |
+| High | stderr 先按字节截断再脱敏，跨在上限上的密钥漏半截 | 整行先脱敏再截断，单行上限 64 KiB，超长退到空白 | `271004b` |
+| High | MCP stdio 关闭后，自建会话组的孙进程留下 | 按 ppid 与进程组记下后代（核对启动时刻），关闭、取消、崩溃后收掉；托管 ACP Agent 的监管各自复制一份，阶梯被取消时也收 | `271004b`、`7ec858a` |
+| High | A2A 客户端没有预算时永不超时 | 按配置超时兜底 | `0cee938` |
+| Medium | OpenAI 的 400 / 500 分支、ACP 与 A2A 的脱敏、无人值守提问、A2A 客户端版本协商与远端错误脱敏、ACP allow-kinds 与隔离路由、MCP serve 的溯源 / schema / 精确版本门 / 外层兜底、`call_external` 的确认后复检与守卫回退、`interop.yaml` 权限族与 `syndica acp` 的 cwd 校验 | 逐项补用例；发现的行为缺陷一并修（A2A 真会话路径重复脱敏、远端三件套不脱敏、守卫认第三方的 `()`） | `a9cef5f`、`f88bb50`、`0cee938`、`990b815` |
+
+跟进（主线，`f16246b`）：ACP 紧挨着的两条提示与取消后的下一条提示不再丢失、不再拿到上一轮的尾巴；A2A 与 ACP 根出错
+只报类型；A2A 取消兜底；ACP 确认参数限长。
+
+跟进（主线，`bf903d2`）：信任确认提示读用户级 `interop.yaml`，逐项写明哪个变量交给哪里、哪项因钉子对不上而不交；
+只在项目声明了会用到它的外部对象时才读这份文件，坏掉的用户级文件不再挡住无关的 run（doctor 照样报）；A2A 客户端
+取公开的 agent card 不带 Bearer。
+
+变异：五条线各自对评审的存活项与自己补的点施加变异（MCP serve 与 `call_external` 13 条、凭证 15 条、会话适配 33 条、
+stderr 与进程 13 条、托管角色 38 条、ACP 进程树 7 条），主线跟进 13 条（1 条存活，是一处多余的等待，已删掉），处置之后
+全部变红。「零存活」只在这些变异下成立。
+
+评审指出、这次没有改的：`call_external` 与开发期守卫各有一份「不认第三方 `()`」的规则，靠对照用例钉住（去重要把一个
+kernel helper 公开，留到 v1.0 冻结公开 API 时）；MCP stdio 客户端从 SDK 挂起的生成器里读子进程 pid（读不到就拒绝连接
+并写明 mcp 版本，真 SDK 用例钉住）；两次 fork、在两次轮询之间同时离开进程组与父子链的守护进程认不出；
+`syndica.backends.mcp` 导出的 `ExternalProcess` 仍只按进程组收（`src/` 里没有活路径用它，MCP stdio 走 SDK 加进程树）。
 
 ## 明确不做（计划收尾复核）
 
@@ -74,7 +105,9 @@
 - HTTP：`docs/reference/api-changes.md` 的 `aefdf03abce0`（`external_activity`）与 `ab8ab7901630`（协议路由）。OpenAI 兼容路由不另装包；没装 `syndica[mcp]` / `syndica[a2a]` 时对应路由仍是 501。
 - 会话：`SessionHandle.install_tools`。撞上已有工具名时抛 ConfigError，不覆盖。
 - CLI：`syndica mcp`、`syndica acp`、`syndica up --api-token`。
-- 配置：项目 `.syndica.yaml` 的 `interop` 只按名字引用；用户级 `interop.yaml` 在信任存储旁边，权限 0600，只存变量名。
+- 配置：项目 `.syndica.yaml` 的 `interop` 只按名字引用；用户级 `interop.yaml` 在信任存储旁边，权限 0600，只存变量名，
+  每一项钉住 `url`（配 `bearer_env`）或 `command`（配 `env`）。
+- 角色：`model: acp:<名字>` 的角色，读 / 写 / 终端分别要在 `tools` 里有 Read / Write / Bash。
 - 依赖：`syndica[mcp]`、`syndica[acp]`、`syndica[a2a]`；`openai` 只在 dev，当测试客户端。
 
 ## 验证
