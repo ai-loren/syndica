@@ -528,6 +528,8 @@ class _Client:
         if limit is not None:
             args['limit'] = limit
         result = await self._use('fs/read_text_file', 'Read', args, done=None)
+        if 'unread' in result.meta:
+            raise self._model._failed('fs/read_text_file', result)  # pyright: ignore[reportPrivateUsage]
         return ReadTextFileResponse(content=_text(result))
 
     async def write_text_file(

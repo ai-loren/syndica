@@ -446,6 +446,22 @@ async def test_a_refused_read_is_a_request_error_not_file_content(tmp_path: Path
     assert 'alpha notes' not in json.dumps(outcome, ensure_ascii=False)
 
 
+async def test_reading_a_missing_file_is_a_request_error_not_its_explanation_as_content(
+    tmp_path: Path,
+) -> None:
+    async def read(conn: Any, session_id: str, root: Path) -> object:
+        del root
+        got = await conn.read_text_file(session_id=session_id, path='absent.md')
+        return got.content
+
+    outcome, _ = await _run(tmp_path, {'read': read})
+
+    data = _assert_three_part(outcome['read'])
+    assert 'fs/read_text_file' in data['expected']
+    assert '没有做成' in data['received']
+    assert 'absent.md' in data['received']
+
+
 async def test_a_refused_terminal_carries_three_part_data_and_runs_nothing(
     tmp_path: Path,
 ) -> None:

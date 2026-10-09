@@ -270,7 +270,9 @@ class Read(Tool):
         try:
             text, version = await self._portal.read_versioned(path, offset=offset, limit=limit)
         except ConfigError as exc:
-            return _told(exc)
+            # 读失败与「读到的内容恰好是这段说明」只有 meta 分得清：替外部 Agent 读文件的一方
+            # （ACP 的 fs/read_text_file）要回错误，而不是把说明当成文件内容交出去。
+            return replace(_told(exc), meta={'unread': path})
         trust = (
             self._portal.file_trust(path, version)
             if isinstance(self._portal, TaintAware)
