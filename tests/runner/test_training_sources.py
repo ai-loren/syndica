@@ -154,7 +154,9 @@ async def _save(
     return trace_id
 
 
-async def test_four_verdicts_export_without_touching_the_stores(tmp_path: Path) -> None:
+async def test_four_verdicts_assemble_from_the_four_stores_and_export_every_format(
+    tmp_path: Path,
+) -> None:
     stores = _Stores()
     plan = (
         ('spass', 'pass', 'wrote the note', 'goal-planets'),
