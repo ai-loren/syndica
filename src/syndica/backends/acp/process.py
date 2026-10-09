@@ -6,6 +6,9 @@
 
 `env` 是完整环境，不是在宿主环境上追加。追加会把宿主的密钥交给外部进程。
 
+进程组之外还跟着进程树：用 setsid / setpgid 离开了组的后代，组的信号够不着，阶梯走完之后
+按树再收一遍。
+
 别的 backend 不得 import 这个模块。MCP 与 A2A 各自有一份监管：backend 之间不共享代码。
 """
 
@@ -17,8 +20,10 @@ import logging
 import os
 import signal
 import subprocess
+import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from types import TracebackType
 from typing import Self, cast
 
@@ -32,6 +37,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_GRACE_S = 2.0
 _DEFAULT_STDERR_LIMIT = 1_048_576
 _POLL_S = 0.02
+_TREE_POLL_S = 0.25
 # 一行 stderr 最多攒这么多字节再脱敏。不换行的输出不能让缓冲无限长；攒满的那一截后面的字节看不见，
 # 刀口前那段连续的非空白可能是半截凭证，脱敏器认不出，所以脱敏之后再退到最近的空白。
 _LINE_CAP = 65_536
@@ -120,6 +126,191 @@ class _StderrLines:
             self._capped()
 
 
+@dataclass(frozen=True)
+class _Row:
+    ppid: int
+    pgid: int
+    zombie: bool
+    started: str
+
+
+def _process_table() -> dict[int, _Row] | None:
+    """此刻的进程表；`ps` 拉不起来时交回 None。`started` 是秒级的启动时刻，pid 被复用后对不上。"""
+    try:
+        listing = subprocess.run(
+            [
+                'ps',
+                '-ax',
+                '-o',
+                'pid=',
+                '-o',
+                'ppid=',
+                '-o',
+                'pgid=',
+                '-o',
+                'stat=',
+                '-o',
+                'lstart=',
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    rows: dict[int, _Row] = {}
+    for line in listing.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            pid, ppid, pgid = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        rows[pid] = _Row(ppid, pgid, parts[3].startswith('Z'), ' '.join(parts[4:]))
+    return rows
+
+
+def _kill(pids: Iterable[int], sig: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+
+class _ProcessTree:
+    """一个进程和它的全部后代，含用 setsid / setpgid 离开了进程组的。
+
+    后代按 ppid 认，而父进程一退出孤儿就挂到 init 名下、父子链断了，所以跑着的时候后台定时走一遍
+    进程表，把见过的后代连同启动时刻记下来；发信号只发给启动时刻还对得上的（pid 会被复用）。根进程
+    的进程组成员也算：组里还有人时组号不会被复用。两次轮询之间就既离开进程组、又断了父子链的后代
+    （两次 fork 的守护化，中间那一代立刻退出）认不出来。根进程退出后后台立刻收掉它留下的后代。
+    """
+
+    def __init__(self, root: int, *, grace: float = _DEFAULT_GRACE_S) -> None:
+        self._root = root
+        self._grace = _grace(grace)
+        self._root_started: str | None = None
+        self._seen: dict[int, str] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._told_blind = False
+
+    def start(self) -> None:
+        table = _process_table()
+        row = None if table is None else table.get(self._root)
+        self._root_started = None if row is None else row.started
+        self._survivors(table)
+        thread = threading.Thread(target=self._watch, name=f'acp-tree-{self._root}', daemon=True)
+        self._thread = thread
+        thread.start()
+
+    def record(self) -> None:
+        """此刻还连在树上的后代记下来。根进程要退出之前调一次：退出之后父子链就断了。"""
+        self._survivors(_process_table())
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+
+    async def reap(self) -> None:
+        """停掉后台，还活着的后代 SIGTERM，宽限之后 SIGKILL。被取消时直接 SIGKILL 再抛出。"""
+        self.stop()
+        try:
+            survivors = self._survivors(_process_table())
+            if not survivors:
+                return
+            _kill(survivors, signal.SIGTERM)
+            if await self._cleared():
+                return
+            _kill(self._survivors(_process_table()), signal.SIGKILL)
+            if await self._cleared():
+                return
+            logger.warning(
+                '期望: 进程 %s 的后代在 SIGKILL 之后退出。 实际: 还剩 %s。'
+                ' 下一步: 用 ps 查这些进程（多半换了用户，收不到这一侧的信号），手动结束它们。',
+                self._root,
+                sorted(self._survivors(_process_table())),
+            )
+        except asyncio.CancelledError:
+            _kill(self._survivors(_process_table()), signal.SIGKILL)
+            raise
+
+    async def _cleared(self) -> bool:
+        deadline = time.monotonic() + self._grace
+        while self._survivors(_process_table()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(_POLL_S, remaining))
+        return True
+
+    def _watch(self) -> None:
+        while not self._stop.wait(_TREE_POLL_S):
+            table = _process_table()
+            self._survivors(table)
+            row = None if table is None else table.get(self._root)
+            if table is not None and (
+                row is None or row.zombie or row.started != self._root_started
+            ):
+                self._sweep()
+                return
+
+    def _sweep(self) -> None:
+        survivors = self._survivors(_process_table())
+        if not survivors:
+            return
+        _kill(survivors, signal.SIGTERM)
+        deadline = time.monotonic() + self._grace
+        while survivors and time.monotonic() < deadline:
+            if self._stop.wait(_POLL_S):
+                return
+            survivors = self._survivors(_process_table())
+        if not self._stop.is_set():
+            _kill(self._survivors(_process_table()), signal.SIGKILL)
+
+    def _survivors(self, table: dict[int, _Row] | None) -> set[int]:
+        if table is None:
+            if not self._told_blind:
+                self._told_blind = True
+                logger.warning(
+                    '期望: 能用 ps 读进程表，好在收尾时找到进程 %s 的后代。 实际: ps 拉不起来。'
+                    ' 下一步: 把 ps 放进宿主进程的 PATH；在此之前，'
+                    '这个进程的后代在关闭之后可能留下。',
+                    self._root,
+                )
+            return set()
+        with self._lock:
+            root = table.get(self._root)
+            trusted = root is not None and root.started == self._root_started
+            tree = {
+                pid
+                for pid, started in self._seen.items()
+                if (row := table.get(pid)) is not None and row.started == started
+            }
+            if trusted:
+                tree.add(self._root)
+            if root is None or trusted:
+                tree.update(pid for pid, row in table.items() if row.pgid == self._root)
+            children: dict[int, list[int]] = {}
+            for pid, row in table.items():
+                children.setdefault(row.ppid, []).append(pid)
+            frontier = list(tree)
+            while frontier:
+                for child in children.get(frontier.pop(), ()):
+                    if child not in tree:
+                        tree.add(child)
+                        frontier.append(child)
+            for pid in tree:
+                self._seen[pid] = table[pid].started
+            spared = {0, 1, os.getpid()}
+            return {pid for pid in tree if not table[pid].zombie and pid not in spared}
+
+
 def _group_members(pgid: int) -> set[int]:
     """此刻还在这个进程组里的 pid。进程表是独立于 wait 的事实：组长变成僵尸之后孙进程仍在。"""
     try:
@@ -146,7 +337,11 @@ def _group_members(pgid: int) -> set[int]:
 
 
 class ExternalProcess:
-    """一个外部进程和它的进程组。`aclose` 幂等：组已经杀过之后不再发信号，避免组号被复用后误杀。"""
+    """一个外部进程、它的进程组和它的进程树。
+
+    `aclose` 幂等：组已经杀过之后不再发信号，避免组号被复用后误杀。组长退出（崩溃）时也走一遍
+    `aclose`，不等宿主来关。
+    """
 
     def __init__(
         self,
@@ -166,6 +361,7 @@ class ExternalProcess:
         self._stderr_limit = _limit(stderr_limit)
         self._process: asyncio.subprocess.Process | None = None
         self._pgid: int | None = None
+        self._tree: _ProcessTree | None = None
         self._closed = False
         self._lock = asyncio.Lock()
         self._reader: asyncio.Task[None] | None = None
@@ -205,6 +401,8 @@ class ExternalProcess:
         self._process = process
         # start_new_session 之后组长的 pid 就是进程组号。
         self._pgid = process.pid
+        self._tree = _ProcessTree(process.pid, grace=self._grace)
+        self._tree.start()
         self._reader = asyncio.create_task(self._read_stderr(), name='acp-stderr')
         self._watch = asyncio.create_task(self._watch_leader(), name='acp-leader')
 
@@ -278,8 +476,19 @@ class ExternalProcess:
 
     async def _ladder(self) -> None:
         process = self._process
-        if process is None or self._pgid is None:
+        tree = self._tree
+        if process is None or tree is None:
             return
+        # 关 stdin 之后组长一退出，它的后代就挂到 init 名下、父子链断了，趁还连着再记一遍。
+        tree.stop()
+        tree.record()
+        # 阶梯中途被取消时 `_closed` 已经置位，之后的 aclose 什么都不做，这里是收掉后代的唯一机会。
+        try:
+            await self._group_ladder(process)
+        finally:
+            await tree.reap()
+
+    async def _group_ladder(self, process: asyncio.subprocess.Process) -> None:
         stdin = process.stdin
         if stdin is not None and not stdin.is_closing():
             stdin.close()
