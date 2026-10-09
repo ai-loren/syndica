@@ -1,12 +1,14 @@
 """把一个远端 A2A Agent 当成 Syndica 的模型。
 
 卡片和 JSON-RPC 都走调用方交来的 HTTP。请求带 `A2A-Version: 1.0`。每个 Syndica Agent
-一个 `contextId`。对方停在 INPUT_REQUIRED 时，问题作为不可信回答交回，下一次调用的新用户
-内容发回同一个任务。回答一律不可信。
+一个 `contextId`，只用对端交回的那个。对方停在 INPUT_REQUIRED 时，问题作为不可信回答交回，
+下一次调用的新用户内容发回同一个任务。超时或被取消时对还开着的任务发 `CancelTask`。
+回答一律不可信。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 from collections.abc import Mapping, Sequence
@@ -28,6 +30,8 @@ _INPUT = 'TASK_STATE_INPUT_REQUIRED'
 _DONE = 'TASK_STATE_COMPLETED'
 _FAILED = 'TASK_STATE_FAILED'
 _CANCELED = 'TASK_STATE_CANCELED'
+# 被取消之后还要等 CancelTask 的上限：取消方（abort、关机）在等这次调用退出。
+_CANCEL_GRACE_S = 5.0
 
 
 class A2ATransport(Protocol):
@@ -133,6 +137,9 @@ class A2AAgentModel:
         try:
             await self._card(link, deadline)
             body = await self._post(_send(self._take_id(), link, text), deadline)
+        except asyncio.CancelledError:
+            await self._cancel(link, min(self._config.timeout, _CANCEL_GRACE_S))
+            raise
         except httpx.TimeoutException:
             await self._cancel(link, self._config.timeout)
             if limit is not None:
@@ -230,16 +237,20 @@ class A2AAgentModel:
         return parsed
 
     async def _cancel(self, link: _Link, deadline: float | None) -> None:
-        if not link.task_id:
+        """尽力而为、有界：发不出、等不到都不报错。任务就此作废，下一次调用开新任务。"""
+        task_id, link.task_id = link.task_id, None
+        if not task_id:
             return
         body = {
             'jsonrpc': '2.0',
             'id': self._take_id(),
             'method': 'CancelTask',
-            'params': {'id': link.task_id},
+            'params': {'id': task_id},
         }
         try:
-            await self._transport.post_json(self._url, body, self._headers(), deadline)
+            # 传输层的超时不一定被遵守（调用方可以换传输），墙钟上限在这里再兜一层。
+            async with asyncio.timeout(deadline):
+                await self._transport.post_json(self._url, body, self._headers(), deadline)
         except Exception:
             return
 

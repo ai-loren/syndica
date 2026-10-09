@@ -1,11 +1,14 @@
 """A2A JSON-RPC。鉴权仍由 `create_app` 做。
 
-缺 `A2A-Version` 在交给 SDK 之前拒绝：SDK 会把缺头当成 0.3。只收 `1.0` 与 `0.3`。
+缺 `A2A-Version` 在交给 SDK 之前以 -32009 拒绝：SDK 会把缺头当成 0.3。只收 `1.0` 与 `0.3`。
+`contextId` 就是 Syndica 的会话 id：不带就新开会话，带了只认这里经 A2A 开过、仍打开着的会话。
+流式先交 Task，再逐条交根 Agent 的文本（WORKING），最后交终态。
 执行器抛错时任务失败，原文不进响应。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
@@ -27,6 +30,7 @@ from a2a.types.a2a_pb2 import (
     ListTasksResponse,
     SendMessageRequest,
     Task,
+    TaskArtifactUpdateEvent,
     TaskPushNotificationConfig,
     TaskState,
     TaskStatusUpdateEvent,
@@ -36,7 +40,7 @@ from google.protobuf.json_format import MessageToDict
 from starlette.requests import Request
 from starlette.responses import Response
 
-from syndica.kernel import ConfigError, Redactor, SyndicaError
+from syndica.kernel import AgentStatus, ConfigError, Redactor, SyndicaError
 from syndica.kernel.redaction import RuleRedactor
 from syndica.server.errors import ApiError
 from syndica.server.live import Live, LiveSession
@@ -57,7 +61,10 @@ logger = logging.getLogger(__name__)
 
 ACCEPTED_PROTOCOL_VERSIONS = ('1.0', '0.3')
 PromptRunner = Callable[[str, str], Awaitable[str]]
-_VERSION_CODE = -32022
+# A2A 的 VersionNotSupportedError；SDK 客户端只把这个码认成版本错误。
+_VERSION_CODE = -32009
+
+_StreamEvent = Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent
 
 
 class SyndicaA2A(RequestHandler):
@@ -82,6 +89,7 @@ class SyndicaA2A(RequestHandler):
         self._card = card
         self._redactor = redactor if redactor is not None else RuleRedactor()
         self._tasks: dict[str, Task] = {}
+        self._streams: set[asyncio.Task[None]] = set()
 
     def redactor(self) -> Redactor:
         return self._redactor
@@ -92,14 +100,24 @@ class SyndicaA2A(RequestHandler):
 
     async def on_message_send_stream(
         self, params: SendMessageRequest, context: object
-    ) -> AsyncGenerator[Task | TaskStatusUpdateEvent]:
+    ) -> AsyncGenerator[_StreamEvent]:
         del context
-        task = await self._run(params)
-        yield TaskStatusUpdateEvent(
-            task_id=task.id,
-            context_id=task.context_id,
-            status=task.status,
-        )
+        events: asyncio.Queue[_StreamEvent | None] = asyncio.Queue()
+        # 这一轮不跟着流走：对端断开时生成器被关掉，轮次照样跑完并记进 `_tasks`，
+        # GetTask 看得到终态。
+        work = asyncio.create_task(self._stream(params, events), name='a2a-stream')
+        self._streams.add(work)
+        work.add_done_callback(self._streams.discard)
+        while (event := await events.get()) is not None:
+            yield event
+
+    async def _stream(
+        self, params: SendMessageRequest, events: asyncio.Queue[_StreamEvent | None]
+    ) -> None:
+        try:
+            await self._run(params, events.put_nowait)
+        finally:
+            events.put_nowait(None)
 
     async def on_get_task(self, params: GetTaskRequest, context: object) -> Task | None:
         del context
@@ -163,15 +181,35 @@ class SyndicaA2A(RequestHandler):
         raise _no_push()
         yield Task()
 
-    async def _run(self, params: SendMessageRequest) -> Task:
+    async def _run(
+        self, params: SendMessageRequest, emit: Callable[[_StreamEvent], None] | None = None
+    ) -> Task:
         message = params.message
         text = '\n'.join(part.text for part in message.parts if part.text)
         role = _role(message)
         task_id = message.task_id or secrets.token_hex(8)
-        context_id = message.context_id or secrets.token_hex(8)
+        # 会话定下来之前它是对端给的值（可能为空）；`started` 把它换成会话 id。
+        context_id = message.context_id
+        opened = False
+
+        def started(sid: str) -> None:
+            nonlocal context_id, opened
+            context_id, opened = sid, True
+            if emit is not None:
+                task = Task(id=task_id, context_id=sid)
+                task.status.state = TaskState.TASK_STATE_WORKING
+                emit(task)
+
+        def progress(shown: str) -> None:
+            if emit is not None:
+                update = TaskStatusUpdateEvent(task_id=task_id, context_id=context_id)
+                update.status.state = TaskState.TASK_STATE_WORKING
+                update.status.message.parts.add(text=shown)
+                emit(update)
+
         # 漏出这里的异常由 SDK 换成 -32603，`str(exc)` 原样进响应：两条路径都必须在这里收住。
         try:
-            state, answer = await self._answer(context_id, task_id, text, role)
+            state, answer = await self._answer(context_id, task_id, text, role, started, progress)
         except SyndicaError as exc:
             answer = f'期望: {exc.expected}。实际: {exc.received}。下一步: {exc.next_action}'
             state = TaskState.TASK_STATE_FAILED
@@ -179,15 +217,32 @@ class SyndicaA2A(RequestHandler):
             logger.error('a2a executor failed: %s', type(exc).__name__)
             answer = _executor_failed(type(exc).__name__)
             state = TaskState.TASK_STATE_FAILED
-        return self._remember(task_id, context_id, state, answer)
+        task = self._remember(task_id, context_id, state, answer)
+        if emit is not None:
+            _emit_final(emit, task, opened=opened)
+        return task
 
-    async def _answer(self, context_id: str, task_id: str, text: str, role: str) -> tuple[int, str]:
+    async def _answer(
+        self,
+        context_id: str,
+        task_id: str,
+        text: str,
+        role: str,
+        started: Callable[[str], None],
+        progress: Callable[[str], None],
+    ) -> tuple[int, str]:
         if self._desk is not None:
             outcome = await self._desk.turn(
-                context_id=context_id, task_id=task_id, text=text, role=role
+                context_id=context_id,
+                task_id=task_id,
+                text=text,
+                role=role,
+                started=started,
+                progress=progress,
             )
             return outcome.state, outcome.text
         assert self._runner is not None
+        started(context_id or secrets.token_hex(8))
         return TaskState.TASK_STATE_COMPLETED, await self._runner(text, role)
 
     def _remember(self, task_id: str, context_id: str, state: int, answer: str) -> Task:
@@ -201,6 +256,20 @@ class SyndicaA2A(RequestHandler):
             artifact.parts.add(text=self._redactor.redact(answer))
         self._tasks[task_id] = task
         return task
+
+
+def _emit_final(emit: Callable[[_StreamEvent], None], task: Task, *, opened: bool) -> None:
+    """没开成会话（被拒、开会话失败）时流里只有这一个 Task；开成了，它之后是产物与终态。"""
+    if not opened:
+        emit(task)
+        return
+    for artifact in task.artifacts:
+        emit(
+            TaskArtifactUpdateEvent(
+                task_id=task.id, context_id=task.context_id, artifact=artifact, last_chunk=True
+            )
+        )
+    emit(TaskStatusUpdateEvent(task_id=task.id, context_id=task.context_id, status=task.status))
 
 
 def build_agent_card(
@@ -336,24 +405,40 @@ class _Outcome:
 
 
 class A2ADesk:
-    """`contextId` 对上一个打开的会话。一次消息一轮。提问停成 INPUT_REQUIRED。"""
+    """`contextId` 就是会话 id。一次消息一轮。提问停成 INPUT_REQUIRED。
+
+    `started` 在会话定下来、这一轮开始之前收到会话 id；被拒时不调。`progress` 收到根 Agent
+    这一轮里的每段文本（已脱敏），子 Agent 的不给。
+    """
 
     def __init__(self, live: Live, *, redactor: Redactor | None = None) -> None:
         self._live = live
         self._redactor = redactor if redactor is not None else RuleRedactor()
-        self._rooms: dict[str, LiveSession] = {}
+        # 只续接这里开的会话：别处开的会话不在 hold_questions 里，提问会被无人值守中止。
+        self._rooms: set[str] = set()
         self._pending: dict[str, tuple[str, str, tuple[str, ...]]] = {}
         self._task_room: dict[str, str] = {}
 
-    async def turn(self, *, context_id: str, task_id: str, text: str, role: str) -> _Outcome:
+    async def turn(
+        self,
+        *,
+        context_id: str,
+        task_id: str,
+        text: str,
+        role: str,
+        started: Callable[[str], None] | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> _Outcome:
         try:
-            session = await self._session(context_id, role)
+            session = await self._session(context_id, task_id, role)
         except SyndicaError as exc:
             return _Outcome(
                 TaskState.TASK_STATE_FAILED,
                 f'期望: {exc.expected}。实际: {exc.received}。下一步: {exc.next_action}',
             )
-        self._task_room[task_id] = context_id
+        if started is not None:
+            started(session.sid)
+        self._task_room[task_id] = session.sid
         position = session.stream.position
         pending = self._pending.get(task_id)
         if pending is not None:
@@ -383,39 +468,65 @@ class A2ADesk:
                     (
                         '期望: 根 Agent 接受这条消息。'
                         f'实际: {delivered.reason or "投递没有给出原因"}。'
-                        '下一步: 用同一个 contextId 再发；会话已经结束就换一个 contextId。'
+                        '下一步: 用同一个 contextId 再发；'
+                        '会话已经结束就去掉 contextId 开一个新会话。'
                     ),
                 )
-        return await self._wait(session, task_id, position)
+        return await self._wait(session, task_id, position, progress)
 
     async def cancel(self, task_id: str) -> Task | None:
         context_id = self._task_room.get(task_id)
         if context_id is None:
             return None
-        session = self._rooms[context_id]
-        await session.handle.abort(session.handle.root_id)
+        session = self._live.sessions.get(context_id)
+        if session is not None:
+            await session.handle.abort(session.handle.root_id)
         task = Task(id=task_id, context_id=context_id)
         task.status.state = TaskState.TASK_STATE_CANCELED
         return task
 
-    async def _session(self, context_id: str, role: str) -> LiveSession:
-        session = self._rooms.get(context_id)
-        if session is not None:
+    async def _session(self, context_id: str, task_id: str, role: str) -> LiveSession:
+        # 只带 taskId 的后续消息属于那个任务所在的会话。
+        sid = context_id or self._task_room.get(task_id, '')
+        if not sid:
+            session = await self._live.open_session(resume=None, role=role)
+            self._live.hold_questions.add(session.sid)
+            self._rooms.add(session.sid)
             return session
-        session = await self._live.open_session(resume=None, role=role)
-        self._live.hold_questions.add(session.sid)
-        self._rooms[context_id] = session
+        session = self._live.sessions.get(sid)
+        if sid not in self._rooms or session is None:
+            raise ConfigError(
+                expected='contextId 是这个 server 经 A2A 开的、仍打开着的会话 id',
+                received=(
+                    f'contextId={self._redact(sid)[:120]!r} 不是：从没在这里开过、已经关闭，'
+                    '或 server 重启过'
+                ),
+                next_action=(
+                    '去掉 contextId 开一个新会话，或原样带上 Syndica 在任务里交回的 contextId'
+                ),
+            )
         return session
 
-    async def _wait(self, session: LiveSession, task_id: str, position: str) -> _Outcome:
+    async def _wait(
+        self,
+        session: LiveSession,
+        task_id: str,
+        position: str,
+        progress: Callable[[str], None] | None,
+    ) -> _Outcome:
         texts: list[str] = []
         root_id = session.handle.root_id
         follower: AsyncIterator[Entry | str] = session.stream.follow(position)
         try:
             async for entry in follower:
-                outcome = self._entry(root_id, task_id, entry, texts)
-                if outcome is not None:
-                    return outcome
+                outcome = self._entry(root_id, task_id, entry, texts, progress)
+                if outcome is None:
+                    continue
+                if outcome.state != TaskState.TASK_STATE_INPUT_REQUIRED:
+                    # agent_end 发出时驱动还在拆邮箱：对端立刻用同一个 contextId 再发，那条
+                    # 消息会落进这个邮箱，拆完就没了，下一轮永远不来。
+                    await _until_quiet(session)
+                return outcome
         finally:
             close = getattr(follower, 'aclose', None)
             if close is not None:
@@ -423,7 +534,12 @@ class A2ADesk:
         return _Outcome(TaskState.TASK_STATE_FAILED, _executor_failed('流已关闭'))
 
     def _entry(
-        self, root_id: str, task_id: str, entry: Entry | str, texts: list[str]
+        self,
+        root_id: str,
+        task_id: str,
+        entry: Entry | str,
+        texts: list[str],
+        progress: Callable[[str], None] | None,
     ) -> _Outcome | None:
         if isinstance(entry, str):
             return None
@@ -449,7 +565,10 @@ class A2ADesk:
             if block is not None and block.get('role') == 'assistant':
                 text = block.get('text')
                 if isinstance(text, str) and text:
-                    texts.append(self._redact(text))
+                    shown = self._redact(text)
+                    texts.append(shown)
+                    if progress is not None:
+                        progress(shown)
             return None
         if entry.kind == 'agent_error':
             return _Outcome(TaskState.TASK_STATE_FAILED, _from_payload(payload))
@@ -464,6 +583,17 @@ class A2ADesk:
 
     def _redact(self, text: str) -> str:
         return self._redactor.redact(text)
+
+
+async def _until_quiet(session: LiveSession) -> None:
+    runtime = getattr(session.handle, 'runtime', None)
+    if runtime is None:
+        return
+    for _ in range(200):
+        info = await runtime.find(session.handle.root_id)
+        if info is None or info.status is AgentStatus.ZOMBIE:
+            return
+        await asyncio.sleep(0.01)
 
 
 def _payload(data: dict[str, Any]) -> dict[str, Any]:

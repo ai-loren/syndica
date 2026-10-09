@@ -1,0 +1,8 @@
+{"id": 1, "jsonrpc": "2.0", "method": "SendStreamingMessage", "params": {"message": {"messageId": "MESSAGE-1", "metadata": {"syndica.role": "Orchestrator"}, "parts": [{"text": "go"}], "role": "ROLE_USER"}}}
+{"id": 1, "jsonrpc": "2.0", "result": {"task": {"contextId": "CONTEXT-1", "id": "TASK-1", "status": {"state": "TASK_STATE_WORKING"}}}}
+{"id": 1, "jsonrpc": "2.0", "result": {"statusUpdate": {"contextId": "CONTEXT-1", "status": {"message": {"parts": [{"text": "ROOT-PLAN"}]}, "state": "TASK_STATE_WORKING"}, "taskId": "TASK-1"}}}
+{"id": 1, "jsonrpc": "2.0", "result": {"statusUpdate": {"contextId": "CONTEXT-1", "status": {"message": {"parts": [{"text": "ROOT-FINAL"}]}, "state": "TASK_STATE_WORKING"}, "taskId": "TASK-1"}}}
+{"id": 1, "jsonrpc": "2.0", "result": {"artifactUpdate": {"artifact": {"artifactId": "ARTIFACT-1", "name": "answer", "parts": [{"text": "ROOT-PLAN\nROOT-FINAL"}]}, "contextId": "CONTEXT-1", "lastChunk": true, "taskId": "TASK-1"}}}
+{"id": 1, "jsonrpc": "2.0", "result": {"statusUpdate": {"contextId": "CONTEXT-1", "status": {"message": {"parts": [{"text": "ROOT-PLAN\nROOT-FINAL"}]}, "state": "TASK_STATE_COMPLETED"}, "taskId": "TASK-1"}}}
+{"id": 2, "jsonrpc": "2.0", "method": "GetTask", "params": {"id": "TASK-1"}}
+{"id": 2, "jsonrpc": "2.0", "result": {"artifacts": [{"artifactId": "ARTIFACT-1", "name": "answer", "parts": [{"text": "ROOT-PLAN\nROOT-FINAL"}]}], "contextId": "CONTEXT-1", "id": "TASK-1", "status": {"message": {"parts": [{"text": "ROOT-PLAN\nROOT-FINAL"}]}, "state": "TASK_STATE_COMPLETED"}}}

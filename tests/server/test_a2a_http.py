@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -18,6 +19,7 @@ from a2a.types import (
     TaskState,
 )
 from a2a.utils.constants import VERSION_HEADER
+from a2a.utils.errors import VersionNotSupportedError
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from server_fakes import FakeAssembly, FakeHandle, running
@@ -90,9 +92,43 @@ async def test_the_card_is_public_and_rpc_needs_a_token_and_a_version() -> None:
                 '/a2a/', json=_send('hi'), headers={'Authorization': f'Bearer {server.token}'}
             )
             assert bare.status_code == 200
-            assert bare.json()['error']['code'] == -32022
+            assert bare.json()['error']['code'] == -32009
             assert 'A2A-Version' in bare.json()['error']['message']
             assert 'sk-a2a-secret' not in bare.text
+
+
+@pytest.mark.parametrize(
+    ('version', 'received'),
+    [
+        (None, '没有 A2A-Version 头'),
+        ('', '没有 A2A-Version 头'),
+        ('2.0', "A2A-Version='2.0'"),
+        ('0.2', "A2A-Version='0.2'"),
+    ],
+)
+async def test_a_missing_or_unknown_version_is_version_not_supported(
+    version: str | None, received: str
+) -> None:
+    card = build_agent_card('workspace', (('Worker', 'does work'),), port=8080)
+    app = jsonrpc_app(SyndicaA2A(_never, card=card))
+    headers = {} if version is None else {'A2A-Version': version}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url='http://a2a', timeout=10
+    ) as client:
+        response = await client.post('/', json=_send('hi'), headers=headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body['id'] == 7
+    error = body['error']
+    assert error['code'] == -32009
+    assert error['data']['received'] == received
+    assert error['data']['supported'] == ['1.0', '0.3']
+    assert '1.0 或 0.3' in error['data']['expected']
+    assert '缺头不会按 0.3 收下' in error['data']['next_action']
+
+
+async def _never(text: str, role: str) -> str:
+    raise AssertionError(f'a refused version reached the runner with {text!r} as {role}')
 
 
 async def test_version_1_returns_the_answer_and_hides_executor_exceptions() -> None:
@@ -233,6 +269,11 @@ def _sdk_request(text: str, role: str) -> SendMessageRequest:
     return SendMessageRequest(message=message)
 
 
+def _first_text(holder: Any) -> str:
+    parts = list(holder.parts)
+    return str(parts[0].text) if parts else ''
+
+
 def _normalize_task(task: object) -> dict[str, object]:
     raw = MessageToDict(task)  # pyright: ignore[reportArgumentType]
     raw['id'] = 'TASK'
@@ -253,19 +294,25 @@ async def test_the_sdk_client_streams_fetches_and_cancels() -> None:
         )
         client = await create_client(server.base, ClientConfig(streaming=True, httpx_client=http))
         try:
-            texts: list[str] = []
+            seen: list[tuple[str, int, str]] = []
             task_id = ''
             async with asyncio.timeout(10):
                 async for event in client.send_message(_sdk_request('hello', 'Worker')):
                     kind = event.WhichOneof('payload')
                     if kind == 'task':
                         task_id = event.task.id
-                        texts.append(event.task.status.message.parts[0].text)
+                        status = event.task.status
+                        seen.append(('task', status.state, _first_text(status.message)))
+                    elif kind == 'artifact_update':
+                        seen.append(('artifact', 0, _first_text(event.artifact_update.artifact)))
                     elif kind == 'status_update':
-                        task_id = event.status_update.task_id
-                        if event.status_update.status.message.parts:
-                            texts.append(event.status_update.status.message.parts[0].text)
-            assert texts == ['Worker:hello']
+                        status = event.status_update.status
+                        seen.append(('status', status.state, _first_text(status.message)))
+            assert seen == [
+                ('task', TaskState.TASK_STATE_WORKING, ''),
+                ('artifact', 0, 'Worker:hello'),
+                ('status', TaskState.TASK_STATE_COMPLETED, 'Worker:hello'),
+            ]
             assert task_id
             fetched = await client.get_task(GetTaskRequest(id=task_id))
             assert fetched.status.message.parts[0].text == 'Worker:hello'
@@ -310,20 +357,21 @@ async def test_the_sdk_client_hides_executor_exceptions_and_rejects_a_blank_vers
         finally:
             await denied.aclose()
 
-        blank = httpx.AsyncClient(
-            headers={
-                'Authorization': f'Bearer {server.token}',
-                VERSION_HEADER: '',
-            },
-            timeout=10,
-        )
-        try:
-            bare = await create_client(
-                server.base, ClientConfig(streaming=False, httpx_client=blank)
+        for version in ('', '2.0'):
+            odd = httpx.AsyncClient(
+                headers={
+                    'Authorization': f'Bearer {server.token}',
+                    VERSION_HEADER: version,
+                },
+                timeout=10,
             )
-            with pytest.raises(Exception, match='A2A-Version'):
-                async for _event in bare.send_message(_sdk_request('hi', 'Worker')):
-                    pass
-            await bare.close()
-        finally:
-            await blank.aclose()
+            try:
+                bare = await create_client(
+                    server.base, ClientConfig(streaming=False, httpx_client=odd)
+                )
+                with pytest.raises(VersionNotSupportedError, match='A2A-Version'):
+                    async for _event in bare.send_message(_sdk_request('hi', 'Worker')):
+                        pass
+                await bare.close()
+            finally:
+                await odd.aclose()

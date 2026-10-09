@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
-from collections.abc import Mapping
+import socket
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from syndica.backends.a2a.model import A2AAgentModel
 from syndica.kernel import (
@@ -205,6 +212,130 @@ async def test_a_timeout_cancels_the_open_task() -> None:
     finally:
         reset_model_call_limit(token)
         await model.aclose()
+
+
+class _CapturePeer:
+    """真 HTTP 上的远端。`script` 逐条答 SendMessage（None：收尾前不答），记下每个 CancelTask。"""
+
+    def __init__(self, script: list[str | None], *, cancel_hangs: bool = False) -> None:
+        self.script = list(script)
+        self.cancel_hangs = cancel_hangs
+        self.sends: list[dict[str, Any]] = []
+        self.cancels: list[tuple[dict[str, Any], dict[str, str | None]]] = []
+        self.hanging = asyncio.Event()
+        self.done = asyncio.Event()
+        self.url = ''
+
+    async def _card(self, request: Request) -> JSONResponse:
+        del request
+        return JSONResponse(_CARD)
+
+    async def _rpc(self, request: Request) -> JSONResponse:
+        body = await request.json()
+        if body['method'] == 'CancelTask':
+            seen = {key: request.headers.get(key) for key in ('a2a-version', 'authorization')}
+            self.cancels.append((body['params'], seen))
+            if self.cancel_hangs:
+                await self.done.wait()
+            canceled = {'id': body['params']['id'], 'status': {'state': 'TASK_STATE_CANCELED'}}
+            return JSONResponse({'jsonrpc': '2.0', 'id': body['id'], 'result': canceled})
+        self.sends.append(body['params']['message'])
+        state = self.script.pop(0)
+        if state is None:
+            self.hanging.set()
+            await self.done.wait()
+            state = 'TASK_STATE_COMPLETED'
+        return JSONResponse(_task(state, f'{state} answer'))
+
+    @contextlib.asynccontextmanager
+    async def serving(self) -> AsyncIterator[_CapturePeer]:
+        app = Starlette(
+            routes=[
+                Route('/.well-known/agent-card.json', self._card),
+                Route('/a2a/', self._rpc, methods=['POST']),
+            ]
+        )
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(('127.0.0.1', 0))
+        sock.listen(16)
+        self.url = f'http://127.0.0.1:{sock.getsockname()[1]}/a2a/'
+        server = uvicorn.Server(uvicorn.Config(app, log_level='warning', lifespan='off'))
+        task = asyncio.create_task(server.serve(sockets=[sock]))
+        for _ in range(1000):
+            if server.started:
+                break
+            await asyncio.sleep(0.01)
+        try:
+            yield self
+        finally:
+            self.done.set()
+            server.should_exit = True
+            await asyncio.wait_for(task, 10)
+
+
+async def test_a_cancelled_call_cancels_the_open_remote_task_and_still_raises_cancelled() -> None:
+    peer = _CapturePeer(['TASK_STATE_INPUT_REQUIRED', None, 'TASK_STATE_COMPLETED'])
+    async with peer.serving():
+        model = A2AAgentModel('remote', peer.url, bearer='machine-token', timeout=5.0)
+        try:
+            asked = await model.create([ContextBlock(role='user', content='ask')])
+            assert asked.content == 'TASK_STATE_INPUT_REQUIRED answer'
+            call = asyncio.create_task(
+                model.create(
+                    [
+                        ContextBlock(role='user', content='ask'),
+                        ContextBlock(role='user', content='go on'),
+                    ]
+                )
+            )
+            await asyncio.wait_for(peer.hanging.wait(), 5)
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            assert peer.cancels == [
+                ({'id': 'task-1'}, {'a2a-version': '1.0', 'authorization': 'Bearer machine-token'})
+            ]
+            fresh = await model.create([ContextBlock(role='user', content='again')])
+            assert fresh.content == 'TASK_STATE_COMPLETED answer'
+        finally:
+            await model.aclose()
+    assert peer.sends[1]['taskId'] == 'task-1'
+    assert 'taskId' not in peer.sends[2]
+
+
+async def test_the_cancel_task_sent_after_a_cancellation_is_bounded() -> None:
+    peer = _CapturePeer(['TASK_STATE_INPUT_REQUIRED', None], cancel_hangs=True)
+    async with peer.serving():
+        model = A2AAgentModel('remote', peer.url, timeout=0.3)
+        loop = asyncio.get_running_loop()
+        try:
+            await model.create([ContextBlock(role='user', content='ask')])
+            call = asyncio.create_task(model.create([ContextBlock(role='user', content='go on')]))
+            await asyncio.wait_for(peer.hanging.wait(), 5)
+            started = loop.time()
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(call, 5)
+            elapsed = loop.time() - started
+        finally:
+            await model.aclose()
+    assert [params for params, _ in peer.cancels] == [{'id': 'task-1'}]
+    assert elapsed < 2
+
+
+async def test_a_cancelled_first_call_has_no_task_to_cancel_and_still_raises_cancelled() -> None:
+    peer = _CapturePeer([None])
+    async with peer.serving():
+        model = A2AAgentModel('remote', peer.url, timeout=5.0)
+        try:
+            call = asyncio.create_task(model.create([ContextBlock(role='user', content='hi')]))
+            await asyncio.wait_for(peer.hanging.wait(), 5)
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+        finally:
+            await model.aclose()
+    assert peer.cancels == []
 
 
 async def test_a_peer_that_accepts_and_never_answers_times_out_at_the_config_timeout() -> None:
