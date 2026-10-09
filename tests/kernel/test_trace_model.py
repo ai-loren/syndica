@@ -119,7 +119,7 @@ def test_the_enum_values_are_the_schema():
         'REPLAY': 'replay',
         'FULL': 'full',
     }
-    assert TRACE_SCHEMA == 'syndica.trace/7'
+    assert TRACE_SCHEMA == 'syndica.trace/8'
 
 
 def test_the_attribute_set_is_exactly_the_schema():
@@ -178,6 +178,7 @@ def test_the_attribute_set_is_exactly_the_schema():
         'verdict.unverified_cause': 'str',
         'verdict.needs_human': 'str[]',
         'verdict.outcomes': 'str[]',
+        'verdict.trust': 'str',
         'compaction.trigger': 'str',
         'compaction.blocks_before': 'int',
         'compaction.blocks_after': 'int',
@@ -216,6 +217,7 @@ def test_the_attribute_set_is_exactly_the_schema():
 def test_the_attributes_with_a_fixed_set_of_values_follow_the_kernel_enums():
     assert ATTRIBUTE_DOMAINS['stop_reason'] == {member.value for member in StopReason}
     assert ATTRIBUTE_DOMAINS['verdict.status'] == {member.value for member in VerdictStatus}
+    assert ATTRIBUTE_DOMAINS['verdict.trust'] == {member.value for member in TrustLevel}
     assert ATTRIBUTE_DOMAINS['confirmation.outcome'] == {
         member.value for member in ConfirmationOutcome
     }
@@ -491,7 +493,7 @@ def test_a_malformed_header_is_refused(changes: dict[str, Any]):
         _header(**changes)
 
 
-@pytest.mark.parametrize('schema', ['syndica.trace/8', 'syndica.trace/10'])
+@pytest.mark.parametrize('schema', ['syndica.trace/9', 'syndica.trace/10'])
 def test_a_header_from_a_newer_version_says_so_and_that_it_is_not_broken(schema: str):
     with pytest.raises(NewerTraceSchema) as caught:
         _header(schema=schema)

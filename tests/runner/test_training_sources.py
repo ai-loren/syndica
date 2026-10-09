@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from syndica.kernel.acceptance import (
     Anchor,
     AnchorSource,
@@ -23,9 +25,11 @@ from syndica.kernel.stores.memory_rubric import InMemoryRubricStore
 from syndica.kernel.stores.memory_session import InMemorySessionStore
 from syndica.kernel.stores.memory_trace import InMemoryTraceStore
 from syndica.kernel.trace import (
+    AttributeValue,
     CausalityEdge,
     EdgeKind,
     Span,
+    SpanEvent,
     SpanKind,
     SpanStatus,
     TraceHeader,
@@ -278,16 +282,171 @@ async def test_one_unreadable_trace_does_not_drop_the_other_sessions() -> None:
     assert skipped == f'{1:032x}: spans.jsonl 每行是一个 span'
 
 
-async def test_a_resumed_session_takes_its_verdict_from_the_latest_run() -> None:
-    stores = _Stores()
-    await _save(stores, sid='sresumed', verdict='block', content='x', goal='g', trace_index=1)
-    later = f'{2:032x}'
-    await stores.traces.begin(
-        TraceHeader(later, 2, TraceLevel.STRUCTURE, TraceRedaction('0' * 64, 1))
+def _verdict_event(
+    time_ns: int, status: str, outcomes: list[str], trust: str = 'trusted'
+) -> SpanEvent:
+    attributes: dict[str, AttributeValue] = {
+        'verdict.status': status,
+        'verdict.outcomes': outcomes,
+        'verdict.trust': trust,
+    }
+    return SpanEvent('verdict', time_ns, attributes)
+
+
+def _turn(index: int, agent_id: str, event: SpanEvent) -> Span:
+    """一个 turn span，带一个 `verdict` 事件；起止包住事件的时刻。`index` 只用来区分 span id。"""
+    return Span(
+        span_id=f'{0xF00 + index:016x}',
+        parent_span_id=None,
+        kind=SpanKind.TURN,
+        name='turn',
+        agent_id=agent_id,
+        start_ns=event.time_ns - 1,
+        end_ns=event.time_ns + 1,
+        status=SpanStatus.OK,
+        events=(event,),
     )
-    await stores.traces.append(later, [_span(2, 'sresumed', 'pass')])
+
+
+async def _resume(stores: _Stores, trace_index: int, spans: list[Span]) -> str:
+    """同一个会话恢复之后录下的又一个原始 trace。"""
+    trace_id = f'{trace_index:032x}'
+    await stores.traces.begin(
+        TraceHeader(trace_id, trace_index, TraceLevel.STRUCTURE, TraceRedaction('0' * 64, 1))
+    )
+    root = spans[-1]
+    child = f'{0xC00 + trace_index:016x}'
+    await stores.traces.append(
+        trace_id, spans, [CausalityEdge(EdgeKind.SPAWN, root.span_id, child)]
+    )
+    return trace_id
+
+
+async def test_a_resumed_session_keeps_the_verdicts_of_every_run() -> None:
+    stores = _Stores()
+    first = _span(1, 'sresumed', 'block')
+    await _save(
+        stores,
+        sid='sresumed',
+        verdict=None,
+        content='x',
+        goal='g',
+        trace_index=1,
+        spans=[_turn(1, 'sresumed', _verdict_event(13, 'block', ['r1=unmet'])), first],
+    )
+    later = await _resume(
+        stores,
+        2,
+        [
+            _turn(2, 'sresumed', _verdict_event(23, 'pass', ['r1=satisfied'])),
+            _span(2, 'sresumed', 'pass', cost='0.5'),
+        ],
+    )
     [attempt] = (await stores.assemble()).attempts
+    assert attempt.verdicts == ('block', 'pass')
     assert (attempt.verdict, attempt.trace_id) == ('pass', later)
+    assert attempt.outcomes == ('r1=satisfied',)
+    assert attempt.timing == (first.start_ns, 24, '0.5')
+    assert [edge[2] for edge in attempt.causality] == [f'{17:016x}', f'{0xC02:016x}']
+
+
+async def test_an_older_trace_without_verdict_events_still_counts_in_a_resumed_session() -> None:
+    stores = _Stores()
+    await _save(
+        stores,
+        sid='smixed',
+        verdict=None,
+        content='x',
+        goal='g',
+        trace_index=1,
+        spans=[_span(1, 'smixed', 'block')],
+    )
+    await _resume(
+        stores,
+        2,
+        [
+            _turn(2, 'smixed', _verdict_event(23, 'pass', ['r1=satisfied'])),
+            _span(2, 'smixed', 'pass'),
+        ],
+    )
+    [attempt] = (await stores.assemble()).attempts
+    assert attempt.verdicts == ('block', 'pass')
+    assert attempt.verdict_trust == 'trusted'
+
+
+async def test_verdict_events_on_several_spans_are_ordered_by_time_not_by_list_order() -> None:
+    stores = _Stores()
+    await _save(
+        stores,
+        sid='sorder',
+        verdict=None,
+        content='x',
+        goal='g',
+        trace_index=1,
+        spans=[
+            _turn(3, 'sorder', _verdict_event(30, 'pass', ['r1=satisfied'])),
+            _turn(1, 'sorder', _verdict_event(10, 'block', ['r1=unmet'])),
+            _turn(2, 'sorder', _verdict_event(20, 'partial', ['r1=unconfirmed'])),
+            _turn(4, 'sorder.OutcomeVerifier.2', _verdict_event(40, 'block', ['r1=unmet'])),
+        ],
+    )
+    [attempt] = (await stores.assemble()).attempts
+    assert attempt.verdicts == ('block', 'partial', 'pass')
+    assert attempt.verdict == 'pass'
+
+
+async def test_outcomes_come_from_the_last_verdict_event() -> None:
+    stores = _Stores()
+    await _save(
+        stores,
+        sid='soutcomes',
+        verdict=None,
+        content='x',
+        goal='g',
+        trace_index=1,
+        spans=[
+            _turn(2, 'soutcomes', _verdict_event(20, 'pass', ['r1=satisfied', 'r2=satisfied'])),
+            _turn(1, 'soutcomes', _verdict_event(10, 'block', ['r1=unmet'])),
+            _span(1, 'soutcomes', 'pass', outcomes=['r1=stale']),
+        ],
+    )
+    [attempt] = (await stores.assemble()).attempts
+    assert attempt.outcomes == ('r1=satisfied', 'r2=satisfied')
+
+
+@pytest.mark.parametrize(
+    ('block_trust', 'pass_trust', 'expected'),
+    [
+        ('untrusted', 'trusted', 'untrusted'),
+        ('trusted', 'untrusted', 'untrusted'),
+        ('trusted', 'trusted', 'trusted'),
+    ],
+    ids=['earlier-verdict-untrusted', 'final-verdict-untrusted', 'both-trusted'],
+)
+async def test_an_untrusted_verdict_anywhere_in_the_session_marks_the_sample(
+    block_trust: str, pass_trust: str, expected: str
+) -> None:
+    stores = _Stores()
+    await _save(
+        stores,
+        sid='sjudged',
+        verdict=None,
+        content='x',
+        goal='g',
+        trace_index=1,
+        spans=[
+            _turn(2, 'sjudged', _verdict_event(20, 'pass', ['r1=satisfied'], pass_trust)),
+            _turn(1, 'sjudged', _verdict_event(10, 'block', ['r1=unmet'], block_trust)),
+        ],
+    )
+    [attempt] = (await stores.assemble()).attempts
+    assert {message.trust for message in attempt.messages} == {'trusted'}
+    assert attempt.verdict_trust == expected
+    messages, _, manifest = export_sft([attempt])
+    [row] = [json.loads(line) for line in messages.splitlines()]
+    samples = manifest['samples']
+    assert isinstance(samples, list)
+    assert row['untrusted'] is samples[0]['untrusted'] is (expected == 'untrusted')
 
 
 async def test_every_verdict_of_the_root_is_kept_in_order_of_its_spans() -> None:

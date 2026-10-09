@@ -54,7 +54,7 @@ _DOCUMENT_KEYS = (
 )
 _TIMING_KEYS = ('start_ns', 'end_ns', 'cost')
 _EDGE_KEYS = ('kind', 'source_span_id', 'target_span_id')
-_SOURCE_KEYS = ('trace_id', 'verdict_source')
+_SOURCE_KEYS = ('trace_id', 'verdict_source', 'verdict_trust')
 _MESSAGE_KEYS = ('role', 'content', 'tool_call_id', 'tool_calls', 'trust')
 _CALL_KEYS = ('id', 'name', 'arguments')
 _REDACTION_KEYS = ('digest', 'rules_version', 'placeholders_kept', 'raw_secrets_exported')
@@ -119,9 +119,12 @@ class Attempt:
     verdicts: tuple[str, ...] = ()
     # 逐条 Rubric 的结论，形如 `R1=satisfied`。
     outcomes: tuple[str, ...] = ()
+    # 给出最后一次裁决的那个原始 trace。
     trace_id: str | None = None
     # acceptance：trace 上有裁决；none：有 trace 但没有裁决；missing：找不到 trace。
     verdict_source: str = 'acceptance'
+    # `verdicts` 里任何一次出自不可信的验收就是 untrusted：样本行的 `untrusted` 随之为真。
+    verdict_trust: str = 'trusted'
 
 
 def trajectory(
@@ -156,7 +159,11 @@ def trajectory(
         'verdicts': list(attempt.verdicts) or [attempt.verdict],
         'outcomes': list(attempt.outcomes),
         'source': _ordered(
-            {'trace_id': attempt.trace_id, 'verdict_source': attempt.verdict_source},
+            {
+                'trace_id': attempt.trace_id,
+                'verdict_source': attempt.verdict_source,
+                'verdict_trust': attempt.verdict_trust,
+            },
             _SOURCE_KEYS,
         ),
         'causality': [_edge(item) for item in attempt.causality],
@@ -202,7 +209,8 @@ def export_sft(
     """SFT 的 messages jsonl（OpenAI 消息形状，带工具调用）、ShareGPT jsonl，以及 manifest。
 
     每行带 `id`、`artifacts`、`untrusted` 与 `redaction`，样本能追回它出自哪次尝试、引用了哪些产物
-    版本、有没有不可信内容、用哪套规则脱敏。一条尝试建轨迹失败或含点名的原文密钥时跳过，其余照常。
+    版本、有没有不可信内容或出自不可信验收的裁决、用哪套规则脱敏。一条尝试建轨迹失败或含点名的
+    原文密钥时跳过，其余照常。
     """
     _check_flag(include_unverified)
     kept, manifest = _select(
@@ -249,6 +257,7 @@ def export_preference(
 
     行是对话形状的 `prompt` / `chosen` / `rejected`（TRL 的 DPO 直接读），另带两边的 id 与裁决。
     `prompt` 是 chosen 那一份第一条 assistant 之前的消息。unverified 不进配对，即使显式包含了它。
+    裁决出自不可信验收的一方照样配对，行的 `untrusted` 为真，由训练侧决定用不用。
     """
     _check_flag(include_unverified)
     kept, manifest = _select(
@@ -668,6 +677,12 @@ def _check_attempt(attempt: object) -> None:
             received=f'verdict_source={attempt.verdict_source!r}',
             next_action='trace 上有裁决用 acceptance，没有用 none，找不到 trace 用 missing',
         )
+    if attempt.verdict_trust not in _TRUST:
+        raise ConfigError(
+            expected='verdict_trust 是 trusted 或 untrusted',
+            received=f'verdict_trust={attempt.verdict_trust!r}',
+            next_action='取 trace 上 verdict.trust 最严的那个；任何一次裁决不可信就填 untrusted',
+        )
     for message in attempt.messages:
         if message.role not in _ROLES:
             raise ConfigError(
@@ -704,7 +719,9 @@ def _copied(item: Mapping[str, object]) -> dict[str, object]:
 
 
 def _untrusted(attempt: Attempt) -> bool:
-    return any(message.trust == 'untrusted' for message in attempt.messages)
+    return attempt.verdict_trust == 'untrusted' or any(
+        message.trust == 'untrusted' for message in attempt.messages
+    )
 
 
 def _split_prompt(messages: Sequence[Message]) -> tuple[list[Message], list[Message]]:

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from syndica.kernel.acceptance import unfinished_verdict
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.context import ContextBlock, ToolCall, TrustLevel
 from syndica.kernel.danger import AllowAll
@@ -21,6 +22,7 @@ from syndica.kernel.runtime import Runtime
 from syndica.kernel.tool import Tool, ToolResult
 from syndica.kernel.tools import Fork
 from syndica.kernel.topology import AgentSlot, Topology
+from syndica.kernel.trace import AttributeValue, SpanStatus
 from syndica.kernel.tracing import NullTracer
 
 _DANGER = 'sudo rm -rf /srv'
@@ -497,6 +499,52 @@ async def test_the_trace_records_a_floored_tools_result_as_untrusted():
     await _run(runtime, llm, {})
 
     assert tracer.trust == [TrustLevel.UNTRUSTED]
+
+
+class _Verdicts(NullTracer):
+    def __init__(self) -> None:
+        self.events: list[dict[str, AttributeValue]] = []
+        self.ended: list[dict[str, AttributeValue]] = []
+
+    def add_event(self, span_id: str, name: str, attributes: dict[str, AttributeValue]) -> None:
+        if name == 'verdict':
+            self.events.append(dict(attributes))
+
+    def end_span(
+        self, span_id: str, status: SpanStatus, attributes: dict[str, AttributeValue]
+    ) -> None:
+        if 'verdict.status' in attributes:
+            self.ended.append(dict(attributes))
+
+
+@pytest.mark.parametrize(
+    ('author', 'given', 'recorded'),
+    [
+        ('module', TrustLevel.TRUSTED, 'untrusted'),
+        ('host', TrustLevel.UNTRUSTED, 'untrusted'),
+        ('host', TrustLevel.TRUSTED, 'trusted'),
+    ],
+    ids=['floored-module', 'untrusted-judge', 'trusted-judge'],
+)
+async def test_the_trace_records_the_trust_of_each_verdict(
+    author: str, given: TrustLevel, recorded: str
+):
+    def judge(**_: Any) -> HookResult:
+        return HookResult(modified={'verdict': unfinished_verdict([], reason='x', trust=given)})
+
+    hooks: Hooks = [(Junction.COMPLETION_PROPOSED, _first_only(judge))]
+    tracer = _Verdicts()
+    runtime = Runtime(
+        plugins=[_host(hooks)] if author == 'host' else (),
+        modules=[_module(hooks if author == 'module' else ())],
+        untrusted_output_modules=['extra'],
+    )
+    runtime._set_tracer(tracer)  # pyright: ignore[reportPrivateUsage]
+
+    await _run(runtime, ScriptedLLM([ScriptedTurn(content='done')]), {})
+
+    assert [event['verdict.trust'] for event in tracer.events] == [recorded]
+    assert [ended['verdict.trust'] for ended in tracer.ended] == [recorded]
 
 
 _HANDED = 'module-authored text'

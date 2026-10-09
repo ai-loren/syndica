@@ -337,7 +337,11 @@ _FEEDBACK_REASON_CHARS = 500
 
 def _verdict_attributes(verdict: Verdict) -> dict[str, AttributeValue]:
     """终态裁决进 agent span（§7.5）：读 trace 的人不打开轨迹也看得到这次交付验没验过、过没过。"""
-    attributes: dict[str, AttributeValue] = {'verdict.status': verdict.status.value}
+    attributes: dict[str, AttributeValue] = {
+        'verdict.status': verdict.status.value,
+        # 训练导出拿裁决当奖励与偏好标签：出自不可信验收的裁决不记下来，标签在数据集里就成了干净的。
+        'verdict.trust': verdict.trust.value,
+    }
     if verdict.unverified_cause is not None:
         attributes['verdict.unverified_cause'] = verdict.unverified_cause
     if verdict.needs_human:

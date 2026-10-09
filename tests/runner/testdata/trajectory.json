@@ -59,7 +59,8 @@
   ],
   "source": {
     "trace_id": "tttttttttttttttttttttttttttttttt",
-    "verdict_source": "acceptance"
+    "verdict_source": "acceptance",
+    "verdict_trust": "trusted"
   },
   "causality": [],
   "timing": {

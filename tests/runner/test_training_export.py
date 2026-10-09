@@ -40,6 +40,7 @@ def _attempt(
     content: str = 'wrote the note',
     arguments: str = '{"path": "planets.md"}',
     trust: str = 'trusted',
+    verdict_trust: str = 'trusted',
 ) -> Attempt:
     return Attempt(
         id=ident,
@@ -57,6 +58,7 @@ def _attempt(
         tools=('Read', 'Write'),
         outcomes=('R1=satisfied',),
         trace_id='t' * 32,
+        verdict_trust=verdict_trust,
     )
 
 
@@ -82,7 +84,8 @@ def test_a_trajectory_matches_the_golden_key_order() -> None:
         'redaction',
     ]
     source = document['source']
-    assert isinstance(source, dict) and list(source) == ['trace_id', 'verdict_source']
+    assert isinstance(source, dict)
+    assert list(source) == ['trace_id', 'verdict_source', 'verdict_trust']
     timing = document['timing']
     assert isinstance(timing, dict) and list(timing) == ['start_ns', 'end_ns', 'cost']
     redaction = document['redaction']
@@ -222,6 +225,68 @@ def test_one_bad_attempt_does_not_drop_the_rest() -> None:
 def test_an_inconsistent_attempt_is_refused(bad: Attempt) -> None:
     with pytest.raises(ConfigError):
         trajectory(bad)
+
+
+def test_an_unknown_verdict_trust_is_refused_and_says_where_to_read_it() -> None:
+    with pytest.raises(ConfigError) as caught:
+        trajectory(Attempt('x', 'g', 'r', (), 'pass', verdict_trust='maybe'))
+    assert "'maybe'" in caught.value.received
+    assert 'verdict.trust' in caught.value.next_action
+
+
+def test_the_trajectory_keeps_the_trust_of_each_message() -> None:
+    document = trajectory(_attempt('pass', trust='untrusted'))
+    messages = document['messages']
+    assert isinstance(messages, list)
+    assert [item['trust'] for item in messages] == ['trusted', 'trusted', 'untrusted']
+
+
+@pytest.mark.parametrize(
+    ('trust', 'verdict_trust', 'flagged'),
+    [
+        ('untrusted', 'trusted', True),
+        ('trusted', 'untrusted', True),
+        ('trusted', 'trusted', False),
+    ],
+    ids=['untrusted-message', 'untrusted-verdict', 'clean'],
+)
+def test_every_row_format_carries_the_untrusted_flag(
+    trust: str, verdict_trust: str, flagged: bool
+) -> None:
+    chosen = _attempt(
+        'pass', ident='chosen', trust=trust, verdict_trust=verdict_trust, content='good note'
+    )
+    rejected = _attempt('block', ident='rejected', content='bad note')
+    messages, share, manifest = export_sft([chosen])
+    [sft] = [json.loads(line) for line in messages.splitlines()]
+    [shared] = [json.loads(line) for line in share.splitlines()]
+    body, _ = export_preference([chosen, rejected])
+    [pair] = [json.loads(line) for line in body.splitlines()]
+    episode = rl_row(chosen, lambda text: [1])['episode']
+    samples = manifest['samples']
+    source = trajectory(chosen)['source']
+    assert isinstance(episode, dict) and isinstance(samples, list) and isinstance(source, dict)
+    assert sft['untrusted'] is flagged
+    assert shared['untrusted'] is flagged
+    assert pair['untrusted'] is flagged
+    assert episode['untrusted'] is flagged
+    assert samples[0]['untrusted'] is flagged
+    assert source['verdict_trust'] == verdict_trust
+
+
+@pytest.mark.parametrize('side', ['chosen', 'rejected'])
+def test_an_untrusted_verdict_is_still_paired_and_the_pair_carries_the_flag(side: str) -> None:
+    chosen = _attempt(
+        'pass', ident='chosen', verdict_trust='untrusted' if side == 'chosen' else 'trusted'
+    )
+    rejected = _attempt(
+        'block', ident='rejected', verdict_trust='untrusted' if side == 'rejected' else 'trusted'
+    )
+    body, manifest = export_preference([chosen, rejected])
+    [pair] = [json.loads(line) for line in body.splitlines()]
+    assert (pair['chosen_id'], pair['rejected_id']) == ('chosen', 'rejected')
+    assert pair['untrusted'] is True
+    assert manifest['preference_pairs'] == 1
 
 
 def test_preference_rows_are_dpo_shaped_and_come_from_the_same_goal_and_rubric() -> None:

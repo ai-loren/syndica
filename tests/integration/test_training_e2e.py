@@ -16,6 +16,7 @@ import subprocess
 import sys
 from io import StringIO
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -26,6 +27,7 @@ from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel.context import ToolCall
 from syndica.kernel.llm import ScriptedLLM, ScriptedTurn
 from syndica.kernel.redaction import RedactionRule, RuleRedactor
+from syndica.runner.training import read_trajectory
 
 _GOAL = 'ship a report with a section four'
 # 宿主环境里有它，run 时就被换掉；它代表「一个本来就会被宿主认出的密钥」。
@@ -139,6 +141,7 @@ def _sessions_by_creation(root: Path) -> list[str]:
     metas = [
         json.loads((path / 'meta.json').read_text(encoding='utf-8'))['meta']
         for path in (root / '.syndica' / 'sessions').iterdir()
+        if path.is_dir()
     ]
     return [meta['sid'] for meta in sorted(metas, key=lambda meta: meta['created_at'])]
 
@@ -255,6 +258,39 @@ def workspace(tmp_path_factory: pytest.TempPathFactory) -> _Workspace:
         retry_host.close()
     [sids['retry']] = set(_sessions_by_creation(root)) - before
 
+    # 判 block 后结束，再 `run --session` 恢复同一个会话、判 pass：两次运行各录一个 trace。
+    before = set(_sessions_by_creation(root))
+    blocked = ScriptedLLM(
+        [
+            _projection([_RUBRIC]),
+            ScriptedTurn(content='Final answer: nothing was written.'),
+            _outcome('unmet', 'nothing was written'),
+        ]
+    )
+    blocked_err = StringIO()
+    blocked_host = _host(root, blocked, blocked_err)
+    argv = ['--config', config, 'run', 'write the report', '--agent', 'Worker', '--goal', _GOAL]
+    try:
+        assert main(argv, host=blocked_host, io=CliIO(StringIO(), StringIO(), blocked_err)) == 0
+    finally:
+        blocked_host.close()
+    [sids['resumed']] = set(_sessions_by_creation(root)) - before
+    resumed = ScriptedLLM(
+        [
+            ScriptedTurn(content='Final answer: the report now has a section four.'),
+            _outcome('satisfied', 'the report now has'),
+        ]
+    )
+    resumed_err = StringIO()
+    resumed_host = _host(root, resumed, resumed_err)
+    argv = ['--config', config, 'run', 'now write it', '--session', sids['resumed']]
+    try:
+        assert main(argv, host=resumed_host, io=CliIO(StringIO(), StringIO(), resumed_err)) == 0
+    finally:
+        resumed_host.close()
+    judged = re.findall(r'验收：(\w+)', blocked_err.getvalue() + resumed_err.getvalue())
+    assert judged == ['block', 'pass'], blocked_err.getvalue() + resumed_err.getvalue()
+
     plain = root / 'plain.yaml'
     plain.write_text('version: 1\n', encoding='utf-8')
     before = set(_sessions_by_creation(root))
@@ -294,7 +330,7 @@ def test_sft_export_keeps_order_tool_calls_and_artifacts_and_leaves_out_unverifi
     assert '会话没拼成' in said
     rows = _lines(out / 'messages.jsonl')
     assert sorted(str(row['id']) for row in rows) == sorted(
-        sids[name] for name in ('pass', 'partial', 'block', 'retry')
+        sids[name] for name in ('pass', 'partial', 'block', 'retry', 'resumed')
     )
     passed = next(row for row in rows if row['id'] == sids['pass'])
     messages = passed['messages']
@@ -326,6 +362,7 @@ def test_sft_export_keeps_order_tool_calls_and_artifacts_and_leaves_out_unverifi
     assert any(str(item).startswith(sids['orphan']) for item in manifest['failed'])
     samples = {sample['id']: sample for sample in manifest['samples']}
     assert samples[sids['retry']]['verdicts'] == ['partial', 'pass']
+    assert samples[sids['resumed']]['verdicts'] == ['block', 'pass']
     assert samples[sids['pass']]['verdict_source'] == 'acceptance'
     assert samples[sids['pass']]['trace_id']
     assert _fingerprint(workspace.root) == before
@@ -353,7 +390,7 @@ def test_preference_pairs_trace_back_to_verdicts_of_the_same_goal_and_rubric(
     out, _, _ = workspace.export('preference', 'preference')
     [pair] = _lines(out / 'preference.jsonl')
     assert pair['chosen_verdict'] == 'pass'
-    assert pair['chosen_id'] in {sids['pass'], sids['retry']}
+    assert pair['chosen_id'] in {sids['pass'], sids['retry'], sids['resumed']}
     assert (pair['rejected_id'], pair['rejected_verdict']) == (sids['block'], 'block')
     assert str(pair['goal_id']).startswith('goal:')
     assert str(pair['rubric_id']).startswith('rubric:')
@@ -365,20 +402,80 @@ def test_rl_rows_mask_the_assistant_and_reward_the_verdict(workspace: _Workspace
     out, _, _ = workspace.export('rl', 'rl')
     rows = _lines(out / 'rl.jsonl')
     rewards = {}
+    histories = {}
     for row in rows:
         ids, mask, episode = row['input_ids'], row['loss_mask'], row['episode']
         assert isinstance(ids, list) and isinstance(mask, list) and isinstance(episode, dict)
         assert len(ids) == len(mask)
         assert set(mask) == {0, 1}
         rewards[episode['id']] = row['reward']
+        histories[episode['id']] = episode['verdicts']
     assert rewards == {
         sids['pass']: 1.0,
         sids['retry']: 1.0,
+        sids['resumed']: 1.0,
         sids['partial']: 0.5,
         sids['block']: 0.0,
     }
+    assert histories[sids['resumed']] == ['block', 'pass']
     manifest = json.loads((out / 'manifest.json').read_text())
     assert manifest['tokenizer'] == 'utf8-bytes'
+
+
+def _traces_of(root: Path, sid: str) -> list[tuple[str, list[dict[str, object]]]]:
+    """根 Agent `sid` 出现过的每个 trace：(trace id, span)，按 trace 开始时间排。"""
+    found: list[tuple[int, str, list[dict[str, object]]]] = []
+    for path in (root / '.syndica' / 'traces').iterdir():
+        if not path.is_dir():
+            continue
+        spans = _lines(path / 'spans.jsonl')
+        if any(span['agent_id'] == sid for span in spans):
+            header = json.loads((path / 'trace.json').read_text(encoding='utf-8'))
+            found.append((header['started_ns'], header['trace_id'], spans))
+    return [(trace_id, spans) for _, trace_id, spans in sorted(found)]
+
+
+def test_every_exported_trajectory_reads_back_with_its_prompt_tools_and_timing(
+    workspace: _Workspace,
+) -> None:
+    sids = workspace.sids
+    out, _, _ = workspace.export('trajectory', 'trajectory')
+    documents = [read_trajectory(row) for row in _lines(out / 'trajectories.jsonl')]
+    assert sorted(str(document['id']) for document in documents) == sorted(
+        sids[name] for name in ('pass', 'partial', 'block', 'retry', 'resumed')
+    )
+    for document in documents:
+        assert document['model'] and document['tools'] and document['system_prompt']
+        timing, source = document['timing'], document['source']
+        assert isinstance(timing, dict) and isinstance(source, dict)
+        assert timing['start_ns'] is not None
+        assert source['verdict_trust'] == 'trusted'
+
+
+def test_a_session_blocked_then_resumed_and_passed_exports_both_verdicts(
+    workspace: _Workspace,
+) -> None:
+    sid = workspace.sids['resumed']
+    runs = _traces_of(workspace.root, sid)
+    assert len(runs) == 2
+    out, _, _ = workspace.export('trajectory', 'resumed')
+    [document] = [row for row in _lines(out / 'trajectories.jsonl') if row['id'] == sid]
+    assert (document['verdict'], document['verdicts']) == ('pass', ['block', 'pass'])
+    source, timing = document['source'], document['timing']
+    assert isinstance(source, dict) and isinstance(timing, dict)
+    assert source['trace_id'] == runs[-1][0]
+    starts = [cast(int, span['start_ns']) for span in runs[0][1]]
+    ends = [cast(int, span['end_ns']) for span in runs[-1][1]]
+    assert (timing['start_ns'], timing['end_ns']) == (min(starts), max(ends))
+    messages = document['messages']
+    assert isinstance(messages, list)
+    assert [item['content'] for item in messages if item['role'] == 'assistant'] == [
+        'Final answer: nothing was written.',
+        'Final answer: the report now has a section four.',
+    ]
+    manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
+    [sample] = [item for item in manifest['samples'] if item['id'] == sid]
+    assert sample['verdicts'] == ['block', 'pass']
 
 
 def test_include_unverified_is_explicit_and_recorded(workspace: _Workspace) -> None:
@@ -473,7 +570,14 @@ def test_trl_reads_the_exported_sft_file_with_its_tool_calls(workspace: _Workspa
     from syndica.backends.trl.dry_run import dry_run
 
     out, _, _ = workspace.export('sft', 'trl')
+    rows = _lines(out / 'messages.jsonl')
     result = dry_run(out / 'messages.jsonl')
-    assert result['rows'] == 4
+    assert result['rows'] == len(rows) == 5
     prepared = result['prepared_columns']
-    assert isinstance(prepared, list) and 'input_ids' in prepared
+    assert isinstance(prepared, list) and {'input_ids', 'labels'} <= set(prepared)
+    counts = result['token_counts']
+    assert isinstance(counts, list) and len(counts) == len(rows)
+    ids = [row['id'] for row in rows]
+    with_call = counts[ids.index(workspace.sids['pass'])]
+    without = counts[ids.index(workspace.sids['block'])]
+    assert with_call > without
