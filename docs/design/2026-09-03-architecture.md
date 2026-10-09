@@ -1475,9 +1475,10 @@ CI 检查项：
 | 11 | 训练出口 | 中立轨迹 + SFT / 偏好 / RL 导出器 + 至少一个训练框架对接 |
 | 12 | 发布准备 | 英文文档、文档站、CI 矩阵、许可与贡献流程 |
 
-**状态（2026-10-09）：** 里程碑 1–9 已完成。里程碑 10 的四个协议适配在工作区里，证据见
-[M10 收口审计](../audits/2026-10-09-m10-final-audit.md)；Gemini CLI 的真实运行还没做，路线图总览写「进行中」。
-里程碑 11 的导出与 TRL 对接也在工作区里，证据见 [M11 收口审计](../audits/2026-10-09-m11-final-audit.md)。
+**状态（2026-10-09）：** 里程碑 1–11 已完成。里程碑 10 的证据见 [M10 收口审计](../audits/2026-10-09-m10-final-audit.md)：
+四个协议都有官方 SDK 对真进程或真 HTTP 服务的脚本化往返，MCP Inspector、Gemini CLI（托管成 ACP Agent）与 `openai` SDK
+（对背后是免费 Gemini 的 `syndica up`）另外手工跑过。里程碑 11 的证据见 [M11 收口审计](../audits/2026-10-09-m11-final-audit.md)：
+真 CLI 跑出的会话导出成五种格式，`syndica[trl]` 的 `SFTTrainer` 读进导出的 SFT 文件。
 审计见 [M1 收口审计](../audits/2026-09-23-m1-final-audit.md)、
 [M2 收口审计](../audits/2026-10-01-m2-final-audit.md)、[M3 收口审计](../audits/2026-10-02-m3-final-audit.md)、
 [M4 收口审计](../audits/2026-10-03-m4-final-audit.md)、[M5 收口审计](../audits/2026-10-04-m5-final-audit.md) 与

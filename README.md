@@ -957,8 +957,8 @@ The v1.0 roadmap has 12 internal milestones:
 | 7 | Artifacts and acceptance | Done |
 | 8 | Long-horizon task control | Done |
 | 9 | HTTP/SSE/Web product surface | Done |
-| 10 | MCP / ACP / A2A / OpenAI HTTP interop | In progress |
-| 11 | Training-data export | In progress |
+| 10 | MCP / ACP / A2A / OpenAI HTTP interop | Done |
+| 11 | Training-data export | Done |
 | 12 | v1.0 release readiness | Planned |
 
 Expanded roadmap: [`docs/plans/2026-09-23-v1-milestone-roadmap.md`](docs/plans/2026-09-23-v1-milestone-roadmap.md).

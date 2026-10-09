@@ -91,4 +91,8 @@ trace 上的 `verdict` 事件，属性沿用 `verdict.*`，`TRACE_SCHEMA` 不变
 
 首版 `0b02601` 的导出验证（`git archive` 到临时目录，`uv sync --all-extras` 后跑全部门禁）：ruff、format、pyright、
 `check_deps`、`check_links`、`check_web`、Playwright 28 / 28 都过；全套 10301 passed、1 failed，失败的是 `syndica down`
-的计时断言（4.48 秒对上限 4 秒），当时两个评审的变异 worker 正把机器压满。处置之后的提交另做一次导出验证，结果补在这里。
+的计时断言（4.48 秒对上限 4 秒），当时两个评审的变异 worker 正把机器压满。
+
+处置与 M10 收口评审之后，最终代码提交 `47c2dc2` 在空闲机器上做了导出验证（没有并行任务）：`uv sync --all-extras`、
+ruff、format、pyright（0 errors）、`check_deps`、`check_links`、`check_web`、Playwright 桌面 + 移动 28 / 28 都过；全套
+10561 passed、0 failed，957 秒。上面那条 `down` 的计时断言这次通过。

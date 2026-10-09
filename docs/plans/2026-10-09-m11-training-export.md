@@ -2,7 +2,8 @@
 
 日期：2026-10-09
 来源：[路线图](2026-09-23-v1-milestone-roadmap.md)「M11 训练出口」、[spec](../design/2026-09-03-architecture.md) §9.5
-状态：首版提交为 `0b02601`；第二方收口评审（2 Blocking / 1 High / 7 Medium）的处置见决策日志 P2，未提交。
+状态：已完成。首版提交为 `0b02601`；第二方收口评审（2 Blocking / 1 High / 7 Medium）的处置见决策日志 P2，在 `400ac7a`；
+最终代码提交 `47c2dc2` 过了导出验证。
 
 ## 目标
 

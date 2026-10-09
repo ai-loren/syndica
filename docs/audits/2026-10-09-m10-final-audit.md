@@ -3,7 +3,7 @@
 日期：2026-10-09
 范围：[M10 计划](../plans/2026-10-09-m10-interop.md) 的阶段零至七
 验证方式：本地验证协议（Actions 额度用完期间，见路线图「当前主线约束」）。实现在提交 `b1ec080` 里，评审处置在其后的
-几个提交里，都没有推送。
+几个提交里，最终代码提交 `47c2dc2` 过了导出验证（见文末）。
 
 ## 结论
 
@@ -98,6 +98,7 @@ kernel helper 公开，留到 v1.0 冻结公开 API 时）；MCP stdio 客户端
 |---|---|
 | 真实客户端收成自动测试 | Inspector 与 Gemini CLI 经 npx 拉取、Gemini 要 key，按路线图归手动 / nightly |
 | 回放文档里的 `mcp.external_tool` | 规则参数表只收内核规则。带 MCP 的 run 不写回放文档，结构 trace 照常记 |
+| DevModule 在 ACP 取消时留下没 await 的 `_Recorder._ended` | 全套里唯一的 RuntimeWarning，只出现在 `test_an_editor_stdio_mcp_tool_runs_untrusted`；开发期记录器少记这一次结束，不影响处置 |
 
 ## 公开契约
 
@@ -122,3 +123,12 @@ sh scripts/check_web.sh                                      通过（产物已�
 ```
 
 全套 `uv run pytest -q`：第一次（守卫修复前）10265 passed、4 failed（自由文本属性 `tool.caller`、server 私有名、写入点、前端产物哈希）。第二次 10263 passed、6 failed，都在 `tests/server/test_acp_turn.py`（公开方法没有转调测试覆盖的私有钩子）。第三次 10275 passed、1 failed：`runner/training.py` 的两处 `write_text` 没在同一个表达式里脱敏。ACP 那 6 条在第三次已经通过。第四次（含 M11）10300 passed，0 failed，813 秒；唯一的警告是 DevModule 在 ACP 取消时留下没 await 的 `_Recorder._ended`（已知，未修）。
+
+收口评审处置之后的导出验证（`git archive` 到临时目录，`uv sync --all-extras` 后跑全部门禁，空闲机器、没有并行任务）：
+
+- `bec0684`：除 pytest 外全部通过，Playwright 28 / 28；全套 10560 passed、1 failed。失败的是凭证钉子的一条用例仍断言取
+  agent card 也带 Bearer，与 `bf903d2` 的新契约冲突；`47c2dc2` 改成逐个请求断言（取 card 不带，JSON-RPC 带）。
+- `47c2dc2`（最终代码提交）：ruff、format、pyright（0 errors）、`check_deps`、`check_links`、`check_web`、Playwright 桌面 +
+  移动 28 / 28 都过；全套 10561 passed、0 failed，957 秒。警告仍只有上面那一条。
+
+之后只有文档提交。
