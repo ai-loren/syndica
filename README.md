@@ -937,16 +937,20 @@ and artifact records into a dataset plus a `manifest.json`:
 - `rl` writes `input_ids`, a `loss_mask` that covers the assistant's text and tool calls, and a
   reward from the verdict (pass 1.0, partial 0.5, block 0.0, unverified `null`).
 - `trajectory` writes the neutral `syndica.trajectory/1` records: messages with their trust
-  markers, tool calls, artifacts, every verdict the run received, causality, timing, and redaction
-  metadata.
+  markers, tool calls, artifacts, every verdict the session received (across resumed runs too),
+  whether any verdict came from an untrusted judge, causality, timing, and redaction metadata.
 
 Samples whose verdict is `unverified` are left out unless you pass `--include-unverified`, and the
-manifest records that choice. Export redacts with the same rules as everything else the host writes
-(your `redaction.rules` plus secret values in the current environment), string by string before
-encoding; placeholders stay and raw secrets never leave. The output directory must be outside the
-workspace and new or empty, files are created `0600`, and the workspace's stores are only read.
-`pip install 'syndica[trl]'` adds `syndica.backends.trl.dry_run`, which loads an exported SFT file
-into TRL's `SFTTrainer` without downloading a model.
+manifest records that choice. A sample is flagged `untrusted` when it carries untrusted content or
+any of its verdicts was given by a judge that had read untrusted content. Export redacts with the
+same rules as everything else the host writes (your `redaction.rules` plus secret values in the
+current environment), string by string before encoding; placeholders stay and raw secrets never
+leave. The output directory must be outside the workspace, new or empty, and not itself a symlink;
+files are created `0600`, and the workspace's stores are only read. A session or trace that cannot
+be read is named in the manifest and the command exits 1 after writing the rest.
+`pip install 'syndica[trl]'` adds `syndica.backends.trl.dry_run` and `dry_run_preference`, which
+load an exported SFT or preference file into TRL's `SFTTrainer` / `DPOTrainer` without downloading
+a model.
 
 ## Roadmap
 

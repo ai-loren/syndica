@@ -1177,11 +1177,13 @@ CLI 的交互模式不经过 HTTP，因此**内核事件流必须首先是进程
       messages + 工具调用 + 产物 + 验收结论 + 时序
       纯 JSON，不含 token id，不依赖分词器
 
-层 2  导出器（backend，按需安装）
+层 2  导出器（runner，只用标准库）
       → SFT：      messages jsonl / ShareGPT
       → 偏好数据： chosen / rejected 对
-      → RL：       token id + loss mask（需分词器，故进 backend）
-      → 对接：     至少一个开源训练框架（TRL 或 verl）
+      → RL：       token id + loss mask（缺省按 UTF-8 字节给 id，manifest 记下分词方式；
+                   按模型分词由训练框架那一侧重做）
+层 3  训练框架对接（backend，按需安装）
+      → 至少一个开源训练框架（TRL 或 verl）读进导出的文件
 ```
 
 **验收结论直接作为训练信号。** 三态裁决加上"哪些标准满足 / 待办"即为奖励；同一任务的多次尝试配上不同裁决即为偏好对。
@@ -1192,7 +1194,7 @@ CLI 的交互模式不经过 HTTP，因此**内核事件流必须首先是进程
 
 因此裁决状态在轨迹里是四值而非三值：`pass` / `partial` / `block` / `unverified`。**导出器默认排除 `unverified` 样本**，需要包含时必须显式开启并在数据集元信息中标注。
 
-里程碑 11 的落地：中立轨迹是 `syndica.trajectory/1`，由 `syndica.runner` 从会话、Goal / Rubric、trace 与产物登记拼出。裁决只读根 Agent 的 `verdict` 事件（内核每给一次裁决记一个，打回之前的也在），验收伴生 Agent 与回放写出的 trace 不算；unverified 的 reward 是 null，不当失败。偏好对按 Goal 与 Rubric 内容的摘要配对，不按模型起的 Rubric id。消息带 trust 标记导出。`syndica export {sft,sharegpt,preference,rl,trajectory}` 用宿主的脱敏器（用户规则加此刻环境里的密钥值），先逐叶脱敏再编码，占位符保留；只读源 store，输出目录必须在工作区之外——导出的数据里有别的会话的全文与不可信内容，放在工作区里会被下一次 run 当成可信基线。`syndica batch` 一条失败不中断其余。训练框架对接是 `syndica.backends.trl`（extra `trl`），`check_deps` 拒绝 backend 之外导入训练框架。
+里程碑 11 的落地：中立轨迹是 `syndica.trajectory/1`，由 `syndica.runner` 从会话、Goal / Rubric、trace 与产物登记拼出。裁决只读根 Agent 的 `verdict` 事件（内核每给一次裁决记一个，打回之前的也在；恢复过的会话跨每次 run 的 trace 合并），验收伴生 Agent 与回放写出的 trace 不算；unverified 的 reward 是 null，不当失败。偏好对按 Goal 与 Rubric 内容的摘要配对，不按模型起的 Rubric id。消息带 trust 标记导出；裁决的信任记在 trace 的 `verdict.trust` 上（`TRACE_SCHEMA` 为 `syndica.trace/8`），任何一次裁决不可信，样本就标成不可信——被注入内容说服的验收给出的奖励标签，与它读过的内容一样不可信。`syndica export {sft,sharegpt,preference,rl,trajectory}` 用宿主的脱敏器（用户规则加此刻环境里的密钥值），先逐叶脱敏再编码，占位符保留；只读源 store，输出目录必须在工作区之外——导出的数据里有别的会话的全文与不可信内容，放在工作区里会被下一次 run 当成可信基线。`syndica batch` 一条失败不中断其余。训练框架对接是 `syndica.backends.trl`（extra `trl`）：`SFTTrainer` 读导出的 SFT 文件、`DPOTrainer` 读导出的偏好文件；`check_deps` 拒绝 backend 之外导入训练框架。
 
 ---
 

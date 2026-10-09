@@ -112,7 +112,7 @@ uv run pytest -q
 | 8 | 长程任务 | 已完成 | 预算树（四维、预留 + 周期收尾结算 + 唤醒重切、单一准入与计量点、三档成本、伴生记账）与可感知预算（`GetBudget`、预算注入历史、`graceful_wrapup` 收尾轮）、`--max-*` 改为根预算；进度账本、停滞、漂移（锚点检查 + 可选语义比对）、可插拔长程策略（基线 + 随 wheel 的契约）与 `long-horizon` Module；目标导向型压缩与压缩前完整前像；后台工具、派活树回收、后代单一定义、拓扑槽隔离；审计见 `docs/audits/2026-10-06-m8-final-audit.md` |
 | 9 | 产品面 | 已完成 | `syndica up/status/down` 本机服务（REST、可续读的 SSE、WebSocket 的请求 / 答复 / 终端，OpenAPI 快照与变更记录）、随包发布的 React 界面（会话、时间线、Agent 树、确认与提问、产物预览 / diff / 反馈、预算 / 进度 / trace、终端、窄屏）、Playwright 桌面与移动 E2E；截止时刻打断在飞的调用、预算跨会话、`--verdict-exit`、隔离拷贝进线程；子树持久化改派到 v1 之后；审计见 `docs/audits/2026-10-08-m9-final-audit.md` |
 | 10 | 互操作 | 已完成 | MCP client / server、ACP agent / client、A2A server / client、OpenAI 兼容 HTTP（chat completions 与 Responses），都映射到已有会话、经 `call_external` 过危险判定与溯源、外部内容不可信、协议错误三件套；`create_app(adapters)`、`up --api-token`、外部进程监管（含 `setsid` 出去的后代）；用户级凭证钉住目的地；MCP Inspector、Gemini CLI、`openai` SDK 真实运行；第二方收口评审 2 Blocking / 5 High 已处置；审计见 `docs/audits/2026-10-09-m10-final-audit.md` |
-| 11 | 训练出口 | 已完成 | 中立轨迹 `syndica.trajectory/1`、SFT / ShareGPT / 偏好 / RL 导出、`syndica batch` / `export`（宿主脱敏、`unverified` 默认排除、只写到工作区之外）、`syndica[trl]` 的 `SFTTrainer` dry-run；审计见 `docs/audits/2026-10-09-m11-final-audit.md` |
+| 11 | 训练出口 | 已完成 | 中立轨迹 `syndica.trajectory/1`、SFT / ShareGPT / 偏好 / RL 导出、`syndica batch` / `export`（宿主脱敏、`unverified` 默认排除、恢复会话保留每次裁决、裁决不可信则样本不可信、只写到工作区之外）、`syndica[trl]` 的 `SFTTrainer` 与 `DPOTrainer` dry-run；审计见 `docs/audits/2026-10-09-m11-final-audit.md` |
 | 12 | 发布准备 | 未开始 | 英文文档、CI 矩阵、v1.0 发布 |
 
 ## 遗留项归属（2026-09-29）

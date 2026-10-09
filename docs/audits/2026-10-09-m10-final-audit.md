@@ -134,7 +134,7 @@ ACP 有几条计划条目没做也没登记，进程不留只在 backend 层证�
 
 ## 公开契约
 
-- 内核：`ExternalCallPolicy`、`call_external`；事件 `external_activity`；`TRACE_SCHEMA` 为 `syndica.trace/7`，新增属性 `tool.caller`。
+- 内核：`ExternalCallPolicy`、`call_external`；事件 `external_activity`；`TRACE_SCHEMA` 由 M10 升到 `syndica.trace/7`，新增属性 `tool.caller`（M11 加 `verdict.trust` 后是 `/8`）。
 - HTTP：`docs/reference/api-changes.md` 的 `aefdf03abce0`（`external_activity`）与 `ab8ab7901630`（协议路由）。OpenAI 兼容路由不另装包；没装 `syndica[mcp]` / `syndica[a2a]` 时对应路由仍是 501。
 - 会话：`SessionHandle.install_tools`。撞上已有工具名时抛 ConfigError，不覆盖。
 - CLI：`syndica mcp`、`syndica acp`、`syndica up --api-token`。
