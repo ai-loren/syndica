@@ -628,7 +628,7 @@ class _Client:
             {'handle': terminal.handle, 'full': True},
             done='running',
         )
-        output, truncated = _clipped(_text(result), terminal.limit)
+        output, truncated = _clipped(_terminal_text(result), terminal.limit)
         return TerminalOutputResponse(
             output=output,
             truncated=truncated or bool(result.meta.get('truncated')),
@@ -769,6 +769,16 @@ def _text_blocks(text: str) -> list[TextContentBlock]:
 def _text(result: ToolResult) -> str:
     output = result.output
     return output if isinstance(output, str) else str(output)
+
+
+def _terminal_text(result: ToolResult) -> str:
+    """终端到目前为止的输出。`output` 是给模型看的报告（带 running / exit_code 这些行），ACP 要的
+    是终端本身的字节，所以取 meta 里的两条流；退出状态另由 `exit_status` 交出。"""
+    stdout = result.meta.get('stdout')
+    stderr = result.meta.get('stderr')
+    if not isinstance(stdout, str) or not isinstance(stderr, str):
+        return _text(result)
+    return stdout + stderr
 
 
 def _shell_command(command: str, args: Sequence[str] | None, env: Sequence[object] | None) -> str:

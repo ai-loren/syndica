@@ -256,6 +256,23 @@ async def test_an_output_byte_limit_keeps_the_last_bytes_and_says_it_truncated(
     assert outcome['last_8'] == {'output': '23456789', 'truncated': True}
 
 
+async def test_terminal_output_is_the_commands_own_bytes_not_the_tool_report(
+    tmp_path: Path,
+) -> None:
+    async def both(conn: Any, session_id: str, root: Path) -> object:
+        del root
+        created = await conn.create_terminal(
+            session_id=session_id, command='sh', args=['-c', "printf 'out-1'; printf 'err-2' >&2"]
+        )
+        await conn.wait_for_terminal_exit(session_id=session_id, terminal_id=created.terminal_id)
+        output = await conn.terminal_output(session_id=session_id, terminal_id=created.terminal_id)
+        return output.output
+
+    outcome, _ = await _run(tmp_path, {'both': both})
+
+    assert outcome['both'] == 'out-1err-2'
+
+
 async def test_an_output_byte_limit_cuts_at_a_character_boundary(tmp_path: Path) -> None:
     async def euros(conn: Any, session_id: str, root: Path) -> object:
         del root
