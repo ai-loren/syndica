@@ -21,7 +21,7 @@
 | MCP Inspector CLI 对 `syndica mcp` 与 `/mcp` | 手工：stdio 的 `tools/list` 只有那三个只读工具；`Read` 读回文件，结果带 `trust: untrusted`。HTTP 同样：`http://127.0.0.1:<port>/mcp` 加 Bearer，`tools/list` 没有 Write，`Read` 读回标记且不含探针密钥，日志里也没有令牌。命令必须写在 Inspector 选项前面，且不能用 `python -m` |
 | MCP client：版本只收 SDK 的五版，结果不可信，`$ref` 内联，分页取全（真 SDK 服务），只连角色用到的服务，断连不自动重连 | `tests/backends/test_mcp_client.py`、`tests/cli/test_mcp_session.py`，黄金文件 `tests/backends/testdata/mcp_client_wire.jsonl` |
 | 外部进程不留：会话关闭、Runtime 关机、chat、run、Ctrl-C、`down`，含 setsid 出去的孙进程 | `tests/cli/test_mcp_lifecycle.py`、`tests/server/test_up_down.py`、`tests/backends/test_mcp_stdio_descendants.py`、`tests/backends/test_acp_descendants.py` |
-| ACP agent：版本 1、非文本拒绝、确认、提问、取消、停止原因映射、`session/load`（含跨进程）、stdin 断开时挂着的确认按拒绝 | `tests/server/test_acp_agent.py`、`tests/server/test_acp_turn.py`、`tests/server/test_acp_bridge.py`、`tests/server/test_acp_stdio_lifecycle.py`，黄金文件 `tests/server/testdata/acp_agent.jsonl`（真子进程，两个方向的原始字节） |
+| ACP agent：版本 1、非文本拒绝、确认、提问、取消、工具输出（脱敏后截断）、停止原因映射、`session/load`（含跨进程）、stdin 断开时挂着的确认按拒绝、配置没被信任时在 `session/new` 拒绝 | `tests/server/test_acp_agent.py`、`tests/server/test_acp_turn.py`、`tests/server/test_acp_bridge.py`、`tests/server/test_acp_stdio_lifecycle.py`，黄金文件 `tests/server/testdata/acp_agent.jsonl`（真子进程，两个方向的原始字节） |
 | 真的 `syndica acp` 子进程，模型是本地假端点 | `tests/server/test_acp_stdio.py`：版本 0 拒绝后再用 1，图片块拒绝，提问必须答选项，确认先拒绝再批准，批准后 `exit_code: 0`。假 key 不进回答和日志 |
 | ACP client：读写与终端经 `call_external`，外部写入读回不可信，高风险命令不执行，被拒与没做成都回三件套 RequestError，`outputByteLimit` 留结尾，kill / release / wait_for_exit，崩溃不回显、不重连，后代（含 setsid）被收掉 | `tests/backends/test_acp_model.py`、`tests/backends/test_acp_callbacks.py`、`tests/backends/test_acp_environment.py`、`tests/backends/test_acp_descendants.py`，活动黄金文件 `tests/backends/testdata/acp_activity.json` |
 | A2A server：卡片、1.0 与 0.3（SDK 自己的 0.3 传输层）、缺版本头 -32009、异常不回显、提问、确认有人等人批准 / 没人按拒绝、`contextId` 就是会话 id、流式按根文本逐段发 WORKING | `tests/server/test_a2a_http.py`、`tests/server/test_a2a_session.py`、`tests/server/test_a2a_live.py`，黄金文件 `tests/server/testdata/a2a_session_stream.jsonl`（真 desk 加脚本化模型） |
@@ -107,6 +107,9 @@ ACP 有几条计划条目没做也没登记，进程不留只在 backend 层证�
 | 进程不留只在 backend 层证明过；Runtime 关机用的是不起进程的替身 | 真 SDK stdio 服务留下两个孙进程（一个 setsid）：`close_session`、`runtime.shutdown`、chat 关闭（含中断）、run、MCP 调用中途的 Ctrl-C（退出码 130）、`up` → 建会话 → `down`，三个进程都不在；没发现泄漏，宿主代码没改 | `eb69973` |
 | MCP：没有角色用到的服务也被拉起；分页只对替身测过；非 initialize 请求不查 `MCP-Protocol-Version`；三个 list / get 处理器没兜底；两份黄金文件只钉 schema 或名字 | 只连角色用到的服务（doctor 给它们一行 `mcp: unused`，组合根不为它们导入 backend）；真 SDK 服务分页；每个 POST 先按接受表查版本头（不带头按规范视为 2025-03-26）；兜底只报类型；`mcp_serve_wire.jsonl` 与 `mcp_client_wire.jsonl` 逐字节比对线上 JSON 行 | `eb69973`、`1de9756` |
 | 全套里唯一的 RuntimeWarning；导出的 MCP `ExternalProcess` 只按进程组收 | 可观察切点的分发被取消时关掉还没开始的 hook 协程；`ExternalProcess` 接上进程树 | `72c7533` |
+| ACP agent 的 `tool_call_update` 从不带输出（计划要「输出经脱敏截断」） | 工具结果块作为那次调用的 `raw_output` 交给编辑器，先脱敏再截到 4000 字符；子 Agent 的工具结果同样推过去 | `061f7b2` |
+| 配置没被信任时 `syndica acp` 启动就退出，编辑器收不到指向 `config trust` 的三件套 | 照常握手，`session/new` / `session/load` 交出带 `syndica config trust --sha256 …` 的三件套；不读配置的任何内容；load 先查信任再查 sessionId | `31cda5b` |
+| `POST /a2a/` 缺 extra 时的 501 没有用例 | 补上 | `10e5a83` |
 
 ## 明确不做（计划收尾复核）
 
@@ -131,6 +134,7 @@ ACP 有几条计划条目没做也没登记，进程不留只在 backend 层证�
 | 前端生成的事件类型里 `external_activity.source` 仍是 `unknown` | `gen-events.mjs` 不读属性 schema 的枚举 |
 | `syndica sessions rm` 不删 ACP 的 sessionId 对照文件 | 之后 load 那个 id 交回三件套「会话不在了」，只留下一个很小的文件 |
 | `/mcp` 的版本头只在 POST 上查 | GET 与 DELETE 不经我们的处理器，交给 SDK；initialize 正文里的版本被拒时 HTTP 是 200，版本头被拒时按 MCP 规范是 400 |
+| `syndica mcp`（stdio）没有自己的版本门；真子进程用例只跑了旧时代 | stdio 由 SDK 按 MCP 规范协商（计划决策日志 P3）；两个时代在进程内各有用例 |
 
 ## 公开契约
 
@@ -168,5 +172,9 @@ sh scripts/check_web.sh                                      通过（产物已�
 0 failed，1036 秒，没有任何警告（那条 `_Recorder._ended` 的 RuntimeWarning 由 `72c7533` 修掉）。合并的过程中查出两处
 分支之间的接缝，都在合并后修了：两个同名的测试模块让 pytest 收集中断（`16ff9d7` 改名），doctor 的逐字断言没算上
 另一条线新加的一行（`1de9756`）。
+
+M10 与 M11 都推送之后，完成审计时把逐条复核的报告再对一遍，又补了三处（`061f7b2`、`31cda5b`、`10e5a83`，见上表）。
+最终代码提交 `10e5a83` 在空闲机器上做了导出验证：所有门禁通过，Playwright 28 / 28，全套 10757 passed、0 failed，
+1085 秒，没有警告。
 
 之后只有文档提交。

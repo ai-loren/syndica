@@ -895,7 +895,8 @@ in that process. Continue an OpenAI session with the `X-Syndica-Session` respons
 Responses ids look like `resp_<session>_<n>` and are passed back as `previous_response_id`.
 An A2A `contextId` is the Syndica session id: omit it to open a session, send the one Syndica
 returned to continue it; any other value gets a failed task saying so. An editor can
-`session/load` an ACP session after `syndica acp` restarts. `syndica doctor` starts each declared
+`session/load` an ACP session after `syndica acp` restarts; in a workspace whose config is not
+trusted yet, `session/new` answers with the `syndica config trust --sha256 ...` command to run. `syndica doctor` starts each declared
 ACP agent for a handshake, fetches each A2A agent card, and lists every MCP server's tools; one
 unreachable object gets its own failed line and the rest are still checked. An MCP server that no
 role lists in `roles` is never started.
