@@ -1,0 +1,18 @@
+{"body": {"messages": [{"content": "hello", "role": "user"}], "model": "Missing"}, "path": "/v1/chat/completions", "x-syndica-session": null}
+{"content-type": "application/json", "status": 404, "x-should-retry": null, "x-syndica-session": null}
+{"error": {"code": "model_not_found", "message": "期望: model 是已有角色之一：['Planner', 'Explorer', 'Worker', 'Orchestrator']。实际: model='Missing'。下一步: 改成 GET /v1/models 列出的 id", "param": null, "type": "invalid_request_error"}}
+{"body": {"messages": [{"content": "hello", "role": "user"}], "model": "Worker", "n": true}, "path": "/v1/chat/completions", "x-syndica-session": null}
+{"content-type": "application/json", "status": 400, "x-should-retry": null, "x-syndica-session": null}
+{"error": {"code": "invalid_type", "message": "期望: n 是整数 1 或缺省。实际: n=True，类型是 bool。下一步: 去掉 n，或传整数 1；JSON 的 true 与 1.0 都不算 1", "param": "n", "type": "invalid_request_error"}}
+{"body": {"messages": [{"content": "hello", "role": "user"}], "model": "Worker"}, "path": "/v1/chat/completions", "x-syndica-session": "no-such-session"}
+{"content-type": "application/json", "status": 404, "x-should-retry": null, "x-syndica-session": null}
+{"error": {"code": "session_not_found", "message": "期望: X-Syndica-Session 是这个进程里打开着的会话。实际: 没有 'no-such-session'。下一步: 去掉这个头重新开始，或用上一次响应里的 X-Syndica-Session", "param": null, "type": "invalid_request_error"}}
+{"body": {"input": "hello", "model": "Worker", "previous_response_id": "resp_no-such-session_1"}, "path": "/v1/responses", "x-syndica-session": null}
+{"content-type": "application/json", "status": 404, "x-should-retry": null, "x-syndica-session": null}
+{"error": {"code": "previous_response_not_found", "message": "期望: previous_response_id 是这个 server 进程交出过的响应 id。实际: previous_response_id='resp_no-such-session_1' 对不上开着的会话。下一步: 去掉 previous_response_id 重新开始，或用上一次响应的 id；server 重启之后旧的 id 作废", "param": "previous_response_id", "type": "invalid_request_error"}}
+{"body": {"messages": [{"content": "hello", "role": "user"}], "model": "Worker"}, "path": "/v1/chat/completions", "x-syndica-session": null}
+{"content-type": "application/json", "status": 500, "x-should-retry": null, "x-syndica-session": "SID-1"}
+{"error": {"code": null, "message": "期望: 根 Agent 跑完这一轮。实际: 根 Agent 报错 RuntimeError，原文不在响应里。下一步: 看 server 日志或 trace 里根 Agent 的 agent span 拿到原因；修好之后新发一次请求，这个 POST 不要原样重放", "param": null, "type": "server_error"}}
+{"body": {"messages": [{"content": "hello", "role": "user"}], "model": "Worker", "n": 2}, "path": "/v1/chat/completions", "x-syndica-session": "SID-1"}
+{"content-type": "application/json", "status": 400, "x-should-retry": null, "x-syndica-session": "SID-1"}
+{"error": {"code": "unsupported_value", "message": "期望: n 是 1 或缺省。实际: n=2。下一步: 一次只生成一条；要多条就分多次请求", "param": "n", "type": "invalid_request_error"}}

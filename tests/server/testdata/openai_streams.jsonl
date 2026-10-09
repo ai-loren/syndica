@@ -1,0 +1,24 @@
+{"body": {"messages": [{"content": "go", "role": "user"}], "model": "Worker", "stream": true, "stream_options": {"include_usage": true}}, "path": "/v1/chat/completions", "x-syndica-session": null}
+{"content-type": "text/event-stream; charset=utf-8", "status": 200, "x-should-retry": null, "x-syndica-session": "SID-1"}
+{"choices": [{"delta": {"content": "mid", "role": "assistant"}, "finish_reason": null, "index": 0}], "created": 0, "id": "chatcmpl-ID", "model": "Worker", "object": "chat.completion.chunk"}
+{"choices": [{"delta": {"content": "\nzeta"}, "finish_reason": null, "index": 0}], "created": 0, "id": "chatcmpl-ID", "model": "Worker", "object": "chat.completion.chunk"}
+{"choices": [{"delta": {"content": "\nalpha"}, "finish_reason": null, "index": 0}], "created": 0, "id": "chatcmpl-ID", "model": "Worker", "object": "chat.completion.chunk"}
+{"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}], "created": 0, "id": "chatcmpl-ID", "model": "Worker", "object": "chat.completion.chunk"}
+{"choices": [], "created": 0, "id": "chatcmpl-ID", "model": "Worker", "object": "chat.completion.chunk", "usage": {"completion_tokens": 14, "prompt_tokens": 0, "total_tokens": 14}}
+"[DONE]"
+{"body": {"input": "go", "model": "Worker", "stream": true, "tools": [{"name": "lookup", "parameters": {"properties": {}, "type": "object"}, "type": "function"}, {"name": "zap", "parameters": {"properties": {}, "type": "object"}, "type": "function"}, {"name": "fetch", "parameters": {"properties": {}, "type": "object"}, "type": "function"}]}, "path": "/v1/responses", "x-syndica-session": null}
+{"content-type": "text/event-stream; charset=utf-8", "status": 200, "x-should-retry": null, "x-syndica-session": "SID-2"}
+{"response": {"created_at": 0, "id": "resp_SID-2_1", "model": "Worker", "object": "response", "output": [], "parallel_tool_calls": false, "status": "in_progress", "tool_choice": "none", "tools": []}, "sequence_number": 0, "type": "response.created"}
+{"item": {"arguments": "", "call_id": "call_2", "id": "fc_call_2", "name": "lookup", "status": "in_progress", "type": "function_call"}, "output_index": 0, "sequence_number": 1, "type": "response.output_item.added"}
+{"delta": "{\"q\": \"two\"}", "item_id": "fc_call_2", "output_index": 0, "sequence_number": 2, "type": "response.function_call_arguments.delta"}
+{"arguments": "{\"q\": \"two\"}", "item_id": "fc_call_2", "name": "lookup", "output_index": 0, "sequence_number": 3, "type": "response.function_call_arguments.done"}
+{"item": {"arguments": "{\"q\": \"two\"}", "call_id": "call_2", "id": "fc_call_2", "name": "lookup", "status": "completed", "type": "function_call"}, "output_index": 0, "sequence_number": 4, "type": "response.output_item.done"}
+{"item": {"arguments": "", "call_id": "call_3", "id": "fc_call_3", "name": "zap", "status": "in_progress", "type": "function_call"}, "output_index": 1, "sequence_number": 5, "type": "response.output_item.added"}
+{"delta": "{\"q\": \"three\"}", "item_id": "fc_call_3", "output_index": 1, "sequence_number": 6, "type": "response.function_call_arguments.delta"}
+{"arguments": "{\"q\": \"three\"}", "item_id": "fc_call_3", "name": "zap", "output_index": 1, "sequence_number": 7, "type": "response.function_call_arguments.done"}
+{"item": {"arguments": "{\"q\": \"three\"}", "call_id": "call_3", "id": "fc_call_3", "name": "zap", "status": "completed", "type": "function_call"}, "output_index": 1, "sequence_number": 8, "type": "response.output_item.done"}
+{"item": {"arguments": "", "call_id": "call_1", "id": "fc_call_1", "name": "fetch", "status": "in_progress", "type": "function_call"}, "output_index": 2, "sequence_number": 9, "type": "response.output_item.added"}
+{"delta": "{\"q\": \"one\"}", "item_id": "fc_call_1", "output_index": 2, "sequence_number": 10, "type": "response.function_call_arguments.delta"}
+{"arguments": "{\"q\": \"one\"}", "item_id": "fc_call_1", "name": "fetch", "output_index": 2, "sequence_number": 11, "type": "response.function_call_arguments.done"}
+{"item": {"arguments": "{\"q\": \"one\"}", "call_id": "call_1", "id": "fc_call_1", "name": "fetch", "status": "completed", "type": "function_call"}, "output_index": 2, "sequence_number": 12, "type": "response.output_item.done"}
+{"response": {"created_at": 0, "id": "resp_SID-2_1", "model": "Worker", "object": "response", "output": [{"arguments": "{\"q\": \"two\"}", "call_id": "call_2", "id": "fc_call_2", "name": "lookup", "status": "completed", "type": "function_call"}, {"arguments": "{\"q\": \"three\"}", "call_id": "call_3", "id": "fc_call_3", "name": "zap", "status": "completed", "type": "function_call"}, {"arguments": "{\"q\": \"one\"}", "call_id": "call_1", "id": "fc_call_1", "name": "fetch", "status": "completed", "type": "function_call"}], "parallel_tool_calls": false, "status": "completed", "tool_choice": "none", "tools": []}, "sequence_number": 13, "type": "response.completed"}
