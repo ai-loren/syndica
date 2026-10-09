@@ -160,7 +160,7 @@ class _World:
 
 
 @asynccontextmanager
-async def _world(tmp_path: Path) -> AsyncIterator[_World]:
+async def _world(tmp_path: Path, *, trusted: bool = True) -> AsyncIterator[_World]:
     script = tmp_path / 'model.py'
     script.write_text(_MODEL, encoding='utf-8')
     fake = await asyncio.create_subprocess_exec(
@@ -180,7 +180,8 @@ async def _world(tmp_path: Path) -> AsyncIterator[_World]:
         (workspace / 'notes.md').write_text('alpha-marker\n', encoding='utf-8')
         config_home = tmp_path / 'config'
         env = _env(config_home, port)
-        _trust(workspace, env)
+        if trusted:
+            _trust(workspace, env)
         yield _World(workspace, env, config_home)
     finally:
         if fake.returncode is None:
@@ -369,6 +370,29 @@ def _is_json_rpc(line: bytes) -> bool:
     if 'method' in fields:
         return isinstance(fields['method'], str)
     return 'id' in fields and (('result' in fields) != ('error' in fields))
+
+
+async def test_an_untrusted_config_is_refused_at_session_new_with_the_trust_command(
+    tmp_path: Path,
+) -> None:
+    async with _world(tmp_path, trusted=False) as world, _acp(world) as agent:
+        editor = _Editor()
+        async with _relayed(agent, editor) as (client, _wire):
+            answered = await asyncio.wait_for(client.initialize(protocol_version=1), _TIMEOUT)
+            assert answered.protocol_version == 1
+            with pytest.raises(RequestError) as new:
+                await asyncio.wait_for(client.new_session(cwd=str(world.workspace)), _TIMEOUT)
+            with pytest.raises(RequestError) as load:
+                await asyncio.wait_for(
+                    client.load_session(cwd=str(world.workspace), session_id='a' * 32), _TIMEOUT
+                )
+        assert await asyncio.wait_for(agent.wait(), _TIMEOUT) == 0
+    for refused in (new.value, load.value):
+        data = cast(dict[str, str], refused.data)
+        assert '没有被信任' in data['received']
+        assert 'syndica config trust --sha256' in data['next_action']
+    sessions = world.workspace / '.syndica' / 'sessions'
+    assert not sessions.exists() or world.sessions() == []
 
 
 async def test_every_stdout_line_of_syndica_acp_is_a_json_rpc_message(tmp_path: Path) -> None:

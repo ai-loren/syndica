@@ -490,7 +490,11 @@ async def _acp_stdio(host: Any, config_path: str, log: _RedactingLog, index: Pat
     from syndica.kernel import FileSessionStore
     from syndica.server.acp_agent import SyndicaAcp, TurnBinding
 
-    config = host.trusted_without_asking(config_path)
+    try:
+        config = host.trusted_without_asking(config_path)
+    except ConfigError as untrusted:
+        await _acp_untrusted(untrusted, log, index)
+        return
     log.redactor = host.redactor_for(config)
     roles: list[tuple[str, str]] = []
     for name in config.catalog.names():
@@ -550,6 +554,36 @@ async def _acp_stdio(host: Any, config_path: str, log: _RedactingLog, index: Pat
         await agent.aclose()
         for parts in opened:
             await host.close_session(parts, None)
+
+
+async def _acp_untrusted(untrusted: ConfigError, log: _RedactingLog, index: Path) -> None:
+    """配置没被信任时照常握手，到 `session/new` / `session/load` 再交出这条三件套：编辑器拉起的进程
+    没有终端可问，启动就退出的话，编辑器只看得到进程没了。配置一个字都不读（载入角色会 import
+    `impl:`），所以角色名单是个占位，信任检查先于它被用到。"""
+    from acp import run_agent
+
+    from syndica.server.acp_agent import SyndicaAcp, TurnBinding
+
+    def refuse(cwd: str) -> None:
+        del cwd
+        raise untrusted
+
+    async def no_turn(*args: Any, **kwargs: Any) -> TurnBinding:
+        del args, kwargs
+        raise untrusted
+
+    agent = SyndicaAcp(
+        (('untrusted', '配置没被信任，这个进程不跑任何角色'),),
+        refuse,
+        open_turn=no_turn,
+        sessions=_AcpSessions(index, log.redactor),
+        redactor=log.redactor,
+        version=__version__,
+    )
+    try:
+        await run_agent(agent)  # pyright: ignore[reportArgumentType]
+    finally:
+        await agent.aclose()
 
 
 async def _mcp_stdio(host: Any, config_path: str, log: _RedactingLog) -> None:

@@ -490,6 +490,11 @@ class SyndicaAcp:
         return LoadSessionResponse(modes=self._mode_state(session.mode))
 
     async def _resume(self, cwd: str, session_id: str, mcp_servers: list[object]) -> AcpSession:
+        # 信任先于一切：没被信任的工作区里，不该先回答这个 sessionId 记没记下。
+        try:
+            self._trust(cwd)
+        except SyndicaError as error:
+            raise _refuse(error.expected, error.received, error.next_action) from None
         sid = None if self._index is None else self._index.recall(session_id)
         if sid is None or self._open_turn is None:
             raise _refuse(
@@ -500,7 +505,6 @@ class SyndicaAcp:
             )
         servers = _stdio_servers(mcp_servers)
         try:
-            self._trust(cwd)
             binding = await self._open_turn(cwd, self._roles[0][0], servers, resume=sid)
         except SyndicaError as error:
             raise _refuse(error.expected, error.received, error.next_action) from None
