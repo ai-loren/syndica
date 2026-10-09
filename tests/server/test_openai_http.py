@@ -605,6 +605,50 @@ def test_a_responses_client_tool_round_trip(tmp_path: Path) -> None:
         host.close()
 
 
+def test_a_response_object_echoes_its_client_tools_and_lists_tool_choice_as_ignored(
+    tmp_path: Path,
+) -> None:
+    host, _live, app, port, credentials = _app(
+        tmp_path,
+        ScriptedLLM([ScriptedTurn(content='no tools here'), ScriptedTurn(content='with tools')]),
+    )
+    tools = [
+        {
+            'type': 'function',
+            'name': 'lookup',
+            'description': 'find a thing',
+            'parameters': {'type': 'object', 'properties': {'q': {'type': 'string'}}},
+        },
+        {'type': 'function', 'name': 'zap', 'parameters': {'type': 'object', 'properties': {}}},
+    ]
+
+    async def body() -> None:
+        client = await _client(app, port, credentials)
+        try:
+            bare = await client.responses.create(model='Worker', input='plain')
+            assert (bare.tool_choice, bare.tools) == ('none', [])
+            raw = await client.responses.with_raw_response.create(
+                model='Worker',
+                input='use them',
+                tools=tools,  # pyright: ignore[reportArgumentType]
+                tool_choice='required',
+            )
+            tooled = raw.parse()
+            assert tooled.tool_choice == 'auto'
+            assert [(tool.name, tool.description) for tool in tooled.tools] == [  # pyright: ignore[reportAttributeAccessIssue]
+                ('lookup', 'find a thing'),
+                ('zap', None),
+            ]
+            assert 'tool_choice' in raw.headers['X-Syndica-Ignored'].split(',')
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
 def _function(name: str) -> dict[str, object]:
     return {
         'type': 'function',

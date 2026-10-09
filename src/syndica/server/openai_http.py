@@ -48,6 +48,8 @@ _IGNORED = (
     'seed',
     'user',
     'max_output_tokens',
+    'tool_choice',
+    'parallel_tool_calls',
 )
 _TOOL_WAIT_S = 60.0
 
@@ -222,11 +224,12 @@ class OpenAIHttp:
             exchange.requested = _sid_from_response_id(previous)
         turn, sid, ignored, response_id = await self.responses(body, exchange)
         model = str(body.get('model') or '')
+        tools = _client_tools(body.get('tools'))
         if body.get('stream') is True:
-            return _responses_stream(model, response_id, turn, sid, ignored, self._redactor)
+            return _responses_stream(model, response_id, turn, tools, sid, ignored, self._redactor)
         return _json(
             self._redactor,
-            _response_object(model, response_id, turn),
+            _response_object(model, response_id, turn, tools),
             headers=_headers(sid, ignored),
         )
 
@@ -562,7 +565,11 @@ def _pieces(blocks: Sequence[str]) -> list[str]:
     return [block if index == 0 else '\n' + block for index, block in enumerate(blocks)]
 
 
-def _response_object(model: str, response_id: str, turn: _Turn) -> dict[str, Any]:
+def _response_object(
+    model: str, response_id: str, turn: _Turn, tools: tuple[dict[str, Any], ...]
+) -> dict[str, Any]:
+    """`tools` 是这次请求的客户端工具，续接时与建会话时相同；模型自己决定调不调，所以有工具时
+    `tool_choice` 如实写 auto。请求里的 `tool_choice` 不生效，列在 `X-Syndica-Ignored` 里。"""
     output: list[dict[str, Any]] = []
     if turn.blocks or not turn.tool_calls:
         output.append(
@@ -593,8 +600,17 @@ def _response_object(model: str, response_id: str, turn: _Turn) -> dict[str, Any
         'status': 'completed',
         'output': output,
         'parallel_tool_calls': False,
-        'tool_choice': 'none',
-        'tools': [],
+        'tool_choice': 'auto' if tools else 'none',
+        'tools': [
+            {
+                'type': 'function',
+                'name': tool['name'],
+                'description': tool['description'] or None,
+                'parameters': tool['parameters'],
+                'strict': False,
+            }
+            for tool in tools
+        ],
     }
 
 
@@ -602,11 +618,12 @@ def _responses_stream(
     model: str,
     response_id: str,
     turn: _Turn,
+    tools: tuple[dict[str, Any], ...],
     sid: str,
     ignored: tuple[str, ...],
     redactor: Redactor,
 ) -> StreamingResponse:
-    final = _response_object(model, response_id, turn)
+    final = _response_object(model, response_id, turn, tools)
     opened: dict[str, Any] = {**final, 'status': 'in_progress', 'output': []}
 
     async def chunks() -> AsyncIterator[str]:
