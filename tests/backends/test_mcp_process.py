@@ -207,6 +207,81 @@ async def test_a_leader_that_exits_first_does_not_leave_its_grandchild(tmp_path:
         await process.aclose()
 
 
+_SETSID = """
+import os, sys, time
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    time.sleep(60)
+    os._exit(0)
+sys.stdout.write(f"{pid}\\n")
+sys.stdout.flush()
+time.sleep(float(sys.argv[1]))
+os._exit(0)
+"""
+
+
+async def _left_the_group(process: ExternalProcess) -> int:
+    line = await asyncio.wait_for(process.read_stdout_line(), 2)
+    grandchild = int(line.strip())
+    pgid = process._pgid  # pyright: ignore[reportPrivateUsage]
+    assert pgid is not None
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and grandchild in _members(pgid):  # noqa: ASYNC110
+        await asyncio.sleep(0.02)
+    assert grandchild not in _members(pgid)
+    assert _alive(grandchild)
+    return grandchild
+
+
+async def _dead(pid: int) -> bool:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+async def test_closing_reaps_a_grandchild_that_left_the_group_with_setsid(tmp_path: Path) -> None:
+    process = ExternalProcess(
+        [sys.executable, '-c', _SETSID, '60'],
+        env=_env(),
+        cwd=str(tmp_path),
+        redactor=RuleRedactor(),
+        grace=_GRACE,
+    )
+    await process.start()
+    grandchild = 0
+    try:
+        grandchild = await _left_the_group(process)
+        await process.aclose()
+        assert await _dead(grandchild)
+    finally:
+        await process.aclose()
+        if grandchild and _alive(grandchild):
+            os.kill(grandchild, 9)
+
+
+async def test_a_crashed_leader_does_not_leave_a_setsid_grandchild(tmp_path: Path) -> None:
+    process = ExternalProcess(
+        [sys.executable, '-c', _SETSID, str(_TREE_POLL_S * 4)],
+        env=_env(),
+        cwd=str(tmp_path),
+        redactor=RuleRedactor(),
+        grace=_GRACE,
+    )
+    await process.start()
+    grandchild = 0
+    try:
+        grandchild = await _left_the_group(process)
+        assert await _dead(grandchild)
+    finally:
+        await process.aclose()
+        if grandchild and _alive(grandchild):
+            os.kill(grandchild, 9)
+
+
 async def test_stderr_is_redacted_and_the_cap_does_not_stop_the_read(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

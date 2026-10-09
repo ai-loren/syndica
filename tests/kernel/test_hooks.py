@@ -1,9 +1,10 @@
 import asyncio
 import copy
 import dataclasses
+import inspect
 import logging
 import pickle
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import cast
 
 import pytest
@@ -434,6 +435,32 @@ async def test_a_sibling_that_awaits_is_waited_for_after_an_observable_hook_rais
     (record,) = caplog.records
     assert record.exc_info is not None
     assert record.exc_info[1] is boom
+
+
+async def test_an_observable_dispatch_cancelled_before_its_hooks_start_closes_their_coroutines():
+    center = HooksCenter()
+    created: list[Coroutine[object, object, None]] = []
+    ran: list[str] = []
+
+    async def body() -> None:
+        ran.append('body')
+
+    def hook(**_: object) -> Coroutine[object, object, None]:
+        coroutine = body()
+        created.append(coroutine)
+        return coroutine
+
+    center.register(Junction.TURN_START, hook)
+    center.register(Junction.TURN_START, hook)
+    dispatching = asyncio.create_task(center._dispatch(Junction.TURN_START, turn=1))
+    await asyncio.sleep(0)
+    assert len(created) == 2
+    dispatching.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatching
+
+    assert ran == []
+    assert [inspect.getcoroutinestate(c) for c in created] == [inspect.CORO_CLOSED] * 2
 
 
 async def test_every_failing_observable_hook_is_logged(caplog: pytest.LogCaptureFixture):

@@ -336,7 +336,11 @@ def _group_members(pgid: int) -> set[int]:
 
 
 class ExternalProcess:
-    """一个外部进程和它的进程组。`aclose` 幂等：组已经杀过之后不再发信号，避免组号被复用后误杀。"""
+    """一个外部进程、它的进程组和它的进程树（`ProcessTree`，含用 setsid 离开了组的后代）。
+
+    `aclose` 幂等：组已经杀过之后不再发信号，避免组号被复用后误杀。组长退出（崩溃）时也走一遍
+    `aclose`，不等宿主来关。
+    """
 
     def __init__(
         self,
@@ -356,6 +360,7 @@ class ExternalProcess:
         self._stderr_limit = _limit(stderr_limit)
         self._process: asyncio.subprocess.Process | None = None
         self._pgid: int | None = None
+        self._tree: ProcessTree | None = None
         self._closed = False
         self._lock = asyncio.Lock()
         self._reader: asyncio.Task[None] | None = None
@@ -395,6 +400,8 @@ class ExternalProcess:
         self._process = process
         # start_new_session 之后组长的 pid 就是进程组号。
         self._pgid = process.pid
+        self._tree = ProcessTree(process.pid, grace=self._grace)
+        self._tree.start()
         self._reader = asyncio.create_task(self._read_stderr(), name='mcp-stderr')
         self._watch = asyncio.create_task(self._watch_leader(), name='mcp-leader')
 
@@ -457,8 +464,19 @@ class ExternalProcess:
 
     async def _ladder(self) -> None:
         process = self._process
-        if process is None or self._pgid is None:
+        tree = self._tree
+        if process is None or tree is None:
             return
+        # 关 stdin 之后组长一退出，它的后代就挂到 init 名下、父子链断了，趁还连着再记一遍。
+        tree.stop()
+        tree.record()
+        # 阶梯中途被取消时 `_closed` 已经置位，之后的 aclose 什么都不做，这里是收掉后代的唯一机会。
+        try:
+            await self._group_ladder(process)
+        finally:
+            await tree.reap()
+
+    async def _group_ladder(self, process: asyncio.subprocess.Process) -> None:
         stdin = process.stdin
         if stdin is not None and not stdin.is_closing():
             stdin.close()

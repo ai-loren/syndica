@@ -889,6 +889,7 @@ class HooksCenter:
         # （保守，安全方向）——有一个被收紧的 Module 在跑且参数变了，就按它写的算。
         before = {key: _projected(watch[key], kwargs[key]) for key in watch if key in kwargs}
         started: list[HookCallback] = []
+        returned_by: list[object] = []
         awaitables: list[Awaitable[object]] = []
         for cb, installer in chain:
             try:
@@ -909,8 +910,21 @@ class HooksCenter:
                 )
                 continue
             started.append(cb)
+            returned_by.append(returned)
             awaitables.append(_acting(installer, returned))
-        outcomes = await asyncio.gather(*awaitables, return_exceptions=True)
+        try:
+            outcomes = await asyncio.gather(*awaitables, return_exceptions=True)
+        except BaseException:
+            # 取消落在包装任务开跑之前时，hook 交回的协程一次都没被 await：不关掉它，回收时会报
+            # 「never awaited」，而这次分发本来就被取消了。gather 等子任务都结束才抛出，
+            # 此刻没人再碰它们。
+            for returned in returned_by:
+                if (
+                    inspect.iscoroutine(returned)
+                    and inspect.getcoroutinestate(returned) == inspect.CORO_CREATED
+                ):
+                    returned.close()
+            raise
         for cb, outcome in zip(started, outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 _report_observable_failure(junction, cb, outcome)
