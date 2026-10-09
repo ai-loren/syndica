@@ -1,0 +1,5 @@
+[
+  {"name": "Read", "readOnlyHint": true},
+  {"name": "Grep", "readOnlyHint": true},
+  {"name": "Glob", "readOnlyHint": true}
+]

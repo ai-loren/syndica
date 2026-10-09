@@ -1156,6 +1156,10 @@ CLI 的交互模式不经过 HTTP，因此**内核事件流必须首先是进程
 | **A2A** | 与其他框架的 Agent 互通 | 中 |
 | **OpenAI 兼容 HTTP** | 让现有客户端直接请求我们 | 中 |
 
+四个适配都映射到已有会话，不另写一套 Runtime。被调用的一面在 `syndica.server`：`syndica mcp`（stdio）与 `syndica up` 的 `/mcp`；`syndica acp`（stdio）；公开的 `/.well-known/agent-card.json` 与 `POST /a2a/`；`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`。调用外部的一面是三个互不依赖的 backend：MCP client、ACP client（角色写成 `model: acp:<name>`）、A2A client（角色写成 `model: a2a:<name>`）。组合根注入；surface 不 import backend；kernel 不 import 协议 SDK。
+
+外部内容一律不可信，没有「声明为可信」。高风险仍走危险判定；没人可问时拒绝。密钥只出现在工作区之外、权限 0600 的用户级 `interop.yaml`，而且那里只存变量名。项目 `.syndica.yaml` 的 `interop` 只按名字引用外部对象。协议错误是三件套，不回显异常原文。版本协商失败即拒绝：MCP 只收其 SDK 列出的五版，ACP 只收协议版本 1，A2A 只收 1.0 与 0.3——缺 `A2A-Version` 不按 0.3 收下。机器客户端的 Bearer 由 `syndica up --api-token` 打印一次，只在该进程的内存里。
+
 ### 9.4 Web UI
 
 **React + TypeScript，构建产物随 Python 包发布。**
@@ -1469,7 +1473,9 @@ CI 检查项：
 | 11 | 训练出口 | 中立轨迹 + SFT / 偏好 / RL 导出器 + 至少一个训练框架对接 |
 | 12 | 发布准备 | 英文文档、文档站、CI 矩阵、许可与贡献流程 |
 
-**状态（2026-10-08）：** 里程碑 1–9 已完成，审计见 [M1 收口审计](../audits/2026-09-23-m1-final-audit.md)、
+**状态（2026-10-09）：** 里程碑 1–9 已完成。里程碑 10 的四个协议适配在工作区里，证据见
+[M10 收口审计](../audits/2026-10-09-m10-final-audit.md)；Gemini CLI 的真实运行还没做，路线图总览写「进行中」。
+审计见 [M1 收口审计](../audits/2026-09-23-m1-final-audit.md)、
 [M2 收口审计](../audits/2026-10-01-m2-final-audit.md)、[M3 收口审计](../audits/2026-10-02-m3-final-audit.md)、
 [M4 收口审计](../audits/2026-10-03-m4-final-audit.md)、[M5 收口审计](../audits/2026-10-04-m5-final-audit.md) 与
 [M6 收口审计](../audits/2026-10-05-m6-final-audit.md)、[M7 收口审计](../audits/2026-10-05-m7-final-audit.md) 与

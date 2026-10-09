@@ -880,6 +880,25 @@ The project uses four layers:
 Every important invariant should be backed by mutation-style checks. A green test suite is not
 enough if a realistic broken implementation can survive it.
 
+## Interop
+
+MCP, ACP, A2A, and OpenAI-compatible HTTP all land in a Syndica session. They do not bypass trace,
+provenance, redaction, or danger decisions. Content that arrives through a protocol is untrusted.
+There is no switch that marks an external tool or agent as trusted.
+
+`syndica mcp` and `syndica acp` speak those protocols on stdio. `syndica up` also serves `/mcp`,
+`/.well-known/agent-card.json`, `POST /a2a/`, `GET /v1/models`, `POST /v1/chat/completions`, and
+`POST /v1/responses`. A machine bearer is printed once by `syndica up --api-token` and lives only
+in that process. Continue an OpenAI session with the `X-Syndica-Session` response header;
+Responses ids look like `resp_<session>_<n>` and are passed back as `previous_response_id`.
+
+A role can call out by setting `model: acp:<name>` or `model: a2a:<name>`. Project `.syndica.yaml`
+may only name those external objects. Secret-like environment names belong in the user-level
+`interop.yaml` next to the trust store (mode `0600`, variable names only, outside the workspace).
+Version negotiation fails closed: MCP accepts only the five versions its SDK lists, ACP accepts
+protocol version 1, and A2A accepts only `1.0` and `0.3`. A missing `A2A-Version` header is
+rejected rather than treated as `0.3`.
+
 ## Roadmap
 
 The v1.0 roadmap has 12 internal milestones:
@@ -895,7 +914,7 @@ The v1.0 roadmap has 12 internal milestones:
 | 7 | Artifacts and acceptance | Done |
 | 8 | Long-horizon task control | Done |
 | 9 | HTTP/SSE/Web product surface | Done |
-| 10 | MCP / ACP / A2A / OpenAI HTTP interop | Planned |
+| 10 | MCP / ACP / A2A / OpenAI HTTP interop | In progress |
 | 11 | Training-data export | Planned |
 | 12 | v1.0 release readiness | Planned |
 

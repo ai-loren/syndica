@@ -201,6 +201,36 @@ def test_kernel_importing_yaml_is_caught_but_cli_may_use_it(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    ('statement', 'distribution'),
+    [
+        ('import mcp', 'mcp'),
+        ('from mcp_types import Tool', 'mcp'),
+        ('from acp import run_agent', 'agent-client-protocol'),
+        ('from a2a.types import AgentCard', 'a2a-sdk'),
+        ('import openai', 'openai'),
+        ('import httpx2', 'httpx2'),
+    ],
+)
+def test_kernel_importing_a_protocol_sdk_is_caught_but_a_backend_may_use_it(
+    tmp_path, statement, distribution
+):
+    kernel_module = tmp_path / 'src' / 'syndica' / 'kernel' / 'interop.py'
+    kernel_module.parent.mkdir(parents=True)
+    kernel_module.write_text(f'{statement}\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode != 0
+    assert 'kernel/interop.py' in result.stdout
+    assert f'({distribution})' in result.stdout
+
+    kernel_module.unlink()
+    backend_module = tmp_path / 'src' / 'syndica' / 'backends' / 'interop' / 'client.py'
+    backend_module.parent.mkdir(parents=True)
+    backend_module.write_text(f'{statement}\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_backend_importing_a_surface_is_caught(tmp_path):
     """backend 只允许依赖 kernel（spec §3.2 规则 3）。"""
     module = tmp_path / 'src' / 'syndica' / 'backends' / 'alpha' / 'client.py'

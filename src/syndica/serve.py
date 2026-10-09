@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import select
 import signal
@@ -29,7 +30,7 @@ import sys
 import time
 import urllib.request
 import webbrowser
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -69,6 +70,7 @@ def up(
     port: int,
     foreground: bool,
     open_browser: bool,
+    api_token: bool = False,
 ) -> CliOutcome:
     _refuse_in_agent(environ, 'up')
     _require_dependencies()
@@ -89,16 +91,26 @@ def up(
     finally:
         host.close()
     if foreground:
-        code = serve_main(['--config', config, '--port', str(port), '--foreground'])
+        argv = ['--config', config, '--port', str(port), '--foreground']
+        if api_token:
+            argv.append('--api-token')
+        code = serve_main(argv)
         return CliOutcome('', code)
-    handshake = _spawn(workspace_root, paths, config, port)
+    handshake = _spawn(workspace_root, paths, config, port, api_token=api_token)
     url = f'http://127.0.0.1:{handshake["port"]}/#login={handshake["login"]}'
     if open_browser:
         with contextlib.suppress(Exception):
             webbrowser.open_new_tab(url)
+    token_line = ''
+    if api_token:
+        token_line = (
+            '机器客户端令牌（只显示这一次，放在 Authorization: Bearer 里；重启即失效）：\n'
+            f'{handshake["api_token"]}\n'
+        )
     return CliOutcome(
         f'Syndica 在 http://127.0.0.1:{handshake["port"]}/ 运行（pid {handshake["pid"]}）。\n'
         f'用这个一次性链接登录（两分钟内有效，只能用一次）：\n{url}\n'
+        f'{token_line}'
         f'日志：{paths.log}\n停止：syndica down',
         0,
     )
@@ -263,13 +275,27 @@ def _lock_held(paths: _Paths) -> bool:
         os.close(descriptor)
 
 
-def _spawn(workspace_root: Path, paths: _Paths, config: str, port: int) -> dict[str, Any]:
+def _spawn(
+    workspace_root: Path, paths: _Paths, config: str, port: int, *, api_token: bool = False
+) -> dict[str, Any]:
     paths.make()
     # stderr 不接进日志文件：那会把没脱敏的文字直接落盘。server 自己的日志经脱敏 handler 写。
     # `-P`：`-m` 默认把当前目录放在 sys.path 最前，而当前目录是 Agent 能写的工作区根——Agent 写一个
     # `uvicorn.py` 或 `syndica/`，它就跑进这个带着宿主全部环境（provider 的 key）与登录码的进程。
+    command = [
+        sys.executable,
+        '-P',
+        '-m',
+        'syndica.serve',
+        '--config',
+        config,
+        '--port',
+        str(port),
+    ]
+    if api_token:
+        command.append('--api-token')
     process = subprocess.Popen(
-        [sys.executable, '-P', '-m', 'syndica.serve', '--config', config, '--port', str(port)],
+        command,
         cwd=workspace_root,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -313,6 +339,310 @@ def _spawn(workspace_root: Path, paths: _Paths, config: str, port: int) -> dict[
     return {**reply, 'pid': process.pid}
 
 
+def with_editor_mcp(config: Any, servers: Sequence[Any], role: str) -> Any:
+    """把编辑器 `session/new` 里的 stdio MCP 并进这份配置。密钥式变量名拒收。"""
+    from dataclasses import replace
+
+    from syndica.cli.environment import refuse_env_name
+    from syndica.cli.interop_config import McpServer
+
+    if not servers:
+        return config
+    extra: list[McpServer] = []
+    seen = {server.name for server in config.interop.mcp_servers}
+    for server in servers:
+        name = str(getattr(server, 'name', ''))
+        if not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', name):
+            raise ConfigError(
+                expected='编辑器 MCP 的 name 是小写字母开头、最多 32 个字符（字母、数字、_、-）',
+                received=f'收到 {name!r}',
+                next_action='改成 files 这样的名字；它会变成工具名前缀',
+            )
+        if name in seen:
+            raise ConfigError(
+                expected='编辑器 MCP 的 name 与已声明的服务都不重复',
+                received=f'{name!r} 已经有了',
+                next_action='给编辑器里的这个 MCP 换一个 name',
+            )
+        seen.add(name)
+        command = str(getattr(server, 'command', '') or '')
+        if not command.strip():
+            raise ConfigError(
+                expected=f'MCP 服务 {name} 的 command 是要执行的程序',
+                received='command 是空的',
+                next_action='写成可执行文件的路径，参数放在 args 里，不要经 shell',
+            )
+        args = tuple(str(item) for item in getattr(server, 'args', ()) or ())
+        values: list[tuple[str, str]] = []
+        for item in getattr(server, 'env', ()) or ():
+            variable = str(getattr(item, 'name', ''))
+            refuse_env_name(variable, f'mcp:{name} env')
+            values.append((variable, str(getattr(item, 'value', ''))))
+        extra.append(
+            McpServer(
+                name=name,
+                command=(command, *args),
+                url=None,
+                pass_env=(),
+                roles=(role,),
+                high_risk=(),
+                low_risk=(),
+                env_values=tuple(values),
+            )
+        )
+    interop = replace(
+        config.interop,
+        mcp_servers=(*config.interop.mcp_servers, *extra),
+        present=True,
+    )
+    return replace(config, interop=interop)
+
+
+def mcp_stdio(host: Any, config: str) -> str:
+    """stdio MCP server。日志先于 SDK 的 import 指到工作区外的文件，`basicConfig` 此后是空操作。
+
+    返回空串：stdout 只放协议，命令结束时不再往上面补一行说明。
+    """
+    paths = _Paths.of(host.workspace_root, os.environ)
+    paths.make()
+    log = _RedactingLog(paths.root / 'mcp.log', host_redactor(os.environ))
+    logging.basicConfig(level=logging.INFO, handlers=[log], force=True)
+    logging.captureWarnings(True)
+    try:
+        asyncio.run(_mcp_stdio(host, config, log))
+    finally:
+        log.close()
+    return ''
+
+
+def acp_stdio(host: Any, config: str) -> str:
+    """stdio ACP agent。日志先于 SDK 的 import 指到工作区外的文件。stdout 只放协议。"""
+    paths = _Paths.of(host.workspace_root, os.environ)
+    paths.make()
+    log = _RedactingLog(paths.root / 'acp.log', host_redactor(os.environ))
+    logging.basicConfig(level=logging.INFO, handlers=[log], force=True)
+    logging.captureWarnings(True)
+    try:
+        asyncio.run(_acp_stdio(host, config, log))
+    finally:
+        log.close()
+    return ''
+
+
+async def _acp_stdio(host: Any, config_path: str, log: _RedactingLog) -> None:
+    from acp import run_agent
+
+    from syndica.server.acp_agent import SyndicaAcp, TurnBinding
+
+    config = host.trusted_without_asking(config_path)
+    log.redactor = host.redactor_for(config)
+    roles: list[tuple[str, str]] = []
+    for name in config.catalog.names():
+        manifest = config.catalog.get(name)
+        description = manifest.description if isinstance(manifest.description, str) else name
+        roles.append((name, description))
+    opened: list[Any] = []
+
+    def trust(cwd: str) -> None:
+        root = Path(cwd).resolve()
+        if root != Path(host.workspace_root).resolve():
+            raise ConfigError(
+                expected=f'cwd 是启动 syndica acp 的工作区 {host.workspace_root}',
+                received=str(root),
+                next_action='在那个目录里运行 syndica acp',
+            )
+
+    async def open_turn(cwd: str, mode: str, servers: tuple[Any, ...] = ()) -> TurnBinding:
+        trust(cwd)
+        parts = await host.assemble_session(
+            config_path,
+            max_turns=None,
+            trace=None,
+            argv=('syndica', 'acp'),
+            trusted_output=(),
+            role=mode,
+            config=with_editor_mcp(config, servers, mode),
+        )
+        opened.append(parts)
+        return TurnBinding(parts.runtime, parts.agent_id, parts.subscription)
+
+    agent = SyndicaAcp(
+        roles, trust, open_turn=open_turn, redactor=log.redactor, version=__version__
+    )
+    try:
+        await run_agent(agent)  # pyright: ignore[reportArgumentType]
+    finally:
+        await agent.aclose()
+        for parts in opened:
+            await host.close_session(parts, None)
+
+
+async def _mcp_stdio(host: Any, config_path: str, log: _RedactingLog) -> None:
+    config = host.trusted_config(config_path)
+    log.redactor = host.redactor_for(config)
+    server, traces, router, environment = await _bind_mcp(host, config, None)
+    try:
+        from syndica.server.mcp_serve import serve_stdio
+
+        await serve_stdio(server)
+    finally:
+        await traces.aclose()
+        await router.close()
+        environment.remove()
+
+
+def mcp_http_mount(host: Any, config: Any, port: int, taint: Any) -> Any:
+    """`/mcp` 的挂载。没装 `syndica[mcp]` 时返回 None，路由保持 501。"""
+    if importlib.util.find_spec('mcp') is None:
+        return None
+    from syndica.cli.redaction import host_redactor
+    from syndica.server import ProtocolMount
+    from syndica.server.outbound import json_response
+
+    state: dict[str, Any] = {}
+
+    class _App:
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            app = state.get('app')
+            if app is None:
+                response = json_response(
+                    {
+                        'expected': '/mcp 的会话管理器已经进入 lifespan',
+                        'received': '请求到了，管理器还没准备好',
+                        'next_action': '等 server 启动完成再连；刚重启时重试一次',
+                    },
+                    host_redactor(os.environ),
+                    status=503,
+                )
+                await response(scope, receive, send)
+                return
+            await app(scope, receive, send)
+
+    @contextlib.asynccontextmanager
+    async def lifespan() -> AsyncGenerator[None, None]:
+        server, traces, router, environment = await _bind_mcp(host, config, taint)
+        try:
+            from syndica.server.mcp_serve import streamable_http
+
+            app, life = streamable_http(server, port=port, traces=traces)
+            state['app'] = app
+            async with life():
+                yield
+        finally:
+            state.pop('app', None)
+            await traces.aclose()
+            await router.close()
+            environment.remove()
+
+    return ProtocolMount('/mcp', _App(), lifespan=lifespan)
+
+
+def a2a_http_mounts(config: Any, port: int, live: Any, workspace_name: str) -> tuple[Any, ...]:
+    """卡片与 `/a2a/`。没装 `syndica[a2a]` 时返回空，两条路由保持 501。"""
+    if importlib.util.find_spec('a2a') is None:
+        return ()
+    from syndica.server import ProtocolMount
+    from syndica.server.a2a_serve import (
+        A2ADesk,
+        SyndicaA2A,
+        build_agent_card,
+        card_app,
+        jsonrpc_app,
+    )
+
+    skills: list[tuple[str, str]] = []
+    for name in config.catalog.names():
+        manifest = config.catalog.get(name)
+        description = manifest.description if isinstance(manifest.description, str) else name
+        skills.append((name, description))
+    redactor = live.assembly.redactor()
+    card = build_agent_card(workspace_name, skills, port=port)
+    handler = SyndicaA2A(card=card, redactor=redactor, desk=A2ADesk(live, redactor=redactor))
+    return (
+        ProtocolMount('/.well-known/agent-card.json', card_app(card, redactor)),
+        ProtocolMount('/a2a/', jsonrpc_app(handler)),
+    )
+
+
+def openai_http_mounts(config: Any, live: Any) -> tuple[Any, ...]:
+    """`/v1/models`、chat completions 与 responses。不另装 SDK。"""
+    from syndica.server import ProtocolMount
+    from syndica.server.openai_http import OpenAIHttp, chat_app, models_app, responses_app
+
+    api = OpenAIHttp(live, tuple(config.catalog.names()), live.assembly.redactor())
+    return (
+        ProtocolMount('/v1/models', models_app(api)),
+        ProtocolMount('/v1/chat/completions', chat_app(api)),
+        ProtocolMount('/v1/responses', responses_app(api)),
+    )
+
+
+async def _bind_mcp(host: Any, config: Any, taint: Any) -> tuple[Any, Any, Any, Any]:
+    """打开与 run 同一份工作区，按配置点名工具，并给每个连接一条 trace。"""
+    from syndica.cli.handoff import artifact_root, trace_root
+    from syndica.cli.policy import dev_danger_options, dev_guard_judge
+    from syndica.kernel import ArtifactRef, ExternalCallPolicy, FileTraceStore, RuleRedactor
+    from syndica.kernel.stores.file_artifact import FileArtifactStore
+    from syndica.kernel.tools.local import local_tools
+    from syndica.server.mcp_serve import (
+        McpPrompt,
+        McpResource,
+        McpTraces,
+        build_mcp_server,
+        read_artifact_bytes,
+        resources_of,
+        select_serve_tools,
+    )
+
+    router, environment = host._open_workspace(config, taint=taint)  # pyright: ignore[reportPrivateUsage]
+    try:
+        selected = select_serve_tools(local_tools(router.portal()), config.interop.mcp_serve_tools)
+        root = host.workspace_root
+        judge, table = dev_danger_options(root)
+        redactor = host.redactor_for(config)
+        if not isinstance(redactor, RuleRedactor):
+            raise ConfigError(
+                expected='MCP server 的 redactor 是 RuleRedactor',
+                received=f'收到 {type(redactor).__name__}',
+                next_action='用宿主的 redactor_for(config)，不要换一个不脱敏的实现',
+            )
+        prompts: list[McpPrompt] = []
+        for name in config.catalog.names():
+            manifest = config.catalog.get(name)
+            description = manifest.description if isinstance(manifest.description, str) else name
+            text = manifest.system_prompt
+            prompts.append(
+                McpPrompt(name, description, text if isinstance(text, str) else str(text))
+            )
+        traces = McpTraces(FileTraceStore(trace_root(root)), redactor, router)
+
+        async def artifact_source() -> tuple[McpResource, ...]:
+            location = artifact_root(root)
+            if not location.is_dir():
+                return ()
+            refs = await FileArtifactStore(location).list()
+
+            async def read(ref: ArtifactRef) -> bytes:
+                return await read_artifact_bytes(router, ref)
+
+            return await resources_of(refs, read)
+
+        server = build_mcp_server(
+            selected,
+            policy=ExternalCallPolicy(judge=judge, policy=table, guard=dev_guard_judge(root)),
+            read_only=frozenset(name for name in selected if name in {'Read', 'Grep', 'Glob'}),
+            redactor=redactor,
+            prompts=tuple(prompts),
+            resource_source=artifact_source,
+            traces=traces,
+        )
+    except BaseException:
+        await router.close()
+        environment.remove()
+        raise
+    return server, traces, router, environment
+
+
 def serve_main(argv: list[str]) -> int:
     """server 进程本身。后台模式下，第一行 stdout 是给 `up` 的握手；握手之后 stdout / stderr 接到
     /dev/null，日志只经脱敏 handler 写。"""
@@ -326,6 +656,7 @@ def serve_main(argv: list[str]) -> int:
     parser.add_argument('--config', default='.syndica.yaml')
     parser.add_argument('--port', type=int, default=0)
     parser.add_argument('--foreground', action='store_true')
+    parser.add_argument('--api-token', action='store_true')
     args = parser.parse_args(argv)
     workspace_root = Path.cwd()
     handshake = sys.stdout
@@ -410,7 +741,17 @@ def _serve(
         port = int(sock.getsockname()[1])
         credentials = Credentials()
         nonce = secrets.token_hex(16)
-        live = Live(ServerAssembly(host, path=args.config, config=config))
+        assembly = ServerAssembly(host, path=args.config, config=config)
+        live = Live(assembly)
+        mount = mcp_http_mount(
+            host,
+            config,
+            port,
+            assembly._taint,  # pyright: ignore[reportPrivateUsage]
+        )
+        mounts: list[Any] = [] if mount is None else [mount]
+        mounts.extend(a2a_http_mounts(config, port, live, workspace_root.name))
+        mounts.extend(openai_http_mounts(config, live))
         app = create_app(
             live,
             credentials,
@@ -420,6 +761,7 @@ def _serve(
                 version=__version__,
                 static_dir=Path(__file__).parent / 'server' / 'static',
             ),
+            protocol_mounts=tuple(mounts),
         )
         state = {
             'pid': os.getpid(),
@@ -433,14 +775,24 @@ def _serve(
         temporary.chmod(0o600)
         os.replace(temporary, paths.state)
         code = credentials.issue_code()
+        api_token = credentials.issue_api_token() if args.api_token else None
         if args.foreground:
+            token_line = ''
+            if api_token is not None:
+                token_line = (
+                    '机器客户端令牌（只显示这一次，放在 Authorization: Bearer 里；重启即失效）：\n'
+                    f'{api_token}\n'
+                )
             print(
                 f'Syndica 在 http://127.0.0.1:{port}/ 运行。一次性登录链接（两分钟内有效）：\n'
-                f'http://127.0.0.1:{port}/#login={code}\nCtrl-C 停止。',
+                f'http://127.0.0.1:{port}/#login={code}\n{token_line}Ctrl-C 停止。',
                 flush=True,
             )
         else:
-            _handshake(handshake, {'ok': True, 'port': port, 'login': code})
+            payload: dict[str, Any] = {'ok': True, 'port': port, 'login': code}
+            if api_token is not None:
+                payload['api_token'] = api_token
+            _handshake(handshake, payload)
             # 握手之后 `up` 已经退出、管道没人读：stdout 与 stderr 接到 /dev/null，什么都不写。
             quiet = os.open(os.devnull, os.O_WRONLY)
             os.dup2(quiet, sys.stdout.fileno())

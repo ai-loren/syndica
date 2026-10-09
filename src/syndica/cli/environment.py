@@ -16,6 +16,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from syndica.kernel import ConfigError
+from syndica.kernel.redaction import looks_secret
 
 __all__ = [
     'AGENT_MARKER',
@@ -23,6 +24,7 @@ __all__ = [
     'HOST_SET_ENV',
     'AgentEnvironment',
     'agent_environment',
+    'refuse_env_name',
     'reopens_git',
     'valid_env_name',
 ]
@@ -68,6 +70,59 @@ AGENT_MARKER = 'SYNDICA_AGENT_ENV'
 
 def valid_env_name(name: str) -> bool:
     return bool(_NAME.match(name))
+
+
+def refuse_env_name(name: str, field: str) -> None:
+    """项目配置里点名的环境变量：像密钥、会把宿主凭证还给外部进程的名字一律拒收。
+
+    用户级 `interop.yaml` 不走这里。那里是唯一允许点名密钥变量的地方，值仍不落盘。
+    """
+    if not valid_env_name(name):
+        raise ConfigError(
+            expected=f'{field} 的每一项是环境变量名（字母、数字、下划线，不以数字开头）',
+            received=f'收到 {name!r}',
+            next_action='改成变量名本身，例如 NO_COLOR；不要写 NAME=值',
+        )
+    if looks_secret(name):
+        raise ConfigError(
+            expected=f'{field} 不含像密钥的名字（按 _ 切开后没有 KEY、TOKEN、AUTH 这类词）',
+            received=f'收到 {name!r}',
+            next_action=(
+                f'从 {field} 删掉 {name}：交给 Agent 或外部进程的环境变量会出现在它能读、能打印的'
+                '地方。Agent 需要调用的服务如果要凭证，让宿主去调它；要透传给外部进程的密钥，'
+                '把变量名写进工作区之外的用户级 interop.yaml，不要写进项目配置'
+            ),
+        )
+    if name in HOST_SET_ENV:
+        raise ConfigError(
+            expected=f'{field} 不含宿主自己设的 {list(HOST_SET_ENV)!r}',
+            received=f'收到 {name!r}',
+            next_action=(
+                f'从 {field} 删掉 {name}：宿主为每次 run 设它，'
+                '透传会让外部进程拿回你的 git / gh 配置'
+            ),
+        )
+    if name.startswith('OTEL_EXPORTER_OTLP_'):
+        raise ConfigError(
+            expected=f'{field} 不含 OTLP 导出的配置（OTEL_EXPORTER_OTLP_*）',
+            received=f'收到 {name!r}',
+            next_action=(
+                f'从 {field} 删掉 {name}：它们是宿主导出 trace 用的端点与鉴权头，交给外部进程'
+                '等于把 collector 的凭证交给它'
+            ),
+        )
+    if reopens_git(name):
+        raise ConfigError(
+            expected=(
+                f'{field} 不含会重新打开 git / gh 配置的名字'
+                '（GIT_CONFIG*、GIT_SSH*、*ASKPASS、GIT_DIR、GIT_WORK_TREE、GIT_EXEC_PATH、GH_*）'
+            ),
+            received=f'收到 {name!r}',
+            next_action=(
+                f'从 {field} 删掉 {name}：它让外部进程的 git 或 gh 重新用上配置、凭证或另一个'
+                '仓库，绕过宿主为每次 run 准备的空配置'
+            ),
+        )
 
 
 def reopens_git(name: str) -> bool:

@@ -65,6 +65,24 @@ def test_the_documented_paths_are_exactly_the_routes_the_app_serves():
     assert all(path in json.dumps(openapi()['x-syndica-pty']) for path in sockets[:2])
 
 
+def test_protocol_routes_are_referenced_not_expanded():
+    spec = openapi()
+    card = spec['paths']['/.well-known/agent-card.json']['get']
+    chat = spec['paths']['/v1/chat/completions']['post']
+    assert card['x-syndica-protocol'] == 'a2a'
+    assert chat['x-syndica-protocol'] == 'openai'
+    assert card['responses']['200']['content']['application/json']['schema'] == {
+        '$ref': '#/components/schemas/ExternalProtocol'
+    }
+    assert 'requestBody' not in card
+    assert chat['requestBody']['content']['application/json']['schema']['$ref'].endswith(
+        'ExternalProtocol'
+    )
+    schema = spec['components']['schemas']['ExternalProtocol']
+    assert schema['additionalProperties'] is True
+    assert 'properties' not in schema
+
+
 def test_every_event_kind_a_client_can_receive_has_a_schema():
     events = openapi()['x-syndica-events']
     assert set(events) == set(KERNEL_EVENTS) | set(SERVER_EVENTS)

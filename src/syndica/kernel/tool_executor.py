@@ -720,6 +720,46 @@ def _skipped_result(call: ToolCall, substitute: object) -> ToolResult:
     return ToolResult(output=str(substitute), trust=TrustLevel.UNTRUSTED)
 
 
+def _untrusted_executed_scripts(
+    tool: Tool,
+    args: Mapping[str, Any],
+    file_trust: Callable[[str], TrustLevel | None] | None,
+) -> list[str]:
+    """这次调用会执行的、工作区里不可信的脚本（规范化之后的路径）。
+
+    相对脚本按工具的 `cwd` 和命令开头的 `cd` 折算；工作区外的路径由 `file_trust` 交回 None、
+    不升级；`cd` 折不出目录时放过。`__tool_session_cwd__` 的工具跨调用保持 cwd，相对脚本放弃，
+    只判绝对路径。`{}` 是 find -exec 的占位符，不是文件。
+
+    `call_external` 与 `ToolExecutor` 必须问这同一个函数：两份扫描分叉时，外部入口会放行
+    执行器拦下的命令，或反过来。
+    """
+    if file_trust is None:
+        return []
+    declared = cast(object, getattr(tool, '__tool_command_args__', None))
+    names = list(args) if declared is None else list(cast(tuple[str, ...], declared))
+    cwd = args.get('cwd')
+    stateful = bool(getattr(tool, '__tool_session_cwd__', False))
+    found: list[str] = []
+    for name in names:
+        value = args.get(name)
+        if not isinstance(value, str):
+            continue
+        base = None if stateful else effective_cwd(value, cwd if isinstance(cwd, str) else '.')
+        for script in executed_scripts(value):
+            if script == '{}':
+                continue
+            if script.startswith('/'):
+                effective = script
+            elif base is None:
+                continue
+            else:
+                effective = posixpath.normpath(posixpath.join(base, script))
+            if file_trust(effective) is TrustLevel.UNTRUSTED and effective not in found:
+                found.append(effective)
+    return found
+
+
 class ToolExecutor:
     """分段执行一批工具调用，把每个调用的结果作为 role='tool' block 追加进 ctx。
 
@@ -831,37 +871,7 @@ class ToolExecutor:
         self._file_trust = file_trust
 
     def _untrusted_scripts(self, tool: Tool, args: Mapping[str, Any]) -> list[str]:
-        """这次调用会执行的、工作区里不可信的脚本（规范化之后的路径）。相对脚本按工具的 `cwd` 和命令
-        开头的 `cd` 折算出的目录解析；工作区外的路径由 `script_trust` 交回 None、不升级；`cd` 折不出
-        目录时这一条放过（有窗口上界兜着）。见 `executed_scripts` / `effective_cwd`（评审 F3）。"""
-        if self._file_trust is None:
-            return []
-        declared = cast(object, getattr(tool, '__tool_command_args__', None))
-        names = list(args) if declared is None else list(cast(tuple[str, ...], declared))
-        cwd = args.get('cwd')
-        # 会话式工具（Terminal 的伪终端）跨调用保持 cwd，此刻在哪个目录认不出：相对脚本一律放弃，
-        # 只判绝对的工作区内脚本（评审 C7）。
-        stateful = bool(getattr(tool, '__tool_session_cwd__', False))
-        found: list[str] = []
-        for name in names:
-            value = args.get(name)
-            if not isinstance(value, str):
-                continue
-            base = None if stateful else effective_cwd(value, cwd if isinstance(cwd, str) else '.')
-            for script in executed_scripts(value):
-                if script == '{}':
-                    # `find . -exec sh {} \;` 的 `{}` 是占位符不是文件；别的带花括号的词可能是 brace
-                    # 展开（`planted.s{h,}`）藏着脚本，交给 script_trust 判（非基线即升级，C8）。
-                    continue
-                if script.startswith('/'):
-                    effective = script
-                elif base is None:
-                    continue
-                else:
-                    effective = posixpath.normpath(posixpath.join(base, script))
-                if self._file_trust(effective) is TrustLevel.UNTRUSTED and effective not in found:
-                    found.append(effective)
-        return found
+        return _untrusted_executed_scripts(tool, args, self._file_trust)
 
     def _observe_outcomes(self, observer: ToolOutcomeObserver) -> None:
         if not callable(observer):

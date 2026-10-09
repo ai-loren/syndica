@@ -920,6 +920,301 @@
           }
         ]
       }
+    },
+    "/.well-known/agent-card.json": {
+      "get": {
+        "summary": "A2A agent card（公开，只含角色名与描述）",
+        "x-syndica-protocol": "a2a",
+        "responses": {
+          "200": {
+            "description": "A2A agent card（公开，只含角色名与描述）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalProtocol"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/a2a/": {
+      "post": {
+        "summary": "A2A JSON-RPC（v1.0 与 0.3）",
+        "x-syndica-protocol": "a2a",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExternalProtocol"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "A2A JSON-RPC（v1.0 与 0.3）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalProtocol"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/mcp": {
+      "get": {
+        "summary": "MCP Streamable HTTP",
+        "x-syndica-protocol": "mcp",
+        "responses": {
+          "200": {
+            "description": "MCP Streamable HTTP",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalProtocol"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "summary": "MCP Streamable HTTP",
+        "x-syndica-protocol": "mcp",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExternalProtocol"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "MCP Streamable HTTP",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalProtocol"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "summary": "MCP Streamable HTTP",
+        "x-syndica-protocol": "mcp",
+        "responses": {
+          "200": {
+            "description": "MCP Streamable HTTP",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalProtocol"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "summary": "OpenAI 兼容：角色列表",
+        "x-syndica-protocol": "openai",
+        "responses": {
+          "200": {
+            "description": "OpenAI 兼容：角色列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalProtocol"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "summary": "OpenAI Chat Completions",
+        "x-syndica-protocol": "openai",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExternalProtocol"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OpenAI Chat Completions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalProtocol"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/responses": {
+      "post": {
+        "summary": "OpenAI Responses",
+        "x-syndica-protocol": "openai",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExternalProtocol"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OpenAI Responses",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalProtocol"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "三件套错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -1441,6 +1736,12 @@
         },
         "title": "EventEnvelope",
         "type": "object"
+      },
+      "ExternalProtocol": {
+        "type": "object",
+        "description": "对方协议的报文，不在这份文档里展开",
+        "additionalProperties": true,
+        "x-syndica-protocol": true
       },
       "FeedbackRequest": {
         "additionalProperties": false,
@@ -2311,6 +2612,26 @@
         "blocks_after": {},
         "tokens_before": {},
         "tokens_after": {}
+      },
+      "additionalProperties": true
+    },
+    "external_activity": {
+      "type": "object",
+      "required": [
+        "source",
+        "name",
+        "activity_id",
+        "kind",
+        "status",
+        "title"
+      ],
+      "properties": {
+        "source": {},
+        "name": {},
+        "activity_id": {},
+        "kind": {},
+        "status": {},
+        "title": {}
       },
       "additionalProperties": true
     },

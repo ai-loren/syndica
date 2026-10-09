@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -85,6 +85,9 @@ class FakeHandle:
     @property
     def subscription(self) -> Subscription:
         return self._subscription
+
+    def install_tools(self, tools: Mapping[str, Any]) -> None:
+        self.calls.append(('install_tools', dict(tools)))
 
     async def deliver(self, target: str, text: str) -> DeliveryResult:
         self.delivered.append((target, text))
@@ -298,6 +301,9 @@ async def running(
     grace_s: float = 60.0,
     static_dir: Any = None,
     credentials: Credentials | None = None,
+    adapters: tuple[Any, ...] = (),
+    protocol_mounts: tuple[Any, ...] = (),
+    mount_factory: Any = None,
 ) -> AsyncIterator[Server]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(('127.0.0.1', 0))
@@ -305,10 +311,15 @@ async def running(
     port = int(sock.getsockname()[1])
     credentials = credentials or Credentials()
     live = Live(assembly, grace_s=grace_s)
+    mounts = protocol_mounts
+    if mount_factory is not None:
+        mounts = (*mounts, *mount_factory(port))
     app = create_app(
         live,
         credentials,
         ServerSettings(port=port, nonce='nonce-1', version='test', static_dir=static_dir),
+        adapters=adapters,
+        protocol_mounts=mounts,
     )
     server = uvicorn.Server(
         uvicorn.Config(app, log_level='warning', lifespan='on', ws='websockets-sansio')

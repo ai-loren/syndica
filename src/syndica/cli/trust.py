@@ -30,6 +30,7 @@ from typing import Protocol, cast
 
 import syndica
 from syndica.cli.config import CliConfig, config_from_text, parse_yaml
+from syndica.cli.interop_config import described_targets
 from syndica.cli.modules import Discovered
 from syndica.cli.terminal import one_line
 from syndica.kernel import ConfigError
@@ -589,6 +590,7 @@ def describe(snapshot: ConfigSnapshot, config: CliConfig) -> str:
             for key, value in sorted(config.flags.items())
         ],
     )
+    lines += _section('interop', list(described_targets(config.interop)))
     lines += _section('danger.roles（只能收紧）', sorted(config.danger_roles))
     lines += _section(
         'redaction.rules（只能多脱敏）', [rule.rule_id for rule in config.redaction_rules]

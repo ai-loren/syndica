@@ -44,7 +44,7 @@ __all__ = [
     'verbatim_attribute',
 ]
 
-TRACE_SCHEMA = 'syndica.trace/6'
+TRACE_SCHEMA = 'syndica.trace/7'
 _SCHEMA_VERSION = re.compile(r'syndica\.trace/([1-9][0-9]{0,8})')
 
 
@@ -58,7 +58,8 @@ def readable_schema(schema: object) -> None:
 
     更旧的版本照样读：闭集只增不减，旧 trace 里的每个字段新读者都认得（`/2` 加了 Module 的 span 属性
     与扩展切点事件，`/3` 加了产物边的属性与读到的文件的出处，`/4` 加了验收裁决，`/5` 加了逐条结论，
-    `/6` 加了预算与长程）。按相等判的话，升一次版本就让此前的每一个 trace 报「删掉它」。
+    `/6` 加了预算与长程，`/7` 加了 `tool.caller`）。按相等判的话，升一次版本就让此前的每一个
+    trace 报「删掉它」。
     """
     if schema == TRACE_SCHEMA:
         return
@@ -146,6 +147,8 @@ ATTRIBUTE_KINDS: Mapping[str, str] = MappingProxyType(
         'tool.name': 'str',
         'tool.call_id': 'str',
         'tool.index': 'int',
+        # 外部调用方（`call_external` 的 caller）。会话里的工具调用不写它。
+        'tool.caller': 'str',
         'tool.outcome': 'str',
         'tool.exit_code': 'int?',
         'tool.timed_out': 'bool',

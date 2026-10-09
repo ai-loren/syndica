@@ -77,6 +77,11 @@ from syndica.cli.handoff import (
     write_handoff,
 )
 from syndica.cli.host_git import Change, GitUnavailable, HostGit
+from syndica.cli.interop_config import (
+    interop_credentials_path,
+    load_interop_credentials,
+    unmatched_credentials,
+)
 from syndica.cli.main import (
     EXIT_INTERRUPTED,
     CliIO,
@@ -87,6 +92,7 @@ from syndica.cli.main import (
     SessionsRequest,
     TraceRequest,
 )
+from syndica.cli.mcp_session import McpOpener, OpenedMcp, doctor_lines
 from syndica.cli.modules import (
     OPTIONAL_BUILTINS,
     EntryPointSource,
@@ -98,7 +104,7 @@ from syndica.cli.modules import (
     third_party,
     validated_modules,
 )
-from syndica.cli.policy import dev_danger_options, role_policies
+from syndica.cli.policy import dev_danger_options, dev_guard_judge, role_policies
 from syndica.cli.recording import (
     MirroredTraceStore,
     Recording,
@@ -146,11 +152,13 @@ from syndica.kernel import (
     ConfigError,
     Context,
     ContractViolation,
+    DangerJudge,
     DangerPolicy,
     DeliveryResult,
     ExecResult,
     Exhaustion,
     ExitMode,
+    ExternalCallPolicy,
     FileSessionStore,
     FileTaint,
     FileTraceStore,
@@ -212,6 +220,7 @@ from syndica.kernel.tools import Delegate, Fork, KillAgent, QueryAgent, SendMess
 __all__ = ['RuntimeCliHost', 'reference_modules']
 
 ModelFactory = Callable[[str], LLM]
+PrepareModels = Callable[[CliConfig], None]
 _RUNTIME_LOGGER = 'syndica.kernel.runtime'
 # Bash 每条输出流、Glob 与 Grep 每次结果最多展示给模型的字符数。整份 pytest 输出进上下文会挤掉别的
 # 一切，而汇总行在末尾，local_tools 截断时留开头 20%、结尾 80%；一次宽泛的 Grep 同理。
@@ -1058,6 +1067,21 @@ def _next_steps(
     return tuple(steps)
 
 
+def _interop_warnings(environ: Mapping[str, str], workspace: Path, config: CliConfig) -> list[str]:
+    """用户级名单对不上这份项目配置时只警告：那份文件跨工作区共用，多出来的名字不是这份配置的错。"""
+    path = interop_credentials_path(environ)
+    if path is None:
+        return []
+    credentials = load_interop_credentials(path, workspace=workspace)
+    return [
+        (
+            f'interop: warning {one_line(key)}（用户级 interop.yaml 有这项，'
+            '这份项目配置没声明对应的外部对象；对不上只是警告）'
+        )
+        for key in unmatched_credentials(credentials, config.interop)
+    ]
+
+
 def _git_line(git: HostGit) -> str:
     """doctor 的 git 一行：只是情况说明，不让 doctor 失败。「不是仓库」只认 git 自己这么说；git
     太旧、`safe.directory` 拒绝这类失败照实写出来——交接时会把这样的仓库当成不是仓库，只有这里
@@ -1500,6 +1524,8 @@ class SessionParts:
     recording: Recording
     redactor: Redactor
     lock: SessionLock | None = None
+    # 托管的外部模型（ACP）。会话结束时 aclose，进程组跟着走。
+    hosted: tuple[object, ...] = ()
 
 
 @dataclass
@@ -1515,8 +1541,47 @@ class _ChatSession:
     redactor: Redactor
     # 会话锁：持 flock 挡住另一个进程同时续 / 跑这份会话（B-01）。会存盘的会话根都持它、close 时放。
     lock: SessionLock | None = None
+    hosted: tuple[object, ...] = ()
     # 最近一轮怎么结束的：chat 在一轮失败时就结束，会话的 trace 以它收尾。
     failure: Exception | None = None
+
+
+def _prepare(prepare: PrepareModels | None, config: CliConfig) -> None:
+    if prepare is not None:
+        prepare(config)
+
+
+def _bind_hosted(
+    models: Mapping[str, LLM],
+    runtime: Runtime,
+    tools: Mapping[str, Tool],
+    policy: ExternalCallPolicy,
+    *,
+    agent_env: Mapping[str, str],
+    host_env: Mapping[str, str],
+    redactor: Redactor,
+) -> None:
+    for model in models.values():
+        bind = getattr(model, 'bind_runtime', None)
+        if bind is None:
+            continue
+        bind(
+            runtime,
+            tools,
+            policy,
+            agent_env=agent_env,
+            host_env=host_env,
+            redactor=redactor,
+        )
+
+
+async def _close_hosted(models: Mapping[str, LLM] | tuple[object, ...]) -> None:
+    closing: tuple[object, ...] = models if isinstance(models, tuple) else tuple(models.values())
+    for model in closing:
+        close = getattr(model, 'aclose', None)
+        if close is None:
+            continue
+        await close()
 
 
 class RuntimeCliHost:
@@ -1538,6 +1603,8 @@ class RuntimeCliHost:
         entry_points: EntryPointSource = no_entry_points,
         trust: TrustGate,
         prices: PriceTable | None = None,
+        mcp_opener: McpOpener | None = None,
+        prepare_models: PrepareModels | None = None,
     ) -> None:
         self._io = io
         # backend 给的默认价格（组合根交进来：surface 不 import backend）；`.syndica.yaml` 的
@@ -1553,6 +1620,8 @@ class RuntimeCliHost:
         self._exports: list[_PendingExport] = []
         self._lines = _Lines(io.stdin)
         self._model_factory = model_factory
+        self._mcp_opener = mcp_opener
+        self._prepare_models = prepare_models
         self._workspace_root = Path(workspace_root)
         self._environ: Mapping[str, str] = os.environ if environ is None else environ
         self._runner = asyncio.Runner(loop_factory=_host_loop)
@@ -2215,6 +2284,7 @@ class RuntimeCliHost:
     def model_checks(self, config: CliConfig) -> list[dict[str, object]]:
         """逐个建配置里用到的模型：缺 key 之类的问题在这里就报出来，而不是建会话时才炸。"""
         checks: list[dict[str, object]] = []
+        _prepare(self._prepare_models, config)
         for name in _model_names(config):
             try:
                 self._model_factory(name)
@@ -2479,9 +2549,13 @@ class RuntimeCliHost:
             return _default_config(Path(path))
         return load_config(file)
 
-    def _trusted_config(self, path: str) -> CliConfig:
+    def trusted_without_asking(self, path: str) -> CliConfig:
+        """读配置并核对信任，但不在终端上问人。ACP 的 stdio 是协议，问人会把协议字节吃掉。"""
+        return self._trusted_config(path, ask=False)
+
+    def _trusted_config(self, path: str, *, ask: bool = True) -> CliConfig:
         """run、chat、doctor 用的配置：工作区之内的那一份要先被信任（M4 D15）。工作区之外的是人
-        显式指过去的，Agent 碰不到。"""
+        显式指过去的，Agent 碰不到。`ask=False` 时没信任过就三件套拒绝，不读 stdin。"""
         file = self._workspace_root / path
         if path == '.syndica.yaml' and not file.exists():
             return _default_config(Path(path))
@@ -2491,6 +2565,13 @@ class RuntimeCliHost:
         snapshot = self._snapshot(file)
         config = config_of(snapshot)
         if store.get(snapshot.path) != snapshot.digest:
+            if not ask:
+                shown = one_line(str(snapshot.path))
+                raise _config_error(
+                    f'工作区之内的配置 {shown} 经人确认之后才用（第一次用或改过之后）',
+                    f'它没有被信任（摘要 {snapshot.digest}），而这条命令不在 stdio 上问人',
+                    f'看过这份配置之后运行 syndica config trust --sha256 {snapshot.digest}，再重跑',
+                )
             self._confirm(snapshot, config)
             store.put(snapshot.path, snapshot.digest)
         digested = [
@@ -2817,6 +2898,7 @@ class RuntimeCliHost:
         config = self._trusted_config(path)
         workspace, environment = self._open_workspace(config)
         failed = False
+        opened_mcp: OpenedMcp | None = None
         try:
             tools = local_tools(
                 workspace.portal(),
@@ -2824,6 +2906,7 @@ class RuntimeCliHost:
                 artifact_kinds=self._artifact_handlers.kinds,
             )
             names = _model_names(config)
+            _prepare(self._prepare_models, config)
             models: Mapping[str, LLM] = {name: self._model_factory(name) for name in names}
             judge, policy = dev_danger_options(self._workspace_root)
             config.catalog.freeze(
@@ -2839,9 +2922,14 @@ class RuntimeCliHost:
                 role_policies=role_policies(judge, config.danger_roles),
             )
             git = HostGit(self._workspace_root, self._environ)
+            mcp_lines, opened_mcp = await self._mcp_doctor(config, environment.values, judge)
+            if any(line.startswith('mcp: failed') for line in mcp_lines):
+                failed = True
             lines = [
                 f'config: ok {one_line(config.source)}',
                 f'models: ok {", ".join(names)}',
+                *_interop_warnings(self._environ, self._workspace_root, config),
+                *mcp_lines,
                 f'workspace: ok {one_line(str(self._workspace_root))}',
                 f'env: {" ".join(environment.values)}',
                 _git_line(git),
@@ -2880,9 +2968,13 @@ class RuntimeCliHost:
                     )
         finally:
             try:
-                await workspace.close()
+                if opened_mcp is not None:
+                    await opened_mcp.aclose()
             finally:
-                environment.remove()
+                try:
+                    await workspace.close()
+                finally:
+                    environment.remove()
         if verify:
             if not config.workspace.verify:
                 lines.append('verify: not_configured（.syndica.yaml 的 workspace.verify 是空的）')
@@ -2957,8 +3049,45 @@ class RuntimeCliHost:
             recording=parts.recording,
             redactor=parts.redactor,
             lock=parts.lock,
+            hosted=parts.hosted,
         )
         return parts.agent_id
+
+    async def _open_mcp(
+        self,
+        config: CliConfig,
+        agent_env: Mapping[str, str],
+        redactor: Redactor,
+        judge: DangerJudge,
+    ) -> OpenedMcp | None:
+        opener = self._mcp_opener
+        if opener is None:
+            return None
+        return await opener(
+            config,
+            agent_env,
+            cwd=str(self._workspace_root),
+            redactor=redactor,
+            environ=self._environ,
+            judge=judge,
+            workspace=str(self._workspace_root),
+        )
+
+    async def _mcp_doctor(
+        self, config: CliConfig, agent_env: Mapping[str, str], judge: DangerJudge
+    ) -> tuple[list[str], OpenedMcp | None]:
+        """连上声明的 MCP 服务，列出协商版本和没装上的工具。没有服务、或没注入连接器时不连。"""
+        if not config.interop.mcp_servers or self._mcp_opener is None:
+            return [], None
+        redactor = host_redactor(self._environ, config.redaction_rules)
+        try:
+            opened = await self._open_mcp(config, agent_env, redactor, judge)
+        except Exception as exc:
+            detail = one_line(redactor.redact(f'{type(exc).__name__}: {exc}'))
+            return [f'mcp: failed（{detail}）'], None
+        if opened is None:
+            return [], None
+        return list(doctor_lines(opened)), opened
 
     async def assemble_session(
         self,
@@ -3019,16 +3148,22 @@ class RuntimeCliHost:
         runtime: Runtime | None = None
         subscription: Subscription | None = None
         session_lock: SessionLock | None = None
+        opened_mcp: OpenedMcp | None = None
+        models: Mapping[str, LLM] = {}
         try:
             tools = local_tools(
                 workspace.portal(),
                 output_limit=_OUTPUT_LIMIT,
                 artifact_kinds=self._artifact_handlers.kinds,
             )
+            _prepare(self._prepare_models, config)
             models: Mapping[str, LLM] = {
                 name: self._model_factory(name) for name in _model_names(config)
             }
             judge, policy = dev_danger_options(self._workspace_root)
+            opened_mcp = await self._open_mcp(config, environment.values, redactor, judge)
+            if opened_mcp is not None:
+                judge = opened_mcp.judge
             factories = catalog.freeze(
                 tools,
                 models,
@@ -3046,9 +3181,12 @@ class RuntimeCliHost:
                 self._environ,
                 configured=self._configured_modules(config, environment.values, goal=goal),
             )
+            if opened_mcp is not None:
+                modules = (*modules, opened_mcp.module)
             # 会话是落盘的 run 产物，和 trace 一样受「关了录制就不往磁盘写」约束。但 resume 是显式续
             # 一份已存的会话，无论录制开没开都要有 SessionStore 才读得到、续得上。
             want_sessions = recording.recorder is not None or resume is not None
+            runtime_confirmation = MailboxConfirmationHandler(timeout=_CONFIRMATION_TIMEOUT)
             runtime = Runtime(
                 agents=factories,
                 orchestration=_ORCHESTRATION,
@@ -3056,7 +3194,7 @@ class RuntimeCliHost:
                 flags=resolved_flags(
                     config.flags, {}, (item for module in modules for item in module.flags)
                 ),
-                confirmation_handler=MailboxConfirmationHandler(timeout=_CONFIRMATION_TIMEOUT),
+                confirmation_handler=runtime_confirmation,
                 tracer=recording.recorder,
                 untrusted_output_modules=self._untrusted_output(config, trusted_output),
                 workspace=workspace,
@@ -3068,6 +3206,20 @@ class RuntimeCliHost:
                 budget=budget,
             )
             subscription = runtime.events.subscribe()
+            _bind_hosted(
+                models,
+                runtime,
+                tools,
+                ExternalCallPolicy(
+                    judge=judge,
+                    policy=policy,
+                    guard=dev_guard_judge(self._workspace_root),
+                    confirm=runtime_confirmation,
+                ),
+                agent_env=environment.values,
+                host_env=self._environ,
+                redactor=redactor,
+            )
             if resume is not None:
                 # 先加锁再恢复：挡住另一个进程同时续同一份会话（last-writer 会丢一段工作，B-01）。
                 session_lock = acquire_session_lock(session_root(self._workspace_root), resume)
@@ -3099,6 +3251,7 @@ class RuntimeCliHost:
                 recording=recording,
                 redactor=redactor,
                 lock=session_lock,
+                hosted=tuple(model for model in models.values() if hasattr(model, 'aclose')),
             )
         except BaseException as exc:
             try:
@@ -3106,6 +3259,9 @@ class RuntimeCliHost:
                     session_lock.release()
                 if runtime is not None:
                     await runtime.shutdown()
+                elif opened_mcp is not None:
+                    await opened_mcp.aclose()
+                await _close_hosted(models)
                 if subscription is not None:
                     subscription.close()
                 await workspace.close()
@@ -3125,6 +3281,7 @@ class RuntimeCliHost:
         共用。"""
         try:
             await parts.runtime.shutdown()
+            await _close_hosted(parts.hosted)
             # Runtime 关了，泵即使收到答复也送不出去；它可能正等着人敲回车，不取消就一直等。
             if pump is not None:
                 pump.cancel()
@@ -3373,6 +3530,8 @@ class RuntimeCliHost:
             output_limit=_OUTPUT_LIMIT,
             artifact_kinds=self._artifact_handlers.kinds,
         )
+        opened_mcp: OpenedMcp | None = None
+        models: Mapping[str, LLM] = {}
         try:
             with _CaptureRuntimeErrors() as runtime_errors:
                 # Module 与 Flag 先于模型定下：取值写错要在建任何模型之前就失败。
@@ -3402,15 +3561,23 @@ class RuntimeCliHost:
                     on_exhausted=request.on_exhausted,
                 )
                 model_names = _model_names(config)
-                models: Mapping[str, LLM] = {
-                    name: self._model_factory(name) for name in model_names
-                }
+                _prepare(self._prepare_models, config)
+                models = {name: self._model_factory(name) for name in model_names}
                 facts = HostFacts(
                     os=platform.system().lower(),
                     platform=platform.platform(),
                     shell=_SHELL,
                 )
                 judge, policy = dev_danger_options(self._workspace_root)
+                opened_mcp = await self._open_mcp(
+                    config,
+                    environment.values,
+                    host_redactor(self._environ, config.redaction_rules),
+                    judge,
+                )
+                if opened_mcp is not None:
+                    judge = opened_mcp.judge
+                    modules = (*modules, opened_mcp.module)
                 per_role = role_policies(judge, config.danger_roles)
                 factories = catalog.freeze(
                     tools,
@@ -3432,12 +3599,13 @@ class RuntimeCliHost:
                         danger_policy=policy,
                         role_policies=per_role,
                     )
+                run_confirmation = MailboxConfirmationHandler(timeout=_CONFIRMATION_TIMEOUT)
                 runtime = Runtime(
                     agents={} if request.topology is not None else factories,
                     orchestration=_ORCHESTRATION,
                     modules=modules,
                     flags=resolved,
-                    confirmation_handler=MailboxConfirmationHandler(timeout=_CONFIRMATION_TIMEOUT),
+                    confirmation_handler=run_confirmation,
                     tracer=tracer,
                     ids=None if tracer is None else tracer.ids,
                     untrusted_output_modules=untrusted,
@@ -3454,6 +3622,20 @@ class RuntimeCliHost:
                     ),
                     artifacts=self._artifact_index(modules),
                     budget=budget,
+                )
+                _bind_hosted(
+                    models,
+                    runtime,
+                    tools,
+                    ExternalCallPolicy(
+                        judge=judge,
+                        policy=policy,
+                        guard=dev_guard_judge(self._workspace_root),
+                        confirm=run_confirmation,
+                    ),
+                    agent_env=environment.values,
+                    host_env=self._environ,
+                    redactor=host_redactor(self._environ, config.redaction_rules),
                 )
                 if tracer is not None and tracer.level is not TraceLevel.STRUCTURE:
                     records = self._module_records(modules, config)
@@ -3582,9 +3764,14 @@ class RuntimeCliHost:
                         )
         finally:
             try:
-                await workspace.close()
+                await _close_hosted(models)
+                if opened_mcp is not None:
+                    await opened_mcp.aclose()
             finally:
-                environment.remove()
+                try:
+                    await workspace.close()
+                finally:
+                    environment.remove()
 
     async def _run_handoff(self, request: RunRequest, flags: Mapping[str, str]) -> CliOutcome:
         """D13：锁住工作区 → 运行前快照 → run → 复核 → 写交接文件 → git 收尾 → 重写并打印。

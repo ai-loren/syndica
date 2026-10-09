@@ -63,6 +63,7 @@ from syndica.kernel.errors import (
     ToolFatalError,
 )
 from syndica.kernel.events import Event, EventBus, Subscription
+from syndica.kernel.external_calls import ExternalCallPolicy, call_external
 from syndica.kernel.file_taint import FileTaint
 from syndica.kernel.hooks import (
     ExtensionJunction,
@@ -226,6 +227,7 @@ __all__ = [
     'Exhaustion',
     'ExitMode',
     'ExtensionJunction',
+    'ExternalCallPolicy',
     'FileSessionStore',
     'FileStat',
     'FileTaint',
@@ -331,6 +333,7 @@ __all__ = [
     'Workspace',
     'WorkspaceRouter',
     'WriteConflict',
+    'call_external',
     'encode_redacted',
     'flag_reference',
     'local_tools',

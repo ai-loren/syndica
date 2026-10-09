@@ -37,7 +37,18 @@ SURFACES = frozenset({'cli', 'server', 'runner'})
 ROOTS = frozenset({'__main__', 'serve'})
 KNOWN = SURFACES | ROOTS | {KERNEL, BACKENDS}
 FORBIDDEN_FROM_KERNEL = SURFACES | {BACKENDS}
-FORBIDDEN_KERNEL_EXTERNALS = frozenset({'yaml'})
+_PROTOCOL_SDK = '协议 SDK 只进 backend 或 surface，经各自的 extra 安装（spec §3.3）'
+# kernel 不得 import 的顶层包 → （违规说明里点名的发行名，它该在哪里）。
+# kernel 只允许标准库、pydantic 与一个 HTTP 客户端（httpx）；httpx2 是第二个，同样拒收。
+FORBIDDEN_KERNEL_EXTERNALS: dict[str, tuple[str, str]] = {
+    'yaml': ('PyYAML', '把 YAML 解析留在 cli / runner surface，再把 Mapping 交给 kernel'),
+    'mcp': ('mcp', _PROTOCOL_SDK),
+    'mcp_types': ('mcp', _PROTOCOL_SDK),
+    'acp': ('agent-client-protocol', _PROTOCOL_SDK),
+    'a2a': ('a2a-sdk', _PROTOCOL_SDK),
+    'openai': ('openai', _PROTOCOL_SDK),
+    'httpx2': ('httpx2', 'kernel 的 HTTP 客户端只有 httpx；需要 httpx2 的 SDK 留在 backend'),
+}
 
 
 class LayoutError(Exception):
@@ -186,10 +197,11 @@ def check(root: Path) -> list[str]:
                 if module and module[0] in FORBIDDEN_KERNEL_EXTERNALS
             )
             for imported in forbidden:
+                distribution, remedy = FORBIDDEN_KERNEL_EXTERNALS[imported]
                 violations.append(
-                    f'{rel}: kernel imports external package {imported!r} (PyYAML). '
+                    f'{rel}: kernel imports external package {imported!r} ({distribution}). '
                     'kernel 只允许标准库、pydantic 与一个 HTTP 客户端；'
-                    '把 YAML 解析留在 cli / runner surface，再把 Mapping 交给 kernel。'
+                    f'{remedy}。'
                 )
         for imported in sorted(_imported_components(modules)):
             message = _violation(rel, owner, imported)

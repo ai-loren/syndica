@@ -2302,6 +2302,7 @@ def test_the_free_text_attributes_are_exactly_these():
         'module.version',
         'progress.regressed',
         'tool.call_id',
+        'tool.caller',
         'tool.name',
         'verdict.needs_human',
         'verdict.outcomes',

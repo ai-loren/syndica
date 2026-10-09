@@ -6,7 +6,8 @@ import os
 import re
 import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -24,11 +25,11 @@ from syndica.cli.main import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
+    from syndica.cli.config import CliConfig
     from syndica.cli.host import RuntimeCliHost
+    from syndica.cli.mcp_session import OpenedMcp
     from syndica.cli.trace_commands import Replayed
-    from syndica.kernel import LLM, ScenarioDocument, TraceRecorder, TraceStore
+    from syndica.kernel import LLM, DangerJudge, ScenarioDocument, TraceRecorder, TraceStore
     from syndica.kernel.budget import PriceTable
     from syndica.kernel.redaction import Redactor
 
@@ -420,21 +421,188 @@ async def _export_trace(
     return await exporter.export(store, trace_id)
 
 
+async def _open_mcp(
+    config: CliConfig,
+    agent_env: Mapping[str, str],
+    *,
+    cwd: str,
+    redactor: Redactor,
+    environ: Mapping[str, str],
+    judge: DangerJudge,
+    workspace: str,
+) -> OpenedMcp | None:
+    """组合根把 MCP backend 接上。没有声明的服务时不导入额外依赖。"""
+    if not config.interop.mcp_servers:
+        return None
+    try:
+        from syndica.backends.mcp.client import connect_http, connect_stdio
+        from syndica.backends.mcp.module import assign_roles, mcp_module
+        from syndica.backends.mcp.tools import McpJudge
+    except ImportError as exc:
+        from syndica.kernel import ConfigError
+
+        raise ConfigError(
+            expected="MCP 客户端已安装（pip install 'syndica[mcp]'）",
+            received=f'导入失败：{exc}',
+            next_action="运行 pip install 'syndica[mcp]' 后重试",
+        ) from exc
+    from syndica.cli.mcp_session import McpPorts, open_mcp_clients
+
+    return await open_mcp_clients(
+        config,
+        agent_env,
+        cwd=cwd,
+        redactor=redactor,
+        environ=environ,
+        judge=judge,
+        workspace=workspace,
+        ports=McpPorts(
+            connect_stdio=connect_stdio,
+            connect_http=connect_http,
+            assign_roles=assign_roles,
+            make_module=mcp_module,
+            wrap_judge=McpJudge,
+        ),
+    )
+
+
+# 组合根在解析模型名之前把这份配置里的 ACP Agent 放进来。工厂只拿到名字，命令在这里。
+_ACP_SPECS: ContextVar[Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]] | None] = ContextVar(
+    'syndica_acp_specs', default=None
+)
+
+
+def _remember_acp(config: CliConfig, workspace: Path, environ: Mapping[str, str]) -> None:
+    from syndica.cli.interop_config import interop_credentials_path, load_interop_credentials
+
+    credentials: Mapping[str, Any] = {}
+    path = interop_credentials_path(environ)
+    if path is not None:
+        credentials = load_interop_credentials(path, workspace=workspace)
+    specs: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    for agent in config.interop.acp_agents:
+        extra = agent.pass_env
+        cred = credentials.get(f'acp:{agent.name}')
+        if cred is not None:
+            extra = (*extra, *tuple(cred.env))
+        specs[agent.name] = (agent.command, extra)
+    _ACP_SPECS.set(specs)
+
+
+def _acp_model(name: str) -> LLM:
+    from syndica.kernel import ConfigError
+
+    key = name.split(':', 1)[1]
+    specs = _ACP_SPECS.get()
+    if specs is None or key not in specs:
+        declared = () if specs is None else tuple(sorted(specs))
+        raise ConfigError(
+            expected=f'{name} 指向这份配置的 interop.acp.agents 里已声明的名字',
+            received=f'没有 {key!r}；已声明 {declared!r}',
+            next_action=(
+                '在 interop.acp.agents 里加上这个 name，或把角色的 model 改成已经声明的 acp:<名字>'
+            ),
+        )
+    command, extra = specs[key]
+    try:
+        from syndica.backends.acp import AcpAgentModel
+    except ImportError as exc:
+        raise ConfigError(
+            expected="ACP 客户端已安装（pip install 'syndica[acp]'）",
+            received=f'导入失败：{exc}',
+            next_action="运行 pip install 'syndica[acp]' 后重试",
+        ) from exc
+    return AcpAgentModel(key, command=command, pass_env=extra)
+
+
+_A2A_SPECS: ContextVar[Mapping[str, tuple[str, str | None]] | None] = ContextVar(
+    'syndica_a2a_specs', default=None
+)
+
+
+def _remember_a2a(config: CliConfig, workspace: Path, environ: Mapping[str, str]) -> None:
+    from syndica.cli.interop_config import interop_credentials_path, load_interop_credentials
+    from syndica.kernel import ConfigError
+
+    credentials: Mapping[str, Any] = {}
+    path = interop_credentials_path(environ)
+    if path is not None:
+        credentials = load_interop_credentials(path, workspace=workspace)
+    specs: dict[str, tuple[str, str | None]] = {}
+    for agent in config.interop.a2a_agents:
+        cred = credentials.get(f'a2a:{agent.name}')
+        bearer: str | None = None
+        if cred is not None and cred.bearer_env:
+            variable = str(cred.bearer_env)
+            value = environ.get(variable)
+            if value is None or not value:
+                raise ConfigError(
+                    expected=f'环境变量 {variable} 有值，用作 A2A Agent {agent.name!r} 的 bearer',
+                    received=f'{variable} 没有设置',
+                    next_action=(
+                        f'在启动 Syndica 的环境里设置 {variable}，'
+                        '或从用户级 interop.yaml 去掉这个 bearer_env'
+                    ),
+                )
+            bearer = value
+        specs[agent.name] = (agent.url, bearer)
+    _A2A_SPECS.set(specs)
+
+
+def _a2a_model(name: str) -> LLM:
+    from syndica.kernel import ConfigError
+
+    key = name.split(':', 1)[1]
+    specs = _A2A_SPECS.get()
+    if specs is None or key not in specs:
+        declared = () if specs is None else tuple(sorted(specs))
+        raise ConfigError(
+            expected=f'{name} 指向这份配置的 interop.a2a.agents 里已声明的名字',
+            received=f'没有 {key!r}；已声明 {declared!r}',
+            next_action=(
+                '在 interop.a2a.agents 里加上这个 name，或把角色的 model 改成已经声明的 a2a:<名字>'
+            ),
+        )
+    url, bearer = specs[key]
+    try:
+        from syndica.backends.a2a import A2AAgentModel
+    except ImportError as exc:
+        raise ConfigError(
+            expected="A2A 客户端已安装（pip install 'syndica[a2a]'）",
+            received=f'导入失败：{exc}',
+            next_action="运行 pip install 'syndica[a2a]' 后重试",
+        ) from exc
+    return A2AAgentModel(key, url, bearer=bearer)
+
+
 def build_host(io: CliIO, workspace_root: Path) -> RuntimeCliHost:
     """CLI 与 server 用同一个宿主：模型、价格、回放、导出、信任都在这里接一次。"""
     from syndica.cli.host import RuntimeCliHost
     from syndica.cli.modules import installed_entry_points
     from syndica.cli.trust import real_trust_gate
 
+    def prepare(config: CliConfig) -> None:
+        _remember_acp(config, workspace_root, os.environ)
+        _remember_a2a(config, workspace_root, os.environ)
+
+    def model_factory(name: str) -> LLM:
+        if name.startswith('acp:'):
+            return _acp_model(name)
+        if name.startswith('a2a:'):
+            return _a2a_model(name)
+        return _configured_model(name)
+
     return RuntimeCliHost(
         io=io,
-        model_factory=_configured_model,
+        model_factory=model_factory,
         workspace_root=workspace_root,
+        prepare_models=prepare,
         replayer=_replay_document,
         exporter=_export_trace,
         entry_points=installed_entry_points,
         trust=real_trust_gate(),
         prices=_default_prices(),
+        mcp_opener=_open_mcp,
     )
 
 
@@ -445,7 +613,13 @@ class _ServerControl:
         self._io = io
 
     def up(
-        self, config: str, *, port: int, foreground: bool, open_browser: bool
+        self,
+        config: str,
+        *,
+        port: int,
+        foreground: bool,
+        open_browser: bool,
+        api_token: bool = False,
     ) -> str | CliOutcome:
         from syndica.serve import up
 
@@ -457,6 +631,7 @@ class _ServerControl:
             port=port,
             foreground=foreground,
             open_browser=open_browser,
+            api_token=api_token,
         )
 
     def down(self) -> str | CliOutcome:
@@ -468,6 +643,43 @@ class _ServerControl:
         from syndica.serve import status
 
         return status(Path.cwd(), os.environ)
+
+    def acp(self, config: str) -> str:
+        """stdio ACP agent。Agent 的命令环境里拒绝：stdout 只放协议。"""
+        from syndica.cli.environment import AGENT_MARKER
+        from syndica.kernel import ConfigError
+        from syndica.serve import acp_stdio
+
+        if os.environ.get(AGENT_MARKER) == '1':
+            raise ConfigError(
+                expected='syndica acp 在人的环境里跑，stdout 只放协议',
+                received=f'环境里 {AGENT_MARKER}=1，这是 Agent 的命令环境',
+                next_action='不要在 Agent 的命令里启动 syndica acp；在人的终端里跑',
+            )
+        host = build_host(self._io, Path.cwd())
+        try:
+            return acp_stdio(host, config)
+        finally:
+            host.close()
+
+    def mcp(self, config: str) -> str:
+        """stdio MCP server。Agent 的命令环境里拒绝：stdout 只放协议，不能再套一层 Agent。"""
+        from syndica.cli.environment import AGENT_MARKER
+        from syndica.kernel import ConfigError
+        from syndica.serve import mcp_stdio
+
+        if os.environ.get(AGENT_MARKER) == '1':
+            raise ConfigError(
+                expected='syndica mcp 在人的环境里跑，stdout 只放协议',
+                received=f'环境里 {AGENT_MARKER}=1，这是 Agent 的命令环境',
+                next_action='不要在 Agent 的命令里启动 syndica mcp；在人的终端里跑',
+            )
+        host = build_host(self._io, Path.cwd())
+        try:
+            # 空串：stdio 的 stdout 只放协议，进程退出时不再补一行说明。
+            return mcp_stdio(host, config)
+        finally:
+            host.close()
 
 
 class _LazyHost:

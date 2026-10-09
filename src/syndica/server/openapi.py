@@ -112,7 +112,33 @@ PATHS: tuple[
         '对产物的反馈，落成提议的 Rubric',
     ),
     ('get', '/api/v1/sessions/{sid}/rubrics', None, 200, RubricList, True, 'Goal 与 Rubric'),
+    (
+        'get',
+        '/.well-known/agent-card.json',
+        None,
+        200,
+        None,
+        False,
+        'A2A agent card（公开，只含角色名与描述）',
+    ),
+    ('post', '/a2a/', None, 200, None, True, 'A2A JSON-RPC（v1.0 与 0.3）'),
+    ('get', '/mcp', None, 200, None, True, 'MCP Streamable HTTP'),
+    ('post', '/mcp', None, 200, None, True, 'MCP Streamable HTTP'),
+    ('delete', '/mcp', None, 200, None, True, 'MCP Streamable HTTP'),
+    ('get', '/v1/models', None, 200, None, True, 'OpenAI 兼容：角色列表'),
+    ('post', '/v1/chat/completions', None, 200, None, True, 'OpenAI Chat Completions'),
+    ('post', '/v1/responses', None, 200, None, True, 'OpenAI Responses'),
 )
+
+# 这些路径的报文是对方协议的，文档只引用、不展开。
+_PROTOCOL: dict[str, str] = {
+    '/.well-known/agent-card.json': 'a2a',
+    '/a2a/': 'a2a',
+    '/mcp': 'mcp',
+    '/v1/models': 'openai',
+    '/v1/chat/completions': 'openai',
+    '/v1/responses': 'openai',
+}
 
 # server 自己发的事件种类（不在内核事件表里）与各自 payload 里必有的键。
 SERVER_EVENTS: dict[str, tuple[str, ...]] = {
@@ -174,6 +200,12 @@ def _schemas() -> dict[str, Any]:
         for name, definition in schema.pop('$defs', {}).items():
             schemas[name] = definition
         schemas[model.__name__] = schema
+    schemas['ExternalProtocol'] = {
+        'type': 'object',
+        'description': '对方协议的报文，不在这份文档里展开',
+        'additionalProperties': True,
+        'x-syndica-protocol': True,
+    }
     return dict(sorted(schemas.items()))
 
 
@@ -188,16 +220,34 @@ def _operation(
     auth: bool,
     summary: str,
     path: str,
+    method: str,
 ) -> dict[str, Any]:
     operation: dict[str, Any] = {'summary': summary}
+    protocol = _PROTOCOL.get(path)
+    if protocol is not None:
+        operation['x-syndica-protocol'] = protocol
     if '{sid}' in path:
         operation['parameters'] = [
             {'name': 'sid', 'in': 'path', 'required': True, 'schema': {'type': 'string'}}
         ]
-    if request is not None:
+    if protocol is not None and method == 'post':
+        operation['requestBody'] = {
+            'required': True,
+            'content': {
+                'application/json': {'schema': {'$ref': _REF.format(model='ExternalProtocol')}}
+            },
+        }
+    elif request is not None:
         operation['requestBody'] = {'required': True, 'content': _json(request)}
     responses: dict[str, Any] = {}
-    if response is not None:
+    if protocol is not None:
+        responses[str(status)] = {
+            'description': summary,
+            'content': {
+                'application/json': {'schema': {'$ref': _REF.format(model='ExternalProtocol')}}
+            },
+        }
+    elif response is not None:
         responses[str(status)] = {'description': summary, 'content': _json(response)}
     elif path.endswith('events'):
         responses[str(status)] = {
@@ -231,7 +281,7 @@ def openapi() -> dict[str, Any]:
     paths: dict[str, dict[str, Any]] = {}
     for method, path, request, status, response, auth, summary in PATHS:
         paths.setdefault(path, {})[method] = _operation(
-            request, status, response, auth, summary, path
+            request, status, response, auth, summary, path, method
         )
     return {
         'openapi': '3.1.0',

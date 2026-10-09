@@ -88,7 +88,7 @@ class LiveSession:
         if request is not None:
             pending = Pending(str(payload.get('request_id')), request, event.agent_id, payload)
             self.pending[pending.request_id] = pending
-            if self._live.unattended:
+            if self._live.unattended and not self.holds_question(pending):
                 self._spawn(self._decline(pending))
         elif event.kind == 'human_request_resolved':
             self.pending.pop(str(payload.get('request_id')), None)
@@ -214,8 +214,15 @@ class LiveSession:
         else:
             await self.handle.abort(pending.agent_id)
 
+    def holds_question(self, pending: Pending) -> bool:
+        if pending.kind not in {'user_input', 'user_question'}:
+            return False
+        return self.sid in self._live.hold_questions
+
     def decline_all(self) -> None:
         for pending in list(self.pending.values()):
+            if self.holds_question(pending):
+                continue
             self._spawn(self._decline(pending))
 
     async def snapshot(self) -> dict[str, Any]:
@@ -272,6 +279,9 @@ class Live:
         self.stream = Stream()
         self.sessions: dict[str, LiveSession] = {}
         self.unattended = False
+        # 这些会话的提问不按无人值守中止：A2A 要把它交成 INPUT_REQUIRED，等对端下一条消息来答。
+        # 确认不在这里，仍是有人就等、没人就拒绝。
+        self.hold_questions: set[str] = set()
         self._grace_s = grace_s
         self._connections = 0
         self._timer: asyncio.Task[None] | None = None

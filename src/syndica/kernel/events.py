@@ -116,6 +116,9 @@ KERNEL_EVENTS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         'agent_status': ('status',),
         'agent_removed': (),
         'artifact_registered': ('ref', 'note'),
+        # 外部 Agent 自己报告的活动（ACP / A2A / MCP）。只进时间线：不进轨迹、不参与工具配对。
+        # 缺任一键，界面就分不出是谁、在做什么、做到哪了。
+        'external_activity': ('source', 'name', 'activity_id', 'kind', 'status', 'title'),
     }
 )
 

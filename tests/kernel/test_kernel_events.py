@@ -165,6 +165,7 @@ def test_the_kernel_event_table_is_exact():
         'agent_status': ('status',),
         'agent_removed': (),
         'artifact_registered': ('ref', 'note'),
+        'external_activity': ('source', 'name', 'activity_id', 'kind', 'status', 'title'),
     }
 
 

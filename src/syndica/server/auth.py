@@ -67,6 +67,16 @@ class Credentials:
         self._tokens.append(token)
         return token
 
+    def issue_api_token(self) -> str:
+        """机器客户端的 Bearer 令牌。与浏览器换来的令牌同一套校验，只活在这个进程的内存里。
+
+        调用方只该把它打印给启动 server 的那个人一次。写进状态文件或配置，重启之后它仍然
+        失效，但磁盘上已经留下一份能调用本机接口的凭证。
+        """
+        token = secrets.token_urlsafe(32)
+        self._tokens.append(token)
+        return token
+
     def valid(self, token: object) -> bool:
         if not isinstance(token, str) or not token:
             return False

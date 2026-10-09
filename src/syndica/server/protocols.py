@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal
 from typing import Any, Protocol
 
-from syndica.kernel import Budget, DeliveryResult, Redactor, Subscription
+from syndica.kernel import Budget, DeliveryResult, Redactor, Subscription, Tool
 
 __all__ = ['AskBudget', 'SessionAssembly', 'SessionHandle', 'Terminal']
 
@@ -45,6 +45,10 @@ class SessionHandle(Protocol):
 
     async def deliver(self, target: str, text: str) -> DeliveryResult:
         """发一条人的消息给会话里的一个 Agent（与 chat 同一条投递路径）。"""
+        ...
+
+    def install_tools(self, tools: Mapping[str, Tool]) -> None:
+        """把调用方的代理工具装进根 Agent。撞上已有名字时抛 ConfigError，不覆盖。"""
         ...
 
     async def answer(self, agent_id: str, request_id: str, text: str) -> DeliveryResult:

@@ -849,7 +849,7 @@ async def test_unreadable_names_each_directory_traces_skips_with_why_and_logs_no
         value.update(change)
         path.write_text(json.dumps(value), encoding='utf-8')
 
-    rewrite(newer, {'schema': 'syndica.trace/7'})
+    rewrite(newer, {'schema': 'syndica.trace/8'})
     rewrite(broken, {'started_ns': 'later'})
     shutil.copytree(directories[_TRACE[:8]], root / 'copy')
     caplog.clear()
@@ -862,7 +862,7 @@ async def test_unreadable_names_each_directory_traces_skips_with_why_and_logs_no
     reasons = {name: (received, next_action) for name, received, next_action in skipped}
     assert [header.trace_id for header in listed] == [_TRACE]
     assert [name for name, _, _ in skipped] == sorted(names)
-    assert 'syndica.trace/7' in reasons[names[0]][0] and '不要删掉' in reasons[names[0]][1]
+    assert 'syndica.trace/8' in reasons[names[0]][0] and '不要删掉' in reasons[names[0]][1]
     assert '读不进来' in reasons[names[1]][0] and '删掉这个目录' in reasons[names[1]][1]
     assert '被改名或复制出来的' in reasons['copy'][0]
     assert quiet == []

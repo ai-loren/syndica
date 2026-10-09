@@ -47,3 +47,17 @@
 - `sessions/{sid}/resume` 收一个可选的请求体 `ResumeSession`（`budget`，与建会话同一套严格校验）。
   tokens / cost / turns 不给就沿用会话里存的上限；墙钟不存进会话，要限就在每次恢复时给，从这一刻起算。
   会话已经开着时带预算返回 409（预算只在打开时生效），不带预算照旧交回那个开着的会话。
+
+## 2026-10-09 · `aefdf03abce0` · 外部活动事件（追加，不破坏）
+
+- 事件种类加 `external_activity`。必有键：`source`（`acp` / `a2a` / `mcp`）、`name`、`activity_id`、
+  `kind`、`status`、`title`。外部 Agent 自己报告的工具调用与计划进时间线，只是展示，不进轨迹、
+  不参与工具调用配对。旧客户端忽略不认识的种类即可。
+
+## 2026-10-09 · `ab8ab7901630` · 协议路由（追加，不破坏）
+
+- 路由：`GET /.well-known/agent-card.json`（公开）、`POST /a2a/`、`GET/POST/DELETE /mcp`、
+  `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`。都在静态兜底之前，除 agent card
+  外要 Bearer。标 `x-syndica-protocol`，请求与响应体只引用 `ExternalProtocol`，不展开对方协议。
+- 没装对应 extra 时这些路由交回 501，`next_action` 指向 `pip install 'syndica[mcp]'` 或
+  `syndica[a2a]`。OpenAI 兼容路由不另装包。

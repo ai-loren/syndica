@@ -1,0 +1,3 @@
+{"messages": [{"content": "hello", "role": "user"}], "model": "Worker", "temperature": 0}
+{"status": 200, "x-should-retry": null, "x-syndica-ignored": "temperature", "x-syndica-session": "SID"}
+{"choices": [{"finish_reason": "stop", "index": 0, "message": {"content": "from the worker", "role": "assistant"}}], "created": 0, "id": "chatcmpl-ID", "model": "Worker", "object": "chat.completion"}

@@ -40,6 +40,7 @@ from syndica.kernel import (
     Redactor,
     Runtime,
     Subscription,
+    Tool,
     WorkspaceRouter,
 )
 from syndica.kernel.acceptance_inject import meaningful_quote
@@ -78,6 +79,23 @@ class ServerSession:
 
     async def deliver(self, target: str, text: str) -> DeliveryResult:
         return await self.runtime.send(target, text)
+
+    def install_tools(self, tools: Mapping[str, Tool]) -> None:
+        agent = self.runtime._table.get(self.root_id)  # pyright: ignore[reportPrivateUsage]
+        if agent is None:
+            raise ConfigError(
+                expected='根 Agent 已经在表里',
+                received='找不到它',
+                next_action='这是 server 的内部错误，重开一次请求',
+            )
+        clash = sorted(set(tools) & set(agent.options.tools))
+        if clash:
+            raise ConfigError(
+                expected='客户端工具名不与 Syndica 工具重名',
+                received=f'撞上 {clash!r}',
+                next_action='给客户端工具换一个名字，例如 client_lookup',
+            )
+        agent.install_runtime_tools(dict(tools))
 
     async def answer(self, agent_id: str, request_id: str, text: str) -> DeliveryResult:
         return await answer_request(self.runtime, agent_id, request_id, text)

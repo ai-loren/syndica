@@ -227,6 +227,11 @@ function summary(kind: string, payload: Record<string, unknown>): string {
       return text(payload.stop_reason);
     case 'agent_spawned':
       return text(payload.name);
+    case 'external_activity':
+      return [payload.source, payload.name, payload.kind, payload.status, payload.title]
+        .map(text)
+        .filter((part) => part.length > 0)
+        .join(' ');
     default:
       return '';
   }

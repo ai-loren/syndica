@@ -64,7 +64,10 @@ def dev_danger_options(workspace_root: Path) -> tuple[DangerJudge, RuleTablePoli
 
 
 def dev_table() -> dict[str, Disposition]:
-    """开发期判定器里每条规则的处置。键就是这张判定器认得的全部规则 ID，与工作区根无关。"""
+    """开发期判定器里每条规则的处置，外加 mcp.external_tool。
+
+    那条规则只有装了 MCP 的判定器才会发出。键与工作区根无关。
+    """
     table = {rule.rule_id: Disposition.BLOCK for rule in DEFAULT_RULES}
     table.update(
         {
@@ -72,6 +75,9 @@ def dev_table() -> dict[str, Disposition]:
             'shell.workspace_root_removal': Disposition.BLOCK,
             # 越界问人：它只在可信轨迹里到得了人手上；读过命令输出之后按 untrusted_high_risk 走。
             'shell.path_outside_workspace': Disposition.CONFIRM,
+            # 处置表按规则 ID 不分等级，所以这条的 LOW 与 HIGH 在开发期都问人。
+            # 轨迹里已有不可信内容时，HIGH 到不了这张表，按 untrusted_high_risk 拒绝。
+            'mcp.external_tool': Disposition.CONFIRM,
         }
     )
     return table

@@ -44,6 +44,8 @@ _COMMANDS = frozenset(
         'up',
         'down',
         'status',
+        'mcp',
+        'acp',
         'version',
         'trace',
     }
@@ -155,7 +157,13 @@ class ServerControl(Protocol):
     """`up` / `down` / `status`：由组合根实现（server 是另一个 surface，CLI 不 import 它）。"""
 
     def up(
-        self, config: str, *, port: int, foreground: bool, open_browser: bool
+        self,
+        config: str,
+        *,
+        port: int,
+        foreground: bool,
+        open_browser: bool,
+        api_token: bool = False,
     ) -> str | CliOutcome: ...
 
     def down(self) -> str | CliOutcome: ...
@@ -181,6 +189,7 @@ def _server_command(
                 port=namespace.port,
                 foreground=namespace.foreground,
                 open_browser=not namespace.no_open,
+                api_token=namespace.api_token,
             ),
             streams,
         )
@@ -434,8 +443,15 @@ def _parser() -> _ArgumentParser:
     up.add_argument('--port', type=_port, default=0, help='监听端口；不给就由系统挑一个空闲的')
     up.add_argument('--foreground', action='store_true', help='在前台跑，Ctrl-C 停')
     up.add_argument('--no-open', action='store_true', help='不自动打开浏览器')
+    up.add_argument(
+        '--api-token',
+        action='store_true',
+        help='额外打印一次机器客户端的 Bearer 令牌（只在这个 server 进程的内存里，重启即失效）',
+    )
     commands.add_parser('down', help='停掉这个工作区的 Web 服务（会话先存盘）')
     commands.add_parser('status', help='这个工作区的 Web 服务在不在跑')
+    commands.add_parser('mcp', help='以 MCP server 暴露本工作区的工具（stdio）')
+    commands.add_parser('acp', help='以 ACP agent 接受编辑器的会话（stdio）')
     commands.add_parser('version')
     trace = commands.add_parser('trace')
     trace_actions = trace.add_subparsers(dest='action', required=True)
@@ -748,6 +764,28 @@ def _route(
         return 0
     if namespace.command in ('up', 'down', 'status'):
         return _server_command(namespace, server, streams)
+    if namespace.command == 'acp':
+        runner = None if server is None else getattr(server, 'acp', None)
+        if runner is None:
+            _write(
+                streams.stderr,
+                '期望: acp 由带 server 控制面的入口启动\n'
+                '实际: 当前入口没有注入 server.acp\n'
+                '下一步: 通过 python -m syndica 启动，不要用没有接上 ACP 的测试入口',
+            )
+            return 2
+        return _host_call(lambda: runner(namespace.config), streams)
+    if namespace.command == 'mcp':
+        runner = None if server is None else getattr(server, 'mcp', None)
+        if runner is None:
+            _write(
+                streams.stderr,
+                '期望: mcp 由带 server 控制面的入口启动\n'
+                '实际: 当前入口没有注入 server.mcp\n'
+                '下一步: 通过 python -m syndica 启动，不要用没有接上 MCP 服务的测试入口',
+            )
+            return 2
+        return _host_call(lambda: runner(namespace.config), streams)
     if namespace.command == 'memory':
         if host is None:
             _write(

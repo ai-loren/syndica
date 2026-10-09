@@ -1,0 +1,25 @@
+{
+  "artifacts": [
+    {
+      "artifactId": "ART",
+      "name": "answer",
+      "parts": [
+        {
+          "text": "Worker:hello"
+        }
+      ]
+    }
+  ],
+  "contextId": "CONTEXT",
+  "id": "TASK",
+  "status": {
+    "message": {
+      "parts": [
+        {
+          "text": "Worker:hello"
+        }
+      ]
+    },
+    "state": "TASK_STATE_COMPLETED"
+  }
+}

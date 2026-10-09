@@ -1,5 +1,5 @@
 // 由 scripts/gen-events.mjs 从 docs/reference/openapi.json 生成；不要手改。
-export const EVENT_KINDS = ["agent_end","agent_error","agent_removed","agent_spawned","agent_start","agent_status","artifact_registered","budget_changed","budget_exhausted","budget_question","budget_question_resolved","compaction","goal_drift","human_request_resolved","message_appended","progress_measured","progress_regressed","progress_stalled","reset","session_closed","session_opened","tool_call_finished","tool_call_started","tool_confirmation_requested","transcript_reset","turn_end","turn_start","user_input_requested","user_question_requested"] as const;
+export const EVENT_KINDS = ["agent_end","agent_error","agent_removed","agent_spawned","agent_start","agent_status","artifact_registered","budget_changed","budget_exhausted","budget_question","budget_question_resolved","compaction","external_activity","goal_drift","human_request_resolved","message_appended","progress_measured","progress_regressed","progress_stalled","reset","session_closed","session_opened","tool_call_finished","tool_call_started","tool_confirmation_requested","transcript_reset","turn_end","turn_start","user_input_requested","user_question_requested"] as const;
 export type EventKind = (typeof EVENT_KINDS)[number];
 export const RPC_OPS = ["abort","activate_rubric","answer","auth","budget_answer","grant","send"] as const;
 export type RpcOp = (typeof RPC_OPS)[number];
@@ -16,6 +16,7 @@ export interface EventPayloads {
   budget_question: { request_id: unknown; view: unknown; [key: string]: unknown };
   budget_question_resolved: { request_id: unknown; [key: string]: unknown };
   compaction: { trigger: unknown; blocks_before: unknown; blocks_after: unknown; tokens_before: unknown; tokens_after: unknown; [key: string]: unknown };
+  external_activity: { source: unknown; name: unknown; activity_id: unknown; kind: unknown; status: unknown; title: unknown; [key: string]: unknown };
   goal_drift: { confirmed: unknown; [key: string]: unknown };
   human_request_resolved: { request_id: unknown; outcome: unknown; [key: string]: unknown };
   message_appended: { generation: unknown; index: unknown; block: unknown; [key: string]: unknown };

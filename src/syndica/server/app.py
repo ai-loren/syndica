@@ -10,7 +10,8 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -18,13 +19,14 @@ from urllib.parse import quote
 
 from pydantic import BaseModel, ValidationError
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import FileResponse, Response, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from syndica.kernel import Budget, Redactor, SyndicaError
+from syndica.kernel import Budget, ConfigError, Redactor, SyndicaError
 from syndica.server.auth import SECURITY_HEADERS, Credentials, check_host, check_origin
 from syndica.server.errors import ApiError, error_body
 from syndica.server.live import Live, LiveSession
@@ -56,8 +58,9 @@ from syndica.server.models import (
     TraceList,
 )
 from syndica.server.outbound import encoded, json_response, sse_frame
+from syndica.server.protocol_routes import PROTOCOL_ROUTES, protocol_handler
 
-__all__ = ['MAX_STREAMS', 'ServerSettings', 'create_app']
+__all__ = ['MAX_STREAMS', 'AppAdapter', 'ProtocolMount', 'ServerSettings', 'create_app']
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +72,41 @@ _AUTH_TIMEOUT_S = 5.0
 _PTY_LINE_CAP = 16_384
 _ModelT = TypeVar('_ModelT', bound=BaseModel)
 _Handler = Callable[[Request], Awaitable[Response]]
+
+
+class AppAdapter:
+    """组合根挂上来的额外路由。`lifespan` 在请求开始前进入、server 关闭时退出。
+
+    协议路由不走这里：它们始终在，缺 extra 时自己交回 501。适配只增加路由，不能撤掉已有的。
+    """
+
+    def __init__(
+        self,
+        routes: Sequence[Route],
+        *,
+        lifespan: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+    ) -> None:
+        self.routes = tuple(routes)
+        self.lifespan = lifespan
+
+
+class ProtocolMount:
+    """换掉一条已经登记的协议路由。路径必须在 `PROTOCOL_ROUTES` 里，适配不能另开一条。
+
+    `app` 是 ASGI（流式响应不经过 `Request -> Response`）。Bearer 仍由 `create_app` 套上，
+    公开与否以路由表为准。`lifespan` 在请求开始前进入、server 关闭时退出。
+    """
+
+    def __init__(
+        self,
+        path: str,
+        app: ASGIApp,
+        *,
+        lifespan: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+    ) -> None:
+        self.path = path
+        self.app = app
+        self.lifespan = lifespan
 
 
 class ServerSettings:
@@ -126,8 +164,84 @@ class _Guard:
         await self._app(scope, receive, with_headers)
 
 
-def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -> ASGIApp:
+def _protocol_mounts(mounts: Sequence[ProtocolMount]) -> dict[str, ProtocolMount]:
+    known = {path for path, _, _, _, _ in PROTOCOL_ROUTES}
+    by_path: dict[str, ProtocolMount] = {}
+    for mount in mounts:
+        if mount.path not in known:
+            raise ConfigError(
+                expected=f'protocol_mounts 的路径是已登记的协议路由：{sorted(known)}',
+                received=f'收到 {mount.path!r}',
+                next_action='用 PROTOCOL_ROUTES 里的路径；新路由先加进那张表',
+            )
+        if mount.path in by_path:
+            raise ConfigError(
+                expected=f'protocol_mounts 里 {mount.path} 只出现一次',
+                received='同一条路径挂了两次',
+                next_action='留下一个 ProtocolMount，删掉另一个',
+            )
+        by_path[mount.path] = mount
+    return by_path
+
+
+class _GuardedASGI:
+    """协议 ASGI 的 Bearer。Host 由外层 `_Guard` 查。公开路由不查令牌。"""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        credentials: Credentials,
+        redactor: Redactor,
+        *,
+        public: bool,
+    ) -> None:
+        self._app = app
+        self._credentials = credentials
+        self._redactor = redactor
+        self._public = public
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope['type'] == 'http' and not self._public:
+            try:
+                self._credentials.require(Headers(scope=scope).get('authorization'))
+            except ApiError as error:
+                response = _error(error, self._redactor)
+                await response(scope, receive, send)
+                return
+        await self._app(scope, receive, send)
+
+
+def _protocol_route(
+    path: str,
+    methods: tuple[str, ...],
+    *,
+    public: bool,
+    extra: str,
+    module: str,
+    mount: ProtocolMount | None,
+    credentials: Credentials,
+    redactor: Redactor,
+    guarded: Callable[..., _Handler],
+) -> Route:
+    if mount is None:
+        endpoint: ASGIApp | _Handler = guarded(
+            cast(_Handler, protocol_handler(extra, module)), public=public
+        )
+    else:
+        endpoint = _GuardedASGI(mount.app, credentials, redactor, public=public)
+    return Route(path, endpoint, methods=list(methods))
+
+
+def create_app(
+    live: Live,
+    credentials: Credentials,
+    settings: ServerSettings,
+    *,
+    adapters: Sequence[AppAdapter] = (),
+    protocol_mounts: Sequence[ProtocolMount] = (),
+) -> ASGIApp:
     host_redactor = live.assembly.redactor()
+    mounted = _protocol_mounts(protocol_mounts)
     streams = _StreamLimit()
     handshakes = _Handshakes()
 
@@ -557,14 +671,41 @@ def create_app(live: Live, credentials: Credentials, settings: ServerSettings) -
         WebSocketRoute('/api/v1/sessions/{sid}/rpc', rpc),
         WebSocketRoute('/api/v1/sessions/{sid}/pty', human_pty),
         WebSocketRoute('/api/v1/sessions/{sid}/agent-pty/{agent_id}/{handle}', agent_pty),
+        *(
+            _protocol_route(
+                path,
+                methods,
+                public=public,
+                extra=extra,
+                module=module,
+                mount=mounted.get(path),
+                credentials=credentials,
+                redactor=host_redactor,
+                guarded=guarded,
+            )
+            for path, methods, public, extra, module in PROTOCOL_ROUTES
+        ),
+        *(route for adapter in adapters for route in adapter.routes),
         Route('/{path:path}', _static(settings.static_dir, host_redactor), methods=['GET']),
     ]
 
     @contextlib.asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncGenerator[None]:
+        entered: list[AbstractAsyncContextManager[None]] = []
         try:
+            for opener in (
+                *(mount.lifespan for mount in protocol_mounts),
+                *(adapter.lifespan for adapter in adapters),
+            ):
+                if opener is None:
+                    continue
+                context = opener()
+                await context.__aenter__()
+                entered.append(context)
             yield
         finally:
+            for context in reversed(entered):
+                await context.__aexit__(None, None, None)
             await live.shutdown()
 
     app = Starlette(routes=routes, lifespan=lifespan)

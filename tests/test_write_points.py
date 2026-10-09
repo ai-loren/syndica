@@ -54,6 +54,8 @@ _ANCHORS = (
 _ALLOWED: dict[str, tuple[str, ...]] = {
     # 发给模型提供方的请求：对话本来就要发给提供方，这是 run 的前提，不是观测数据（M2 D5）。
     'backends/llm_openai/client.py': ('post json', 'post json'),
+    # MCP 子进程的 stderr 管道：读端记日志之前先脱敏，写端只交给子进程。
+    'backends/mcp/client.py': ('os.fdopen', 'os.fdopen'),
     # Agent 自己的文件工具：写进工作区的就是 run 的产物。命令的输出走自建的管道，读端经 `os.fdopen`
     # 接进事件循环，写端交给子进程。
     'kernel/local_workspace.py': (
@@ -94,6 +96,17 @@ _ALLOWED: dict[str, tuple[str, ...]] = {
     # 产物下载是人取回自己工作区里的文件（同在磁盘上打开，按附件、沙箱化交出）；SSE 的流由
     # sse_frame 逐帧产出；`_Guard` 转发的是应用已经经出口编码好的消息，只追加常量响应头，另一处是
     # 常量的 websocket.close；人的终端把人自己 shell 的输出原样回给本机已认证的人（同终端模拟器）。
+    # 进来的 ASGI Request，第二个位置参数是 receive，不是要发出去的正文。流的正文在生成器里
+    # 逐块先 redacted 再 dumps。
+    'server/openai_http.py': (
+        'Request positional',
+        'StreamingResponse positional',
+        'StreamingResponse positional',
+    ),
+    # 进来的 ASGI Request。卡片和版本错误经 json_response 脱敏。
+    'server/a2a_serve.py': ('Request positional',),
+    # 版本拒绝是 ASGI send。正文是固定的 JSON-RPC 错误，请求里的版本字符串先 redact。
+    'server/mcp_serve.py': ('send positional', 'send positional'),
     'server/app.py': (
         'FileResponse positional',
         'Response positional',

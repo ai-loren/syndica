@@ -1,0 +1,11 @@
+{
+  "name": "docs__echo",
+  "description": "echo text",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "text": {"type": "string"}
+    },
+    "required": ["text"]
+  }
+}

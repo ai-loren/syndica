@@ -147,6 +147,72 @@ def test_the_server_process_never_imports_code_from_the_workspace_root(
         _syndica(workspace, environ, 'down')
 
 
+def test_the_openai_sdk_talks_to_syndica_up(tmp_path: Path, workspace: Path) -> None:
+    fake = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve().parents[1] / 'e2e' / 'fake_openai.py')],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    assert fake.stdout is not None
+    port_line = fake.stdout.readline()
+    environ = _environ(tmp_path)
+    environ['OPENAI_BASE_URL'] = f'http://127.0.0.1:{int(port_line.strip())}/v1'
+    started = _syndica(workspace, environ, 'up', '--no-open', '--api-token')
+    try:
+        assert started.returncode == 0, started.stderr
+        token = re.search(r'机器客户端令牌.*\n([A-Za-z0-9_-]+)\n', started.stdout)
+        listen = re.search(r'127\.0\.0\.1:(\d+)', started.stdout)
+        assert token is not None and listen is not None, started.stdout
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=token.group(1),
+            base_url=f'http://127.0.0.1:{listen.group(1)}/v1',
+            max_retries=0,
+        )
+        completion = client.chat.completions.create(
+            model='Worker',
+            messages=[{'role': 'user', 'content': 'from-the-sdk'}],
+        )
+        assert completion.choices[0].message.content is not None
+        assert '收到：' in completion.choices[0].message.content
+        assert _SECRET not in completion.choices[0].message.content
+    finally:
+        _syndica(workspace, environ, 'down')
+        fake.terminate()
+        fake.wait(timeout=5)
+
+
+def test_api_token_is_printed_once_and_absent_from_the_state_file(tmp_path: Path, workspace: Path):
+    environ = _environ(tmp_path)
+    started = _syndica(workspace, environ, 'up', '--no-open', '--api-token')
+    try:
+        assert started.returncode == 0, started.stderr
+        match = re.search(r'机器客户端令牌.*\n([A-Za-z0-9_-]+)\n', started.stdout)
+        assert match is not None, started.stdout
+        token = match.group(1)
+        port = int(re.search(r'127\.0\.0\.1:(\d+)', started.stdout).group(1))  # type: ignore[union-attr]
+        [state_file] = (tmp_path / 'config' / 'syndica' / 'servers').glob('*/server.json')
+        blob = b''.join(
+            path.read_bytes() for path in state_file.parent.rglob('*') if path.is_file()
+        )
+        assert token.encode() not in blob
+        request = urllib.request.Request(
+            f'http://127.0.0.1:{port}/v1/models',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            listed = json.loads(response.read())
+        assert 'Worker' in {item['id'] for item in listed['data']}
+        denied = urllib.request.Request(f'http://127.0.0.1:{port}/v1/models')
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(denied, timeout=5)
+        assert caught.value.code == 401
+    finally:
+        _syndica(workspace, environ, 'down')
+
+
 @pytest.mark.parametrize('command', ['up', 'down'])
 def test_up_and_down_refuse_inside_an_agent_environment(
     tmp_path: Path, workspace: Path, command: str
