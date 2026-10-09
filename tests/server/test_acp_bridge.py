@@ -46,6 +46,9 @@ class _Runtime:
     async def abort(self, agent_id: str) -> None:
         del agent_id
 
+    async def find(self, agent_id: str) -> None:
+        del agent_id
+
 
 class _Emit:
     def __init__(self) -> None:
@@ -161,9 +164,11 @@ async def test_a_root_error_fails_that_prompt_and_the_next_prompt_runs() -> None
     async with _bridge() as (bridge, bus, runtime, _emit):
         prompt = await _submit(bridge, runtime, 'go')
         await bus.emit(_failed(_ROOT, '修好模型配置再发'))
-        with pytest.raises(RequestError, match='修好模型配置再发'):
+        with pytest.raises(RequestError, match='报错 RuntimeError') as failed:
             async with asyncio.timeout(_TIMEOUT):
                 await prompt
+        # 内核事件里的三件套可能带着异常原文，只有类型交给编辑器。
+        assert '修好模型配置再发' not in str(failed.value)
         again = await _submit(bridge, runtime, 'again')
         await bus.emit(_ended(_ROOT))
         async with asyncio.timeout(_TIMEOUT):
@@ -270,6 +275,28 @@ async def test_confirmation_arguments_are_redacted() -> None:
     [(_call_id, _name, arguments)] = emit.permissions
     assert _SECRET not in arguments
     assert arguments.startswith('{"command": "curl -H [REDACTED')
+
+
+async def test_confirmation_arguments_are_redacted_before_they_are_clipped() -> None:
+    arguments = 'x' * 3990 + _SECRET + 'y' * 5000
+    async with _bridge() as (_bridge_, bus, _runtime, emit):
+        await bus.emit(
+            Event(
+                'tool_confirmation_requested',
+                _ROOT,
+                {
+                    'request_id': 'c2',
+                    'tool_call_id': 'b2',
+                    'tool_name': 'Bash',
+                    'arguments': arguments,
+                },
+            )
+        )
+        await _drain(bus, emit, 'mark-2')
+    [(_call_id, _name, shown)] = emit.permissions
+    assert len(shown) == 4000
+    assert shown.startswith('x' * 3990 + '[REDACTED')
+    assert _SECRET[:8] not in shown
 
 
 async def test_the_assistant_text_and_a_question_are_redacted() -> None:

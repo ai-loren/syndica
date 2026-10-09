@@ -191,6 +191,25 @@ async def test_a_desk_exception_is_a_failed_task_that_names_only_its_type(method
     assert '执行器抛出 RuntimeError' in response.text
 
 
+class _CancelRaises:
+    async def cancel(self, task_id: str) -> object:
+        del task_id
+        raise RuntimeError(_LEAK)
+
+
+async def test_a_cancel_that_raises_names_only_the_exception_type() -> None:
+    card = build_agent_card('workspace', (('Worker', 'does work'),), port=8080)
+    handler = SyndicaA2A(card=card, desk=_CancelRaises())  # pyright: ignore[reportArgumentType]
+    payload = {'jsonrpc': '2.0', 'id': 9, 'method': 'CancelTask', 'params': {'id': 't1'}}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=jsonrpc_app(handler)), base_url='http://a2a', timeout=10
+    ) as client:
+        response = await client.post('/', json=payload, headers={'A2A-Version': '1.0'})
+    assert response.status_code == 200
+    assert 'quiz' not in response.text
+    assert '中止根 Agent 时抛出 RuntimeError' in response.text
+
+
 async def test_the_client_reads_the_card_and_gets_an_untrusted_answer() -> None:
     async with running(FakeAssembly(), mount_factory=_mounts) as server:
         model = A2AAgentModel('workspace', f'{server.base}/a2a/', bearer=server.token)

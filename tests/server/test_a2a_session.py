@@ -81,6 +81,32 @@ def test_one_message_is_one_turn_on_a_worker_session(tmp_path: Path) -> None:
         host.close()
 
 
+class _Down(ScriptedLLM):
+    async def create(self, messages: list[object], **kwargs: object) -> object:  # type: ignore[override]
+        del messages, kwargs
+        raise RuntimeError(f'model is down {_SECRET} https://user:pw@host')
+
+
+def test_a_root_error_fails_the_task_naming_only_its_type(tmp_path: Path) -> None:
+    host, live, desk = _desk(tmp_path, _Down([]))
+
+    async def body() -> None:
+        try:
+            async with asyncio.timeout(_TIMEOUT):
+                outcome = await desk.turn(context_id='c1', task_id='t1', text='hi', role='Worker')
+            assert outcome.state == TaskState.TASK_STATE_FAILED
+            assert '报错 RuntimeError' in outcome.text
+            assert _SECRET not in outcome.text and 'pw@host' not in outcome.text
+            assert 'model is down' not in outcome.text
+        finally:
+            await live.shutdown()
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
 def test_a_question_waits_for_the_next_message_with_the_same_task(tmp_path: Path) -> None:
     host, live, desk = _desk(
         tmp_path,

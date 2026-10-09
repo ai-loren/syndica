@@ -31,7 +31,7 @@ from a2a.types.a2a_pb2 import (
     TaskState,
     TaskStatusUpdateEvent,
 )
-from a2a.utils.errors import TaskNotFoundError, UnsupportedOperationError
+from a2a.utils.errors import InternalError, TaskNotFoundError, UnsupportedOperationError
 from google.protobuf.json_format import MessageToDict
 from starlette.requests import Request
 from starlette.responses import Response
@@ -108,7 +108,12 @@ class SyndicaA2A(RequestHandler):
     async def on_cancel_task(self, params: CancelTaskRequest, context: object) -> Task | None:
         del context
         if self._desk is not None:
-            task = await self._desk.cancel(params.id)
+            try:
+                task = await self._desk.cancel(params.id)
+            except Exception as exc:
+                # SDK 的分派器会把异常原文放进 -32603 交给对端；这里只留类型名。
+                logger.exception('a2a cancel failed')
+                raise InternalError(message=_cancel_failed(type(exc).__name__)) from None
             if task is None:
                 raise TaskNotFoundError()
             self._tasks[params.id] = task
@@ -469,10 +474,21 @@ def _payload(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _from_payload(payload: dict[str, Any]) -> str:
-    expected = str(payload.get('expected') or '这一轮执行完并交回回答')
-    received = str(payload.get('received') or '根 Agent 报了错，原文不回显')
-    next_action = str(payload.get('next_action') or '看 server 日志')
-    return f'期望: {expected}。实际: {received}。下一步: {next_action}'
+    """根 Agent 的失败只报异常类型：内核事件里的 `received` 是异常原文，脱敏规则认不全它。"""
+    error_type = str(payload.get('error_type') or '未知类型')
+    return (
+        '期望: 这一轮执行完并交回回答。'
+        f'实际: 根 Agent 报错 {error_type}，原文不在任务里。'
+        '下一步: 看 server 日志或 trace 里根 Agent 的 agent span 拿到原因；修好之后换一条消息再发。'
+    )
+
+
+def _cancel_failed(kind: str) -> str:
+    return (
+        '期望: 取消这个任务。'
+        f'实际: 中止根 Agent 时抛出 {kind}。'
+        '下一步: 看 server 日志；异常原文不会回给对端。用 GetTask 查任务此刻的状态。'
+    )
 
 
 def _executor_failed(kind: str) -> str:

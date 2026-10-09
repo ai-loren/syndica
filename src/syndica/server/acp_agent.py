@@ -38,6 +38,7 @@ from acp.schema import (
 )
 
 from syndica.kernel import (
+    AgentStatus,
     ConfigError,
     Event,
     Redactor,
@@ -51,6 +52,9 @@ __all__ = ['AcpBridge', 'AcpSession', 'SyndicaAcp', 'TurnBinding']
 
 _OUTPUT_CAP = 4_000
 _ROOT_ONLY = frozenset({'message_appended', 'agent_error', 'agent_end'})
+# 等被取消的那一轮收完尾、等根 Agent 拆完邮箱的上限。到点照样往下走：宁可多一段尾巴，也不挂住提示。
+_SETTLE_S = 10.0
+_QUIET_POLLS = 200
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +122,10 @@ class AcpBridge:
         self._failure: BaseException | None = None
         self._turn_done = asyncio.Event()
         self._turn_done.set()
+        # 取消之后，被中止那一轮的 agent_end 还在路上。它到之前放下一条提示进来，它就会被当成
+        # 下一轮的结束，下一条提示带着上一轮的尾巴提前返回。
+        self._settled = asyncio.Event()
+        self._settled.set()
         self._pump = asyncio.create_task(
             self._run(binding.subscription), name=f'acp-pump:{binding.agent_id}'
         )
@@ -125,6 +133,12 @@ class AcpBridge:
     async def submit(self, text: str) -> str:
         # 失败只属于报错的那一次提示：根 Agent 收到下一条消息会重新开一个周期，
         # 留着它会让会话此后每条提示都失败。
+        if not self._settled.is_set():
+            try:
+                async with asyncio.timeout(_SETTLE_S):
+                    await self._settled.wait()
+            except TimeoutError:
+                self._settled.set()
         question = self._question
         self._cancelled = False
         self._failure = None
@@ -148,6 +162,8 @@ class AcpBridge:
                 trust=TrustLevel.TRUSTED,
             )
         else:
+            # agent_end 发出时（正常结束或被取消）驱动还在拆邮箱；这时送达的提示会随邮箱一起丢掉。
+            await self._quiet()
             delivered = await self._runtime.send(self._agent_id, text)
         if not delivered.ok:
             self._turn_done.set()
@@ -162,6 +178,13 @@ class AcpBridge:
         if self._failure is not None:
             raise self._failure
         return self._stop
+
+    async def _quiet(self) -> None:
+        for _ in range(_QUIET_POLLS):
+            info = await self._runtime.find(self._agent_id)
+            if info is None or info.status in (AgentStatus.ZOMBIE, AgentStatus.IDLE):
+                return
+            await asyncio.sleep(0.01)
 
     async def replay(self) -> None:
         # 这一轮的驱动任务结束之后 `wait` 立刻返回。还在跑就等到它结束再重放，不读半截轨迹。
@@ -181,6 +204,9 @@ class AcpBridge:
         self._cancelled = True
         self._stop = 'cancelled'
         self._turn_done.set()
+        info = await self._runtime.find(self._agent_id)
+        if info is not None and info.status is not AgentStatus.ZOMBIE:
+            self._settled.clear()
         await self._runtime.abort(self._agent_id)
 
     async def close(self) -> None:
@@ -198,6 +224,11 @@ class AcpBridge:
         # 回答、结束与失败只认根：子 Agent 先结束会让这次提示提前返回，根的回答落到提示返回之后。
         # 工具、确认与提问来自谁都推给编辑器，答复交回发起的那个 Agent。
         if event.kind in _ROOT_ONLY and event.agent_id != self._agent_id:
+            return
+        if not self._settled.is_set():
+            # 被取消的那一轮还在收尾：它的输出与结束都不属于下一条提示。
+            if event.kind in {'agent_end', 'agent_error'}:
+                self._settled.set()
             return
         if event.kind == 'message_appended':
             await self._message(event.payload)
@@ -225,10 +256,11 @@ class AcpBridge:
         elif event.kind == 'user_input_requested':
             await self._ask(event)
         elif event.kind == 'agent_error':
+            # 只报异常类型：内核事件里的 `received` 是异常原文，脱敏规则认不全它。
             self._failure = _refuse(
-                str(event.payload.get('expected') or '根 Agent 正常结束'),
-                str(event.payload.get('received') or '根 Agent 报了错，原文不回显'),
-                str(event.payload.get('next_action') or '看 acp 的日志'),
+                '根 Agent 跑完这一轮',
+                f'根 Agent 报错 {event.payload.get("error_type") or "未知类型"}，原文不在回复里',
+                '看工作区之外的 acp.log 或 trace 里根 Agent 的 agent span；修好之后再发一条提示',
             )
             self._turn_done.set()
         elif event.kind == 'agent_end':
@@ -253,7 +285,7 @@ class AcpBridge:
     async def _confirm(self, event: Event) -> None:
         name = str(event.payload.get('tool_name'))
         tool_call_id = str(event.payload.get('tool_call_id'))
-        arguments = self._redact(str(event.payload.get('arguments', '')))
+        arguments = _clip(self._redact(str(event.payload.get('arguments', ''))))
         try:
             decision = await self._emit.permission(tool_call_id, name, arguments)
         except Exception:

@@ -443,6 +443,99 @@ def test_a_root_error_fails_one_prompt_and_the_next_prompt_is_answered(tmp_path:
         host.close()
 
 
+def test_a_root_error_names_only_its_type_to_the_editor(tmp_path: Path) -> None:
+    class _Leaks(ScriptedLLM):
+        async def create(self, messages: list[ContextBlock], **kwargs: object) -> ContextBlock:
+            del messages, kwargs
+            raise RuntimeError('model is down quizvalue https://user:pw@host')
+
+    host, agent, opened, workspace = _default_host(tmp_path, _Leaks([]))
+
+    async def body() -> None:
+        session_id = ''
+        try:
+            session = await agent.new_session(str(workspace))
+            session_id = session.session_id
+            with pytest.raises(RequestError) as failed:
+                async with asyncio.timeout(20):
+                    await agent.prompt(session_id, [TextContentBlock(type='text', text='one')])
+            data = failed.value.data
+            assert isinstance(data, dict)
+            assert 'RuntimeError' in data['received']
+            assert 'quizvalue' not in json.dumps(data) and 'pw@host' not in json.dumps(data)
+            assert 'quizvalue' not in str(failed.value)
+        finally:
+            await _finish(host, agent, session_id, opened)
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
+def test_back_to_back_prompts_are_both_answered(tmp_path: Path) -> None:
+    host, agent, opened, workspace = _default_host(
+        tmp_path, ScriptedLLM([ScriptedTurn(content='ONE'), ScriptedTurn(content='TWO')])
+    )
+
+    async def body() -> None:
+        session_id = ''
+        try:
+            session = await agent.new_session(str(workspace))
+            session_id = session.session_id
+            async with asyncio.timeout(20):
+                first = await agent.prompt(session_id, [TextContentBlock(type='text', text='a')])
+                second = await agent.prompt(session_id, [TextContentBlock(type='text', text='b')])
+            assert (first.stop_reason, second.stop_reason) == ('end_turn', 'end_turn')
+            assert agent.messages == ['ONE', 'TWO']
+        finally:
+            await _finish(host, agent, session_id, opened)
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
+def test_a_prompt_after_cancel_returns_with_its_own_answer(tmp_path: Path) -> None:
+    sleep = json.dumps({'command': 'sleep 1'})
+    host, agent, opened, workspace = _default_host(
+        tmp_path,
+        ScriptedLLM(
+            [
+                # 被中止的那一轮不再问模型，下一条脚本回复属于下一条提示。
+                ScriptedTurn(tool_calls=[ToolCall(id='s1', name='Bash', arguments=sleep)]),
+                ScriptedTurn(content='SECOND-ANSWER'),
+            ]
+        ),
+    )
+
+    async def body() -> None:
+        session_id = ''
+        try:
+            session = await agent.new_session(str(workspace))
+            session_id = session.session_id
+            await agent.set_session_mode(session_id, 'Worker')
+            first = asyncio.create_task(
+                agent.prompt(session_id, [TextContentBlock(type='text', text='a')])
+            )
+            await asyncio.sleep(0.3)
+            await agent.cancel(session_id)
+            assert (await first).stop_reason == 'cancelled'
+            before = len(agent.messages)
+            async with asyncio.timeout(20):
+                second = await agent.prompt(session_id, [TextContentBlock(type='text', text='b')])
+            assert second.stop_reason == 'end_turn'
+            assert agent.messages[before:] == ['SECOND-ANSWER']
+        finally:
+            await _finish(host, agent, session_id, opened)
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
 def test_cancel_returns_while_a_confirmation_is_waiting(tmp_path: Path) -> None:
     command = json.dumps({'command': 'cat /etc/hosts'})
     host, agent, opened = _drive(
