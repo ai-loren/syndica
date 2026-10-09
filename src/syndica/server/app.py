@@ -94,7 +94,8 @@ class ProtocolMount:
     """换掉一条已经登记的协议路由。路径必须在 `PROTOCOL_ROUTES` 里，适配不能另开一条。
 
     `app` 是 ASGI（流式响应不经过 `Request -> Response`）。Bearer 仍由 `create_app` 套上，
-    公开与否以路由表为准。`lifespan` 在请求开始前进入、server 关闭时退出。
+    公开与否以路由表为准。`lifespan` 在请求开始前进入、server 关闭时退出。`unauthorized` 把
+    Bearer 不对的那次拒绝画成这个协议的错误体（同样经脱敏）；不给时是 Syndica 自己的三件套。
     """
 
     def __init__(
@@ -103,10 +104,12 @@ class ProtocolMount:
         app: ASGIApp,
         *,
         lifespan: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+        unauthorized: Callable[[ApiError, Redactor], Response] | None = None,
     ) -> None:
         self.path = path
         self.app = app
         self.lifespan = lifespan
+        self.unauthorized = unauthorized
 
 
 class ServerSettings:
@@ -194,18 +197,25 @@ class _GuardedASGI:
         redactor: Redactor,
         *,
         public: bool,
+        unauthorized: Callable[[ApiError, Redactor], Response] | None = None,
     ) -> None:
         self._app = app
         self._credentials = credentials
         self._redactor = redactor
         self._public = public
+        self._unauthorized = unauthorized
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope['type'] == 'http' and not self._public:
             try:
                 self._credentials.require(Headers(scope=scope).get('authorization'))
             except ApiError as error:
-                response = _error(error, self._redactor)
+                render = self._unauthorized
+                response = (
+                    _error(error, self._redactor)
+                    if render is None
+                    else render(error, self._redactor)
+                )
                 await response(scope, receive, send)
                 return
         await self._app(scope, receive, send)
@@ -228,7 +238,9 @@ def _protocol_route(
             cast(_Handler, protocol_handler(extra, module)), public=public
         )
     else:
-        endpoint = _GuardedASGI(mount.app, credentials, redactor, public=public)
+        endpoint = _GuardedASGI(
+            mount.app, credentials, redactor, public=public, unauthorized=mount.unauthorized
+        )
     return Route(path, endpoint, methods=list(methods))
 
 

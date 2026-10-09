@@ -29,8 +29,9 @@ from syndica.cli.main import CliIO
 from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import RuleRedactor, ScriptedLLM, ScriptedTurn, ToolCall, TrustLevel
 from syndica.kernel.context import ContextBlock
-from syndica.server import Credentials, Live, ProtocolMount, ServerSettings, create_app, openai_http
-from syndica.server.openai_http import OpenAIHttp, chat_app, models_app, responses_app
+from syndica.serve import openai_http_mounts
+from syndica.server import Credentials, Live, ServerSettings, create_app, openai_http
+from syndica.server.openai_http import OpenAIHttp, chat_app
 
 _LEAK = 'Bearer sk-live-quizzical0123456789 postgres://quizuser:quizpw@db.internal/x'
 _TIMEOUT = 20
@@ -57,18 +58,13 @@ def _app(tmp_path: Path, llm: ScriptedLLM) -> tuple[RuntimeCliHost, Live, object
     )
     loaded = host.trusted_config(str(config_path))
     live = Live(ServerAssembly(host, path=str(config_path), config=loaded))
-    api = OpenAIHttp(live, tuple(loaded.catalog.names()), live.assembly.redactor())
     port = _port()
     credentials = Credentials()
     app = create_app(
         live,
         credentials,
         ServerSettings(port=port, nonce='nonce', version='test'),
-        protocol_mounts=(
-            ProtocolMount('/v1/models', models_app(api)),
-            ProtocolMount('/v1/chat/completions', chat_app(api)),
-            ProtocolMount('/v1/responses', responses_app(api)),
-        ),
+        protocol_mounts=openai_http_mounts(loaded, live),
     )
     return host, live, app, port, credentials
 
@@ -259,8 +255,13 @@ def test_a_missing_token_is_an_authentication_error(tmp_path: Path) -> None:
         http = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=base)  # pyright: ignore[reportArgumentType]
         client = AsyncOpenAI(api_key='nope', base_url=f'{base}/v1', http_client=http, max_retries=0)  # pyright: ignore[reportArgumentType]
         try:
-            with pytest.raises(AuthenticationError):
+            with pytest.raises(AuthenticationError) as caught:
                 await client.models.list()
+            assert caught.value.code == 'invalid_api_key'
+            assert caught.value.type == 'invalid_request_error'
+            body = cast(dict[str, object], caught.value.body)
+            assert str(body['message']).startswith('期望: ')
+            assert 'nope' not in str(body['message'])
         finally:
             await client.close()
 

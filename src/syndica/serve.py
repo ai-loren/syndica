@@ -642,13 +642,19 @@ def a2a_http_mounts(config: Any, port: int, live: Any, workspace_name: str) -> t
 def openai_http_mounts(config: Any, live: Any) -> tuple[Any, ...]:
     """`/v1/models`、chat completions 与 responses。不另装 SDK。"""
     from syndica.server import ProtocolMount
-    from syndica.server.openai_http import OpenAIHttp, chat_app, models_app, responses_app
+    from syndica.server.openai_http import (
+        OpenAIHttp,
+        chat_app,
+        models_app,
+        responses_app,
+        unauthorized,
+    )
 
     api = OpenAIHttp(live, tuple(config.catalog.names()), live.assembly.redactor())
     return (
-        ProtocolMount('/v1/models', models_app(api)),
-        ProtocolMount('/v1/chat/completions', chat_app(api)),
-        ProtocolMount('/v1/responses', responses_app(api)),
+        ProtocolMount('/v1/models', models_app(api), unauthorized=unauthorized),
+        ProtocolMount('/v1/chat/completions', chat_app(api), unauthorized=unauthorized),
+        ProtocolMount('/v1/responses', responses_app(api), unauthorized=unauthorized),
     )
 
 

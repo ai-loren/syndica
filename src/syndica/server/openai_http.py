@@ -29,6 +29,7 @@ from syndica.kernel import (
     WaitState,
 )
 from syndica.kernel.ids import current_tool_call
+from syndica.server.errors import ApiError
 from syndica.server.live import Live, LiveSession
 from syndica.server.outbound import json_response, redacted
 from syndica.server.streams import Entry
@@ -444,6 +445,21 @@ def models_app(api: OpenAIHttp) -> Any:
         await response(scope, receive, send)
 
     return app
+
+
+def unauthorized(error: ApiError, redactor: Redactor) -> Response:
+    """`/v1/*` 上 Bearer 不对时的错误体。OpenAI 客户端按 `error.code` 认出是令牌的问题，
+    Syndica 自己的三件套形状它读不出 `message`。"""
+    message = f'期望: {error.expected}。实际: {error.received}。下一步: {error.next_action}'
+    body = {
+        'error': {
+            'message': message,
+            'type': 'invalid_request_error',
+            'param': None,
+            'code': 'invalid_api_key',
+        }
+    }
+    return json_response(body, redactor, status=error.status)
 
 
 def chat_app(api: OpenAIHttp) -> Any:
