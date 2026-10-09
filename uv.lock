@@ -3116,7 +3116,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "starlette", marker = "extra == 'server'", specifier = ">=0.40" },
-    { name = "trl", marker = "extra == 'trl'", specifier = ">=0.21" },
+    { name = "trl", marker = "extra == 'trl'", specifier = ">=1.15" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.30" },
     { name = "websockets", marker = "extra == 'server'", specifier = ">=13" },
 ]
