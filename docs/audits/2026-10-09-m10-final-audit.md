@@ -3,7 +3,7 @@
 日期：2026-10-09
 范围：[M10 计划](../plans/2026-10-09-m10-interop.md) 的阶段零至七
 验证方式：本地验证协议（Actions 额度用完期间，见路线图「当前主线约束」）。实现在提交 `b1ec080` 里，评审处置在其后的
-几个提交里，最终代码提交 `47c2dc2` 过了导出验证（见文末）。
+几个提交里；`86e235b` 推送之后又做了一轮逐条复核，最终代码提交 `1de9756` 过了导出验证（见文末）。
 
 ## 结论
 
@@ -15,24 +15,26 @@
 
 | 判据 | 证据 |
 |---|---|
-| MCP server 缺省只读，`tools/call` 经 `call_external`，产物与提示脱敏，异常不回显 | `tests/server/test_mcp_serve.py`，黄金文件 `tests/server/testdata/mcp_serve_tools.json` |
-| `/mcp` Bearer、Host、未知版本在交给 SDK 之前以 -32022 拒绝 | `tests/server/test_mcp_http.py` |
+| MCP server 缺省只读，`tools/call` 经 `call_external`，产物与提示脱敏，每个处理器的异常都不回显 | `tests/server/test_mcp_serve.py`，黄金文件 `tests/server/testdata/mcp_serve_wire.jsonl`（一次脚本化 stdio 会话的线上 JSON 行） |
+| `/mcp` Bearer、Host、未知版本（initialize 正文与每个 POST 的 `MCP-Protocol-Version` 头）在交给 SDK 之前以 -32022 拒绝 | `tests/server/test_mcp_http.py` |
 | 真的 `syndica mcp` 子进程：只有 Read / Grep / Glob，读到的环境密钥被换掉，日志在工作区外 | `tests/server/test_mcp_stdio.py` |
 | MCP Inspector CLI 对 `syndica mcp` 与 `/mcp` | 手工：stdio 的 `tools/list` 只有那三个只读工具；`Read` 读回文件，结果带 `trust: untrusted`。HTTP 同样：`http://127.0.0.1:<port>/mcp` 加 Bearer，`tools/list` 没有 Write，`Read` 读回标记且不含探针密钥，日志里也没有令牌。命令必须写在 Inspector 选项前面，且不能用 `python -m` |
-| MCP client：版本只收 SDK 的五版，结果不可信，`$ref` 内联，断连不自动重连 | `tests/backends/test_mcp_client.py` |
-| ACP agent：版本 1、非文本拒绝、确认、提问、取消、`session/load` | `tests/server/test_acp_agent.py`、`tests/server/test_acp_turn.py` |
+| MCP client：版本只收 SDK 的五版，结果不可信，`$ref` 内联，分页取全（真 SDK 服务），只连角色用到的服务，断连不自动重连 | `tests/backends/test_mcp_client.py`、`tests/cli/test_mcp_session.py`，黄金文件 `tests/backends/testdata/mcp_client_wire.jsonl` |
+| 外部进程不留：会话关闭、Runtime 关机、chat、run、Ctrl-C、`down`，含 setsid 出去的孙进程 | `tests/cli/test_mcp_lifecycle.py`、`tests/server/test_up_down.py`、`tests/backends/test_mcp_stdio_descendants.py`、`tests/backends/test_acp_descendants.py` |
+| ACP agent：版本 1、非文本拒绝、确认、提问、取消、停止原因映射、`session/load`（含跨进程）、stdin 断开时挂着的确认按拒绝 | `tests/server/test_acp_agent.py`、`tests/server/test_acp_turn.py`、`tests/server/test_acp_bridge.py`、`tests/server/test_acp_stdio_lifecycle.py`，黄金文件 `tests/server/testdata/acp_agent.jsonl`（真子进程，两个方向的原始字节） |
 | 真的 `syndica acp` 子进程，模型是本地假端点 | `tests/server/test_acp_stdio.py`：版本 0 拒绝后再用 1，图片块拒绝，提问必须答选项，确认先拒绝再批准，批准后 `exit_code: 0`。假 key 不进回答和日志 |
-| ACP client：读写与终端经 `call_external`，外部写入读回不可信，高风险命令不执行，崩溃不回显、不重连，挂起的进程组被杀掉 | `tests/backends/test_acp_model.py`，活动黄金文件 `tests/backends/testdata/acp_activity.json` |
-| A2A server：卡片、1.0 与 0.3、缺版本头 -32022、异常不回显、提问、无人值守时确认按拒绝 | `tests/server/test_a2a_http.py`、`tests/server/test_a2a_session.py` |
+| ACP client：读写与终端经 `call_external`，外部写入读回不可信，高风险命令不执行，被拒与没做成都回三件套 RequestError，`outputByteLimit` 留结尾，kill / release / wait_for_exit，崩溃不回显、不重连，后代（含 setsid）被收掉 | `tests/backends/test_acp_model.py`、`tests/backends/test_acp_callbacks.py`、`tests/backends/test_acp_environment.py`、`tests/backends/test_acp_descendants.py`，活动黄金文件 `tests/backends/testdata/acp_activity.json` |
+| A2A server：卡片、1.0 与 0.3（SDK 自己的 0.3 传输层）、缺版本头 -32009、异常不回显、提问、确认有人等人批准 / 没人按拒绝、`contextId` 就是会话 id、流式按根文本逐段发 WORKING | `tests/server/test_a2a_http.py`、`tests/server/test_a2a_session.py`、`tests/server/test_a2a_live.py`，黄金文件 `tests/server/testdata/a2a_session_stream.jsonl`（真 desk 加脚本化模型） |
 | `a2a` SDK 客户端对 Syndica：流式发送、取任务、取消 | `tests/server/test_a2a_http.py`，黄金文件 `tests/server/testdata/a2a_sdk_task.json` |
-| Syndica 客户端对 SDK 写的远端 Agent：INPUT_REQUIRED 后同一任务答复 | `tests/backends/test_a2a_sdk_peer.py` |
+| Syndica 客户端对 SDK 写的远端 Agent：INPUT_REQUIRED 后同一任务答复；Syndica 对 Syndica 全程一个会话；被取消时发 CancelTask | `tests/backends/test_a2a_sdk_peer.py`、`tests/backends/test_a2a_model.py`，黄金文件 `tests/backends/testdata/a2a_client_wire.jsonl` |
 | Orchestrator 派活给 `a2a:` 角色，交回不可信 | `tests/backends/test_a2a_model.py` |
-| OpenAI HTTP：模型列表、chat、Responses、流、客户端工具、续接、400 / 401 / 404、有人看着时批准确认、断开不中止这一轮 | `tests/server/test_openai_http.py`，黄金文件 `tests/server/testdata/openai_chat.jsonl` |
+| OpenAI HTTP：模型列表、chat、Responses、流（每块一个 delta、每个 function_call 都发）、客户端工具、续接、400 / 401 / 404 / 500 的 OpenAI `type` / `param` / `code`、有人看着时批准确认、断开不中止这一轮 | `tests/server/test_openai_http.py`，黄金文件 `openai_chat.jsonl`、`openai_errors.jsonl`、`openai_streams.jsonl` |
+| `syndica doctor` 报告外部对象：ACP 握手、A2A 卡片、MCP 版本与工具名、被排除的工具 | `tests/cli/test_doctor_interop.py` |
 | 真的 `syndica up --api-token`：`/v1/models` 列出角色，机器令牌不进状态文件；`openai` SDK 打到本地假端点 | `tests/server/test_up_down.py` |
 | Gemini CLI 作为托管的 ACP Agent，免费 Gemini key 下完成一件读写 | 手工，2026-10-09，仓库外的临时工作区。项目配置写 `model: acp:gemini` 与命令 `npx @google/gemini-cli@0.63.0 --acp -m gemini-3.5-flash-lite`；用户级 `interop.yaml`（0600）只写 `acp:gemini: {env: [GEMINI_API_KEY]}`；key 只在子壳里从 0600 的临时文件读进环境，跑完删掉。任务是读 `notes.md`、把暗号写进 `answer.md`。Gemini 请求 `edit` 权限时 Syndica 在终端问人：回 `approve` 后 `answer.md` 是 `BLUEFIN`，回 `reject` 后文件不存在。trace 里两次 Read、一次 Write 都记成 `tool.caller=acp-agent:gemini`。工作区（含 `.syndica`）、配置目录、stdout / stderr 与 npm 日志里都找不到 key，跑完没有残留的 Gemini 进程 |
 | `openai` SDK 对背后是免费 Gemini 的 `syndica up` | 手工，同一个临时工作区：`/v1/models` 含 Worker；`chat.completions` 答 `PELICAN`，带 `X-Syndica-Session` 续接后答 `OSPREY`，`X-Syndica-Ignored` 列出 `temperature`；key 与机器令牌都不在工作区和 server 状态目录里 |
 | kernel 不 import 协议 SDK；surface 不 import backend | `scripts/check_deps.py`、`tests/test_deps.py` |
-| 协议响应与外发 JSON 先脱敏 | `tests/test_write_points.py`；OpenAI / A2A / MCP 的 HTTP 出口走 `json_response` 或 `redacted` |
+| 协议响应与外发 JSON 先脱敏 | `tests/test_write_points.py`。OpenAI 的出口、各协议在 SDK 之前就回的响应（版本错误、鉴权失败）走 `json_response` / `redacted`；MCP Streamable HTTP、A2A JSON-RPC 与 ACP NDJSON 的正常响应由 SDK 序列化，处理器在交出之前逐字段脱敏（计划决策日志 P3） |
 | server 不碰内核私有属性 | `tests/server/test_private_guard.py`。客户端工具经 `SessionHandle.install_tools` 装，不读 `runtime._table` |
 
 ## 定向变异
@@ -81,6 +83,31 @@ kernel helper 公开，留到 v1.0 冻结公开 API 时）；MCP stdio 客户端
 并写明 mcp 版本，真 SDK 用例钉住）；两次 fork、在两次轮询之间同时离开进程组与父子链的守护进程认不出；
 `syndica.backends.mcp` 导出的 `ExternalProcess` 仍只按进程组收（`src/` 里没有活路径用它，MCP stdio 走 SDK 加进程树）。
 
+## 逐条复核（2026-10-10）
+
+`86e235b` 推送之后，独立子代理只读地把计划的硬约束、公开契约与阶段零至七逐条对到代码与用例，标出 PROVEN / PARTIAL /
+MISSING / CONTRADICTED。它推翻了这份审计的几条说法：三处与公开契约冲突，计划要求的黄金文件只有 OpenAI 一个达标，
+ACP 有几条计划条目没做也没登记，进程不留只在 backend 层证明过。处置分六条互不重叠的线并行做，主线另补几处；有意不照
+计划做的几条写进计划决策日志 P3。
+
+| 发现 | 处置 | 提交 |
+|---|---|---|
+| A2A 缺版本头答 -32022，计划与 SDK 都是 -32009 | 改成 -32009，SDK 客户端认出 `VersionNotSupportedError` | `a141096` |
+| A2A 的 `contextId` 不是会话 id | `contextId` 就是会话 id；不带就新开，未知的交回三件套的 FAILED 任务 | `a141096` |
+| A2A 流式整轮结束才发一条状态 | 先发 Task，再按根 Agent 的每段文本发 WORKING，最后产物与终态 | `a141096` |
+| A2A 0.3 只用裸 httpx 对替身测过；有人值守的确认没测；客户端被取消不发 CancelTask；两个方向都没有线上往返黄金文件 | SDK 自己的 0.3 传输层对真 desk；有人批准的用例；取消时有界地发 CancelTask；`a2a_session_stream.jsonl`（真 desk）与 `a2a_client_wire.jsonl` | `a141096` |
+| `external_activity` 的 `source` 发 `acp:<名字>`、`name` 装的是 tool_call_id，黄金文件把偏差钉住了 | `source='acp'`、`name` 是托管 Agent 名；SSE schema 给 `source` 加了枚举（快照 `ea6fc49a256e`） | `c49d078` |
+| ACP client：`outputByteLimit` 留开头且拒收 0；`kill` / `release` 没用例；被拒的写入答成功、读被拒时把说明当内容；回调里的 SyndicaError 漏给 SDK | 留结尾、截在字符边界、接受 0；被信号杀掉的终端报信号名；所有回调经同一个出口回三件套 RequestError；真子进程证明外部进程的环境只有 Agent 环境加点名的变量 | `c49d078` |
+| ACP client：读不存在的文件把说明当内容交回；终端输出交的是 Bash 工具的报告 | Read 失败在 meta 里标 `unread`，读回调回错误；终端输出取命令自己的 stdout 与 stderr | `f288fb9`、`86179b8` |
+| ACP agent：没有黄金文件；停止原因映射零用例；stdin EOF 零用例；`session/load` 只能在同一进程内 | `acp_agent.jsonl`（真子进程，原样记两个方向的字节）；`max_turn_requests` / `max_tokens` 在真装配上；关闭时挂着的确认先按拒绝答掉；第一条提示时把 sessionId 与会话 id 的对照写进工作区之外，load 经恢复会话重放 | `aa2afa3` |
+| stdout 只放协议没有抓原始字节的用例；`syndica mcp` / `syndica acp` 缺 SDK 时抛裸 ImportError | 两个 stdio 命令各一条逐行解析 JSON-RPC 的用例；先查 `find_spec`，缺了报三件套指向 `pip install 'syndica[mcp]'` / `'syndica[acp]'` | `aa2afa3` |
+| OpenAI 错误体的 `type` / `code` 恒为 `invalid_request_error` / `syndica`；错误不带会话头；`n=true` 当成 1；多块合成一个 delta；Responses 流只发第一个 function_call | 按 OpenAI 的取值给 `type` / `param` / `code`；能续接时带会话头；先拒 bool；每块一个 delta；每个 function_call 都发；新增 `openai_errors.jsonl` 与 `openai_streams.jsonl` | `58b1f22` |
+| OpenAI：Responses 对象的 `tools` / `tool_choice` 恒为空；`/v1/*` 的 401 是 Syndica 的形状 | 回显客户端工具，有工具时 `tool_choice` 写 auto，请求里的 `tool_choice` 列进 `X-Syndica-Ignored`；Bearer 不对时 `code: invalid_api_key` | `d6a74bb`、`4422f9b` |
+| `syndica doctor` 只报 MCP，不列工具清单 | ACP 握手（协议版本、Agent 名）、A2A 卡片（版本、技能，取卡片不带 Bearer）、MCP 每个服务的工具名；一个对象失败只占一行 | `61f8c9f` |
+| 进程不留只在 backend 层证明过；Runtime 关机用的是不起进程的替身 | 真 SDK stdio 服务留下两个孙进程（一个 setsid）：`close_session`、`runtime.shutdown`、chat 关闭（含中断）、run、MCP 调用中途的 Ctrl-C（退出码 130）、`up` → 建会话 → `down`，三个进程都不在；没发现泄漏，宿主代码没改 | `eb69973` |
+| MCP：没有角色用到的服务也被拉起；分页只对替身测过；非 initialize 请求不查 `MCP-Protocol-Version`；三个 list / get 处理器没兜底；两份黄金文件只钉 schema 或名字 | 只连角色用到的服务（doctor 给它们一行 `mcp: unused`，组合根不为它们导入 backend）；真 SDK 服务分页；每个 POST 先按接受表查版本头（不带头按规范视为 2025-03-26）；兜底只报类型；`mcp_serve_wire.jsonl` 与 `mcp_client_wire.jsonl` 逐字节比对线上 JSON 行 | `eb69973`、`1de9756` |
+| 全套里唯一的 RuntimeWarning；导出的 MCP `ExternalProcess` 只按进程组收 | 可观察切点的分发被取消时关掉还没开始的 hook 协程；`ExternalProcess` 接上进程树 | `72c7533` |
+
 ## 明确不做（计划收尾复核）
 
 这些都没有做，和计划「明确不做」一致：
@@ -98,7 +125,12 @@ kernel helper 公开，留到 v1.0 冻结公开 API 时）；MCP stdio 客户端
 |---|---|
 | 真实客户端收成自动测试 | Inspector 与 Gemini CLI 经 npx 拉取、Gemini 要 key，按路线图归手动 / nightly |
 | 回放文档里的 `mcp.external_tool` | 规则参数表只收内核规则。带 MCP 的 run 不写回放文档，结构 trace 照常记 |
-| DevModule 在 ACP 取消时留下没 await 的 `_Recorder._ended` | 全套里唯一的 RuntimeWarning，只出现在 `test_an_editor_stdio_mcp_tool_runs_untrusted`；开发期记录器少记这一次结束，不影响处置 |
+| A2A 客户端在一个任务的第一条 `SendMessage` 被取消时没法通知远端 | 非流式 `SendMessage` 要到响应里才给出任务 id；要做得让客户端改走流式请求 |
+| A2A 版本头与方法名的写法对不上（头是 0.3、方法用 1.0 的名字）时 | 由 SDK 以 -32009 拒绝，消息不是三件套 |
+| doctor：凭证钉子对不上、钉住的 Bearer 变量没设、`interop.yaml` 权限不对时整条命令失败；MCP 一个服务连不上时整个 MCP 只有一行失败 | 与 run 的绑定共用同一步，失败方式与 run 一致；MCP 的连接是全有或全无 |
+| 前端生成的事件类型里 `external_activity.source` 仍是 `unknown` | `gen-events.mjs` 不读属性 schema 的枚举 |
+| `syndica sessions rm` 不删 ACP 的 sessionId 对照文件 | 之后 load 那个 id 交回三件套「会话不在了」，只留下一个很小的文件 |
+| `/mcp` 的版本头只在 POST 上查 | GET 与 DELETE 不经我们的处理器，交给 SDK；initialize 正文里的版本被拒时 HTTP 是 200，版本头被拒时按 MCP 规范是 400 |
 
 ## 公开契约
 
@@ -130,5 +162,11 @@ sh scripts/check_web.sh                                      通过（产物已�
   agent card 也带 Bearer，与 `bf903d2` 的新契约冲突；`47c2dc2` 改成逐个请求断言（取 card 不带，JSON-RPC 带）。
 - `47c2dc2`（最终代码提交）：ruff、format、pyright（0 errors）、`check_deps`、`check_links`、`check_web`、Playwright 桌面 +
   移动 28 / 28 都过；全套 10561 passed、0 failed，957 秒。警告仍只有上面那一条。
+
+`86e235b` 推送之后的逐条复核处置完，最终代码提交 `1de9756` 在空闲机器上做了导出验证：ruff、format、pyright
+（0 errors）、`check_deps`、`check_links`、`check_web`、Playwright 桌面 + 移动 28 / 28 都过；全套 10714 passed、
+0 failed，1036 秒，没有任何警告（那条 `_Recorder._ended` 的 RuntimeWarning 由 `72c7533` 修掉）。合并的过程中查出两处
+分支之间的接缝，都在合并后修了：两个同名的测试模块让 pytest 收集中断（`16ff9d7` 改名），doctor 的逐字断言没算上
+另一条线新加的一行（`1de9756`）。
 
 之后只有文档提交。

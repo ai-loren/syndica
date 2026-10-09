@@ -893,6 +893,12 @@ There is no switch that marks an external tool or agent as trusted.
 `POST /v1/responses`. A machine bearer is printed once by `syndica up --api-token` and lives only
 in that process. Continue an OpenAI session with the `X-Syndica-Session` response header;
 Responses ids look like `resp_<session>_<n>` and are passed back as `previous_response_id`.
+An A2A `contextId` is the Syndica session id: omit it to open a session, send the one Syndica
+returned to continue it; any other value gets a failed task saying so. An editor can
+`session/load` an ACP session after `syndica acp` restarts. `syndica doctor` starts each declared
+ACP agent for a handshake, fetches each A2A agent card, and lists every MCP server's tools; one
+unreachable object gets its own failed line and the rest are still checked. An MCP server that no
+role lists in `roles` is never started.
 
 A role can call out by setting `model: acp:<name>` or `model: a2a:<name>`. A hosted ACP agent only
 gets what its role declares: reading files needs `Read` in the role's `tools`, writing needs
@@ -915,7 +921,7 @@ The credential is handed over only when the project declares that object with ex
 loopback host.
 Version negotiation fails closed: MCP accepts only the five versions its SDK lists, ACP accepts
 protocol version 1, and A2A accepts only `1.0` and `0.3`. A missing `A2A-Version` header is
-rejected rather than treated as `0.3`.
+rejected with `-32009` (the SDK's version-not-supported code) rather than treated as `0.3`.
 
 ## Training Export
 
