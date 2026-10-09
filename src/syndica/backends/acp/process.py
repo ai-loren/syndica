@@ -2,7 +2,7 @@
 
 关 stdin、宽限、SIGTERM 整组、宽限、SIGKILL 整组。组长退出后组里还可能有孙进程，所以结束看的是
 进程组，不是组长的 wait。stderr 一直读到进程结束：超过上限只丢内容，不停止读取——没人读的管道
-会把子进程堵死。写出日志之前先过 Redactor。
+会把子进程堵死。写出日志之前先过 Redactor，而且整行脱敏之后才截。
 
 `env` 是完整环境，不是在宿主环境上追加。追加会把宿主的密钥交给外部进程。
 
@@ -18,11 +18,12 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
 from typing import Self, cast
 
 from syndica.kernel import ConfigError, Redactor
+from syndica.kernel.clipping import drop_cut_end
 
 __all__ = ['ExternalProcess', 'ProcessSupervisor']
 
@@ -31,6 +32,92 @@ logger = logging.getLogger(__name__)
 _DEFAULT_GRACE_S = 2.0
 _DEFAULT_STDERR_LIMIT = 1_048_576
 _POLL_S = 0.02
+# 一行 stderr 最多攒这么多字节再脱敏。不换行的输出不能让缓冲无限长；攒满的那一截后面的字节看不见，
+# 刀口前那段连续的非空白可能是半截凭证，脱敏器认不出，所以脱敏之后再退到最近的空白。
+_LINE_CAP = 65_536
+
+
+class _StderrLines:
+    """把 stderr 的字节切成行交给 `emit`：整行先脱敏，再按 `limit` 字节截。
+
+    先截再脱敏会把跨过上限的凭证切成两截，前一截认不出来、原样进日志。所以一行攒齐（或攒满
+    `_LINE_CAP`）才脱敏，截的是脱敏后的文本。用满 `limit` 之后的字节直接丢掉，调用方照常读。
+    """
+
+    def __init__(
+        self,
+        redactor: Redactor,
+        limit: int,
+        *,
+        emit: Callable[[str], None],
+        capped: Callable[[], None],
+        clipped: Callable[[int], None],
+    ) -> None:
+        self._redactor = redactor
+        self._limit = limit
+        self._emit = emit
+        self._capped = capped
+        self._clipped = clipped
+        self._kept = 0
+        self._line = bytearray()
+        self._overlong = False
+        self._told_capped = False
+        self._told_clipped = False
+
+    def feed(self, chunk: bytes) -> None:
+        position = 0
+        while position < len(chunk):
+            if self._kept >= self._limit:
+                self._cap()
+                return
+            newline = chunk.find(b'\n', position)
+            end = len(chunk) if newline < 0 else newline
+            if not self._overlong:
+                room = _LINE_CAP - len(self._line)
+                if end - position > room:
+                    self._line += chunk[position : position + room]
+                    self._overlong = True
+                    self._flush(cut=True)
+                else:
+                    self._line += chunk[position:end]
+            if newline < 0:
+                return
+            if self._overlong:
+                self._overlong = False
+            else:
+                self._flush(cut=False)
+            position = newline + 1
+
+    def close(self) -> None:
+        """流结束了：最后那行没有换行，后面也不会再有字节，按完整的一行记。"""
+        if self._line:
+            self._flush(cut=False)
+
+    def _flush(self, *, cut: bool) -> None:
+        raw = bytes(self._line)
+        self._line.clear()
+        text = self._redactor.redact(raw.decode('utf-8', errors='replace'))
+        if cut:
+            text = drop_cut_end(text)
+        room = self._limit - self._kept
+        dropped = len(raw) > room
+        if dropped:
+            text = text.encode('utf-8')[:room].decode('utf-8', errors='ignore')
+            self._kept = self._limit
+        else:
+            self._kept = min(self._limit, self._kept + len(raw) + 1)
+        if text:
+            self._emit(text)
+        if cut and not self._told_clipped:
+            self._told_clipped = True
+            self._clipped(_LINE_CAP)
+        if dropped:
+            self._cap()
+
+    def _cap(self) -> None:
+        if not self._told_capped:
+            self._told_capped = True
+            self._capped()
 
 
 def _group_members(pgid: int) -> set[int]:
@@ -239,38 +326,21 @@ class ExternalProcess:
         if process is None or process.stderr is None:
             return
         stream = process.stderr
-        kept = 0
-        dropped = False
-        pending: bytes = b''
+        lines = _StderrLines(
+            self._redactor,
+            self._stderr_limit,
+            emit=self._log_line,
+            capped=self._log_cap,
+            clipped=self._log_clipped,
+        )
         while True:
             chunk = await stream.read(4096)
             if not chunk:
                 break
-            room = self._stderr_limit - kept
-            if room > 0:
-                take = chunk[:room]
-                kept += len(take)
-                pending += take
-                while True:
-                    newline = pending.find(b'\n')
-                    if newline < 0:
-                        break
-                    self._log_line(pending[:newline])
-                    pending = pending[newline + 1 :]
-                if kept >= self._stderr_limit and not dropped:
-                    dropped = True
-                    if pending:
-                        self._log_line(pending)
-                        pending = b''
-                    self._log_cap()
-        if pending and not dropped:
-            self._log_line(pending)
+            lines.feed(chunk)
+        lines.close()
 
-    def _log_line(self, line: bytes) -> None:
-        text = line.decode('utf-8', errors='replace')
-        if not text:
-            return
-        redacted = self._redactor.redact(text)
+    def _log_line(self, redacted: str) -> None:
         logger.info('external process %s stderr: %s', self._pgid, redacted)
 
     def _log_cap(self) -> None:
@@ -280,6 +350,15 @@ class ExternalProcess:
             ' 下一步: 让这个进程少写 stderr，或把它自己的日志写到文件里。',
             self._pgid,
             self._stderr_limit,
+        )
+
+    def _log_clipped(self, line_cap: int) -> None:
+        logger.warning(
+            '期望: 外部进程 %s 的 stderr 每行不超过 %s 字节。'
+            ' 实际: 有一行超出，只记了开头，刀口前那段连续的非空白也丢了（它可能是半截凭证）。'
+            ' 下一步: 让这个进程按行写 stderr，或把大段输出写到文件里。',
+            self._pgid,
+            line_cap,
         )
 
     @staticmethod

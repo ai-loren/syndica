@@ -2,25 +2,29 @@
 
 stdio 的环境必须整份交给 SDK：它只继承六个变量，漏交的名字不会出现在子进程里，交了的会盖掉
 那六个里的同名项。协商版本不在接受表里就拒绝。调用超时取服务超时和墙钟剩余的较小者。
-服务中途退出交回三件套，不自动重连。stderr 先脱敏再记，超过上限仍继续读。
+服务中途退出交回三件套，不自动重连。stderr 整行脱敏之后才截，超过上限仍继续读。stdio 服务关闭
+之后它的后代一个不留，含离开了进程组的。
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import logging
 import os
 import threading
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from types import MappingProxyType, TracebackType
 from typing import Any, Protocol, TextIO, cast
 
 import httpx2
+from mcp.client._transport import TransportStreams
 from mcp.client.client import Client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
+from syndica.backends.mcp.process import ProcessTree, StderrLines
 from syndica.backends.mcp.tools import (
     ExcludedTool,
     RemoteTool,
@@ -324,7 +328,7 @@ class McpClient:
 
 
 class _StderrTap:
-    """子进程 stderr 的读端。先脱敏再记；写满上限之后继续读，否则管道会把进程堵死。"""
+    """子进程 stderr 的读端。整行脱敏之后才截；写满上限之后继续读，否则管道会把进程堵死。"""
 
     def __init__(self, redactor: Redactor, limit: int, label: str) -> None:
         read_fd, write_fd = os.pipe()
@@ -352,9 +356,13 @@ class _StderrTap:
             pass
 
     def _run(self) -> None:
-        kept = 0
-        dropped = False
-        pending = b''
+        lines = StderrLines(
+            self._redactor,
+            self._limit,
+            emit=self._log_line,
+            capped=self._log_cap,
+            clipped=self._log_clipped,
+        )
         while True:
             try:
                 chunk = self._read.read(4096)
@@ -362,31 +370,11 @@ class _StderrTap:
                 break
             if not chunk:
                 break
-            room = self._limit - kept
-            if room > 0:
-                take = chunk[:room]
-                kept += len(take)
-                pending += take
-                while True:
-                    newline = pending.find(b'\n')
-                    if newline < 0:
-                        break
-                    self._log_line(pending[:newline])
-                    pending = pending[newline + 1 :]
-                if kept >= self._limit and not dropped:
-                    dropped = True
-                    if pending:
-                        self._log_line(pending)
-                        pending = b''
-                    self._log_cap()
-        if pending and not dropped:
-            self._log_line(pending)
+            lines.feed(chunk)
+        lines.close()
 
-    def _log_line(self, line: bytes) -> None:
-        text = line.decode('utf-8', errors='replace')
-        if not text:
-            return
-        logger.info('external process %s stderr: %s', self._label, self._redactor.redact(text))
+    def _log_line(self, redacted: str) -> None:
+        logger.info('external process %s stderr: %s', self._label, redacted)
 
     def _log_cap(self) -> None:
         logger.warning(
@@ -396,6 +384,58 @@ class _StderrTap:
             self._label,
             self._limit,
         )
+
+    def _log_clipped(self, line_cap: int) -> None:
+        logger.warning(
+            '期望: 外部进程 %s 的 stderr 每行不超过 %s 字节。'
+            ' 实际: 有一行超出，只记了开头，刀口前那段连续的非空白也丢了（它可能是半截凭证）。'
+            ' 下一步: 让这个进程按行写 stderr，或把大段输出写到文件里。',
+            self._label,
+            line_cap,
+        )
+
+
+@contextlib.asynccontextmanager
+async def _supervised_stdio(
+    params: StdioServerParameters, errlog: TextIO
+) -> AsyncGenerator[TransportStreams]:
+    # SDK 收尾时 server 按时退出就不再对它的进程组发信号，组里的孙进程留下；setsid 离开了组的
+    # 后代 SDK 本来就够不着。这一层与 SDK 的上下文在同一个任务里进出（SDK 的取消域要求）。
+    transport = stdio_client(params, errlog=errlog)
+    tree: ProcessTree | None = None
+    try:
+        async with transport as streams:
+            tree = ProcessTree(_server_pid(transport))
+            tree.start()
+            try:
+                yield streams
+            finally:
+                # SDK 接下来关 stdin，server 一退出它的后代就挂到 init 名下，趁父子链还在再记一遍。
+                tree.stop()
+                tree.record()
+    finally:
+        if tree is not None:
+            await tree.reap()
+
+
+def _server_pid(transport: object) -> int:
+    # SDK 不交出它拉起的进程，只能从挂起在 yield 上的生成器里读。读不到就不连：连上了也收不干净。
+    frame = getattr(getattr(transport, 'gen', None), 'ag_frame', None)
+    local_vars = cast(dict[str, object], getattr(frame, 'f_locals', None) or {})
+    pid = getattr(local_vars.get('process'), 'pid', None)
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        try:
+            installed = importlib.metadata.version('mcp')
+        except importlib.metadata.PackageNotFoundError:
+            installed = '未知版本'
+        raise ConfigError(
+            expected='mcp SDK 的 stdio_client 里有它拉起的 server 进程（局部变量 process）',
+            received=f'mcp {installed} 里读到的是 {pid!r}，关闭之后没法收掉 server 的后代',
+            next_action=(
+                '安装 syndica[mcp] 声明的 mcp 版本；在 Syndica 适配这个版本之前，改用 HTTP 服务'
+            ),
+        )
+    return pid
 
 
 def connect_stdio(
@@ -424,7 +464,7 @@ def connect_stdio(
     )
     try:
         protocol = Client(
-            stdio_client(params, errlog=tap.file),
+            _supervised_stdio(params, tap.file),
             mode='auto',
             cache=None,
             read_timeout_seconds=seconds,

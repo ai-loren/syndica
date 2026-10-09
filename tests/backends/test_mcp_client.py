@@ -338,6 +338,84 @@ async def test_stdio_child_env_overrides_inherited_names_and_stderr_is_redacted(
     assert warnings[0].args[1] == 64
 
 
+_STRADDLER = 'sk-live-QuizWaltzVex9876JUMP'
+
+
+def _fragments(secret: str, size: int = 6) -> list[str]:
+    return [secret[start : start + size] for start in range(len(secret) - size + 1)]
+
+
+async def _stdio_stderr(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, payload: str, limit: int
+) -> tuple[list[str], list[tuple[object, ...]]]:
+    script = tmp_path / 'srv.py'
+    script.write_text(
+        f'import sys\nsys.stderr.write({payload!r})\nsys.stderr.flush()\n', encoding='utf-8'
+    )
+    client = connect_stdio(
+        'docs',
+        [sys.executable, str(script)],
+        env={'PATH': os.environ.get('PATH', '/usr/bin:/bin')},
+        cwd=str(tmp_path),
+        redactor=RuleRedactor(secrets=(_STRADDLER,)),
+        timeout=2,
+        stderr_limit=limit,
+    )
+    failed = False
+    with caplog.at_level(logging.INFO, logger='syndica.backends.mcp.client'):
+        try:
+            async with client:
+                pass
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            failed = True
+    assert failed
+    texts: list[str] = []
+    warnings: list[tuple[object, ...]] = []
+    for record in caplog.records:
+        if record.name != 'syndica.backends.mcp.client' or not isinstance(record.args, tuple):
+            continue
+        if record.levelno == logging.WARNING:
+            warnings.append(record.args)
+        elif 'stderr' in str(record.msg):
+            texts.append(str(record.args[1]))
+    return texts, warnings
+
+
+async def test_stdio_stderr_straddling_the_limit_leaves_no_secret_fragment(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    texts, warnings = await _stdio_stderr(
+        tmp_path, caplog, 'x' * 50 + _STRADDLER + '\nafter\n', limit=64
+    )
+    assert not [piece for piece in _fragments(_STRADDLER) if piece in caplog.text]
+    assert texts[0].startswith('x' * 50)
+    assert sum(len(text.encode('utf-8')) for text in texts) <= 64
+    assert [args[1] for args in warnings] == [64]
+
+
+async def test_stdio_stderr_straddling_the_line_cap_leaves_no_secret_fragment(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    line_cap = 65_536
+    head = 'word ' * (line_cap // 5 - 2)
+    payload = head + _STRADDLER + 'y' * 1000 + '\ntail line\n'
+    texts, warnings = await _stdio_stderr(tmp_path, caplog, payload, limit=1_048_576)
+    assert not [piece for piece in _fragments(_STRADDLER) if piece in caplog.text]
+    assert texts[0].startswith('word word')
+    assert texts[-1] == 'tail line'
+    assert [args[1] for args in warnings] == [line_cap]
+
+
+def test_an_sdk_that_hides_the_server_process_is_refused():
+    from syndica.backends.mcp.client import _server_pid  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(ConfigError, match='process') as exc:
+        _server_pid(SimpleNamespace(gen=SimpleNamespace(ag_frame=SimpleNamespace(f_locals={}))))
+    assert 'HTTP' in str(exc.value)
+
+
 def test_roles_receive_only_their_tools_and_shutdown_closes_clients():
     echo = SimpleNamespace(name='docs__echo')
     other = SimpleNamespace(name='docs__other')
