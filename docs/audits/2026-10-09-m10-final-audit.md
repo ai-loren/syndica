@@ -2,13 +2,13 @@
 
 日期：2026-10-09
 范围：[M10 计划](../plans/2026-10-09-m10-interop.md) 的阶段零至七
-验证方式：本地验证协议（Actions 额度用完期间，见路线图「当前主线约束」）。改动还在工作区里，没有提交，也没有推送。
+验证方式：本地验证协议（Actions 额度用完期间，见路线图「当前主线约束」）。实现在提交 `b1ec080` 里，没有推送。
 
 ## 结论
 
 四个协议都映射到已有的 Syndica 会话，不另写一套 Runtime。被调用的适配在 `syndica.server`，调用外部的三个 backend 互不依赖，由组合根注入。外部内容一律不可信。协议错误是三件套，不回显异常原文。密钥只从工作区之外的用户级 `interop.yaml` 来。
 
-回归证据是官方 SDK 对真进程或真 HTTP 服务的脚本化往返，不花钱。MCP Inspector 的 CLI 模式对 `syndica mcp` 与 `syndica up` 的 `/mcp` 都已手工跑通。Gemini CLI 没有跑：这个环境里没有 Gemini key。路线图把真实客户端写成可手动或 nightly；计划阶段七仍把它列进收口。这一条没做，所以路线图总览写「进行中」，不写「已完成」。
+回归证据是官方 SDK 对真进程或真 HTTP 服务的脚本化往返，不花钱。真实客户端另外手工跑过：MCP Inspector 的 CLI 模式对 `syndica mcp` 与 `syndica up` 的 `/mcp`；Gemini CLI 0.63 作为托管的 ACP Agent，用免费 Gemini key 做了一次读写（批准时写入、拒绝时不写）；`openai` SDK 对背后是免费 Gemini 的 `syndica up --api-token`。三处都查过 key 零泄露、外部进程不留。
 
 ## 完成判据 × 证据
 
@@ -28,6 +28,8 @@
 | Orchestrator 派活给 `a2a:` 角色，交回不可信 | `tests/backends/test_a2a_model.py` |
 | OpenAI HTTP：模型列表、chat、Responses、流、客户端工具、续接、400 / 401 / 404、有人看着时批准确认、断开不中止这一轮 | `tests/server/test_openai_http.py`，黄金文件 `tests/server/testdata/openai_chat.jsonl` |
 | 真的 `syndica up --api-token`：`/v1/models` 列出角色，机器令牌不进状态文件；`openai` SDK 打到本地假端点 | `tests/server/test_up_down.py` |
+| Gemini CLI 作为托管的 ACP Agent，免费 Gemini key 下完成一件读写 | 手工，2026-10-09，仓库外的临时工作区。项目配置写 `model: acp:gemini` 与命令 `npx @google/gemini-cli@0.63.0 --acp -m gemini-3.5-flash-lite`；用户级 `interop.yaml`（0600）只写 `acp:gemini: {env: [GEMINI_API_KEY]}`；key 只在子壳里从 0600 的临时文件读进环境，跑完删掉。任务是读 `notes.md`、把暗号写进 `answer.md`。Gemini 请求 `edit` 权限时 Syndica 在终端问人：回 `approve` 后 `answer.md` 是 `BLUEFIN`，回 `reject` 后文件不存在。trace 里两次 Read、一次 Write 都记成 `tool.caller=acp-agent:gemini`。工作区（含 `.syndica`）、配置目录、stdout / stderr 与 npm 日志里都找不到 key，跑完没有残留的 Gemini 进程 |
+| `openai` SDK 对背后是免费 Gemini 的 `syndica up` | 手工，同一个临时工作区：`/v1/models` 含 Worker；`chat.completions` 答 `PELICAN`，带 `X-Syndica-Session` 续接后答 `OSPREY`，`X-Syndica-Ignored` 列出 `temperature`；key 与机器令牌都不在工作区和 server 状态目录里 |
 | kernel 不 import 协议 SDK；surface 不 import backend | `scripts/check_deps.py`、`tests/test_deps.py` |
 | 协议响应与外发 JSON 先脱敏 | `tests/test_write_points.py`；OpenAI / A2A / MCP 的 HTTP 出口走 `json_response` 或 `redacted` |
 | server 不碰内核私有属性 | `tests/server/test_private_guard.py`。客户端工具经 `SessionHandle.install_tools` 装，不读 `runtime._table` |
@@ -42,7 +44,11 @@
 - 客户端工具与 Syndica 工具撞名不报错：测试替身的 `install_tools` 不查重名，真装配那条路径没有用例。补了经真装配、用
   `Read` 当客户端工具名的 400。
 
-补完之后 17 条全部变红。「零存活」只在这组变异下成立；这一轮没有第二个人施加变异，收口对抗评审仍算没做。
+补完之后 17 条全部变红。「零存活」只在这组变异下成立；第二方的收口对抗评审另记在下一节。
+
+## 收口对抗评审
+
+用户 2026-10-09 允许起子代理。第二方评审对 `b1ec080` 的结论与处置在这里补齐。
 
 ## 明确不做（计划收尾复核）
 
@@ -59,11 +65,7 @@
 
 | 条目 | 原因 |
 |---|---|
-| Gemini CLI 作为托管 ACP Agent，用免费 key 做一次读写 | 环境里没有 Gemini key。key 只能在子壳里 source，不能写进仓库 |
-| MCP Inspector 对 `/mcp`（HTTP） | 已手工跑通，见上表。没有收成自动测试：Inspector 经 npx 拉取 |
-| `openai` SDK 对 `syndica up` 且背后是免费 Gemini | 同一条 key 缺口。现在的证明用本地假端点 |
-| 收口对抗评审 | 2026-10-09 起不再起子代理。作者自己做了 17 条定向变异（见上），但没有第二个人施加变异 |
-| 导出验证（`git archive` 到临时目录再跑全门禁） | 改动还没提交。提交前再做 |
+| 真实客户端收成自动测试 | Inspector 与 Gemini CLI 经 npx 拉取、Gemini 要 key，按路线图归手动 / nightly |
 | 回放文档里的 `mcp.external_tool` | 规则参数表只收内核规则。带 MCP 的 run 不写回放文档，结构 trace 照常记 |
 
 ## 公开契约
