@@ -706,3 +706,89 @@ def test_an_editor_stdio_mcp_tool_runs_untrusted(tmp_path: Path) -> None:
         asyncio.run(body())
     finally:
         host.close()
+
+
+def _stopping(
+    tmp_path: Path, config_text: str, max_turns: int | None, turns: list[ScriptedTurn]
+) -> tuple[RuntimeCliHost, _Recording, list[object], Path]:
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    (workspace / 'notes.md').write_text('alpha marker\n', encoding='utf-8')
+    config = workspace / '.syndica.yaml'
+    config.write_text(config_text, encoding='utf-8')
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
+        model_factory=lambda _: ScriptedLLM(turns),
+        workspace_root=workspace,
+    )
+    opened: list[object] = []
+
+    async def open_turn(cwd: str, mode: str, servers: tuple[object, ...] = ()) -> TurnBinding:
+        del cwd, servers
+        parts = await host.assemble_session(
+            str(config),
+            max_turns=max_turns,
+            trace=None,
+            argv=('syndica', 'acp'),
+            trusted_output=(),
+            role=mode,
+        )
+        opened.append(parts)
+        return TurnBinding(parts.runtime, parts.agent_id, parts.subscription)
+
+    return host, _Recording(open_turn), opened, workspace
+
+
+def _reads(count: int) -> list[ScriptedTurn]:
+    read = json.dumps({'path': 'notes.md'})
+    return [
+        ScriptedTurn(tool_calls=[ToolCall(id=f'r{index}', name='Read', arguments=read)])
+        for index in range(count)
+    ]
+
+
+def test_a_root_out_of_its_own_turns_answers_max_turn_requests(tmp_path: Path) -> None:
+    host, agent, opened, workspace = _stopping(
+        tmp_path, _CONFIG + '    budget: {turns: 1}\n', None, _reads(4)
+    )
+
+    async def body() -> None:
+        session_id = ''
+        try:
+            session = await agent.new_session(str(workspace))
+            session_id = session.session_id
+            async with asyncio.timeout(20):
+                result = await agent.prompt(session_id, [TextContentBlock(type='text', text='go')])
+            assert result.stop_reason == 'max_turn_requests'
+            assert not any('预算用尽' in text for text in agent.messages)
+        finally:
+            await _finish(host, agent, session_id, opened)
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
+def test_a_root_out_of_budget_answers_max_tokens_and_names_the_dimension(
+    tmp_path: Path,
+) -> None:
+    host, agent, opened, workspace = _stopping(tmp_path, _CONFIG, 1, _reads(4))
+
+    async def body() -> None:
+        session_id = ''
+        try:
+            session = await agent.new_session(str(workspace))
+            session_id = session.session_id
+            async with asyncio.timeout(20):
+                result = await agent.prompt(session_id, [TextContentBlock(type='text', text='go')])
+            assert result.stop_reason == 'max_tokens'
+            assert agent.messages == ['预算用尽：turns']
+        finally:
+            await _finish(host, agent, session_id, opened)
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()

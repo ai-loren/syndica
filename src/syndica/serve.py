@@ -221,6 +221,15 @@ def _require_dependencies() -> None:
         )
 
 
+def _require_extra(module: str, extra: str, command: str) -> None:
+    if importlib.util.find_spec(module) is None:
+        raise ConfigError(
+            expected=f'syndica {command} 要的协议 SDK（模块 {module}）已经装好',
+            received=f'找不到模块 {module}',
+            next_action=f"pip install 'syndica[{extra}]' 之后再运行 syndica {command}",
+        )
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -403,6 +412,7 @@ def mcp_stdio(host: Any, config: str) -> str:
 
     返回空串：stdout 只放协议，命令结束时不再往上面补一行说明。
     """
+    _require_extra('mcp', 'mcp', 'mcp')
     paths = _Paths.of(host.workspace_root, os.environ)
     paths.make()
     log = _RedactingLog(paths.root / 'mcp.log', host_redactor(os.environ))
@@ -417,21 +427,67 @@ def mcp_stdio(host: Any, config: str) -> str:
 
 def acp_stdio(host: Any, config: str) -> str:
     """stdio ACP agent。日志先于 SDK 的 import 指到工作区外的文件。stdout 只放协议。"""
+    _require_extra('acp', 'acp', 'acp')
     paths = _Paths.of(host.workspace_root, os.environ)
     paths.make()
     log = _RedactingLog(paths.root / 'acp.log', host_redactor(os.environ))
     logging.basicConfig(level=logging.INFO, handlers=[log], force=True)
     logging.captureWarnings(True)
     try:
-        asyncio.run(_acp_stdio(host, config, log))
+        asyncio.run(_acp_stdio(host, config, log, paths.root / 'acp-sessions'))
     finally:
         log.close()
     return ''
 
 
-async def _acp_stdio(host: Any, config_path: str, log: _RedactingLog) -> None:
+_HEX_ID = re.compile(r'[0-9a-f]{32}')
+
+
+class _AcpSessions:
+    """ACP 的 sessionId 落在哪个 Syndica 会话上：一条会话一个文件，放在工作区之外的 server 目录。
+
+    文件名是 sessionId、内容是会话 id，两者都只认 32 位小写十六进制：`session/load` 的 sessionId
+    是编辑器给的，不卡住它就能拼出这个目录之外的路径。记不下只告警：这个进程里的会话照常用，
+    只是换了进程之后 load 不回来。
+    """
+
+    def __init__(self, root: Path, redactor: Redactor) -> None:
+        self._root = root
+        self._redactor = redactor
+
+    def remember(self, session_id: str, sid: str) -> None:
+        if not (_HEX_ID.fullmatch(session_id) and _HEX_ID.fullmatch(sid)):
+            logging.getLogger(__name__).warning(
+                '期望: ACP 会话与 Syndica 会话的 id 都是 32 位小写十六进制。 实际: 不是，这条对照'
+                '没有记下。 下一步: 这个会话换了进程之后 load 不回来，用 new_session 另开。'
+            )
+            return
+        try:
+            self._root.mkdir(mode=0o700, exist_ok=True)
+            (self._root / session_id).write_text(self._redactor.redact(sid), encoding='utf-8')
+        except OSError as error:
+            logging.getLogger(__name__).warning(
+                '期望: 在 %s 记下 ACP 会话落在哪个 Syndica 会话上。 实际: 写不进去（%s）。'
+                ' 下一步: 这个会话换了进程之后 load 不回来；修好这个目录的权限再开新会话。',
+                self._root,
+                type(error).__name__,
+            )
+
+    def recall(self, session_id: str) -> str | None:
+        if not _HEX_ID.fullmatch(session_id):
+            return None
+        try:
+            sid = (self._root / session_id).read_text(encoding='utf-8')
+        except OSError:
+            return None
+        return sid if _HEX_ID.fullmatch(sid) else None
+
+
+async def _acp_stdio(host: Any, config_path: str, log: _RedactingLog, index: Path) -> None:
     from acp import run_agent
 
+    from syndica.cli.handoff import session_root
+    from syndica.kernel import FileSessionStore
     from syndica.server.acp_agent import SyndicaAcp, TurnBinding
 
     config = host.trusted_without_asking(config_path)
@@ -452,22 +508,41 @@ async def _acp_stdio(host: Any, config_path: str, log: _RedactingLog) -> None:
                 next_action='在那个目录里运行 syndica acp',
             )
 
-    async def open_turn(cwd: str, mode: str, servers: tuple[Any, ...] = ()) -> TurnBinding:
+    async def open_turn(
+        cwd: str, mode: str, servers: tuple[Any, ...] = (), *, resume: str | None = None
+    ) -> TurnBinding:
         trust(cwd)
+        history = None
+        if resume is not None:
+            record = await FileSessionStore(session_root(host.workspace_root)).load(resume)
+            if record is None:
+                raise ConfigError(
+                    expected='sessionId 落在这个工作区 .syndica/sessions 里还在的会话上',
+                    received=f'会话 {resume} 不在了',
+                    next_action='用 new_session 开一条新会话；删掉的会话续不回来',
+                )
+            mode = record.meta.agent
+            history = record.content
         parts = await host.assemble_session(
             config_path,
             max_turns=None,
             trace=None,
             argv=('syndica', 'acp'),
             trusted_output=(),
+            resume=resume,
             role=mode,
             config=with_editor_mcp(config, servers, mode),
         )
         opened.append(parts)
-        return TurnBinding(parts.runtime, parts.agent_id, parts.subscription)
+        return TurnBinding(parts.runtime, parts.agent_id, parts.subscription, history=history)
 
     agent = SyndicaAcp(
-        roles, trust, open_turn=open_turn, redactor=log.redactor, version=__version__
+        roles,
+        trust,
+        open_turn=open_turn,
+        sessions=_AcpSessions(index, log.redactor),
+        redactor=log.redactor,
+        version=__version__,
     )
     try:
         await run_agent(agent)  # pyright: ignore[reportArgumentType]

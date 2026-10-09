@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 from mcp.client.client import Client
 from mcp.client.stdio import StdioServerParameters
@@ -77,3 +81,104 @@ async def test_the_sdk_client_drives_syndica_mcp(tmp_path: Path) -> None:
     assert logs
     assert all(workspace not in path.parents for path in logs)
     assert _SECRET not in logs[0].read_text(encoding='utf-8')
+
+
+def _is_json_rpc(line: bytes) -> bool:
+    if not line.endswith(b'\n'):
+        return False
+    try:
+        message: object = json.loads(line)
+    except ValueError:
+        return False
+    if not isinstance(message, dict):
+        return False
+    fields = cast(dict[str, object], message)
+    if fields.get('jsonrpc') != '2.0':
+        return False
+    if 'method' in fields:
+        return isinstance(fields['method'], str)
+    return 'id' in fields and (('result' in fields) != ('error' in fields))
+
+
+async def test_every_stdout_line_of_syndica_mcp_is_a_json_rpc_message(tmp_path: Path) -> None:
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    (workspace / '.syndica.yaml').write_text('version: 1\n', encoding='utf-8')
+    (workspace / 'notes.md').write_text(f'{_MARKER}\n{_SECRET}\n', encoding='utf-8')
+    env = _env(tmp_path / 'config')
+    _trust(workspace, env)
+    server = await asyncio.create_subprocess_exec(
+        sys.executable,
+        '-m',
+        'syndica',
+        'mcp',
+        cwd=workspace,
+        env=env,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert server.stdin is not None and server.stdout is not None and server.stderr is not None
+    stdin, stdout = server.stdin, server.stdout
+    stderr = asyncio.create_task(server.stderr.read())
+    lines: list[bytes] = []
+
+    async def call(message: dict[str, object]) -> None:
+        stdin.write(json.dumps(message).encode() + b'\n')
+        await stdin.drain()
+        if 'id' not in message:
+            return
+        async with asyncio.timeout(20):
+            while True:
+                line = await stdout.readline()
+                assert line, b''.join(lines)
+                lines.append(line)
+                if json.loads(line).get('id') == message['id']:
+                    return
+
+    try:
+        await call(
+            {
+                'jsonrpc': '2.0',
+                'id': 1,
+                'method': 'initialize',
+                'params': {
+                    'protocolVersion': '2025-11-25',
+                    'capabilities': {},
+                    'clientInfo': {'name': 'raw', 'version': '0'},
+                },
+            }
+        )
+        await call({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+        await call({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})
+        await call(
+            {
+                'jsonrpc': '2.0',
+                'id': 3,
+                'method': 'tools/call',
+                'params': {'name': 'Read', 'arguments': {'path': 'notes.md'}},
+            }
+        )
+        await call(
+            {
+                'jsonrpc': '2.0',
+                'id': 4,
+                'method': 'tools/call',
+                'params': {'name': 'Write', 'arguments': {'path': 'x', 'content': 'y'}},
+            }
+        )
+        await call({'jsonrpc': '2.0', 'id': 5, 'method': 'no/such/method'})
+        stdin.close()
+        async with asyncio.timeout(20):
+            lines.extend([line async for line in stdout])
+            assert await server.wait() == 0
+    finally:
+        if server.returncode is None:
+            os.killpg(server.pid, signal.SIGKILL)
+            await server.wait()
+        await asyncio.wait_for(stderr, 10)
+    assert len(lines) >= 5
+    assert [line for line in lines if not _is_json_rpc(line)] == []
+    assert _MARKER.encode() in b''.join(lines)
+    assert _SECRET.encode() not in b''.join(lines)

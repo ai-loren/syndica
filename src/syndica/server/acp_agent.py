@@ -40,6 +40,7 @@ from acp.schema import (
 from syndica.kernel import (
     AgentStatus,
     ConfigError,
+    ContextBlock,
     Event,
     Redactor,
     Runtime,
@@ -47,8 +48,9 @@ from syndica.kernel import (
     SyndicaError,
     TrustLevel,
 )
+from syndica.kernel.history_blocks import kind_of
 
-__all__ = ['AcpBridge', 'AcpSession', 'SyndicaAcp', 'TurnBinding']
+__all__ = ['AcpBridge', 'AcpSession', 'OpenTurn', 'SessionIndex', 'SyndicaAcp', 'TurnBinding']
 
 _OUTPUT_CAP = 4_000
 _ROOT_ONLY = frozenset({'message_appended', 'agent_error', 'agent_end'})
@@ -73,12 +75,45 @@ class AcpSession:
 
 
 class TurnBinding:
-    """一次已经装好的 Syndica 会话，ACP 的一轮提示在它上面跑。"""
+    """一次已经装好的 Syndica 会话，ACP 的一轮提示在它上面跑。
 
-    def __init__(self, runtime: Runtime, agent_id: str, subscription: Subscription) -> None:
+    `history` 是从落盘会话恢复时存下的那份轨迹：恢复出来的根 Agent 停在空闲、等下一条消息，
+    `Runtime.wait` 要等到下一轮结束才返回，重放只能读这一份。
+    """
+
+    def __init__(
+        self,
+        runtime: Runtime,
+        agent_id: str,
+        subscription: Subscription,
+        *,
+        history: Sequence[ContextBlock] | None = None,
+    ) -> None:
         self.runtime = runtime
         self.agent_id = agent_id
         self.subscription = subscription
+        self.history = None if history is None else tuple(history)
+
+
+class OpenTurn(Protocol):
+    """装好一次 Syndica 会话。`resume` 给定时续那个落盘会话，角色沿用落盘时的那个。"""
+
+    def __call__(
+        self,
+        cwd: str,
+        mode: str,
+        servers: tuple[Any, ...] = (),
+        *,
+        resume: str | None = None,
+    ) -> Awaitable[TurnBinding]: ...
+
+
+class SessionIndex(Protocol):
+    """ACP 的 sessionId 落在哪个 Syndica 会话上。新进程里的 `session/load` 靠它找回会话。"""
+
+    def remember(self, session_id: str, sid: str) -> None: ...
+
+    def recall(self, session_id: str) -> str | None: ...
 
 
 class TurnEmit(Protocol):
@@ -114,9 +149,12 @@ class AcpBridge:
     ) -> None:
         self._runtime = binding.runtime
         self._agent_id = binding.agent_id
+        self._history = binding.history
         self._emit = emit
         self._redactor = redactor
         self._question: tuple[str, str, tuple[str, ...]] | None = None
+        # 正在问编辑器的确认：request_id -> 发起的 Agent。谁先从这里摘走谁答，答复只发一次。
+        self._asking: dict[str, str] = {}
         self._stop = 'end_turn'
         self._cancelled = False
         self._failure: BaseException | None = None
@@ -172,6 +210,7 @@ class AcpBridge:
                 received=delivered.reason or '投递没有给出原因',
                 next_action='看这个会话是不是已经结束；结束了就 new_session',
             )
+        self._history = None
         await self._turn_done.wait()
         if self._cancelled:
             return 'cancelled'
@@ -188,10 +227,14 @@ class AcpBridge:
 
     async def replay(self) -> None:
         # 这一轮的驱动任务结束之后 `wait` 立刻返回。还在跑就等到它结束再重放，不读半截轨迹。
-        context = await self._runtime.wait(self._agent_id)
-        for block in context.current_traj:
+        if self._history is not None:
+            blocks: Sequence[ContextBlock] = self._history
+        else:
+            blocks = (await self._runtime.wait(self._agent_id)).current_traj
+        for block in blocks:
             text = block.content if isinstance(block.content, str) else ''
-            if not text:
+            # 内核署名的块（预算、恢复提示）是写给模型的，不是人说过的话。
+            if not text or kind_of(block) is not None:
                 continue
             text = self._redact(text)
             if block.role == 'user':
@@ -210,6 +253,15 @@ class AcpBridge:
         await self._runtime.abort(self._agent_id)
 
     async def close(self) -> None:
+        # 挂着的确认在拆泵之前按拒绝答掉：只取消泵，这次调用要等到确认超时或关机才落定，
+        # 结局是超时或中止而不是拒绝，Agent 在那之前一直停在它上面。
+        asking = list(self._asking.items())
+        self._asking.clear()
+        for request_id, agent_id in asking:
+            try:
+                await self._answer(agent_id, request_id, 'reject')
+            except Exception:
+                logger.exception('acp reject on close failed')
         self._pump.cancel()
         await asyncio.gather(self._pump, return_exceptions=True)
 
@@ -268,7 +320,10 @@ class AcpBridge:
                 self._stop = _stop_reason(event.payload.get('stop_reason'))
             self._turn_done.set()
         elif event.kind == 'budget_exhausted':
-            await self._emit.message(self._redact(f'预算用尽：{event.payload.get("dimensions")}'))
+            raw = event.payload.get('dimensions')
+            dimensions = cast(list[object], raw) if isinstance(raw, list) else []
+            named = '、'.join(str(item) for item in dimensions) or '未知的一维'
+            await self._emit.message(self._redact(f'预算用尽：{named}'))
 
     async def _message(self, payload: dict[str, Any]) -> None:
         raw = payload.get('block')
@@ -285,18 +340,25 @@ class AcpBridge:
     async def _confirm(self, event: Event) -> None:
         name = str(event.payload.get('tool_name'))
         tool_call_id = str(event.payload.get('tool_call_id'))
+        request_id = str(event.payload.get('request_id'))
         arguments = _clip(self._redact(str(event.payload.get('arguments', ''))))
+        self._asking[request_id] = event.agent_id
         try:
             decision = await self._emit.permission(tool_call_id, name, arguments)
         except Exception:
             logger.exception('acp permission failed')
             decision = 'reject'
+        if self._asking.pop(request_id, None) is None:
+            return
+        await self._answer(event.agent_id, request_id, decision)
+
+    async def _answer(self, agent_id: str, request_id: str, decision: str) -> None:
         await self._runtime.send(
-            event.agent_id,
+            agent_id,
             'approve' if decision == 'approve' else 'reject',
             activate=False,
             sender='human',
-            correlation_id=str(event.payload.get('request_id')),
+            correlation_id=request_id,
             trust=TrustLevel.TRUSTED,
         )
 
@@ -316,7 +378,11 @@ class AcpBridge:
 
 
 class SyndicaAcp:
-    """低层 ACP agent。`trust` 不通过就三件套拒绝，不在这条 stdio 上问人。"""
+    """低层 ACP agent。`trust` 不通过就三件套拒绝，不在这条 stdio 上问人。
+
+    给了 `sessions` 时，每条会话第一次提示装好的 Syndica 会话记进去；这个进程里没有的 sessionId
+    在 `session/load` 时从那里找回，按落盘会话恢复。
+    """
 
     def __init__(
         self,
@@ -324,7 +390,8 @@ class SyndicaAcp:
         trust: Callable[[str], None],
         *,
         runner: PromptRunner | None = None,
-        open_turn: Callable[[str, str, tuple[Any, ...]], Awaitable[TurnBinding]] | None = None,
+        open_turn: OpenTurn | None = None,
+        sessions: SessionIndex | None = None,
         redactor: Redactor | None = None,
         version: str = '',
     ) -> None:
@@ -339,6 +406,7 @@ class SyndicaAcp:
         self._trust = trust
         self._runner = runner
         self._open_turn = open_turn
+        self._index = sessions
         self._redactor = redactor
         self._version = version
         self._sessions: dict[str, AcpSession] = {}
@@ -400,11 +468,45 @@ class SyndicaAcp:
         additional_directories: list[str] | None = None,
         **kwargs: object,
     ) -> LoadSessionResponse:
-        del cwd, mcp_servers, additional_directories, kwargs
-        session = self._require(session_id)
-        if session.bridge is not None:
+        del additional_directories, kwargs
+        session = self._sessions.get(session_id)
+        if session is None:
+            session = await self._resume(cwd, session_id, mcp_servers or [])
+        elif session.bridge is not None:
             await session.bridge.replay()
         return LoadSessionResponse(modes=self._mode_state(session.mode))
+
+    async def _resume(self, cwd: str, session_id: str, mcp_servers: list[object]) -> AcpSession:
+        sid = None if self._index is None else self._index.recall(session_id)
+        if sid is None or self._open_turn is None:
+            raise _refuse(
+                'sessionId 是这个工作区里 new_session 交回、并且提示过的那个',
+                f'收到 {session_id!r}；这个进程里没有它，也没有记下它落在哪个会话上',
+                '用 new_session 开一条新会话；续旧会话要在同一个工作区、同一个配置目录下启动 '
+                'syndica acp 再 load',
+            )
+        servers = _stdio_servers(mcp_servers)
+        try:
+            self._trust(cwd)
+            binding = await self._open_turn(cwd, self._roles[0][0], servers, resume=sid)
+        except SyndicaError as error:
+            raise _refuse(error.expected, error.received, error.next_action) from None
+        except Exception as exc:
+            logger.exception('acp load failed')
+            raise _refuse(
+                'session/load 恢复落盘的会话',
+                f'恢复时抛出了 {type(exc).__name__}，原文不回显',
+                '看 acp 的日志',
+            ) from None
+        info = await binding.runtime.find(binding.agent_id)
+        known = {name for name, _ in self._roles}
+        mode = info.name if info is not None and info.name in known else self._roles[0][0]
+        session = AcpSession(cwd, mode, servers)
+        session.prompted = True
+        session.bridge = AcpBridge(binding, _Sink(self, session_id), redactor=self._redactor)
+        self._sessions[session_id] = session
+        await session.bridge.replay()
+        return session
 
     async def set_session_mode(
         self, session_id: str, mode_id: str, **kwargs: object
@@ -490,6 +592,8 @@ class SyndicaAcp:
                 session.bridge = AcpBridge(
                     binding, _Sink(self, session_id), redactor=self._redactor
                 )
+                if self._index is not None:
+                    self._index.remember(session_id, binding.agent_id)
             stop = await session.bridge.submit(text)
         except SyndicaError as error:
             raise _refuse(error.expected, error.received, error.next_action) from None
@@ -508,9 +612,9 @@ class SyndicaAcp:
         session = self._sessions.get(session_id)
         if session is None:
             raise _refuse(
-                'sessionId 是这个进程里 new_session 交回的那个',
+                'sessionId 是这个进程里 new_session 或 load_session 过的那个',
                 f'收到 {session_id!r}',
-                '用 new_session 的 sessionId；这个进程退出之后旧的 id 就没了',
+                '用 new_session 的 sessionId；上一个 syndica acp 进程里的会话先 session/load 再用',
             )
         return session
 

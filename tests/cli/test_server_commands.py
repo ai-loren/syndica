@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from io import StringIO
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -127,6 +130,33 @@ def test_mcp_in_the_agent_environment_is_refused(monkeypatch: pytest.MonkeyPatch
     code, _, stderr = _run(['mcp'], control)
     assert code == 1
     assert 'SYNDICA_AGENT_ENV' in stderr and '下一步' in stderr
+
+
+@pytest.mark.parametrize('command', ['acp', 'mcp'])
+def test_a_stdio_server_without_its_sdk_names_the_extra_to_install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+):
+    from syndica.__main__ import _ServerControl  # pyright: ignore[reportPrivateUsage]
+
+    real = importlib.util.find_spec
+
+    def find_spec(name: str, package: str | None = None) -> Any:
+        if name == command or name.startswith(f'{command}.'):
+            return None
+        return real(name, package)
+
+    monkeypatch.setattr(importlib.util, 'find_spec', find_spec)
+    monkeypatch.setitem(sys.modules, command, None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv('SYNDICA_AGENT_ENV', raising=False)
+    monkeypatch.delenv('SYNDICA_TRUST_STORE', raising=False)
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
+    control = _ServerControl(CliIO(stdin=StringIO(''), stdout=StringIO(), stderr=StringIO()))
+    code, stdout, stderr = _run([command], control)
+    assert (code, stdout) == (1, '')
+    assert f"pip install 'syndica[{command}]'" in stderr
+    assert f'找不到模块 {command}' in stderr
+    assert not (tmp_path / 'config').exists()
 
 
 @pytest.mark.parametrize('port', ['-1', '65536', 'http'])

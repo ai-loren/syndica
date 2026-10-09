@@ -22,6 +22,7 @@ from syndica.kernel import (
     RuleRedactor,
     TrustLevel,
 )
+from syndica.kernel.history_blocks import HistoryKind, signed_block
 from syndica.server.acp_agent import AcpBridge, TurnBinding
 
 _SECRET = 'quizSECRETvalue-918273'
@@ -329,3 +330,103 @@ async def test_history_replay_redacts_both_sides() -> None:
     assert _SECRET not in emit.users[0] and _SECRET not in emit.messages[0]
     assert emit.users[0].startswith('问 [REDACTED')
     assert emit.messages[0].startswith('答 [REDACTED')
+
+
+class _Unanswered(_Emit):
+    """编辑器收到确认请求、一直不答。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.asked = asyncio.Event()
+
+    async def permission(self, tool_call_id: str, name: str, arguments: str) -> str:
+        self.permissions.append((tool_call_id, name, arguments))
+        self.asked.set()
+        await asyncio.Event().wait()
+        raise AssertionError('unreachable')
+
+
+def _confirmation(agent_id: str, request_id: str) -> Event:
+    return Event(
+        'tool_confirmation_requested',
+        agent_id,
+        {
+            'request_id': request_id,
+            'tool_call_id': 'b1',
+            'tool_name': 'Bash',
+            'arguments': '{"command": "rm notes.md"}',
+        },
+    )
+
+
+async def test_close_rejects_a_confirmation_the_editor_never_answered() -> None:
+    bus = EventBus()
+    runtime = _Runtime()
+    emit = _Unanswered()
+    bridge = AcpBridge(
+        TurnBinding(runtime, _ROOT, bus.subscribe()),  # pyright: ignore[reportArgumentType]
+        emit,
+    )
+    try:
+        await bus.emit(_confirmation(_CHILD, 'c-open'))
+        async with asyncio.timeout(_TIMEOUT):
+            await emit.asked.wait()
+        assert runtime.sent == []
+        async with asyncio.timeout(_TIMEOUT):
+            await bridge.close()
+        assert runtime.sent == [
+            (
+                _CHILD,
+                'reject',
+                {
+                    'activate': False,
+                    'sender': 'human',
+                    'correlation_id': 'c-open',
+                    'trust': TrustLevel.TRUSTED,
+                },
+            )
+        ]
+    finally:
+        await bridge.close()
+        await bus.close()
+
+
+async def test_close_does_not_answer_a_confirmation_the_editor_already_answered() -> None:
+    async with _bridge() as (bridge, bus, runtime, emit):
+        await bus.emit(_confirmation(_ROOT, 'c-done'))
+        await _drain(bus, emit, 'mark-1')
+        await bridge.close()
+    assert [(text, options['correlation_id']) for _target, text, options in runtime.sent] == [
+        ('approve', 'c-done')
+    ]
+
+
+class _Idle(_Runtime):
+    """恢复出来的根 Agent 停在空闲：`wait` 要等到下一轮结束。"""
+
+    async def wait(self, agent_id: str) -> Any:
+        del agent_id
+        await asyncio.Event().wait()
+        raise AssertionError('unreachable')
+
+
+async def test_a_resumed_session_replays_its_stored_history_without_kernel_notes() -> None:
+    history = [
+        ContextBlock(role='user', content='earlier prompt'),
+        signed_block(HistoryKind.BUDGET, '你的预算：轮次剩 9 / 10。', key='budget:1'),
+        ContextBlock(role='assistant', content='earlier answer'),
+        signed_block(HistoryKind.RESUME_NOTE, '（恢复）从落盘会话续跑。', key='resume:1'),
+    ]
+    bus = EventBus()
+    emit = _Emit()
+    bridge = AcpBridge(
+        TurnBinding(_Idle(), _ROOT, bus.subscribe(), history=history),  # pyright: ignore[reportArgumentType]
+        emit,
+    )
+    try:
+        async with asyncio.timeout(_TIMEOUT):
+            await bridge.replay()
+        assert (emit.users, emit.messages) == (['earlier prompt'], ['earlier answer'])
+    finally:
+        await bridge.close()
+        await bus.close()

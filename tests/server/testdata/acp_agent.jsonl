@@ -1,0 +1,11 @@
+{"from": "client", "message": {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": 1}}}
+{"from": "agent", "message": {"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false}, "mcpCapabilities": {"http": false, "sse": false}}, "agentInfo": {"name": "syndica", "title": "Syndica", "version": "VERSION"}}}}
+{"from": "client", "message": {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "CWD", "mcpServers": []}}}
+{"from": "agent", "message": {"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "SESSION", "modes": {"currentModeId": "Planner", "availableModes": [{"id": "Planner", "name": "Planner", "description": "规划范围 / 决策 / 依赖 / 成功判据时用我"}, {"id": "Explorer", "name": "Explorer", "description": "定位文件、符号、引用时用我，不要用我改文件"}, {"id": "Worker", "name": "Worker", "description": "读文件"}, {"id": "Orchestrator", "name": "Orchestrator", "description": "把工作拆给 Planner、Explorer、Worker，自己不改文件"}]}}}}
+{"from": "client", "message": {"jsonrpc": "2.0", "id": 2, "method": "session/set_mode", "params": {"sessionId": "SESSION", "modeId": "Worker"}}}
+{"from": "agent", "message": {"jsonrpc": "2.0", "id": 2, "result": {}}}
+{"from": "client", "message": {"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "SESSION", "prompt": [{"text": "read notes", "type": "text"}]}}}
+{"from": "agent", "message": {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "SESSION", "update": {"toolCallId": "TOOL_CALL", "title": "Read", "kind": "read", "status": "in_progress", "rawInput": "{\"path\": \"notes.md\"}", "sessionUpdate": "tool_call"}}}}
+{"from": "agent", "message": {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "SESSION", "update": {"toolCallId": "TOOL_CALL", "status": "completed", "sessionUpdate": "tool_call_update"}}}}
+{"from": "agent", "message": {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "SESSION", "update": {"content": {"text": "saw alpha-marker", "type": "text"}, "sessionUpdate": "agent_message_chunk"}}}}
+{"from": "agent", "message": {"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "end_turn"}}}
