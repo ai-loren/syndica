@@ -78,6 +78,7 @@ from syndica.cli.handoff import (
 )
 from syndica.cli.host_git import Change, GitUnavailable, HostGit
 from syndica.cli.interop_config import (
+    InteropCredential,
     interop_credentials_path,
     load_interop_credentials,
     unmatched_credentials,
@@ -2650,7 +2651,10 @@ class RuntimeCliHost:
                 f'它没有被信任（摘要 {snapshot.digest}），而 stdin / stderr 不是交互终端',
                 f'看过这份配置之后运行 syndica config trust --sha256 {snapshot.digest}，再重跑',
             )
-        self._io.stderr.write(describe(snapshot, config) + '\n信任这份配置并继续？[y/N] ')
+        self._io.stderr.write(
+            describe(snapshot, config, self._interop_credentials(config))
+            + '\n信任这份配置并继续？[y/N] '
+        )
         self._io.stderr.flush()
         if self._lines.readline().strip().lower() not in {'y', 'yes'}:
             raise _config_error(
@@ -2665,6 +2669,14 @@ class RuntimeCliHost:
                 f'确认期间 {shown} 或它引用的文件变了',
                 '重跑这条命令，看过新的内容再确认',
             )
+
+    def _interop_credentials(self, config: CliConfig) -> Mapping[str, InteropCredential]:
+        """确认提示要列的用户级凭证：与启动时交凭证读的是同一份。项目配置没有 `interop` 时不读，
+        一份坏掉的用户级文件不该挡住与它无关的配置。"""
+        path = interop_credentials_path(self._environ)
+        if path is None or not config.interop.present:
+            return {}
+        return load_interop_credentials(path, workspace=self._workspace_root)
 
     def trust_config(self, config: str, sha256: str | None) -> str:
         """`syndica config trust`：记下这份配置现在的摘要。非交互时必须给 `--sha256`，从拒绝消息里

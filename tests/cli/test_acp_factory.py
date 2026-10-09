@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from syndica.__main__ import _acp_model, _remember_acp
+from syndica.__main__ import _acp_model, _remember_a2a, _remember_acp
 from syndica.backends.acp import AcpAgentModel
 from syndica.cli.config import CliConfig, load_config
 from syndica.kernel import (
@@ -106,6 +106,7 @@ async def test_a_command_matching_the_pin_hands_the_variable_to_the_hosted_proce
                 'KillBash': KillBash(router),
             },
             ExternalCallPolicy(judge=DangerJudge(), policy=BlockHighRisk()),
+            role='Worker',
             agent_env={'PATH': '/usr/bin'},
             host_env={**environ, 'OTHER_TOKEN': 'not-named'},
             redactor=RuleRedactor(secrets=[_SECRET]),
@@ -119,6 +120,39 @@ async def test_a_command_matching_the_pin_hands_the_variable_to_the_hosted_proce
     finally:
         await runtime.shutdown()
         await router.close()
+
+
+def _loosen(environ: dict[str, str]) -> None:
+    os.chmod(Path(environ['SYNDICA_TRUST_STORE']).parent / 'interop.yaml', 0o644)
+
+
+def test_a_config_without_external_agents_never_reads_the_user_level_file(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    environ = _environ(tmp_path, _COMMAND)
+    _loosen(environ)
+    plain = workspace / '.syndica.yaml'
+    plain.write_text('version: 1\n', encoding='utf-8')
+
+    _remember_acp(load_config(plain), workspace, environ)
+    _remember_a2a(load_config(plain), workspace, environ)
+
+
+def test_a_config_with_an_external_agent_still_refuses_a_loose_user_level_file(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    environ = _environ(tmp_path, _COMMAND)
+    _loosen(environ)
+
+    with pytest.raises(ConfigError) as caught:
+        _remember_acp(_config(workspace), workspace, environ)
+
+    assert '0600' in caught.value.expected
+    assert 'chmod 600' in caught.value.next_action
 
 
 @pytest.mark.parametrize(

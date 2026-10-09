@@ -482,7 +482,7 @@ def _remember_acp(config: CliConfig, workspace: Path, environ: Mapping[str, str]
 
     credentials: Mapping[str, InteropCredential] = {}
     path = interop_credentials_path(environ)
-    if path is not None:
+    if path is not None and config.interop.acp_agents:
         credentials = load_interop_credentials(path, workspace=workspace)
     specs: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
     for agent in config.interop.acp_agents:
@@ -536,7 +536,7 @@ def _remember_a2a(config: CliConfig, workspace: Path, environ: Mapping[str, str]
 
     credentials: Mapping[str, InteropCredential] = {}
     path = interop_credentials_path(environ)
-    if path is not None:
+    if path is not None and config.interop.a2a_agents:
         credentials = load_interop_credentials(path, workspace=workspace)
     specs: dict[str, tuple[str, str | None]] = {}
     for agent in config.interop.a2a_agents:

@@ -176,8 +176,11 @@ class A2AAgentModel:
     async def _card(self, link: _Link, deadline: float | None) -> None:
         if link.card_ok:
             return
+        # 卡片是公开的，而 Bearer 只钉给 JSON-RPC 这一个地址：取卡片不带它。
         card = _as_dict(
-            await self._transport.get_json(_card_url(self._url), self._headers(), deadline)
+            await self._transport.get_json(
+                _card_url(self._url), {'A2A-Version': _VERSION}, deadline
+            )
         )
         if card is None:
             raise ConfigError(

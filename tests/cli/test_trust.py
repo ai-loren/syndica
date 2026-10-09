@@ -150,6 +150,82 @@ def test_anything_but_yes_refuses(tmp_path: Path, answer: str):
     assert store.get((workspace / '.syndica.yaml').resolve()) is None
 
 
+_INTEROP_CONFIG = """\
+version: 1
+interop:
+  a2a:
+    agents:
+      - name: researcher
+        url: https://attacker.example/a2a/
+      - name: reviewer
+        url: http://127.0.0.1:9999/a2a/
+"""
+
+
+def test_the_prompt_names_the_user_level_credentials_and_where_each_one_goes(tmp_path: Path):
+    workspace = _workspace(tmp_path, _INTEROP_CONFIG)
+    store = _store(tmp_path)
+    credentials = store.path.parent / 'interop.yaml'
+    credentials.parent.mkdir(parents=True, exist_ok=True)
+    credentials.write_text(
+        'credentials:\n'
+        "  a2a:researcher: {url: 'http://127.0.0.1:8000/a2a/', bearer_env: RESEARCHER_TOKEN}\n"
+        "  a2a:reviewer: {url: 'http://127.0.0.1:9999/a2a/', bearer_env: REVIEWER_TOKEN}\n",
+        encoding='utf-8',
+    )
+    credentials.chmod(0o600)
+    stderr = _Tty()
+    io = CliIO(stdin=_Tty('n\n'), stdout=StringIO(), stderr=stderr)
+    host = RuntimeCliHost(
+        io=io,
+        model_factory=lambda _: ScriptedLLM([ScriptedTurn(content='done')]),
+        workspace_root=workspace,
+        environ={'SYNDICA_TRUST_STORE': str(store.path)},
+        trust=TrustGate(store_for=lambda _: store),
+    )
+    try:
+        code = main(['run', '--agent', 'Worker', 'go'], host=host, io=io)
+    finally:
+        host.close(interrupted=False)
+
+    shown = stderr.getvalue()
+    assert code != 0
+    assert (
+        'a2a researcher: https://attacker.example/a2a/；凭证：不交——用户级 a2a:researcher '
+        '钉的是 url http://127.0.0.1:8000/a2a/，对不上，RESEARCHER_TOKEN（Authorization: Bearer） '
+        '不发、启动时拒绝'
+    ) in shown
+    assert (
+        'a2a reviewer: http://127.0.0.1:9999/a2a/；凭证：REVIEWER_TOKEN（Authorization: Bearer） '
+        '交给这里'
+    ) in shown
+
+
+def test_a_broken_user_level_interop_file_does_not_block_a_config_without_interop(
+    tmp_path: Path,
+):
+    workspace = _workspace(tmp_path)
+    store = _store(tmp_path)
+    credentials = store.path.parent / 'interop.yaml'
+    credentials.parent.mkdir(parents=True, exist_ok=True)
+    credentials.write_text('credentials: {}\n', encoding='utf-8')
+    credentials.chmod(0o644)
+    io = CliIO(stdin=_Tty('y\n'), stdout=StringIO(), stderr=_Tty())
+    host = RuntimeCliHost(
+        io=io,
+        model_factory=lambda _: ScriptedLLM([ScriptedTurn(content='done')]),
+        workspace_root=workspace,
+        environ={'SYNDICA_TRUST_STORE': str(store.path)},
+        trust=TrustGate(store_for=lambda _: store),
+    )
+    try:
+        code = main(['run', '--agent', 'Worker', 'go'], host=host, io=io)
+    finally:
+        host.close(interrupted=False)
+
+    assert code == 0, io.stderr.getvalue()  # pyright: ignore[reportAttributeAccessIssue]
+
+
 def test_a_change_during_the_confirmation_is_caught_by_a_second_read(tmp_path: Path):
     workspace = _workspace(tmp_path)
     store = _store(tmp_path)

@@ -30,7 +30,7 @@ from typing import Protocol, cast
 
 import syndica
 from syndica.cli.config import CliConfig, config_from_text, parse_yaml
-from syndica.cli.interop_config import described_targets
+from syndica.cli.interop_config import InteropCredential, described_targets
 from syndica.cli.modules import Discovered
 from syndica.cli.terminal import one_line
 from syndica.kernel import ConfigError
@@ -551,8 +551,15 @@ def _section(title: str, items: Sequence[str]) -> list[str]:
     return [f'  {title}:', *(f'{_GUTTER}{one_line(item)}' for item in items)]
 
 
-def describe(snapshot: ConfigSnapshot, config: CliConfig) -> str:
-    """给人看的确认内容。每一项都过 `one_line` 并带固定的前缀：一个值伪造不出一行确认。"""
+def describe(
+    snapshot: ConfigSnapshot,
+    config: CliConfig,
+    credentials: Mapping[str, InteropCredential] | None = None,
+) -> str:
+    """给人看的确认内容。每一项都过 `one_line` 并带固定的前缀：一个值伪造不出一行确认。
+
+    `credentials` 是读好的用户级凭证名单：给了就逐项写明哪个变量交给哪里、哪项因钉子对不上而不交。
+    """
     catalog = config.catalog
     lines = [
         '这份项目配置第一次用（或改过了）。确认之前不会执行它里面的任何东西。',
@@ -590,7 +597,7 @@ def describe(snapshot: ConfigSnapshot, config: CliConfig) -> str:
             for key, value in sorted(config.flags.items())
         ],
     )
-    lines += _section('interop', list(described_targets(config.interop)))
+    lines += _section('interop', list(described_targets(config.interop, credentials)))
     lines += _section('danger.roles（只能收紧）', sorted(config.danger_roles))
     lines += _section(
         'redaction.rules（只能多脱敏）', [rule.rule_id for rule in config.redaction_rules]

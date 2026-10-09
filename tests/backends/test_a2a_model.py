@@ -47,11 +47,12 @@ class _Script:
         self.replies = list(replies)
         self.posts: list[dict[str, Any]] = []
         self.headers: list[dict[str, str]] = []
+        self.card_headers: list[dict[str, str]] = []
 
     async def get_json(self, url: str, headers: Mapping[str, str], deadline: float | None) -> Any:
         del deadline
         assert url.endswith('/.well-known/agent-card.json')
-        self.headers.append(dict(headers))
+        self.card_headers.append(dict(headers))
         return _CARD
 
     async def post_json(
@@ -125,7 +126,27 @@ async def test_input_required_is_answered_on_the_same_task() -> None:
         assert second['taskId'] == 'task-1'
         assert second['contextId'] == 'ctx-1'
         assert second['parts'] == [{'text': '红'}]
-        assert script.headers[0]['A2A-Version'] == '1.0'
+        assert [headers['A2A-Version'] for headers in script.headers] == ['1.0', '1.0']
+        assert [headers['Authorization'] for headers in script.headers] == [
+            'Bearer machine-token',
+            'Bearer machine-token',
+        ]
+    finally:
+        await model.aclose()
+
+
+async def test_the_public_agent_card_is_fetched_without_the_bearer() -> None:
+    script = _Script([_task('TASK_STATE_COMPLETED', 'done')])
+    model = A2AAgentModel(
+        'remote',
+        'http://127.0.0.1:9/a2a/',
+        bearer='machine-token',
+        transport=script,
+        redactor=RuleRedactor(secrets=[]),
+    )
+    try:
+        await model.create([ContextBlock(role='user', content='go')])
+        assert script.card_headers == [{'A2A-Version': '1.0'}]
         assert script.headers[0]['Authorization'] == 'Bearer machine-token'
     finally:
         await model.aclose()
