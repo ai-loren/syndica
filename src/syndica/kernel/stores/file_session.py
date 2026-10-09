@@ -169,14 +169,7 @@ class FileSessionStore:
         with self._root_fd() as root:
             if root is None:
                 return []
-            for name in sorted(os.listdir(root)):
-                if not self._is_session_dir(root, name):
-                    continue
-                with io.opened(name, root) as session:
-                    try:
-                        meta = self._read_meta(session, name)
-                    except (OSError, ContractViolation, ConfigError):
-                        continue
+            for meta in self._metas(root):
                 if (
                     (status is None or meta.status is status)
                     and (agent is None or meta.agent == agent)
@@ -185,6 +178,18 @@ class FileSessionStore:
                     metas.append(meta)
         metas.sort(key=lambda meta: meta.updated_at, reverse=True)
         return metas
+
+    async def unreadable(self) -> list[tuple[str, str, str]]:
+        """有 `meta.json` 却读不出来、因而不在 `list_metas()` 里的会话：（sid，怎么了，下一步）。
+        没有 `meta.json` 的目录不算：那是第一次存盘半途失败留下的，这个会话本来就不存在。不在
+        `SessionStore` 协议里：别的 store 没有文件可言。"""
+        with self._root_fd() as root:
+            if root is None:
+                return []
+            skipped: list[tuple[str, str, str]] = []
+            for _ in self._metas(root, skipped=skipped):
+                pass
+            return skipped
 
     async def replace_content(self, sid: str, content: RedactedContent) -> None:
         _valid_sid(sid)
@@ -272,6 +277,38 @@ class FileSessionStore:
                 return
             with io.opened(sid, root) as session:
                 yield session
+
+    def _metas(
+        self, root: int, *, skipped: list[tuple[str, str, str]] | None = None
+    ) -> Iterator[SessionMeta]:
+        """每个会话目录的元数据。读不出来的跳过，给了 `skipped` 就记进去：一个坏掉的会话不能让别的
+        会话都列不出来。"""
+        for name in sorted(os.listdir(root)):
+            if not self._is_session_dir(root, name):
+                continue
+            where = f'{self._root / name}/{_META}'
+            with io.opened(name, root) as session:
+                try:
+                    meta = self._read_meta(session, name)
+                except FileNotFoundError:
+                    continue
+                except (ContractViolation, ConfigError) as error:
+                    if skipped is not None:
+                        skipped.append(
+                            (name, f'{where} 读不进来：{error.received}', error.next_action)
+                        )
+                    continue
+                except OSError as error:
+                    if skipped is not None:
+                        skipped.append(
+                            (
+                                name,
+                                f'{where} 读不进来：{type(error).__name__}: {error.strerror}',
+                                f'查清 {where} 为什么读不了（权限、属主），修好再来',
+                            )
+                        )
+                    continue
+            yield meta
 
     def _is_session_dir(self, root: int, name: str) -> bool:
         if name in ('.', '..') or '/' in name:

@@ -1,3 +1,5 @@
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -70,3 +72,56 @@ async def test_archive_count_survives_replace_content(tmp_path: Path) -> None:
     after_load = await store.load('s')
     assert after_meta is not None and after_load is not None
     assert after_meta.archived == 1 and after_load.meta.archived == 1
+
+
+async def test_unreadable_names_each_session_list_metas_skips_with_why_but_not_a_half_made_one(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / 'sessions'
+    store = FileSessionStore(root)
+    for sid in ('newer', 'fine', 'linked', 'garbled'):
+        await store.save(sid, _red(sid, [ContextBlock(role='user', content='hi')]))
+    (root / 'garbled' / 'meta.json').write_text('{not json', encoding='utf-8')
+    newer = root / 'newer' / 'meta.json'
+    value = json.loads(newer.read_text(encoding='utf-8'))
+    value['schema'] = 'syndica.session/99'
+    newer.write_text(json.dumps(value), encoding='utf-8')
+    linked = root / 'linked' / 'meta.json'
+    linked.unlink()
+    linked.symlink_to(root / 'fine' / 'meta.json')
+    (root / 'half').mkdir()
+
+    skipped = await store.unreadable()
+    listed = await store.list_metas()
+
+    reasons = {sid: (received, next_action) for sid, received, next_action in skipped}
+    assert [meta.sid for meta in listed] == ['fine']
+    assert [sid for sid, _, _ in skipped] == ['garbled', 'linked', 'newer']
+    for sid, (received, _) in reasons.items():
+        assert received.startswith(f'{root / sid / "meta.json"} 读不进来：')
+    assert '不是 JSON' in reasons['garbled'][0] and '删掉它所在的目录' in reasons['garbled'][1]
+    assert '符号链接' in reasons['linked'][0]
+    assert 'syndica.session/99' in reasons['newer'][0]
+    assert '用新版 syndica 读它' in reasons['newer'][1]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root 读得了权限是 0000 的文件')
+async def test_unreadable_names_a_session_whose_meta_this_process_may_not_read(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / 'sessions'
+    store = FileSessionStore(root)
+    await store.save('s', _red('s', [ContextBlock(role='user', content='hi')]))
+    meta = root / 's' / 'meta.json'
+    meta.chmod(0)
+    try:
+        skipped = await store.unreadable()
+        listed = await store.list_metas()
+    finally:
+        meta.chmod(0o600)
+
+    assert listed == []
+    [(sid, received, next_action)] = skipped
+    assert sid == 's'
+    assert received.startswith(f'{meta} 读不进来：PermissionError')
+    assert '权限' in next_action
