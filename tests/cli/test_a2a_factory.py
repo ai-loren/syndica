@@ -94,7 +94,7 @@ def _remote_agent(method: str, path: str, body: bytes) -> tuple[int, object]:
     }
 
 
-async def test_a_url_matching_the_pin_carries_the_bearer_on_every_request(
+async def test_a_url_matching_the_pin_carries_the_bearer_on_rpc_but_not_on_the_public_card(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / 'ws'
@@ -110,11 +110,10 @@ async def test_a_url_matching_the_pin_carries_the_bearer_on_every_request(
             await model.aclose()
 
         assert reply.content == 'done remotely'
-        assert [(seen.method, seen.path) for seen in remote.seen] == [
-            ('GET', '/.well-known/agent-card.json'),
-            ('POST', '/a2a/'),
+        assert [(seen.method, seen.path, seen.authorization) for seen in remote.seen] == [
+            ('GET', '/.well-known/agent-card.json', None),
+            ('POST', '/a2a/', f'Bearer {_TOKEN}'),
         ]
-        assert {seen.authorization for seen in remote.seen} == {f'Bearer {_TOKEN}'}
 
 
 def test_a_project_url_other_than_the_pin_gets_no_request_and_names_both(
