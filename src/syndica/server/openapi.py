@@ -149,6 +149,11 @@ SERVER_EVENTS: dict[str, tuple[str, ...]] = {
     'session_closed': (),
 }
 
+# 事件表只列必有键；取值是封闭集合的键在这里写出它的 schema，其余键不约束取值。
+_EVENT_PROPERTIES: dict[str, dict[str, dict[str, Any]]] = {
+    'external_activity': {'source': {'type': 'string', 'enum': ['acp', 'a2a', 'mcp']}},
+}
+
 _RPC_OPS: dict[str, dict[str, Any]] = {
     'auth': {'token': {'type': 'string'}},
     'send': {'text': {'type': 'string'}, 'target': {'type': 'string'}},
@@ -270,7 +275,7 @@ def _events() -> dict[str, Any]:
         kind: {
             'type': 'object',
             'required': list(required),
-            'properties': {key: {} for key in required},
+            'properties': {key: _EVENT_PROPERTIES.get(kind, {}).get(key, {}) for key in required},
             'additionalProperties': True,
         }
         for kind, required in sorted(kinds.items())

@@ -4,6 +4,9 @@
 `call_external`，调用方是 `acp-agent:<名字>`。`call_external` 不过 PRE_TOOL_USE，所以回调只用驱动
 它的那个 Agent 所属角色交进来的工具与处置：角色的 tools 里没有的工具、只读 run 里的写与终端，一律
 拒绝。回答一律不可信。协议版本不是 1 就拒绝。
+
+回调被拒、没做成或出错时一律回 `RequestError`，`data` 是脱敏后的三件套：答成功，外部 Agent 就会
+以为写进去了、拿拒绝说明当文件内容；让异常漏给 SDK，它回 -32603 并把异常原文交给第三方进程。
 """
 
 from __future__ import annotations
@@ -14,10 +17,11 @@ import json
 import logging
 import secrets
 import shlex
-from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+import signal
+from collections.abc import AsyncGenerator, Callable, Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from acp.exceptions import RequestError
 from acp.schema import (
@@ -74,6 +78,10 @@ _KIND_TOOLS = {'edit': 'Write', 'delete': 'Write', 'move': 'Write', 'execute': '
 _READ_ONLY_REFUSED = frozenset({'Write', 'Bash'})
 _CANCEL_WAIT_S = 0.2
 _POLL_S = 0.05
+_MESSAGE_CHARS = 500
+_FIELD_CHARS = 2000
+
+_T = TypeVar('_T')
 
 
 @dataclass(frozen=True)
@@ -325,27 +333,23 @@ class AcpAgentModel:
         agent = f'acp:{self._name}'
         owner = f'角色 {grant.role}' if grant.role else agent
         if grant.read_only and tool_name in _READ_ONLY_REFUSED:
-            raise _request(
-                ConfigError(
-                    expected=f'只读 run 里 {agent} 只读文件：{method} 会改动工作区',
-                    received=f'{owner} 的 {agent} 发来 {method}，而这次 run 是只读的（--no-write）',
-                    next_action=(
-                        '换成只读的做法；要改动就把改什么、怎么改写进回答，由人去掉 --no-write 再跑'
-                    ),
-                )
+            raise ConfigError(
+                expected=f'只读 run 里 {agent} 只读文件：{method} 会改动工作区',
+                received=f'{owner} 的 {agent} 发来 {method}，而这次 run 是只读的（--no-write）',
+                next_action=(
+                    '换成只读的做法；要改动就把改什么、怎么改写进回答，由人去掉 --no-write 再跑'
+                ),
             )
         tool = grant.tools.get(tool_name)
         policy = grant.policy
         if tool is None or policy is None:
-            raise _request(
-                ConfigError(
-                    expected=f'{owner} 的 tools 里有 {tool_name}：{agent} 的 {method} 要用它',
-                    received=f'{owner} 的 tools 只有 {sorted(grant.tools)!r}',
-                    next_action=(
-                        f'在{owner} 的 tools 里加上 {tool_name}；不加就让 {agent} 换一种不用 '
-                        f'{method} 的做法'
-                    ),
-                )
+            raise ConfigError(
+                expected=f'{owner} 的 tools 里有 {tool_name}：{agent} 的 {method} 要用它',
+                received=f'{owner} 的 tools 只有 {sorted(grant.tools)!r}',
+                next_action=(
+                    f'在{owner} 的 tools 里加上 {tool_name}；不加就让 {agent} 换一种不用 '
+                    f'{method} 的做法'
+                ),
             )
         return tool, policy
 
@@ -372,15 +376,16 @@ class AcpAgentModel:
             return
         kind = str(getattr(update, 'session_update', ''))
         title = str(getattr(update, 'title', '') or getattr(update, 'kind', '') or kind)
-        name = str(getattr(update, 'tool_call_id', '') or kind)
         await runtime.events.emit(
             Event(
                 'external_activity',
                 agent_id,
                 {
-                    'source': f'acp:{self._name}',
-                    'name': name,
-                    'activity_id': name,
+                    # 契约里 source 是协议（acp / a2a / mcp），name 是外部对象的名字：界面靠这两项
+                    # 认出是谁在做事，activity_id 只用来把同一个调用的几次更新串起来。
+                    'source': 'acp',
+                    'name': self._name,
+                    'activity_id': str(getattr(update, 'tool_call_id', '') or kind),
                     'kind': kind,
                     'status': str(getattr(update, 'status', '') or 'update'),
                     'title': self._redact(title)[:200],
@@ -392,6 +397,36 @@ class AcpAgentModel:
         if self._redactor is None:
             return text
         return self._redactor.redact(text)
+
+    def _error(self, code: int, expected: str, received: str, next_action: str) -> RequestError:
+        """交给对端的错误。先脱敏再截：截在密钥中间，剩下那截脱敏器就认不出了。"""
+        data = {
+            'expected': self._redact(expected)[:_FIELD_CHARS],
+            'received': self._redact(received)[:_FIELD_CHARS],
+            'next_action': self._redact(next_action)[:_FIELD_CHARS],
+        }
+        message = (
+            f'期望: {data["expected"]}。实际: {data["received"]}。下一步: {data["next_action"]}'
+        )
+        return RequestError(code, message[:_MESSAGE_CHARS], data)
+
+    def _refused(self, method: str, result: ToolResult) -> RequestError:
+        return self._error(
+            -32000,
+            expected=f'acp:{self._name} 的 {method} 过了 Syndica 的危险判定与处置再执行',
+            received=f'被 Syndica 拒绝，没有执行、也没有副作用。拒绝说明：{_text(result)}',
+            next_action=(
+                '照拒绝说明里的下一步换一种做法，或把这一步写进回答交给人去做；不要当成已经做了'
+            ),
+        )
+
+    def _failed(self, method: str, result: ToolResult) -> RequestError:
+        return self._error(
+            -32000,
+            expected=f'acp:{self._name} 的 {method} 做成',
+            received=f'Syndica 的工具没有做成这件事：{_text(result)}',
+            next_action='照「实际」里工具给的说明改了再试；这一次没有做成，不要当成已经做了',
+        )
 
 
 class _Live:
@@ -420,12 +455,51 @@ class _Client:
     def _granted(self, method: str, tool_name: str) -> tuple[Tool, ExternalCallPolicy]:
         return self._model._granted(self._grant, method, tool_name)  # pyright: ignore[reportPrivateUsage]
 
-    async def _use(self, method: str, tool_name: str, args: Mapping[str, object]) -> ToolResult:
+    async def _answer(self, method: str, work: Coroutine[Any, Any, _T]) -> _T:
+        """每个回调都从这里交出去。SyndicaError 换成三件套；别的异常只报类型，原文不交给对端。"""
+        model = self._model
+        try:
+            return await work
+        except RequestError:
+            raise
+        except SyndicaError as exc:
+            raise model._error(-32602, exc.expected, exc.received, exc.next_action) from None  # pyright: ignore[reportPrivateUsage]
+        except Exception as exc:
+            agent = f'acp:{model._name}'  # pyright: ignore[reportPrivateUsage]
+            logger.warning(
+                '期望: %s 的回调 %s 正常处理完。 实际: 抛出 %s，已回给对端 -32603，原文没有交出去。'
+                ' 下一步: 看 trace 里这次调用的 span，在本机复现这次调用拿原文。',
+                agent,
+                method,
+                type(exc).__name__,
+            )
+            raise model._error(  # pyright: ignore[reportPrivateUsage]
+                -32603,
+                expected=f'{agent} 的 {method} 由 Syndica 正常处理完',
+                received=f'Syndica 处理时抛出 {type(exc).__name__}（异常原文不交给对端）',
+                next_action='这一步没有做成；换一种做法，或把这一步写进回答交给人',
+            ) from None
+
+    async def _use(
+        self, method: str, tool_name: str, args: Mapping[str, object], *, done: str | None
+    ) -> ToolResult:
+        """经 `call_external` 跑一次，没做成就抛。`done` 是这个工具只在做成时才放进 meta 的键。
+
+        `call_external` 执行过的结果一律收紧成不可信，还是可信的就是内核写的拒绝说明：工具没有跑。
+        """
         granted = self._granted(method, tool_name)
-        return await self._model._call(self._agent_id, granted, args)  # pyright: ignore[reportPrivateUsage]
+        result = await self._model._call(self._agent_id, granted, args)  # pyright: ignore[reportPrivateUsage]
+        if result.trust is TrustLevel.TRUSTED:
+            raise self._model._refused(method, result)  # pyright: ignore[reportPrivateUsage]
+        if done is not None and done not in result.meta:
+            raise self._model._failed(method, result)  # pyright: ignore[reportPrivateUsage]
+        return result
 
     async def session_update(self, session_id: str, update: object, **kwargs: object) -> None:
         del session_id, kwargs
+        await self._answer('session/update', self._update(update))
+
+    async def _update(self, update: object) -> None:
         kind = getattr(update, 'session_update', None)
         if kind == 'agent_message_chunk':
             content = getattr(update, 'content', None)
@@ -445,19 +519,27 @@ class _Client:
         **kwargs: object,
     ) -> ReadTextFileResponse:
         del session_id, kwargs
+        return await self._answer('fs/read_text_file', self._read(path, line, limit))
+
+    async def _read(self, path: str, line: int | None, limit: int | None) -> ReadTextFileResponse:
         args: dict[str, object] = {'path': path}
         if line is not None:
             args['offset'] = line
         if limit is not None:
             args['limit'] = limit
-        result = await self._use('fs/read_text_file', 'Read', args)
+        result = await self._use('fs/read_text_file', 'Read', args, done=None)
         return ReadTextFileResponse(content=_text(result))
 
     async def write_text_file(
         self, session_id: str, path: str, content: str, **kwargs: object
     ) -> WriteTextFileResponse:
         del session_id, kwargs
-        await self._use('fs/write_text_file', 'Write', {'path': path, 'content': content})
+        return await self._answer('fs/write_text_file', self._write(path, content))
+
+    async def _write(self, path: str, content: str) -> WriteTextFileResponse:
+        await self._use(
+            'fs/write_text_file', 'Write', {'path': path, 'content': content}, done='path'
+        )
         return WriteTextFileResponse()
 
     async def request_permission(
@@ -468,6 +550,11 @@ class _Client:
         **kwargs: object,
     ) -> RequestPermissionResponse:
         del session_id, kwargs
+        return await self._answer('session/request_permission', self._permit(tool_call, options))
+
+    async def _permit(
+        self, tool_call: ToolCallUpdate, options: list[PermissionOption]
+    ) -> RequestPermissionResponse:
         kind = str(getattr(tool_call, 'kind', '') or '')
         needed = _KIND_TOOLS.get(kind)
         if needed is not None and (self._grant.read_only or needed not in self._grant.tools):
@@ -493,10 +580,9 @@ class _Client:
         **kwargs: object,
     ) -> CreateTerminalResponse:
         del session_id, kwargs
-        try:
-            return await self._create_terminal(command, args, env, cwd, output_byte_limit)
-        except SyndicaError as exc:
-            raise _request(exc) from None
+        return await self._answer(
+            'terminal/create', self._create_terminal(command, args, env, cwd, output_byte_limit)
+        )
 
     async def _create_terminal(
         self,
@@ -506,20 +592,20 @@ class _Client:
         cwd: str | None,
         output_byte_limit: int | None,
     ) -> CreateTerminalResponse:
-        granted = self._granted('terminal/create', 'Bash')
         limit = _byte_limit(output_byte_limit)
-        result = await self._model._call(  # pyright: ignore[reportPrivateUsage]
-            self._agent_id,
-            granted,
+        result = await self._use(
+            'terminal/create',
+            'Bash',
             {
                 'command': _shell_command(command, args, env),
                 'run_in_background': True,
                 'cwd': self._relative_cwd(cwd),
             },
+            done='handle',
         )
-        handle = result.meta.get('handle')
+        handle = result.meta['handle']
         if not isinstance(handle, str) or not handle:
-            raise _refused(result)
+            raise self._model._failed('terminal/create', result)  # pyright: ignore[reportPrivateUsage]
         terminal_id = secrets.token_hex(8)
         live = self._model._sessions.get(self._agent_id)  # pyright: ignore[reportPrivateUsage]
         if live is not None:
@@ -530,9 +616,15 @@ class _Client:
         self, session_id: str, terminal_id: str, **kwargs: object
     ) -> TerminalOutputResponse:
         del session_id, kwargs
+        return await self._answer('terminal/output', self._output(terminal_id))
+
+    async def _output(self, terminal_id: str) -> TerminalOutputResponse:
         terminal = self._terminal(terminal_id)
         result = await self._use(
-            'terminal/output', 'BashOutput', {'handle': terminal.handle, 'full': True}
+            'terminal/output',
+            'BashOutput',
+            {'handle': terminal.handle, 'full': True},
+            done='running',
         )
         output, truncated = _clipped(_text(result), terminal.limit)
         return TerminalOutputResponse(
@@ -545,17 +637,21 @@ class _Client:
         self, session_id: str, terminal_id: str, **kwargs: object
     ) -> WaitForTerminalExitResponse:
         del session_id, kwargs
+        return await self._answer('terminal/wait_for_exit', self._wait(terminal_id))
+
+    async def _wait(self, terminal_id: str) -> WaitForTerminalExitResponse:
         terminal = self._terminal(terminal_id)
         deadline = _deadline()
         while True:
             result = await self._use(
-                'terminal/wait_for_exit', 'BashOutput', {'handle': terminal.handle, 'full': True}
+                'terminal/wait_for_exit',
+                'BashOutput',
+                {'handle': terminal.handle, 'full': True},
+                done='running',
             )
             if result.meta.get('running') is False:
-                code = result.meta.get('exit_code')
-                return WaitForTerminalExitResponse(
-                    exit_code=code if isinstance(code, int) else None
-                )
+                exit_code, signal_name = _exited(result)
+                return WaitForTerminalExitResponse(exit_code=exit_code, signal=signal_name)
             if deadline is not None and asyncio.get_running_loop().time() >= deadline:
                 raise ConfigError(
                     expected='终端在墙钟剩余时间内退出',
@@ -566,11 +662,13 @@ class _Client:
 
     async def kill_terminal(self, session_id: str, terminal_id: str, **kwargs: object) -> None:
         del session_id, kwargs
-        await self._stop('terminal/kill', terminal_id, drop=False)
+        await self._answer('terminal/kill', self._stop('terminal/kill', terminal_id, drop=False))
 
     async def release_terminal(self, session_id: str, terminal_id: str, **kwargs: object) -> None:
         del session_id, kwargs
-        await self._stop('terminal/release', terminal_id, drop=True)
+        await self._answer(
+            'terminal/release', self._stop('terminal/release', terminal_id, drop=True)
+        )
 
     async def _approved(self, tool_call: ToolCallUpdate, kind: str) -> bool:
         model = self._model
@@ -612,7 +710,7 @@ class _Client:
 
     async def _stop(self, method: str, terminal_id: str, *, drop: bool) -> None:
         terminal = self._terminal(terminal_id)
-        await self._use(method, 'KillBash', {'handle': terminal.handle})
+        await self._use(method, 'KillBash', {'handle': terminal.handle}, done='handle')
         if drop:
             live = self._model._sessions.get(self._agent_id)  # pyright: ignore[reportPrivateUsage]
             if live is not None:
@@ -671,23 +769,6 @@ def _text(result: ToolResult) -> str:
     return output if isinstance(output, str) else str(output)
 
 
-def _refused(result: ToolResult) -> RequestError:
-    return RequestError(-32000, _text(result)[:500])
-
-
-def _request(exc: SyndicaError) -> RequestError:
-    message = f'期望: {exc.expected}。实际: {exc.received}。下一步: {exc.next_action}'
-    return RequestError(
-        -32602,
-        message[:500],
-        {
-            'expected': exc.expected,
-            'received': exc.received,
-            'next_action': exc.next_action,
-        },
-    )
-
-
 def _shell_command(command: str, args: Sequence[str] | None, env: Sequence[object] | None) -> str:
     body = shlex.join((command, *(args or ())))
     if not env:
@@ -720,31 +801,50 @@ def _shell_command(command: str, args: Sequence[str] | None, env: Sequence[objec
 def _byte_limit(value: object) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigError(
-            expected='outputByteLimit 是空或者 >= 1 的字节数',
+            expected='outputByteLimit 是空或者 >= 0 的字节数',
             received=f'收到 {value!r}',
-            next_action='不限制就不传；要限制就传正整数，不要传 true',
+            next_action='不限制就不传；要限制就传非负整数，不要传 true',
         )
     return value
 
 
 def _clipped(text: str, limit: int | None) -> tuple[str, bool]:
+    """ACP 要求超限时从开头截、留下结尾，且截在字符边界上（宁可比上限少几个字节）。"""
     if limit is None:
         return text, False
     encoded = text.encode('utf-8')
     if len(encoded) <= limit:
         return text, False
-    return encoded[:limit].decode('utf-8', errors='ignore'), True
+    # 不能写成 encoded[-limit:]：limit 为 0 时它是整段。
+    return encoded[len(encoded) - limit :].decode('utf-8', errors='ignore'), True
+
+
+def _exited(result: ToolResult) -> tuple[int | None, str | None]:
+    """退出码与终止它的信号，按 ACP 二选一。
+
+    子进程被信号杀掉时退出码是负的信号值；ACP 的 exitCode 必须 >= 0，SDK 会把负数静默换成 null，
+    外部 Agent 于是既看不到退出码也看不到信号。
+    """
+    code = result.meta.get('exit_code')
+    if isinstance(code, bool) or not isinstance(code, int):
+        return None, None
+    if code >= 0:
+        return code, None
+    try:
+        return None, signal.Signals(-code).name
+    except ValueError:
+        return None, f'SIG{-code}'
 
 
 def _exit_status(result: ToolResult) -> TerminalExitStatus | None:
     if result.meta.get('running') is not False:
         return None
-    code = result.meta.get('exit_code')
-    if not isinstance(code, int):
+    exit_code, signal_name = _exited(result)
+    if exit_code is None and signal_name is None:
         return None
-    return TerminalExitStatus(exit_code=code)
+    return TerminalExitStatus(exit_code=exit_code, signal=signal_name)
 
 
 def _deadline() -> float | None:

@@ -61,3 +61,12 @@
   外要 Bearer。标 `x-syndica-protocol`，请求与响应体只引用 `ExternalProtocol`，不展开对方协议。
 - 没装对应 extra 时这些路由交回 501，`next_action` 指向 `pip install 'syndica[mcp]'` 或
   `syndica[a2a]`。OpenAI 兼容路由不另装包。
+
+## 2026-10-10 · `ea6fc49a256e` · `external_activity.source` 写成枚举（追加，不破坏已记录的契约）
+
+- `x-syndica-events.external_activity.properties.source` 是 `{"type": "string", "enum": ["acp", "a2a", "mcp"]}`，
+  与 `aefdf03abce0` 那条记录写的取值相同。其余键仍不约束取值。
+- 托管 ACP Agent 发出的事件改成按这份契约取值：`source` 是 `acp`、`name` 是托管 Agent 的名字（`.syndica.yaml`
+  里 `interop.acp.agents[].name`），`activity_id` 是它报来的工具调用 id（计划更新是 `plan`）。此前它发的是
+  `source: "acp:<名字>"`、`name` 与 `activity_id` 都是工具调用 id，不符合上面的契约；照着那份旧取值解析
+  `source` 的客户端要改成读 `name`。

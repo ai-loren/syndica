@@ -2626,7 +2626,14 @@
         "title"
       ],
       "properties": {
-        "source": {},
+        "source": {
+          "type": "string",
+          "enum": [
+            "acp",
+            "a2a",
+            "mcp"
+          ]
+        },
         "name": {},
         "activity_id": {},
         "kind": {},

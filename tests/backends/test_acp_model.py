@@ -578,13 +578,27 @@ def _refusal(exc: Exception) -> dict[str, object]:
 
 
 class _Tries(_Reads):
-    """依次读 notes.md、写 planted.md、开终端 touch made.txt；每一步的结果或拒绝原文写进回答。"""
+    """依次读 notes.md、写 planted.md、开终端 touch made.txt；每一步的结果或拒绝原文写进回答。
+
+    第 n 个会话（n > 1）写 planted-n.md：几个角色共用一个工作区，后来的角色没读过前一个写下的
+    planted.md，覆盖它会被 Write 拒绝。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sessions = 0
+
+    async def new_session(self, cwd: str, **kwargs: object) -> NewSessionResponse:
+        del cwd, kwargs
+        self.sessions += 1
+        return NewSessionResponse(session_id='sess')
 
     async def prompt(
         self, session_id: str, prompt: list[object], **kwargs: object
     ) -> PromptResponse:
         del prompt, kwargs
         outcome: dict[str, object] = {}
+        planted = 'planted.md' if self.sessions == 1 else f'planted-{self.sessions}.md'
         try:
             got = await self.conn.read_text_file(session_id=session_id, path='notes.md')
             outcome['read'] = got.content
@@ -592,7 +606,7 @@ class _Tries(_Reads):
             outcome['read'] = _refusal(exc)
         try:
             await self.conn.write_text_file(
-                session_id=session_id, path='planted.md', content='from-outside'
+                session_id=session_id, path=planted, content='from-outside'
             )
             outcome['write'] = 'ok'
         except Exception as exc:
@@ -755,7 +769,7 @@ async def test_a_role_that_declares_write_and_bash_can_write_and_run_a_terminal(
 async def test_two_roles_sharing_one_hosted_model_each_get_only_their_own_tools(
     tmp_path: Path,
 ) -> None:
-    replies, _ = await _run_roles(
+    replies, root = await _run_roles(
         tmp_path, _Tries(), {'Peek': ['Read'], 'Doer': _ALL_TOOLS, 'Note': ['Read', 'Write']}
     )
 
@@ -767,6 +781,9 @@ async def test_two_roles_sharing_one_hosted_model_each_get_only_their_own_tools(
     assert doer['terminal'] == 'ok'
     assert note['write'] == 'ok'
     assert '角色 Note 的 tools 里加上 Bash' in note['terminal']['data']['next_action']
+    assert not (root / 'planted.md').exists()
+    assert (root / 'planted-2.md').read_text(encoding='utf-8') == 'from-outside'
+    assert (root / 'planted-3.md').read_text(encoding='utf-8') == 'from-outside'
 
 
 async def test_a_role_the_host_never_bound_gets_no_tools_at_all(tmp_path: Path) -> None:
