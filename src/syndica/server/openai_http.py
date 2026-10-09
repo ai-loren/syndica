@@ -275,7 +275,11 @@ class OpenAIHttp:
             async for entry in follower:
                 if isinstance(entry, str):
                     continue
-                outcome = self._event(seat, entry, texts, calls)
+                try:
+                    outcome = self._event(seat, entry, texts, calls)
+                except _Status:
+                    await self._until_quiet(seat)
+                    raise
                 if outcome is None:
                     continue
                 if outcome.finish == 'stop' and seat.question is None:
@@ -292,6 +296,20 @@ class OpenAIHttp:
         self, seat: _Seat, entry: Entry, texts: list[str], calls: list[dict[str, str]]
     ) -> _Turn | None:
         payload = _payload(entry.data)
+        # 子 Agent 的提问照样交回：根停在派活里等它。答复经待答表交给提问的那个 Agent。
+        if entry.kind in {'user_question_requested', 'user_input_requested'}:
+            options = _strings(payload.get('options'))
+            question = str(payload.get('question') or '')
+            request_id = str(payload.get('request_id') or '')
+            seat.question = (request_id, tuple(options))
+            lines = [question, *(f'{index}. {option}' for index, option in enumerate(options, 1))]
+            return _Turn('\n'.join(line for line in lines if line), (), 'stop')
+        # 回答、结束、失败与客户端工具调用只认根：代理工具只装在根上，子 Agent 与客户端工具
+        # 同名的调用是它自己在服务端跑的工具，交给客户端就是把服务端的命令当成客户端要执行的调用。
+        if entry.data.get('agent_id') != seat.session.handle.root_id:
+            return None
+        if entry.kind == 'agent_error':
+            raise _Status(500, _root_failed(str(payload.get('error_type') or '未知类型')))
         if entry.kind == 'message_appended':
             block = _as_dict(payload.get('block'))
             if block is None or block.get('role') != 'assistant':
@@ -318,13 +336,6 @@ class OpenAIHttp:
             if calls:
                 return _Turn('', tuple(calls), 'tool_calls')
             return None
-        if entry.kind in {'user_question_requested', 'user_input_requested'}:
-            options = _strings(payload.get('options'))
-            question = str(payload.get('question') or '')
-            request_id = str(payload.get('request_id') or '')
-            seat.question = (request_id, tuple(options))
-            lines = [question, *(f'{index}. {option}' for index, option in enumerate(options, 1))]
-            return _Turn('\n'.join(line for line in lines if line), (), 'stop')
         if entry.kind == 'agent_end':
             return _Turn('\n'.join(texts), (), 'stop')
         return None
@@ -885,6 +896,17 @@ class _Status(Exception):
     def __init__(self, status: int, error: ConfigError) -> None:
         self.status = status
         self.error = error
+
+
+def _root_failed(error_type: str) -> ConfigError:
+    return ConfigError(
+        expected='根 Agent 跑完这一轮',
+        received=f'根 Agent 报错 {error_type}，原文不在响应里',
+        next_action=(
+            '看 server 日志或 trace 里根 Agent 的 agent span 拿到原因；修好之后新发一次请求，'
+            '这个 POST 不要原样重放'
+        ),
+    )
 
 
 def _missing_model(model: str, roles: Sequence[str]) -> ConfigError:

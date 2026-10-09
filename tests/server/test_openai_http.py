@@ -8,19 +8,30 @@ import re
 import socket
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
-from openai import AsyncOpenAI, AuthenticationError, BadRequestError, NotFoundError
+from openai import (
+    AsyncOpenAI,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    NotFoundError,
+)
+from server_fakes import FakeAssembly
 
 from syndica.cli.assembly import ServerAssembly
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO
 from syndica.cli.trust import NO_TRUST_GATE
-from syndica.kernel import ScriptedLLM, ScriptedTurn, ToolCall, TrustLevel
+from syndica.kernel import RuleRedactor, ScriptedLLM, ScriptedTurn, ToolCall, TrustLevel
 from syndica.kernel.context import ContextBlock
 from syndica.server import Credentials, Live, ProtocolMount, ServerSettings, create_app
 from syndica.server.openai_http import OpenAIHttp, chat_app, models_app, responses_app
+
+_LEAK = 'Bearer sk-live-quizzical0123456789 postgres://quizuser:quizpw@db.internal/x'
+_TIMEOUT = 20
 
 
 def _port() -> int:
@@ -572,3 +583,303 @@ def test_a_responses_client_tool_round_trip(tmp_path: Path) -> None:
         asyncio.run(body())
     finally:
         host.close()
+
+
+def _function(name: str) -> dict[str, object]:
+    return {
+        'type': 'function',
+        'function': {
+            'name': name,
+            'description': f'{name} on the client',
+            'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}},
+        },
+    }
+
+
+def test_a_delegated_turn_answers_with_the_root_and_keeps_a_childs_bash_on_the_server(
+    tmp_path: Path,
+) -> None:
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        id='d1',
+                        name='Delegate',
+                        arguments=json.dumps({'agent': 'Worker', 'query': 'do it'}),
+                    )
+                ]
+            ),
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        id='b1',
+                        name='Bash',
+                        arguments=json.dumps({'command': 'echo CHILD-SECRET-CMD'}),
+                    )
+                ]
+            ),
+            ScriptedTurn(content='CHILD-ANSWER'),
+            ScriptedTurn(content='ROOT-FINAL'),
+        ]
+    )
+    host, live, app, port, credentials = _app(tmp_path, llm)
+
+    async def body() -> None:
+        client = await _client(app, port, credentials)
+        try:
+            async with asyncio.timeout(_TIMEOUT):
+                raw = await client.with_raw_response.chat.completions.create(
+                    model='Orchestrator',
+                    messages=[{'role': 'user', 'content': 'go'}],
+                    tools=[_function('Bash')],  # pyright: ignore[reportArgumentType]
+                )
+            assert 'CHILD-SECRET-CMD' not in raw.text
+            choice = raw.parse().choices[0]
+            assert choice.finish_reason == 'stop'
+            assert choice.message.tool_calls is None
+            assert choice.message.content == 'ROOT-FINAL'
+        finally:
+            await client.close()
+            async with asyncio.timeout(_TIMEOUT):
+                await live.shutdown()
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+    ran = [block for call in llm.calls for block in call if block.tool_call_id == 'b1']
+    assert ran and 'CHILD-SECRET-CMD' in str(ran[-1].content)
+
+
+def test_a_childs_question_is_returned_and_the_next_request_answers_the_child(
+    tmp_path: Path,
+) -> None:
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        id='d1',
+                        name='Delegate',
+                        arguments=json.dumps({'agent': 'Worker', 'query': 'do it'}),
+                    )
+                ]
+            ),
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        id='q1',
+                        name='AskUserQuestion',
+                        arguments=json.dumps(
+                            {'question': '子问：选哪个？', 'options': ['红', '蓝']}
+                        ),
+                    )
+                ]
+            ),
+            ScriptedTurn(content='CHILD-ANSWER'),
+            ScriptedTurn(content='ROOT-FINAL'),
+        ]
+    )
+    host, live, app, port, credentials = _app(tmp_path, llm)
+
+    async def body() -> None:
+        client = await _client(app, port, credentials)
+        try:
+            async with asyncio.timeout(_TIMEOUT):
+                first = await client.with_raw_response.chat.completions.create(
+                    model='Orchestrator', messages=[{'role': 'user', 'content': 'go'}]
+                )
+            sid = first.headers['x-syndica-session']
+            asked = first.parse().choices[0].message.content or ''
+            assert '子问：选哪个？' in asked
+            async with asyncio.timeout(_TIMEOUT):
+                answered = await client.chat.completions.create(
+                    model='Orchestrator',
+                    messages=[
+                        {'role': 'user', 'content': 'go'},
+                        {'role': 'assistant', 'content': asked},
+                        {'role': 'user', 'content': '红'},
+                    ],
+                    extra_headers={'X-Syndica-Session': sid},
+                )
+            assert answered.choices[0].message.content == 'ROOT-FINAL'
+        finally:
+            await client.close()
+            async with asyncio.timeout(_TIMEOUT):
+                await live.shutdown()
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+    child_after_answer = llm.calls[2]
+    assert any(block.role == 'tool' and '红' in str(block.content) for block in child_after_answer)
+
+
+class _Raises(ScriptedLLM):
+    async def create(self, messages: list[ContextBlock], **kwargs: object) -> ContextBlock:
+        del messages, kwargs
+        raise RuntimeError(_LEAK)
+
+
+def test_a_root_error_is_a_500_that_names_only_its_type(tmp_path: Path) -> None:
+    host, _live, app, port, credentials = _app(tmp_path, _Raises([]))
+
+    async def body() -> None:
+        client = await _client(app, port, credentials)
+        try:
+            with pytest.raises(InternalServerError) as caught:
+                async with asyncio.timeout(_TIMEOUT):
+                    await client.chat.completions.create(
+                        model='Worker', messages=[{'role': 'user', 'content': 'go'}]
+                    )
+            text = caught.value.response.text
+            assert 'quiz' not in text
+            assert '根 Agent 报错 RuntimeError' in text
+            assert 'agent span' in text
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
+def test_audio_and_audio_modalities_are_bad_requests(tmp_path: Path) -> None:
+    host, live, app, port, credentials = _app(tmp_path, ScriptedLLM([ScriptedTurn(content='x')]))
+
+    async def body() -> None:
+        client = await _client(app, port, credentials)
+        try:
+            with pytest.raises(BadRequestError, match='音频'):
+                await client.chat.completions.create(
+                    model='Worker',
+                    messages=[{'role': 'user', 'content': 'hi'}],
+                    audio={'voice': 'alloy', 'format': 'wav'},
+                )
+            with pytest.raises(BadRequestError, match='音频'):
+                await client.chat.completions.create(
+                    model='Worker',
+                    messages=[{'role': 'user', 'content': 'hi'}],
+                    modalities=['text', 'audio'],
+                )
+            assert live.sessions == {}
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
+def test_changing_the_tools_on_a_continued_session_is_a_bad_request(tmp_path: Path) -> None:
+    llm = ScriptedLLM([ScriptedTurn(content='first'), ScriptedTurn(content='second')])
+    host, _live, app, port, credentials = _app(tmp_path, llm)
+    history = [{'role': 'user', 'content': 'one'}, {'role': 'assistant', 'content': 'first'}]
+
+    async def body() -> None:
+        client = await _client(app, port, credentials)
+        try:
+            first = await client.with_raw_response.chat.completions.create(
+                model='Worker',
+                messages=[{'role': 'user', 'content': 'one'}],
+                tools=[_function('lookup')],  # pyright: ignore[reportArgumentType]
+            )
+            sid = first.headers['x-syndica-session']
+            with pytest.raises(BadRequestError, match='工具集'):
+                await client.chat.completions.create(
+                    model='Worker',
+                    messages=[*history, {'role': 'user', 'content': 'two'}],  # pyright: ignore[reportArgumentType]
+                    tools=[_function('fetch')],  # pyright: ignore[reportArgumentType]
+                    extra_headers={'X-Syndica-Session': sid},
+                )
+            assert len(llm.calls) == 1
+            second = await client.chat.completions.create(
+                model='Worker',
+                messages=[*history, {'role': 'user', 'content': 'two'}],  # pyright: ignore[reportArgumentType]
+                tools=[_function('lookup')],  # pyright: ignore[reportArgumentType]
+                extra_headers={'X-Syndica-Session': sid},
+            )
+            assert second.choices[0].message.content == 'second'
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
+def test_a_question_answer_outside_the_options_is_a_bad_request(tmp_path: Path) -> None:
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        id='q1',
+                        name='AskUserQuestion',
+                        arguments=json.dumps({'question': '选哪个？', 'options': ['红', '蓝']}),
+                    )
+                ]
+            ),
+            ScriptedTurn(content='picked red'),
+        ]
+    )
+    host, _live, app, port, credentials = _app(tmp_path, llm)
+
+    async def body() -> None:
+        client = await _client(app, port, credentials)
+        try:
+            first = await client.with_raw_response.chat.completions.create(
+                model='Worker', messages=[{'role': 'user', 'content': 'ask'}]
+            )
+            sid = first.headers['x-syndica-session']
+            asked = first.parse().choices[0].message.content or ''
+            assert '选哪个？' in asked and '红' in asked
+            history = [
+                {'role': 'user', 'content': 'ask'},
+                {'role': 'assistant', 'content': asked},
+            ]
+            with pytest.raises(BadRequestError, match='选项之一'):
+                await client.chat.completions.create(
+                    model='Worker',
+                    messages=[*history, {'role': 'user', 'content': '绿'}],  # pyright: ignore[reportArgumentType]
+                    extra_headers={'X-Syndica-Session': sid},
+                )
+            answered = await client.chat.completions.create(
+                model='Worker',
+                messages=[*history, {'role': 'user', 'content': '红'}],  # pyright: ignore[reportArgumentType]
+                extra_headers={'X-Syndica-Session': sid},
+            )
+            assert answered.choices[0].message.content == 'picked red'
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
+class _Explodes(OpenAIHttp):
+    async def chat(self, body: object, session_id: str | None) -> Any:
+        del body, session_id
+        raise RuntimeError(_LEAK)
+
+
+async def test_an_unexpected_exception_is_a_500_that_names_only_its_type() -> None:
+    live = Live(FakeAssembly())
+    app = chat_app(_Explodes(live, ('Worker',), RuleRedactor()))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url='http://openai', timeout=10
+    ) as client:
+        response = await client.post(
+            '/', json={'model': 'Worker', 'messages': [{'role': 'user', 'content': 'hi'}]}
+        )
+    assert response.status_code == 500
+    assert 'quiz' not in response.text
+    assert '抛出 RuntimeError' in response.text
+    assert 'POST 不要重放' in response.text

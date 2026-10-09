@@ -20,13 +20,21 @@ from a2a.types import (
 from a2a.utils.constants import VERSION_HEADER
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
-from server_fakes import FakeAssembly, running
+from server_fakes import FakeAssembly, FakeHandle, running
 
 from syndica.backends.a2a import A2AAgentModel
 from syndica.kernel import ContextBlock, TrustLevel
 from syndica.kernel.redaction import RuleRedactor
-from syndica.server import ProtocolMount
-from syndica.server.a2a_serve import SyndicaA2A, build_agent_card, card_app, jsonrpc_app
+from syndica.server import Live, ProtocolMount
+from syndica.server.a2a_serve import (
+    A2ADesk,
+    SyndicaA2A,
+    build_agent_card,
+    card_app,
+    jsonrpc_app,
+)
+
+_LEAK = 'Bearer sk-live-quizzical0123456789 postgres://quizuser:quizpw@db.internal/x'
 
 
 def _mounts(port: int) -> tuple[ProtocolMount, ...]:
@@ -154,6 +162,33 @@ async def test_version_0_3_message_send_reaches_the_same_runner() -> None:
         assert response.status_code == 200, response.text
         assert 'Explorer:ping' in response.text
         assert 'sk-a2a-secret' not in response.text
+
+
+class _RaisingAssembly(FakeAssembly):
+    async def open(self, **options: object) -> FakeHandle:
+        handle = await super().open(**options)
+        handle.deliver_error = RuntimeError(_LEAK)
+        return handle
+
+
+@pytest.mark.parametrize('method', ['SendMessage', 'SendStreamingMessage'])
+async def test_a_desk_exception_is_a_failed_task_that_names_only_its_type(method: str) -> None:
+    live = Live(_RaisingAssembly())
+    card = build_agent_card('workspace', (('Worker', 'does work'),), port=8080)
+    app = jsonrpc_app(SyndicaA2A(card=card, desk=A2ADesk(live)))
+    payload = {**_send('hello', role='Worker'), 'method': method}
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url='http://a2a', timeout=10
+        ) as client:
+            response = await client.post('/', json=payload, headers={'A2A-Version': '1.0'})
+    finally:
+        await live.shutdown()
+    assert response.status_code == 200
+    assert 'quiz' not in response.text
+    assert '-32603' not in response.text
+    assert 'TASK_STATE_FAILED' in response.text
+    assert '执行器抛出 RuntimeError' in response.text
 
 
 async def test_the_client_reads_the_card_and_gets_an_untrusted_answer() -> None:

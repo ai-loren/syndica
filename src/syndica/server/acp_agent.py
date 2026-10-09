@@ -50,6 +50,7 @@ from syndica.kernel import (
 __all__ = ['AcpBridge', 'AcpSession', 'SyndicaAcp', 'TurnBinding']
 
 _OUTPUT_CAP = 4_000
+_ROOT_ONLY = frozenset({'message_appended', 'agent_error', 'agent_end'})
 
 logger = logging.getLogger(__name__)
 
@@ -122,10 +123,11 @@ class AcpBridge:
         )
 
     async def submit(self, text: str) -> str:
-        if self._failure is not None:
-            raise self._failure
+        # 失败只属于报错的那一次提示：根 Agent 收到下一条消息会重新开一个周期，
+        # 留着它会让会话此后每条提示都失败。
         question = self._question
         self._cancelled = False
+        self._failure = None
         self._turn_done.clear()
         if question is not None:
             agent_id, request_id, options = question
@@ -193,6 +195,10 @@ class AcpBridge:
                 logger.exception('acp event failed')
 
     async def _on(self, event: Event) -> None:
+        # 回答、结束与失败只认根：子 Agent 先结束会让这次提示提前返回，根的回答落到提示返回之后。
+        # 工具、确认与提问来自谁都推给编辑器，答复交回发起的那个 Agent。
+        if event.kind in _ROOT_ONLY and event.agent_id != self._agent_id:
+            return
         if event.kind == 'message_appended':
             await self._message(event.payload)
         elif event.kind == 'tool_call_started':

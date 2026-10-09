@@ -164,15 +164,9 @@ class SyndicaA2A(RequestHandler):
         role = _role(message)
         task_id = message.task_id or secrets.token_hex(8)
         context_id = message.context_id or secrets.token_hex(8)
-        if self._desk is not None:
-            outcome = await self._desk.turn(
-                context_id=context_id, task_id=task_id, text=text, role=role
-            )
-            return self._remember(task_id, context_id, outcome.state, outcome.text)
-        assert self._runner is not None
+        # 漏出这里的异常由 SDK 换成 -32603，`str(exc)` 原样进响应：两条路径都必须在这里收住。
         try:
-            answer = await self._runner(text, role)
-            state = TaskState.TASK_STATE_COMPLETED
+            state, answer = await self._answer(context_id, task_id, text, role)
         except SyndicaError as exc:
             answer = f'期望: {exc.expected}。实际: {exc.received}。下一步: {exc.next_action}'
             state = TaskState.TASK_STATE_FAILED
@@ -181,6 +175,15 @@ class SyndicaA2A(RequestHandler):
             answer = _executor_failed(type(exc).__name__)
             state = TaskState.TASK_STATE_FAILED
         return self._remember(task_id, context_id, state, answer)
+
+    async def _answer(self, context_id: str, task_id: str, text: str, role: str) -> tuple[int, str]:
+        if self._desk is not None:
+            outcome = await self._desk.turn(
+                context_id=context_id, task_id=task_id, text=text, role=role
+            )
+            return outcome.state, outcome.text
+        assert self._runner is not None
+        return TaskState.TASK_STATE_COMPLETED, await self._runner(text, role)
 
     def _remember(self, task_id: str, context_id: str, state: int, answer: str) -> Task:
         task = Task(id=task_id, context_id=context_id)
@@ -401,10 +404,11 @@ class A2ADesk:
 
     async def _wait(self, session: LiveSession, task_id: str, position: str) -> _Outcome:
         texts: list[str] = []
+        root_id = session.handle.root_id
         follower: AsyncIterator[Entry | str] = session.stream.follow(position)
         try:
             async for entry in follower:
-                outcome = self._entry(task_id, entry, texts)
+                outcome = self._entry(root_id, task_id, entry, texts)
                 if outcome is not None:
                     return outcome
         finally:
@@ -413,10 +417,27 @@ class A2ADesk:
                 await close()
         return _Outcome(TaskState.TASK_STATE_FAILED, _executor_failed('流已关闭'))
 
-    def _entry(self, task_id: str, entry: Entry | str, texts: list[str]) -> _Outcome | None:
+    def _entry(
+        self, root_id: str, task_id: str, entry: Entry | str, texts: list[str]
+    ) -> _Outcome | None:
         if isinstance(entry, str):
             return None
         payload = _payload(entry.data)
+        agent_id = str(entry.data.get('agent_id') or '')
+        # 子 Agent 的提问照样停成 INPUT_REQUIRED：根停在派活里等它，丢掉它这一轮就永远不结束。
+        # 答复按待答表交给提问的那个 Agent。
+        if entry.kind in {'user_question_requested', 'user_input_requested'}:
+            raw_options = payload.get('options')
+            items = cast(list[object], raw_options) if isinstance(raw_options, list) else []
+            options = tuple(str(item) for item in items)
+            question = str(payload.get('question') or '')
+            lines = [question, *(f'{index}. {option}' for index, option in enumerate(options, 1))]
+            shown = '\n'.join(line for line in lines if line)
+            self._pending[task_id] = (agent_id, str(payload.get('request_id') or ''), options)
+            return _Outcome(TaskState.TASK_STATE_INPUT_REQUIRED, self._redact(shown))
+        # 回答、结束与失败只认根：子 Agent 先结束、先说话，这一轮还没完。
+        if agent_id != root_id:
+            return None
         if entry.kind == 'message_appended':
             raw_block = payload.get('block')
             block = cast(dict[str, object], raw_block) if isinstance(raw_block, dict) else None
@@ -425,16 +446,6 @@ class A2ADesk:
                 if isinstance(text, str) and text:
                     texts.append(self._redact(text))
             return None
-        if entry.kind in {'user_question_requested', 'user_input_requested'}:
-            raw_options = payload.get('options')
-            items = cast(list[object], raw_options) if isinstance(raw_options, list) else []
-            options = tuple(str(item) for item in items)
-            question = str(payload.get('question') or '')
-            lines = [question, *(f'{index}. {option}' for index, option in enumerate(options, 1))]
-            shown = '\n'.join(line for line in lines if line)
-            agent_id = str(entry.data.get('agent_id') or '')
-            self._pending[task_id] = (agent_id, str(payload.get('request_id') or ''), options)
-            return _Outcome(TaskState.TASK_STATE_INPUT_REQUIRED, self._redact(shown))
         if entry.kind == 'agent_error':
             return _Outcome(TaskState.TASK_STATE_FAILED, _from_payload(payload))
         if entry.kind == 'agent_end':
@@ -443,7 +454,7 @@ class A2ADesk:
                 return _Outcome(TaskState.TASK_STATE_CANCELED, '')
             if reason == 'error':
                 return _Outcome(TaskState.TASK_STATE_FAILED, _from_payload(payload))
-            return _Outcome(TaskState.TASK_STATE_COMPLETED, self._redact('\n'.join(texts)))
+            return _Outcome(TaskState.TASK_STATE_COMPLETED, '\n'.join(texts))
         return None
 
     def _redact(self, text: str) -> str:

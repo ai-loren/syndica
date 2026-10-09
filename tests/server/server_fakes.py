@@ -69,6 +69,7 @@ class FakeHandle:
         self.granted: list[tuple[str, Budget]] = []
         self.closed: list[BaseException | None] = []
         self.deliver_ok = True
+        self.deliver_error: Exception | None = None
         self.trace: str | None = 'trace-1'
         self.calls: list[tuple[Any, ...]] = []
         self.terminals: list[FakeTerminal] = []
@@ -91,6 +92,8 @@ class FakeHandle:
 
     async def deliver(self, target: str, text: str) -> DeliveryResult:
         self.delivered.append((target, text))
+        if self.deliver_error is not None:
+            raise self.deliver_error
         if not self.deliver_ok:
             return DeliveryResult(ok=False, reason='agent is gone')
         return DeliveryResult(ok=True, message_id='m1')

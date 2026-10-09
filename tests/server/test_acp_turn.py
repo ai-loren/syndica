@@ -7,6 +7,7 @@ import json
 import sys
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 from acp.exceptions import RequestError
@@ -18,7 +19,9 @@ from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO
 from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
+    AgentStatus,
     ConfigError,
+    ContextBlock,
     RuleRedactor,
     ScriptedLLM,
     ScriptedTurn,
@@ -39,9 +42,11 @@ _CONFIG = (
 
 
 class _Recording(SyndicaAcp):
-    def __init__(self, open_turn: object) -> None:
+    def __init__(
+        self, open_turn: object, roles: tuple[tuple[str, str], ...] = (('Worker', '干活'),)
+    ) -> None:
         super().__init__(
-            (('Worker', '干活'),),
+            roles,
             lambda _cwd: None,
             open_turn=open_turn,  # pyright: ignore[reportArgumentType]
             redactor=RuleRedactor(),
@@ -305,6 +310,130 @@ def test_a_question_ends_the_prompt_and_the_next_prompt_is_the_answer(tmp_path: 
             answered = await agent.prompt(session_id, [TextContentBlock(type='text', text='红')])
             assert answered.stop_reason == 'end_turn'
             assert any('picked red' in text for text in agent.messages)
+        finally:
+            await _finish(host, agent, session_id, opened)
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
+def _default_host(
+    tmp_path: Path, llm: ScriptedLLM
+) -> tuple[RuntimeCliHost, _Recording, list[object], Path]:
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    config = workspace / '.syndica.yaml'
+    config.write_text('version: 1\n', encoding='utf-8')
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
+        model_factory=lambda _: llm,
+        workspace_root=workspace,
+    )
+    opened: list[object] = []
+
+    async def open_turn(cwd: str, mode: str, servers: tuple[object, ...] = ()) -> TurnBinding:
+        del cwd, servers
+        parts = await host.assemble_session(
+            str(config),
+            max_turns=8,
+            trace=None,
+            argv=('syndica', 'acp'),
+            trusted_output=(),
+            role=mode,
+        )
+        opened.append(parts)
+        return TurnBinding(parts.runtime, parts.agent_id, parts.subscription)
+
+    agent = _Recording(open_turn, (('Orchestrator', '派活'), ('Worker', '干活')))
+    return host, agent, opened, workspace
+
+
+def test_a_delegated_prompt_returns_after_the_root_with_only_the_root_answer(
+    tmp_path: Path,
+) -> None:
+    llm = ScriptedLLM(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        id='d1',
+                        name='Delegate',
+                        arguments=json.dumps({'agent': 'Worker', 'query': 'do it'}),
+                    )
+                ]
+            ),
+            ScriptedTurn(content='CHILD-ANSWER'),
+            ScriptedTurn(content='ROOT-FINAL'),
+        ]
+    )
+    host, agent, opened, workspace = _default_host(tmp_path, llm)
+
+    async def body() -> None:
+        session_id = ''
+        try:
+            session = await agent.new_session(str(workspace))
+            session_id = session.session_id
+            async with asyncio.timeout(20):
+                result = await agent.prompt(session_id, [TextContentBlock(type='text', text='go')])
+            at_return = list(agent.messages)
+            assert result.stop_reason == 'end_turn'
+            assert at_return == ['ROOT-FINAL']
+        finally:
+            await _finish(host, agent, session_id, opened)
+
+    try:
+        asyncio.run(body())
+    finally:
+        host.close()
+
+
+async def _until_zombie(parts: Any) -> None:
+    """等根 Agent 拆完这个周期再发下一条：拆邮箱期间送达的提示会随邮箱一起丢掉。"""
+    async with asyncio.timeout(20):
+        while True:
+            info = await parts.runtime.find(parts.agent_id)
+            if info is not None and info.status is AgentStatus.ZOMBIE:
+                return
+            await asyncio.sleep(0.01)
+
+
+class _FailsOnce(ScriptedLLM):
+    def __init__(self, script: list[ScriptedTurn]) -> None:
+        super().__init__(script)
+        self.failed = False
+
+    async def create(self, messages: list[ContextBlock], **kwargs: object) -> ContextBlock:
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError('model is down')
+        return await super().create(messages, **kwargs)
+
+
+def test_a_root_error_fails_one_prompt_and_the_next_prompt_is_answered(tmp_path: Path) -> None:
+    host, agent, opened, workspace = _default_host(
+        tmp_path, _FailsOnce([ScriptedTurn(content='recovered')])
+    )
+
+    async def body() -> None:
+        session_id = ''
+        try:
+            session = await agent.new_session(str(workspace))
+            session_id = session.session_id
+            await agent.set_session_mode(session_id, 'Worker')
+            with pytest.raises(RequestError) as failed:
+                async with asyncio.timeout(20):
+                    await agent.prompt(session_id, [TextContentBlock(type='text', text='one')])
+            assert isinstance(failed.value.data, dict)
+            assert failed.value.data['next_action']
+            [parts] = opened
+            await _until_zombie(parts)
+            async with asyncio.timeout(20):
+                again = await agent.prompt(session_id, [TextContentBlock(type='text', text='two')])
+            assert again.stop_reason == 'end_turn'
+            assert agent.messages == ['recovered']
         finally:
             await _finish(host, agent, session_id, opened)
 
