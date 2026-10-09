@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Coroutine, Generator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
@@ -27,7 +27,7 @@ from functools import partial
 from pathlib import Path
 from textwrap import indent
 from types import MappingProxyType
-from typing import Any, TextIO, TypeVar, cast
+from typing import Any, Protocol, TextIO, TypeVar, cast
 
 from syndica import __version__
 from syndica.cli.capture import frozen_roles, host_profile
@@ -223,6 +223,33 @@ __all__ = ['RuntimeCliHost', 'reference_modules']
 
 ModelFactory = Callable[[str], LLM]
 PrepareModels = Callable[[CliConfig], None]
+
+
+class AcpProbe(Protocol):
+    """doctor 按 run 的方式拉起 `acp:<name>`、握手、整组收掉。交回的对象带 `protocol_version`、
+    `agent_name`、`agent_version`；失败抛三件套。组合根注入：surface 不 import backend。"""
+
+    def __call__(
+        self,
+        config: CliConfig,
+        name: str,
+        agent_env: Mapping[str, str],
+        *,
+        cwd: str,
+        redactor: Redactor,
+        environ: Mapping[str, str],
+        workspace: str,
+        timeout: float,
+    ) -> Awaitable[object]: ...
+
+
+class A2aProbe(Protocol):
+    """doctor 取 `a2a:<name>` 的 agent card（不带 Bearer）。交回的对象带 `versions`、`skills`、
+    `more_skills`；失败抛三件套。"""
+
+    def __call__(self, name: str, url: str, *, timeout: float) -> Awaitable[object]: ...
+
+
 _RUNTIME_LOGGER = 'syndica.kernel.runtime'
 # Bash 每条输出流、Glob 与 Grep 每次结果最多展示给模型的字符数。整份 pytest 输出进上下文会挤掉别的
 # 一切，而汇总行在末尾，local_tools 截断时留开头 20%、结尾 80%；一次宽泛的 Grep 同理。
@@ -277,6 +304,9 @@ _READ_ONLY_NOTICE = (
 _VERIFY_TIMEOUT = 900.0
 # doctor 跑 `command -v` 与 `<exe> --version` 的上限。
 _PROBE_TIMEOUT = 30.0
+# doctor 等一个外部对象答出握手或交出卡片的上限，每个对象各算一次；关进程的宽限不在其内。
+_EXTERNAL_PROBE_TIMEOUT = 30.0
+_EXTERNAL_FAILED = ('mcp: failed', 'acp: failed', 'a2a: failed')
 # 记录开始时问一次 HEAD 的上限：问不出来就不记，不为它拖住 run。
 _HEAD_TIMEOUT = 5.0
 # run 结束时导出的总上限：一个慢的 collector 按批收，每批都在单次请求的超时以内，也能把命令行拖住。
@@ -1087,6 +1117,49 @@ def _interop_warnings(environ: Mapping[str, str], workspace: Path, config: CliCo
     ]
 
 
+def _shown(text: str, redactor: Redactor) -> str:
+    """对端或异常给的文字：先脱敏再转义，转义会把跨行的密钥拆得认不出。"""
+    return one_line(redactor.redact(text))
+
+
+def _probe_failure(exc: Exception, redactor: Redactor) -> str:
+    if isinstance(exc, SyndicaError):
+        return _shown(
+            f'期望: {exc.expected}。实际: {exc.received}。下一步: {exc.next_action}', redactor
+        )
+    return _shown(
+        f'期望: 探测交回结果或三件套错误。实际: {type(exc).__name__}: {exc}。'
+        '下一步: 这是 Syndica 的缺陷，带着这一行报 issue',
+        redactor,
+    )
+
+
+def _acp_hello(hello: object, redactor: Redactor) -> str:
+    version = getattr(hello, 'protocol_version', None)
+    reported = [
+        part
+        for part in (getattr(hello, 'agent_name', None), getattr(hello, 'agent_version', None))
+        if isinstance(part, str) and part
+    ]
+    agent = f'Agent {_shown(" ".join(reported), redactor)}' if reported else '对端没报名字与版本'
+    return f'协议 {_shown(str(version), redactor)}；{agent}'
+
+
+def _listed(value: object, redactor: Redactor) -> str:
+    if not isinstance(value, tuple | list):
+        return ''
+    return ', '.join(_shown(str(item), redactor) for item in cast(Sequence[object], value))
+
+
+def _a2a_card(card: object, redactor: Redactor) -> str:
+    declared = _listed(getattr(card, 'versions', ()), redactor)
+    named = _listed(getattr(card, 'skills', ()), redactor)
+    more = getattr(card, 'more_skills', 0)
+    if isinstance(more, int) and more > 0:
+        named += f'，另有 {more} 个没列出'
+    return f'协议 {declared}；技能 {named or "（卡片上没有技能）"}'
+
+
 def _git_line(git: HostGit) -> str:
     """doctor 的 git 一行：只是情况说明，不让 doctor 失败。「不是仓库」只认 git 自己这么说；git
     太旧、`safe.directory` 拒绝这类失败照实写出来——交接时会把这样的仓库当成不是仓库，只有这里
@@ -1641,6 +1714,8 @@ class RuntimeCliHost:
         prices: PriceTable | None = None,
         mcp_opener: McpOpener | None = None,
         prepare_models: PrepareModels | None = None,
+        acp_probe: AcpProbe | None = None,
+        a2a_probe: A2aProbe | None = None,
     ) -> None:
         self._io = io
         # backend 给的默认价格（组合根交进来：surface 不 import backend）；`.syndica.yaml` 的
@@ -1657,6 +1732,8 @@ class RuntimeCliHost:
         self._lines = _Lines(io.stdin)
         self._model_factory = model_factory
         self._mcp_opener = mcp_opener
+        self._acp_probe = acp_probe
+        self._a2a_probe = a2a_probe
         self._prepare_models = prepare_models
         self._workspace_root = Path(workspace_root)
         self._environ: Mapping[str, str] = os.environ if environ is None else environ
@@ -2941,7 +3018,8 @@ class RuntimeCliHost:
 
     async def _doctor(self, path: str, *, verify: bool) -> CliOutcome:
         """D16：在 Agent 的环境里自检。git 与 python 两行只是情况说明；verify 用到的可执行文件跑不
-        起来、`--verify` 里有命令没过，退出 1。"""
+        起来、`--verify` 里有命令没过、声明的外部对象（MCP / ACP / A2A）起不来或连不上，退出 1。
+        外部对象各占各的行：一个起不来不妨碍探下一个，也不妨碍后面的检查。"""
         config = self._trusted_config(path)
         workspace, environment = self._open_workspace(config)
         failed = False
@@ -2970,13 +3048,18 @@ class RuntimeCliHost:
             )
             git = HostGit(self._workspace_root, self._environ)
             mcp_lines, opened_mcp = await self._mcp_doctor(config, environment.values, judge)
-            if any(line.startswith('mcp: failed') for line in mcp_lines):
+            external = [
+                *mcp_lines,
+                *await self._acp_doctor(config, environment.values),
+                *await self._a2a_doctor(config),
+            ]
+            if any(line.startswith(_EXTERNAL_FAILED) for line in external):
                 failed = True
             lines = [
                 f'config: ok {one_line(config.source)}',
                 f'models: ok {", ".join(names)}',
                 *_interop_warnings(self._environ, self._workspace_root, config),
-                *mcp_lines,
+                *external,
                 f'workspace: ok {one_line(str(self._workspace_root))}',
                 f'env: {" ".join(environment.values)}',
                 _git_line(git),
@@ -3135,6 +3218,49 @@ class RuntimeCliHost:
         if opened is None:
             return [], None
         return list(doctor_lines(opened)), opened
+
+    async def _acp_doctor(self, config: CliConfig, agent_env: Mapping[str, str]) -> list[str]:
+        """逐个拉起声明的 ACP Agent、握手、收掉。没有声明、或没注入探测时不拉起。"""
+        probe = self._acp_probe
+        if not config.interop.acp_agents or probe is None:
+            return []
+        redactor = host_redactor(self._environ, config.redaction_rules)
+        lines: list[str] = []
+        for agent in config.interop.acp_agents:
+            shown = one_line(agent.name)
+            try:
+                hello = await probe(
+                    config,
+                    agent.name,
+                    agent_env,
+                    cwd=str(self._workspace_root),
+                    redactor=redactor,
+                    environ=self._environ,
+                    workspace=str(self._workspace_root),
+                    timeout=_EXTERNAL_PROBE_TIMEOUT,
+                )
+            except Exception as exc:
+                lines.append(f'acp: failed {shown}（{_probe_failure(exc, redactor)}）')
+                continue
+            lines.append(f'acp: ok {shown}（{_acp_hello(hello, redactor)}）')
+        return lines
+
+    async def _a2a_doctor(self, config: CliConfig) -> list[str]:
+        """逐个取声明的 A2A Agent 的卡片。没有声明、或没注入探测时不连。"""
+        probe = self._a2a_probe
+        if not config.interop.a2a_agents or probe is None:
+            return []
+        redactor = host_redactor(self._environ, config.redaction_rules)
+        lines: list[str] = []
+        for agent in config.interop.a2a_agents:
+            shown = one_line(agent.name)
+            try:
+                card = await probe(agent.name, agent.url, timeout=_EXTERNAL_PROBE_TIMEOUT)
+            except Exception as exc:
+                lines.append(f'a2a: failed {shown}（{_probe_failure(exc, redactor)}）')
+                continue
+            lines.append(f'a2a: ok {shown}（{_a2a_card(card, redactor)}）')
+        return lines
 
     async def assemble_session(
         self,

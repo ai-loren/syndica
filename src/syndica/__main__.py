@@ -472,7 +472,11 @@ _ACP_SPECS: ContextVar[Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]] | N
 )
 
 
-def _remember_acp(config: CliConfig, workspace: Path, environ: Mapping[str, str]) -> None:
+def _acp_specs(
+    config: CliConfig, workspace: Path, environ: Mapping[str, str]
+) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    """名字 → (command, 透传变量名)。用户级凭证钉住的 command 与项目声明的不逐字相同，三件套
+    拒绝。"""
     from syndica.cli.interop_config import (
         InteropCredential,
         credential_for,
@@ -491,7 +495,46 @@ def _remember_acp(config: CliConfig, workspace: Path, environ: Mapping[str, str]
         if cred is not None:
             extra = (*extra, *cred.env)
         specs[agent.name] = (agent.command, extra)
-    _ACP_SPECS.set(specs)
+    return specs
+
+
+def _remember_acp(config: CliConfig, workspace: Path, environ: Mapping[str, str]) -> None:
+    _ACP_SPECS.set(_acp_specs(config, workspace, environ))
+
+
+async def _probe_acp(
+    config: CliConfig,
+    name: str,
+    agent_env: Mapping[str, str],
+    *,
+    cwd: str,
+    redactor: Redactor,
+    environ: Mapping[str, str],
+    workspace: str,
+    timeout: float,  # noqa: ASYNC109
+) -> object:
+    """doctor 拉起 `acp:<name>`：command 与透传变量与 run 取自同一处，凭证钉住的目的地照样核对。"""
+    from syndica.kernel import ConfigError
+
+    command, extra = _acp_specs(config, Path(workspace), environ)[name]
+    try:
+        from syndica.backends.acp.probe import probe_acp
+    except ImportError as exc:
+        raise ConfigError(
+            expected="ACP 客户端已安装（pip install 'syndica[acp]'）",
+            received=f'导入失败：{exc}',
+            next_action="运行 pip install 'syndica[acp]' 后重试",
+        ) from exc
+    return await probe_acp(
+        name,
+        command,
+        pass_env=extra,
+        agent_env=agent_env,
+        host_env=environ,
+        cwd=cwd,
+        redactor=redactor,
+        timeout=timeout,
+    )
 
 
 def _acp_model(name: str) -> LLM:
@@ -585,6 +628,21 @@ def _a2a_model(name: str) -> LLM:
     return A2AAgentModel(key, url, bearer=bearer)
 
 
+async def _probe_a2a(name: str, url: str, *, timeout: float) -> object:  # noqa: ASYNC109
+    """doctor 取 `a2a:<name>` 的 agent card。卡片是公开的：用户级凭证里的 Bearer 不交给它。"""
+    try:
+        from syndica.backends.a2a.probe import probe_a2a
+    except ImportError as exc:
+        from syndica.kernel import ConfigError
+
+        raise ConfigError(
+            expected="A2A 客户端已安装（pip install 'syndica[a2a]'）",
+            received=f'导入失败：{exc}',
+            next_action="运行 pip install 'syndica[a2a]' 后重试",
+        ) from exc
+    return await probe_a2a(name, url, timeout=timeout)
+
+
 def build_host(io: CliIO, workspace_root: Path) -> RuntimeCliHost:
     """CLI 与 server 用同一个宿主：模型、价格、回放、导出、信任都在这里接一次。"""
     from syndica.cli.host import RuntimeCliHost
@@ -613,6 +671,8 @@ def build_host(io: CliIO, workspace_root: Path) -> RuntimeCliHost:
         trust=real_trust_gate(),
         prices=_default_prices(),
         mcp_opener=_open_mcp,
+        acp_probe=_probe_acp,
+        a2a_probe=_probe_a2a,
     )
 
 

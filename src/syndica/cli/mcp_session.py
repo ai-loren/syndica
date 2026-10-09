@@ -138,12 +138,17 @@ async def open_mcp_clients(
 
 
 def doctor_lines(opened: OpenedMcp) -> tuple[str, ...]:
-    """doctor 里每个已连接服务一行版本，每个没装上的工具一行。"""
+    """doctor 里每个已连接服务一行版本、一行装上的工具（Agent 看到的名字，按服务列出的顺序），
+    每个没装上的工具一行。"""
     lines: list[str] = []
     for client in opened.clients:
         name = getattr(client, 'name', '')
         version = getattr(client, 'protocol_version', None)
         lines.append(f'mcp: ok {one_line(str(name))} {one_line(str(version))}')
+        tools = getattr(client, 'tools', None)
+        if isinstance(tools, Mapping):
+            listed = ', '.join(one_line(str(key)) for key in cast(Mapping[object, object], tools))
+            lines.append(f'mcp: tools {one_line(str(name))} {listed or "（没有工具）"}')
         excluded = getattr(client, 'excluded', ())
         if isinstance(excluded, tuple | list):
             for item in cast(Sequence[object], excluded):
