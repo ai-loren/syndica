@@ -60,6 +60,7 @@ def dry_run(dataset: Path) -> dict[str, object]:
         'max_steps': config.max_steps,
         'columns': list(loaded.column_names),
         'prepared_columns': list(prepared.column_names),
+        'token_counts': [len(row['input_ids']) for row in prepared],
     }
 
 
@@ -71,8 +72,11 @@ def _local_model(transformers: Any, tokenizers: Any) -> tuple[Any, Any]:
     processing = transformers.PreTrainedTokenizerFast(
         tokenizer_object=raw, pad_token='<pad>', eos_token='<eos>'
     )
+    # 工具调用也渲染进去：导出的 SFT 行里 assistant 带 tool_calls，模板丢掉它们就等于没测工具调用。
     processing.chat_template = (
-        "{% for m in messages %}{{ m['content'] }} {{ eos_token }}{% endfor %}"
+        "{% for m in messages %}{{ m['content'] }}"
+        "{% if m.get('tool_calls') %} {{ m['tool_calls'] | tojson }}{% endif %}"
+        ' {{ eos_token }}{% endfor %}'
     )
     model_config = transformers.GPT2Config(
         vocab_size=8,

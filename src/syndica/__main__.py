@@ -692,6 +692,9 @@ class _LazyHost:
             self._host = build_host(self._io, Path.cwd())
         return self._host
 
+    def runtime_host(self) -> RuntimeCliHost:
+        return self._get()
+
     def run_request(self, request: RunRequest) -> str | CliOutcome:
         return self._get().run_request(request)
 
@@ -763,7 +766,10 @@ class _Training:
             )
 
         def run_one(task: BatchTask) -> int:
-            result = self._host.run_request(RunRequest(prompt=task.prompt, config=config))
+            request = RunRequest(
+                prompt=task.prompt, config=config, agent=task.agent, goal=task.goal
+            )
+            result = self._host.run_request(request)
             return result.exit_code if isinstance(result, CliOutcome) else 0
 
         body, code = run_dataset(path.read_text(encoding='utf-8'), run_one)
@@ -777,18 +783,21 @@ class _Training:
         output: str,
         include_unverified: bool,
     ) -> CliOutcome:
-        del config
+        """导出用宿主的脱敏器：`.syndica.yaml` 的用户规则加此刻环境里的密钥值，与落盘同一套。"""
         from syndica.cli.handoff import artifact_root, rubric_root, session_root, trace_root
+        from syndica.cli.redaction import host_secrets
         from syndica.runner.commands import export_workspace
 
+        host = self._host.runtime_host()
+        loaded = host.trusted_config(config)
         root = Path.cwd()
         body, code = export_workspace(
-            session_root(root),
-            trace_root(root),
-            rubric_root(root),
-            artifact_root(root),
+            root,
+            (session_root(root), trace_root(root), rubric_root(root), artifact_root(root)),
             fmt,
             Path(output),
+            redactor=host.redactor_for(loaded),
+            secrets=host_secrets(os.environ),
             include_unverified=include_unverified,
         )
         return CliOutcome(body, code)

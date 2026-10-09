@@ -3,12 +3,19 @@
   "id": "try-1",
   "goal_id": "goal-planets",
   "rubric_id": "rubric-1",
+  "model": "scripted",
+  "system_prompt": "you write notes",
+  "tools": [
+    "Read",
+    "Write"
+  ],
   "messages": [
     {
       "role": "user",
       "content": "write planets.md",
       "tool_call_id": null,
-      "tool_calls": []
+      "tool_calls": [],
+      "trust": "trusted"
     },
     {
       "role": "assistant",
@@ -20,13 +27,15 @@
           "name": "Write",
           "arguments": "{\"path\": \"planets.md\"}"
         }
-      ]
+      ],
+      "trust": "trusted"
     },
     {
       "role": "tool",
       "content": "[REDACTED:secret.token]",
       "tool_call_id": "call-1",
-      "tool_calls": []
+      "tool_calls": [],
+      "trust": "trusted"
     }
   ],
   "tool_calls": [
@@ -42,6 +51,16 @@
     }
   ],
   "verdict": "pass",
+  "verdicts": [
+    "pass"
+  ],
+  "outcomes": [
+    "R1=satisfied"
+  ],
+  "source": {
+    "trace_id": "tttttttttttttttttttttttttttttttt",
+    "verdict_source": "acceptance"
+  },
   "causality": [],
   "timing": {
     "start_ns": null,
@@ -49,6 +68,8 @@
     "cost": null
   },
   "redaction": {
+    "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "rules_version": 2,
     "placeholders_kept": true,
     "raw_secrets_exported": false
   }

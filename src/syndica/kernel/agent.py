@@ -1428,6 +1428,9 @@ class BaseAgent:
         if self._by_floored(authors.wrote.get('verdict', ()), authors.wrote.get('send_back', ())):
             verdict = replace(verdict, trust=TrustLevel.UNTRUSTED)
         ctx.verdict = verdict
+        # agent span 收尾时只记终态；被打回之前的那些结论只留在这些事件上，训练导出靠它们分清一次
+        # 打回之后才通过的会话。
+        self._tracing.event('verdict', _verdict_attributes(verdict))
         if self._long_horizon is not None:
             await self._long_horizon.record_verdict(ctx, turn)
         sent_back = send_back and any(

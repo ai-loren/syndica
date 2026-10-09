@@ -1192,7 +1192,7 @@ CLI 的交互模式不经过 HTTP，因此**内核事件流必须首先是进程
 
 因此裁决状态在轨迹里是四值而非三值：`pass` / `partial` / `block` / `unverified`。**导出器默认排除 `unverified` 样本**，需要包含时必须显式开启并在数据集元信息中标注。
 
-里程碑 11 的落地：中立轨迹是 `syndica.trajectory/1`，由 `syndica.runner` 从会话、Goal / Rubric、trace 与产物登记拼出；裁决只读根 Agent 的 span，验收伴生 Agent 的不算。偏好对按 Goal 与 Rubric 内容的摘要配对，不按模型起的 Rubric id。`syndica export {sft,sharegpt,preference,rl}` 先逐叶脱敏再编码，占位符保留，只读源 store；`syndica batch` 一条失败不中断其余。训练框架对接是 `syndica.backends.trl`（extra `trl`），runner 与 kernel 不导入它。
+里程碑 11 的落地：中立轨迹是 `syndica.trajectory/1`，由 `syndica.runner` 从会话、Goal / Rubric、trace 与产物登记拼出。裁决只读根 Agent 的 `verdict` 事件（内核每给一次裁决记一个，打回之前的也在），验收伴生 Agent 与回放写出的 trace 不算；unverified 的 reward 是 null，不当失败。偏好对按 Goal 与 Rubric 内容的摘要配对，不按模型起的 Rubric id。消息带 trust 标记导出。`syndica export {sft,sharegpt,preference,rl,trajectory}` 用宿主的脱敏器（用户规则加此刻环境里的密钥值），先逐叶脱敏再编码，占位符保留；只读源 store，输出目录必须在工作区之外——导出的数据里有别的会话的全文与不可信内容，放在工作区里会被下一次 run 当成可信基线。`syndica batch` 一条失败不中断其余。训练框架对接是 `syndica.backends.trl`（extra `trl`），`check_deps` 拒绝 backend 之外导入训练框架。
 
 ---
 

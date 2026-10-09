@@ -20,8 +20,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class BatchTask:
+    """一行任务。`agent` 与 `goal` 可选，与 `run --agent` / `--goal` 同义。"""
+
     id: str
     prompt: str
+    agent: str | None = None
+    goal: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,12 +111,30 @@ def _task(line: str, number: int) -> BatchTask:
             next_action='改成 {"id": "...", "prompt": "..."}',
         )
     row = cast(dict[str, object], payload)
+    unknown = sorted(set(row) - {'id', 'prompt', 'agent', 'goal'})
+    if unknown:
+        raise ConfigError(
+            expected='每一行只有 id、prompt，以及可选的 agent、goal',
+            received=f'第 {number} 行还有 {", ".join(unknown)}',
+            next_action='删掉这些键；拼错的键会被当成没写，任务就按缺省角色与目标跑了',
+        )
     ident = row.get('id')
     prompt = row.get('prompt')
-    if isinstance(ident, str) and ident and isinstance(prompt, str) and prompt:
-        return BatchTask(ident, prompt)
-    raise ConfigError(
-        expected='id 与 prompt 都是非空字符串',
-        received=f'第 {number} 行的 id={ident!r}，prompt 的类型是 {type(prompt).__name__}',
-        next_action='补上字符串 id 与 prompt',
-    )
+    if not (isinstance(ident, str) and ident and isinstance(prompt, str) and prompt):
+        raise ConfigError(
+            expected='id 与 prompt 都是非空字符串',
+            received=f'第 {number} 行的 id 类型是 {type(ident).__name__}，'
+            f'prompt 的类型是 {type(prompt).__name__}',
+            next_action='补上字符串 id 与 prompt',
+        )
+    optional: dict[str, str | None] = {}
+    for key in ('agent', 'goal'):
+        value = row.get(key)
+        if value is not None and not (isinstance(value, str) and value):
+            raise ConfigError(
+                expected=f'{key} 不写，或是非空字符串',
+                received=f'第 {number} 行的 {key} 类型是 {type(value).__name__}',
+                next_action=f'把 {key} 写成字符串，或删掉它',
+            )
+        optional[key] = value if isinstance(value, str) else None
+    return BatchTask(ident, prompt, optional['agent'], optional['goal'])

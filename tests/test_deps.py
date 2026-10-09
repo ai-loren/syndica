@@ -231,6 +231,32 @@ def test_kernel_importing_a_protocol_sdk_is_caught_but_a_backend_may_use_it(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    'statement',
+    ['import torch', 'from trl import SFTConfig', 'import datasets', 'import transformers'],
+)
+@pytest.mark.parametrize(
+    'relative',
+    ['kernel/train.py', 'runner/train.py', 'cli/train.py', 'server/train.py', 'serve.py'],
+)
+def test_a_training_package_is_caught_outside_backends(tmp_path, statement, relative):
+    package = tmp_path / 'src' / 'syndica'
+    module = package / relative
+    module.parent.mkdir(parents=True, exist_ok=True)
+    module.write_text(f'{statement}\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode != 0
+    assert relative in result.stdout
+    assert 'training package' in result.stdout
+
+    module.unlink()
+    backend = package / 'backends' / 'trl' / 'dry_run.py'
+    backend.parent.mkdir(parents=True)
+    backend.write_text(f'{statement}\n')
+    result = _run_checker('--root', str(tmp_path / 'src'))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_backend_importing_a_surface_is_caught(tmp_path):
     """backend 只允许依赖 kernel（spec §3.2 规则 3）。"""
     module = tmp_path / 'src' / 'syndica' / 'backends' / 'alpha' / 'client.py'

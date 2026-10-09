@@ -766,7 +766,7 @@ syndica doctor [--verify]
 syndica trace list | show <id> | replay <id> [--allow-divergence]
 syndica trace export <id> [--otlp <url>] | prune [<id>...] [--keep <n>]
 syndica batch <tasks.jsonl>
-syndica export sft | sharegpt | preference | rl --output <dir> [--include-unverified]
+syndica export sft | sharegpt | preference | rl | trajectory --output <dir> [--include-unverified]
 syndica version
 ```
 
@@ -903,20 +903,26 @@ rejected rather than treated as `0.3`.
 
 ## Training Export
 
-`syndica batch tasks.jsonl` runs one task per line (`{"id": ..., "prompt": ...}`) and prints one JSON
-result per line; a failed task does not stop the rest. `syndica export <format> --output <dir>`
-turns the workspace's sessions, goals, rubrics, traces, and artifact records into a dataset plus a
-`manifest.json`:
+`syndica batch tasks.jsonl` runs one task per line (`{"id": ..., "prompt": ...}`, optionally
+`"agent"` and `"goal"`) and prints one JSON result per line; a failed task does not stop the rest.
+`syndica export <format> --output <dir>` turns the workspace's sessions, goals, rubrics, traces,
+and artifact records into a dataset plus a `manifest.json`:
 
 - `sft` writes OpenAI-shaped `messages` with tool calls and the artifacts each sample produced;
   `sharegpt` writes the same conversations as `human` / `gpt` / `function_call` / `observation`.
-- `preference` pairs a better and a worse verdict for the same goal and the same rubrics.
+- `preference` writes DPO-shaped `prompt` / `chosen` / `rejected` for a better and a worse verdict
+  of the same goal and the same rubrics.
 - `rl` writes `input_ids`, a `loss_mask` that covers the assistant's text and tool calls, and a
-  reward from the verdict (pass 1.0, partial 0.5, block 0.0).
+  reward from the verdict (pass 1.0, partial 0.5, block 0.0, unverified `null`).
+- `trajectory` writes the neutral `syndica.trajectory/1` records: messages with their trust
+  markers, tool calls, artifacts, every verdict the run received, causality, timing, and redaction
+  metadata.
 
 Samples whose verdict is `unverified` are left out unless you pass `--include-unverified`, and the
-manifest records that choice. Every string is redacted before it is encoded; redaction placeholders
-stay in the data and raw secrets never do. Export only reads the workspace's stores.
+manifest records that choice. Export redacts with the same rules as everything else the host writes
+(your `redaction.rules` plus secret values in the current environment), string by string before
+encoding; placeholders stay and raw secrets never leave. The output directory must be outside the
+workspace and new or empty, files are created `0600`, and the workspace's stores are only read.
 `pip install 'syndica[trl]'` adds `syndica.backends.trl.dry_run`, which loads an exported SFT file
 into TRL's `SFTTrainer` without downloading a model.
 

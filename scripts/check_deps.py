@@ -49,6 +49,15 @@ FORBIDDEN_KERNEL_EXTERNALS: dict[str, tuple[str, str]] = {
     'openai': ('openai', _PROTOCOL_SDK),
     'httpx2': ('httpx2', 'kernel 的 HTTP 客户端只有 httpx；需要 httpx2 的 SDK 留在 backend'),
 }
+# 训练框架只进 backend（经 extra 安装）：kernel、surface 与组合根都不得 import。torch 一个包就是
+# 几百 MB，surface 里一句 import 就让 `pip install syndica` 的 CLI 起不来或拖进整个生态。
+_TRAINING = '训练框架只进 backend（syndica.backends.trl），经 extra 安装；在函数体里导入'
+FORBIDDEN_OUTSIDE_BACKENDS: dict[str, tuple[str, str]] = {
+    'torch': ('torch', _TRAINING),
+    'trl': ('trl', _TRAINING),
+    'datasets': ('datasets', _TRAINING),
+    'transformers': ('transformers', _TRAINING),
+}
 
 
 class LayoutError(Exception):
@@ -190,6 +199,20 @@ def check(root: Path) -> list[str]:
             )
             continue
         modules = _imported_modules(path, package_root)
+        if owner[0] != BACKENDS:
+            training = sorted(
+                {
+                    module[0]
+                    for module in modules
+                    if module and module[0] in FORBIDDEN_OUTSIDE_BACKENDS
+                }
+            )
+            for imported in training:
+                distribution, remedy = FORBIDDEN_OUTSIDE_BACKENDS[imported]
+                violations.append(
+                    f'{rel}: {owner[0]!r} imports training package {imported!r} ({distribution}). '
+                    f'{remedy}。'
+                )
         if owner[0] == KERNEL:
             forbidden = sorted(
                 module[0]

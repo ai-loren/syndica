@@ -472,7 +472,7 @@ def _parser() -> _ArgumentParser:
     batch = commands.add_parser('batch', help='跑一份 jsonl 任务清单，一条失败不中断其余')
     batch.add_argument('dataset', help='每行一个 {"id","prompt"}')
     exported = commands.add_parser('export', help='把会话、trace 与裁决导出成训练集')
-    exported.add_argument('format', choices=('sft', 'sharegpt', 'preference', 'rl'))
+    exported.add_argument('format', choices=('sft', 'sharegpt', 'preference', 'rl', 'trajectory'))
     exported.add_argument('--output', required=True, help='写出 jsonl 与 manifest 的目录')
     exported.add_argument(
         '--include-unverified',

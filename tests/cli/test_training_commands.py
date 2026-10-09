@@ -50,6 +50,20 @@ def test_batch_and_export_reach_the_injected_training_control() -> None:
     assert training.export_calls == [('sft', '.syndica.yaml', 'out', True)]
 
 
+def test_every_format_the_runner_writes_is_accepted_by_the_parser() -> None:
+    from syndica.runner.training import FORMATS
+
+    for fmt in FORMATS:
+        training = _Training()
+        code = main(
+            ['export', fmt, '--output', 'out'],
+            io=CliIO(StringIO(), StringIO(), StringIO()),
+            training=training,
+        )
+        assert code == 0
+        assert training.export_calls[0][0] == fmt
+
+
 def test_batch_without_training_says_how_to_start() -> None:
     stderr = StringIO()
     code = main(['batch', 'tasks.jsonl'], io=CliIO(StringIO(), StringIO(), stderr))
