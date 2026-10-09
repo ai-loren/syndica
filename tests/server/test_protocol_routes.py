@@ -30,14 +30,15 @@ def test_an_api_token_authorizes_like_a_browser_token_and_is_not_a_login_code() 
 
 
 @pytest.mark.parametrize(
-    ('path', 'module', 'extra'),
+    ('method', 'path', 'module', 'extra'),
     [
-        ('/.well-known/agent-card.json', 'a2a', 'a2a'),
-        ('/mcp', 'mcp', 'mcp'),
+        ('GET', '/.well-known/agent-card.json', 'a2a', 'a2a'),
+        ('POST', '/a2a/', 'a2a', 'a2a'),
+        ('GET', '/mcp', 'mcp', 'mcp'),
     ],
 )
 async def test_a_missing_protocol_extra_answers_501_with_the_install_line(
-    monkeypatch: pytest.MonkeyPatch, path: str, module: str, extra: str
+    monkeypatch: pytest.MonkeyPatch, method: str, path: str, module: str, extra: str
 ) -> None:
     real = importlib.util.find_spec
 
@@ -49,7 +50,7 @@ async def test_a_missing_protocol_extra_answers_501_with_the_install_line(
     monkeypatch.setattr(importlib.util, 'find_spec', find_spec)
     async with running(FakeAssembly()) as server, httpx.AsyncClient(base_url=server.base) as client:
         headers = {} if path.endswith('.json') else {'Authorization': f'Bearer {server.token}'}
-        response = await client.get(path, headers=headers)
+        response = await client.request(method, path, headers=headers)
     assert response.status_code == 501
     assert f'syndica[{extra}]' in response.text
     assert 'pip install' in response.text
