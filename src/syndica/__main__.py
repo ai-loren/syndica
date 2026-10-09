@@ -473,18 +473,23 @@ _ACP_SPECS: ContextVar[Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]] | N
 
 
 def _remember_acp(config: CliConfig, workspace: Path, environ: Mapping[str, str]) -> None:
-    from syndica.cli.interop_config import interop_credentials_path, load_interop_credentials
+    from syndica.cli.interop_config import (
+        InteropCredential,
+        credential_for,
+        interop_credentials_path,
+        load_interop_credentials,
+    )
 
-    credentials: Mapping[str, Any] = {}
+    credentials: Mapping[str, InteropCredential] = {}
     path = interop_credentials_path(environ)
     if path is not None:
         credentials = load_interop_credentials(path, workspace=workspace)
     specs: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
     for agent in config.interop.acp_agents:
         extra = agent.pass_env
-        cred = credentials.get(f'acp:{agent.name}')
+        cred = credential_for(credentials, agent)
         if cred is not None:
-            extra = (*extra, *tuple(cred.env))
+            extra = (*extra, *cred.env)
         specs[agent.name] = (agent.command, extra)
     _ACP_SPECS.set(specs)
 
@@ -521,27 +526,32 @@ _A2A_SPECS: ContextVar[Mapping[str, tuple[str, str | None]] | None] = ContextVar
 
 
 def _remember_a2a(config: CliConfig, workspace: Path, environ: Mapping[str, str]) -> None:
-    from syndica.cli.interop_config import interop_credentials_path, load_interop_credentials
+    from syndica.cli.interop_config import (
+        InteropCredential,
+        credential_for,
+        interop_credentials_path,
+        load_interop_credentials,
+    )
     from syndica.kernel import ConfigError
 
-    credentials: Mapping[str, Any] = {}
+    credentials: Mapping[str, InteropCredential] = {}
     path = interop_credentials_path(environ)
     if path is not None:
         credentials = load_interop_credentials(path, workspace=workspace)
     specs: dict[str, tuple[str, str | None]] = {}
     for agent in config.interop.a2a_agents:
-        cred = credentials.get(f'a2a:{agent.name}')
+        cred = credential_for(credentials, agent)
         bearer: str | None = None
         if cred is not None and cred.bearer_env:
-            variable = str(cred.bearer_env)
+            variable = cred.bearer_env
             value = environ.get(variable)
             if value is None or not value:
                 raise ConfigError(
                     expected=f'环境变量 {variable} 有值，用作 A2A Agent {agent.name!r} 的 bearer',
                     received=f'{variable} 没有设置',
                     next_action=(
-                        f'在启动 Syndica 的环境里设置 {variable}，'
-                        '或从用户级 interop.yaml 去掉这个 bearer_env'
+                        f'在启动 Syndica 的环境里设置 {variable}，或从用户级 interop.yaml 删掉 '
+                        f'a2a:{agent.name} 这一项（它的 bearer_env 点名了 {variable}）'
                     ),
                 )
             bearer = value

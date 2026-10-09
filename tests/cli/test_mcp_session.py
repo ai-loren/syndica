@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -10,6 +11,7 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+from capture_http import capturing
 
 from syndica.__main__ import _open_mcp
 from syndica.backends.mcp.client import ACCEPTED_PROTOCOL_VERSIONS, connect_http, connect_stdio
@@ -140,17 +142,24 @@ async def test_a_declared_stdio_server_is_called_then_closed(tmp_path: Path):
         await opened.aclose()
 
 
+def _user_credentials(home: Path, text: str) -> None:
+    creds = home / '.config' / 'syndica' / 'interop.yaml'
+    creds.parent.mkdir(parents=True, exist_ok=True)
+    creds.write_text(text, encoding='utf-8')
+    os.chmod(creds, 0o600)
+
+
 async def test_a_missing_bearer_names_the_variable(tmp_path: Path):
     home = tmp_path / 'home'
     workspace = tmp_path / 'ws'
     workspace.mkdir()
-    creds = home / '.config' / 'syndica' / 'interop.yaml'
-    creds.parent.mkdir(parents=True)
-    creds.write_text(
-        'credentials:\n  mcp:tracker: {bearer_env: TRACKER_TOKEN}\n',
-        encoding='utf-8',
+    _user_credentials(
+        home,
+        'credentials:\n'
+        '  mcp:tracker:\n'
+        '    url: http://127.0.0.1:9/mcp\n'
+        '    bearer_env: TRACKER_TOKEN\n',
     )
-    os.chmod(creds, 0o600)
     config = _config(
         workspace / '.syndica.yaml',
         'version: 1\n'
@@ -175,6 +184,324 @@ async def test_a_missing_bearer_names_the_variable(tmp_path: Path):
     assert caught.value.expected
     assert '没有设置' in caught.value.received
     assert 'bearer_env' in caught.value.next_action
+
+
+_ENV_SERVER = """\
+import asyncio
+import os
+
+import mcp_types as types
+from mcp.server.lowlevel.server import Server
+from mcp.server.stdio import stdio_server
+
+
+async def on_list_tools(ctx, params):
+    return types.ListToolsResult(
+        tools=[types.Tool(name="env", description="env", input_schema={"type": "object"})]
+    )
+
+
+async def on_call_tool(ctx, params):
+    value = os.environ.get("FILES_TOKEN", "<absent>")
+    return types.CallToolResult(content=[types.TextContent(type="text", text=value)])
+
+
+async def main():
+    server = Server("env", on_list_tools=on_list_tools, on_call_tool=on_call_tool)
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
+asyncio.run(main())
+"""
+
+_FILES_SECRET = 'files-secret-0123456789'
+_TRACKER_SECRET = 'tracker-secret-0123456789'
+
+
+async def test_a_stdio_server_whose_command_matches_the_pin_sees_the_pinned_variable(
+    tmp_path: Path,
+):
+    script = tmp_path / 'env_srv.py'
+    script.write_text(_ENV_SERVER, encoding='utf-8')
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    command = json.dumps([sys.executable, str(script)])
+    _user_credentials(
+        home, f'credentials:\n  mcp:files:\n    command: {command}\n    env: [FILES_TOKEN]\n'
+    )
+    config = _config(
+        workspace / '.syndica.yaml',
+        'version: 1\n'
+        'interop:\n'
+        '  mcp:\n'
+        '    servers:\n'
+        '      - name: files\n'
+        f'        command: {command}\n'
+        '        roles: [Worker]\n',
+    )
+    path = os.environ.get('PATH', '')
+    opened = await open_mcp_clients(
+        config,
+        {'PATH': path},
+        cwd=str(workspace),
+        redactor=RuleRedactor(),
+        environ={'HOME': str(home), 'PATH': path, 'FILES_TOKEN': _FILES_SECRET},
+        judge=DangerJudge(),
+        workspace=str(workspace),
+        ports=_PORTS,
+    )
+    assert opened is not None
+    try:
+        from types import SimpleNamespace
+        from typing import Any, cast
+
+        agent = SimpleNamespace(options=SimpleNamespace(name='Worker'), agent_id='w')
+        tools = opened.module.tool_factories[0](cast(Any, SimpleNamespace()), cast(Any, agent), {})
+        result = await tools['files__env'].execute()
+        assert result.output == _FILES_SECRET
+    finally:
+        await opened.aclose()
+
+
+class _Link:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.tools: dict[str, object] = {}
+
+    async def __aenter__(self) -> _Link:
+        return self
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _Connector:
+    """记下组合根交给 backend 的每一次连接：名字、目的地、环境与 bearer。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, object, dict[str, object]]] = []
+
+    def stdio(self, name: str, command: object, **kwargs: object) -> _Link:
+        self.calls.append(('stdio', name, command, kwargs))
+        return _Link(name)
+
+    def http(self, name: str, url: object, **kwargs: object) -> _Link:
+        self.calls.append(('http', name, url, kwargs))
+        return _Link(name)
+
+    def ports(self) -> McpPorts:
+        return McpPorts(
+            connect_stdio=self.stdio,
+            connect_http=self.http,
+            assign_roles=assign_roles,
+            make_module=mcp_module,
+            wrap_judge=McpJudge,
+        )
+
+
+async def _open_with(connector: _Connector, workspace: Path, home: Path, body: str):
+    config = _config(workspace / '.syndica.yaml', f'version: 1\ninterop:\n  mcp:\n{body}')
+    return await open_mcp_clients(
+        config,
+        {'PATH': '/usr/bin'},
+        cwd=str(workspace),
+        redactor=RuleRedactor(),
+        environ={
+            'HOME': str(home),
+            'FILES_TOKEN': _FILES_SECRET,
+            'TRACKER_TOKEN': _TRACKER_SECRET,
+        },
+        judge=DangerJudge(),
+        workspace=str(workspace),
+        ports=connector.ports(),
+    )
+
+
+async def test_a_stdio_server_whose_command_differs_from_the_pin_is_never_started(
+    tmp_path: Path,
+):
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    _user_credentials(
+        home, 'credentials:\n  mcp:files:\n    command: [files-server]\n    env: [FILES_TOKEN]\n'
+    )
+    connector = _Connector()
+
+    with pytest.raises(ConfigError) as caught:
+        await _open_with(
+            connector,
+            workspace,
+            home,
+            '    servers:\n      - name: files\n        command: [/tmp/evil, files-server]\n',
+        )
+
+    assert connector.calls == []
+    assert 'mcp:files' in caught.value.expected
+    assert 'FILES_TOKEN' in caught.value.expected
+    assert 'command ["files-server"]' in caught.value.expected
+    assert 'command ["/tmp/evil", "files-server"]' in caught.value.received
+    assert 'mcp:files 的 command' in caught.value.next_action
+
+
+async def test_a_stdio_server_whose_command_matches_the_pin_is_handed_the_variable(
+    tmp_path: Path,
+):
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    _user_credentials(
+        home, 'credentials:\n  mcp:files:\n    command: [files-server]\n    env: [FILES_TOKEN]\n'
+    )
+    connector = _Connector()
+
+    opened = await _open_with(
+        connector,
+        workspace,
+        home,
+        '    servers:\n      - name: files\n        command: [files-server]\n',
+    )
+
+    assert opened is not None
+    [(kind, name, command, kwargs)] = connector.calls
+    assert (kind, name, command) == ('stdio', 'files', ('files-server',))
+    assert kwargs['env'] == {'PATH': '/usr/bin', 'FILES_TOKEN': _FILES_SECRET}
+
+
+async def test_an_http_server_whose_url_matches_the_pin_is_handed_the_bearer(tmp_path: Path):
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    _user_credentials(
+        home,
+        'credentials:\n'
+        '  mcp:tracker:\n'
+        '    url: https://mcp.example.com/mcp\n'
+        '    bearer_env: TRACKER_TOKEN\n',
+    )
+    connector = _Connector()
+
+    opened = await _open_with(
+        connector,
+        workspace,
+        home,
+        '    servers:\n      - name: tracker\n        url: https://mcp.example.com/mcp\n',
+    )
+
+    assert opened is not None
+    [(kind, name, url, kwargs)] = connector.calls
+    assert (kind, name, url) == ('http', 'tracker', 'https://mcp.example.com/mcp')
+    assert kwargs['bearer'] == _TRACKER_SECRET
+
+
+async def test_one_mismatched_pin_starts_none_of_the_servers(tmp_path: Path):
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    _user_credentials(
+        home,
+        'credentials:\n'
+        '  mcp:tracker:\n'
+        '    url: https://mcp.example.com/mcp\n'
+        '    bearer_env: TRACKER_TOKEN\n',
+    )
+    connector = _Connector()
+
+    with pytest.raises(ConfigError, match='mcp:tracker'):
+        await _open_with(
+            connector,
+            workspace,
+            home,
+            '    servers:\n'
+            '      - name: files\n'
+            '        command: [files-server]\n'
+            '      - name: tracker\n'
+            '        url: https://attacker.example/mcp\n',
+        )
+
+    assert connector.calls == []
+
+
+async def test_a_project_url_other_than_the_pin_never_receives_a_request(tmp_path: Path):
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    with capturing() as pinned, capturing() as attacker:
+        _user_credentials(
+            home,
+            'credentials:\n'
+            '  mcp:tracker:\n'
+            f'    url: {pinned.url}/mcp\n'
+            '    bearer_env: TRACKER_TOKEN\n',
+        )
+        config = _config(
+            workspace / '.syndica.yaml',
+            'version: 1\n'
+            'interop:\n'
+            '  mcp:\n'
+            '    servers:\n'
+            '      - name: tracker\n'
+            f'        url: {attacker.url}/mcp\n'
+            '        roles: [Worker]\n',
+        )
+
+        with pytest.raises(ConfigError) as caught:
+            await open_mcp_clients(
+                config,
+                {},
+                cwd=str(workspace),
+                redactor=RuleRedactor(),
+                environ={'HOME': str(home), 'TRACKER_TOKEN': _TRACKER_SECRET},
+                judge=DangerJudge(),
+                workspace=str(workspace),
+                ports=_PORTS,
+            )
+
+        assert attacker.seen == []
+        assert pinned.seen == []
+    assert f'url {pinned.url}/mcp' in caught.value.expected
+    assert f'url {attacker.url}/mcp' in caught.value.received
+
+
+async def test_the_pinned_url_receives_the_bearer_on_every_request(tmp_path: Path):
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    with capturing() as pinned:
+        _user_credentials(
+            home,
+            'credentials:\n'
+            '  mcp:tracker:\n'
+            f'    url: {pinned.url}/mcp\n'
+            '    bearer_env: TRACKER_TOKEN\n',
+        )
+        config = _config(
+            workspace / '.syndica.yaml',
+            'version: 1\n'
+            'interop:\n'
+            '  mcp:\n'
+            '    servers:\n'
+            '      - name: tracker\n'
+            f'        url: {pinned.url}/mcp\n'
+            '        roles: [Worker]\n',
+        )
+
+        with contextlib.suppress(Exception):
+            await open_mcp_clients(
+                config,
+                {},
+                cwd=str(workspace),
+                redactor=RuleRedactor(),
+                environ={'HOME': str(home), 'TRACKER_TOKEN': _TRACKER_SECRET},
+                judge=DangerJudge(),
+                workspace=str(workspace),
+                ports=_PORTS,
+            )
+
+        assert pinned.seen
+        assert {seen.authorization for seen in pinned.seen} == {f'Bearer {_TRACKER_SECRET}'}
 
 
 def _spans(root: Path):

@@ -3,10 +3,15 @@
 项目配置只按名字引用外部对象。点名形似密钥的环境变量在这里拒收：那些名字只能出现在工作区之外的
 用户级文件里，而且那里也只存变量名、不存值。用户级文件权限必须是 0600，放进工作区就拒——Agent
 改得到工作区里的文件。
+
+用户级的每一项凭证都钉住自己的目的地（`url` 或 `command`），只交给项目配置里同名、且目的地与它
+逐字相同的外部对象：名字和目的地都写在项目配置里，只按名字绑定，等于让项目配置决定你的凭证发往
+哪里。
 """
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -29,6 +34,7 @@ __all__ = [
     'InteropCredential',
     'McpServer',
     'bind_interop',
+    'credential_for',
     'described_targets',
     'interop_credentials_path',
     'load_interop_credentials',
@@ -47,7 +53,11 @@ _ACP_AGENT_KEYS = frozenset({'name', 'command', 'pass_env'})
 _A2A_KEYS = frozenset({'agents'})
 _A2A_AGENT_KEYS = frozenset({'name', 'url'})
 _CREDENTIAL_ROOT = frozenset({'credentials'})
-_CREDENTIAL_FIELDS = frozenset({'env', 'bearer_env'})
+_CREDENTIAL_FIELDS = frozenset({'url', 'command', 'env', 'bearer_env'})
+_PINS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {'a2a': ('url',), 'acp': ('command',), 'mcp': ('url', 'command')}
+)
+_LOOPBACK = re.compile(r'(?:127\.0\.0\.1|\[::1\]|localhost)(?::[0-9]{1,5})?')
 
 
 def _error(expected: str, received: str, next_action: str) -> ConfigError:
@@ -140,10 +150,20 @@ class InteropConfig:
 
 @dataclass(frozen=True)
 class InteropCredential:
-    """用户级文件里的一条：只存要读的变量名。`env` 透传给外部进程，`bearer_env` 的值放进鉴权头。"""
+    """用户级文件里的一条：钉住的目的地，加上要读的变量名。
 
+    `url` 与 `bearer_env` 成对（A2A Agent、HTTP 的 MCP 服务：值放进 Authorization: Bearer），
+    `command` 与 `env` 成对（托管的 ACP Agent、stdio 的 MCP 服务：值透传进那个进程的环境）。
+    """
+
+    url: str | None = None
+    command: tuple[str, ...] | None = None
     env: tuple[str, ...] = ()
     bearer_env: str | None = None
+
+
+_Target = McpServer | AcpAgent | A2aAgent
+_Pin = tuple[str, str | tuple[str, ...] | None]
 
 
 def bind_interop(value: object, catalog: AgentCatalog) -> InteropConfig:
@@ -154,20 +174,110 @@ def bind_interop(value: object, catalog: AgentCatalog) -> InteropConfig:
     return interop
 
 
-def described_targets(interop: InteropConfig) -> tuple[str, ...]:
-    """给人看的 command / url，逐字。整段省略时不列。"""
+def described_targets(
+    interop: InteropConfig, credentials: Mapping[str, InteropCredential] | None = None
+) -> tuple[str, ...]:
+    """给人看的 command / url，逐字，各带一句哪些凭证变量会交给它。整段省略时不列。
+
+    `credentials` 是读好的用户级名单；不给时只写明哪一项、在什么条件下会交给它。
+    """
     if not interop.present:
         return ()
     rows: list[str] = []
     for server in interop.mcp_servers:
         target = server.url if server.url is not None else _shown(server.command)
-        rows.append(f'mcp {server.name}: {target}')
+        rows.append(f'mcp {server.name}: {target}{_sending(server, credentials)}')
     rows.append('mcp serve: ' + ', '.join(interop.mcp_serve_tools))
     for agent in interop.acp_agents:
-        rows.append(f'acp {agent.name}: {_shown(agent.command)}')
+        rows.append(f'acp {agent.name}: {_shown(agent.command)}{_sending(agent, credentials)}')
     for agent in interop.a2a_agents:
-        rows.append(f'a2a {agent.name}: {agent.url}')
+        rows.append(f'a2a {agent.name}: {agent.url}{_sending(agent, credentials)}')
     return tuple(rows)
+
+
+def credential_for(
+    credentials: Mapping[str, InteropCredential], target: McpServer | AcpAgent | A2aAgent
+) -> InteropCredential | None:
+    """项目配置里的 `target` 可用的那一项用户级凭证。用户级文件里没有它的名字时是 None。
+
+    目的地逐字比较：`url` 比整个字符串，`command` 比整个参数列表。大小写、默认端口、末尾斜杠都
+    不归一化：归一化要挑一个 URL 解析器，而真正发请求的客户端可能把同一个字符串解析到别的主机。
+    对不上时三件套拒绝，这个外部对象不启动。
+    """
+    key = _key_of(target)
+    credential = credentials.get(key)
+    if credential is None:
+        return None
+    pinned = _pin_of(credential)
+    declared = _target_pin(target)
+    if pinned != declared:
+        raise _error(
+            (
+                f'用户级 interop.yaml 的 {key} 只把 {_names(credential)} '
+                f'交给它钉住的 {_pin_text(pinned)}'
+            ),
+            f'项目配置里的 {key} 指向 {_pin_text(declared)}，与钉住的不逐字相同',
+            (
+                f'项目配置里的 {declared[0]} 就是你要连的，就把 interop.yaml 里 {key} 的 '
+                f'{declared[0]} 改成与它逐字相同；不是的话别用这份项目配置。改好之前 {key} 不启动：'
+                '项目配置选的目的地拿不到你的凭证，不带凭证连过去也只会换来说不清原因的鉴权失败'
+            ),
+        )
+    return credential
+
+
+def _key_of(target: _Target) -> str:
+    if isinstance(target, McpServer):
+        return f'mcp:{target.name}'
+    if isinstance(target, AcpAgent):
+        return f'acp:{target.name}'
+    return f'a2a:{target.name}'
+
+
+def _target_pin(target: _Target) -> _Pin:
+    if isinstance(target, A2aAgent):
+        return ('url', target.url)
+    if isinstance(target, McpServer) and target.url is not None:
+        return ('url', target.url)
+    return ('command', target.command)
+
+
+def _pin_of(credential: InteropCredential) -> _Pin:
+    if credential.url is not None:
+        return ('url', credential.url)
+    return ('command', credential.command)
+
+
+def _pin_text(pin: _Pin) -> str:
+    field, value = pin
+    if isinstance(value, tuple):
+        return f'{field} {json.dumps(list(value), ensure_ascii=False)}'
+    return f'{field} {value}'
+
+
+def _names(credential: InteropCredential) -> str:
+    if credential.bearer_env is not None:
+        return f'{credential.bearer_env}（Authorization: Bearer）'
+    if not credential.env:
+        return '（没有变量）'
+    return '、'.join(credential.env)
+
+
+def _sending(target: _Target, credentials: Mapping[str, InteropCredential] | None) -> str:
+    key = _key_of(target)
+    declared = _target_pin(target)
+    if credentials is None:
+        return f'；凭证：只交用户级 interop.yaml 里 {declared[0]} 与此逐字相同的 {key} 点名的变量'
+    credential = credentials.get(key)
+    if credential is None:
+        return f'；凭证：无（用户级 interop.yaml 没有 {key}）'
+    pinned = _pin_of(credential)
+    if pinned != declared:
+        return (
+            f'；凭证：不交——用户级 {key} 钉的是 {_pin_text(pinned)}，对不上，'
+            f'{_names(credential)} 不发、启动时拒绝'
+        )
+    return f'；凭证：{_names(credential)} 交给这里'
 
 
 def _shown(command: tuple[str, ...] | None) -> str:
@@ -185,7 +295,8 @@ def interop_credentials_path(environ: Mapping[str, str]) -> Path | None:
 
 
 def load_interop_credentials(path: Path, *, workspace: Path) -> Mapping[str, InteropCredential]:
-    """读用户级凭证名单。文件不存在是空表；在工作区之内、或权限不是 0600，三件套拒绝。"""
+    """读用户级凭证名单。文件不存在是空表；在工作区之内、权限不是 0600、某一项没钉住目的地、或
+    bearer 要走明文离开本机，三件套拒绝。"""
     if not path.exists():
         return MappingProxyType({})
     if not path.is_file():
@@ -405,19 +516,100 @@ def _credentials(path: Path, text: str) -> Mapping[str, InteropCredential]:
 
 
 def _credential(key: str, value: object) -> InteropCredential:
-    raw = _mapping(value, f'credentials.{key}', _CREDENTIAL_FIELDS)
-    env = _env_var_names(raw.get('env', ()), f'credentials.{key}.env')
-    bearer = raw.get('bearer_env')
-    if 'env' not in raw and 'bearer_env' not in raw:
-        raise _error(
-            f'credentials.{key} 有 env（变量名列表）或 bearer_env（一个变量名）',
-            '两个都没写',
-            'env 是额外透传给外部进程的变量；bearer_env 的值放进 Authorization: Bearer',
+    field = f'credentials.{key}'
+    raw = _mapping(value, field, _CREDENTIAL_FIELDS)
+    if _pin_field(key, raw, field) == 'url':
+        _absent(
+            raw,
+            'env',
+            field,
+            'env 只透传给本机拉起的进程，url 那头是远端，到不了它；远端的凭证写 bearer_env',
         )
-    parsed_bearer = None
-    if 'bearer_env' in raw:
-        parsed_bearer = _one_env_name(bearer, f'credentials.{key}.bearer_env')
-    return InteropCredential(env=env, bearer_env=parsed_bearer)
+        url = _url(raw.get('url'), f'{field}.url')
+        bearer = _one_env_name(
+            _required(raw, 'bearer_env', field, '写上 bearer_env: <变量名>，或删掉这一项'),
+            f'{field}.bearer_env',
+        )
+        _refuse_cleartext_bearer(url, f'{field}.url')
+        return InteropCredential(url=url, bearer_env=bearer)
+    _absent(
+        raw,
+        'bearer_env',
+        field,
+        'bearer_env 只发给 url 那头的远端；command 拉起的进程用 env 透传变量',
+    )
+    command = _command(raw.get('command'), f'{field}.command')
+    env = _env_var_names(
+        _required(raw, 'env', field, '写上 env: [<变量名>, ...]，或删掉这一项'),
+        f'{field}.env',
+    )
+    return InteropCredential(command=command, env=env)
+
+
+def _pin_field(key: str, raw: Mapping[str, object], field: str) -> str:
+    kind, name = key.split(':', 1)
+    allowed = _PINS[kind]
+    given = [pin for pin in ('url', 'command') if pin in raw]
+    if len(given) == 1 and given[0] in allowed:
+        return given[0]
+    section = {'a2a': 'a2a.agents', 'acp': 'acp.agents', 'mcp': 'mcp.servers'}[kind]
+    if kind == 'mcp':
+        wanted = 'url（HTTP 服务，配 bearer_env）或 command（stdio 服务，配 env）其中之一'
+        copy = 'url 或 command'
+    else:
+        wanted = allowed[0]
+        copy = allowed[0]
+    raise _error(
+        (
+            f'{field} 恰好有 {wanted}，钉住凭证的目的地：与项目配置 interop.{section} 里 {name} '
+            '的同名字段逐字相同'
+        ),
+        f'收到键 {sorted(raw)!r}',
+        (
+            f'把项目配置里 {name} 的 {copy} 原样抄进来；凭证只交给目的地与它逐字相同的外部对象，'
+            '项目配置换了目的地就不再交'
+        ),
+    )
+
+
+def _required(raw: Mapping[str, object], key: str, field: str, next_action: str) -> object:
+    if key not in raw:
+        raise _error(
+            f'{field} 有 {key}',
+            f'没写；收到键 {sorted(raw)!r}，只钉了目的地、没有凭证',
+            next_action,
+        )
+    return raw[key]
+
+
+def _absent(raw: Mapping[str, object], key: str, field: str, next_action: str) -> None:
+    if key in raw:
+        raise _error(
+            f'{field} 不含 {key}',
+            f'收到键 {sorted(raw)!r}',
+            next_action,
+        )
+
+
+def _refuse_cleartext_bearer(url: str, field: str) -> None:
+    """明文 http 只在本机回环上带 bearer：出了本机，路上任何一跳都读得到这个头。
+
+    主机部分取 `http://` 之后到第一个 `/`、`?`、`#` 为止，整段与回环名单逐字匹配：带 userinfo、
+    反斜杠或别的写法的一律拒绝，不靠解析器猜它最终连到哪里。
+    """
+    if url.startswith('https://'):
+        return
+    host = re.split(r'[/?#]', url.removeprefix('http://'), maxsplit=1)[0]
+    if _LOOPBACK.fullmatch(host):
+        return
+    raise _error(
+        (
+            f'{field} 是 https://，或主机是 127.0.0.1 / [::1] / localhost 的 http://：'
+            'bearer 不走明文离开本机'
+        ),
+        f'收到 {url!r}，主机部分是 {host!r}',
+        '改用对方的 https:// 地址；对方只有 http 时，在本机起 TLS 隧道或反向代理并钉住本机那一头',
+    )
 
 
 def _env_var_names(value: object, field: str) -> tuple[str, ...]:

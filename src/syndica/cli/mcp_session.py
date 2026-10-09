@@ -1,7 +1,8 @@
 """会话开始前连上项目里声明的 MCP 服务。
 
 backend 由组合根注入。没有服务时不调用注入的连接函数。环境交给子进程的是完整的 Agent 环境，
-再叠上用户级文件点名的变量，不是宿主环境的增量。配置里没有每服务超时，调用先限 30 秒，
+再叠上用户级文件点名的变量，不是宿主环境的增量。用户级凭证钉住的目的地与哪个服务对不上，就
+一个服务都不连：先核对完全部，再拉起第一个。配置里没有每服务超时，调用先限 30 秒，
 再和这个 Agent 的墙钟剩余取较小者。
 """
 
@@ -18,6 +19,7 @@ from syndica.cli.environment import refuse_env_name
 from syndica.cli.interop_config import (
     InteropCredential,
     McpServer,
+    credential_for,
     interop_credentials_path,
     load_interop_credentials,
 )
@@ -91,17 +93,18 @@ async def open_mcp_clients(
     if not servers:
         return None
     credentials = _credentials(environ, workspace)
+    bound = [(server, credential_for(credentials, server)) for server in servers]
     live: list[_Link] = []
     try:
-        for server in servers:
+        for server, credential in bound:
             client = _as_link(
                 _connect(
                     server,
+                    credential,
                     agent_env,
                     cwd=cwd,
                     redactor=redactor,
                     environ=environ,
-                    credentials=credentials,
                     ports=ports,
                 )
             )
@@ -170,15 +173,14 @@ def _wall_remaining(runtime: Runtime, agent_id: str) -> float | None:
 
 def _connect(
     server: McpServer,
+    credential: InteropCredential | None,
     agent_env: Mapping[str, str],
     *,
     cwd: str,
     redactor: Redactor,
     environ: Mapping[str, str],
-    credentials: Mapping[str, InteropCredential],
     ports: McpPorts,
 ) -> object:
-    credential = credentials.get(f'mcp:{server.name}')
     extra = () if credential is None else credential.env
     env = _child_env(agent_env, (*server.pass_env, *extra), environ)
     for name, value in server.env_values:
@@ -241,8 +243,8 @@ def _bearer(name: str, credential: InteropCredential | None, host: Mapping[str, 
             expected=f'环境变量 {variable} 有值，用作 MCP 服务 {name!r} 的 bearer',
             received=f'{variable} 没有设置',
             next_action=(
-                f'在启动 Syndica 的环境里设置 {variable}，'
-                '或从用户级 interop.yaml 去掉这个 bearer_env'
+                f'在启动 Syndica 的环境里设置 {variable}，或从用户级 interop.yaml 删掉 '
+                f'mcp:{name} 这一项（它的 bearer_env 点名了 {variable}）'
             ),
         )
     return value
