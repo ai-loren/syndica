@@ -9,7 +9,8 @@ MCP 客户端与托管的 ACP Agent 发起的调用不经过 `ToolExecutor`：�
 可信——标成不可信会把随后把它放进轨迹的会话整段升级。
 
 守卫命中即拒绝，不咨询处置策略，也不看 `untrusted_high_risk`。开发期那两族「永不允许」靠它：
-读过不可信内容之后，高风险调用不再问宿主策略。
+读过不可信内容之后，高风险调用不再问宿主策略。守卫不认 syndica 之外的工具自己声明的
+`__tool_command_args__ = ()`，与开发期 Module 在 `PRE_TOOL_USE` 上的守卫同一条约定。
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from syndica.kernel.context import (
     TrustLevel,
 )
 from syndica.kernel.danger import (
+    _UNDECLARED_NOTE,  # pyright: ignore[reportPrivateUsage]
     NO_RULE_MATCHED,
     ConfirmationHandler,
     ConfirmationOutcome,
@@ -71,7 +73,8 @@ __all__ = ['ExternalCallPolicy', 'call_external']
 class ExternalCallPolicy:
     """一次外部调用用的判定、处置与守卫。
 
-    `guard` 命中即无条件拒绝。`confirm` 为 None 时，处置成确认按拒绝交回，不问人。
+    `guard` 命中即无条件拒绝；syndica 之外的工具声明 `__tool_command_args__ = ()` 时，守卫按它的
+    每个参数都可能被执行来判。`confirm` 为 None 时，处置成确认按拒绝交回，不问人。
     """
 
     judge: DangerJudge
@@ -201,6 +204,31 @@ def _mark_danger(
             'danger.disposition': disposition.value,
         }
     )
+
+
+_DISTRUSTED_EMPTY_NOTE = (
+    '；{tool} 声明了 __tool_command_args__ = ()，但它不是 syndica 自带的工具，守卫不认这份声明，'
+    '按它的每个参数都可能被执行来判'
+)
+
+
+def _guard_subject(tool: Tool) -> Tool:
+    """守卫判的那个工具。syndica 之外的代码自己声明的 `()` 换成同名、没声明命令参数的替身。
+
+    判定器只读声明与类名：认了第三方的 `()`，真会执行命令的工具写一行声明就躲开这道无条件拒绝。
+    开发期 Module 的守卫按同一条约定判，两边对不上时同一个工具在执行器里被拦、从这里进来就放行。
+    """
+    if tool.__tool_command_args__ != () or type(tool).__module__.partition('.')[0] == 'syndica':
+        return tool
+    stand_in = type(type(tool).__name__, (), {'__tool_command_args__': None})
+    return cast(Tool, stand_in())
+
+
+def _distrusted_empty(verdict: DangerVerdict, tool: Tool) -> DangerVerdict:
+    """替身的结论带着「没声明」的改法，而工具其实声明了 `()`：换成说清它为什么不被认的那句。"""
+    name = type(tool).__name__
+    reason = verdict.reason.removesuffix(_UNDECLARED_NOTE.format(tool=name))
+    return replace(verdict, reason=reason + _DISTRUSTED_EMPTY_NOTE.format(tool=name))
 
 
 def _guard_result(call: ToolCall, verdict: DangerVerdict) -> ToolResult:
@@ -436,12 +464,15 @@ async def _decide(
         if verdict.level is not RiskLevel.HIGH:
             verdict = untrusted_script_verdict(scripts)
     if policy.guard is not None:
+        subject = _guard_subject(tool)
         try:
-            guarded = policy.guard.judge(tool, args)
+            guarded = policy.guard.judge(subject, args)
         except Exception:
             _mark(span, 'judge_failed')
             raise
         if guarded is not NO_RULE_MATCHED:
+            if subject is not tool:
+                guarded = _distrusted_empty(guarded, tool)
             _mark_danger(span, guarded, provenance, 'guard', Disposition.BLOCK)
             _mark(span, 'blocked')
             return _guard_result(call, guarded)

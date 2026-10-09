@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+from io import StringIO
 from pathlib import Path
 
 import mcp_types as types
@@ -11,8 +13,12 @@ import pytest
 from mcp.client.client import Client
 from mcp.server.lowlevel.server import Server
 
+from syndica.cli.host import RuntimeCliHost
+from syndica.cli.main import CliIO
 from syndica.cli.policy import dev_guard_judge
+from syndica.cli.trust import NO_TRUST_GATE
 from syndica.kernel import (
+    AllowAll,
     ArtifactRef,
     BlockHighRisk,
     ConfigError,
@@ -20,8 +26,11 @@ from syndica.kernel import (
     ExternalCallPolicy,
     InMemoryTraceStore,
     RuleRedactor,
+    ScriptedLLM,
+    Span,
     Tool,
     ToolResult,
+    TrustLevel,
 )
 from syndica.kernel.file_taint import FileTaint
 from syndica.kernel.local_workspace import LocalWorkspace
@@ -282,6 +291,168 @@ async def test_read_artifact_bytes_uses_the_file_while_the_version_matches(
             await read_artifact_bytes(router, stale)
     finally:
         await router.close()
+
+
+class _Shell(Tool):
+    __tool_name__ = 'Shell'
+    __tool_command_args__ = ('command',)
+
+    def __init__(self) -> None:
+        self.ran: list[str] = []
+
+    async def execute(self, command: str) -> ToolResult:
+        """记下命令，不真的执行。"""
+        self.ran.append(command)
+        return ToolResult(output=f'ran {command}', trust=TrustLevel.TRUSTED)
+
+
+async def _shell_calls(
+    tmp_path: Path, calls: list[dict[str, object]]
+) -> tuple[_Shell, list[types.CallToolResult], list[Span]]:
+    router, _ = await _portal(tmp_path)
+    store = InMemoryTraceStore()
+    traces = McpTraces(store, RuleRedactor(), router)
+    shell = _Shell()
+    results: list[types.CallToolResult] = []
+    try:
+        server = build_mcp_server(
+            {'Shell': shell},
+            policy=ExternalCallPolicy(judge=DangerJudge(), policy=AllowAll()),
+            read_only=frozenset(),
+            traces=traces,
+        )
+        async with Client(server, mode='legacy', cache=None) as client:
+            for arguments in calls:
+                results.append(await client.call_tool('Shell', arguments))
+        await traces.aclose()
+        spans = [
+            span
+            for header in await store.traces()
+            for span in await store.spans(header.trace_id)
+            if span.attributes.get('tool.name') == 'Shell'
+        ]
+    finally:
+        await router.close()
+    return shell, results, spans
+
+
+async def test_a_high_risk_call_is_refused_under_allow_all_because_the_mcp_client_is_untrusted(
+    tmp_path: Path,
+) -> None:
+    shell, (refused, allowed), spans = await _shell_calls(
+        tmp_path, [{'command': 'sudo true'}, {'command': 'echo hi'}]
+    )
+
+    assert shell.ran == ['echo hi']
+    assert refused.is_error is True
+    assert 'shell.privilege_escalation' in _text(refused)
+    assert allowed.is_error is not True
+    assert [
+        (
+            span.attributes.get('danger.provenance'),
+            span.attributes.get('danger.decided_by'),
+            span.attributes.get('danger.disposition'),
+        )
+        for span in spans
+    ] == [('untrusted', 'flag', 'block'), ('untrusted', 'policy', 'allow')]
+
+
+@pytest.mark.parametrize(
+    ('arguments', 'received'),
+    [({}, "'command' is a required property"), ({'command': 7}, "is not of type 'string'")],
+    ids=['missing', 'wrong_type'],
+)
+async def test_arguments_outside_the_input_schema_are_refused_before_the_tool_is_judged(
+    tmp_path: Path, arguments: dict[str, object], received: str
+) -> None:
+    shell, [result], spans = await _shell_calls(tmp_path, [arguments])
+    text = _text(result)
+
+    assert shell.ran == []
+    assert spans == []
+    assert result.is_error is True
+    assert '期望实参符合 Shell 的 inputSchema' in text
+    assert received in text
+    assert '下一步：按 inputSchema 改参数后再次调用 Shell' in text
+
+
+class _Misconfigured(Tool):
+    __tool_name__ = 'Misconfigured'
+    __tool_command_args__ = ()
+
+    async def execute(self) -> ToolResult:
+        """抛一个调用方配置错误。"""
+        raise ConfigError(
+            expected='quiz-expected',
+            received=f'quiz-received {_SECRET}',
+            next_action='quiz-next',
+        )
+
+
+async def test_an_error_raised_past_call_external_is_neither_echoed_nor_leaks_a_secret(
+    tmp_path: Path,
+) -> None:
+    portal, root = await _portal(tmp_path)
+    try:
+        server = _server(portal, root, extra={'Misconfigured': _Misconfigured()})
+        async with Client(server, mode='legacy', cache=None) as client:
+            result = await client.call_tool('Misconfigured', {})
+    finally:
+        await portal.close()
+    text = _text(result)
+
+    assert result.is_error is True
+    assert 'ConfigError' in text
+    assert '原文不回显' in text
+    assert '下一步：看 server 的 stderr 日志' in text
+    assert _SECRET not in text
+    assert 'quiz' not in text
+
+
+def test_the_composed_server_marks_only_read_grep_glob_read_only(tmp_path: Path) -> None:
+    from syndica.serve import _bind_mcp  # pyright: ignore[reportPrivateUsage]
+
+    (tmp_path / '.syndica.yaml').write_text(
+        'version: 1\ninterop:\n  mcp:\n    serve:\n      tools: [Write, Read, Bash, Glob]\n',
+        encoding='utf-8',
+    )
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
+        io=CliIO(stdin=StringIO(''), stdout=StringIO(), stderr=StringIO()),
+        model_factory=lambda _: ScriptedLLM([]),
+        workspace_root=tmp_path,
+        environ={},
+    )
+
+    async def body() -> list[types.Tool]:
+        config = host.trusted_config('.syndica.yaml')
+        server, traces, router, environment = await _bind_mcp(host, config, None)
+        try:
+            async with Client(server, mode='legacy', cache=None) as client:
+                return (await client.list_tools(cache_mode='bypass')).tools
+        finally:
+            await traces.aclose()
+            await router.close()
+            environment.remove()
+
+    try:
+        listed = asyncio.run(body())
+    finally:
+        host.close()
+
+    assert [
+        (
+            tool.name,
+            tool.annotations is not None and tool.annotations.read_only_hint is True,
+            tool.annotations is not None and tool.annotations.destructive_hint is True,
+        )
+        for tool in listed
+    ] == [
+        ('Write', False, True),
+        ('Read', True, False),
+        ('Bash', False, True),
+        ('Glob', True, False),
+    ]
 
 
 def test_an_unknown_serve_tool_names_the_missing_one() -> None:

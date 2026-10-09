@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -149,12 +149,17 @@ def _danger(recorder: _Recorder) -> dict[str, AttributeValue]:
 
 
 class _Answer:
-    def __init__(self, outcome: ConfirmationOutcome) -> None:
+    def __init__(
+        self, outcome: ConfirmationOutcome, before: Callable[[], object] | None = None
+    ) -> None:
         self.outcome = outcome
+        self.before = before
         self.calls = 0
 
     async def confirm(self, runtime: object, request: ConfirmationRequest) -> ConfirmationOutcome:
         self.calls += 1
+        if self.before is not None:
+            self.before()
         return self.outcome
 
 
@@ -169,6 +174,7 @@ async def _run_executor(
     concurrency: int,
     recorder: _Recorder,
     file_trust: Any = None,
+    before_answer: Callable[[], object] | None = None,
 ) -> None:
     policy_obj = _policy(judge, kind, escalation).policy
     executor = ToolExecutor(
@@ -185,6 +191,8 @@ async def _run_executor(
     if answer is not None:
 
         async def callback(request: ConfirmationRequest) -> ConfirmationOutcome:
+            if before_answer is not None:
+                before_answer()
             return answer
 
         executor._configure_confirmation('agent', callback)  # pyright: ignore[reportPrivateUsage]
@@ -478,6 +486,153 @@ async def test_an_untrusted_script_is_escalated_the_same_way(
     assert exec_tool.ran == ext_tool.ran == 0
     assert result.trust is TrustLevel.TRUSTED
     assert 'exec.untrusted_script' in result.output
+
+
+def _baseline_script(root: Path) -> WorkspaceRouter:
+    root.mkdir()
+    (root / 'setup.sh').write_text('echo baseline\n')
+    local = LocalWorkspace(str(root), shell='/bin/sh', env={})
+    return WorkspaceRouter(local, taint=FileTaint(root))
+
+
+def _replant(root: Path) -> None:
+    (root / 'setup.sh').write_text('echo planted while the question was pending\n')
+
+
+@pytest.mark.parametrize('concurrency', [1, 4])
+@pytest.mark.parametrize(('replanted', 'outcome', 'ran'), [(True, 'blocked', 0), (False, 'ok', 1)])
+async def test_a_script_changed_while_the_confirmation_is_pending_is_not_run(
+    concurrency: int, replanted: bool, outcome: str, ran: int, tmp_path: Path
+) -> None:
+    exec_root, ext_root = tmp_path / 'exec', tmp_path / 'ext'
+    exec_router = _baseline_script(exec_root)
+    ext_router = _baseline_script(ext_root)
+    exec_tool = _Marker()
+    ext_tool = _Marker()
+    exec_rec = _Recorder()
+    ext_rec = _Recorder()
+    handler = _Answer(
+        ConfirmationOutcome.APPROVED, before=(lambda: _replant(ext_root)) if replanted else None
+    )
+    runtime = Runtime(workspace=ext_router, tracer=ext_rec)
+    try:
+        await _run_executor(
+            exec_tool,
+            'sudo sh setup.sh',
+            TrustLevel.TRUSTED,
+            DangerJudge(),
+            'confirm',
+            Disposition.BLOCK,
+            ConfirmationOutcome.APPROVED,
+            concurrency,
+            exec_rec,
+            file_trust=exec_router.script_trust,
+            before_answer=(lambda: _replant(exec_root)) if replanted else None,
+        )
+        result = await call_external(
+            runtime,
+            ext_tool,
+            {'command': 'sudo sh setup.sh'},
+            caller='mcp-client',
+            agent_id='agent',
+            policy=_policy(DangerJudge(), 'confirm', Disposition.BLOCK, handler),
+            provenance=TrustLevel.TRUSTED,
+        )
+    finally:
+        await runtime.shutdown()
+        await exec_router.close()
+        await ext_router.close()
+
+    expected = {
+        'danger.rule_ids': ['shell.privilege_escalation'],
+        'danger.risk': 'high',
+        'danger.provenance': 'trusted',
+        'danger.decided_by': 'policy',
+        'danger.disposition': 'confirm',
+        'tool.outcome': outcome,
+    }
+    assert handler.calls == 1
+    assert _danger(exec_rec) == expected
+    assert _danger(ext_rec) == expected
+    assert exec_tool.ran == ext_tool.ran == ran
+    if replanted:
+        assert result.trust is TrustLevel.TRUSTED
+        assert '批准之后复查' in result.output
+        assert 'setup.sh' in result.output
+    else:
+        assert result.output == 'did sudo sh setup.sh'
+
+
+class _ThirdPartyShell(Tool):
+    """自己声明「什么都不执行」，实际把 command 交给 shell 的第三方工具。"""
+
+    __tool_name__ = 'ThirdPartyShell'
+    __tool_command_args__ = ()
+
+    def __init__(self) -> None:
+        self.ran: list[str] = []
+
+    async def execute(self, command: str) -> ToolResult:
+        self.ran.append(command)
+        return ToolResult(output=f'did {command}', trust=TrustLevel.TRUSTED)
+
+
+def _git_guarded() -> ExternalCallPolicy:
+    return ExternalCallPolicy(
+        judge=DangerJudge(()),
+        policy=AllowAll(),
+        untrusted_high_risk=Disposition.ALLOW,
+        guard=DangerJudge((git_state_change_rule(),)),
+    )
+
+
+async def test_the_guard_does_not_take_a_third_party_tools_word_that_nothing_runs() -> None:
+    tool = _ThirdPartyShell()
+    outputs: list[ToolResult] = []
+    for command in ('git commit -m x', 'git status'):
+        outputs.append(
+            await call_external(
+                None,
+                tool,
+                {'command': command},
+                caller='acp-agent:gemini',
+                agent_id=None,
+                policy=_git_guarded(),
+                provenance=TrustLevel.TRUSTED,
+            )
+        )
+    refused, allowed = outputs
+
+    assert tool.ran == ['git status']
+    assert refused.trust is TrustLevel.TRUSTED
+    assert 'shell.git_state_change' in refused.output
+    assert 'ThirdPartyShell 声明了 __tool_command_args__ = ()' in refused.output
+    assert '不是 syndica 自带' in refused.output
+    assert '没有声明 __tool_command_args__' not in refused.output
+    assert allowed.output == 'did git status'
+
+
+async def test_the_guard_still_takes_syndicas_own_word_that_nothing_runs(tmp_path: Path) -> None:
+    root = tmp_path / 'ws'
+    root.mkdir()
+    router = WorkspaceRouter(
+        LocalWorkspace(str(root), shell='/bin/sh', env={}), taint=FileTaint(root)
+    )
+    try:
+        result = await call_external(
+            None,
+            Write(router),
+            {'path': 'notes.md', 'content': 'git commit -m x'},
+            caller='mcp-client',
+            agent_id=None,
+            policy=_git_guarded(),
+            provenance=TrustLevel.TRUSTED,
+        )
+    finally:
+        await router.close()
+
+    assert 'shell.git_state_change' not in result.output
+    assert (root / 'notes.md').read_text() == 'git commit -m x'
 
 
 async def test_the_guard_refuses_git_commit_even_when_policy_and_escalation_allow() -> None:
