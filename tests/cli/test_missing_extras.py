@@ -59,6 +59,31 @@ def test_declared_mcp_servers_without_the_mcp_backend_name_the_mcp_extra(
     assert 'syndica.backends.mcp.client' in caught.value.received
 
 
+def test_servers_no_role_uses_need_no_mcp_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, 'syndica.backends.mcp.client', None)
+    text = _MCP_CONFIG.replace('roles: [Worker]', 'roles: []')
+    path = tmp_path / '.syndica.yaml'
+    path.write_text(text, encoding='utf-8')
+    config = config_from_text(path, text)
+    judge, _table = dev_danger_options(tmp_path)
+
+    opened = asyncio.run(
+        _open_mcp(
+            config,
+            {},
+            cwd=str(tmp_path),
+            redactor=RuleRedactor(),
+            environ={},
+            judge=judge,
+            workspace=str(tmp_path),
+        )
+    )
+
+    assert opened is None
+
+
 def test_an_acp_role_without_the_acp_backend_names_the_acp_extra(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

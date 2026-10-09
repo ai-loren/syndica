@@ -721,9 +721,40 @@ def test_doctor_names_the_tool_whose_schema_could_not_be_inlined(tmp_path: Path)
     mcp_lines = [line for line in outcome.output.splitlines() if line.startswith('mcp: ')]
     assert [line.rsplit(' ', 1)[0] for line in mcp_lines] == [
         'mcp: ok files',
+        'mcp: tools files',
         'mcp: excluded files loop',
     ]
-    assert mcp_lines[1] == 'mcp: excluded files loop cyclic-$ref'
+    assert mcp_lines[2] == 'mcp: excluded files loop cyclic-$ref'
+
+
+def test_doctor_gives_an_unused_server_its_own_line_and_never_starts_it(tmp_path: Path):
+    started = tmp_path / 'started'
+    idle = tmp_path / 'idle.py'
+    idle.write_text(f'open({str(started)!r}, "w").write("started")\n' + _SERVER, encoding='utf-8')
+    script = tmp_path / 'srv.py'
+    script.write_text(_SERVER, encoding='utf-8')
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    config = _config(
+        workspace / '.syndica.yaml',
+        'version: 1\n'
+        'interop:\n'
+        '  mcp:\n'
+        '    servers:\n'
+        '      - name: files\n'
+        f'        command: [{sys.executable!r}, {str(script)!r}]\n'
+        '        roles: [Worker]\n'
+        '      - name: idle\n'
+        f'        command: [{sys.executable!r}, {str(idle)!r}]\n',
+    )
+
+    outcome = _doctor(workspace, config.source)
+
+    assert outcome.exit_code == 0, outcome.output
+    mcp_lines = [line for line in outcome.output.splitlines() if line.startswith('mcp: ')]
+    assert mcp_lines[0].startswith('mcp: ok files ')
+    assert mcp_lines[-1] == 'mcp: unused idle（没有角色用到，run 与 doctor 都不启动它）'
+    assert not started.exists()
 
 
 def test_doctor_warns_once_per_user_level_credential_this_project_does_not_declare(

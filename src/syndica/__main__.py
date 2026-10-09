@@ -431,8 +431,8 @@ async def _open_mcp(
     judge: DangerJudge,
     workspace: str,
 ) -> OpenedMcp | None:
-    """组合根把 MCP backend 接上。没有声明的服务时不导入额外依赖。"""
-    if not config.interop.mcp_servers:
+    """组合根把 MCP backend 接上。没有角色用到的服务时不导入额外依赖：那些服务本来也不启动。"""
+    if not any(server.roles for server in config.interop.mcp_servers):
         return None
     try:
         from syndica.backends.mcp.client import connect_http, connect_stdio

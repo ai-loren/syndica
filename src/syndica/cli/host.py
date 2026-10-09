@@ -3206,18 +3206,24 @@ class RuntimeCliHost:
     async def _mcp_doctor(
         self, config: CliConfig, agent_env: Mapping[str, str], judge: DangerJudge
     ) -> tuple[list[str], OpenedMcp | None]:
-        """连上声明的 MCP 服务，列出协商版本和没装上的工具。没有服务、或没注入连接器时不连。"""
+        """连上有角色用到的 MCP 服务，列出协商版本、工具和没装上的工具；没有角色用到的服务各一行
+        说明它不启动。没有服务、或没注入连接器时不连。"""
         if not config.interop.mcp_servers or self._mcp_opener is None:
             return [], None
+        unused = [
+            f'mcp: unused {one_line(server.name)}（没有角色用到，run 与 doctor 都不启动它）'
+            for server in config.interop.mcp_servers
+            if not server.roles
+        ]
         redactor = host_redactor(self._environ, config.redaction_rules)
         try:
             opened = await self._open_mcp(config, agent_env, redactor, judge)
         except Exception as exc:
             detail = one_line(redactor.redact(f'{type(exc).__name__}: {exc}'))
-            return [f'mcp: failed（{detail}）'], None
+            return [f'mcp: failed（{detail}）', *unused], None
         if opened is None:
-            return [], None
-        return list(doctor_lines(opened)), opened
+            return unused, None
+        return [*doctor_lines(opened), *unused], opened
 
     async def _acp_doctor(self, config: CliConfig, agent_env: Mapping[str, str]) -> list[str]:
         """逐个拉起声明的 ACP Agent、握手、收掉。没有声明、或没注入探测时不拉起。"""
