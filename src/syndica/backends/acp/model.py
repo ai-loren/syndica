@@ -1,7 +1,9 @@
 """把一个 ACP Agent 当成 Syndica 的模型。
 
 每个 Syndica Agent 第一次 `create` 时握手并 `session/new`，拆除时收掉进程组。读、写、终端都经
-`call_external`，调用方是 `acp-agent:<名字>`。回答一律不可信。协议版本不是 1 就拒绝。
+`call_external`，调用方是 `acp-agent:<名字>`。`call_external` 不过 PRE_TOOL_USE，所以回调只用驱动
+它的那个 Agent 所属角色交进来的工具与处置：角色的 tools 里没有的工具、只读 run 里的写与终端，一律
+拒绝。回答一律不可信。协议版本不是 1 就拒绝。
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import secrets
 import shlex
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, cast
 
 from acp.exceptions import RequestError
@@ -63,13 +66,32 @@ logger = logging.getLogger(__name__)
 
 AcpConnection = Callable[[object], AbstractAsyncContextManager[Any]]
 _ALLOW_KINDS = frozenset({'read', 'search', 'think'})
-_TOOL_NAMES = ('Read', 'Write', 'Bash', 'BashOutput', 'KillBash')
+# 这几类权限放行的是外部 Agent 自己的改文件、跑命令工具：角色没有对应的工具、或 run 是只读的，不问人
+# 直接拒——人点了允许也不能给角色它没有的能力。
+_KIND_TOOLS = {'edit': 'Write', 'delete': 'Write', 'move': 'Write', 'execute': 'Bash'}
+# 只读 run 里拒的工具。终端的输出、等待、结束与释放都只碰 terminal/create 交出去的句柄，拒了 Bash
+# 就一个句柄也交不出去。
+_READ_ONLY_REFUSED = frozenset({'Write', 'Bash'})
 _CANCEL_WAIT_S = 0.2
 _POLL_S = 0.05
 
 
+@dataclass(frozen=True)
+class _Grant:
+    """一个角色交给托管 Agent 的工具与处置。`role` 为空是构造时直接给的那一份。"""
+
+    role: str
+    tools: Mapping[str, Tool]
+    policy: ExternalCallPolicy | None
+    read_only: bool = False
+
+
 class AcpAgentModel:
-    """一个模型名对应的 ACP 托管。`connect` 与 `command` 给一个：测试注入连接，正式路径拉起进程。"""
+    """一个模型名对应的 ACP 托管。`connect` 与 `command` 给一个：测试注入连接，正式路径拉起进程。
+
+    构造时给的 `tools` / `policy` 对每个调用方都一样；宿主经 `bind_runtime` 按角色交过之后，回调只认
+    驱动它的那个 Agent 的角色。
+    """
 
     def __init__(
         self,
@@ -96,8 +118,8 @@ class AcpAgentModel:
         self._name = name
         self._connect = connect
         self._command = command
-        self._tools = dict(tools or {})
-        self._policy = policy
+        self._own = _Grant(role='', tools=dict(tools or {}), policy=policy)
+        self._grants: dict[str, _Grant] = {}
         self._cwd = cwd
         self._runtime = runtime
         self._redactor = redactor
@@ -116,26 +138,24 @@ class AcpAgentModel:
         tools: Mapping[str, Tool],
         policy: ExternalCallPolicy,
         *,
+        role: str,
+        read_only: bool = False,
         agent_env: Mapping[str, str],
         host_env: Mapping[str, str],
         redactor: Redactor,
     ) -> None:
-        """宿主在 Runtime 建好之后把工具、处置和 Agent 环境交进来。进程要等第一次 create 才拉起。"""
-        missing = [name for name in _TOOL_NAMES if name not in tools]
-        if missing:
-            raise ConfigError(
-                expected=f'ACP 回调能用的工具里有 {", ".join(_TOOL_NAMES)}',
-                received=f'缺 {missing!r}',
-                next_action='用 local_tools 装上 Read、Write、Bash、BashOutput、KillBash',
-            )
+        """宿主在 Runtime 建好之后，对每个用这个模型的角色交一次：`tools` 是那个角色冻结后的工具表
+        （有 Bash 时连同 BashOutput、KillBash），`policy` 是它自己的处置。`read_only` 时写文件与终端
+        一律拒绝。进程要等第一次 create 才拉起。"""
         env = dict(agent_env)
         for key in self._extra_env:
             value = host_env.get(key)
             if value is not None:
                 env[key] = value
         self._runtime = runtime
-        self._tools = {name: tools[name] for name in _TOOL_NAMES}
-        self._policy = policy
+        self._grants[role] = _Grant(
+            role=role, tools=dict(tools), policy=policy, read_only=read_only
+        )
         self._env = env
         self._redactor = redactor
         workspace = runtime.workspace
@@ -175,18 +195,29 @@ class AcpAgentModel:
             await self._drop(agent_id)
 
     def _require_bound(self) -> None:
-        if self._policy is None or not self._tools:
+        if not self._grants and self._own.policy is None:
             raise ConfigError(
                 expected='create 之前已经 bind_runtime，或构造时就给了 tools 与 policy',
                 received=f'{self._name} 还没有工具或处置',
                 next_action='等宿主把 Runtime 交进来再调用；单测直接把 tools 和 policy 传进构造',
             )
 
+    async def _grant_for(self, agent_id: str) -> _Grant:
+        if not self._grants:
+            return self._own
+        runtime = self._runtime
+        info = None if runtime is None or not agent_id else await runtime.find(agent_id)
+        role = '' if info is None else info.name
+        grant = self._grants.get(role)
+        if grant is None:
+            return _Grant(role=role or f'（agent {agent_id or "未知"}）', tools={}, policy=None)
+        return grant
+
     async def _open(self, agent_id: str) -> _Live:
         live = self._sessions.get(agent_id)
         if live is not None:
             return live
-        client = _Client(self, agent_id)
+        client = _Client(self, agent_id, await self._grant_for(agent_id))
         opener = self._connect if self._connect is not None else self._spawn
         cm = opener(client)
         try:
@@ -288,15 +319,43 @@ class AcpAgentModel:
                     await closer()
             await process.aclose()
 
-    async def _call(self, agent_id: str, tool_name: str, args: Mapping[str, object]) -> ToolResult:
-        tool = self._tools.get(tool_name)
-        policy = self._policy
-        if tool is None or policy is None:
-            raise ConfigError(
-                expected=f'ACP 回调能用的工具里有 {tool_name}',
-                received=f'没有 {tool_name}',
-                next_action='给 AcpAgentModel 装上 Read、Write、Bash、BashOutput 和 KillBash',
+    def _granted(
+        self, grant: _Grant, method: str, tool_name: str
+    ) -> tuple[Tool, ExternalCallPolicy]:
+        agent = f'acp:{self._name}'
+        owner = f'角色 {grant.role}' if grant.role else agent
+        if grant.read_only and tool_name in _READ_ONLY_REFUSED:
+            raise _request(
+                ConfigError(
+                    expected=f'只读 run 里 {agent} 只读文件：{method} 会改动工作区',
+                    received=f'{owner} 的 {agent} 发来 {method}，而这次 run 是只读的（--no-write）',
+                    next_action=(
+                        '换成只读的做法；要改动就把改什么、怎么改写进回答，由人去掉 --no-write 再跑'
+                    ),
+                )
             )
+        tool = grant.tools.get(tool_name)
+        policy = grant.policy
+        if tool is None or policy is None:
+            raise _request(
+                ConfigError(
+                    expected=f'{owner} 的 tools 里有 {tool_name}：{agent} 的 {method} 要用它',
+                    received=f'{owner} 的 tools 只有 {sorted(grant.tools)!r}',
+                    next_action=(
+                        f'在{owner} 的 tools 里加上 {tool_name}；不加就让 {agent} 换一种不用 '
+                        f'{method} 的做法'
+                    ),
+                )
+            )
+        return tool, policy
+
+    async def _call(
+        self,
+        agent_id: str,
+        granted: tuple[Tool, ExternalCallPolicy],
+        args: Mapping[str, object],
+    ) -> ToolResult:
+        tool, policy = granted
         return await call_external(
             self._runtime,
             tool,
@@ -352,10 +411,18 @@ class _Terminal:
 
 
 class _Client:
-    def __init__(self, model: AcpAgentModel, agent_id: str) -> None:
+    def __init__(self, model: AcpAgentModel, agent_id: str, grant: _Grant) -> None:
         self._model = model
         self._agent_id = agent_id
+        self._grant = grant
         self.chunks: list[str] = []
+
+    def _granted(self, method: str, tool_name: str) -> tuple[Tool, ExternalCallPolicy]:
+        return self._model._granted(self._grant, method, tool_name)  # pyright: ignore[reportPrivateUsage]
+
+    async def _use(self, method: str, tool_name: str, args: Mapping[str, object]) -> ToolResult:
+        granted = self._granted(method, tool_name)
+        return await self._model._call(self._agent_id, granted, args)  # pyright: ignore[reportPrivateUsage]
 
     async def session_update(self, session_id: str, update: object, **kwargs: object) -> None:
         del session_id, kwargs
@@ -383,16 +450,14 @@ class _Client:
             args['offset'] = line
         if limit is not None:
             args['limit'] = limit
-        result = await self._model._call(self._agent_id, 'Read', args)  # pyright: ignore[reportPrivateUsage]
+        result = await self._use('fs/read_text_file', 'Read', args)
         return ReadTextFileResponse(content=_text(result))
 
     async def write_text_file(
         self, session_id: str, path: str, content: str, **kwargs: object
     ) -> WriteTextFileResponse:
         del session_id, kwargs
-        await self._model._call(  # pyright: ignore[reportPrivateUsage]
-            self._agent_id, 'Write', {'path': path, 'content': content}
-        )
+        await self._use('fs/write_text_file', 'Write', {'path': path, 'content': content})
         return WriteTextFileResponse()
 
     async def request_permission(
@@ -404,6 +469,9 @@ class _Client:
     ) -> RequestPermissionResponse:
         del session_id, kwargs
         kind = str(getattr(tool_call, 'kind', '') or '')
+        needed = _KIND_TOOLS.get(kind)
+        if needed is not None and (self._grant.read_only or needed not in self._grant.tools):
+            return _rejected(options)
         if kind in _ALLOW_KINDS:
             option_id = _option(options, 'allow_once')
             if option_id is not None:
@@ -438,10 +506,11 @@ class _Client:
         cwd: str | None,
         output_byte_limit: int | None,
     ) -> CreateTerminalResponse:
+        granted = self._granted('terminal/create', 'Bash')
         limit = _byte_limit(output_byte_limit)
         result = await self._model._call(  # pyright: ignore[reportPrivateUsage]
             self._agent_id,
-            'Bash',
+            granted,
             {
                 'command': _shell_command(command, args, env),
                 'run_in_background': True,
@@ -462,8 +531,8 @@ class _Client:
     ) -> TerminalOutputResponse:
         del session_id, kwargs
         terminal = self._terminal(terminal_id)
-        result = await self._model._call(  # pyright: ignore[reportPrivateUsage]
-            self._agent_id, 'BashOutput', {'handle': terminal.handle, 'full': True}
+        result = await self._use(
+            'terminal/output', 'BashOutput', {'handle': terminal.handle, 'full': True}
         )
         output, truncated = _clipped(_text(result), terminal.limit)
         return TerminalOutputResponse(
@@ -479,8 +548,8 @@ class _Client:
         terminal = self._terminal(terminal_id)
         deadline = _deadline()
         while True:
-            result = await self._model._call(  # pyright: ignore[reportPrivateUsage]
-                self._agent_id, 'BashOutput', {'handle': terminal.handle, 'full': True}
+            result = await self._use(
+                'terminal/wait_for_exit', 'BashOutput', {'handle': terminal.handle, 'full': True}
             )
             if result.meta.get('running') is False:
                 code = result.meta.get('exit_code')
@@ -497,15 +566,15 @@ class _Client:
 
     async def kill_terminal(self, session_id: str, terminal_id: str, **kwargs: object) -> None:
         del session_id, kwargs
-        await self._stop(terminal_id, drop=False)
+        await self._stop('terminal/kill', terminal_id, drop=False)
 
     async def release_terminal(self, session_id: str, terminal_id: str, **kwargs: object) -> None:
         del session_id, kwargs
-        await self._stop(terminal_id, drop=True)
+        await self._stop('terminal/release', terminal_id, drop=True)
 
     async def _approved(self, tool_call: ToolCallUpdate, kind: str) -> bool:
         model = self._model
-        policy = model._policy  # pyright: ignore[reportPrivateUsage]
+        policy = self._grant.policy
         runtime = model._runtime  # pyright: ignore[reportPrivateUsage]
         if policy is None or policy.confirm is None or runtime is None or not self._agent_id:
             return False
@@ -541,11 +610,9 @@ class _Client:
             )
         return terminal
 
-    async def _stop(self, terminal_id: str, *, drop: bool) -> None:
+    async def _stop(self, method: str, terminal_id: str, *, drop: bool) -> None:
         terminal = self._terminal(terminal_id)
-        await self._model._call(  # pyright: ignore[reportPrivateUsage]
-            self._agent_id, 'KillBash', {'handle': terminal.handle}
-        )
+        await self._use(method, 'KillBash', {'handle': terminal.handle})
         if drop:
             live = self._model._sessions.get(self._agent_id)  # pyright: ignore[reportPrivateUsage]
             if live is not None:

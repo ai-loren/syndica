@@ -127,12 +127,23 @@ class A2AAgentModel:
         limit = model_call_limit()
         if limit is not None and limit <= 0:
             raise BudgetDeadline()
+        # 没有预算上限时用 config.timeout：交给 httpx 的 None 是永不超时，接了连接却不答的对端会把
+        # 这次调用挂死。
+        deadline = limit if limit is not None else self._config.timeout
         try:
-            await self._card(link, limit)
-            body = await self._post(_send(self._take_id(), link, text), limit)
+            await self._card(link, deadline)
+            body = await self._post(_send(self._take_id(), link, text), deadline)
         except httpx.TimeoutException:
-            await self._cancel(link, None)
-            raise BudgetDeadline() from None
+            await self._cancel(link, self._config.timeout)
+            if limit is not None:
+                raise BudgetDeadline() from None
+            raise ConfigError(
+                expected=f'{self._name} 在 {deadline:g} 秒内答复',
+                received=f'{self._url} 在 {deadline:g} 秒内没有答复',
+                next_action=(
+                    f'确认 {self._url} 上的 A2A Agent 在跑、没有卡住；不会自动重试，也不会自动重连'
+                ),
+            ) from None
         except ConfigError:
             raise
         link.cursor = len(messages)
@@ -200,17 +211,17 @@ class A2AAgentModel:
         parsed = cast(dict[str, Any], raw)
         error = _as_dict(parsed.get('error'))
         if error is not None:
-            data = _as_dict(error.get('data'))
-            expected = None if data is None else data.get('expected')
+            data = _as_dict(error.get('data')) or {}
+            expected = data.get('expected')
             if isinstance(expected, str):
                 raise ConfigError(
-                    expected=expected,
-                    received=str(data.get('received') if data is not None else ''),
-                    next_action=str(data.get('next_action') if data is not None else ''),
+                    expected=self._remote(expected),
+                    received=self._remote(data.get('received')),
+                    next_action=self._remote(data.get('next_action')),
                 )
             raise ConfigError(
                 expected=f'{self._name} 接受这次 JSON-RPC',
-                received=self._redact(str(error.get('message') or error.get('code')))[:300],
+                received=self._remote(error.get('message') or error.get('code')),
                 next_action='检查 URL、A2A-Version 和 Bearer；不会自动重连',
             )
         return parsed
@@ -244,6 +255,10 @@ class A2AAgentModel:
         if self._redactor is None:
             return text
         return self._redactor.redact(text)
+
+    def _remote(self, value: object) -> str:
+        """对端写进错误里的文字：先脱敏再截断，截断可能切在一个密钥中间。"""
+        return self._redact(str(value))[:300]
 
 
 def _send(request_id: int, link: _Link, text: str) -> dict[str, Any]:

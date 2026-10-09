@@ -155,6 +155,7 @@ from syndica.kernel import (
     DangerJudge,
     DangerPolicy,
     DeliveryResult,
+    EventBus,
     ExecResult,
     Exhaustion,
     ExitMode,
@@ -233,6 +234,9 @@ _DEFAULT_ROOT_TURNS = 200
 _CONFIRMATION_TIMEOUT = 300.0
 # Agent 的 Bash 用的 shell。HostFacts 把它告诉模型，两处必须是同一个值。
 _SHELL = '/bin/sh'
+# 托管 Agent 的角色有 Bash 时连同交上：ACP 的终端要读、要停 terminal/create 交出去的句柄，这两件
+# 碰不到别的句柄，角色因此不必在 tools 里写它们。
+_TERMINAL_MACHINERY = ('BashOutput', 'KillBash')
 # 文件工具碰不到的目录：trace 里存着此前标成不可信的工具输出，经 Read 读回来就成了可信内容；交接
 # 文件只由宿主写；会话 / 记忆 / 产物 / Rubric 存着 trust 标记与验收状态，Agent 经 Write 改它们能把
 # 不可信内容写成可信、或把 proposed Rubric 改成 active 给自己出题（与 danger._HOST_RECORDS 同一份
@@ -1554,25 +1558,56 @@ def _prepare(prepare: PrepareModels | None, config: CliConfig) -> None:
 def _bind_hosted(
     models: Mapping[str, LLM],
     runtime: Runtime,
+    catalog: AgentCatalog,
+    factories: Mapping[str, AgentFactory],
     tools: Mapping[str, Tool],
     policy: ExternalCallPolicy,
     *,
+    read_only: bool,
     agent_env: Mapping[str, str],
     host_env: Mapping[str, str],
     redactor: Redactor,
 ) -> None:
-    for model in models.values():
-        bind = getattr(model, 'bind_runtime', None)
+    """托管模型（有 `bind_runtime` 的）对每个用它的角色绑一次。
+
+    托管 Agent 的回调经 `call_external`，不过 PRE_TOOL_USE：`--no-write` 的闸、角色的 tools 白名单与
+    danger.roles 只能经这里交进去，交整张 `tools` 与全局处置等于三者全部失效。工具表与处置从工厂建出
+    的 Agent 上读，与真正交给这个角色的是同一份（`--no-write` 时是重新冻结过的那一份）。
+    """
+    for role in catalog.names():
+        bind = getattr(models[catalog.get(role).model], 'bind_runtime', None)
         if bind is None:
             continue
+        options = factories[role](HooksCenter(), EventBus()).options
         bind(
             runtime,
-            tools,
-            policy,
+            _hosted_tools(options.tools, tools, read_only=read_only),
+            replace(policy, policy=options.danger_policy or policy.policy),
+            role=role,
+            read_only=read_only,
             agent_env=agent_env,
             host_env=host_env,
             redactor=redactor,
         )
+
+
+def _hosted_tools(
+    role_tools: Mapping[str, Tool], host_tools: Mapping[str, Tool], *, read_only: bool
+) -> dict[str, Tool]:
+    """交给托管 Agent 的那个角色的工具。只读 run 只留宿主的只读工具实例，按身份认（同
+    `_ReadOnlyGuard`）：类式角色的构造函数换进来的同名工具不算。"""
+    if read_only:
+        kept = tuple(host_tools[name] for name in sorted(_READ_ONLY_TOOLS))
+        return {
+            name: tool
+            for name, tool in role_tools.items()
+            if any(tool is read_tool for read_tool in kept)
+        }
+    granted = dict(role_tools)
+    if 'Bash' in granted:
+        for name in _TERMINAL_MACHINERY:
+            granted.setdefault(name, host_tools[name])
+    return granted
 
 
 async def _close_hosted(models: Mapping[str, LLM] | tuple[object, ...]) -> None:
@@ -3209,6 +3244,8 @@ class RuntimeCliHost:
             _bind_hosted(
                 models,
                 runtime,
+                catalog,
+                factories,
                 tools,
                 ExternalCallPolicy(
                     judge=judge,
@@ -3216,6 +3253,7 @@ class RuntimeCliHost:
                     guard=dev_guard_judge(self._workspace_root),
                     confirm=runtime_confirmation,
                 ),
+                read_only=False,
                 agent_env=environment.values,
                 host_env=self._environ,
                 redactor=redactor,
@@ -3626,6 +3664,8 @@ class RuntimeCliHost:
                 _bind_hosted(
                     models,
                     runtime,
+                    catalog,
+                    factories,
                     tools,
                     ExternalCallPolicy(
                         judge=judge,
@@ -3633,6 +3673,7 @@ class RuntimeCliHost:
                         guard=dev_guard_judge(self._workspace_root),
                         confirm=run_confirmation,
                     ),
+                    read_only=request.no_write,
                     agent_env=environment.values,
                     host_env=self._environ,
                     redactor=host_redactor(self._environ, config.redaction_rules),
