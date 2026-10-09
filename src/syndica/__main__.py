@@ -744,12 +744,62 @@ class _LazyHost:
             self._host.close(interrupted=interrupted)
 
 
+class _Training:
+    """`syndica batch` / `syndica export`。runner 只在这里 import。"""
+
+    def __init__(self, host: _LazyHost) -> None:
+        self._host = host
+
+    def batch(self, dataset: str, config: str) -> CliOutcome:
+        from syndica.kernel import ConfigError
+        from syndica.runner.batch import BatchTask, run_dataset
+
+        path = Path(dataset)
+        if not path.is_file():
+            raise ConfigError(
+                expected=f'{dataset} 是一份 jsonl 任务清单',
+                received='这个路径不是文件',
+                next_action='传 batch 的 dataset 参数指向每行一个 {"id","prompt"} 的文件',
+            )
+
+        def run_one(task: BatchTask) -> int:
+            result = self._host.run_request(RunRequest(prompt=task.prompt, config=config))
+            return result.exit_code if isinstance(result, CliOutcome) else 0
+
+        body, code = run_dataset(path.read_text(encoding='utf-8'), run_one)
+        return CliOutcome(body, code)
+
+    def export(
+        self,
+        fmt: str,
+        *,
+        config: str,
+        output: str,
+        include_unverified: bool,
+    ) -> CliOutcome:
+        del config
+        from syndica.cli.handoff import artifact_root, rubric_root, session_root, trace_root
+        from syndica.runner.commands import export_workspace
+
+        root = Path.cwd()
+        body, code = export_workspace(
+            session_root(root),
+            trace_root(root),
+            rubric_root(root),
+            artifact_root(root),
+            fmt,
+            Path(output),
+            include_unverified=include_unverified,
+        )
+        return CliOutcome(body, code)
+
+
 def entrypoint() -> None:
     io = CliIO(stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
     host = _LazyHost(io)
     code = EXIT_INTERRUPTED
     try:
-        code = main(host=host, io=io, server=_ServerControl(io))
+        code = main(host=host, io=io, server=_ServerControl(io), training=_Training(host))
     except KeyboardInterrupt:
         # main 正在打印第一次 Ctrl-C 的说明时又按了一次：照样不打 traceback。
         code = EXIT_INTERRUPTED

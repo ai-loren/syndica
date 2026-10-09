@@ -46,6 +46,8 @@ _COMMANDS = frozenset(
         'status',
         'mcp',
         'acp',
+        'batch',
+        'export',
         'version',
         'trace',
     }
@@ -151,6 +153,21 @@ class CliIO:
     stdin: TextIO
     stdout: TextIO
     stderr: TextIO
+
+
+class TrainingControl(Protocol):
+    """`batch` / `export`：由组合根实现（runner 是另一个 surface，CLI 不 import 它）。"""
+
+    def batch(self, dataset: str, config: str) -> str | CliOutcome: ...
+
+    def export(
+        self,
+        fmt: str,
+        *,
+        config: str,
+        output: str,
+        include_unverified: bool,
+    ) -> str | CliOutcome: ...
 
 
 class ServerControl(Protocol):
@@ -452,6 +469,16 @@ def _parser() -> _ArgumentParser:
     commands.add_parser('status', help='这个工作区的 Web 服务在不在跑')
     commands.add_parser('mcp', help='以 MCP server 暴露本工作区的工具（stdio）')
     commands.add_parser('acp', help='以 ACP agent 接受编辑器的会话（stdio）')
+    batch = commands.add_parser('batch', help='跑一份 jsonl 任务清单，一条失败不中断其余')
+    batch.add_argument('dataset', help='每行一个 {"id","prompt"}')
+    exported = commands.add_parser('export', help='把会话、trace 与裁决导出成训练集')
+    exported.add_argument('format', choices=('sft', 'sharegpt', 'preference', 'rl'))
+    exported.add_argument('--output', required=True, help='写出 jsonl 与 manifest 的目录')
+    exported.add_argument(
+        '--include-unverified',
+        action='store_true',
+        help='把 unverified 样本写进数据集，并在 manifest 里标明',
+    )
     commands.add_parser('version')
     trace = commands.add_parser('trace')
     trace_actions = trace.add_subparsers(dest='action', required=True)
@@ -679,11 +706,12 @@ def main(
     host: CliHost | None = None,
     io: CliIO | None = None,
     server: ServerControl | None = None,
+    training: TrainingControl | None = None,
 ) -> int:
     """Route one CLI invocation."""
     streams = io or CliIO(stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
     try:
-        return _route(list(sys.argv[1:] if argv is None else argv), host, streams, server)
+        return _route(list(sys.argv[1:] if argv is None else argv), host, streams, server, training)
     except KeyboardInterrupt:
         # `run --handoff` 的 Ctrl-C 在宿主里处理并写明停在哪；到这里的是普通 run、chat、强制退出，
         # 以及落在宿主交回结论与打印之间的按键——那时命令已经做完，所以只能说「可能」。
@@ -700,6 +728,7 @@ def _route(
     host: CliHost | None,
     streams: CliIO,
     server: ServerControl | None = None,
+    training: TrainingControl | None = None,
 ) -> int:
     first = _first_positional(received)
     if first is not None and first.startswith('-') and first not in {'-h', '--help'}:
@@ -786,6 +815,26 @@ def _route(
             )
             return 2
         return _host_call(lambda: runner(namespace.config), streams)
+    if namespace.command in ('batch', 'export'):
+        if training is None:
+            _write(
+                streams.stderr,
+                f'期望: {namespace.command} 由带训练出口的入口启动\n'
+                f'实际: 当前入口没有注入 training.{namespace.command}\n'
+                '下一步: 通过 python -m syndica 启动，不要用没有接上训练出口的测试入口',
+            )
+            return 2
+        if namespace.command == 'batch':
+            return _host_call(lambda: training.batch(namespace.dataset, namespace.config), streams)
+        return _host_call(
+            lambda: training.export(
+                namespace.format,
+                config=namespace.config,
+                output=namespace.output,
+                include_unverified=namespace.include_unverified,
+            ),
+            streams,
+        )
     if namespace.command == 'memory':
         if host is None:
             _write(

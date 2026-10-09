@@ -112,7 +112,7 @@ uv run pytest -q
 | 8 | 长程任务 | 已完成 | 预算树（四维、预留 + 周期收尾结算 + 唤醒重切、单一准入与计量点、三档成本、伴生记账）与可感知预算（`GetBudget`、预算注入历史、`graceful_wrapup` 收尾轮）、`--max-*` 改为根预算；进度账本、停滞、漂移（锚点检查 + 可选语义比对）、可插拔长程策略（基线 + 随 wheel 的契约）与 `long-horizon` Module；目标导向型压缩与压缩前完整前像；后台工具、派活树回收、后代单一定义、拓扑槽隔离；审计见 `docs/audits/2026-10-06-m8-final-audit.md` |
 | 9 | 产品面 | 已完成 | `syndica up/status/down` 本机服务（REST、可续读的 SSE、WebSocket 的请求 / 答复 / 终端，OpenAPI 快照与变更记录）、随包发布的 React 界面（会话、时间线、Agent 树、确认与提问、产物预览 / diff / 反馈、预算 / 进度 / trace、终端、窄屏）、Playwright 桌面与移动 E2E；截止时刻打断在飞的调用、预算跨会话、`--verdict-exit`、隔离拷贝进线程；子树持久化改派到 v1 之后；审计见 `docs/audits/2026-10-08-m9-final-audit.md` |
 | 10 | 互操作 | 进行中 | 四个协议在工作区里、未提交；Gemini CLI 真实运行、导出验证、收口对抗评审未做；审计草稿见 `docs/audits/2026-10-09-m10-final-audit.md` |
-| 11 | 训练出口 | 未开始 | 中立轨迹与 SFT/偏好/RL 导出 |
+| 11 | 训练出口 | 进行中 | 中立轨迹、SFT / ShareGPT / 偏好 / RL 导出、`syndica batch` / `export`、TRL dry-run 在工作区里、未提交；等 M10 收口后再标完成；审计见 `docs/audits/2026-10-09-m11-final-audit.md` |
 | 12 | 发布准备 | 未开始 | 英文文档、CI 矩阵、v1.0 发布 |
 
 ## 遗留项归属（2026-09-29）
@@ -190,7 +190,8 @@ deferred items」。
 | M7 后续 | 装了 `acceptance` 的 run 不写回放文档 | 后续（回放文档 v4） | 伴生调用不在主 Agent 的录制轮次里；与 M5 C3、M6 aux 调用同属回放文档 v4 的槽位；回放重建器认得这个名字但拒绝重建（三件套） |
 | M7 后续 | 目标导向型压缩（§8.8 第四种策略） | 已修（M8，`1281454`） | `compaction_strategy: goal_directed`：旧轮次按与 Goal / Rubric 的词面相关度挑 |
 | M7 后续 | 进度 = 已满足强制 Rubric / 强制总数、目标漂移检测（§8.2 / §8.3） | 已修（M8） | 进度账本、停滞、锚点检查 + 可选语义比对，在 `long-horizon` Module 里 |
-| M7 后续 | 导出器默认排除 `unverified`（§13） | M11 | 四值类型与 fail-open 标记已在内核 |
+| M7 后续 | 导出器默认排除 `unverified`（§13） | 已修（M11，未提交） | `syndica export` 默认排除，`--include-unverified` 显式打开并写进 manifest |
+| M11 后续 | `SessionMeta.last_trace` 从来没有被写过，新会话一律是 null（M6 起） | 后续 | 导出按根 Agent 的 id 在 trace store 里找最近的 trace；内核写起它要改存盘语义（恢复、回放都读这个字段），单独做 |
 | M7 后续 | 二进制格式处理器（xlsx / docx 的 `semantic_diff` 与校验） | 后端 | 内核只给协议与文本 `generic` 处理器 |
 | M7 后续 | `RubricStore` / `ArtifactStore` 契约与验收 Module 进公开面 | M12 | 先私有（同 M6 的记忆）；v1.0 冻结公开 API 时一起定 |
 | M7 后续 | `encode_assured` 的调用方白名单（AST 守卫） | M12 | 产物索引存的路径 / kind 已收窄（kind 只收 `KINDS`、id 由内核派生）；守卫随公开面冻结一起补 |

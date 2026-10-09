@@ -1,0 +1,55 @@
+{
+  "schema": "syndica.trajectory/1",
+  "id": "try-1",
+  "goal_id": "goal-planets",
+  "rubric_id": "rubric-1",
+  "messages": [
+    {
+      "role": "user",
+      "content": "write planets.md",
+      "tool_call_id": null,
+      "tool_calls": []
+    },
+    {
+      "role": "assistant",
+      "content": "wrote the note",
+      "tool_call_id": null,
+      "tool_calls": [
+        {
+          "id": "call-1",
+          "name": "Write",
+          "arguments": "{\"path\": \"planets.md\"}"
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "[REDACTED:secret.token]",
+      "tool_call_id": "call-1",
+      "tool_calls": []
+    }
+  ],
+  "tool_calls": [
+    {
+      "id": "call-1",
+      "name": "Write"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "planets.md",
+      "version": "1"
+    }
+  ],
+  "verdict": "pass",
+  "causality": [],
+  "timing": {
+    "start_ns": null,
+    "end_ns": null,
+    "cost": null
+  },
+  "redaction": {
+    "placeholders_kept": true,
+    "raw_secrets_exported": false
+  }
+}

@@ -86,4 +86,4 @@ uv run python scripts/check_links.py                         通过
 sh scripts/check_web.sh                                      通过（产物已按当前 OpenAPI 快照重建）
 ```
 
-全套 `uv run pytest -q`：第一次（守卫修复前）10265 passed、4 failed（自由文本属性 `tool.caller`、server 私有名、写入点、前端产物哈希）。第二次 10263 passed、6 failed，都在 `tests/server/test_acp_turn.py`（公开方法没有转调测试覆盖的私有钩子）。第三次 10275 passed、1 failed：`runner/training.py` 的两处 `write_text` 没在同一个表达式里脱敏。ACP 那 6 条在第三次已经通过。
+全套 `uv run pytest -q`：第一次（守卫修复前）10265 passed、4 failed（自由文本属性 `tool.caller`、server 私有名、写入点、前端产物哈希）。第二次 10263 passed、6 failed，都在 `tests/server/test_acp_turn.py`（公开方法没有转调测试覆盖的私有钩子）。第三次 10275 passed、1 failed：`runner/training.py` 的两处 `write_text` 没在同一个表达式里脱敏。ACP 那 6 条在第三次已经通过。第四次（含 M11）10300 passed，0 failed，813 秒；唯一的警告是 DevModule 在 ACP 取消时留下没 await 的 `_Recorder._ended`（已知，未修）。

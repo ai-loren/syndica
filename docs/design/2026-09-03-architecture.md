@@ -1192,6 +1192,8 @@ CLI 的交互模式不经过 HTTP，因此**内核事件流必须首先是进程
 
 因此裁决状态在轨迹里是四值而非三值：`pass` / `partial` / `block` / `unverified`。**导出器默认排除 `unverified` 样本**，需要包含时必须显式开启并在数据集元信息中标注。
 
+里程碑 11 的落地：中立轨迹是 `syndica.trajectory/1`，由 `syndica.runner` 从会话、Goal / Rubric、trace 与产物登记拼出；裁决只读根 Agent 的 span，验收伴生 Agent 的不算。偏好对按 Goal 与 Rubric 内容的摘要配对，不按模型起的 Rubric id。`syndica export {sft,sharegpt,preference,rl}` 先逐叶脱敏再编码，占位符保留，只读源 store；`syndica batch` 一条失败不中断其余。训练框架对接是 `syndica.backends.trl`（extra `trl`），runner 与 kernel 不导入它。
+
 ---
 
 ## 10. 错误处理
@@ -1475,6 +1477,7 @@ CI 检查项：
 
 **状态（2026-10-09）：** 里程碑 1–9 已完成。里程碑 10 的四个协议适配在工作区里，证据见
 [M10 收口审计](../audits/2026-10-09-m10-final-audit.md)；Gemini CLI 的真实运行还没做，路线图总览写「进行中」。
+里程碑 11 的导出与 TRL 对接也在工作区里，证据见 [M11 收口审计](../audits/2026-10-09-m11-final-audit.md)。
 审计见 [M1 收口审计](../audits/2026-09-23-m1-final-audit.md)、
 [M2 收口审计](../audits/2026-10-01-m2-final-audit.md)、[M3 收口审计](../audits/2026-10-02-m3-final-audit.md)、
 [M4 收口审计](../audits/2026-10-03-m4-final-audit.md)、[M5 收口审计](../audits/2026-10-04-m5-final-audit.md) 与

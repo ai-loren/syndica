@@ -765,6 +765,8 @@ syndica memory list | forget <n> | forget --pending   [--global]
 syndica doctor [--verify]
 syndica trace list | show <id> | replay <id> [--allow-divergence]
 syndica trace export <id> [--otlp <url>] | prune [<id>...] [--keep <n>]
+syndica batch <tasks.jsonl>
+syndica export sft | sharegpt | preference | rl --output <dir> [--include-unverified]
 syndica version
 ```
 
@@ -899,6 +901,25 @@ Version negotiation fails closed: MCP accepts only the five versions its SDK lis
 protocol version 1, and A2A accepts only `1.0` and `0.3`. A missing `A2A-Version` header is
 rejected rather than treated as `0.3`.
 
+## Training Export
+
+`syndica batch tasks.jsonl` runs one task per line (`{"id": ..., "prompt": ...}`) and prints one JSON
+result per line; a failed task does not stop the rest. `syndica export <format> --output <dir>`
+turns the workspace's sessions, goals, rubrics, traces, and artifact records into a dataset plus a
+`manifest.json`:
+
+- `sft` writes OpenAI-shaped `messages` with tool calls and the artifacts each sample produced;
+  `sharegpt` writes the same conversations as `human` / `gpt` / `function_call` / `observation`.
+- `preference` pairs a better and a worse verdict for the same goal and the same rubrics.
+- `rl` writes `input_ids`, a `loss_mask` that covers the assistant's text and tool calls, and a
+  reward from the verdict (pass 1.0, partial 0.5, block 0.0).
+
+Samples whose verdict is `unverified` are left out unless you pass `--include-unverified`, and the
+manifest records that choice. Every string is redacted before it is encoded; redaction placeholders
+stay in the data and raw secrets never do. Export only reads the workspace's stores.
+`pip install 'syndica[trl]'` adds `syndica.backends.trl.dry_run`, which loads an exported SFT file
+into TRL's `SFTTrainer` without downloading a model.
+
 ## Roadmap
 
 The v1.0 roadmap has 12 internal milestones:
@@ -915,7 +936,7 @@ The v1.0 roadmap has 12 internal milestones:
 | 8 | Long-horizon task control | Done |
 | 9 | HTTP/SSE/Web product surface | Done |
 | 10 | MCP / ACP / A2A / OpenAI HTTP interop | In progress |
-| 11 | Training-data export | Planned |
+| 11 | Training-data export | In progress |
 | 12 | v1.0 release readiness | Planned |
 
 Expanded roadmap: [`docs/plans/2026-09-23-v1-milestone-roadmap.md`](docs/plans/2026-09-23-v1-milestone-roadmap.md).
