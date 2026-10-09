@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -287,6 +289,126 @@ async def test_an_in_process_server_round_trips_both_protocol_eras():
             assert failed.meta['isError'] is True
             assert 'nope' in failed.output
             assert failed.trust is TrustLevel.UNTRUSTED
+
+
+_PAGED_NAMES = ('t0', 't1', 't2', 't3', 't4')
+
+
+def _paged_list_tools(seen: list[object], params: object) -> types.ListToolsResult:
+    cursor = getattr(params, 'cursor', None)
+    seen.append(cursor)
+    start = 0 if cursor is None else int(str(cursor).removeprefix('page-'))
+    stop = start + 2
+    return types.ListToolsResult(
+        tools=[
+            types.Tool(name=name, description=name, input_schema={'type': 'object'})
+            for name in _PAGED_NAMES[start:stop]
+        ],
+        next_cursor=f'page-{stop}' if stop < len(_PAGED_NAMES) else None,
+    )
+
+
+@pytest.mark.parametrize('mode', ['legacy', 'auto'])
+async def test_an_sdk_server_paging_two_tools_at_a_time_hands_over_all_five(mode: str):
+    seen: list[object] = []
+
+    async def on_list_tools(ctx: object, params: object) -> types.ListToolsResult:
+        del ctx
+        return _paged_list_tools(seen, params)
+
+    server = Server('paged', on_list_tools=on_list_tools)
+    protocol = Client(server, mode=mode, cache=None)  # pyright: ignore[reportArgumentType]
+    async with McpClient('docs', protocol, RuleRedactor(), 30) as client:
+        assert list(client.tools) == [f'docs__{name}' for name in _PAGED_NAMES]
+    assert seen == [None, 'page-2', 'page-4']
+
+
+_PAGED_SERVER = """
+import json, sys
+import anyio
+import mcp_types as types
+from mcp.server.lowlevel.server import Server
+from mcp.server.stdio import stdio_server
+
+NAMES = ('t0', 't1', 't2', 't3', 't4')
+SEEN = sys.argv[1]
+
+
+async def on_list_tools(ctx, params):
+    cursor = getattr(params, 'cursor', None)
+    with open(SEEN, 'a') as handle:
+        handle.write(json.dumps(cursor) + '\\n')
+    start = 0 if cursor is None else int(cursor.removeprefix('page-'))
+    stop = start + 2
+    return types.ListToolsResult(
+        tools=[
+            types.Tool(name=n, description=n, input_schema={'type': 'object'})
+            for n in NAMES[start:stop]
+        ],
+        next_cursor=f'page-{stop}' if stop < len(NAMES) else None,
+    )
+
+
+async def main():
+    server = Server('paged', on_list_tools=on_list_tools)
+    async with stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
+
+anyio.run(main)
+"""
+
+
+async def test_a_stdio_sdk_server_paging_its_tool_list_gets_each_cursor_back(tmp_path: Path):
+    script = tmp_path / 'paged.py'
+    script.write_text(_PAGED_SERVER, encoding='utf-8')
+    seen = tmp_path / 'seen.jsonl'
+    client = connect_stdio(
+        'docs',
+        [sys.executable, str(script), str(seen)],
+        env={'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(tmp_path)},
+        cwd=str(tmp_path),
+        redactor=RuleRedactor(),
+        timeout=10,
+    )
+    async with client:
+        assert list(client.tools) == [f'docs__{name}' for name in _PAGED_NAMES]
+    cursors = [json.loads(line) for line in seen.read_text(encoding='utf-8').splitlines()]
+    assert cursors == [None, 'page-2', 'page-4']
+
+
+_TEE_SERVER = Path(__file__).parent / 'testdata' / 'mcp_tee_server.py'
+_WIRE_GOLDEN = Path(__file__).parent / 'testdata' / 'mcp_client_wire.jsonl'
+_ENVELOPE_ID = re.compile(r'^(\{"jsonrpc":"2\.0","id":)(\d+|"(?:[^"\\]|\\.)*")')
+
+
+def _numbered_ids(text: str) -> str:
+    """请求 id 换成首次出现的次序：配对留着，SDK 怎么发号不进黄金文件。"""
+    order: dict[str, int] = {}
+
+    def number(match: re.Match[str]) -> str:
+        order.setdefault(match.group(2), len(order) + 1)
+        return f'{match.group(1)}{order[match.group(2)]}'
+
+    return ''.join(_ENVELOPE_ID.sub(number, line) for line in text.splitlines(keepends=True))
+
+
+async def test_what_the_stdio_client_sends_and_receives_matches_the_wire_golden(tmp_path: Path):
+    wire = tmp_path / 'wire.jsonl'
+    client = connect_stdio(
+        'docs',
+        [sys.executable, str(_TEE_SERVER), str(wire)],
+        env={'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(tmp_path)},
+        cwd=str(tmp_path),
+        redactor=RuleRedactor(),
+        timeout=10,
+    )
+    async with client:
+        result = await client.tools['docs__echo'].execute(text='ping')
+    assert result.output == 'ping'
+    transcript = _numbered_ids(wire.read_text(encoding='utf-8')).replace(str(tmp_path), '<TMP>')
+
+    assert transcript == _WIRE_GOLDEN.read_text(encoding='utf-8')
 
 
 async def test_stdio_child_env_overrides_inherited_names_and_stderr_is_redacted(

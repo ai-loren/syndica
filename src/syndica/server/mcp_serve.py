@@ -13,12 +13,14 @@ import json
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from typing import Any, cast
 from urllib.parse import quote
 
 import jsonschema
 import mcp_types as types
 from mcp.server.lowlevel.server import Server
+from mcp.shared.exceptions import MCPError
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from syndica.kernel import (
@@ -269,21 +271,24 @@ def build_mcp_server(
     async def on_list_tools(ctx: object, params: object) -> types.ListToolsResult:
         del params
         await _touch_trace(traces, ctx)
-        listed: list[types.Tool] = []
-        for name, tool in owned.items():
-            schema = input_schema(name)
-            listed.append(
-                types.Tool(
-                    name=name,
-                    description=tool.description,
-                    input_schema=schema,
-                    annotations=types.ToolAnnotations(
-                        read_only_hint=name in read_only,
-                        destructive_hint=name not in read_only,
-                    ),
+        try:
+            listed: list[types.Tool] = []
+            for name, tool in owned.items():
+                schema = input_schema(name)
+                listed.append(
+                    types.Tool(
+                        name=name,
+                        description=tool.description,
+                        input_schema=schema,
+                        annotations=types.ToolAnnotations(
+                            read_only_hint=name in read_only,
+                            destructive_hint=name not in read_only,
+                        ),
+                    )
                 )
-            )
-        return types.ListToolsResult(tools=listed)
+            return types.ListToolsResult(tools=listed)
+        except Exception as exc:
+            raise _handler_failed('tools/list', exc) from None
 
     async def on_call_tool(ctx: object, params: object) -> types.CallToolResult:
         try:
@@ -380,27 +385,37 @@ def build_mcp_server(
 
     async def on_list_prompts(ctx: object, params: object) -> types.ListPromptsResult:
         del ctx, params
-        return types.ListPromptsResult(
-            prompts=[
-                types.Prompt(name=item.name, description=item.description) for item in prompt_list
-            ]
-        )
+        try:
+            return types.ListPromptsResult(
+                prompts=[
+                    types.Prompt(name=item.name, description=item.description)
+                    for item in prompt_list
+                ]
+            )
+        except Exception as exc:
+            raise _handler_failed('prompts/list', exc) from None
 
     async def on_get_prompt(ctx: object, params: object) -> types.GetPromptResult:
         del ctx
-        name = str(getattr(params, 'name', ''))
-        found = next((item for item in prompt_list if item.name == name), None)
-        if found is None:
-            text = (
-                f'期望 prompt 名字是已列出的角色之一。实际收到 {name!r}。下一步：先 prompts/list。'
+        try:
+            name = str(getattr(params, 'name', ''))
+            found = next((item for item in prompt_list if item.name == name), None)
+            if found is None:
+                text = (
+                    f'期望 prompt 名字是已列出的角色之一。实际收到 {name!r}。'
+                    '下一步：先 prompts/list。'
+                )
+            else:
+                text = found.text if scrub is None else scrub.redact(found.text)
+            return types.GetPromptResult(
+                messages=[
+                    types.PromptMessage(
+                        role='user', content=types.TextContent(type='text', text=text)
+                    )
+                ]
             )
-        else:
-            text = found.text if scrub is None else scrub.redact(found.text)
-        return types.GetPromptResult(
-            messages=[
-                types.PromptMessage(role='user', content=types.TextContent(type='text', text=text))
-            ]
-        )
+        except Exception as exc:
+            raise _handler_failed('prompts/get', exc) from None
 
     return Server(
         'syndica',
@@ -430,7 +445,9 @@ def streamable_http(
 ) -> tuple[ASGIApp, Callable[[], AbstractAsyncContextManager[None]]]:
     """Streamable HTTP。`lifespan` 必须在请求前进入：会话管理器只许 `run` 一次。
 
-    Host 允许表与 `_Guard` 同一对回环地址。`DELETE` 带着 `mcp-session-id` 时结束那一条 trace。
+    Host 允许表与 `_Guard` 同一对回环地址。每个 POST 的版本（`initialize` 的 `protocolVersion`、
+    `MCP-Protocol-Version` 头）在交给 SDK 之前按接受表核对。`DELETE` 带着 `mcp-session-id` 时结束
+    那一条 trace。
     """
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from mcp.server.transport_security import TransportSecuritySettings
@@ -456,7 +473,7 @@ def streamable_http(
         async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
             if scope.get('type') == 'http' and scope.get('method') == 'POST':
                 messages, body = await _buffer_request(receive)
-                rejection = _unsupported_version(body)
+                rejection = _unsupported_version(body) or _unsupported_header(scope, body)
                 if rejection is not None:
                     active = traces.redactor() if traces is not None else RuleRedactor()
                     await _reject_version(send, rejection, active)
@@ -479,6 +496,19 @@ def streamable_http(
                     await traces.aclose()
 
     return _App(), lifespan
+
+
+def _handler_failed(method: str, exc: Exception) -> MCPError:
+    """换成三件套的 JSON-RPC 错误。SDK 只原样交出 MCPError，别的异常它连原文一起回给对端。"""
+    logger.exception('mcp %s failed', method)
+    expected = f'{method} 正常返回'
+    received = f'处理时抛出了 {type(exc).__name__}，原文不回显'
+    next_action = '看 server 日志'
+    return MCPError(
+        code=types.INTERNAL_ERROR,
+        message=f'期望 {expected}。实际{received}。下一步：{next_action}。',
+        data={'expected': expected, 'received': received, 'next_action': next_action},
+    )
 
 
 def _client_name(ctx: object) -> str:
@@ -559,16 +589,33 @@ def _replay(messages: list[dict[str, Any]], receive: Receive) -> Receive:
     return inner
 
 
-def _unsupported_version(body: bytes) -> dict[str, Any] | None:
-    """SDK 会把不认识的 initialize 版本协商成它自己的一版。这里先拒绝。"""
+@dataclass(frozen=True)
+class _VersionRejection:
+    id: object
+    requested: str
+    field: str
+    next_action: str
+    status: int
+
+
+# MCP 规范：HTTP 请求没带 MCP-Protocol-Version 头、又无从得知版本时，服务端按 2025-03-26 处理。
+_ABSENT_HEADER_VERSION = '2025-03-26'
+
+
+def _json_object(body: bytes) -> dict[str, object] | None:
     try:
         payload = cast(object, json.loads(body))
     except (json.JSONDecodeError, UnicodeError):
         return None
     if not isinstance(payload, dict):
         return None
-    message = cast(dict[str, object], payload)
-    if message.get('method') != 'initialize':
+    return cast(dict[str, object], payload)
+
+
+def _unsupported_version(body: bytes) -> _VersionRejection | None:
+    """SDK 会把不认识的 initialize 版本协商成它自己的一版。这里先拒绝。"""
+    message = _json_object(body)
+    if message is None or message.get('method') != 'initialize':
         return None
     params = message.get('params')
     if isinstance(params, dict):
@@ -577,26 +624,50 @@ def _unsupported_version(body: bytes) -> dict[str, Any] | None:
         requested = None
     if isinstance(requested, str) and requested in ACCEPTED_PROTOCOL_VERSIONS:
         return None
-    shown = requested if isinstance(requested, str) else repr(requested)
-    return {'id': message.get('id'), 'requested': shown}
+    return _VersionRejection(
+        id=message.get('id'),
+        requested=requested if isinstance(requested, str) else repr(requested),
+        field='protocolVersion',
+        next_action='改成 supported 里的一个版本再 initialize',
+        status=200,
+    )
 
 
-async def _reject_version(send: Send, rejection: dict[str, Any], redactor: RuleRedactor) -> None:
+def _unsupported_header(scope: Scope, body: bytes) -> _VersionRejection | None:
+    """SDK 把接受表之外的头交给新时代的入口自己分类，不按这张表拒绝。这里先拒绝。"""
+    raw = _header(scope, b'mcp-protocol-version')
+    requested = _ABSENT_HEADER_VERSION if raw is None else raw
+    if requested in ACCEPTED_PROTOCOL_VERSIONS:
+        return None
+    message = _json_object(body)
+    return _VersionRejection(
+        id=None if message is None else message.get('id'),
+        requested=requested,
+        field='MCP-Protocol-Version',
+        next_action=(
+            '把 MCP-Protocol-Version 头改成 supported 里的一个版本，'
+            f'或省略它（按 {_ABSENT_HEADER_VERSION} 处理）'
+        ),
+        status=400,
+    )
+
+
+async def _reject_version(send: Send, rejection: _VersionRejection, redactor: RuleRedactor) -> None:
     supported = list(ACCEPTED_PROTOCOL_VERSIONS)
-    requested = redactor.redact(str(rejection['requested']))
+    requested = redactor.redact(rejection.requested)
     encoded = json.dumps(
         {
             'jsonrpc': '2.0',
-            'id': rejection['id'],
+            'id': rejection.id,
             'error': {
                 'code': -32022,
                 'message': 'Unsupported protocol version',
                 'data': {
                     'supported': supported,
                     'requested': requested,
-                    'expected': 'protocolVersion 是 ' + '、'.join(supported),
+                    'expected': f'{rejection.field} 是 ' + '、'.join(supported),
                     'received': requested,
-                    'next_action': '改成 supported 里的一个版本再 initialize',
+                    'next_action': rejection.next_action,
                 },
             },
         }
@@ -604,7 +675,7 @@ async def _reject_version(send: Send, rejection: dict[str, Any], redactor: RuleR
     await send(
         {
             'type': 'http.response.start',
-            'status': 200,
+            'status': rejection.status,
             'headers': [
                 (b'content-type', b'application/json'),
                 (b'content-length', str(len(encoded)).encode()),
@@ -614,11 +685,11 @@ async def _reject_version(send: Send, rejection: dict[str, Any], redactor: RuleR
     await send({'type': 'http.response.body', 'body': encoded})
 
 
-def _header(scope: Scope, name: bytes) -> str:
+def _header(scope: Scope, name: bytes) -> str | None:
     for key, value in scope.get('headers', []):
         if key.lower() == name:
-            return value.decode()
-    return ''
+            return value.decode('latin-1')
+    return None
 
 
 def _error(text: str) -> types.CallToolResult:

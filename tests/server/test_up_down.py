@@ -350,6 +350,83 @@ def test_a_server_that_holds_its_lock_but_does_not_answer_keeps_its_state_file(
     assert '已经有一个在跑' in refused.value.received
 
 
+_MCP_SERVER = Path(__file__).resolve().parents[1] / 'fixtures' / 'mcp_spawning_server.py'
+
+
+def _trust(workspace: Path, environ: dict[str, str]) -> None:
+    probe = _syndica(workspace, environ, 'config', 'trust')
+    digest = re.search(r'--sha256 ([0-9a-f]{64})', probe.stdout + probe.stderr)
+    assert digest is not None, probe.stdout + probe.stderr
+    trusted = _syndica(workspace, environ, 'config', 'trust', '--sha256', digest.group(1))
+    assert trusted.returncode == 0, trusted.stdout + trusted.stderr
+
+
+def _ps_running(pid: int) -> bool:
+    state = subprocess.run(
+        ['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    return bool(state) and not state.startswith('Z')
+
+
+def _mcp_pids(marker: Path) -> dict[str, int]:
+    deadline = time.monotonic() + 30
+    while not marker.exists():
+        assert time.monotonic() < deadline, 'the MCP server never reported its grandchildren'
+        time.sleep(0.05)
+    pids = json.loads(marker.read_text(encoding='utf-8'))
+    assert set(pids) == {'server', 'plain', 'detached'}
+    assert all(_ps_running(pid) for pid in pids.values())
+    assert os.getpgid(pids['detached']) == pids['detached'] != os.getpgid(pids['server'])
+    return pids
+
+
+def test_down_leaves_no_mcp_server_or_grandchild_a_session_started(tmp_path: Path, workspace: Path):
+    marker = tmp_path / 'mcp.pids'
+    (workspace / '.syndica.yaml').write_text(
+        'version: 1\n'
+        'interop:\n'
+        '  mcp:\n'
+        '    servers:\n'
+        '      - name: files\n'
+        f'        command: {json.dumps([sys.executable, str(_MCP_SERVER), "../mcp.pids"])}\n'
+        '        roles: [Worker]\n',
+        encoding='utf-8',
+    )
+    environ = _environ(tmp_path)
+    _trust(workspace, environ)
+    started = _syndica(workspace, environ, 'up', '--no-open')
+    pids: dict[str, int] = {}
+    stopped: subprocess.CompletedProcess[str] | None = None
+    try:
+        assert started.returncode == 0, started.stderr
+        match = re.search(r'http://127\.0\.0\.1:(\d+)/#login=([A-Za-z0-9_-]+)', started.stdout)
+        assert match is not None, started.stdout
+        port, token = int(match.group(1)), _login(int(match.group(1)), match.group(2))
+        request = urllib.request.Request(
+            f'http://127.0.0.1:{port}/api/v1/sessions',
+            data=b'{"role": "Worker"}',
+            headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {token}'},
+            method='POST',
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            assert json.loads(response.read())['sid']
+        pids = _mcp_pids(marker)
+
+        stopped = _syndica(workspace, environ, 'down')
+
+        assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+        assert '已停止' in stopped.stdout
+        assert sorted(name for name, pid in pids.items() if _ps_running(pid)) == []
+    finally:
+        if stopped is None:
+            _syndica(workspace, environ, 'down')
+        for pid in pids.values():
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                continue
+
+
 def test_down_stops_gracefully_with_a_stream_open_and_the_session_saved(
     tmp_path: Path, workspace: Path
 ):

@@ -335,7 +335,10 @@ async def test_a_stdio_server_whose_command_differs_from_the_pin_is_never_starte
             connector,
             workspace,
             home,
-            '    servers:\n      - name: files\n        command: [/tmp/evil, files-server]\n',
+            '    servers:\n'
+            '      - name: files\n'
+            '        command: [/tmp/evil, files-server]\n'
+            '        roles: [Worker]\n',
         )
 
     assert connector.calls == []
@@ -361,7 +364,10 @@ async def test_a_stdio_server_whose_command_matches_the_pin_is_handed_the_variab
         connector,
         workspace,
         home,
-        '    servers:\n      - name: files\n        command: [files-server]\n',
+        '    servers:\n'
+        '      - name: files\n'
+        '        command: [files-server]\n'
+        '        roles: [Worker]\n',
     )
 
     assert opened is not None
@@ -387,7 +393,10 @@ async def test_an_http_server_whose_url_matches_the_pin_is_handed_the_bearer(tmp
         connector,
         workspace,
         home,
-        '    servers:\n      - name: tracker\n        url: https://mcp.example.com/mcp\n',
+        '    servers:\n'
+        '      - name: tracker\n'
+        '        url: https://mcp.example.com/mcp\n'
+        '        roles: [Worker]\n',
     )
 
     assert opened is not None
@@ -417,11 +426,125 @@ async def test_one_mismatched_pin_starts_none_of_the_servers(tmp_path: Path):
             '    servers:\n'
             '      - name: files\n'
             '        command: [files-server]\n'
+            '        roles: [Worker]\n'
             '      - name: tracker\n'
-            '        url: https://attacker.example/mcp\n',
+            '        url: https://attacker.example/mcp\n'
+            '        roles: [Worker]\n',
         )
 
     assert connector.calls == []
+
+
+@pytest.mark.parametrize('roles', ['', '        roles: []\n'], ids=['omitted', 'empty'])
+async def test_a_server_no_role_uses_is_never_handed_to_the_connector(tmp_path: Path, roles: str):
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    connector = _Connector()
+
+    opened = await _open_with(
+        connector,
+        workspace,
+        home,
+        '    servers:\n'
+        '      - name: idle\n'
+        '        command: [idle-server]\n'
+        f'{roles}'
+        '      - name: files\n'
+        '        command: [files-server]\n'
+        '        roles: [Worker]\n',
+    )
+
+    assert opened is not None
+    assert [(kind, name) for kind, name, _command, _kwargs in connector.calls] == [
+        ('stdio', 'files')
+    ]
+    assert [getattr(client, 'name', None) for client in opened.clients] == ['files']
+
+
+async def test_only_unused_servers_open_nothing(tmp_path: Path):
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    connector = _Connector()
+
+    opened = await _open_with(
+        connector,
+        workspace,
+        home,
+        '    servers:\n'
+        '      - name: idle\n'
+        '        command: [idle-server]\n'
+        '      - name: tracker\n'
+        '        url: https://mcp.example.com/mcp\n'
+        '        roles: []\n',
+    )
+
+    assert opened is None
+    assert connector.calls == []
+
+
+async def test_an_unused_servers_mismatched_pin_does_not_block_the_used_one(tmp_path: Path):
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    _user_credentials(
+        home, 'credentials:\n  mcp:idle:\n    command: [idle-server]\n    env: [FILES_TOKEN]\n'
+    )
+    connector = _Connector()
+
+    opened = await _open_with(
+        connector,
+        workspace,
+        home,
+        '    servers:\n'
+        '      - name: idle\n'
+        '        command: [/tmp/evil, idle-server]\n'
+        '      - name: files\n'
+        '        command: [files-server]\n'
+        '        roles: [Worker]\n',
+    )
+
+    assert opened is not None
+    [(kind, name, _command, kwargs)] = connector.calls
+    assert (kind, name) == ('stdio', 'files')
+    assert 'FILES_TOKEN' not in kwargs['env']  # type: ignore[operator]
+
+
+async def test_a_declared_server_without_roles_never_runs_its_command(tmp_path: Path):
+    started = tmp_path / 'started'
+    script = tmp_path / 'srv.py'
+    script.write_text(f'open({str(started)!r}, "w").write("started")\n' + _SERVER, encoding='utf-8')
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    config = _config(
+        workspace / '.syndica.yaml',
+        'version: 1\n'
+        'interop:\n'
+        '  mcp:\n'
+        '    servers:\n'
+        '      - name: files\n'
+        f'        command: [{sys.executable!r}, {str(script)!r}]\n'
+        '        roles: []\n',
+    )
+
+    opened = await open_mcp_clients(
+        config,
+        {'PATH': os.environ.get('PATH', '')},
+        cwd=str(workspace),
+        redactor=RuleRedactor(),
+        environ={'HOME': str(tmp_path / 'home'), 'PATH': os.environ.get('PATH', '')},
+        judge=DangerJudge(),
+        workspace=str(workspace),
+        ports=_PORTS,
+    )
+
+    try:
+        assert opened is None
+        assert not started.exists()
+    finally:
+        if opened is not None:
+            await opened.aclose()
 
 
 async def test_a_project_url_other_than_the_pin_never_receives_a_request(tmp_path: Path):
@@ -546,6 +669,108 @@ def test_doctor_lists_the_negotiated_version(tmp_path: Path):
     line = next(item for item in outcome.output.splitlines() if item.startswith('mcp: ok files '))
     version = line.removeprefix('mcp: ok files ')
     assert version in ACCEPTED_PROTOCOL_VERSIONS
+
+
+_CYCLIC_SERVER = _SERVER.replace(
+    '            )\n        ]\n    )\n\n\nasync def on_call_tool',
+    '            ),\n'
+    '            types.Tool(\n'
+    '                name="loop",\n'
+    '                description="loop",\n'
+    '                input_schema={"type": "object", "properties": {"self": {"$ref": "#"}}},\n'
+    '            ),\n'
+    '        ]\n    )\n\n\nasync def on_call_tool',
+)
+
+
+def _doctor(workspace: Path, config: str, environ: dict[str, str] | None = None):
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
+        io=CliIO(stdin=StringIO(), stdout=StringIO(), stderr=StringIO()),
+        model_factory=lambda _: ScriptedLLM([ScriptedTurn(content='idle')]),
+        workspace_root=workspace,
+        environ=environ,
+        mcp_opener=_open_mcp,
+    )
+    try:
+        return host.doctor(config)
+    finally:
+        host.close()
+
+
+def test_doctor_names_the_tool_whose_schema_could_not_be_inlined(tmp_path: Path):
+    script = tmp_path / 'srv.py'
+    script.write_text(_CYCLIC_SERVER, encoding='utf-8')
+    assert 'name="loop"' in _CYCLIC_SERVER
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    config = _config(
+        workspace / '.syndica.yaml',
+        'version: 1\n'
+        'interop:\n'
+        '  mcp:\n'
+        '    servers:\n'
+        '      - name: files\n'
+        f'        command: [{sys.executable!r}, {str(script)!r}]\n'
+        '        roles: [Worker]\n',
+    )
+
+    outcome = _doctor(workspace, config.source)
+
+    assert outcome.exit_code == 0
+    mcp_lines = [line for line in outcome.output.splitlines() if line.startswith('mcp: ')]
+    assert [line.rsplit(' ', 1)[0] for line in mcp_lines] == [
+        'mcp: ok files',
+        'mcp: excluded files loop',
+    ]
+    assert mcp_lines[1] == 'mcp: excluded files loop cyclic-$ref'
+
+
+def test_doctor_warns_once_per_user_level_credential_this_project_does_not_declare(
+    tmp_path: Path,
+):
+    script = tmp_path / 'srv.py'
+    script.write_text(_SERVER, encoding='utf-8')
+    home = tmp_path / 'home'
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    command = json.dumps([sys.executable, str(script)])
+    _user_credentials(
+        home,
+        'credentials:\n'
+        '  mcp:tracker:\n'
+        '    url: https://mcp.example.com/mcp\n'
+        '    bearer_env: TRACKER_TOKEN\n'
+        '  a2a:ghost:\n'
+        '    url: https://ghost.example/a2a/\n'
+        '    bearer_env: GHOST_TOKEN\n'
+        '  mcp:files:\n'
+        f'    command: {command}\n'
+        '    env: [FILES_TOKEN]\n',
+    )
+    config = _config(
+        workspace / '.syndica.yaml',
+        'version: 1\n'
+        'interop:\n'
+        '  mcp:\n'
+        '    servers:\n'
+        '      - name: files\n'
+        f'        command: {command}\n'
+        '        roles: [Worker]\n',
+    )
+
+    outcome = _doctor(
+        workspace, config.source, {'HOME': str(home), 'PATH': os.environ.get('PATH', '')}
+    )
+
+    assert outcome.exit_code == 0
+    warnings = [line for line in outcome.output.splitlines() if line.startswith('interop: ')]
+    assert warnings == [
+        f'interop: warning {key}（用户级 interop.yaml 有这项，'
+        '这份项目配置没声明对应的外部对象；对不上只是警告）'
+        for key in ('a2a:ghost', 'mcp:tracker')
+    ]
+    assert any(line.startswith('mcp: ok files ') for line in outcome.output.splitlines())
 
 
 def test_a_scripted_worker_records_the_external_call_and_blocks_the_next_high_risk_one(

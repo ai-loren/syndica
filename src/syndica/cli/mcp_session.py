@@ -1,6 +1,7 @@
-"""会话开始前连上项目里声明的 MCP 服务。
+"""会话开始前连上项目里声明、且有角色用到的 MCP 服务。
 
-backend 由组合根注入。没有服务时不调用注入的连接函数。环境交给子进程的是完整的 Agent 环境，
+backend 由组合根注入。没有角色用到的服务不拉起、不核对凭证：拉起它只会多一个谁也调不到的外部
+进程。一个都不用连时不调用注入的连接函数。环境交给子进程的是完整的 Agent 环境，
 再叠上用户级文件点名的变量，不是宿主环境的增量。用户级凭证钉住的目的地与哪个服务对不上，就
 一个服务都不连：先核对完全部，再拉起第一个。配置里没有每服务超时，调用先限 30 秒，
 再和这个 Agent 的墙钟剩余取较小者。
@@ -88,8 +89,8 @@ async def open_mcp_clients(
     workspace: str,
     ports: McpPorts,
 ) -> OpenedMcp | None:
-    """连上 `interop.mcp.servers`。一个都没有时返回 None，不碰 `ports`。"""
-    servers = config.interop.mcp_servers
+    """连上 `interop.mcp.servers` 里 `roles` 非空的服务。一个都没有时返回 None，不碰 `ports`。"""
+    servers = tuple(server for server in config.interop.mcp_servers if server.roles)
     if not servers:
         return None
     credentials = _credentials(environ, workspace)

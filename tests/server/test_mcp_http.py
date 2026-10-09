@@ -9,13 +9,14 @@ from typing import Any
 
 import httpx
 import httpx2
+import pytest
 from mcp.client.client import Client
 from mcp.client.streamable_http import streamable_http_client
 from server_fakes import FakeAssembly, running
 from test_mcp_serve import _portal, _server
 
 from syndica.kernel import InMemoryTraceStore, RuleRedactor
-from syndica.server import ProtocolMount
+from syndica.server import ProtocolMount, mcp_serve
 from syndica.server.mcp_serve import ACCEPTED_PROTOCOL_VERSIONS, McpTraces, streamable_http
 
 
@@ -157,6 +158,123 @@ async def test_only_the_exact_accepted_versions_get_past_the_gate_before_the_sdk
         assert response.status_code == 200
         assert '-32022' not in response.text
         assert 'protocolVersion' in response.text
+
+
+async def _post(
+    client: httpx.AsyncClient,
+    token: str,
+    payload: dict[str, Any],
+    *,
+    version: str | None = None,
+    session: str | None = None,
+) -> httpx.Response:
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/json, text/event-stream',
+        'Content-Type': 'application/json',
+    }
+    if version is not None:
+        headers['MCP-Protocol-Version'] = version
+    if session is not None:
+        headers['Mcp-Session-Id'] = session
+    return await client.post('/mcp', headers=headers, json=payload)
+
+
+_LIST = {'jsonrpc': '2.0', 'id': 11, 'method': 'tools/list', 'params': {}}
+
+
+@pytest.mark.parametrize('version', ['2099-01-01', '2025-13-40', '2025-06-180', '2025-06'])
+async def test_tools_list_with_an_unknown_version_header_is_refused_before_the_sdk(
+    tmp_path: Path, version: str
+) -> None:
+    store = InMemoryTraceStore()
+
+    def mounts(port: int) -> tuple[ProtocolMount, ...]:
+        return (_mount(tmp_path, port, store),)
+
+    async with running(FakeAssembly(), mount_factory=mounts) as server:
+        async with httpx.AsyncClient(base_url=server.base, timeout=10) as client:
+            response = await _post(client, server.token, _LIST, version=version)
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body['id'] == 11
+    assert body['error']['code'] == -32022
+    data = body['error']['data']
+    assert data['supported'] == list(ACCEPTED_PROTOCOL_VERSIONS)
+    assert data['requested'] == data['received'] == version
+    assert data['expected'].startswith('MCP-Protocol-Version 是 ')
+    assert 'MCP-Protocol-Version' in data['next_action']
+    assert await store.traces() == []
+
+
+async def test_a_header_version_the_sdk_speaks_but_the_table_drops_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    narrowed = tuple(item for item in ACCEPTED_PROTOCOL_VERSIONS if item != '2025-06-18')
+    monkeypatch.setattr(mcp_serve, 'ACCEPTED_PROTOCOL_VERSIONS', narrowed)
+
+    def mounts(port: int) -> tuple[ProtocolMount, ...]:
+        return (_mount(tmp_path, port),)
+
+    async with running(FakeAssembly(), mount_factory=mounts) as server:
+        async with httpx.AsyncClient(base_url=server.base, timeout=10) as client:
+            response = await _post(client, server.token, _LIST, version='2025-06-18')
+
+    body = response.json()
+    assert body['error']['code'] == -32022
+    assert body['error']['data']['supported'] == list(narrowed)
+    assert body['error']['data']['requested'] == '2025-06-18'
+
+
+async def _handshake_without_header(client: httpx.AsyncClient, token: str) -> str:
+    opened = await _initialize(client, token, '2025-06-18')
+    assert opened.status_code == 200, opened.text
+    session = opened.headers['mcp-session-id']
+    initialized = await _post(
+        client,
+        token,
+        {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+        session=session,
+    )
+    assert initialized.status_code == 202, initialized.text
+    return session
+
+
+async def test_an_absent_version_header_is_taken_as_the_spec_default_and_passes(
+    tmp_path: Path,
+) -> None:
+    def mounts(port: int) -> tuple[ProtocolMount, ...]:
+        return (_mount(tmp_path, port),)
+
+    async with running(FakeAssembly(), mount_factory=mounts) as server:
+        async with httpx.AsyncClient(base_url=server.base, timeout=10) as client:
+            session = await _handshake_without_header(client, server.token)
+            listed = await _post(client, server.token, _LIST, session=session)
+
+    assert listed.status_code == 200, listed.text
+    assert '-32022' not in listed.text
+    assert '"Read"' in listed.text
+
+
+async def test_an_absent_header_is_refused_once_the_spec_default_leaves_the_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    narrowed = tuple(item for item in ACCEPTED_PROTOCOL_VERSIONS if item != '2025-03-26')
+
+    def mounts(port: int) -> tuple[ProtocolMount, ...]:
+        return (_mount(tmp_path, port),)
+
+    async with running(FakeAssembly(), mount_factory=mounts) as server:
+        async with httpx.AsyncClient(base_url=server.base, timeout=10) as client:
+            session = await _handshake_without_header(client, server.token)
+            monkeypatch.setattr(mcp_serve, 'ACCEPTED_PROTOCOL_VERSIONS', narrowed)
+            response = await _post(client, server.token, _LIST, session=session)
+
+    assert response.status_code == 400
+    data = response.json()['error']['data']
+    assert data['requested'] == '2025-03-26'
+    assert data['supported'] == list(narrowed)
 
 
 async def test_a_rejected_version_is_redacted_with_the_connections_redactor(

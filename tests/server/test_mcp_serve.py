@@ -5,13 +5,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from io import StringIO
 from pathlib import Path
 
+import anyio
 import mcp_types as types
 import pytest
 from mcp.client.client import Client
 from mcp.server.lowlevel.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.shared.exceptions import MCPError
 
 from syndica.cli.host import RuntimeCliHost
 from syndica.cli.main import CliIO
@@ -155,6 +159,65 @@ async def test_both_eras_list_read_grep_prompt_and_redacted_resources(tmp_path: 
                 assert _SECRET not in binary_text
     finally:
         await portal.close()
+
+
+_WIRE_GOLDEN = Path(__file__).parent / 'testdata' / 'mcp_serve_wire.jsonl'
+_WIRE_SCRIPT = (
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18",'
+    '"capabilities":{},"clientInfo":{"name":"golden","version":"0"}}}',
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"Read",'
+    '"arguments":{"path":"notes.md"}}}',
+    '{"jsonrpc":"2.0","id":4,"method":"resources/list","params":{}}',
+    '{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"syndica://artifact/note"}}',
+    '{"jsonrpc":"2.0","id":6,"method":"prompts/list","params":{}}',
+    '{"jsonrpc":"2.0","id":7,"method":"prompts/get","params":{"name":"Worker"}}',
+)
+
+
+async def _stdio_transcript(server: Server, script: tuple[str, ...]) -> list[str]:
+    """`syndica mcp` 用的 stdio 传输，接在两条管道上：一行一行喂进去，原样收回 server 写出的行。"""
+    to_server, feed_end = os.pipe()
+    reply_end, from_server = os.pipe()
+    stdin = anyio.wrap_file(open(to_server, encoding='utf-8'))  # noqa: ASYNC230
+    stdout = anyio.wrap_file(open(from_server, 'w', encoding='utf-8'))  # noqa: ASYNC230
+    replies = anyio.wrap_file(open(reply_end, encoding='utf-8'))  # noqa: ASYNC230
+    feed = open(feed_end, 'w', encoding='utf-8')  # noqa: ASYNC230
+
+    async def serve() -> None:
+        async with stdio_server(stdin, stdout) as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+
+    serving = asyncio.create_task(serve())
+    lines: list[str] = []
+    try:
+        for request in script:
+            feed.write(request + '\n')
+            feed.flush()
+            lines.append(request)
+            if '"id"' in request:
+                lines.append((await asyncio.wait_for(replies.readline(), 10)).rstrip('\n'))
+    finally:
+        feed.close()
+        await asyncio.wait_for(serving, 10)
+        await stdout.aclose()
+        await replies.aclose()
+    return lines
+
+
+async def test_a_scripted_stdio_session_matches_the_wire_golden_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    portal, root = await _portal(tmp_path)
+    try:
+        lines = await _stdio_transcript(_server(portal, root), _WIRE_SCRIPT)
+    finally:
+        await portal.close()
+    transcript = '\n'.join(line.replace(str(root), '<ROOT>') for line in lines) + '\n'
+
+    assert _SECRET not in transcript
+    assert transcript == _WIRE_GOLDEN.read_text(encoding='utf-8')
 
 
 async def test_bash_and_git_are_refused_and_an_external_write_reads_back_untrusted(
@@ -407,6 +470,89 @@ async def test_an_error_raised_past_call_external_is_neither_echoed_nor_leaks_a_
     assert '下一步：看 server 的 stderr 日志' in text
     assert _SECRET not in text
     assert 'quiz' not in text
+
+
+class _LeakyDescription(Tool):
+    __tool_name__ = 'Leaky'
+    __tool_command_args__ = ()
+
+    @property
+    def description(self) -> str:
+        raise RuntimeError(f'description blew up {_SECRET}')
+
+    async def execute(self) -> ToolResult:
+        """列清单时就失败的工具。"""
+        raise AssertionError('never called')
+
+
+class _LeakyPrompt(McpPrompt):
+    def __init__(self, broken: str) -> None:
+        super().__init__('Leaky', 'ok', 'ok')
+        self._broken = broken
+
+    def __getattribute__(self, name: str) -> object:
+        if name == object.__getattribute__(self, '_broken'):
+            raise RuntimeError(f'{name} blew up {_SECRET}')
+        return object.__getattribute__(self, name)
+
+
+def _three_parts(caught: pytest.ExceptionInfo[MCPError], method: str) -> None:
+    error = caught.value.error
+    assert error.code == types.INTERNAL_ERROR
+    assert _SECRET not in error.model_dump_json()
+    assert 'blew up' not in error.model_dump_json()
+    assert error.data == {
+        'expected': f'{method} 正常返回',
+        'received': '处理时抛出了 RuntimeError，原文不回显',
+        'next_action': '看 server 日志',
+    }
+    assert error.message == (
+        f'期望 {method} 正常返回。'
+        '实际处理时抛出了 RuntimeError，原文不回显。'
+        '下一步：看 server 日志。'
+    )
+
+
+@pytest.mark.parametrize('mode', ['legacy', 'auto'])
+async def test_a_failing_tools_list_is_a_three_part_error_without_the_secret(
+    tmp_path: Path, mode: str
+) -> None:
+    portal, root = await _portal(tmp_path)
+    try:
+        server = _server(portal, root, extra={'Leaky': _LeakyDescription()})
+        async with Client(server, mode=mode, cache=None) as client:  # pyright: ignore[reportArgumentType]
+            with pytest.raises(MCPError) as caught:
+                await client.list_tools(cache_mode='bypass')
+    finally:
+        await portal.close()
+    _three_parts(caught, 'tools/list')
+
+
+@pytest.mark.parametrize('mode', ['legacy', 'auto'])
+@pytest.mark.parametrize(
+    ('broken', 'method'), [('description', 'prompts/list'), ('text', 'prompts/get')]
+)
+async def test_a_failing_prompt_handler_is_a_three_part_error_without_the_secret(
+    tmp_path: Path, mode: str, broken: str, method: str
+) -> None:
+    portal, root = await _portal(tmp_path)
+    try:
+        server = build_mcp_server(
+            {'Read': Read(portal)},
+            policy=_policy(root),
+            read_only=_READ_ONLY,
+            redactor=RuleRedactor(),
+            prompts=(_LeakyPrompt(broken),),
+        )
+        async with Client(server, mode=mode, cache=None) as client:  # pyright: ignore[reportArgumentType]
+            with pytest.raises(MCPError) as caught:
+                if method == 'prompts/list':
+                    await client.list_prompts()
+                else:
+                    await client.get_prompt('Leaky')
+    finally:
+        await portal.close()
+    _three_parts(caught, method)
 
 
 def test_the_composed_server_marks_only_read_grep_glob_read_only(tmp_path: Path) -> None:

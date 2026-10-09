@@ -1,0 +1,15 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"golden","version":"0"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"prompts":{"listChanged":false},"resources":{"listChanged":false,"subscribe":false},"tools":{"listChanged":false}},"protocolVersion":"2025-06-18","serverInfo":{"name":"syndica","version":""}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"annotations":{"destructiveHint":false,"readOnlyHint":true},"description":"读取工作区里的一个文本文件。","inputSchema":{"properties":{"path":{"type":"string","description":"相对工作区根的路径"},"offset":{"type":"integer","description":"从 1 开始的行号，默认 1"},"limit":{"type":"integer","description":"最多返回的行数，默认 2000"}},"required":["path"],"type":"object"},"name":"Read"},{"annotations":{"destructiveHint":false,"readOnlyHint":true},"description":"按 Python 正则搜索文件，每条结果包含相对路径、行号和行内容。\n结果太多时可能只列出前面一部分，并写明共几条；以 . 开头的目录与文件、二进制文件可能不搜，\n要搜某个以 . 开头的目录或文件就把它写进 path。","inputSchema":{"properties":{"pattern":{"type":"string","description":"Python 正则表达式"},"path":{"type":"string","description":"相对工作区根的文件或目录，默认搜索整个工作区"}},"required":["pattern"],"type":"object"},"name":"Grep"},{"annotations":{"destructiveHint":false,"readOnlyHint":true},"description":"按相对工作区根的模式查找路径，结果按字典序排列。\n结果太多时可能只列出前面一部分，并写明共几条；以 . 开头的目录与文件可能不列，要找它们就在\npattern 里写出来（例如 .github/**）。","inputSchema":{"properties":{"pattern":{"type":"string","description":"相对工作区根的 glob 模式"}},"required":["pattern"],"type":"object"},"name":"Glob"}]}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"Read","arguments":{"path":"notes.md"}}}
+{"jsonrpc":"2.0","id":3,"result":{"_meta":{"trust":"untrusted"},"content":[{"text":"alpha marker","type":"text"}],"isError":false}}
+{"jsonrpc":"2.0","id":4,"method":"resources/list","params":{}}
+{"jsonrpc":"2.0","id":4,"result":{"resources":[{"mimeType":"text/plain","name":"note","uri":"syndica://artifact/note"},{"mimeType":"application/octet-stream","name":"bin","uri":"syndica://artifact/bin"}]}}
+{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"syndica://artifact/note"}}
+{"jsonrpc":"2.0","id":5,"result":{"contents":[{"mimeType":"text/plain","text":"正文 [REDACTED:secret.env_value]","uri":"syndica://artifact/note"}]}}
+{"jsonrpc":"2.0","id":6,"method":"prompts/list","params":{}}
+{"jsonrpc":"2.0","id":6,"result":{"prompts":[{"description":"干活的角色","name":"Worker"}]}}
+{"jsonrpc":"2.0","id":7,"method":"prompts/get","params":{"name":"Worker"}}
+{"jsonrpc":"2.0","id":7,"result":{"messages":[{"content":{"text":"系统提示 [REDACTED:secret.env_value]","type":"text"},"role":"user"}]}}
