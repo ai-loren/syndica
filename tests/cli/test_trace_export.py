@@ -1171,6 +1171,41 @@ def test_a_chat_session_is_exported_when_the_host_closes(tmp_path: Path):
     assert [call['trace_id'][:8] for call in spy.calls] == [_only_directory(tmp_path)[-8:]]
 
 
+def test_a_ctrl_c_that_stops_the_loop_mid_export_does_not_turn_into_a_traceback_on_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """按键落在导出任务已经完成、循环还没处理「停下」回调的那一刻：那个回调留在队列里，下一次
+    `run_until_complete` 一开始就被它停下。关循环时还有任务要取消，停在半路就是一个
+    RuntimeError。"""
+
+    async def finishes_then_a_press_lands(self: Any, item: Any) -> None:
+        loop = asyncio.get_running_loop()
+        loop.create_task(asyncio.sleep(3600))
+
+        def press() -> None:
+            raise KeyboardInterrupt
+
+        loop.call_soon(press)
+
+    monkeypatch.setattr(RuntimeCliHost, '_export', finishes_then_a_press_lands)
+    stdout, stderr = StringIO(), StringIO()
+    io = CliIO(stdin=StringIO('hello\n'), stdout=stdout, stderr=stderr)
+    host = RuntimeCliHost(
+        trust=NO_TRUST_GATE,
+        io=io,
+        model_factory=lambda _: ScriptedLLM([ScriptedTurn(content='hi')]),
+        workspace_root=tmp_path,
+        environ={'OTEL_EXPORTER_OTLP_ENDPOINT': 'http://localhost:9'},
+        exporter=_Spy(),
+    )
+    code = main(['chat'], host=host, io=io)
+
+    host.close(interrupted=False)
+
+    assert code == 0
+    assert '导出被中断；要导出就运行 syndica trace export ' in stderr.getvalue()
+
+
 def test_an_export_refuses_with_2_when_the_config_it_redacts_with_cannot_be_read(tmp_path: Path):
     spy = _Spy()
     _run(tmp_path, {}, exporter=spy)

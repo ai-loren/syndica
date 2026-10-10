@@ -2477,7 +2477,7 @@ class RuntimeCliHost:
         try:
             with self._logging_to_stderr():
                 self._runner.run(self._close_sessions(interrupted=interrupted))
-                self._flush_exports()
+                pressed = self._flush_exports()
         except KeyboardInterrupt:
             pressed = True
             raise
@@ -2485,7 +2485,7 @@ class RuntimeCliHost:
             self._close_loop(pressed=pressed)
 
     def _close_loop(self, *, pressed: bool = False) -> None:
-        """关掉事件循环。这时按的 Ctrl-C、或者收会话时按的那一次（它把循环停在了半路上），会让
+        """关掉事件循环。这时按的 Ctrl-C、或者收会话与导出时按的那一次（它把循环停在了半路上），会让
         关线程池交出「Event loop stopped before Future completed」这个 RuntimeError 而不是
         KeyboardInterrupt；循环照样关掉了，结论早已打出去，按过键时两者都不再往外抛——收会话时
         按的那一次由 `close` 接着往外抛。没按过键的 RuntimeError 照抛。"""
@@ -2510,9 +2510,10 @@ class RuntimeCliHost:
             if previous is not None:
                 signal.signal(signal.SIGINT, previous)
 
-    def _flush_exports(self) -> None:
+    def _flush_exports(self) -> bool:
         """run 结束时的导出放在结论打出去之后：导出可能要等，这时按的 Ctrl-C 不该把一次做完的 run
-        变成被中断的。被打断就不再发剩下的，逐个说怎么补发。"""
+        变成被中断的。被打断就不再发剩下的，逐个说怎么补发，并交回 True：那次按键可能把循环停在了
+        半路上，`_close_loop` 要知道按过键。"""
         pending, self._exports = self._exports, []
         for number, item in enumerate(pending):
             try:
@@ -2521,7 +2522,8 @@ class RuntimeCliHost:
                 for skipped in pending[number:]:
                     resend = f'syndica trace export {skipped.trace_id[:8]}'
                     self._warn(skipped.redactor.redact(f'导出被中断；要导出就运行 {resend}。'))
-                return
+                return True
+        return False
 
     def _config_file(self, path: str) -> Path | None:
         """配置文件本身（trace 记下它的 sha256）；用的是内置默认配置时 None。"""
