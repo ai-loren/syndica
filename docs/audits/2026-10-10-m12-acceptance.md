@@ -7,6 +7,17 @@
 
 ## 结论
 
+合入主线、修掉 B1 与 B3 之后（`9bc819a`），在主线上从构建出的 wheel 重跑 `sh scripts/acceptance.sh`，四项全部通过：
+
+| 项 | 主线 `9bc819a` |
+| --- | --- |
+| (a) 新机器照 README 五分钟内完成 CLI run | PASS，95.4 s（容器启动到跑完 89.5 s，上限 300 s） |
+| (b) Web UI：多 Agent 任务、人工确认、查看产物 | PASS，4.6 s（委派、在页面上批准、预览产物） |
+| (c) MCP / OpenAI SDK 连本地 server 完成工具调用 | PASS，2.2 s（客户端工具往返、MCP 列工具与 Read、该不可信处标不可信） |
+| (d) 跑一批任务并导出训练数据 | PASS，3.0 s（裁决 pass / block / partial / unverified；导出在工作区之外；密钥不在导出里） |
+
+下面是线 E 在自己分支上的记录，保留原样。
+
 | 项 | 本分支（`530a0d7` 构建的 wheel） | 只加 `httpx<1` 上限的同一棵树 |
 | --- | --- | --- |
 | (a) 新机器照 README 五分钟内完成 CLI run | **FAIL**：照 README 的 `pip install --pre` 装到 `httpx 1.0.dev6`，`syndica run` 每次调模型都失败（问题 B1） | PASS，容器启动到跑完 105.7 s（另一次 7.4 s） |
@@ -198,7 +209,10 @@ Playwright 套件（桌面与移动 28/28，用改过的假端点）都通过。
 
 ## 遗留
 
-- B1 要线 B（`pyproject.toml`）或线 D（README、install 页）改；改完之后重跑 `sh scripts/acceptance.sh`，(a) 应当通过。
-- B3 的 RELEASING.md 措辞。
+- B1 已在主线修掉（`9bc819a`）：直接 import httpx 的 backend 所在的 extra（`openai`、`otel`、`a2a`，以及 `dev`）
+  封顶 `httpx>=0.27,<1`，MCP backend 用的是 MCP SDK 的 `httpx2`，不需要；`smoke_install.sh` 改为
+  `--prerelease allow` 解析，照用户装 rc 的方式撞预发布依赖；一条用例把每个 import httpx 的 backend 映射到它的
+  extra 并要求封顶。修完之后 (a) 通过（见结论）。
+- B3 已改：RELEASING.md 写明 (a) 在容器里，其余三项在全新的 venv 里，都从构建出的 wheel。
 - 真模型模式：有 key 时 (a) 与 (d) 会自动多跑一遍并报告；本次没有 key，没跑。
 - 路线图的「所有 demo 都有录屏或截图证据」：验收每次在运行目录里写出 (b) 的三张截图，没有提交进仓库。
