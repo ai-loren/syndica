@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -167,3 +168,4 @@ def test_an_explicit_file_naming_a_symlink_loop_is_a_config_error(tmp_path: Path
         _load({'file': 'a.md'}, tmp_path)
     _three_parts(excinfo.value)
     assert "'a.md'" in excinfo.value.received
+    assert re.search(r'loop|成环', excinfo.value.received)

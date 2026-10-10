@@ -402,12 +402,15 @@ def _explicit_prompt_file(table: Mapping[object, object], origin: str | None) ->
             next_action='改成一个更短、真实存在的相对路径',
         ) from exc
     if relative.is_absolute() or not exists:
+        # 3.13 起非 strict 的 `resolve` 遇到成环的符号链接不再抛，停在环上的那条链接交回来。
+        unresolved = '一条解析不到文件的符号链接（目标不存在或成环）'
         raise ConfigError(
             expected=f'system_prompt.file 是 {rooted} 之内的一个文件',
             received=(
                 f'{shown!r} 是绝对路径'
                 if relative.is_absolute()
-                else f'{candidate} 不存在或不是文件'
+                else f'{shown!r} 解析到 {candidate}，'
+                + (unresolved if candidate.is_symlink() else '它不存在或不是文件')
             ),
             next_action='写清单所在目录之内的相对路径，并确认文件存在',
         )
