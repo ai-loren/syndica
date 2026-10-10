@@ -112,13 +112,14 @@ record() {
   echo "$line"
 }
 
-# 非交互 shell 的后台任务（--jobs 2 的两路）把 SIGINT、SIGQUIT 设成忽略，忽略会经 exec 一路继承到
-# pytest：Ctrl-C 的用例全红，被测的程序也收不到 Ctrl-C。每一格先复位成默认处置再起。
 host_env() {
   env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" \
-    LANG="${LANG:-en_US.UTF-8}" CI=true \
-    perl -e '$SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or die "exec $ARGV[0]: $!\n"' -- "$@"
+    LANG="${LANG:-en_US.UTF-8}" CI=true "$@"
 }
+
+# 非交互 shell 的后台任务（--jobs 2 的两路）把 SIGINT、SIGQUIT 设成忽略，忽略会经 exec 一路继承到
+# pytest：Ctrl-C 的用例全红，被测的程序也收不到 Ctrl-C。每一格先复位成默认处置再起。
+DEFAULT_SIGNALS='$SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or die "exec $ARGV[0]: $!\n"'
 
 run_host() {
   cell=$1
@@ -126,8 +127,8 @@ run_host() {
   shift 2
   log="$out/$cell.log"
   started=$(date +%s)
-  host_env UV_PYTHON="$python" sh "$out/harness/local_ci_cell.sh" "$out/export" "$out/$cell" "$@" \
-    > "$log" 2>&1
+  host_env UV_PYTHON="$python" perl -e "$DEFAULT_SIGNALS" -- \
+    sh "$out/harness/local_ci_cell.sh" "$out/export" "$out/$cell" "$@" > "$log" 2>&1
   record "$cell" $? $(($(date +%s) - started)) "$log"
 }
 
