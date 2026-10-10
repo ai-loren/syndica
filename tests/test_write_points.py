@@ -1134,3 +1134,166 @@ def test_the_guard_flags_every_write_whose_content_it_cannot_see(source: str, ex
 )
 def test_the_guard_allows_content_free_constant_and_redacted_writes(source: str):
     assert _violations(source) == []
+
+
+# `encode_assured` 绕过 `write_redacted` 的逐值核对，只做保真编码：只有「类型即脱敏证明」的写入面
+# 能调它——四个文件 store 的写盘方法，它们的公开写入面只收脱敏收口铸造过的 `Redacted*` 类型。按
+# （文件, 所在的限定名）逐处写死，次数也算：同一个文件里多一处、别的文件里出现一处、把它当值传出去、
+# 改名导入、经 `getattr` 取，都会变红。
+_ASSURED: dict[str, tuple[str, ...]] = {
+    'kernel/redaction.py': ('def encode_assured',),
+    'kernel/stores/file_artifact.py': ('FileArtifactStore._write', 'import'),
+    'kernel/stores/file_memory.py': ('FileMemoryStore._write', 'import'),
+    'kernel/stores/file_rubric.py': ('FileRubricStore._write', 'import'),
+    'kernel/stores/file_session.py': ('FileSessionStore._write_json', 'import'),
+}
+_ASSURED_NAME = 'encode_assured'
+
+
+class _AssuredUses(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.scope: list[str] = []
+        self.found: list[str] = []
+        self._callees: set[int] = set()
+        self._exports: set[int] = set()
+
+    def _here(self) -> str:
+        return '.'.join(self.scope) or '<module>'
+
+    def _scoped(self, node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        if node.name == _ASSURED_NAME and not isinstance(node, ast.ClassDef):
+            self.found.append(f'def {_ASSURED_NAME}')
+        self.scope.append(node.name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+    visit_ClassDef = _scoped
+    visit_FunctionDef = _scoped
+    visit_AsyncFunctionDef = _scoped
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if any(isinstance(target, ast.Name) and target.id == '__all__' for target in node.targets):
+            self._exports.update(id(child) for child in ast.walk(node.value))
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            if alias.name == _ASSURED_NAME:
+                self.found.append('import' if alias.asname is None else f'import as {alias.asname}')
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if (isinstance(func, ast.Name) and func.id == _ASSURED_NAME) or (
+            isinstance(func, ast.Attribute) and func.attr == _ASSURED_NAME
+        ):
+            self.found.append(self._here())
+            self._callees.add(id(func))
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id == _ASSURED_NAME and id(node) not in self._callees:
+            self.found.append(f'reference in {self._here()}')
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr == _ASSURED_NAME and id(node) not in self._callees:
+            self.found.append(f'reference in {self._here()}')
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if node.value == _ASSURED_NAME and id(node) not in self._exports:
+            self.found.append(f'string in {self._here()}')
+
+
+def _assured_uses(source: str) -> list[str]:
+    visitor = _AssuredUses()
+    visitor.visit(ast.parse(source))
+    return sorted(visitor.found)
+
+
+def _assured_scan(package: Path = _PACKAGE) -> tuple[dict[str, tuple[str, ...]], list[str]]:
+    uses: dict[str, tuple[str, ...]] = {}
+    scanned: list[str] = []
+    for path in sorted(package.rglob('*.py')):
+        relative = path.relative_to(package).as_posix()
+        scanned.append(relative)
+        found = _assured_uses(path.read_text(encoding='utf-8'))
+        if found:
+            uses[relative] = tuple(found)
+    return uses, scanned
+
+
+def test_only_the_typed_store_writers_use_encode_assured():
+    uses, _ = _assured_scan()
+
+    assert uses == _ASSURED, (
+        '期望 encode_assured 只在四个文件 store 的写盘方法里被调用（它们的写入面只收脱敏收口铸造的 '
+        f'Redacted* 类型）；实际 {uses}。别的写入经 encode_redacted / write_redacted 逐值核对；新的'
+        'store 要用它，先让写入面只收 Redacted* 类型，再在 _ASSURED 里写明。'
+    )
+
+
+def test_the_encode_assured_scan_covered_the_whole_package_and_every_allowed_file():
+    _, scanned = _assured_scan()
+
+    assert set(scanned) == _package_python_files()
+    assert sorted(set(_ASSURED) - set(scanned)) == []
+
+
+@pytest.mark.parametrize(
+    ('source', 'expected'),
+    [
+        (
+            'from syndica.kernel.redaction import encode_assured\n'
+            'def save(v):\n    return encode_assured(v)\n',
+            ['import', 'save'],
+        ),
+        (
+            'from syndica.kernel.redaction import encode_assured as fast\n'
+            'def save(v):\n    return fast(v)\n',
+            ['import as fast'],
+        ),
+        (
+            'from syndica.kernel import redaction\n'
+            'class Store:\n    def put(self, v):\n        return redaction.encode_assured(v)\n',
+            ['Store.put'],
+        ),
+        (
+            'from syndica.kernel.redaction import encode_assured\nENCODE = encode_assured\n',
+            ['import', 'reference in <module>'],
+        ),
+        (
+            'from syndica.kernel import redaction\n'
+            'def save(v):\n    return getattr(redaction, "encode_assured")(v)\n',
+            ['string in save'],
+        ),
+        ('def encode_assured(v):\n    return v\n', ['def encode_assured']),
+    ],
+    ids=['new-caller', 'renamed-import', 'attribute-call', 'passed-as-value', 'getattr', 'shadow'],
+)
+def test_every_way_of_reaching_encode_assured_is_seen(source: str, expected: list[str]):
+    assert _assured_uses(source) == expected
+
+
+def test_a_second_encode_assured_call_in_an_allowed_store_is_reported(tmp_path: Path):
+    stores = tmp_path / 'kernel' / 'stores'
+    stores.mkdir(parents=True)
+    (stores / 'file_rubric.py').write_text(
+        'from syndica.kernel.redaction import encode_assured\n'
+        'class FileRubricStore:\n'
+        '    def _write(self, key, name, value):\n'
+        '        return encode_assured(value)\n'
+        '    def put_raw(self, value):\n'
+        '        return encode_assured(value)\n',
+        encoding='utf-8',
+    )
+
+    uses, scanned = _assured_scan(tmp_path)
+
+    assert uses == {
+        'kernel/stores/file_rubric.py': (
+            'FileRubricStore._write',
+            'FileRubricStore.put_raw',
+            'import',
+        )
+    }
+    assert scanned == ['kernel/stores/file_rubric.py']
