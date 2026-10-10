@@ -113,7 +113,7 @@ uv run pytest -q
 | 9 | 产品面 | 已完成 | `syndica up/status/down` 本机服务（REST、可续读的 SSE、WebSocket 的请求 / 答复 / 终端，OpenAPI 快照与变更记录）、随包发布的 React 界面（会话、时间线、Agent 树、确认与提问、产物预览 / diff / 反馈、预算 / 进度 / trace、终端、窄屏）、Playwright 桌面与移动 E2E；截止时刻打断在飞的调用、预算跨会话、`--verdict-exit`、隔离拷贝进线程；子树持久化改派到 v1 之后；审计见 `docs/audits/2026-10-08-m9-final-audit.md` |
 | 10 | 互操作 | 已完成 | MCP client / server、ACP agent / client、A2A server / client、OpenAI 兼容 HTTP（chat completions 与 Responses），都映射到已有会话、经 `call_external` 过危险判定与溯源、外部内容不可信、协议错误三件套；`create_app(adapters)`、`up --api-token`、外部进程监管（含 `setsid` 出去的后代）；用户级凭证钉住目的地；MCP Inspector、Gemini CLI、`openai` SDK 真实运行；第二方收口评审 2 Blocking / 5 High 已处置；审计见 `docs/audits/2026-10-09-m10-final-audit.md` |
 | 11 | 训练出口 | 已完成 | 中立轨迹 `syndica.trajectory/1`、SFT / ShareGPT / 偏好 / RL 导出、`syndica batch` / `export`（宿主脱敏、`unverified` 默认排除、恢复会话保留每次裁决、裁决不可信则样本不可信、只写到工作区之外）、`syndica[trl]` 的 `SFTTrainer` 与 `DPOTrainer` dry-run；审计见 `docs/audits/2026-10-09-m11-final-audit.md` |
-| 12 | 发布准备 | 未开始 | 英文文档、CI 矩阵、v1.0 发布 |
+| 12 | 发布准备 | 已完成（发布动作待维护者确认） | 公开 API 冻结与快照、英文用户文档与文档站、仓库规范、打包与发布配置（1.0.0rc1）、CI 矩阵（3.11–3.13 × Linux / macOS，本月本地跑通，托管矩阵下月作发布门禁）、四个 demo、四项 E2E 验收；推送、发 PyPI、设仓库公开、打标签等维护者点头；审计见 `docs/audits/2026-10-10-m12-final-audit.md` |
 
 ## 遗留项归属（2026-09-29）
 
@@ -129,7 +129,7 @@ deferred items」。
 | B-03 | `LLMConfig` 不可哈希 | 接受 | 失败是响亮的；有缓存需求时再加稳定身份 |
 | B-04 | `WaitResult` 成功路径不可哈希 | 接受 | 根因是 `Message` 可变，已写进 docstring |
 | B-05 | 异常链不过 copy / pickle | 接受 | 与标准库行为一致 |
-| B-06 | `ConfigError` 被借来表达调用方误用 | M12 | v1.0 冻结公开 API 时统一错误分类 |
+| B-06 | `ConfigError` 被借来表达调用方误用 | 已处理（M12） | 错误分类写定（`docs/user/reference/errors.md`）：`ConfigError` 覆盖调用方能自己改的输入，含 API 实参；不新增类，`test_error_taxonomy.py` 钉住层级 |
 | B-07 | 关联 ID 是扁平命名空间 | 接受 | 已裁决不加前缀，理由在 `wait_for` docstring |
 | B-08 | 危险规则不认经中间工具执行、落盘后再执行 | 已修 | M5 T9：同一条命令里下载到文件再执行它的是 `shell.download_then_execute`；跨调用执行工作区里不可信的脚本按 `exec.untrusted_script` 判（文件污点 × `executed_scripts`），走强制升级 |
 | B-09 | 未声明 `__tool_command_args__` 的非文本参数被静默跳过 | 已修 | M4 D7：Module 的工具与类式角色自己装的工具必须在自己的类上声明，登记表已关闭 |
@@ -158,18 +158,18 @@ deferred items」。
 | 轮换后续 | `ModelRouter` 不实现 `CachePrefixProvider`：经它的漂移检测只做逻辑比对，换平台记成一次 `identity` 漂移 | 已修 | M3 T8：LLM span 记下作答平台，`ModelRouter` 转发作答成员的前缀单位 |
 | 轮换后续 | 清单显式写的模型名只走 OpenRouter / `OPENAI_*`，一次 run 只能用一个 Gemini 型号 | 已修 | M4 D10（T6）：清单的 `model` 可以写「平台:型号」 |
 | D-61 | `Delegate` 对用完轮数的子 Agent 仍建议 SendMessage 继续 | 已修 | 登记表已关闭 |
-| M-3 | `provenance_of` / `strictest_trust` 不满足「公开签名需要它」 | M12 | API 冻结时决定是否扣留 |
+| M-3 | `provenance_of` / `strictest_trust` 不满足「公开签名需要它」 | 已处理（M12） | 从公开面撤下，写进 CHANGELOG；仍可从 `syndica.kernel.context` 导入供内部使用 |
 | M-4 | 端到端 WAITING 断言只有一跳调度余量 | 已修 | 登记表已关闭 |
 | M-5 | D-53 正文夸大「静默漂移」 | 已关闭 | D-53 关闭时条目已改写 |
-| M-6 | spec 写 `send(..., message)`，实现是 `content` | M12 | API 冻结时按实现改写 spec §4.2 的签名 |
-| M-7 | spec 写 `AgentInfo.type`，实现是 `agent_type` | M12 | 同 M-6（spec §4.3） |
+| M-6 | spec 写 `send(..., message)`，实现是 `content` | 已处理（M12） | spec §4.2 按实现改写，顺带补了 `spawn` 收 `AgentFactory`、其余参数只能按关键字传 |
+| M-7 | spec 写 `AgentInfo.type`，实现是 `agent_type` | 已处理（M12） | spec §4.3 按实现改写 |
 | M-8 | `WaitState.ABORTED` 的 docstring 缺 D-26 契约 | 已修 | 登记表已关闭 |
 | M5 后续 | `Bash` / `Terminal` 的输出一律不可信，不按命令真实读到的内容收窄溯源 | 沙箱后端 | 用户裁决（2026-10-04）：真正的边界是沙箱化的 Workspace 后端；只有后端知道一条命令读了什么，收窄随它落地 |
 | M5 后续 | `Bash` 写文件绕过乐观并发（版本前提只在 `Write` / `Edit` / 删除上） | 接受 | shell 写了什么只有沙箱后端看得到；下一次 `Write` 照样按版本冲突，文件污点把 shell 写的版本记成不可信 |
 | M5 后续 | 交互式 shell 的历史展开（`!!`）能把一条经人确认过的命令再跑一次而不再问 | 沙箱后端 | `Terminal` 的文本闸挡失手不挡蓄意；授权仅放行当次调用要靠后端隔离兑现 |
 | M5 后续 | 后台跑的只有进程，没有通用的后台工具 | 已修（M8，`3a8a1d6`） | `background` Module；只转声明了可后台化的工具（内置只有 `Bash`），获批调用从不转；周期不带着在跑的后台调用结束 |
 | M5 后续 | 拓扑槽的隔离 | 已修（M8，`a0c4e38`） | `AgentSlot.isolation`：每个周期在拷贝里干活、周期返回时合并（中止、预算用完的也合并；还有后代的副本建在上面时不合并、留到下个周期），冲突与没合并的原因下个周期以署名块告诉它 |
-| M5 后续 | 会话拿控制终端的启动器只能在 Linux 上被证明（macOS 不论有没有 `TIOCSCTTY` 都给控制终端） | M12 | CI 恢复后在 Linux 上跑那条变异 |
+| M5 后续 | 会话拿控制终端的启动器只能在 Linux 上被证明（macOS 不论有没有 `TIOCSCTTY` 都给控制终端） | 已处理（M12） | 在 Colima 的 Linux 容器里，删掉 `TIOCSCTTY` 或整个去掉启动器都让 3 条已有用例变红（macOS 上存活）；本地矩阵与 `ci.yml` 的 Linux 格就是这道门禁。顺带查出关闭 Web 的人的终端会 SIGKILL 掉 server 自己（M12 修） |
 | M5 后续 | 隔离副本里的命令经 `..` 写进兄弟 Agent 的副本，危险判据按形状认不出（副本名是 Agent 的 id） | 沙箱后端 | 每个隔离的 Agent 需要自己的根；文本规则只按路径形状判 |
 | M5 后续 | 合并之后被叫醒的子 Agent，上下文里仍写着「在隔离副本里」 | 接受 | 已经进 ZOMBIE 的 Agent 收不到不叫醒它的消息；合并结果提示父 Agent 在叫醒它的消息里说明 |
 | M5 后续 | 合并只合内容，不合可执行位的变化 | 已修（M7） | `Portal.set_executable` + `FileStat.executable`；子 Agent 改过的可执行位才合回去，父那边自己改的不撤销；契约钉住往返、改写保留、真能执行 |
@@ -182,7 +182,7 @@ deferred items」。
 | M6 后续 | 一次性辅助调用（摘要压缩、LLM 记忆整理）的完整回放：ReplayCapture 把不在任何一轮里的模型调用当 gap，这类 run 不写回放文档 | 后续（回放文档 v4） | 与 M5 的 C3 同属回放文档 v4 的 aux / 门槽位；此刻优雅降级（结构照常记录、记一条 warning），两类调用都 opt-in |
 | M6 后续 | 压缩前**完整前像**落 `SessionStore.archive`（spec §8.8「压缩前必须留快照」的完整形态） | 已修（M8，`1281454`） | 压缩前把当前记录脱敏后归档，trace 的压缩点记归档序号；内置 store 只留最近 20 份 |
 | M6 后续 | 多 Agent **子树**的持久化与恢复（子 Agent、broker 队列、租约） | v1 之后（多进程宿主） | 再改派（M9 计划阶段五）：M9 的 server 是单进程、持会话锁，根会话的恢复 M6 已有；Fork / 槽 / 类式角色的子 Agent 从角色名重建不出来，邮箱只在 checkpoint 时存——要一起定的是多进程的租约与接管（#40），v1 不引入多进程。用户可见的后果：`syndica down` 或崩溃后，在飞的子 Agent 与它们的邮箱丢失，恢复只有根对话加「子 Agent 未恢复」的说明 |
-| M6 后续 | `MemoryStore` / `MemoryStoreContract` 进公开面 | M12 | 先私有：`SessionStoreContract` 已发布，记忆契约未发布，第三方记忆后端暂无公开契约可照着自证；v1.0 冻结公开 API 时一起定 |
+| M6 后续 | `MemoryStore` / `MemoryStoreContract` 进公开面 | 已定（M12）：v1.0 不公开 | API 参考写明 provisional；以后公开是追加、不破坏 |
 | M6 后续 | LLM 记忆整理可能添油加醋（真实运行实测编造了源里没有的细节，且按源条目记为 trusted） | 接受，附缓解 | 整理 / 摘要提示已要求只保留源事实，重跑只剩源事实；M7 没有接验收器比对（每次整理多一次伴生调用、与验收主路径无关） |
 | M6 后续 | 恢复会话时安全 flags 取「当前或更严」（M6 阶段二 P28-M7），恢复提示列出失效的子 Agent id | 已修（M7） | 快照里更严的 `untrusted_high_risk` / `max_wait_seconds` 作为恢复出的 Agent 的覆盖值并记 warning；当前 Runtime 没声明的 key 不收；恢复提示点名 `tool_meta` 里记着的失效 Agent |
 | M6 后续 | 一条不可信的工作区记忆永久影响此后每个会话、且无法删（M6 收口评审 M4） | 已修（M7） | `syndica memory list` 列出每段的信任与未整理的短期记录，`memory forget <n>` / `--pending` 按版本重写（被并发整理就报冲突）；记忆条目的逐条来源（哪个会话、哪条消息）仍只到「整理 seq 区间」，随 M12 定 |
@@ -193,24 +193,24 @@ deferred items」。
 | M7 后续 | 导出器默认排除 `unverified`（§13） | 已修（M11） | `syndica export` 默认排除，`--include-unverified` 显式打开并写进 manifest |
 | M11 后续 | `SessionMeta.last_trace` 从来没有被写过，新会话一律是 null（M6 起） | 后续 | 导出按根 Agent 的 id 在 trace store 里找最近的 trace；内核写起它要改存盘语义（恢复、回放都读这个字段），单独做 |
 | M7 后续 | 二进制格式处理器（xlsx / docx 的 `semantic_diff` 与校验） | 后端 | 内核只给协议与文本 `generic` 处理器 |
-| M7 后续 | `RubricStore` / `ArtifactStore` 契约与验收 Module 进公开面 | M12 | 先私有（同 M6 的记忆）；v1.0 冻结公开 API 时一起定 |
-| M7 后续 | `encode_assured` 的调用方白名单（AST 守卫） | M12 | 产物索引存的路径 / kind 已收窄（kind 只收 `KINDS`、id 由内核派生）；守卫随公开面冻结一起补 |
+| M7 后续 | `RubricStore` / `ArtifactStore` 契约与验收 Module 进公开面 | 已定（M12）：v1.0 不公开 | 同记忆；`ArtifactHandler` 协议公开，第三方经 `RuntimeModule(artifact_handlers=...)` 装处理器 |
+| M7 后续 | `encode_assured` 的调用方白名单（AST 守卫） | 已处理（M12） | 守卫按（文件, 函数）写死，只放行四个文件 store 的写盘方法；改名导入、当值传出、`getattr` 都抓得到 |
 | M7 后续 | 只有根协调者有 Goal，子 Agent 的交付不单独验收 | 接受 | 由派活的一方验收；子 Agent 各付一份伴生太贵，需要时由宿主给子 Agent 一个 Goal（M8 的预算树之后再议） |
 | M7 后续 | 裁决的机器可读出口（退出码映射、交接文件字段） | 已修（M9） | `run --verdict-exit`：`pass` 10、`partial` 11、`block` 12、`unverified` 13，没装验收退出 2；130、1、交接被拒的 3 优先。交接文件加 `acceptance_verdict`（与读审查者标记行的 `reviewer_verdict` 分开），schema 升到 `syndica.handoff/2` |
 | M7 后续 | 文件 / 产物锚点钉到具体版本（§7.6「`spec.md:12 → protocol.md:88`」「`artifact:report.md#section-4`」） | 后续 | 投影的来源只有 Goal 与任务原文；`Anchor` 没有 version 字段，加它是公开类型的变更 |
 | M7 后续 | 处理器注册新 kind、`preview` / `semantic_diff` 的消费方、反馈带出产物定位、`Deliver.note` 落进交付记录 | 已修（M9） | 一个会话一份处理器注册表，L1、`Deliver` 收的类别（基础类别加已装处理器声明的）、服务面的预览与 diff 共用；反馈带产物定位、落成提议的 Rubric、激活走人的门；`Deliver.note` 进 trace（`artifact.delivered`）与 `artifact_registered` 事件，产物索引仍不存自由文本。CLI 还没有装第三方处理器的入口（随 Module 的扩展点，M12） |
-| M7 后续 | Module 服务经 `runtime.send` 发的消息与宿主同一个 sender，会被当成人的反馈提议 | M12 | 提议仍要人 `sessions activate`；正面标记宿主消息要在 `Runtime.send` 上区分调用方，随宿主身份一起定 |
+| M7 后续 | Module 服务经 `runtime.send` 发的消息与宿主同一个 sender，会被当成人的反馈提议 | v1.x（M12 定） | 提议仍要人 `sessions activate`，安全结论不变；在 `Runtime.send` 上区分调用方随宿主身份一起做 |
 | M7 后续 | 主 Agent 的整条回复恰好就是要求原文时，L3 仍把它算作证据 | 接受 | 「只回 DONE」这类要求的证据就是那一行；整行之外的复述已被拒 |
 | M8 后续 | 截止时刻到了打断正在跑的这一轮（工具超时与轮内等待按剩余时间收紧） | 已修（M9） | 在飞的模型调用到截止时刻由路由器取消，停在 BUDGET、按估算的输入计费，不换平台；收尾轮有 30 秒宽限。已经带超时的工具（`Bash`）拿 `min(自己的, 剩余)`，到点写明「到预算截止时刻停下，副作用未知」；人的等待与派活等待按剩余时间收紧。没有超时的工具不做通用的工具内取消 |
 | M8 后续 | 预算按「这次调用」计，会话恢复从新预算开始 | 已修（M9） | 可加的维度（tokens / cost / turns）按「上限 + 已用」存进会话记录，恢复时已用续上；这次没给新上限就沿用存的上限。墙钟不跨会话，每次打开从新的截止时刻起算 |
 | M8 后续 | 宿主在 span 之外追加预算时那条 trace 事件丢掉 | 已修（M9） | 追加挂到这个 Agent 下一个周期的 agent span 上，带真实的追加时刻（`budget.granted_at_ms`）；之后再没跑周期的，关机或拆除时记一条 WARNING（trace 里没有开着的 span 可挂） |
 | M8 后续 | 隔离槽每个周期在事件循环上同步拷贝共享工作区（大工作区下其余 Agent 停顿数秒） | 已修（M9） | 文件字节在 Runtime 自有的两线程池里拷到带代号的临时目录；换入与路由表的改动回到事件循环、代号仍是当前的才做；拷贝中途消失的文件按不存在处理；合并留在事件循环 |
-| M8 后续 | 长程策略协议、上下文、动作类型与契约、预算树的读写入口进公开面 | M12 | 与 Goal / Rubric / Verdict 一起冻结（M8 计划 P1 H5） |
+| M8 后续 | 长程策略协议、上下文、动作类型与契约、预算树的读写入口进公开面 | 已处理（M12，部分） | 协议、上下文、动作类型、`BaselineStrategy`、Goal / Rubric / Verdict 与 `LongHorizonStrategyContract` 公开；预算树读写入口留在外面（策略从快照读 `BudgetView`），装自定义策略仍经 provisional 的 `LongHorizonModule`，以后公开不破坏 |
 | M8 后续 | `Delegate` / `Fork` 后台化 | 后续 | 一个 Agent 的在轮等待只有一个槽，转到后台的派活会被下一次派活顶掉；要先把在轮等待按子 Agent 分槽 |
 | M8 后续 | 收尾轮里模型仍可能只发工具调用、不留文字（真实运行：成本上限紧到第一轮就是收尾轮时） | 后续 | 收尾轮照发工具定义以保前缀；CLI 照实说「收尾那一轮也没有留下文字」。provider 支持时可在收尾轮带 `tool_choice: none` |
 | M8 后续 | 装了 `long-horizon` / `background` / 隔离槽的 run 不写回放文档 | 后续（回放文档 v4） | 里程碑验收与语义比对是伴生调用、后台结果进历史的时刻取决于真实耗时、回放不记工作区；回放重建器认得名字但拒绝重建 |
 | 卫生 | 基础 CI：每次 push 跑与本地一致的门禁 | M2 | 自举开始改代码之前先有自动门禁 |
-| 卫生 | CHANGELOG、PyPI 预发布、版本策略、issue 模板 | M12 | 发布准备 |
+| 卫生 | CHANGELOG、PyPI 预发布、版本策略、issue 模板 | 已处理（M12） | `CHANGELOG.md`、`docs/user/versioning.md`、`RELEASING.md`（TestPyPI 再 PyPI，维护者点头）、issue / PR 模板 |
 | 卫生 | `.env.example` | 不做 | key 文件不该放在 Agent 操作的工作区里，`Read` / `Grep` 读得到它 |
 
 ---
