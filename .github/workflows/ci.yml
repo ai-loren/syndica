@@ -14,18 +14,97 @@ permissions:
 
 jobs:
   gates:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: gates (${{ matrix.os }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # 一格红了其余照跑：跨版本、跨系统的缺陷要看到是哪几格红，取消掉的格子什么也说明不了。
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.11', '3.12', '3.13']
+        include:
+          # torch 只装在这一格。Linux 上 PyPI 的 torch 带着几 GB 的 CUDA 轮子，每格都装要多下几 GB、
+          # 多花几分钟；macOS 的 torch 不带 CUDA。TRL 的用例测的是本仓对 trl 公开 API 的适配，与系统
+          # 无关；放在最新的 Python 上，trl / torch 的弃用最先在这里露面。其余格子里这些用例照常跳过。
+          - os: macos-latest
+            python: '3.13'
+            trl: true
+          # pyright 按 pyproject 里钉死的 pythonVersion 检查，换解释器结论不变，跑一格就够；放在与
+          # pythonVersion 相同的那一格，装进环境的依赖版本也与它对得上。
+          - os: ubuntu-latest
+            python: '3.11'
+            pyright: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.12.19"
-          python-version: "3.11"
-      - run: uv sync --locked --extra openai --extra dev
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked --all-extras --no-extra trl
+        if: ${{ !matrix.trl }}
+      - run: uv sync --locked --all-extras
+        if: ${{ matrix.trl }}
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run pyright
+        if: ${{ matrix.pyright }}
       - run: uv run python scripts/check_deps.py
       - run: uv run python scripts/check_links.py
       - run: uv run pytest -q
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: web/package.json
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.19"
+          python-version: '3.11'
+      - run: uv sync --locked --all-extras --no-extra trl
+      - run: npm ci --no-audit --no-fund
+        working-directory: web
+      - run: npx playwright install --with-deps chromium
+        working-directory: web
+      - run: scripts/check_e2e.sh
+      # check_web.sh 重新生成类型、重新构建并重写 build-info.json；提交里的产物必须与这次构建逐字节相同，
+      # 否则 wheel 里发出去的前端不是这份源码构建出来的。
+      - run: scripts/check_web_reproduced.sh
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.19"
+          python-version: '3.11'
+      - run: uv build
+      - run: uv tool run twine==7.0.0 check --strict dist/*
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: web/package.json
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.19"
+          python-version: '3.11'
+      - run: scripts/audit_deps.sh
