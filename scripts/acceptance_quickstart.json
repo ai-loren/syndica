@@ -1,0 +1,22 @@
+{
+  "rules": [
+    {
+      "when": "four-line poem",
+      "tool": "Write",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "name": "Write",
+              "arguments": {
+                "path": "poem.md",
+                "content": "Each change I make is kept in line,\na history of small design;\nI branch, I merge, I tag the past,\nand every commit holds it fast.\n"
+              }
+            }
+          ]
+        },
+        {"content": "Wrote a four-line poem about version control to poem.md."}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {
+      "when": "order 88412",
+      "tool": "lookup_order",
+      "steps": [{"tool_calls": [{"name": "lookup_order", "arguments": {"order_id": "88412"}}]}]
+    }
+  ]
+}
