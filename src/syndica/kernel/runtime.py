@@ -234,6 +234,10 @@ _StoreT = TypeVar('_StoreT')
 # 并由契约套件强制，见 protocols/broker.py。
 _ACTIVATION_ALLOWED: ContextVar[bool] = ContextVar('syndica_activation_allowed', default=True)
 _SHUTTING_DOWN: ContextVar[tuple[object, ...]] = ContextVar('syndica_shutting_down', default=())
+# 「这段代码跑在某次收尾里」（`_reap` 入口置位）。收尾里的 hook 由 `gather` 包成子任务，比对
+# `current_task()` 认不出它们；它们回头 `wait` 一个正在收尾的 Agent 时若去等收割任务，就是 hook 等
+# 收割任务、收割任务等 hook，永久挂死。
+_IN_TEARDOWN: ContextVar[bool] = ContextVar('syndica_in_teardown', default=False)
 
 
 @dataclass(frozen=True)
@@ -1271,9 +1275,10 @@ class Runtime:
         # 收尾在事件循环之外做，因此它自己是一个任务；不在实例表里，`shutdown` 的取消名单看不见
         # 它们，只能另等一次。
         self._reapers: set[asyncio.Task[None]] = set()
-        # 此刻有收尾在飞的 Agent。一个 Agent 同时只有一次收尾：两次并发的收尾会各自走一遍级联，
-        # 而它们在拆同一个节点时都会先看到「它还在」，于是同一个 Agent 被报两遍 despawn。
-        self._reaping: set[str] = set()
+        # 此刻有收尾在飞的 Agent → 做这次收尾的收割任务。一个 Agent 同时只有一次收尾：两次并发的收尾
+        # 会各自走一遍级联，而它们在拆同一个节点时都会先看到「它还在」，于是同一个 Agent 被报两遍
+        # despawn。`wait` 要等的也是它。
+        self._reaping: dict[str, asyncio.Task[None]] = {}
         # 「正在被拆的那些条目」→ **有几条在飞的级联把它钉住了**。计数而不是集合：一个节点可以
         # 同时落在多条级联的钉住范围里，而释放必须只撤掉本次调用自己放上去的那一份（理由见模块
         # 文档）。成员判定仍是 `agent_id in self._doomed`。
@@ -2455,12 +2460,18 @@ class Runtime:
 
         Agent 的异常与取消都是**被等待者**的终态，不冒充成本次调用自己的失败：崩溃在
         `ctx.stop_reason` 上是 ERROR，被取消的运行没有 stop_reason。
+
+        被 `kill` 的 Agent 还要等它的收尾做完才返回：收尾之前它停在 aborting，此刻一条 `send` 投进的
+        是收尾要摘掉的邮箱，拿到 ok=True 却不会被处理，也不会把它叫醒。
         """
         task = self._table.get_task(agent_id)
         self._await_count[agent_id] = self._await_count.get(agent_id, 0) + 1
         try:
             if task is not None:
                 await asyncio.wait({task})
+            reaper = self._reaping.get(agent_id)
+            if reaper is not None and not _IN_TEARDOWN.get():
+                await asyncio.wait({reaper})
             return self._finished_context(agent_id)
         finally:
             self._release_awaited(agent_id)
@@ -3177,8 +3188,8 @@ class Runtime:
         # 「后置条件已成立」，而是「这件事已经有人在做，且它失败会自己记一条 ERROR」。
         if agent_id in self._reaping:
             return
-        self._reaping.add(agent_id)
         reaper = asyncio.create_task(self._reap(agent_id, slot), name=f'reap:{agent_id}')
+        self._reaping[agent_id] = reaper
         self._reapers.add(reaper)
         reaper.add_done_callback(self._reapers.discard)
 
@@ -3390,6 +3401,7 @@ class Runtime:
         # 收尾刻意跑在事件循环之外，那个值在这里是假的：留着它，一次落在那个 Agent 身上的拆除会被
         # 误判成「等自己」而拒掉，被杀的 Agent 于是停在 aborting、再也复活不了。
         _DRIVING_AGENT.set(None)
+        _IN_TEARDOWN.set(True)
         # 同理它也继承了发起 kill 的那次工具调用与当前 span：不清掉，收尾里取的键会与那次调用抢序号
         # （谁先谁后取决于调度，M3 D10），事件与边记到那次早已结束的调用上。收尾自己不派活：拆除的
         # hook 在 `_destroy` 里换到它自己的出处。
@@ -3410,7 +3422,7 @@ class Runtime:
                 agent_id,
             )
         finally:
-            self._reaping.discard(agent_id)
+            self._reaping.pop(agent_id, None)
 
     def _set_tracer(self, tracer: Tracer) -> None:
         """换上接收插桩的 tracer（内部入口：tracer 的公开面还没定）。已经在跑的 Agent 从下一次

@@ -4159,6 +4159,50 @@ async def test_kill_keeps_the_registry_entry_so_children_never_point_at_a_hole()
     await runtime.shutdown()
 
 
+async def test_wait_after_kill_returns_once_the_teardown_is_done_so_a_send_revives_the_agent():
+    """上界用 `asyncio.timeout`：`asyncio.wait_for` 在 3.11 上多插的调度跳转让收尾先跑完，把要测的
+    窗口关掉。"""
+    runtime = Runtime()
+    agent_id = await _running(runtime, [])
+
+    await runtime.kill(agent_id)
+    async with asyncio.timeout(_TIMEOUT):
+        await runtime.wait(agent_id)
+    settled = await _status(runtime, agent_id)
+    delivered = await runtime.send(agent_id, 'carry on')
+    revived = await _status(runtime, agent_id)
+    await runtime.shutdown()
+
+    assert (settled, delivered.ok, revived) == (AgentStatus.ZOMBIE, True, AgentStatus.IDLE)
+
+
+async def test_a_despawn_hook_that_waits_for_the_agent_being_reaped_does_not_stall_the_teardown():
+    runtime = Runtime()
+    outcomes: list[str] = []
+
+    async def wait_for_it(**kwargs: Any) -> HookResult:
+        try:
+            await runtime.wait(kwargs['agent_id'])
+        except ContractViolation as exc:
+            outcomes.append(type(exc).__name__)
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, wait_for_it)
+    blocker = _Block()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go', exit_mode=ExitMode.EXIT)
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+
+    await runtime.kill(agent_id)
+    try:
+        await asyncio.wait_for(_reaped(runtime), _TIMEOUT)
+    finally:
+        for reaper in list(runtime._reapers):
+            reaper.cancel()
+        await runtime.shutdown()
+
+    assert outcomes == ['ContractViolation']
+
+
 async def test_killing_an_exit_mode_agent_takes_its_subtree_with_it_instead_of_orphaning_it():
     """kill 自己不选择注销——去留由 exit_mode 决定，而 EXIT 走的是同一条级联。
 
@@ -5096,7 +5140,7 @@ async def test_one_agents_finished_reaping_leaves_another_agents_token_alone():
     reaper_of_quick = (set(runtime._reapers) - reapers).pop()
     await asyncio.wait_for(asyncio.wait({reaper_of_quick}), _TIMEOUT)
 
-    assert runtime._reaping == {held}
+    assert list(runtime._reaping) == [held]
     # 令牌还在，所以第二次 kill 不再排收割任务：末态由那个还在飞的收尾给出。
     await runtime.kill(held)
     assert [task.get_name() for task in runtime._reapers] == [f'reap:{held}']
@@ -5106,7 +5150,7 @@ async def test_one_agents_finished_reaping_leaves_another_agents_token_alone():
     assert [await _status(runtime, agent_id) for agent_id in (held, quick)] == [
         AgentStatus.ZOMBIE
     ] * 2
-    assert runtime._reaping == set()
+    assert list(runtime._reaping) == []
     # 一次收尾就是一次摘队列：第二个收割任务会把同一个 Agent 的收尾整个走第二遍。
     assert [agent_id for agent_id, _ in broker.removals].count(held) == 1
     await runtime.shutdown()
