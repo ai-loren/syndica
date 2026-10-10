@@ -1,6 +1,8 @@
 import asyncio
 import copy
 import time
+from collections.abc import Awaitable
+from typing import TypeVar
 
 import pytest
 
@@ -23,6 +25,8 @@ _MAX_WAKE_LATENCY = 0.1
 
 _PARK_DELAY = 0.05
 _LONG_ENOUGH = 1.0
+
+T = TypeVar('T')
 
 
 async def _park(task: asyncio.Task, call: str) -> None:
@@ -100,11 +104,43 @@ class _KeepsThePendingEntryAwayFromConsume(InMemoryMessageBroker):
         return await super().wait_for_messages(agent_id, timeout)
 
 
-class _SwallowsTheCancel(InMemoryMessageBroker):
-    """刻意不合规：两个阻塞方法的内层等待都用 `asyncio.wait_for`，即本实现修掉之前的写法。
+async def _wait_for_as_in_3_11(awaitable: Awaitable[T], seconds: float | None) -> T:
+    """Python 3.11 的 `asyncio.wait_for` 的写法：内层 future 已经就绪时到达的取消被当成「结果已到」
+    吞掉。3.12 起 `wait_for` 改用 `asyncio.timeout`，不再吞，所以照抄在这里，每个解释器上都有它。"""
+    loop = asyncio.get_running_loop()
+    inner = asyncio.ensure_future(awaitable)
+    waiter: asyncio.Future[None] = loop.create_future()
 
-    内层 future 已经就绪时到达的取消被 `wait_for` 当成「结果已到」吃掉：`take_by_correlation` 因此
-    挂满整个超时，而 `wait_for_messages` 更隐蔽——它照常交回 True，取消静默失效。
+    def release(_: object) -> None:
+        if not waiter.done():
+            waiter.set_result(None)
+
+    inner.add_done_callback(release)
+    expiry = None if seconds is None else loop.call_later(seconds, release, None)
+    try:
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            if inner.done():
+                return inner.result()
+            inner.remove_done_callback(release)
+            inner.cancel()
+            raise
+        if inner.done():
+            return inner.result()
+        inner.remove_done_callback(release)
+        inner.cancel()
+        raise TimeoutError
+    finally:
+        if expiry is not None:
+            expiry.cancel()
+
+
+class _SwallowsTheCancel(InMemoryMessageBroker):
+    """刻意不合规：两个阻塞方法的内层等待都用 3.11 的 `asyncio.wait_for`，即本实现修掉之前的写法。
+
+    内层 future 已经就绪时到达的取消被它当成「结果已到」吃掉：`take_by_correlation` 因此挂满整个
+    超时，而 `wait_for_messages` 更隐蔽——它照常交回 True，取消静默失效。
     """
 
     async def wait_for_messages(
@@ -118,7 +154,7 @@ class _SwallowsTheCancel(InMemoryMessageBroker):
         if mailbox.messages:
             return True
         try:
-            await asyncio.wait_for(mailbox.nonempty.wait(), timeout=timeout)
+            await _wait_for_as_in_3_11(mailbox.nonempty.wait(), timeout)
         except TimeoutError:
             return False
         if self._mailboxes.get(agent_id) is not mailbox:
@@ -145,7 +181,7 @@ class _SwallowsTheCancel(InMemoryMessageBroker):
             if remaining is not None and remaining <= 0:
                 return None
             try:
-                await asyncio.wait_for(mailbox.arrival.wait(), timeout=remaining)
+                await _wait_for_as_in_3_11(mailbox.arrival.wait(), remaining)
             except TimeoutError:
                 return None
             if self._mailboxes.get(agent_id) is not mailbox:

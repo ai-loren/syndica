@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import signal
@@ -178,7 +179,8 @@ async def test_the_sdk_client_drives_syndica_acp(tmp_path: Path) -> None:
         assert _KEY not in logs[0].read_text(encoding='utf-8')
     finally:
         if agent is not None and agent.returncode is None and agent.pid is not None:
-            os.killpg(agent.pid, signal.SIGTERM)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(agent.pid, signal.SIGTERM)
             await agent.wait()
         if fake.returncode is None and fake.pid is not None:
             fake.terminate()

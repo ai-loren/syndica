@@ -2382,11 +2382,23 @@ async def test_query_agent_reports_the_name_the_parent_and_the_children_of_its_t
 
 
 async def _resident(runtime: Runtime, parent_id: str | None = None) -> str:
-    """一个常驻等消息的 Agent。**IDLE 而不是 ZOMBIE**：被杀与没被杀才区分得开。"""
-    agent_id = await runtime.spawn(
-        _worker([ScriptedTurn(content='x')]), exit_mode=ExitMode.IDLE, parent_id=parent_id
-    )
-    await _wait_for_registry_status(runtime, agent_id, AgentStatus.IDLE)
+    """一个常驻等消息的 Agent。**IDLE 而不是 ZOMBIE**：被杀与没被杀才区分得开。
+
+    等的是驱动任务把它从 RUNNING 转回 IDLE 的那条事件，不是注册表里读到 IDLE：spawn 登记的初始状态
+    就是 IDLE，驱动任务接管之前读到的也是它，那时的 kill 以「本进程停不了它」被拒。
+    """
+    async with runtime.events.subscribe() as events:
+        agent_id = await runtime.spawn(
+            _worker([ScriptedTurn(content='x')]), exit_mode=ExitMode.IDLE, parent_id=parent_id
+        )
+        async with asyncio.timeout(_TIMEOUT):
+            async for event in events:
+                if (event.kind, event.agent_id, event.payload) == (
+                    'agent_status',
+                    agent_id,
+                    {'status': AgentStatus.IDLE.value},
+                ):
+                    break
     return agent_id
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -209,7 +210,8 @@ async def _acp(world: _World) -> AsyncIterator[asyncio.subprocess.Process]:
         yield agent
     finally:
         if agent.returncode is None:
-            os.killpg(agent.pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(agent.pid, signal.SIGKILL)
             await agent.wait()
         err = (await asyncio.wait_for(stderr, 10)).decode()
         assert _KEY not in err

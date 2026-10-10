@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import sys
@@ -78,5 +79,6 @@ async def test_syndica_acp_opens_sessions_only_in_its_own_workspace(tmp_path: Pa
         await asyncio.wait_for(stderr, 10)
     finally:
         if agent.returncode is None and agent.pid is not None:
-            os.killpg(agent.pid, signal.SIGTERM)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(agent.pid, signal.SIGTERM)
             await agent.wait()

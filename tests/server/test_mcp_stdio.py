@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -175,7 +176,8 @@ async def test_every_stdout_line_of_syndica_mcp_is_a_json_rpc_message(tmp_path: 
             assert await server.wait() == 0
     finally:
         if server.returncode is None:
-            os.killpg(server.pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(server.pid, signal.SIGKILL)
             await server.wait()
         await asyncio.wait_for(stderr, 10)
     assert len(lines) >= 5

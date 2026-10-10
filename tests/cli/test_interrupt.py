@@ -185,7 +185,7 @@ class _Child:
     def stderr(self) -> str:
         return b''.join(self._err).decode('utf-8', 'replace')
 
-    def wait_for(self, ready: Any, what: str) -> None:
+    def wait_for(self, ready: Any, what: str, *, every: float = 0.05) -> None:
         deadline = time.monotonic() + _WITHIN
         while not ready():
             if self.process.poll() is not None:
@@ -193,7 +193,7 @@ class _Child:
             if time.monotonic() > deadline:
                 self.process.kill()
                 pytest.fail(f'{what} did not happen within {_WITHIN:g}s:\n{self.stderr}')
-            time.sleep(0.05)
+            time.sleep(every)
 
     def interrupt(self, presses: int = 1, gap: float = 0.0) -> int:
         for press in range(presses):
@@ -388,7 +388,10 @@ def test_a_double_ctrl_c_during_the_run_still_writes_the_handoff(tmp_path: Path)
     )
 
     child.wait_for((root / 'run.ready').exists, 'the agent command started')
-    code = child.interrupt(presses=2, gap=0.01)
+    child.process.send_signal(signal.SIGINT)
+    # 第一次还没递送时发出的第二次 SIGINT 会被内核合并掉：等它被处理过再按第二次。
+    child.wait_for(lambda: '再按两次强制退出' in child.stderr, 'the first Ctrl-C', every=0.001)
+    code = child.interrupt()
 
     (path,) = child.handoffs()
     assert code == 130

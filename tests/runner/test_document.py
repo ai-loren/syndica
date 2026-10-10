@@ -91,7 +91,7 @@ def test_the_same_document_as_yaml_and_as_json_reads_the_same(tmp_path: Path):
     [
         ('{"version": 2, "version": 1}', "'version' 出现了不止一次"),
         ('{"version": NaN}', 'NaN'),
-        ('{"version": 2,}', 'Expecting property name'),
+        ('{"version": 2,}', 'line 1 column'),
     ],
     ids=['duplicate-key', 'nan', 'syntax'],
 )
