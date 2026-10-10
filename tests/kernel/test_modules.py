@@ -168,6 +168,7 @@ def test_runtime_module_field_order_is_public():
         'junctions',
         'replay_safe',
         'security_notes',
+        'artifact_handlers',
     ]
 
 
@@ -191,6 +192,7 @@ def test_runtime_module_constructor_shape_is_public():
         ('junctions', 'KEYWORD_ONLY', True),
         ('replay_safe', 'KEYWORD_ONLY', True),
         ('security_notes', 'KEYWORD_ONLY', True),
+        ('artifact_handlers', 'KEYWORD_ONLY', True),
     ]
     assert RuntimeModule.__init__.__annotations__ == {
         'name': 'str',
@@ -207,6 +209,7 @@ def test_runtime_module_constructor_shape_is_public():
         'junctions': 'Sequence[ExtensionJunction]',
         'replay_safe': 'bool',
         'security_notes': 'str',
+        'artifact_handlers': 'Sequence[ArtifactHandler]',
         'return': 'None',
     }
     assert parameters['flags'].default == ()

@@ -410,6 +410,9 @@ def _manifest(module: RuntimeModule) -> dict[str, object]:
         'replay_safe': module.replay_safe,
         'security_notes': module.security_notes,
         'flags': [flag.key for flag in module.flags],
+        'artifact_handlers': [
+            list(pair) for handler in module.artifact_handlers for pair in handler.handles
+        ],
     }
 
 
@@ -1750,6 +1753,9 @@ class RuntimeCliHost:
         # 一份处理器注册表：L1 验收、`Deliver` 收的类别、服务面的预览与 diff 都查它。各自建一份，
         # 宿主装的处理器就只在其中一处生效。
         self._artifact_handlers = ArtifactHandlers()
+        # 处理器已经装进注册表的 Module。服务面一个宿主装很多个会话、每次重新构造 Module：同名的
+        # 只装第一次，否则第二个会话撞上第一个会话装的同一批处理器。
+        self._handler_modules: set[str] = set()
 
     def trace(self, request: TraceRequest) -> str | CliOutcome:
         """`syndica trace ...`：读 `.syndica/traces`（与记录同样核对；还没有时当作空的，不建）。
@@ -2045,10 +2051,17 @@ class RuntimeCliHost:
         if 'long-horizon' in names:
             # 长程读的是同一个验收 Module 的 Goal、Rubric 与 L3：另建一个就读不到这次 run 的。
             built['long-horizon'] = LongHorizonModule(cast(AcceptanceModule, built['acceptance']))
-        return tuple(
+        modules = tuple(
             built[name] if name in built else load_module(entries[name], host, redactor)
             for name in names
         )
+        for module in modules:
+            if module.artifact_handlers and module.name not in self._handler_modules:
+                self._artifact_handlers.register_all(
+                    module.artifact_handlers, source=f'Module {module.name!r}'
+                )
+                self._handler_modules.add(module.name)
+        return modules
 
     def _builtin_module(
         self, name: str, redactor: Redactor, goal: str | None = None

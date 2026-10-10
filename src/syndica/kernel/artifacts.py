@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import difflib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -114,17 +115,29 @@ class ArtifactHandlers:
 
     def register(self, handler: ArtifactHandler) -> None:
         """全部 (kind, mime) 先校验、再一起装：被拒的处理器一个键也不留下。"""
-        keys = [(kind, mime) for kind, mime in handler.handles]
-        for key in keys:
-            existing = self._by_key.get(key)
-            if existing is not None:
-                raise ConfigError(
-                    expected=f'(kind, mime)={key} 只由一个处理器声明（spec §7.2）',
-                    received=f'{_name(existing)} 与 {_name(handler)} 都声明了它',
-                    next_action='卸掉其中一个，或用更具体的 (kind, mime) 区分；别让它看导入顺序',
-                )
-        for key in keys:
-            self._by_key[key] = handler
+        self.register_all((handler,))
+
+    def register_all(self, handlers: Sequence[ArtifactHandler], *, source: str = '') -> None:
+        """一批处理器（一个 Module 声明的那些）要么全装上、要么一个键也不留下。`source` 写进冲突的
+        说明，让人知道是哪个 Module 带来的。"""
+        staged: dict[tuple[str, str], ArtifactHandler] = {}
+        origin = f'（{source}）' if source else ''
+        for handler in handlers:
+            for kind, mime in handler.handles:
+                key = (kind, mime)
+                existing = self._by_key.get(key)
+                if existing is None and staged.get(key, handler) is not handler:
+                    existing = staged[key]
+                if existing is not None:
+                    raise ConfigError(
+                        expected=f'(kind, mime)={key} 只由一个处理器声明（spec §7.2）',
+                        received=f'{_name(existing)} 与 {_name(handler)}{origin} 都声明了它',
+                        next_action=(
+                            '卸掉其中一个，或用更具体的 (kind, mime) 区分；别让它看导入顺序'
+                        ),
+                    )
+                staged[key] = handler
+        self._by_key.update(staged)
 
     def kinds(self) -> frozenset[str]:
         """`Deliver` 收的类别：内核的基础类别，加上已装处理器声明的（不含通配 `*`）。处理器是宿主装

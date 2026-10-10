@@ -17,6 +17,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, TypeAlias, cast
 
 from syndica import __version__
+from syndica.kernel.artifacts import ArtifactHandler
 from syndica.kernel.danger import require_own_command_args
 from syndica.kernel.errors import ConfigError
 from syndica.kernel.hooks import HooksCenter
@@ -51,6 +52,10 @@ RuntimeStartHook: TypeAlias = Callable[['Runtime', Mapping[str, FlagValue]], Non
 RuntimeShutdownHook: TypeAlias = Callable[['Runtime'], Awaitable[None]]
 
 _FLAG_KEY = re.compile(r'[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z')
+# 处理器声明的类别会出现在 `Deliver` 给模型的说明里、写进产物索引：只收短的小写标识，挡掉换行与
+# 控制字符。`*` 是通配，与注册表的匹配规则一致。
+_HANDLER_KIND = re.compile(r'(?:\*|[a-z][a-z0-9_-]{0,31})\Z')
+_HANDLER_MIME = re.compile(r'(?:\*|[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9*][a-z0-9.+*-]{0,127})\Z')
 # 第三方能力包声明它要什么（spec §12.4），供人审查。闭集：词表外的词没有人知道该怎么审。
 MODULE_CAPABILITIES: tuple[str, ...] = ('environment', 'filesystem', 'network', 'subprocess')
 
@@ -403,6 +408,66 @@ def _replay_safe(value: object) -> bool:
     return value
 
 
+def _artifact_handlers(value: object, name: str) -> tuple[ArtifactHandler, ...]:
+    """Module 交给宿主装进处理器注册表的产物处理器。这里只查形状；同一个 (kind, mime) 由谁处理的
+    冲突由注册表在装的那一刻判，与宿主自己装的处理器同一条规则。"""
+    handlers: list[ArtifactHandler] = []
+    for index, item in enumerate(_sequence(value, 'artifact_handlers')):
+        where = f'artifact_handlers[{index}]'
+        if isinstance(item, type):
+            raise _config(
+                f'Module {name!r} 的 {where} 是处理器实例',
+                f'收到类对象 {item.__name__}',
+                f'给 {item.__name__} 加上括号，放构造后的实例',
+            )
+        if not isinstance(item, ArtifactHandler):
+            raise _config(
+                f'Module {name!r} 的 {where} 满足 ArtifactHandler：有 handles 与 async 的 '
+                'preview / semantic_diff / validate',
+                f'收到 {type(item).__name__}，缺其中至少一项',
+                '照 syndica.kernel.ArtifactHandler 补齐属性与方法',
+            )
+        for method in ('preview', 'semantic_diff', 'validate'):
+            if not _is_async_callable(getattr(item, method)):
+                raise _config(
+                    f'Module {name!r} 的 {where}.{method} 是 async def',
+                    f'{type(item).__name__}.{method} 是同步的',
+                    f'把 {method} 改成 async def：内容要按版本从工作区读，同步读会阻塞事件循环',
+                )
+        raw = cast(object, item.handles)
+        pairs = (
+            ()
+            if isinstance(raw, str | bytes | bytearray) or not isinstance(raw, Sequence)
+            else tuple(cast(Sequence[object], raw))
+        )
+        if not pairs:
+            raise _config(
+                f'Module {name!r} 的 {where}.handles 是非空的 (kind, mime) 序列',
+                f'收到 handles={raw!r}',
+                '写成 (("spreadsheet", "text/csv"),)；通配用 "*"',
+            )
+        for pair in pairs:
+            kind, mime = cast(tuple[object, object], pair) if _is_pair(pair) else (None, None)
+            if (
+                not isinstance(kind, str)
+                or not isinstance(mime, str)
+                or _HANDLER_KIND.fullmatch(kind) is None
+                or _HANDLER_MIME.fullmatch(mime) is None
+            ):
+                raise _config(
+                    f'Module {name!r} 的 {where}.handles 每一项是 (kind, mime)：kind 是小写字母开头'
+                    '的短标识或 "*"，mime 是小写的 type/subtype 或 "*"',
+                    f'收到 {pair!r}',
+                    '改成 ("spreadsheet", "text/csv") 这样的写法：类别会显示给模型、写进产物索引',
+                )
+        handlers.append(item)
+    return tuple(handlers)
+
+
+def _is_pair(value: object) -> bool:
+    return isinstance(value, tuple | list) and len(cast(Sequence[object], value)) == 2
+
+
 @dataclass(frozen=True, init=False)
 class RuntimeModule:
     """一个带 Flag 的自包含 Runtime 能力声明。
@@ -412,6 +477,10 @@ class RuntimeModule:
     随机数、不起线程或执行器——回放跑在虚拟时钟上，等一个线程会让事件循环看起来空闲、定时器提前
     触发。回放交给入口点的 `ModuleHost` 是空环境，读 `environment` 决定行为的工厂会分叉。声明错了，
     回放报分叉。
+
+    `artifact_handlers` 不由 Runtime 装：处理器注册表归宿主（L1 验收、`Deliver` 收的类别、预览与
+    diff 共用一份），宿主按 Module 的次序把它们注册进去，与已装的处理器在同一个 (kind, mime) 上
+    冲突时报 `ConfigError`。
 
     装配失败按快照回滚内核持有的状态（hook 中心、服务）；已经 `on_start` 过的 Module 不补偿：
     `on_shutdown` 是异步的，同步的 Runtime 构造里调不了。第三方在 `on_start` 里起的任务、写的
@@ -436,6 +505,7 @@ class RuntimeModule:
     junctions: tuple[ExtensionJunction, ...]
     replay_safe: bool
     security_notes: str
+    artifact_handlers: tuple[ArtifactHandler, ...]
 
     def __init__(
         self,
@@ -454,6 +524,7 @@ class RuntimeModule:
         junctions: Sequence[ExtensionJunction] = (),
         replay_safe: bool = False,
         security_notes: str = '',
+        artifact_handlers: Sequence[ArtifactHandler] = (),
     ) -> None:
         name = _module_name(cast(object, name), 'RuntimeModule.name')
         raw_flags = _sequence(cast(object, flags), 'flags')
@@ -557,6 +628,9 @@ class RuntimeModule:
             self,
             'security_notes',
             _shown_text(cast(object, security_notes), 'security_notes', one_line=False),
+        )
+        object.__setattr__(
+            self, 'artifact_handlers', _artifact_handlers(cast(object, artifact_handlers), name)
         )
 
 

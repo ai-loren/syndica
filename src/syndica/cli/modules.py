@@ -285,15 +285,16 @@ def load_module(entry: Discovered, host: ModuleHost, redactor: Redactor) -> Runt
 
 
 def runs_code(module: RuntimeModule) -> bool:
-    """这个 Module 有没有会在 run 里跑的代码（服务、启停钩子、插件工厂、工具工厂）。只声明 Flag 的
-    没有：捕获不因它挡回放文档，回放也不因它没声明 `replay_safe` 就不重建。两处用这同一个判据，
-    否则捕获写下的文档回放一定拒绝。"""
+    """这个 Module 有没有会在 run 里跑的代码（服务、启停钩子、插件工厂、工具工厂、产物处理器）。只
+    声明 Flag 的没有：捕获不因它挡回放文档，回放也不因它没声明 `replay_safe` 就不重建。两处用这同一
+    个判据，否则捕获写下的文档回放一定拒绝。"""
     return bool(
         module.services
         or module.on_start is not None
         or module.on_shutdown is not None
         or module.agent_plugins
         or module.tool_factories
+        or module.artifact_handlers
     )
 
 

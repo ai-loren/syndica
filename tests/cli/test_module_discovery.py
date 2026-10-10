@@ -233,8 +233,10 @@ def test_modules_show_prints_a_builtin_manifest(tmp_path: Path):
         'replay_safe',
         'security_notes',
         'flags',
+        'artifact_handlers',
     ]
     assert (shown['name'], shown['capabilities'], shown['replay_safe']) == ('retry', [], True)
+    assert shown['artifact_handlers'] == []
     assert shown['flags'] == ['llm_retry_attempts', 'llm_retry_backoff_ms', 'llm_fallbacks']
 
 

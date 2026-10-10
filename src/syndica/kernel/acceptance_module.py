@@ -446,7 +446,8 @@ class AcceptanceModule(RuntimeModule):
             tools = agent.options.tools
             if router is None or 'Deliver' in tools or not _WRITERS & set(tools):
                 return {}
-            return {'Deliver': Deliver(router.portal())}
+            # 收的类别跟着同一份注册表走：Module 装上的处理器声明的类别，这里不收就等于没装。
+            return {'Deliver': Deliver(router.portal(), kinds=self.handlers.kinds)}
 
         super().__init__(
             'acceptance',
