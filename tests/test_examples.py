@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -153,9 +154,8 @@ def test_training_export_gets_four_verdicts_and_exports_all_but_the_unverified_o
     for name, rows in (('sft', 3), ('preference', 1), ('rl', 3), ('trajectory', 3)):
         line = f"{name:<11} {rows} rows; samples ['block', 'partial', 'pass']; "
         assert line + 'left out as unverified: 1' in completed.stdout, said
-    try:
-        import trl  # noqa: F401  # pyright: ignore[reportUnusedImport]
-    except ImportError:
+    # 不静态 import trl：CI 的 pyright 那一格不装 trl 这个 extra，静态导入在那里是一条类型错误。
+    if importlib.util.find_spec('trl') is None:
         assert 'TRL dry runs skipped' in completed.stdout
     else:
         assert 'SFTTrainer prepared 3 rows' in completed.stdout

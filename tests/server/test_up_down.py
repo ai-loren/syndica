@@ -21,6 +21,9 @@ from syndica import serve
 from syndica.kernel import ConfigError
 
 _SECRET = 'sk-test-abcdefghijklmnopqrstuv'
+# 刚起来的 server 在满载的机器上（本地矩阵两格并行跑全量）第一次应答可以超过 5 秒；
+# server 真没起来时，前面等状态文件那一步先失败，这个上限只管慢、不管死。
+_REQUEST_S = 30
 
 
 def _environ(tmp_path: Path) -> dict[str, str]:
@@ -58,7 +61,7 @@ def _get(url: str, token: str | None = None) -> dict[str, object]:
     request = urllib.request.Request(url)
     if token is not None:
         request.add_header('Authorization', f'Bearer {token}')
-    with urllib.request.urlopen(request, timeout=5) as response:
+    with urllib.request.urlopen(request, timeout=_REQUEST_S) as response:
         return json.loads(response.read())
 
 
@@ -69,7 +72,7 @@ def _login(port: int, code: str) -> str:
         headers={'Content-Type': 'application/json'},
         method='POST',
     )
-    with urllib.request.urlopen(request, timeout=5) as response:
+    with urllib.request.urlopen(request, timeout=_REQUEST_S) as response:
         return json.loads(response.read())['token']
 
 
