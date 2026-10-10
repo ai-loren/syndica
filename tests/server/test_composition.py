@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -349,6 +350,68 @@ async def test_the_human_terminal_runs_in_the_agent_environment_and_is_gone_afte
             break
         await asyncio.sleep(0.1)
     assert not _sleeping('3017')
+
+
+async def _terminal_until(terminal: Any, marker: bytes) -> bytes:
+    """读人的终端直到出现 marker、shell 退出或超时，交回读到的全部输出。"""
+    seen = b''
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(_TIMEOUT):
+            while not marker or marker not in seen:
+                chunk = await terminal.read()
+                if not chunk:
+                    break
+                seen += chunk
+    return seen
+
+
+async def test_ctrl_c_in_the_human_terminal_interrupts_the_foreground_command(tmp_path: Path):
+    assembly, _ = _assembly(tmp_path, lambda _: ScriptedLLM([]))
+    live = Live(assembly)
+    try:
+        session = await live.open_session(resume=None, role='Worker')
+        handle: Any = session.handle
+        terminal = handle.open_terminal(80, 24)
+        terminal.write(b'echo started=$((40+2)); sleep 3019\n')
+        await _terminal_until(terminal, b'started=42')
+        await asyncio.sleep(0.3)
+        terminal.write(b'\x03')
+        terminal.write(b'echo after=$((1+1))\n')
+        seen = await _terminal_until(terminal, b'after=2')
+    finally:
+        await live.shutdown()
+
+    assert b'after=2' in seen, seen
+
+
+async def test_closing_the_human_terminal_after_its_shell_exited_spares_the_servers_own_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    real_killpg = os.killpg
+    own = os.getpgrp()
+    signalled: list[int] = []
+
+    def recording_killpg(group: int, signum: int) -> None:
+        signalled.append(group)
+        if group not in (0, own):
+            real_killpg(group, signum)
+
+    assembly, _ = _assembly(tmp_path, lambda _: ScriptedLLM([]))
+    live = Live(assembly)
+    try:
+        session = await live.open_session(resume=None, role='Worker')
+        handle: Any = session.handle
+        terminal = handle.open_terminal(80, 24)
+        terminal.write(b'exit\n')
+        await _terminal_until(terminal, b'')
+        await asyncio.to_thread(terminal._process.wait)
+        monkeypatch.setattr(os, 'killpg', recording_killpg)
+        await terminal.close()
+    finally:
+        await live.shutdown()
+
+    assert signalled
+    assert [group for group in signalled if group in (0, own)] == []
 
 
 async def test_the_agent_terminal_mirror_finds_a_terminal_opened_inside_an_isolated_copy(

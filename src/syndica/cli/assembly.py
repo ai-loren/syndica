@@ -17,6 +17,7 @@ import pty
 import signal
 import struct
 import subprocess
+import sys
 import termios
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -45,6 +46,7 @@ from syndica.kernel import (
 )
 from syndica.kernel.acceptance_inject import meaningful_quote
 from syndica.kernel.feedback import propose_feedback_rubric
+from syndica.kernel.local_pty import _CONTROLLING_TTY  # pyright: ignore[reportPrivateUsage]
 from syndica.kernel.stores.file_artifact import FileArtifactStore
 from syndica.kernel.stores.file_rubric import FileRubricStore
 from syndica.kernel.trace_analysis import analyze_trace
@@ -474,14 +476,18 @@ class _Reader:
 class HumanTerminal:
     """人的终端：跑在 Agent 的环境里（白名单变量、临时的 git / gh 配置，没有宿主的密钥）。**不是
     沙箱**：它能读写人能读写的一切，与在工作区里开一个 shell 相同。用 `/bin/sh -i` 而不是人的登录
-    shell：登录 shell 会读 rc 文件，rc 里 export 的密钥就又回到这个环境里了。"""
+    shell：登录 shell 会读 rc 文件，rc 里 export 的密钥就又回到这个环境里了。
+
+    伪终端经 Agent 终端会话的同一个启动器成为 shell 的控制终端：Linux 不会替新会话自动分配控制终端，
+    没有它 shell 没有作业控制，Ctrl-C 到不了前台命令。"""
 
     def __init__(self, environment: AgentEnvironment, cwd: Path, cols: int, rows: int) -> None:
         master, slave = pty.openpty()
         self._master = master
         _set_size(master, cols, rows)
+        launcher = [sys.executable, '-c', _CONTROLLING_TTY] if sys.executable else []
         self._process = subprocess.Popen(
-            ['/bin/sh', '-i'],
+            [*launcher, '/bin/sh', '-i'],
             stdin=slave,
             stdout=slave,
             stderr=slave,
@@ -524,7 +530,11 @@ class HumanTerminal:
         # 前台命令会在关掉终端之后继续跑。后台作业与关掉一个终端窗口时一样，不在此列。
         groups = {self._process.pid}
         with contextlib.suppress(OSError):
-            groups.add(os.tcgetpgrp(self._master))
+            foreground = os.tcgetpgrp(self._master)
+            # shell 已经退出、会话里没有前台进程组时这里是 0；killpg(0) 杀的是调用方自己的进程组，
+            # 也就是整个 server。
+            if foreground > 0:
+                groups.add(foreground)
         for group in groups:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(group, signal.SIGKILL)
