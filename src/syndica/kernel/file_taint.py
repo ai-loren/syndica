@@ -7,6 +7,10 @@
 基线是打开时逐文件取的 (inode, 大小, ctime) 指纹，不哈希内容：ctime 由内核在每次改动时设成当前时间，
 用户态写不回去，`touch -d` 伪造修改时间骗不过它；整篇换掉（`mv`、`os.replace`）换了 inode。指纹与
 打开时不同就不再按基线算，哪怕内容其实没变（多判的方向，安全）。
+
+例外是打开前刚改过的文件：Linux 的 ctime 取自按 tick 走的粗粒度时钟，同一个 tick 里的两次改动 ctime
+相同，同样大小的改写于是留下同一个指纹。ctime 离打开不到 `_RACY_NS` 的文件在打开时另记内容哈希，判
+「没动过」时内容也要对得上。
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import logging
 import os
 import posixpath
 import stat
+import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -30,6 +35,9 @@ _MAX_FILES = 20000
 # 判一个改过的文件时要哈希它的内容；更大的文件不哈希，按不可信算。
 _MAX_HASHED = 64 * 1024 * 1024
 _CHUNK = 1024 * 1024
+# 比任何一种文件系统的时间戳粒度都长（Linux 的 tick 是毫秒级，粗的文件系统按秒记）：ctime 早于打开
+# 这么久的文件，此后的任何改动都会让 ctime 变。
+_RACY_NS = 2 * 1_000_000_000
 
 _Fingerprint = tuple[int, int, int]
 
@@ -56,6 +64,7 @@ class FileTaint:
         self._baseline_dirs: set[str] = set()
         self._baseline_links: dict[str, _Fingerprint] = {}
         self._baseline_hashes: dict[str, str | None] = {}
+        self._racy: set[str] = set()
         self._written: dict[str, dict[str, TrustLevel]] = {}
         if baseline:
             self._scan(max_files)
@@ -133,6 +142,7 @@ class FileTaint:
         )
 
     def _scan(self, max_files: int) -> None:
+        started = time.time_ns()
         for folder, directories, names in os.walk(self._root):
             # 符号链接（文件或目录）按名字记进基线：打开时就在的链接名字可信，之后新建的不可信。
             for entry in (*directories, *names):
@@ -157,11 +167,20 @@ class FileTaint:
                 path = Path(folder) / name
                 fingerprint = _fingerprint(path)
                 if fingerprint is not None:
-                    self._baseline[path.relative_to(self._root).as_posix()] = fingerprint
+                    relative = path.relative_to(self._root).as_posix()
+                    self._baseline[relative] = fingerprint
+                    if fingerprint[2] > started - _RACY_NS:
+                        self._racy.add(relative)
+                        self._baseline_hashes[relative] = self._current_version(relative)
 
     def _unchanged(self, relative: str) -> bool:
         recorded = self._baseline.get(relative)
-        return recorded is not None and _fingerprint(self._root / relative) == recorded
+        if recorded is None or _fingerprint(self._root / relative) != recorded:
+            return False
+        if relative in self._racy:
+            hashed = self._baseline_hashes.get(relative)
+            return hashed is not None and self._current_version(relative) == hashed
+        return True
 
     def _is_baseline_dir(self, relative: str) -> bool:
         """打开时就在、此刻仍是目录的那个目录。目录名本身是基线内容，不要因为它没有文件指纹就判不可信

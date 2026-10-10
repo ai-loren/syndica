@@ -12,6 +12,7 @@ from typing import TypeVar
 
 import pytest
 
+from syndica.kernel import file_taint
 from syndica.kernel.agent import AgentOptions, BaseAgent
 from syndica.kernel.context import (  # pyright: ignore[reportPrivateUsage]
     _CALL_TRUST,
@@ -90,12 +91,47 @@ async def test_setting_the_modification_time_back_does_not_restore_trust(
     router: WorkspaceRouter, root: Path
 ) -> None:
     before = os.stat(root / 'notes.md')
-    (root / 'notes.md').write_text('present at open\n')
+    (root / 'notes.md').write_text('PRESENT AT OPEN\n')
     os.utime(root / 'notes.md', ns=(before.st_atime_ns, before.st_mtime_ns))
 
     result = await Read(router).execute('notes.md')
 
     assert result.trust is TrustLevel.UNTRUSTED
+
+
+async def test_a_same_size_rewrite_the_clock_did_not_register_is_judged_by_its_content(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = file_taint._fingerprint  # pyright: ignore[reportPrivateUsage]
+    frozen: dict[Path, int] = {}
+
+    def coarse(path: Path) -> tuple[int, int, int] | None:
+        found = real(path)
+        if found is None:
+            return None
+        inode, size, ctime = found
+        return inode, size, frozen.setdefault(path, ctime)
+
+    monkeypatch.setattr(file_taint, '_fingerprint', coarse)
+    router = WorkspaceRouter(
+        LocalWorkspace(str(root), shell='/bin/sh', env={}), taint=FileTaint(root)
+    )
+
+    async def trust() -> tuple[TrustLevel, ...]:
+        read = await Read(router).execute('notes.md')
+        listed = await Glob(router).execute('*.md')
+        found = await Grep(router).execute('(?i)open')
+        return read.trust, listed.trust, found.trust
+
+    try:
+        (root / 'notes.md').write_text('PRESENT AT OPEN\n')
+        rewritten = await trust()
+        (root / 'notes.md').write_text('present at open\n')
+        restored = await trust()
+    finally:
+        await router.close()
+
+    assert (rewritten, restored) == ((TrustLevel.UNTRUSTED,) * 3, (TrustLevel.TRUSTED,) * 3)
 
 
 async def test_a_file_created_outside_the_tools_is_untrusted_in_read_glob_and_grep(
