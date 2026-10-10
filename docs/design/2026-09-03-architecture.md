@@ -118,14 +118,17 @@ backends    全部可选，按需安装
 
 ### 4.2 Runtime 公开 API
 
-公开面刻意收紧到 11 个方法。发布之后每个公开方法都是永久兼容承诺，宁少勿多，不够再加。
+驱动 Agent 的核心面刻意收紧到 11 个方法。发布之后每个公开方法都是永久兼容承诺，宁少勿多，不够再加。
 
 ```python
 class Runtime:
     # 生命周期
-    async def spawn(self, agent, options, query=None, *, parent_id=None,
-                    exit_mode=ExitMode.ZOMBIE, fork_from=None,
-                    flags=None, metadata=None, budget=None) -> str: ...
+    async def spawn(self, factory: AgentFactory, *, query: str | None = None,
+                    query_trust: TrustLevel = TrustLevel.TRUSTED,
+                    exit_mode: ExitMode = ExitMode.ZOMBIE, parent_id: str | None = None,
+                    fork_from: str | None = None, metadata: dict[str, Any] | None = None,
+                    flags: Mapping[str, FlagValue] | None = None, isolation: str = 'shared',
+                    session: bool = False, budget: Budget | None = None) -> str: ...
     async def kill(self, agent_id: str) -> None: ...
     async def despawn(self, agent_id: str) -> None: ...
     async def wait(self, agent_id: str) -> Context: ...
@@ -136,9 +139,10 @@ class Runtime:
     async def abort(self, agent_id: str, *, recursive: bool = False) -> None: ...
 
     # 消息
-    async def send(self, agent_id: str, message, *,
-                   trigger: Trigger = Trigger.PENDING,
-                   activate: bool = True) -> DeliveryResult: ...
+    async def send(self, agent_id: str, content: str, *,
+                   trigger: Trigger = Trigger.PENDING, activate: bool = True,
+                   sender: str = 'runtime', correlation_id: str | None = None,
+                   trust: TrustLevel = TrustLevel.TRUSTED) -> DeliveryResult: ...
 
     # 寻址
     async def ensure_active(self, agent_id: str) -> bool: ...
@@ -148,15 +152,34 @@ class Runtime:
     async def wait_for(self, agent_id: str, waiter: Waiter) -> WaitResult: ...
 ```
 
+`spawn` 收的是 `AgentFactory`（`(HooksCenter, EventBus) -> BaseAgent`），除它之外的参数一律 keyword-only。
+`send` 的正文参数叫 `content`；`trust` 让宿主把转述了不可信内容的消息标成不可信（编排工具 `SendMessage`
+按发送方的溯源传它），`query_trust` 对 `spawn` 的首条输入同理。
+
+核心面之外的公开成员各自归属别的机制，同样是永久承诺（由 `tests/kernel/test_public_api.py` 按真实
+实例逐字钉住，完整签名见 `docs/user/reference/api.md`）：
+
+- 生命周期：`shutdown()`。
+- 拓扑（§4.7）：`assemble(topology, catalog, *, tools, ...)`、`occupy(name, *, key)`、
+  `resolve(name, *, key, spawn)`、`send_to_slot(name, content, *, key, ...)`，以及角色表的读面
+  `agent_factory(name)`、`agent_names`。
+- 隔离（§6.4）：`merge_isolated(agent_id) -> MergeReport`、`discard_isolated(agent_id)`。
+- Module 与 Flag（§5.3 / §5.5）：`modules`、`plugins`、`flags`、`flag_declarations`；Module 声明的服务
+  挂成 `runtime.<name>`。
+- 构造时交给宿主的协作方：`registry`、`broker`、`events`、`hooks`、`workspace`。
+
+预算树的读写（某个 Agent 此刻的 `BudgetView`、宿主追加预算）不在公开面：长程策略从
+`LongHorizonContext.budget` 读，宿主经 `BudgetPolicy.ask_human` 追加。
+
 三处刻意的设计：
 
 - **`send` 默认激活目标。** 绝大多数调用方想要的语义是"发消息，它没在跑就叫醒它"。需要严格的"仅入队"语义时显式传 `activate=False`。**投递失败返回结构化 `DeliveryResult` 而不抛异常**，使调用方能识别可重试的瞬时错误。
 - **`ensure_active` 是唯一的激活入口。** 复活、重开、从落盘会话恢复、恢复子会话在语义上是同一件事，不应暴露成四个方法让用户猜。
 - **`find` 明文承诺绝不激活任何 Agent。** 只读路径必须与激活路径分离，否则查询类工具无法把"不存在"与"存在但未运行"分开回答。
 
-`Waiter` 是密封类型：`UserInput` / `Confirmation(tool_call_id)` / `Reply(correlation_id)`。新增等待类型不需要新增公开方法。
+`Waiter` 是密封类型：`UserInput(request_id)` / `Confirmation(tool_call_id)` / `Reply(correlation_id)`。新增等待类型不需要新增公开方法。
 
-`WaitResult` 的状态集合：`answered` / `timeout` / `preempted` / `aborted`。**`timeout` 是必须的** —— 长跑场景下等人工输入可能几小时无人查看，没有超时就是永久挂起，而一个挂住的 Agent 会一直占着预算与租约。每个 `Waiter` 携带自己的等待上限。
+`WaitResult` 是 `(state, message)`，状态集合：`answered` / `timeout` / `preempted` / `aborted`。**`timeout` 是必须的** —— 长跑场景下等人工输入可能几小时无人查看，没有超时就是永久挂起，而一个挂住的 Agent 会一直占着预算与租约。每个 `Waiter` 携带自己的等待上限（`timeout`）。
 
 ### 4.3 关键分离：注册表 vs 进程内实例表
 
@@ -164,12 +187,15 @@ Agent 的**可序列化状态**与**运行时对象**必须分开存放，这是
 
 ```
 AgentRegistry（Protocol，可远程、可多进程共享）
-    AgentInfo: agent_id / name / type / status / parent_id / children
-               / flags / metadata / created_at / session_id
+    AgentInfo: agent_id / name / agent_type / status / parent_id / children
+               / session_id / metadata / owner / heartbeat_at / created_at / flags
 
 LocalAgentTable（进程内，不进 Protocol）
-    agent_id → Agent 实例、asyncio.Task、asyncio.Event
+    agent_id → Agent 实例、asyncio.Task
 ```
+
+字段按 `AgentInfo` 的声明顺序列出，顺序计入公开 API。角色名的字段叫 `agent_type`（避开内置的 `type`）。
+挂起与唤醒用的 `asyncio.Event` 在每个 Agent 自己的控制块里，不在本地表上。
 
 注册表回答"这个 Agent 处于什么状态"，本地表回答"这个 Agent 的对象在哪"。多进程部署时前者共享，后者各进程只持有自己那部分。
 
@@ -182,8 +208,8 @@ LocalAgentTable（进程内，不进 Protocol）
 因此 `AgentInfo` 携带租约：
 
 ```python
-owner: str          # 持有该 Agent 实例的进程标识
-heartbeat_at: float # 最近一次心跳
+owner: str | None          # 持有该 Agent 实例的进程标识；None 是还没有持有者
+heartbeat_at: float | None # 最近一次心跳
 ```
 
 - 持有进程周期性续租；租约过期即视为孤儿
