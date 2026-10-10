@@ -1,108 +1,168 @@
-# Syndica — Agent 指南
+# Syndica — Agent Guide
 
-> 本文是给在本仓库改代码的 AI 与人类的**约束清单**，不是教程。
-> 它会被注入 Agent 上下文，因此**只写定位、边界、不变式**——实现细节留在代码里，设计推理留在
-> [`docs/design/2026-09-03-architecture.md`](docs/design/2026-09-03-architecture.md)（下称 spec）。
-> 写成 changelog 会挤掉其他文档的上下文预算。
+> This is the **list of constraints** for the AIs and humans who change code in this repository,
+> not a tutorial. It is injected into agents' context, so it **only states positioning, boundaries
+> and invariants**: implementation details stay in the code, design reasoning stays in
+> [`docs/design/2026-09-03-architecture.md`](docs/design/2026-09-03-architecture.md) (the spec).
+> Writing it as a changelog would crowd out the context budget of the other documents.
 >
-> 公开发布前需译为英文。
+> Three section titles keep their Chinese names in front (硬约束, 错误消息, 测试): the development
+> roles' prompts in `docs/agents/` look those sections up by name.
 
-## 这是什么
+## What this is
 
-**以 Multi-Agent 为一等公民的 Agent Harness，面向通用知识工作。**
-一句话：让一支 Agent 团队 7×24 小时完成"可验收的知识工作"，并把干活的过程变成训练数据。
+**An agent harness with multi-agent as a first-class citizen, for general knowledge work.**
+In one sentence: let a team of agents complete "verifiable knowledge work" 7×24 hours, and turn
+the process of doing the work into training data.
 
-四条主张（改动若与它们冲突，说明改错了方向）：
+Four claims (a change that conflicts with them is going in the wrong direction):
 
-1. Multi-Agent 是一等公民——Agent 有进程语义；派活 / 分叉 / 通信是内核工具；组织结构是声明式数据。
-2. 面向通用知识工作，不只是编程——文档、表格、图表与代码同等对待。
-3. 产物与验收是内核能力——产物有身份与版本；验收标准必须可追溯到原始需求。
-4. 推理与训练同源——验收结论即奖励与偏好信号。
+1. Multi-agent is a first-class citizen: agents have process semantics; delegating / forking /
+   messaging are kernel tools; the organisational structure is declarative data.
+2. General knowledge work, not just programming: documents, tables and diagrams are treated the
+   same as code.
+3. Artifacts and acceptance are kernel capabilities: artifacts have identity and versions;
+   acceptance criteria must be traceable to the original request.
+4. Inference and training share one source: acceptance verdicts are reward and preference signals.
 
-长程任务（long-horizon）是主动选择的探索方向，见 spec §8。
+Long-horizon tasks are a deliberately chosen direction of exploration; see spec §8.
 
 ---
 
-## 硬约束（违反即打回）
+## 硬约束 · Hard constraints (a violation is sent back)
 
-| # | 约束 | 破了会怎样 |
+| # | Constraint | What breaks if it is violated |
 |---|---|---|
-| 1 | **kernel 不依赖任何 surface 或 backend** | 分层塌陷，无法单独发布 kernel |
-| 2 | **surface → kernel 单向；surface 之间互不依赖** | CLI 拖进 web 依赖，安装体积失控 |
-| 3 | **backend → kernel 单向；backend 之间互不依赖** | 装一个后端被迫装另一个 |
-| 4 | **kernel 不读环境变量** | 内核绑定某种部署方式；而开源项目对用户部署一无所知 |
-| 5 | **kernel 零重依赖**（仅标准库 + pydantic + 一个 HTTP 客户端）；厂商 SDK 一律进 backend | `pip install` 拖下半个生态 |
-| 6 | **公开 API 全量类型标注**，随包发布 `py.typed` | 下游拿不到类型，Protocol 形同虚设 |
-| 7 | **Agent 的命令环境只按白名单透传，形似密钥的名字一律拒收**，写在 `pass_env` 里也拒 | 密钥进了 Agent 的环境，就会被命令打印进上下文、随请求发给模型提供方 |
-| 8 | **写进 trace、交接文件、提交与导出给第三方的数据都先过内核的 `Redactor`**；发给模型提供方的请求是唯一的例外；新增落盘或外发路径走同一个脱敏器 | 密钥写进磁盘、git 历史与别人的 collector，事后删除来不及 |
-| 9 | **Agent 不执行 git 写命令；提交与推送只由宿主在人选择之后执行** | 模型失手改写历史，或推走没有复核过的提交 |
+| 1 | **The kernel depends on no surface and no backend** | The layering collapses; the kernel cannot be released on its own |
+| 2 | **surface → kernel only; surfaces do not depend on each other** | The CLI drags in web dependencies; install size gets out of control |
+| 3 | **backend → kernel only; backends do not depend on each other** | Installing one backend forces installing another |
+| 4 | **The kernel reads no environment variables** | The kernel gets tied to one way of deploying, while an open-source project knows nothing about how users deploy |
+| 5 | **The kernel has zero heavy dependencies** (standard library + pydantic + one HTTP client only); vendor SDKs always go into backends | `pip install` drags down half the ecosystem |
+| 6 | **The public API is fully type-annotated** and ships `py.typed` | Downstream gets no types, and the Protocols are hollow |
+| 7 | **The agents' command environment is passed through by allowlist only, and names that look like secrets are always refused**, even when written in `pass_env` | Once a secret is in the agents' environment, a command prints it into the context and it is sent to the model provider with the request |
+| 8 | **Data written into traces, handoff files and commits, and data exported to third parties, all go through the kernel's `Redactor` first**; requests sent to the model provider are the only exception; new persistence or outbound paths go through the same redactor | Secrets are written to disk, to git history and to someone else's collector; deleting them afterwards is too late |
+| 9 | **Agents do not run git write commands; commits and pushes are made only by the host, after a person chooses** | The model rewrites history by mistake, or pushes commits nobody reviewed |
 
-前三条由 CI 机器校验，不靠人守；第 7–9 条由测试守着（命令环境的用例、全仓写入点与外发点的 AST 守卫、开发期无条件拦截的用例）。第 9 条的拦截读的是命令文本：`sh -c`、`eval`、`xargs`、`find -exec` 转手的命令认得出，脚本、变量、`python -c` 与名单之外的程序（`su -c`、`ssh`、`make`）里的认不出，挡的是失手不是蓄意，真正的边界是沙箱化的 Workspace 后端（内核只定 `Workspace` / `Portal` 协议与契约套件，沙箱由后端实现）；所以这条约束首先是对代码的要求：任何改动都不得给 Agent 增加执行 git 写操作的途径。
+The first three are checked by machine in CI, not by people; numbers 7–9 are guarded by tests (cases
+for the command environment, an AST guard over every write point and outbound point in the
+repository, cases for the unconditional development-time block). The block for number 9 reads the
+command text: commands handed on through `sh -c`, `eval`, `xargs` and `find -exec` are recognised;
+those inside scripts, variables, `python -c` and programs outside the list (`su -c`, `ssh`, `make`)
+are not. It stops mistakes, not intent; the real boundary is a sandboxed Workspace backend (the
+kernel only defines the `Workspace` / `Portal` protocols and their contract suite; the sandbox is
+implemented by a backend). So this constraint is first of all a requirement on the code: no change
+may give agents a new way to perform git write operations.
 
-**公开 API 的范围比直觉宽**：除函数签名外，**切点名、Store Protocol、Flag key、声明式 Agent 清单字段**全部计入，变更即破坏性变更。
+**The public API is wider than intuition suggests**: besides function signatures, **junction names,
+Store Protocols, Flag keys and declarative agent manifest fields** all count, and changing them is
+a breaking change.
 
 ---
 
-## 关键不变式
+## Key invariants
 
-### 前缀缓存（spec §5.2）
+### Prefix cache (spec §5.2)
 
-缓存按**请求字节前缀**匹配，System Prompt 在最前。**SP 变一个字节，该会话此后所有请求缓存全失效**，而 SP 每轮重建、没有冻结机制。
+Caches match on the **byte prefix of the request**, and the system prompt comes first. **Change one
+byte of the SP and every later request in that session misses the cache**, and the SP is rebuilt
+every turn with no freezing mechanism.
 
-1. 前缀逐轮**字节一致**；随轮变化的内容一律不进 SP。
-2. **动态环境事实注入历史，不进 SP**（工作目录、隔离状态等），spawn 时一次性且幂等。
-3. 新增内容**只 append**，不改动已有前缀。
-4. 缓存亲和随会话语义：同类型分叉继承缓存键，跨类型不继承。
-5. 一次性调用（生成标题、抽取记忆）关闭缓存写入。
+1. The prefix is **byte-identical** from turn to turn; nothing that changes from turn to turn goes
+   into the SP.
+2. **Dynamic environment facts are injected into the history, not into the SP** (working
+   directory, isolation state and so on), once at spawn and idempotently.
+3. New content is **only appended**; the existing prefix is never changed.
+4. Cache affinity follows session semantics: a fork of the same type inherits the cache key, a fork
+   of another type does not.
+5. One-off calls (generating a title, extracting memories) turn cache writes off.
 
-违反**不报错，只静默多付费用**。开发模式默认开启漂移检测。
+Violations **raise no error; they only cost money silently**. Development mode turns drift
+detection on by default.
 
-推论：声明式 Agent 的提示词插值变量**禁止 `{cwd}`**；记忆必须缓存同一份块，不得每轮重拉。
+Corollary: prompt interpolation variables of declarative agents **must not include `{cwd}`**;
+memory must cache one and the same block and must not be re-fetched every turn.
 
-### 上下文压缩（spec §8.8）
+### Context compaction (spec §8.8)
 
-压缩不得破坏五件事：工具调用与结果**配对**、SP **不参与**压缩、**Goal 与未满足 Rubric 存活**、已注入的环境事实存活或重新注入、**不可信标记随衍生内容存活**。
+Compaction must not break five things: tool calls stay **paired** with their results, the SP **takes
+no part** in compaction, **the goal and unmet rubrics survive**, injected environment facts survive
+or are re-injected, and **untrusted markers survive on derived content**.
 
-最后一条是压缩与安全的交界处，最容易漏：压缩会把不可信内容重写成看起来像结论的文字，标记一丢，此后基于它的高风险操作就绕过了安全升级。
+The last one sits where compaction meets security and is the easiest to miss: compaction rewrites
+untrusted content into text that looks like a conclusion; once the marker is lost, high-risk
+operations based on it bypass the security escalation.
 
-压缩后**重建缓存键**（让失效一次性发生），压缩点记入 trace。
+After compaction, **rebuild the cache key** (so the invalidation happens once), and record the
+compaction point in the trace.
 
-### 并发（spec §4.4 / §6.4）
+### Concurrency (spec §4.4 / §6.4)
 
-- Agent 状态转换用 **CAS**，不是直接赋值。`update()` 仅限单一写者字段；多方可写集合必须提供原子操作。
-- 共享工作区下产物写入用**乐观并发控制**，冲突显式返回而非静默覆盖。丢数据是静默且灾难性的，冲突是显式且可恢复的。
-- 记忆写入同上；**只有根协调者可写全局记忆**。
+- Agent state transitions use **CAS**, not direct assignment. `update()` is only for fields with a
+  single writer; collections that several parties write must provide atomic operations.
+- Artifact writes in a shared workspace use **optimistic concurrency control**; a conflict is
+  returned explicitly instead of silently overwriting. Losing data is silent and catastrophic; a
+  conflict is explicit and recoverable.
+- The same for memory writes; **only the root coordinator may write global memory**.
 
-### 不确定性必须显式（spec §7.5 / §10 / §9.5）
+### Uncertainty must be explicit (spec §7.5 / §10 / §9.5)
 
-- 验收器失败 → 放行，但**显式标记未验收**。
-- 裁决状态四值：`pass` / `partial` / `block` / **`unverified`**。
-- 训练数据导出器**默认排除 `unverified`**。把"我们没能验证"当成"验证通过"是最隐蔽的数据污染，且直接损害主张 4。
+- Verifier fails → let the run through, but **explicitly mark it as not accepted**.
+- The verdict has four values: `pass` / `partial` / `block` / **`unverified`**.
+- The training-data exporter **excludes `unverified` by default**. Treating "we could not verify
+  it" as "verified" is the most insidious data pollution, and directly damages claim 4.
 
-### 授权与危险操作（spec §5.6）
+### Authorisation and dangerous operations (spec §5.6)
 
-- 危险判定是**纯规则**：只输出规则 ID、风险等级、原因；不读配置、不调 LLM、不决定交互方式。
-- 处置由宿主决定（阻断 / 模型自授权 / 人工确认）。
-- **授权仅放行当次调用**，不存在"此后均可"。长跑数百轮，宽泛授权会在完全不同的上下文中被使用。
+- Danger judgement is **pure rules**: it outputs only a rule ID, a risk level and a reason; it reads
+  no configuration, calls no LLM and does not decide how to interact.
+- The disposition is decided by the host (block / let the model authorise itself / ask a person).
+- **An authorisation allows only the current call**; there is no "allowed from now on". In a long
+  run of hundreds of turns, a broad authorisation ends up used in a completely different context.
 
-### 拓扑（spec §4.7）
+### Topology (spec §4.7)
 
-**只声明结构，不声明行为。** slot 可以给 Agent 附加工具 / 插件 / 预算，**不得替换其基础配置**。否则同一个 Agent 在不同拓扑下行为不同，排查时必须同时读两处定义。需要不同行为就定义不同角色。
+**Declare structure only, never behaviour.** A slot may attach tools / plugins / budget to an agent,
+but **must not replace its base configuration**. Otherwise the same agent behaves differently in
+different topologies, and debugging requires reading two definitions at once. If you need
+different behaviour, define a different role.
 
-### 安全（spec §12）
+### Security (spec §12)
 
-- **任何新增的持久化路径都必须经过脱敏收口。** 脱敏发生在**写入之前**——写进磁盘再删除是来不及的，备份里已经有了。新增写入点不走收口即视为缺陷。脱敏也发生在**截断之前**：截断可能切在一个密钥中间，剩下的那截不一定还认得出来。
-- **宿主替 Agent 执行的动作，不能给 Agent 它本来没有的能力。** 宿主的 `git commit` 会跑钩子与配置里的程序（`gpg.program`、filter），而它们执行的往往是工作区里 Agent 能改的代码（husky、lint-staged、`npm test`）；在宿主环境里跑，等于把 ssh agent 与全部密钥交给 Agent。凡是会执行工作区代码的子进程只在 Agent 的环境里跑；必须用宿主环境的（推送要 ssh agent）就关掉其中会执行代码的部分，关不掉就不提供。检查与动作之间隔着一次问人时，检查要在动作之前**再做一次**：问题挂着的这段时间，逃过进程组清理的进程照样能改仓库。
-- **不可信内容的标记必须可传递。** 外部内容经摘要、压缩、记忆整理之后，衍生内容**仍然不可信**。这一条最容易漏：压缩会把不可信内容重写成看起来像结论的文字。
-- **高风险操作若可溯源到不可信内容，处置必须升级**，不允许模型自授权。规则匹配挡不住"被说服后写出一段看起来合法的脚本"。无人值守下**默认拒绝而非等待**——拒绝让 Agent 能立刻换路径，等待只是白耗一段超时。
-- **第三方 Skill 正文默认不可信**（可逐个声明可信）。Skill 天生就是"要被当指令执行的东西"，是比网页更直接的注入向量；"用户装了"不等于"用户读过每一行"。
-- 脱敏与可回放冲突时**选安全**：回放用占位符，需要真凭证的步骤失败是正确行为。
+- **Every new persistence path must go through the redaction choke point.** Redaction happens
+  **before writing**: writing to disk and deleting afterwards is too late, the backups already have
+  it. A new write point that bypasses the choke point is a defect. Redaction also happens **before
+  truncation**: a cut may land in the middle of a secret, and the remaining half may no longer be
+  recognisable.
+- **An action the host performs on an agent's behalf must not give the agent a capability it does
+  not have.** The host's `git commit` runs hooks and programs from the configuration
+  (`gpg.program`, filters), and they often execute code in the workspace that agents can change
+  (husky, lint-staged, `npm test`); running them in the host's environment hands the ssh agent and
+  every secret to the agent. Any subprocess that executes workspace code runs only in the agents'
+  environment; where the host environment is required (pushing needs the ssh agent), turn off the
+  parts that execute code, and if they cannot be turned off, do not offer the feature. When a
+  question to a person sits between a check and an action, **do the check again** right before the
+  action: while the question is pending, a process that escaped process-group cleanup can still
+  change the repository.
+- **The untrusted marker must be transitive.** After external content is summarised, compacted or
+  consolidated into memory, the derived content is **still untrusted**. This is the easiest one to
+  miss: compaction rewrites untrusted content into text that looks like a conclusion.
+- **If a high-risk operation can be traced to untrusted content, its disposition must be
+  escalated**, and the model may not authorise it itself. Rule matching cannot stop "persuaded,
+  then wrote a script that looks legitimate". Unattended, **refuse by default instead of waiting**:
+  refusing lets the agent switch paths immediately, waiting only burns a timeout.
+- **The body of a third-party Skill is untrusted by default** (it can be declared trusted one by
+  one). A Skill is by nature "something to be executed as instructions", a more direct injection
+  vector than a web page; "the user installed it" does not mean "the user read every line".
+- When redaction conflicts with replayability, **choose safety**: replay uses placeholders, and a
+  step that needs a real credential failing is correct behaviour.
 
-### 错误消息（硬规范）
+### 错误消息 · Error messages (hard rule)
 
-**面向使用者的错误必须包含三件套：期望什么 / 实际收到什么 / 下一步做什么。** 缺一不可。
+**An error a user sees must have three parts: what was expected / what was actually received /
+what to do next.** None may be missing.
 
-开源项目的错误消息质量直接决定 issue 数量——报不清楚，用户只能来提 issue。
+The quality of an open-source project's error messages directly determines the number of issues:
+if the error is unclear, users can only open an issue.
 
 ```
 ✗  duplicate handler for spreadsheet
@@ -110,142 +170,668 @@
    syndica-sheets 重复注册同一精度。卸载其中之一，或用更具体的 mime 区分。
 ```
 
-适用范围：Protocol 契约违反、依赖规则违反、Flag 配置错误、处理器冲突、拓扑校验失败——凡是用户能看到的。纯内部诊断日志可以简短。
+(The good example says: artifact handler conflict: kind=spreadsheet mime=xlsx is already
+registered by syndica-office, and syndica-sheets registers the same precision again; uninstall one
+of them, or tell them apart with a more specific mime. Runtime messages stay in Chinese in v1.0.)
 
-**三件套里最容易整条零断言的是第三件。** 实测：一个新模块九处 `raise` 的 `next_action` 全部换成「请检查你的请求」，959 条测试全绿——而同仓已有五个测试文件都断言了它的锚词。每处挑一个**不可替换**的锚词断进去（要改的那个字段名、那个开关名、这条裁决独有的词），措辞留给它可以改。
+Scope: Protocol contract violations, dependency rule violations, Flag configuration errors, handler
+conflicts, topology validation failures: anything a user can see. Purely internal diagnostic logs
+may be brief.
 
-**类名由构造中的那个类给出，不写死基类名。** 这条消息的读者正在写子类，报出基类名会指着一个没问题的地方。`type(self).__name__`，不是字面量。
+**Of the three parts, the third is the easiest to end up with zero assertions.** Measured: in a new
+module, all nine `raise` sites had their `next_action` replaced with "please check your request",
+and all 959 tests stayed green, although five test files in the same repository already asserted
+its anchor words. At each site, assert one **irreplaceable** anchor word (the name of the field to
+change, the name of the switch, the word unique to this verdict), and leave the wording free to
+change.
+
+**The class name comes from the class being constructed; do not hard-code the base class name.**
+The reader of that message is writing a subclass, and reporting the base class name points at a
+place that is fine. `type(self).__name__`, not a literal.
 
 ---
 
-## 加功能该动哪一层
+## Which layer a new feature belongs in
 
-| 你要做的事 | 该动的地方 |
+| What you want to do | Where to change |
 |---|---|
-| 能力**需要一个开关**（可配、要出文档） | 写 **Runtime Module** + Flag 声明。**这是默认答案** |
-| 跨 Agent 通用且**永不暴露为开关** | kernel 内置插件 |
-| 只增强**某一个 Agent** | 该 Agent 内注册钩子 |
-| 支持**新执行环境** | 实现 `Workspace` + `Portal`，放 backend，工具层零改动 |
-| 支持**新模型厂商** | 实现 provider，放 backend；kernel 不认识厂商 |
-| 支持**新产物格式** | 实现 `ArtifactHandler`，放 backend |
-| 换**存储后端** | 实现对应 Store Protocol，**必须跑通 kernel 发布的契约测试** |
-| 要**新的 Agent 角色** | 优先写**声明式清单 + 提示词**；只有需要自定义工具注册 / 钩子 / 复杂提示词组装才写类式 |
-| 改**系统组织结构** | 改拓扑声明，不改代码 |
-| 换**长跑范式** | 实现 `LongHorizonStrategy`，做成 Runtime Module |
+| A capability **needs a switch** (configurable, documented) | Write a **Runtime Module** + Flag declarations. **This is the default answer** |
+| Common to all agents and **never exposed as a switch** | A kernel built-in plugin |
+| Enhances **only one agent** | Register hooks in that agent |
+| Support a **new execution environment** | Implement `Workspace` + `Portal`, in a backend; zero changes to the tool layer |
+| Support a **new model vendor** | Implement a provider, in a backend; the kernel knows no vendors |
+| Support a **new artifact format** | Implement an `ArtifactHandler`, in a backend |
+| Change the **storage backend** | Implement the corresponding Store Protocol; it **must pass the contract tests the kernel publishes** |
+| Need a **new agent role** | Prefer a **declarative manifest + prompt**; write a class-based one only for custom tool registration / hooks / complex prompt assembly |
+| Change the **system's organisational structure** | Change the topology declaration, not code |
+| Change the **long-run paradigm** | Implement `LongHorizonStrategy` as a Runtime Module |
 
-判断顺序：**能不能做成 Module？不能的话，是不是某一层的 Protocol 实现？都不是才考虑动 kernel。**
+Order of judgement: **Can it be a Module? If not, is it a Protocol implementation of some layer?
+Only if neither, consider touching the kernel.**
 
 ---
 
-## 测试
+## 测试 · Testing
 
-| 层 | 何时跑 | 说明 |
+| Layer | When it runs | Notes |
 |---|---|---|
-| 单测 / L1 进程内小流程 | 每次推送 | 纯函数、schema 生成、状态机转换 |
-| **L2 场景回放** | 每次推送 | 声明式场景 + 脚本化假 LLM 驱动**真** runtime。**唯一能测失败路径的手段** |
-| **Protocol 契约测试** | 每次推送 | 四个 Store Protocol 各一套，任何实现都必须通过 |
-| 真 LLM 端到端 | 手动 / 定时 | 效果正确性的唯一权威 |
+| Unit / L1 in-process small flows | Every push | Pure functions, schema generation, state machine transitions |
+| **L2 scenario replay** | Every push | Declarative scenarios + a scripted fake LLM driving the **real** runtime. **The only way to test failure paths** |
+| **Protocol contract tests** | Every push | One suite for each of the four Store Protocols; every implementation must pass |
+| Real-LLM end to end | Manual / scheduled | The only authority on effective correctness |
 
-**前三层必须零成本可跑**（无需 API 密钥）。理由：来自 fork 的 PR 拿不到密钥，若测试都需要真 LLM，等于没有任何自动化能挡住回归。
+**The first three layers must run at zero cost** (no API keys). Reason: PRs from forks get no
+secrets; if the tests all needed a real LLM, no automation at all could stop regressions.
 
-长跑测试用**假时钟 + 确定性种子 + 故障注入**，不靠真等。
+Long-run tests use **a fake clock + deterministic seeds + fault injection**, not real waiting.
 
-**判断一套测试够不够强，靠变异**：问"我能改坏实现里的哪一处而不让任何测试变红"，然后真去改。多次发现看着齐全的用例集只挡住其中一个变异。两个反复踩到的盲区值得单列：
+**Whether a test suite is strong enough is judged by mutation**: ask "which part of the
+implementation could I break without turning any test red", then actually break it. Several times
+a suite that looked complete stopped only one of the mutations. Two blind spots that were hit
+repeatedly are worth listing on their own:
 
-- **枚举成员取值撞车不是错误，是别名。** `UNTRUSTED = 'trusted'` 让 `UNTRUSTED` 静默成为 `TRUSTED` 的别名，整个不可信标记体系塌成一个值而测试全绿。挡法是断言整张成员→取值表相等（`{m.name: m.value for m in E} == {...}`）—— 枚举迭代跳过别名，塌缩时字典少一项即失败，一句同时钉住互异性、成员完备与落盘取值。
-- **变异跑出假绿，可能是字节码缓存没失效。** `.pyc` 按 (mtime 秒, 源文件字节数) 判失效，所以等长替换（`'max_turns'` → `'completed'`）在同一秒内改完会复用旧字节码，变异对解释器根本不可见。做变异验证前先清 `__pycache__`。
-- **新文件还没 `git add` 时，`git diff` 是瞎的。** 变异验证的收尾动作是"还原后确认 `git diff` 为空"，但未跟踪文件不在 diff 里，于是漏掉的变异会被当成基线快照下来——已真实发生过一次。新增文件的任务先 `git add`，再用索引做还原基准，并在还原后重跑一遍确认是绿的。**但索引本身也会被污染**：`git checkout <commit> -- <file>` 同时写工作区和索引，之后「从索引还原」还回来的是那个 commit 的版本而不是你的基线。所以还原后一律按 sha256 与基线比对，别只看 diff 是否为空。
-- **按 sha256 对基线校验，只在基线集合覆盖了这一轮会改到的每一个文件时才成立——基线集合本身是要被证明的。** 已真实发生过：一条变异改的文件不在快照清单里，于是还原时它没被还原、校验时它根本没被查，脚本报「还原 OK」，之后的两条变异与整轮归因全跑在一棵带残留的树上（54 条既有用例在红），而校验全程没出声，最后是 `git status` 而不是校验发现的。**这类漏洞不会让校验报错，只会让它沉默地缩小范围**，与「搜索范围写死的守卫可以被悄悄收窄」同型。修法：每次施加变异**之前**也跑一遍校验（基线自洽性检查），或者干脆让清单从「本轮要改的文件」自动派生而不是手写。
-- **测试辅助函数会连带固定"基数"，把所有顺序与多重性性质一起藏起来。** 先出现的是浅层版本：helper 总是显式传 `max_turns` / `system_prompt`，于是那些默认值从未被执行过。更深的一层是 Task 13：helper 固定 `tools` 只有 1 个，于是**反转工具顺序能通过全部 498 条测试**——而工具定义的顺序正属于前缀缓存这条硬约束。**判据**：凡是集合、列表、映射参与的性质，至少要有一条用例把基数取到 2 以上；`n=1` 时反转、排序、去重、取首、取尾全都是同一个答案。
+- **Enum members with colliding values are not an error; they are aliases.** `UNTRUSTED = 'trusted'`
+  silently makes `UNTRUSTED` an alias of `TRUSTED`; the whole untrusted-marker system collapses
+  into one value and the tests stay green. The defence is to assert the whole member → value table
+  for equality (`{m.name: m.value for m in E} == {...}`): enum iteration skips aliases, so on a
+  collapse the dict loses an entry and fails; one statement pins distinctness, completeness of
+  members and the persisted values at once.
+- **A mutation that runs green may be a stale bytecode cache.** `.pyc` is invalidated by (mtime in
+  seconds, source size in bytes), so an equal-length replacement (`'max_turns'` → `'completed'`)
+  made within the same second reuses the old bytecode, and the mutation is invisible to the
+  interpreter. Clear `__pycache__` before mutation testing.
+- **While new files are not `git add`ed, `git diff` is blind.** The closing step of mutation testing
+  is "after restoring, confirm `git diff` is empty", but untracked files are not in the diff, so a
+  missed mutation gets snapshotted as the baseline; this has really happened once. For tasks that
+  add files, `git add` first, use the index as the restore baseline, and after restoring run again
+  to confirm green. **But the index itself can be polluted**: `git checkout <commit> -- <file>`
+  writes both the working tree and the index, and afterwards "restoring from the index" gives back
+  that commit's version, not your baseline. So after restoring, always compare against the baseline
+  by sha256; do not rely only on whether the diff is empty.
+- **Checking against a baseline by sha256 only holds if the baseline set covers every file this
+  round will change; the baseline set itself has to be proven.** It has really happened: a mutation
+  changed a file that was not in the snapshot list, so on restore it was not restored and on
+  verification it was never checked; the script reported "restore OK", the next two mutations and
+  the attribution of the whole round ran on a tree with leftovers (54 existing tests red), and the
+  verification said nothing the whole time; `git status`, not the verification, found it. **This
+  kind of hole does not make the verification fail; it silently narrows its scope**, the same shape
+  as "a guard with a hard-coded search scope can be narrowed quietly". Fix: also run the
+  verification **before** applying each mutation (a baseline self-consistency check), or derive the
+  list automatically from "the files this round will change" instead of writing it by hand.
+- **Test helpers also fix the "cardinality", hiding every ordering and multiplicity property with
+  it.** The shallow version came first: the helper always passed `max_turns` / `system_prompt`
+  explicitly, so those defaults were never executed. The deeper layer was Task 13: the helper fixed
+  `tools` at exactly one, so **reversing the order of tools passed all 498 tests**, and the order
+  of tool definitions belongs precisely to the prefix-cache hard constraint. **Criterion**: any
+  property involving a set, list or mapping needs at least one case with cardinality above 2; at
+  `n=1`, reverse, sort, deduplicate, take-first and take-last all give the same answer.
 
-  **而基数 ≥ 2 仍然不够——顺序不能是任何自然排序。** n=2 时 `sorted` 与 `sorted(reverse=True)` 里必有一个是恒等变换，所以两个元素**无论怎么排都挡不住排序类变异**："既非升序亦非降序"在 n=2 下不可能成立。要让顺序不是任何自然排序，**基数至少要 3**，且固定装置的顺序既非升序、亦非降序、也不等于反转结果。
-- **`==` 比较 dict 对键序完全无感——而键序在本项目里是承重的。** 发给模型的 schema、拼进请求的消息体，只要键序漂移，**前缀缓存整体失效且不报任何错**（成本只体现在账单与命中率上，正是 `LLMConfig.derive` 存在的同一类理由）。Task 11 里三条"重排键序"的变异全部存活，因为该文件几乎所有断言都是 `==`。**凡是会进 LLM 请求或缓存键的结构，要显式断言 `list(d)` 的顺序**，别只断言相等。
-- **测试必须在与生产相同的模块条件下运行。** 本仓要求每个模块开头写 `from __future__ import annotations`（PEP 563），于是该模块里所有标注在运行时都是**字符串**，`inspect.signature` 默认不求值。Task 11 的测试文件漏了这行，其工具类保留了真实类型对象——套件全绿，而按仓库约定写的每一个真实工具都会报错。**凡是反射标注、`__module__`、`__qualname__`、导入顺序、编译期开关的代码，测试文件必须复刻生产模块的头部条件**，否则验证的是与所发布代码相反的情形。
-- **`asyncio.wait_for` 会自己插进调度跳转，所以「这两句之间没有挂起点」这类论证必须把它算进去。** 已三次咬人：一次是某条用例在变异下发绿，因为 `wait_for` 多插了一次调度；一次是「事件 `set()` 之后紧接着复检，中间不可能有别的任务插进来」被实测推翻——3.11 的 `wait_for` 把内层协程包成 Task 并加一个 done-callback，真实窗口是**六个 ready-queue 槽位**，用两个普通任务就能构造出区分用例。**判据**：凡是要断言「无交错窗口」，别靠推理，去插桩数 ready-queue 槽位。
+  **And cardinality ≥ 2 is still not enough: the order must not be any natural ordering.** At n=2,
+  one of `sorted` and `sorted(reverse=True)` is always the identity, so two elements **cannot stop a
+  sorting mutation however they are arranged**: "neither ascending nor descending" is impossible at
+  n=2. For the order to be no natural ordering, **cardinality must be at least 3**, and the fixture's
+  order must be neither ascending, nor descending, nor equal to its reverse.
+- **`==` on dicts is completely blind to key order, and key order is load-bearing in this
+  project.** In the schema sent to the model or the message bodies assembled into a request, any
+  drift in key order **invalidates the whole prefix cache without any error** (the cost only shows
+  up on the bill and in the hit rate; the same class of reason `LLMConfig.derive` exists for). In
+  Task 11, all three "reorder keys" mutations survived, because nearly every assertion in that file
+  was `==`. **For any structure that goes into an LLM request or a cache key, assert the order of
+  `list(d)` explicitly**, not just equality.
+- **Tests must run under the same module conditions as production.** This repository requires
+  `from __future__ import annotations` (PEP 563) at the top of every module, so all annotations in
+  that module are **strings** at run time, and `inspect.signature` does not evaluate them by
+  default. Task 11's test file lacked that line, so its tool classes kept real type objects: the
+  suite was green, while every real tool written to the repository's convention raised an error.
+  **For code that reflects on annotations, `__module__`, `__qualname__`, import order or
+  compile-time switches, the test file must reproduce the production module's header conditions**,
+  otherwise it verifies the opposite of the code that ships.
+- **`asyncio.wait_for` inserts scheduling hops of its own, so any argument of the form "there is no
+  suspension point between these two statements" must account for it.** It has bitten three times:
+  once a case went green under mutation because `wait_for` inserted an extra scheduling step; once
+  "immediately after the event's `set()` comes the re-check, no other task can get in between" was
+  disproved by measurement: 3.11's `wait_for` wraps the inner coroutine in a Task and adds a
+  done-callback, and the real window is **six ready-queue slots**; two ordinary tasks are enough to
+  build a distinguishing case. **Criterion**: whenever you want to assert "no interleaving window",
+  do not reason about it; instrument and count the ready-queue slots.
 
-  **第三次的形态不同：它不只是多插调度跳转，它会把到达的取消整个吃掉。** 3.11 的 `wait_for` 里有 `except CancelledError: if fut.done(): return fut.result()`——内层那个 future 已经就绪时到达的取消被它当成「结果已到」消费掉，于是 `task.cancel()` 静默失效、这次调用此后**不可取消**。实测：broker 按关联 ID 取消息的循环里，一条**不匹配**的消息投进来就让内层就绪（`arrival` 置位），此刻的取消被吃掉、`while True` 照常往下转，`abort` / `shutdown` / `despawn` 于是全都要挂满交给它的整个超时（实测 20s 超时上各挂 19.95s，而生产上的超时可以是几小时）。内存 store 的 `publish` 全程不挂起，所以这个交错是**确定**命中的，不是概率事件。**判据**：任何「调用方靠取消让它当场停下」的阻塞调用，内层等待一律用 `asyncio.timeout`，不要用 `asyncio.wait_for`；`asyncio.timeout` 只在自己那个 deadline 到期时才把 `CancelledError` 换成 `TimeoutError`，外部取消照常上抛。这类缺陷**整套测试无感**（同一实现修前修后都是 985 passed），必须专门为它写用例。
+  **The third time had a different shape: it does not just insert scheduling hops, it swallows an
+  arriving cancellation whole.** 3.11's `wait_for` contains
+  `except CancelledError: if fut.done(): return fut.result()`: a cancellation arriving when the
+  inner future is already done is consumed as "the result has arrived", so `task.cancel()`
+  silently has no effect and the call is **not cancellable** from then on. Measured: in the loop
+  where the broker takes messages by correlation ID, delivering one **non-matching** message makes
+  the inner future ready (`arrival` set), the
+  cancellation at that moment is swallowed, `while True` carries on, and `abort` / `shutdown` /
+  `despawn` all have to wait out the whole timeout given to it (measured: 19.95 s each on a 20 s
+  timeout, and in production the timeout can be hours). The in-memory store's `publish` never
+  suspends, so this interleaving is hit **deterministically**, not by chance. **Criterion**: for
+  any blocking call that callers stop on the spot by cancelling it, the inner wait always uses
+  `asyncio.timeout`, never `asyncio.wait_for`; `asyncio.timeout` turns `CancelledError` into
+  `TimeoutError` only when its own deadline expires, and external cancellation propagates as usual.
+  This class of defect is **invisible to the whole test suite** (the same implementation gave 985
+  passed both before and after the fix); it needs cases written specifically for it.
 
-  **反过来，在测试里给调用套 `asyncio.wait_for` 加上界，会插进一次调度跳转、把要测的那个窗口关掉。** 同一次修复轮里实测：给一条 C1 回归用例的 `abort` 套上 `_TIMEOUT` 之后，`wait_for` 把它包成 Task，broker 那次取在中止到达之前就清掉了信号并重新停稳，用例于是在 bug 原样存在的情况下变绿。**上界只加在真的可能挂住的调用上**（等别人的任务：`shutdown` / `despawn` / `kill`）；只碰注册表与同步位的控制面调用（内存实现下全程不挂起）不加——加了既无收益，又把交错改掉了。
+  **Conversely, wrapping a call in `asyncio.wait_for` in a test to bound it inserts a scheduling hop
+  and closes the very window under test.** Measured in the same round of fixes: after the `abort`
+  in a C1 regression case was wrapped in `_TIMEOUT`, `wait_for` turned it into a Task, the broker's
+  take cleared the signal and settled again before the abort arrived, and the case went green with
+  the bug still there. **Add the bound only to calls that really can hang** (waiting on someone
+  else's task: `shutdown` / `despawn` / `kill`); control-plane calls that only touch the registry
+  and synchronous flags (never suspending under the in-memory implementation) get none: it brings
+  no benefit and changes the interleaving.
 
-  **而槽位数是解释器版本的函数，所以插桩结论只对插桩用的那个版本成立。** 同一段插桩在 3.11.9 上量到「置位那一刻起入队的每个回调都先于复检」，在 3.12.11 上量到**零槽位**——3.12 的 `wait_for` 改成 `async with timeouts.timeout(...): return await fut`，不再包 Task，`set()` 当场就调度了等待者。本仓 `requires-python = ">=3.11"`，因此窗口存在的那个版本决定实现该怎么写（复检必须留着），而**用例不能把某个版本的槽位数写进断言**——那是一颗只在升级解释器时才爆的雷。断言要写成跨版本都成立的契约形式（「答案与此刻的状态一致」），代价是它只在有窗口的版本上杀得死变异。
-- **等待类代码里，电平信号与边沿信号不能混。** 已两次咬人。"队列非空"是**电平**（状态），"有新东西到了"是**边沿**（事件），二者只在队列空时恰好重合。用电平信号驱动"等下一个"的循环，一旦缓冲区里躺着不满足条件的元素，信号恒为高、循环立刻醒来再检查，退化成不让出控制权的空转——它连 `asyncio.wait_for` 都击穿，因为从不 await 到能被取消的点上，表现为整套测试挂死而非超时。要"等新事件"就必须先 `clear()` 再 `wait()`，把它当边沿用。
-- **全局测试超时是必需的基础设施，不是奢侈品。** 挂死类回归（永久 park、非让出空转）在没有超时的情况下表现为 CI 无输出地跑到平台上限，拿不到任何定位信息。`pytest-timeout` 让它变成一条带栈的红色断言。
-- **派生值会自动满足任何用它自身推导方式表达的不变式。** 已两次以不同面貌出现：`OBSERVABLE = 全集 - INTERCEPTABLE` 时，"两集合互斥且并集覆盖全集"这条划分断言**由构造恒成立**，因此完全抓不住"新增成员被静默归类"这个本要防的缺陷；同理，期望值与被测对象同源时（两边都从一次 `--collect-only` 推导），漏掉一套契约会让期望值跟着缩水。**判据**：写下断言后自问"如果实现改成从被测对象自己推导，这条断言还会红吗"——不会，就说明它测的是恒等式而非行为。补法是另加一条断言**确切内容**的测试。
+  **And the number of slots is a function of the interpreter version, so an instrumented conclusion
+  holds only for the version it was instrumented on.** The same instrumentation measured "every
+  callback queued from the moment of the set runs before the re-check" on 3.11.9, and **zero slots**
+  on 3.12.11: 3.12's `wait_for` became `async with timeouts.timeout(...): return await fut`, no
+  longer wraps a Task, and `set()` schedules the waiter on the spot. This repository has
+  `requires-python = ">=3.11"`, so the version where the window exists decides how the
+  implementation is written (the re-check must stay), while **a test must not write one version's
+  slot count into an assertion**: that is a mine that only goes off when the interpreter is
+  upgraded. Write assertions in a contract form that holds on every version ("the answer is
+  consistent with the state at this moment"), at the cost that it only kills the mutation on the
+  versions that have the window.
+- **In waiting code, level signals and edge signals must not be mixed.** It has bitten twice.
+  "The queue is not empty" is a **level** (state); "something new arrived" is an **edge** (event);
+  the two coincide only when the queue is empty. A loop that "waits for the next one" driven by a
+  level signal, once the buffer holds an element that does not satisfy the condition, sees the
+  signal stay high, wakes immediately to check again, and degenerates into a spin that never yields
+  control. It even defeats `asyncio.wait_for`, because it never awaits a point where it can be
+  cancelled, and shows up as the whole suite hanging rather than timing out. To "wait for a new
+  event", always `clear()` first and then `wait()`, using it as an edge.
+- **A global test timeout is required infrastructure, not a luxury.** Without a timeout, hang-type
+  regressions (permanent park, non-yielding spin) show up as CI running silently to the platform
+  limit, with no information to locate them. `pytest-timeout` turns that into a red assertion with
+  a stack.
+- **A derived value automatically satisfies any invariant expressed through its own derivation.**
+  It has appeared twice in different guises: when `OBSERVABLE = all - INTERCEPTABLE`, the partition
+  assertion "the two sets are disjoint and their union covers everything" **holds by construction**,
+  so it cannot catch "a new member was silently classified", the very defect it was meant to stop;
+  likewise, when the expected value and the object under test come from the same source (both
+  derived from one `--collect-only`), missing a contract suite makes the expected value shrink with
+  it. **Criterion**: after writing an assertion, ask "if the implementation were changed to derive
+  this from the object under test itself, would this assertion still turn red?" If not, it tests an
+  identity, not behaviour. The fix is to add a test that asserts the **exact contents**.
 
-  **断言"某集合的确切内容"时，被断言的东西必须是别的用例改不动的。** 若它是模块级可变状态，这条断言就取决于此前跑过什么，"绿"变成了运行顺序的函数而不是行为的函数——本仓靠把扩展分类放进**实例**、把内核分类放进 frozenset 才避开（已实测：两条内核分类断言单独跑同样成立）。
+  **When asserting "the exact contents of some set", the thing asserted must be something other
+  cases cannot change.** If it is module-level mutable state, the assertion depends on what ran
+  before it, and "green" becomes a function of run order instead of behaviour; this repository
+  avoids it by putting extension classifications in **instances** and kernel classifications in a
+  frozenset (measured: the two kernel classification assertions hold when run alone, too).
 
-  但"确切内容"也会被喂饱：枚举异常子类时若只走顶层模块，子包 `__init__` 的 re-export 会把清单填满，遗漏的子类照样查不出来。**期望值必须来自与被测机制无关的第三方事实源**（如文件树），不能来自被测对象自己的导出面。
+  But "exact contents" can also be fed: if enumerating exception subclasses walks only the
+  top-level module, re-exports in sub-packages' `__init__` fill the list, and a missing subclass
+  still goes unnoticed. **The expected value must come from a third-party source of truth unrelated
+  to the mechanism under test** (such as the file tree), not from the export surface of the object
+  under test.
 
-  **第四种面貌：期望值写死了还不够，搜索范围本身也要被证明。** 一条 AST 守卫扫 `src/syndica/**` 找"谁调了 `DangerPolicy.decide`"，期望值写死成 `['kernel/danger.py']`——把扫描根指到一个没有调用者的目录会变红（清单空掉），而把 `rglob('*.py')` 收窄成 `rglob('danger.py')` **全绿**：它依旧找到那一个期望答案，而此后它对包里任何别的文件都是瞎的，守卫唯一的价值（抓未来新增、还没有行为用例覆盖的文件）被这一个字删掉。不是期望值派生自被测对象，而是**搜索范围收窄到只含期望答案**，效果相同。**判据**：凡是"扫一遍某个范围，断言结果"的守卫，都要另有一条断言**它真的扫过了最该被抓的那个位置**（写死那个文件名），并用一次独立的遍历（`os.walk` 对 `rglob`）证明范围没缩——两份清单只有同时改才对得上。
-- **隔离性断言要跨"同一个对象的两次读取"做，不要跨两次调用。** 同一家族的第三种面貌：「改了返回的清单不影响下一次调用」在每次调用各建一份记录的实现下**由构造恒成立**，于是"交出内部列表而不是副本"这个变异被原样放过；改成「改完再读同一个对象」才变红。判据同上——问"实现里到底是什么让这条断言成立的"，如果答案是"这两次本来就各有一份"，它测的就不是隔离。
-- **异步测试里「兄弟任务没被丢下」要在被测调用返回的那一刻取快照。** 被 `gather` 丢下的任务并没有死——事件循环转下去它照样跑完，所以在 `await` 之后断言"它跑了"，测的是调度顺序而不是等待语义。已实测：同一条用例，直接 `await` 时能杀掉"裸 gather"变异，套一层 `asyncio.wait_for`（多出一个 Task 的跳数）就变绿。做法是让兄弟阻塞在只有测试能放开的 `Event` 上，并在被测调用返回的瞬间记下已完成者。
-- **本仓是**多** Agent 框架，所以"操作没错但作用在错的主体上"是一等变异轴。** 实测：把一个 Runtime 里所有 Agent 换成共用同一个 `ControlBlock`，712 条用例全绿——而它意味着一个 Agent 的延迟消息会静默进另一个的上下文、一次 `pause` 会按住整个 Runtime。凡是按 `agent_id` 索引的东西（控制块、邮箱、上下文、实例表、注册表条目）都要有一条用例证明**两个** Agent 互不串线；单 Agent 的用例对这一整类缺陷完全无感。
-- **内核不得就地改写宿主持有的对象。** 宿主的 dict / list 可能被它自己在多次调用之间复用（工厂每次都交出同一张工具表是合法写法），于是第一次写入就把它变成「属于第一个调用方」。症状分两档：同一进程里第二次调用**响亮失败，但错误消息指着宿主从未做过的事**（「你自己的表里已经有这五个」——它们是内核刚塞进去的），跨进程 / 跨 Runtime 则**静默**把能力绑到别的主体身上（实测：一个 `orchestration=False` 的 Runtime 里的 Agent 继承到五件套，它们绑着另一个 Runtime 的另一个 Agent，于是它停掉了一个既不是它的后代、也不在它这个 Runtime 里的 Agent，零日志零报错）。**判据**：凡是从宿主收下的可变容器，要么只读、要么先取自己的一份；而「同一张表被用了几次」是一条**独立的基数轴**——Agent 数到了 3 不代表它到了 2。
+  **A fourth guise: a hard-coded expected value is not enough; the search scope itself must be
+  proven too.** An AST guard scans `src/syndica/**` for "who calls `DangerPolicy.decide`", with the
+  expected value hard-coded as `['kernel/danger.py']`. Pointing the scan root at a directory with no
+  callers turns it red (the list becomes empty), but narrowing `rglob('*.py')` to
+  `rglob('danger.py')` stays **all green**: it still finds the one expected answer, and from then on
+  it is blind to every other file in the package; the guard's only value (catching files added in
+  the future that no behavioural case covers yet) is deleted by that one word. It is not that the
+  expected value derives from the object under test; **the search scope shrank to contain only the
+  expected answer**, with the same effect. **Criterion**: every guard of the form "scan some scope,
+  assert the result" needs another assertion that **it really scanned the place most worth
+  catching** (hard-code that file name), and an independent traversal (`os.walk` against `rglob`)
+  proving the scope did not shrink: the two lists only agree if both are changed together.
+- **Isolation assertions must span "two reads of the same object", not two calls.** A third guise
+  of the same family: "modifying the returned list does not affect the next call" **holds by
+  construction** for an implementation that builds a fresh record on every call, so the mutation
+  "hand out the internal list instead of a copy" passes untouched; it only turns red as "modify it,
+  then read the same object again". Same criterion as above: ask "what in the implementation
+  actually makes this assertion hold?" If the answer is "the two calls had separate copies anyway",
+  it does not test isolation.
+- **In async tests, "the sibling task was not abandoned" must be snapshotted at the moment the call
+  under test returns.** A task abandoned by `gather` is not dead: it keeps running as the event loop
+  turns, so asserting "it ran" after an `await` tests scheduling order, not waiting semantics.
+  Measured: the same case kills the "bare gather" mutation when awaited directly, and goes green
+  when wrapped in `asyncio.wait_for` (one extra Task hop). The way to do it: make the siblings block
+  on an `Event` only the test can release, and record which ones finished at the instant the call
+  under test returns.
+- **This repository is a *multi*-agent framework, so "the operation is right but applied to the
+  wrong subject" is a first-class mutation axis.** Measured: making every agent in a Runtime share
+  one `ControlBlock` kept all 712 cases green, while it means one agent's deferred message silently
+  enters another's context and one `pause` holds the whole Runtime. Anything indexed by `agent_id`
+  (control blocks, mailboxes, contexts, the instance table, registry entries) needs a case proving
+  that **two** agents do not cross wires; single-agent cases are completely blind to this whole
+  class of defects.
+- **The kernel must not modify objects the host holds in place.** The host may reuse its dict /
+  list between calls (a factory handing out the same tool table every time is legitimate), so the
+  first write makes it "belong to the first caller". The symptoms come in two grades: within one
+  process, the second call **fails loudly, but the error points at something the host never did**
+  ("your own table already has these five": the kernel just put them there); across processes /
+  Runtimes, it **silently** binds capabilities to another subject (measured: an agent in a Runtime
+  with `orchestration=False` inherited the five orchestration tools, bound to another agent of
+  another Runtime, so it stopped an agent that was neither its descendant nor in its Runtime, with
+  zero logs and zero errors). **Criterion**: any mutable container received from the host is either
+  read-only or copied first; and "how many times the same table was used" is an **independent
+  cardinality axis**: three agents does not mean the table was used twice.
 
-  **而「先取自己的一份」不等于随便换一份新的。** 两处靠**共享同一个对象**表达「热插拔」时（这里是 `AgentOptions.tools` 与 `ToolExecutor`），换表必须让两侧同时换到**同一个**新对象：只给一侧换的话，「装进去的那几个调得到」这条断言照绿，而此后每一次热插拔只有一侧看得到，模型按 description 发起的调用落空、run 照常 `COMPLETED`。这条性质的见证者只能是**跨同一个对象的两次读取**（装完之后再往表里塞一个，看执行那一侧认不认），不是「装完调一次」。
-- **一个性质在某一层被钉住了，不等于在真正依赖它的那道接缝上被钉住。** 实测：「挂起是电平、唤醒是边沿」这条头号裁决由 `test_control.py` 守着，但把 `runtime` 侧的唤醒信号改成电平后 `test_runtime.py` 全部 83 条照绿——真正会因它而空转的那一层零覆盖。**判据**：跨层的性质要在**每一个消费它的层**各有一条用例，而且触发它往往需要**把基数从集合搬到操作序列**（同一操作在同一主体上反复施加，比如连做三轮挂起—唤醒往返），单次操作看不出电平与边沿的差别。
-- **本仓的核心承诺是「四面可替换」，所以最该打的变异是「接缝另一侧的合法替换」**——协作方既不出故障也不说谎，它只是**另一个满足了全部明文条款的实现**。判据：把内存实现换成一个同样通过契约套件、但在契约没写到的地方做了别的选择的实现，行为还对吗？实测两次都命中：`on_missing_queue` 若不在 `publish` 的后代上下文里跑，`activate=False` 会静默失效——而这条约束**能通过整套 66 条契约测试**；以及一个在首次 publish 时冻结回调列表的 broker 同样全绿，却会让此后新建的任何 Runtime 复活不了自己的 zombie。**凡是内核依赖而契约没写的性质，等于第三方 backend 一定会违反的性质。**
+  **And "copy it first" does not mean swapping in any fresh copy.** Where two places express
+  "hot-plugging" by **sharing the same object** (here `AgentOptions.tools` and `ToolExecutor`),
+  replacing the table must switch both sides to **the same** new object: if only one side is
+  switched, the assertion "the installed ones are callable" stays green, while every later
+  hot-plug is visible to only one side, the model's calls made from the description miss, and the
+  run still ends `COMPLETED`. The only witness for this property is **two reads of the same object**
+  (after installing, add one more to the table and see whether the executing side accepts it), not
+  "install, then call once".
+- **A property pinned in one layer is not pinned at the seam that actually depends on it.**
+  Measured: the top ruling "pause is a level, wake is an edge" is guarded by `test_control.py`, but
+  changing the `runtime` side's wake signal to a level kept all 83 cases of `test_runtime.py` green;
+  the layer that would really spin because of it had zero coverage. **Criterion**: a cross-layer
+  property needs a case **in every layer that consumes it**, and triggering it often requires
+  **moving the cardinality from sets to sequences of operations** (applying the same operation to the
+  same subject repeatedly, such as three pause–wake round trips in a row); a single operation cannot
+  tell a level from an edge.
+- **This repository's core promise is "four replaceable sides", so the mutation most worth trying is
+  "a legitimate replacement on the other side of a seam"**: the collaborator neither fails nor lies;
+  it is just **another implementation that satisfies every written clause**. Criterion: replace the
+  in-memory implementation with one that also passes the contract suite but makes different choices
+  where the contract says nothing; is the behaviour still right? Measured, it hit both times: if
+  `on_missing_queue` does not run in a descendant context of `publish`, `activate=False` silently
+  stops working, and that constraint **passes the whole 66-case contract suite**; and a broker that
+  freezes its callback list at the first publish is equally green, but no Runtime created afterwards
+  can revive its own zombies. **Any property the kernel depends on that the contract does not state
+  is a property a third-party backend is certain to violate.**
 
-  **第三次命中的是「契约正文写对了，而用例只测了它的一半」**，比「契约没写」更难发现——正文已经在那里，读起来完全成立。正文写「取消一次取之后那条消息仍在邮箱里」，配套用例却只问「再 take 一次还取得到吗」；于是一个把被取消的消息挪进 pending entry（Redis 消费组的原样写法）的 broker 通过**整套**契约测试，而内核真正依赖的是「门的 `consume` 看得见它」——接进 Runtime 后一次被中止的等待如约返回 ABORTED，那条答复既不在 `consume` 里、也不在轨迹里、**零 ERROR**，而 `send` 早已回过 `ok=True`。**判据**：正文里每一个可以被两种方式满足的词（「在邮箱里」「可见」「可重取」）都必须在用例里**定死成一条可执行的路径**；正文与用例的差集，就是第三方会走进去的那个缺口。顺带：给第三方指出的**替代实现路径**同样要逐条验证可满足——主路径「摘掉与返回之间不留挂起点」对 Redis Streams 根本排不出来（`XREADGROUP` 与 `XACK` 之间天然隔一次往返），替代路径于是是必需的，而它必须把随之而来的义务一起写清（pending entry 要求该实现的 `consume` 先读自己的 pending）。
-- **想变异想不出新方向时，换成打接缝另一侧的协作方——不是它说了什么，而是它坏掉了。** 本仓接缝很多（门、broker、LLM、工具、hooks、四个 Store），而变异通常只打「它返回了错的东西」，很少打「它抛了」。实测两次：吞掉门的异常换一个默认决定，静默变成「忽略中止、继续跑」；把它折成一次正常 `COMPLETED`，界面上看着像干完了活。两者的基线行为都是对的，只是从没有用例走过那条路。
-- **有些丢失是设计裁决，此时那条日志就是唯一的证据，于是证据本身成了承重结构。** 预算耗尽的 Agent 产不出新的一轮，已经收下的输入只能丢——**丢数据可以，静默不可以**，所以那条 ERROR 是这次丢失留下的全部痕迹。这类路径上的变异不必碰行为：让报告**说谎**（少报一项被丢掉的量）或让它**隐身**（`logger.error` → `logger.debug`；root logger 默认 WARNING，记录根本不会被创建）就把「静默丢数据」原样放回来了，而两者都能通过「有一条 ERROR」「`agent_id in caplog.text`」这类宽松断言。**判据**：断言 `record.args` —— 级别、主体、以及被丢掉的**每一个量**；措辞留给它可以改。
+  **The third hit was "the contract text is right, and the cases test only half of it"**, harder to
+  find than "the contract does not say": the text is already there and reads as perfectly correct.
+  The text says "after a take is cancelled, the message is still in the mailbox", while the
+  accompanying case only asks "can another take still get it"; so a broker that moves the cancelled
+  message into a pending entry (exactly how Redis consumer groups work) passes the **whole** contract
+  suite, while what the kernel really depends on is "the gate's `consume` can see it": wired into a
+  Runtime, an aborted wait returns ABORTED as promised, and that reply is neither in `consume` nor in
+  the trajectory, with **zero ERROR**, while `send` had long since answered `ok=True`.
+  **Criterion**: every word in the text that can be satisfied in two ways ("in the mailbox",
+  "visible", "re-takeable") must be **pinned to one executable path** in the cases; the difference
+  between text and cases is exactly the gap third parties walk into. Also: **alternative
+  implementation paths** offered to third parties must be verified as satisfiable one by one; the
+  main path "no suspension point between removing and returning" cannot be arranged at all for
+  Redis Streams (`XREADGROUP` and `XACK` are naturally a round trip apart), so the alternative path is
+  required, and it must spell out the obligations that come with it (a pending entry requires that
+  implementation's `consume` to read its own pending first).
+- **When you run out of new directions for mutations, attack the collaborator on the other side of a
+  seam: not what it says, but that it breaks.** This repository has many seams (the gate, the
+  broker, the LLM, tools, hooks, four Stores), and mutations usually only try "it returned the wrong
+  thing", rarely "it raised". Measured twice: swallowing the gate's exception and substituting a
+  default decision silently becomes "ignore the abort, keep running"; folding it into a normal
+  `COMPLETED` makes the UI look as if the work was done. The baseline behaviour was right in both
+  cases; no case had ever taken that path.
+- **Some losses are design rulings, and then the log line is the only evidence, so the evidence
+  itself becomes load-bearing.** An agent whose budget is exhausted cannot produce a new turn, and
+  input it has already accepted can only be dropped: **dropping data is acceptable, silence is not**,
+  so that ERROR is the only trace the loss leaves. Mutations on such paths need not touch behaviour:
+  making the report **lie** (under-report one dropped quantity) or **invisible** (`logger.error` →
+  `logger.debug`; the root logger defaults to WARNING, so the record is never created) puts "silent
+  data loss" right back, and both pass loose assertions such as "there is an ERROR" or
+  "`agent_id in caplog.text`". **Criterion**: assert `record.args`: the level, the subject, and
+  **every quantity** that was dropped; leave the wording free to change.
 
-  **第三种说谎方式是报一件没发生的丢失。** 这类记录的主语是「什么东西因此没了」，所以它的触发条件必须是**真的有东西没了**，而不是某个形状上的近似。实测：可观察切点丢弃 hook 返回值这件事，按「返回了非 `None` 就报」实现时，两条只做记录、按类型正确写法 `return HookResult()` 的既有 hook 立刻各产出一条 ERROR——而空结论在可拦截切点上也什么都不做，那两次根本没有丢失。误报会让读者去改一段没问题的代码，而它与漏报共用同一条断言（「这里有一条 ERROR」），所以**每个新报告都要同时有「该报时报了」与「不该报时没报」两侧的用例**，后者按「看起来像但实际没丢」的形状枚举。
-- **一个变异存活，说明缺的是测试，不是说明被变异的代码没用。** 已真实酿成本仓第一条 Critical：某处引用计数的变异杀不掉，作者据此判它是「无法验证的过度设计」并删掉——而它正是防止永久悬空 `parent_id` 的那个机制，删后用默认 store、纯公开路径就能造出该缺陷。**因为杀不掉变异就删掉代码，方向是反的**：先假设自己还没找到那个能区分的场景（往往要把同一操作的并发度提到 2，或让某条路径在中途失败），找不到再说它无用。删除一段防御性代码前，先说清它防的是什么、以及那件事现在由谁防。
-- **别人的完成信号不是关于世界的证据，而一条落在「同操作的另一个调用方」身上的等待边可以成环。** 本仓第二、三条 Critical 是同一次修复引入的，都出自「去重时相信对方」：一个 `torn_down` 事件在 `finally` 里置位，因此它表达的是**持有者离开了**，不是**它承诺的后置条件成立了**——持有者被取消时两者分叉，而醒来即返回的一方带着为假的后置条件继续动作，产物与被修的缺陷同型且**零日志**。同一条修法还把「等另一个调用方」这条边加进了一个此前从不阻塞在调用方上的操作，于是两个执行体各停在对方持有的资源上，两次调用永不返回、被卡住的资源再没有入口可救。**两条判据**：(1) 一个去重守卫的等待对象必须是**后置条件本身**，信号只意味着「可以再看一眼了」，醒来必须复检并**自己接手**；(2) 加阻塞边前先问它能不能成环——沿着自己的**后代**等是安全的（后代成树），等一个**平级调用方**不是。去重与等待都不必要时，最省的写法是**各自动手 + 一份同步取的收据**：动作幂等所以重复无代价，而「恰好一次」的那件事（报告/日志/回调）由收据定。 已两次出现：作者报「变异全红、零存活」，独立评审自己发明一批变异后立刻推翻。原因不是作者偷懒，而是**他的变异集偏向他当时正在想的那些路径**——最典型的一次，守卫本身写对了，但没有任何测试走过它最具破坏性的那条分支（在已占用的 id 上带 task 调用 `put`，同时覆盖实例又丢弃可能还活着的任务），而那恰是该任务头号裁决所依赖的路径。所以「零存活」只在给定那组变异下成立，报告里要如实这么写。
-- **密封类型（tagged union）里，「两两互不继承」不足以保证一个实例只属于一种。** 兄弟关系不排除**共同子类**：`class Both(Confirmation, Reply)` 可构造、同时命中两个分支，于是「分支顺序不影响结果」这条前提被推翻，而钉住它的那条断言（两两之间无继承）照绿——断言本身没写错，是命题窄了一格。**结构上的解法强于补断言**：别按顺序取第一个命中，去数命中数（0 个是未知类型、≥2 个是歧义、恰好 1 个才取值），答案于是是命中**集合**的函数，顺序在语义上真的无关，重排从「存活的变异」变成「真等价的变异」。顺带：歧义必须在**读任何字段之前**判出——多重继承子类若没重新套 `@dataclass`，第二个父类的字段根本不存在，读值换来的是裸 `AttributeError` 而不是那条说得清楚的歧义错误。
-- **一个只能被「联合变异」证明的守卫，等于下一次重构可以无声删掉它。** 实测：歧义错误把命中的类型名 `sorted` 后报出，为的是重排名单连错误文本都改不动；但名单原本恰好就声明成字典序，于是**单独**删掉 `sorted` 没有任何用例出声，只有「重排名单 + 删 sorted」一起施加才变红。**判据**：每个守卫都要有一条单独施加即变红的变异；做不到通常是固定装置退化了（这里把名单改成非字典序声明即可，一行、免费，因为顺序本来不影响结果）。
-- **基类上的 dataclass 参数会被子类自己的 `@dataclass` 遮住。** 每个子类各自 `@dataclass(frozen=True)` 生成自己的 `__eq__`，于是基类的 `eq=False` 对只考子类的用例完全不可见。这是「性质在某一层钉住了不等于在接缝上钉住」的又一面，触发条件是把参数化的取值集合**从子类扩到含基类**。
-- **固定装置里所有取值都是归一化的不动点时，恒等与 `strip` / `lower` / `casefold` 是同一个函数。** 实测：关联 ID 出口加 `.strip()` 或 `.lower()` 全部 959 条通过，因为测试里出现过的每一个 ID 都是小写、无空白——而下游是逐字节比较，归一化一下答复就永远匹配不上。凡是「原样传递」的性质，固定装置里至少要有一个非不动点取值（`'  Call-7  '`），并补一条真穿过下游接缝的用例。
-- **`bool` 是 `int` 的子类，而 YAML 1.1 把 `yes` / `on` / `true` 解析成 `True`。** 于是任何 `isinstance(v, int | float)` 的数值配置项都接受 `True` 并当它是 1——`timeout: yes` 静默变成 1 秒超时，每次都超时且不报错。数值配置项要单独拒 `bool`，且拒绝放在数值检查**之前**（放后面就是死代码）。另一头也要钉：只测「拒非法」不测「收合法」时，把接受面窄成只收 `float`（连 `timeout: 30` 一起拒）同样全绿。**放宽方向同样要钉，而它的症状更隐蔽**：参数化只列了 `0 / -1 / True / '4'` 时，把 `isinstance(v, int)` 放宽成 `isinstance(v, int | float)` 全绿——而 `len(x) == limit` 与任何 float 恒不相等，于是 `max_concurrency: 2.5` 或 `inf` 等于把上限整个去掉（实测峰值 8/8，即完全没有上限）。**拒绝面的参数化按「类型族」枚举**（布尔 / 字符串 / 数值但非整型 / 越界整型），不是按「几个想得到的坏值」。
-- **一个性能 / 调度配置项能静默改掉安全结论，是并发与安全交叉处的一等缺陷。** 实测：工具调用分段并发之后，把 `max_concurrency` 从 1 抬到 4 就让 spec §12.2 那道「关不掉」的强制升级失效（`sudo rm -rf /` 从被拦下变成照跑），以及让低风险那一格的记录义务无声消失——因为同段调用的结果块要等整段跑完才落进轨迹，段内那次溯源重取什么也看不到。**判据：同一批输入在 `limit=1` 与 `limit=N` 下必须得出同一个安全结论**，因此凡是与安全结论有关的用例都按上限参数化（至少 `{1, N}` 两档），并**单独**有一条断言「同一批调用在两个上限下落下逐块相同的轨迹」——`limit=1` 与串行实现逐块等价是这类回归唯一的锚，少了它，任何一次「顺手放宽并发」都能把安全结论改掉而整套测试无感。同族的一般形态：**任何声称「只改什么时候跑、不改跑出什么」的机制，都要有一条用例把这句话真的断言下来。**
-- **降级到安全侧也是一种丢失，因此同样需要一条证据。** 已有的面貌是「预算耗尽只能丢输入」；新的面貌是兜底：`except Exception: return False` 把一次声明违约（工具的 `is_concurrency_safe` 抛出、或签名根本不收 `args`）降级成「这个工具此后每一批都单独跑」。方向是安全的、行为也有用例钉住，但**串行既不报错也不改结果**，于是任何级别都查不出来。同仓对「拼错 `__tool_command_args__`」的处置是响亮失败，理由写的是「闸消失得无声无息，比报错难查得多」——同一条理由适用于每一个降级兜底，而「签名写错」比「拼错参数名」更不该被宽容。
-- **为某个失败模式引入的诊断设施，只装在需要它的一部分用例上，等于另一部分在该模式下退回原样。** 实测：文件里有 `_SEGMENT_DEADLINE` 且 docstring 写明它「只用来把『并发根本没发生』从一次挂死变成一条红色断言」，而它只用在三条需要它的用例中的一条上——去掉并发之后另两条双双 TIMEOUT，`pytest-timeout` 兜住了所以不是 CI 无输出，代价是 45–60 秒加一份线程栈，而不是一条指着分段结果的断言。**判据**：引入一个常量 / 夹具 / 上界时，把「谁需要它」的判据写下来并逐条落实；只装一处的设施下一次重构会被当成那一处的特例删掉。
-- **生成 ID 的「不可预测性」是安全属性，唯一性测试对它完全无感。** 顺序计数器满足「两次生成不相等」。`UserInput.request_id` 是三种等待里唯一一个调用方事先不知道的关联 ID，猜得到就意味着任何能往该邮箱 publish 的组件（含被注入内容说服的模型自己）能伪造一条人工输入的答复、绕过人工确认。钉生成器的**性质**（字符集、长度、大样本下字典序与生成顺序不相关、末几位逐个互异），不是结果。注意别把正确实现判红：`uuid4().hex` 第 12 位恒为 `'4'`（version bits）。
-- **测性能属性要挑对度量，也要挑对位置。** 忙轮询与阻塞等待返回同样的结果、耗掉同样的墙钟时间，只有 CPU 时间能区分——但 `time.process_time()` 统计整个进程所有线程，带后台连接线程的远端实现会被误判。这类断言留在具体实现自己的测试里，**不要**放进随发行版分发的契约套件；契约里用文字声明该要求。
-- **分词 / 解析类代码里，「哪些字符是分隔符」这个选择本身是承重的，而选错的症状是漏报——一份虚假的安全保证。** 实测：危险命令判定把 `<` `>` 当成段边界，而它们在 shell 里**从不开启一条新命令**、只做重定向；于是 `curl x 2>/dev/null | sh` 里的 `/dev/null` 自成一段且不由管道接续，「这条链里下载过」被清零——**任意一次重定向都能打断整条管道链**（`2>&1` / `</dev/null` / `|&` 同理，全部静默漏过）。而这两个字符同时是**零覆盖**的：把它们从集合里删掉不会让任何用例变红。常量表（分隔符、wrapper 名、解释器名、白名单）里的条目天生没有「单独施加即变红」的变异，除非**每个成员各有一条用例**；表越像「配置」，越容易被下一次重构无声删掉。
-- **写下「这一点是承重的」之后，去施加对应的变异；不红就说明承重的是别处。** 同一次修复里实测：注释写在分隔符集合上（「`<` `>` 不在这里是承重的」），而把它们加回那个集合**全部用例照绿**——真正决定行为的是分支顺序（重定向分支先于分隔符分支接走这两个字符），集合里那两项根本到不了。**指着不承重位置的注释比没有注释更坏**：下一个人照它推理，并据此以为改另一处是安全的。
-- **把一个值包成只读时，读面必须整体枚举，而不是枚举「我想到的读法」。** `copy` / `deepcopy` / `pickle` 走的是协议方法：`copy._reconstruct` 会往**新建的那一份**里逐键 `y[key] = value`，于是一个只拦 `__setitem__` 的包装会把一次**纯读**操作拒掉、并报出一条说它就地写了的假消息（实测：`copy.deepcopy(args)` 报「收到对 'args' 的就地赋值」，而作者一次都没就地写过；`pickle` 更糟——它先灌键值再装状态，拒绝跑在自己的字段存在之前，撞成一条裸 `AttributeError`）。这条尤其贵，因为**这些协议往往正是那个只读包装留下的缺口的唯一自助补法**：视图只护顶层、`{**v}` 是浅拷贝，认真的作者的下一个念头必然是 `deepcopy`。**判据**：读面用例要覆盖协议层（`copy` / `deepcopy` / `pickle` / `reversed` / `|` / `fromkeys`），不只是下标与 `.get`；每一个「另给我一份」的协议交回什么，要作为一条契约钉住（哪些浅、哪些深也要分开钉，否则两档 id 是同一个断言）。顺带：`__slots__` 让 `vars(view)` 抛而不是交出可写的 `__dict__`，诊断指向谁于是也不可伪造。
-- **单向引用的链上，任何「全链唯一」的不变式都只在引用方向上成立。** 实测：`HooksCenter(outer=...)` 的分类冲突检查沿「本层 → 外层」查，docstring 据此写「一条链上同一个名字至多有一种分类」——而外层没有指向内层的引用，于是**后声明的外层**可以把内层已声明的名字分叉成两种分类，同一个回调在两层的 `trigger` 下按两套语义跑（一边吞异常、一边把 `skip` 当真）。单向是有意的（没有反向写入面 = 装配链不可能成环），所以这不是能补全的检查。**判据**：写下「全链 / 全局唯一」之前，先问这个检查是从哪一端出发走的，另一端能不能后来才加进来；答案是「能」时，docstring 只许陈述**有方向的**那个约束，并说清哪个方向是危险方向、它被挡住了没有。
-- **「校验全做完才开始动手」只覆盖内核自己校验得出的那些错。** 实测：`install_plugins` 两遍走完（先逐项校验、再逐个注册），而第二遍里调的是第三方的 `register`——它抛出时，前面几个插件已经挂上去了，且中心没有拆除入口，于是「被拒的装配什么都没发生」这句 docstring 是假的。**判据**：凡是「先校验后执行」的两遍结构，第二遍里只要有一次**第三方调用**，就要么按私有快照回滚、要么把承诺收窄到收得住的那一格（并把回滚接不住的部分——第三方在你的对象之外做的事——写进去）。回滚要接 `BaseException` 而不是 `Exception`：`KeyboardInterrupt` / `CancelledError` 从第三方代码里出来，留下的是同一个半装配状态。快照 / 还原要放在**被还原的那个对象自己**的类里，不要让调用方伸手取它的私有字段——后者会让下一个给它加状态的人改不到还原的那一处。
-- **一次为保不变式而做的截断，同时是一条信息丢失路径。** `Fork` 为保住「工具调用与结果配对」这条不变式，必须截掉末尾未配对的批次，而**被截掉的块可能携带这份轨迹里唯一的安全标记**。判据是**每一处丢弃数据的地方都要问「它携带了什么别处没有的东西」**，而补偿必须留在**丢弃发生的那一处**——丢弃的事实在返回之后就不存在了，下游无从补救（实测：`spawn` 已经在有 `query` 的那条路上补了，且 docstring 逐字写着这条理由，而 `query=None` 那条路照样漏掉；下游入口「让调用方自己传 `UNTRUSTED`」修不上它，因为调用方无从得知刚刚丢了一块）。**同一个截断还有第二个坑**：它跑在**上游那份数据**上，所以任何一次就地写（`head.tool_calls = []`）都写进了上游——保住不变式的改写必须改到副本上（`replace` / 深拷），否则源 Agent 的轨迹里那批声明过的调用就没了。两条都由「同一处代码的两条入口」和「上游是否被改」各自一条用例钉住。
-- **一个「方向安全」的保守标记，一旦作用域是整份轨迹而逃生口没实现，就是一条宿主关不掉的永久误报源。** 实测：派活等待被打断时那一块无条件标 `UNTRUSTED`，而它只嵌内核自撰的文字与一个内核生成的 id、没有任何外部字节；一次正当的 `abort` 之后，这块落进轨迹，此后**每一次**高风险调用在明确声明了 `AllowAll` 的宿主上都被拦下——因为溯源是「出现过就算」的上界。同一个模块里另一条路（读真实溯源）对同样的输入给出相反答案。**判据**：落下一个保守标记前问两句——「这块内容里有没有一个字节来自外部」、以及「这个标记的作用域有多长、谁关得掉它」。两句都答不好时，保守不是安全的那一侧。
-- **每一代都跑在自己的 `asyncio.Task` 里时，栈不累积，于是任何「深到一定程度会先响亮失败」的论证都不成立。** 实测：派活深度 12 的叶子与一个独立 Agent 量到同一个栈深（`len(inspect.stack())` 都是 16），因为 `spawn` 用 `create_task` 起子 Agent。一条遗留项曾拿「会先撞 Python 的递归/帧上限」当成「所以无界增长不要紧」的兜底依据，而真实情况是**任何深度都不会失败**，增长的是任务数、注册表条目与一串各自阻塞着的等待，全部静默。**判据**：「它会先撞上某个上限」这类兜底一律要量，不要推。
-- **公开面：加一个公开名字不是破坏性变更，去掉一个是——所以「先私有、有第三方要再放出来」严格优于「先公开、下个任务再收」。** 而 `__all__` 的逐字守卫对**类上新增的方法**完全无感（它只导出类名那一个字符串），于是一次「顺手加个公开方法」把 spec 刻意收紧到 11 个的面涨到 16 个，没有任何东西变红。**判据**：凡是「公开面刻意收紧到 N 个」的类型，守卫要按**一个真实实例**枚举非下划线名字并逐字比对——按类枚举会漏掉 `__init__` 里赋的实例属性，而宿主读写的往往正是那几个。
-- **用来证明「这件事没发生」的探针，本身可能就会让它发生。** 实测：证明 `QueryAgent` 没把一个 ZOMBIE 叫醒，最自然的写法是往它邮箱 `broker.publish` 一条消息、断言 `ok=False`——而 `publish` 的 `on_missing_queue` 回调正是本仓**唯一**的复活入口，这个断言于是必然失败，且失败的原因是探针干的。同族：任何带默认副作用的读（默认激活、默认建资源、默认重试）都不能当观测手段用。判据是**探针要走那条明文关掉副作用的路**（这里是 `send(activate=False)`），并且**两侧各断一条**——只断注册表状态会让「查完顺手叫醒」的变异在邮箱那一侧活下来。
-- **「跳过一个选项」与「跳过它的取值」是两件事，混同的症状是把真正的命令词吞掉。** 实测：命令词解析跳过 `-` 开头的 token 却不跳过它的取值，于是 `nice -n 19 rm -rf /` 里 `19` 当了命令词、`rm` 再也看不见——默认规则表下**一条闸都没有**。而「哪个选项吃下一个词」无法从语法判断（`timeout 30 rm` 的 `30` 根本不是选项取值，是位置实参），所以在这类前缀之后必须放弃「第一个非选项词就是命令」这个假设。凡是这种**放宽 / 收紧都会出错**的判据，两个方向各要有用例：放宽造误报、收紧造漏报，只测一侧等于只锁了一半。
-- **spec 里有、而没有任何任务负责交付的条目，单任务评审结构上看不见。** 每轮只看自己那个 diff，沉默缺席不在任何 diff 里。横切审计一口气查出三条（`created_at`、`runtime_start`、§5.1 第 9 步「中止再检查」），其中第 9 步有活的安全后果：abort 文档把「轮与轮之间兑现」当成全部，一轮里声明的工具照跑。对策：每份计划收口时拿 spec 的签名与字段表**逐字**对实现 grep，而不是按自检表勾选。
-- **入口校验纪律必须铺到每一个公开构造入口，不是只铺写得最仔细的那两处。** 仓里 `validate_max_concurrency` 与 `_validate_timeout` 先拒 bool、再判类型、再判值域；另四个公开入口（`EventBus.capacity`、`Runtime(registry=/broker=)`、`spawn(metadata=)`、`DangerJudge`）一条都没有。症状分两档：YAML `capacity: yes` 静默退化成容量 1 并丢事件；`DangerJudge('abc')` 从错误格式化器内部抛 `AttributeError`，轨迹指着格式化器而不是那张坏掉的规则表。同仓已经挡过的两个陷阱（`plugins._is_a_class` 的「忘了加括号」、`_validated_sequence` 的 str-is-a-Sequence）在相邻入口原样漏过。
-- **CAS 契约没有并发用例时，内存实现下「看起来对」。** spec §13.3 点名 CAS 是并发正确性的地基；套件里三条 CAS 用例全部是顺序的。一个在读与写之间 `await asyncio.sleep(0)` 的 store（远端必然有的那次往返）能过完整套契约，而 spec §4.4 要防的正是「挂起与中止相撞」那种丢失。基数取 3：n=2 下有退化解。契约一旦随 wheel 发布、第三方 store 一旦照着它自证合规，再加要求就是破坏性变更。
-- **幂等操作的收据只钉触发次数时，拦不住提前返回。** `shutdown` 并发三次钩子仍只报一次，但在方法开头 `if self._closed: return` 同样满足「报一次」——第二次在第一次还堵在 RUNTIME_SHUTDOWN 钩子里时就返回了，总线没关。对策：第一次堵在钩子里时调第二次，返回后 emit 必须进不了还开着的订阅（总线已关），不要只数钩子。
-- **对照组与被测代码同源时，比较永远相等。** 指纹缓存「热的对冷的」那条用例里，冷的那一份跑的是同一份实现：把角色从缓存键里拿掉，两边在同一处撞键、一起错，比较照样相等，变异活了下来。真值要来自与被测机制无关的路径（逐块单独算）。同族：手写的回放文档可能是内核产不出来的形状（消息到了却没被处理、空的等待名单），在不可能的世界里测出的对与错都不作数——形状靠真的捕获产生，手写只用来造捕获产不出的坏文档。
-- **负载会把「不到一毫秒」的窗口撑到复现得出来。** 信号在负载下晚到：交回结论与打印之间的那个窗口，登记时估作不到一毫秒，几个核被占满时 25 次里坏 2 次。按键、信号与关闭一类的窗口按「任何时刻都可能到」设计；判断修好没有，在负载下循环跑（`yes > /dev/null` 占满几个核），不看一次绿。第一次修补只关掉了其中一个窗口，第二轮循环才找出另一个。
-- **等到一件事、醒来再去读，读到的可能已经是下一件。** 实测：`Delegate` 等子 Agent 的驱动任务结束、醒来才读它活的 Context；子 Agent 进了 zombie 就叫得醒，复活的周期排在等待者醒来之前时（回放里外部世界不花时间，必然如此；真实运行里也会），交回的是下一个周期的结论。等的是一个事件，读的就要是那个事件那一刻的值：内核在 `_finish` 一开头、早于进 zombie，按驱动任务存一份快照。判据：被等的对象在「完成」与「等待者醒来」之间还能被别人改，就不能醒来再读。
-- **把内核的一次调用重新解释成「等」之前，先数清它有几个调用方。** 实测：回放的 broker 把周期刚结束时的 `wait_for_messages(timeout=0)` 撑成「等记录里下一轮的消息到」，而 `_finish` 记丢弃的输入时也问这一句——被 kill 的 Agent 的收割任务于是等一条消息，那条消息要等第二次 kill 落下之后才发，第二次 kill 又在等它停下：死锁；停下之后关机还在等这个收割任务。同一个签名有几个调用方，就要有几条用例走到它们；撑出来的等待在停下时要放开。
-- **起子进程的用例在相对 `PYTHONPATH` 下测的是另一份代码。** 子进程的工作目录不同，相对条目解析不到，Python 退回装在环境里的那一份（editable install 指向活的工作区）。实测：评审对一份导出的副本跑变异，Ctrl-C 那条用例导入的是活工作区的代码，几个变异被它假杀、真存活的被藏住。`tests/conftest.py` 在会话开始时把条目换成绝对路径；变异与导出验证照旧给绝对路径。
-- **负断言（`x not in out`）的子串不能是随机 id 拼得出来的。** 实测：断言「头的值 `caf%C3%A9` 没被回显」写成 `'caf' not in err`，而 stderr 里有 trace 目录名的 8 位随机十六进制，`c` `a` `f` 都是十六进制数字——九个参数里约百分之一的全量跑会撞上一次，只在负载高、跑得多的宿主复核里露面。负断言的探针值要含十六进制之外的字母（`quiz`），或者断言前先把输出里的 id 换掉。
+  **The third way to lie is to report a loss that did not happen.** The subject of such a record is
+  "what was lost because of this", so its trigger must be **that something was really lost**, not
+  some approximation by shape. Measured: when "an observable junction discards a hook's return
+  value" was implemented as "report whenever it returns non-`None`", two existing hooks that only
+  record, written the type-correct way `return HookResult()`, each produced an ERROR immediately,
+  and an empty result does nothing on an interceptable junction either, so nothing was lost in those
+  two cases. A false report sends readers to change code that is fine, and it shares its assertion
+  with a missed report ("there is an ERROR here"), so **every new report needs cases on both sides,
+  "reported when it should" and "silent when it should"**, the latter enumerated by the shapes that
+  "look like it but lose nothing".
+- **A surviving mutation means a test is missing, not that the mutated code is useless.** This
+  really produced the repository's first Critical: a mutation on a reference count could not be
+  killed, the author concluded it was "unverifiable over-engineering" and deleted it, and it was
+  exactly the mechanism preventing a permanently dangling `parent_id`; after deleting it, the defect
+  could be produced with the default store through public paths only. **Deleting code because a
+  mutation cannot be killed goes the wrong way**: first assume you have not yet found the
+  distinguishing scenario (often it requires raising the concurrency of the same operation to 2, or
+  making some path fail halfway), and only call it useless if you cannot find one. Before deleting a
+  piece of defensive code, say what it defends against and who defends against that now.
+- **Someone else's completion signal is not evidence about the world, and a wait edge that lands on
+  "another caller of the same operation" can form a cycle.** The repository's second and third
+  Criticals were introduced by the same fix, both from "trusting the other side when
+  deduplicating": a `torn_down` event is set in a `finally`, so it means **the holder left**, not
+  **the postcondition it promised holds**; when the holder is cancelled the two diverge, and the side
+  that returns as soon as it wakes carries on with a false postcondition, producing the same kind of
+  defect being fixed, with **zero logs**. The same fix also added the edge "wait for another caller"
+  to an operation that had never blocked on a caller before, so two executors each stopped on a
+  resource the other held, both calls never returned, and the stuck resources had no remaining way to
+  be rescued. **Two criteria**: (1) what a deduplication guard waits for must be **the postcondition
+  itself**; the signal only means "worth another look", and on waking it must re-check and **take
+  over itself**; (2) before adding a blocking edge, ask whether it can form a cycle: waiting along
+  your own **descendants** is safe (descendants form a tree), waiting on a **peer caller** is not.
+  When neither deduplication nor waiting is necessary, the cheapest form is **each acts on its own +
+  a receipt taken synchronously**: the action is idempotent so repetition costs nothing, and the
+  "exactly once" part (report / log / callback) is decided by the receipt.
+
+  It has happened twice: the author reported "every mutation red, zero survivors", and an
+  independent reviewer refuted it immediately with a batch of mutations of their own. The reason was
+  not laziness: **the author's mutation set leaned towards the paths they were thinking about at the
+  time**. In the most typical case, the guard itself was written correctly, but no test ever took
+  its most destructive branch (calling `put` with a task on an id already taken, overwriting the
+  instance while dropping a task that may still be alive), and that was exactly the path the task's
+  top ruling depended on. So "zero survivors" holds only for the given set of mutations, and the
+  report must say so honestly.
+- **In a sealed type (tagged union), "no two members inherit from each other" does not guarantee an
+  instance belongs to only one.** Being siblings does not exclude a **common subclass**:
+  `class Both(Confirmation, Reply)` can be constructed and hits both branches, so the premise "the
+  order of branches does not affect the result" falls, while the assertion pinning it (no
+  inheritance between any two) stays green; the assertion was not wrong, the proposition was one
+  notch too narrow. **A structural fix beats an extra assertion**: instead of taking the first hit in
+  order, count the hits (0 is an unknown type, ≥2 is ambiguous, exactly 1 gives the value); the
+  answer then is a function of the **set** of hits, order is truly irrelevant semantically, and a
+  reordering goes from "surviving mutation" to "truly equivalent mutation". Also: the ambiguity must
+  be decided **before reading any field**; if a multiply-inherited subclass is not wrapped in
+  `@dataclass` again, the second parent's fields do not exist at all, and reading a value produces a
+  bare `AttributeError` instead of the clear ambiguity error.
+- **A guard that can only be proven by a "joint mutation" can be deleted silently by the next
+  refactoring.** Measured: the ambiguity error reports the matched type names `sorted`, so that
+  reordering the list cannot change even the error text; but the list happened to be declared in
+  lexicographic order already, so deleting `sorted` **alone** made no case speak, and only "reorder
+  the list + delete sorted" applied together turned red. **Criterion**: every guard needs a mutation
+  that turns red when applied alone; failing that usually means the fixture degenerated (here,
+  declaring the list in non-lexicographic order is enough: one line, free, because the order does
+  not affect the result anyway).
+- **Dataclass parameters on a base class are shadowed by the subclass's own `@dataclass`.** Each
+  subclass's own `@dataclass(frozen=True)` generates its own `__eq__`, so the base class's `eq=False`
+  is completely invisible to cases that only test subclasses. This is another face of "a property
+  pinned in one layer is not pinned at the seam"; the trigger is to extend the parametrised set of
+  values **from the subclasses to include the base class**.
+- **When every value in a fixture is a fixed point of normalisation, identity and `strip` / `lower` /
+  `casefold` are the same function.** Measured: adding `.strip()` or `.lower()` to the correlation
+  ID's output passed all 959 tests, because every ID in the tests was lowercase without whitespace,
+  while downstream compares byte by byte, so with normalisation the reply never matches again. For
+  any "passed through unchanged" property, the fixture needs at least one value that is not a fixed
+  point (`'  Call-7  '`), plus a case that really goes through the downstream seam.
+- **`bool` is a subclass of `int`, and YAML 1.1 parses `yes` / `on` / `true` as `True`.** So any
+  numeric setting checked with `isinstance(v, int | float)` accepts `True` as 1: `timeout: yes`
+  silently becomes a 1-second timeout that always times out without an error. Numeric settings must
+  reject `bool` explicitly, and the rejection goes **before** the numeric check (after it, it is
+  dead code). Pin the other end too: when only "reject invalid" is tested and not "accept valid",
+  narrowing acceptance to `float` only (rejecting `timeout: 30` too) is equally green. **The widening
+  direction must be pinned as well, and its symptom is more hidden**: with the parametrisation
+  listing only `0 / -1 / True / '4'`, widening `isinstance(v, int)` to `isinstance(v, int | float)`
+  stays all green, while `len(x) == limit` is never equal to any float, so `max_concurrency: 2.5` or
+  `inf` removes the limit entirely (measured peak 8/8, i.e. no limit at all). **Parametrise the
+  rejection side by "type family"** (boolean / string / numeric but not integer / out-of-range
+  integer), not by "a few bad values that come to mind".
+- **A performance / scheduling setting that can silently change a security conclusion is a
+  first-class defect where concurrency meets security.** Measured: after tool calls ran in
+  concurrent segments, raising `max_concurrency` from 1 to 4 disabled the forced escalation of spec
+  §12.2 that "cannot be turned off" (`sudo rm -rf /` went from blocked to executed), and made the
+  recording obligation of the low-risk cell disappear silently, because the result blocks of calls
+  in the same segment land in the trajectory only after the whole segment finishes, so the
+  provenance re-fetch inside the segment sees nothing. **Criterion: the same batch of input must
+  reach the same security conclusion under `limit=1` and `limit=N`**, so every case related to a
+  security conclusion is parametrised over the limit (at least the two values `{1, N}`), and there
+  is **a separate** assertion "the same batch of calls leaves block-for-block identical trajectories
+  under both limits": `limit=1` being block-for-block equivalent to the serial implementation is the
+  only anchor for this class of regression; without it, any "casual widening of concurrency" can
+  change a security conclusion while the whole suite notices nothing. The general form of this
+  family: **any mechanism that claims "it only changes when things run, not what they produce" needs
+  a case that actually asserts that sentence.**
+- **Degrading to the safe side is also a loss, so it needs evidence too.** The known face is
+  "an exhausted budget can only drop input"; the new face is a fallback:
+  `except Exception: return False` degrades a declaration violation (a tool's `is_concurrency_safe`
+  raising, or its signature not accepting `args` at all) into "this tool runs alone in every batch
+  from now on". The direction
+  is safe and the behaviour is pinned by a case, but **running serially neither raises nor changes
+  the result**, so no level can detect it. The same repository's handling of "misspelled
+  `__tool_command_args__`" is to fail loudly, with the stated reason "a gate that disappears silently
+  is much harder to find than an error"; the same reason applies to every degrading fallback, and "a
+  wrong signature" deserves less tolerance than "a misspelled parameter name".
+- **Diagnostic machinery introduced for one failure mode, installed on only some of the cases that
+  need it, leaves the others as they were under that mode.** Measured: the file has a
+  `_SEGMENT_DEADLINE` whose docstring says it exists "only to turn 'concurrency did not happen at
+  all' from a hang into a red assertion", and it was used in only one of the three cases that need
+  it; after removing concurrency, the other two both TIMEOUT. `pytest-timeout` caught them, so CI was
+  not silent, but the cost was 45–60 seconds plus a thread dump instead of an assertion pointing at
+  the segmentation result. **Criterion**: when introducing a constant / fixture / bound, write down
+  the criterion for "who needs it" and apply it to each case; machinery installed in only one place
+  is deleted by the next refactoring as a special case of that place.
+- **The "unpredictability" of generated IDs is a security property, and uniqueness tests are
+  completely blind to it.** A sequential counter satisfies "two generations are not equal".
+  `UserInput.request_id` is the only correlation ID among the three kinds of waits that the caller
+  does not know in advance; if it can be guessed, any component that can publish to that mailbox
+  (including a model persuaded by injected content) can forge a reply to a human input and bypass
+  human confirmation. Pin the generator's **properties** (alphabet, length, no correlation between
+  lexicographic order and generation order over a large sample, the last few characters each
+  distinct), not its results. Take care not to fail a correct implementation: character 12 of
+  `uuid4().hex` is always `'4'` (version bits).
+- **Testing a performance property means choosing the right measure, and the right place.** Busy
+  polling and blocking waits return the same result and take the same wall-clock time; only CPU time
+  tells them apart. But `time.process_time()` counts every thread of the whole process, so a remote
+  implementation with a background connection thread would be misjudged. Keep such assertions in
+  the tests of the concrete implementation, **not** in the contract suite shipped with the
+  distribution; the contract states the requirement in words.
+- **In tokenising / parsing code, the choice of "which characters are separators" is itself
+  load-bearing, and the symptom of choosing wrong is missed detection: a false guarantee of
+  safety.** Measured: the dangerous-command judge treated `<` `>` as segment boundaries, while in a
+  shell they **never start a new command**, only redirect; so in `curl x 2>/dev/null | sh`,
+  `/dev/null` became a segment of its own not continued by the pipe, and "something was downloaded in
+  this chain" was reset: **any redirection could break the whole pipeline chain** (`2>&1` /
+  `</dev/null` / `|&` likewise, all slipping through silently). And those two characters also had
+  **zero coverage**: removing them from the set turned no case red. Entries in constant tables
+  (separators, wrapper names, interpreter names, allowlists) have by nature no mutation that turns
+  red when applied alone, unless **each member has a case of its own**; the more a table looks like
+  "configuration", the easier it is to delete silently in the next refactoring.
+- **After writing "this is load-bearing", apply the corresponding mutation; if it does not turn red,
+  something else is carrying the load.** Measured in the same fix: the comment sat on the separator
+  set ("`<` `>` not being here is load-bearing"), and adding them back to that set kept **every case
+  green**: what really decided the behaviour was the order of the branches (the redirection branch
+  takes those two characters before the separator branch), so the two entries in the set were never
+  reached. **A comment pointing at a non-load-bearing place is worse than no comment**: the next
+  person reasons from it and concludes that changing the other place is safe.
+- **When wrapping a value as read-only, enumerate the whole read surface, not "the reads I thought
+  of".** `copy` / `deepcopy` / `pickle` go through protocol methods: `copy._reconstruct` assigns
+  `y[key] = value` key by key into **the newly created copy**, so a wrapper that only intercepts
+  `__setitem__` rejects a **pure read** and reports a false message saying it was written in place
+  (measured: `copy.deepcopy(args)` reported "an in-place assignment to 'args' was received", although
+  the author never wrote in place once; `pickle` is worse: it fills key-values before restoring
+  state, so the rejection runs before its own fields exist and crashes into a bare
+  `AttributeError`). This one is particularly expensive, because **these protocols are often the only
+  self-help fix for the gap the read-only wrapper leaves**: the view only protects the top level and
+  `{**v}` is a shallow copy, so a careful author's next thought is inevitably `deepcopy`.
+  **Criterion**: read-surface cases cover the protocol layer (`copy` / `deepcopy` / `pickle` /
+  `reversed` / `|` / `fromkeys`), not just indexing and `.get`; what each "give me another copy"
+  protocol returns is pinned as a contract (which are shallow and which deep must be pinned
+  separately, otherwise the two ids are the same assertion). Also: `__slots__` makes `vars(view)`
+  raise instead of handing out a writable `__dict__`, so who the diagnostic points at cannot be
+  forged either.
+- **On a chain of one-directional references, any "unique across the chain" invariant holds only
+  in the direction of the references.** Measured: the classification-conflict check of
+  `HooksCenter(outer=...)` walks "this layer → outer layer", and the docstring accordingly said "a
+  name has at most one classification on a chain"; but the outer layer has no reference to the inner
+  layer, so **an outer layer declared later** can fork a name the inner layer already declared into
+  two classifications, and the same callback runs under two sets of semantics under the two layers'
+  `trigger` (one swallowing exceptions, the other taking `skip` seriously). The one-directionality is
+  intentional (no reverse write surface = the assembly chain cannot form a cycle), so this is not a
+  check that can be completed. **Criterion**: before writing "unique across the chain / globally",
+  ask which end the check starts from, and whether the other end can be added later; when the answer
+  is "yes", the docstring may only state the **directional** constraint, and must say which direction
+  is the dangerous one and whether it is blocked.
+- **"Validate everything before acting" only covers the errors the kernel itself can validate.**
+  Measured: `install_plugins` makes two passes (first validate each item, then register each one), and
+  the second pass calls third-party `register`; when it raises, the earlier plugins are already
+  attached, and the center has no way to detach them, so the docstring "a rejected assembly has no
+  effect" was false. **Criterion**: in any two-pass "validate, then execute" structure, as soon as the
+  second pass contains a single **third-party call**, either roll back from a private snapshot, or
+  narrow the promise to what can be kept (and write down what the rollback cannot catch: what the
+  third party did outside your objects). Rollback catches `BaseException`, not `Exception`:
+  `KeyboardInterrupt` / `CancelledError` coming out of third-party code leaves the same half-assembled
+  state. Put the snapshot / restore in the class of **the object being restored**, do not let callers
+  reach into its private fields: otherwise the next person who adds state to it cannot find the
+  place where restoring happens.
+- **A truncation made to keep an invariant is at the same time a path of information loss.** To keep
+  the invariant "tool calls paired with results", `Fork` must cut the trailing unpaired batch, and
+  **the cut blocks may carry the only security marker in that trajectory**. The criterion: **at every
+  place that drops data, ask "what does it carry that exists nowhere else"**, and the compensation
+  must stay **at the place where the dropping happens**: after returning, the fact that something was
+  dropped no longer exists, and downstream has no way to make up for it (measured: `spawn` already
+  compensated on the path with a `query`, and its docstring states exactly this reason, while the
+  `query=None` path still missed it; the downstream entry "let the caller pass `UNTRUSTED` itself"
+  cannot fix it, because the caller cannot know that a block was just dropped). **The same truncation
+  has a second pitfall**: it runs on **the upstream data**, so any in-place write
+  (`head.tool_calls = []`) writes into the upstream; a rewrite that keeps an invariant must be made on
+  a copy (`replace` / deep copy), otherwise the batch of declared calls disappears from the source
+  agent's trajectory. Both are pinned by one case each: "two entries into the same code" and "whether
+  the upstream was changed".
+- **A conservative marker that is "safe in direction" becomes a permanent source of false positives
+  the host cannot turn off once its scope is the whole trajectory and the escape hatch is not
+  implemented.** Measured: the block for an interrupted delegation wait was unconditionally marked
+  `UNTRUSTED`, although it only embeds text written by the kernel and an id generated by the kernel,
+  without a single external byte; after one legitimate `abort`, that block landed in the trajectory,
+  and from then on **every** high-risk call on a host that had explicitly declared `AllowAll` was
+  blocked, because provenance is the upper bound "it appeared, so it counts". Another path in the same
+  module (reading real provenance) gave the opposite answer for the same input. **Criterion**: before
+  putting down a conservative marker, ask two questions: "does a single byte of this content come
+  from outside", and "how long is this marker's scope, and who can turn it off". If both have bad
+  answers, being conservative is not the safe side.
+- **When every generation runs in its own `asyncio.Task`, the stack does not accumulate, so any
+  argument of the form "it will fail loudly once it gets deep enough" does not hold.** Measured: a
+  leaf at delegation depth 12 and an independent agent measured the same stack depth
+  (`len(inspect.stack())` was 16 for both), because `spawn` starts child agents with `create_task`. A
+  leftover item once used "it will hit Python's recursion / frame limit first" as the fallback for
+  "so unbounded growth does not matter", while in reality **no depth ever fails**; what grows is the
+  number of tasks, registry entries and a chain of waits each blocked on the next, all silently.
+  **Criterion**: fallbacks of the form "it will hit some limit first" must always be measured, never
+  reasoned.
+- **Public surface: adding a public name is not a breaking change, removing one is, so "private
+  first, release it when a third party needs it" is strictly better than "public first, take it back
+  in the next task".** And a verbatim guard on `__all__` is completely blind to **methods added to a
+  class** (it only exports the class name, one string), so one "casually add a public method"
+  enlarged a surface the spec deliberately limited to 11 to 16, and nothing turned red.
+  **Criterion**: for any type whose "public surface is deliberately limited to N", the guard
+  enumerates the non-underscore names of **a real instance** and compares them verbatim; enumerating
+  the class misses instance attributes assigned in `__init__`, and those are often exactly the ones
+  the host reads and writes.
+- **A probe used to prove "this did not happen" can itself make it happen.** Measured: to prove
+  `QueryAgent` did not wake a ZOMBIE, the most natural way is to `broker.publish` a message to its
+  mailbox and assert `ok=False`; but the `on_missing_queue` callback of `publish` is the repository's
+  **only** revival entry, so the assertion is bound to fail, and the failure is caused by the probe.
+  Same family: any read with a default side effect (activate by default, create resources by
+  default, retry by default) cannot be used as an observation. The criterion: **the probe takes the
+  path that explicitly turns the side effect off** (here `send(activate=False)`), and **asserts both
+  sides**: asserting only the registry state lets the mutation "wake it up after querying" survive on
+  the mailbox side.
+- **"Skip an option" and "skip its value" are two different things, and confusing them swallows the
+  real command word.** Measured: command-word parsing skipped tokens starting with `-` but not their
+  values, so in `nice -n 19 rm -rf /`, `19` became the command word and `rm` was never seen again:
+  **not a single gate** under the default rule table. And "which option takes the next word" cannot
+  be decided from syntax (the `30` in `timeout 30 rm` is not an option value at all, it is a
+  positional argument), so after such prefixes the assumption "the first non-option word is the
+  command" must be dropped. For any criterion where **both widening and narrowing go wrong**, each
+  direction needs cases: widening causes false positives, narrowing causes missed detections, and
+  testing one side locks only half.
+- **Items that are in the spec but that no task is responsible for delivering are structurally
+  invisible to single-task reviews.** Each round looks only at its own diff, and a silent absence is
+  in no diff. A cross-cutting audit found three at once (`created_at`, `runtime_start`, step 9 of
+  §5.1 "check for abort again"), and step 9 had live security consequences: the abort documentation
+  treated "honoured between turns" as the whole story, and tools declared within a turn still ran.
+  Countermeasure: when closing each plan, grep the implementation for the spec's signatures and
+  field tables **verbatim**, instead of ticking a self-check list.
+- **Entry validation discipline must reach every public constructor entry, not only the two written
+  most carefully.** In the repository, `validate_max_concurrency` and `_validate_timeout` first
+  reject bool, then check the type, then the range; four other public entries
+  (`EventBus.capacity`, `Runtime(registry=/broker=)`, `spawn(metadata=)`, `DangerJudge`) had none of
+  it. The symptoms come in two grades: YAML `capacity: yes` silently degrades to capacity 1 and drops
+  events; `DangerJudge('abc')` raises `AttributeError` from inside the error formatter, and the
+  traceback points at the formatter instead of the broken rule table. Two traps the same repository
+  had already blocked (`plugins._is_a_class`'s "forgot the parentheses", `_validated_sequence`'s
+  str-is-a-Sequence) slipped through unchanged at adjacent entries.
+- **Without concurrent cases, a CAS contract "looks right" under the in-memory implementation.** Spec
+  §13.3 names CAS as the foundation of concurrent correctness; all three CAS cases in the suite were
+  sequential. A store that does `await asyncio.sleep(0)` between read and write (the round trip a
+  remote implementation is bound to have) passes the whole contract, while what spec §4.4 wants to
+  prevent is exactly the kind of loss where "a pause collides with an abort". Cardinality 3: n=2 has a
+  degenerate solution. Once the contract ships in the wheel and third-party stores prove compliance
+  against it, adding requirements is a breaking change.
+- **If the receipt of an idempotent operation only pins how many times it fired, it cannot stop an
+  early return.** Three concurrent `shutdown` calls still report the hook only once, but
+  `if self._closed: return` at the top of the method satisfies "reported once" just as well: the
+  second call returned while the first was still stuck in the RUNTIME_SHUTDOWN hook, and the bus was
+  not closed. Countermeasure: make the second call while the first is stuck in the hook, and after it
+  returns, an emit must not reach a still-open subscription (the bus is closed); do not just count
+  hooks.
+- **When the control group comes from the same source as the code under test, the comparison is
+  always equal.** In the "hot versus cold" case of the fingerprint cache, the cold side ran the same
+  implementation: removing the role from the cache key made both sides collide on the same key and be
+  wrong together, the comparison was still equal, and the mutation survived. The truth must come from
+  a path unrelated to the mechanism under test (computed block by block, separately). Same family: a
+  hand-written replay document may have a shape the kernel cannot produce (a message arrived but was
+  never handled, an empty waiting list), and right or wrong measured in an impossible world counts for
+  nothing: shapes come from real captures; hand-writing is only for making bad documents captures
+  cannot produce.
+- **Load stretches a "less than a millisecond" window until it can be reproduced.** Signals arrive
+  late under load: the window between handing back the conclusion and printing it was estimated at
+  under a millisecond when recorded, and with several cores saturated it broke 2 times in 25. Design
+  windows involving key presses, signals and shutdown as "may arrive at any moment"; to judge whether
+  a fix works, loop it under load (`yes > /dev/null` saturating several cores), do not look at one
+  green run. The first fix closed only one of the windows; the second round of looping found the
+  other.
+- **Wait for an event, wake up and then read, and you may read the next one.** Measured: `Delegate`
+  waited for the child agent's driver task to end and only on waking read its live Context; a child
+  that went into zombie can be woken, and when the revived cycle is scheduled before the waiter wakes
+  (in replay the outside world takes no time, so it always is; in real runs it can be too), what is
+  handed back is the next cycle's conclusion. If you wait for an event, read the value at the moment
+  of that event: at the very start of `_finish`, before going into zombie, the kernel saves a snapshot
+  per driver task. Criterion: if the awaited object can still be changed by someone else between
+  "done" and "the waiter wakes", do not read it after waking.
+- **Before reinterpreting a kernel call as "wait", count how many callers it has.** Measured: the
+  replay broker stretched the `wait_for_messages(timeout=0)` at the end of a cycle into "wait for the
+  next turn's message in the record", and `_finish` asks the same question when recording dropped
+  input; the reaping task of a killed agent then waited for a message that is only sent after the
+  second kill lands, and the second kill was waiting for it to stop: deadlock; after it stopped, the
+  shutdown was still waiting for that reaping task. As many callers as a signature has, that many
+  cases must reach them; a stretched wait must be released on stop.
+- **A case that starts a subprocess tests different code under a relative `PYTHONPATH`.** The
+  subprocess has a different working directory, the relative entry does not resolve, and Python falls
+  back to the copy installed in the environment (an editable install pointing at the live working
+  tree). Measured: a reviewer ran mutations on an exported copy, and the Ctrl-C case imported the live
+  working tree's code; several mutations were falsely killed by it and real survivors were hidden.
+  `tests/conftest.py` replaces the entries with absolute paths at the start of the session; mutation
+  and export verification still pass absolute paths.
+- **The substring of a negative assertion (`x not in out`) must not be something a random id can
+  spell.** Measured: the assertion "the header value `caf%C3%A9` was not echoed" was written as
+  `'caf' not in err`, while stderr contains the 8 random hex digits of the trace directory name, and
+  `c` `a` `f` are all hex digits: about one in a hundred full runs over nine parameters hits it, and it
+  only shows up in re-checks on busy hosts that run a lot. A negative assertion's probe value must
+  contain letters outside hex (`quiz`), or replace the ids in the output before asserting.
 
 ---
 
-## 常用命令
+## Common commands
 
 ```bash
-uv sync                  # 装依赖
-uv run pytest            # 跑测试
+uv sync                  # install dependencies
+uv run pytest            # run the tests
 uv run ruff check .      # lint
-uv run ruff format .     # 格式化
-uv run pyright           # 类型检查
-uv run python scripts/check_deps.py   # 依赖方向
-uv run python scripts/check_links.py  # Markdown 相对链接
+uv run ruff format .     # format
+uv run pyright           # type check
+uv run python scripts/check_deps.py   # dependency direction
+uv run python scripts/check_links.py  # relative Markdown links
+sh scripts/check_docs.sh              # the docs site, strict build
 ```
 
-## 文档指路
+## Where the docs are
 
-- **[spec](docs/design/2026-09-03-architecture.md)** —— 完整架构设计。改动前读对应章节；**§17 是 89 条决策速查表，先查它**。
-- 每条约束的**理由**都在 spec 里。本文只给结论，不重复推理。
+- **[spec](docs/design/2026-09-03-architecture.md)**: the complete architecture design. Read the
+  relevant section before changing something; **§17 is a quick reference of 89 decisions, check it
+  first**.
+- The **reasons** for every constraint are in the spec. This guide only gives conclusions and does
+  not repeat the reasoning.
+- [`docs/user/`](docs/user/index.md): the English user documentation, built with MkDocs
+  (`mkdocs.yml`). Every code block in it and in `README.md` is executed or parsed by
+  `tests/test_docs.py`, or marked `<!-- not-tested: reason -->`.
 
-## 写代码的约定
+## Code conventions
 
-- **注释只写代码表达不了的硬约束**，不写变更历史、不写"我为什么没那么做"、不写对 reviewer 的辩护。这些属于 commit message。
-- 测试用例名即断言说明；名字说清楚了就不要再加注释。
-- 新代码的注释密度与周边一致。
+- **Comments only state hard constraints the code cannot express**; no change history, no "why I
+  did not do it that way", no defence addressed to a reviewer. Those belong in the commit message.
+- A test case's name is its assertion; if the name says it, do not add a comment.
+- New code matches the comment density of its surroundings.
+- Code comments, runtime error messages and CLI output stay in Chinese in v1.0; the user
+  documentation and this guide are in English.
