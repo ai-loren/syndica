@@ -235,8 +235,8 @@ _StoreT = TypeVar('_StoreT')
 _ACTIVATION_ALLOWED: ContextVar[bool] = ContextVar('syndica_activation_allowed', default=True)
 _SHUTTING_DOWN: ContextVar[tuple[object, ...]] = ContextVar('syndica_shutting_down', default=())
 # 「这段代码跑在某次收尾里」（`_reap` 入口置位）。收尾里的 hook 由 `gather` 包成子任务，比对
-# `current_task()` 认不出它们；它们回头 `wait` 一个正在收尾的 Agent 时若去等收割任务，就是 hook 等
-# 收割任务、收割任务等 hook，永久挂死。
+# `current_task()` 认不出它们；它们回头 `wait` 或 `send` 一个正在收尾的 Agent 时若去等收割任务，就是
+# hook 等收割任务、收割任务等 hook，永久挂死。
 _IN_TEARDOWN: ContextVar[bool] = ContextVar('syndica_in_teardown', default=False)
 
 
@@ -2779,6 +2779,11 @@ class Runtime:
         # 也要占掉它的序号，后面的消息才在两次运行里拿到同一个键（M3 D10）。
         trust = self._from_listed_module(trust)
         key = self._message_key(agent_id, correlation_id)
+        # 被 kill 的 Agent 收尾之前停在 aborting：此刻投进去的是收尾要摘掉的邮箱，拿到 ok=True 却
+        # 不会被处理。等收尾做完再投，落在 zombie 上就照常叫醒它（EXIT 的如实答它不在了）。
+        reaper = self._reaping.get(agent_id)
+        if reaper is not None and not _IN_TEARDOWN.get():
+            await asyncio.wait({reaper})
         if await self.registry.get(agent_id) is None:
             if agent_id in self._reaped:
                 return DeliveryResult(

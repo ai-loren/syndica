@@ -4176,6 +4176,42 @@ async def test_wait_after_kill_returns_once_the_teardown_is_done_so_a_send_reviv
     assert (settled, delivered.ok, revived) == (AgentStatus.ZOMBIE, True, AgentStatus.IDLE)
 
 
+async def test_a_send_right_after_kill_lands_after_the_teardown_and_revives_the_agent():
+    runtime = Runtime()
+    agent_id = await _running(runtime, [])
+
+    await runtime.kill(agent_id)
+    delivered = await runtime.send(agent_id, 'carry on')
+    revived = await _status(runtime, agent_id)
+    await runtime.shutdown()
+
+    assert (delivered.ok, revived) == (True, AgentStatus.IDLE)
+
+
+async def test_a_despawn_hook_that_messages_the_agent_being_reaped_does_not_stall_the_teardown():
+    runtime = Runtime()
+    receipts: list[bool] = []
+
+    async def message_it(**kwargs: Any) -> HookResult:
+        receipts.append((await runtime.send(kwargs['agent_id'], 'bye')).ok)
+        return HookResult()
+
+    runtime.hooks.register(Junction.AGENT_DESPAWN, message_it)
+    blocker = _Block()
+    agent_id = await runtime.spawn(_blocking(blocker), query='go', exit_mode=ExitMode.EXIT)
+    await asyncio.wait_for(blocker.entered.wait(), _TIMEOUT)
+
+    await runtime.kill(agent_id)
+    try:
+        await asyncio.wait_for(_reaped(runtime), _TIMEOUT)
+    finally:
+        for reaper in list(runtime._reapers):
+            reaper.cancel()
+        await runtime.shutdown()
+
+    assert receipts == [False]
+
+
 async def test_a_despawn_hook_that_waits_for_the_agent_being_reaped_does_not_stall_the_teardown():
     runtime = Runtime()
     outcomes: list[str] = []
