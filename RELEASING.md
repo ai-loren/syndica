@@ -87,10 +87,17 @@ target also requires every extra's import check to fail, so none of them passes 
 sh scripts/acceptance.sh
 ```
 
-It runs the four end-to-end acceptance scenarios in a clean Linux container, from the built wheel,
-following the README: a CLI run within five minutes, a multi-agent task with a confirmation and
-artifacts in the web UI, a tool call from MCP and from the OpenAI SDK against a local server, and a
-batch followed by a training export.
+It runs the four end-to-end acceptance scenarios from the built wheel, never the source tree, against
+a scripted model endpoint:
+
+- a fresh Linux container follows the README's install and quickstart commands and must finish a CLI
+  run within five minutes of starting;
+- in a fresh virtual environment with the wheel installed: a multi-agent task with a confirmation
+  and an artifact in the web UI (driven by Playwright), a tool call from MCP and from the OpenAI SDK
+  against a local server, and a batch followed by a training export.
+
+With a model key in the environment it repeats the README run and the batch/export against the real
+model; the key goes to the container on stdin and is never written to disk.
 
 ## 6. Tag (maintainer go)
 

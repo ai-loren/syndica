@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
 from packaging.version import Version
 
 REPO_ROOT = Path(__file__).parents[1]
@@ -90,6 +91,42 @@ def test_pyproject_declares_the_release_metadata() -> None:
 @pytest.mark.parametrize('extra', EXTRAS)
 def test_each_extra_is_declared_with_dependencies(extra: str) -> None:
     assert _project()['optional-dependencies'].get(extra)
+
+
+# backend 包 -> 带它的 extra。直接 import httpx 的 backend 用的是 0.x 的接口。
+HTTPX_BACKENDS = {'llm_openai': 'openai', 'otel_otlp': 'otel', 'a2a': 'a2a'}
+
+
+def _imports_httpx(package: Path) -> bool:
+    return any(
+        line.strip() in {'import httpx'} or line.strip().startswith('from httpx ')
+        for path in package.rglob('*.py')
+        for line in path.read_text(encoding='utf-8').splitlines()
+    )
+
+
+def test_every_backend_that_imports_httpx_is_mapped_to_its_extra() -> None:
+    backends = REPO_ROOT / 'src' / 'syndica' / 'backends'
+    importing = {path.name for path in backends.iterdir() if path.is_dir() and _imports_httpx(path)}
+
+    assert importing == set(HTTPX_BACKENDS), (
+        f'期望: 直接 import httpx 的 backend 都在 HTTPX_BACKENDS 里。实际: {sorted(importing)}。'
+        ' 下一步: 把新 backend 和带它的 extra 加进映射，并给那个 extra 的 httpx 封顶 <1。'
+    )
+
+
+@pytest.mark.parametrize('extra', sorted({*HTTPX_BACKENDS.values(), 'dev'}))
+def test_an_extra_whose_code_imports_httpx_caps_it_below_1(extra: str) -> None:
+    requirements = cast(list[str], _project()['optional-dependencies'][extra])
+    httpx = [Requirement(item) for item in requirements if Requirement(item).name == 'httpx']
+
+    assert httpx, f'期望: extra {extra} 声明 httpx。实际: 没有。下一步: 加上 "httpx>=0.27,<1"。'
+    specifier = httpx[0].specifier
+    assert not specifier.contains('1.0.0.dev6', prereleases=True), (
+        f'期望: extra {extra} 的 httpx 封顶在 1 以下（pip install --pre 会装进 1.0 的预发布'
+        f'重写版）。实际: {httpx[0]}。下一步: 写成 "httpx>=0.27,<1"。'
+    )
+    assert specifier.contains('0.28.1'), f'期望: 锁定的 httpx 0.28.1 仍满足 {httpx[0]}。'
 
 
 def test_project_urls_point_at_the_repository() -> None:

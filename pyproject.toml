@@ -55,7 +55,7 @@ syndica = "syndica.__main__:entrypoint"
 
 [project.optional-dependencies]
 dev = [
-    "httpx>=0.27",
+    "httpx>=0.27,<1",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-timeout>=2.3",
@@ -63,8 +63,10 @@ dev = [
     "pyright>=1.1",
     "openai>=3.26,<4",
 ]
-openai = ["httpx>=0.27"]
-otel = ["httpx>=0.27"]
+# httpx 1.0 是重写（没有 TimeoutException 等），而 `pip install --pre` 会把它的预发布版装进来：
+# 直接 import httpx 的 backend 所在的每个 extra 都要封顶。
+openai = ["httpx>=0.27,<1"]
+otel = ["httpx>=0.27,<1"]
 server = [
     "starlette>=0.40",
     "uvicorn>=0.30",
@@ -72,7 +74,7 @@ server = [
 ]
 mcp = ["mcp>=2.3,<3", "jsonschema>=4"]
 acp = ["agent-client-protocol>=0.12,<0.13"]
-a2a = ["a2a-sdk[http-server]>=1.2,<2"]
+a2a = ["a2a-sdk[http-server]>=1.2,<2", "httpx>=0.27,<1"]
 trl = ["trl>=1.15", "datasets>=3"]
 docs = ["mkdocs>=1.6,<2", "mkdocs-material>=9.5,<10"]
 

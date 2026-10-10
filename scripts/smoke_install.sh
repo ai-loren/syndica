@@ -96,7 +96,9 @@ smoke() {
     fail "$target" "uv venv 用 Python $python 建出 venv" "uv python install $python，或用 SMOKE_PYTHON 换一个版本"
     return 1
   fi
-  if ! uv pip install --quiet --python "$bin/python" "$spec" >"$log" 2>&1; then
+  # README 让用户带 --pre 装 rc：pip 的 --pre 对每个依赖都生效，预发布的依赖会被装进来。
+  # 这里照同样的方式装，依赖的预发布版先在这里撞上，而不是在用户那里。
+  if ! uv pip install --quiet --prerelease allow --python "$bin/python" "$spec" >"$log" 2>&1; then
     fail "$target" "uv pip install '$spec' 成功" "看上面的解析错误，修 [project.optional-dependencies] 后重新 uv build"
     return 1
   fi

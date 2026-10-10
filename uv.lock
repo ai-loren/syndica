@@ -3237,6 +3237,7 @@ dependencies = [
 [package.optional-dependencies]
 a2a = [
     { name = "a2a-sdk", extra = ["http-server"] },
+    { name = "httpx" },
 ]
 acp = [
     { name = "agent-client-protocol" },
@@ -3279,9 +3280,10 @@ requires-dist = [
     { name = "a2a-sdk", extras = ["http-server"], marker = "extra == 'a2a'", specifier = ">=1.2,<2" },
     { name = "agent-client-protocol", marker = "extra == 'acp'", specifier = ">=0.12,<0.13" },
     { name = "datasets", marker = "extra == 'trl'", specifier = ">=3" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
-    { name = "httpx", marker = "extra == 'openai'", specifier = ">=0.27" },
-    { name = "httpx", marker = "extra == 'otel'", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'a2a'", specifier = ">=0.27,<1" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27,<1" },
+    { name = "httpx", marker = "extra == 'openai'", specifier = ">=0.27,<1" },
+    { name = "httpx", marker = "extra == 'otel'", specifier = ">=0.27,<1" },
     { name = "jsonschema", marker = "extra == 'mcp'", specifier = ">=4" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.3,<3" },
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6,<2" },
