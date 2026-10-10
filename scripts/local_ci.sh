@@ -24,6 +24,9 @@ linux-3.12 linux 3.12 no no
 linux-3.13 linux 3.13 no no
 '
 EXTRA_CELLS='web package security'
+# 一格 Linux 用例往容器里写的临时文件的上限，再留些余量。Colima 的数据盘是几个项目共用的，写满时
+# pytest 建不出临时目录，报出来的是几百个看不出原因的 error。
+LINUX_FREE_GB=4
 
 fail_usage() {
   echo "期望: $1" >&2
@@ -119,6 +122,7 @@ host_env() {
 
 # 非交互 shell 的后台任务（--jobs 2 的两路）把 SIGINT、SIGQUIT 设成忽略，忽略会经 exec 一路继承到
 # pytest：Ctrl-C 的用例全红，被测的程序也收不到 Ctrl-C。每一格先复位成默认处置再起。
+# shellcheck disable=SC2016
 DEFAULT_SIGNALS='$SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or die "exec $ARGV[0]: $!\n"'
 
 run_host() {
@@ -174,6 +178,17 @@ run_linux() {
   fi
   if ! build_image "$python" "$out/$cell.image.log"; then
     cp "$out/$cell.image.log" "$log"
+    record "$cell" 1 $(($(date +%s) - started)) "$log"
+    return
+  fi
+  free_kb=$(docker run --rm "$(image_for "$python")" df -Pk /tmp | awk 'NR == 2 { print $4 }')
+  if [ "${free_kb:-0}" -lt $((LINUX_FREE_GB * 1024 * 1024)) ]; then
+    {
+      echo "期望: Docker 虚拟机的数据盘至少还有 ${LINUX_FREE_GB} GB 空闲"
+      echo "实际: 只剩 $((${free_kb:-0} / 1024)) MB"
+      echo "下一步: 用 docker system df 找出占地方的镜像与卷并清掉不用的，或给 Colima 扩盘\
+（colima stop && colima start --disk <GB>），再重跑：scripts/local_ci.sh --cells $cell $short"
+    } > "$log"
     record "$cell" 1 $(($(date +%s) - started)) "$log"
     return
   fi
