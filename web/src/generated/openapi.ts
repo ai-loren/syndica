@@ -1555,6 +1555,20 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /**
+         * BudgetAmounts
+         * @description `Budget` 的四维；None 是那一维不限。金额是十进制字符串。
+         */
+        BudgetAmounts: {
+            /** Tokens */
+            tokens: number | null;
+            /** Cost */
+            cost: string | null;
+            /** Wall Clock S */
+            wall_clock_s: number | null;
+            /** Turns */
+            turns: number | null;
+        };
         /** BudgetRequest */
         BudgetRequest: {
             /**
@@ -1578,6 +1592,35 @@ export interface components {
              * @default null
              */
             turns: number | null;
+        };
+        /**
+         * BudgetSpent
+         * @description `Usage`。`cost` 为 None 是其中有价格未知的调用；`estimated` 是其中有按字符估出来的 token。
+         */
+        BudgetSpent: {
+            /** Input Tokens */
+            input_tokens: number;
+            /** Output Tokens */
+            output_tokens: number;
+            /** Cached Input Tokens */
+            cached_input_tokens: number;
+            /** Cost */
+            cost: string | null;
+            /** Turns */
+            turns: number;
+            /** Estimated */
+            estimated: boolean;
+        };
+        /**
+         * BudgetViewOut
+         * @description `BudgetView`：根 Agent 此刻的上限、已用与剩余，`exhausted` 是已经用完的维度。
+         */
+        BudgetViewOut: {
+            limit: components["schemas"]["BudgetAmounts"];
+            used: components["schemas"]["BudgetSpent"];
+            remaining: components["schemas"]["BudgetAmounts"];
+            /** Exhausted */
+            exhausted: string[];
         };
         /** CreateSession */
         CreateSession: {
@@ -1734,6 +1777,28 @@ export interface components {
             [key: string]: unknown;
         };
         /**
+         * ProgressOut
+         * @description 一个 Agent 最近一次量到的进度（`ProgressSnapshot` 加那一次的裁决）。来自
+         *     `progress_measured` 事件，与事件一样只约束必有键。
+         */
+        ProgressOut: {
+            /** Satisfied */
+            satisfied: string[];
+            /** Mandatory */
+            mandatory: string[];
+            /** Pending Human */
+            pending_human: string[];
+            /** Measured Turn */
+            measured_turn: number | null;
+            /**
+             * Verdict
+             * @enum {string}
+             */
+            verdict: "pass" | "partial" | "block" | "unverified";
+        } & {
+            [key: string]: unknown;
+        };
+        /**
          * ResumeSession
          * @description 恢复时的预算。tokens / cost / turns 不给就沿用会话里存的上限；墙钟不存进会话，要限就每次打开
          *     重给，从这一刻起算。
@@ -1834,13 +1899,10 @@ export interface components {
             transcripts: {
                 [key: string]: components["schemas"]["Transcript"];
             };
-            /** Budget */
-            budget: {
-                [key: string]: unknown;
-            } | null;
+            budget: components["schemas"]["BudgetViewOut"] | null;
             /** Progress */
             progress: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ProgressOut"];
             } | null;
             /** Pending */
             pending: components["schemas"]["PendingRequest"][];

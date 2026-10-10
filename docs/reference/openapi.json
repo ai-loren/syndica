@@ -3,7 +3,7 @@
   "info": {
     "title": "Syndica",
     "version": "1",
-    "description": "syndica 的 HTTP / SSE / WebSocket 面。标 x-syndica-stability: provisional 的字段来自内核里 M12 才冻结的类型，形状仍可能变。"
+    "description": "syndica 的 HTTP / SSE / WebSocket 面。"
   },
   "paths": {
     "/api/v1/health": {
@@ -1500,6 +1500,64 @@
         "title": "Block",
         "type": "object"
       },
+      "BudgetAmounts": {
+        "additionalProperties": false,
+        "description": "`Budget` 的四维；None 是那一维不限。金额是十进制字符串。",
+        "properties": {
+          "tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokens"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost"
+          },
+          "wall_clock_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wall Clock S"
+          },
+          "turns": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turns"
+          }
+        },
+        "required": [
+          "tokens",
+          "cost",
+          "wall_clock_s",
+          "turns"
+        ],
+        "title": "BudgetAmounts",
+        "type": "object"
+      },
       "BudgetRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1557,6 +1615,83 @@
           }
         },
         "title": "BudgetRequest",
+        "type": "object"
+      },
+      "BudgetSpent": {
+        "additionalProperties": false,
+        "description": "`Usage`。`cost` 为 None 是其中有价格未知的调用；`estimated` 是其中有按字符估出来的 token。",
+        "properties": {
+          "input_tokens": {
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "cached_input_tokens": {
+            "title": "Cached Input Tokens",
+            "type": "integer"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost"
+          },
+          "turns": {
+            "title": "Turns",
+            "type": "integer"
+          },
+          "estimated": {
+            "title": "Estimated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "cached_input_tokens",
+          "cost",
+          "turns",
+          "estimated"
+        ],
+        "title": "BudgetSpent",
+        "type": "object"
+      },
+      "BudgetViewOut": {
+        "additionalProperties": false,
+        "description": "`BudgetView`：根 Agent 此刻的上限、已用与剩余，`exhausted` 是已经用完的维度。",
+        "properties": {
+          "limit": {
+            "$ref": "#/components/schemas/BudgetAmounts"
+          },
+          "used": {
+            "$ref": "#/components/schemas/BudgetSpent"
+          },
+          "remaining": {
+            "$ref": "#/components/schemas/BudgetAmounts"
+          },
+          "exhausted": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Exhausted",
+            "type": "array"
+          }
+        },
+        "required": [
+          "limit",
+          "used",
+          "remaining",
+          "exhausted"
+        ],
+        "title": "BudgetViewOut",
         "type": "object"
       },
       "CreateSession": {
@@ -1941,6 +2076,63 @@
         "title": "PendingRequest",
         "type": "object"
       },
+      "ProgressOut": {
+        "additionalProperties": true,
+        "description": "一个 Agent 最近一次量到的进度（`ProgressSnapshot` 加那一次的裁决）。来自\n`progress_measured` 事件，与事件一样只约束必有键。",
+        "properties": {
+          "satisfied": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Satisfied",
+            "type": "array"
+          },
+          "mandatory": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Mandatory",
+            "type": "array"
+          },
+          "pending_human": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pending Human",
+            "type": "array"
+          },
+          "measured_turn": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Measured Turn"
+          },
+          "verdict": {
+            "enum": [
+              "pass",
+              "partial",
+              "block",
+              "unverified"
+            ],
+            "title": "Verdict",
+            "type": "string"
+          }
+        },
+        "required": [
+          "satisfied",
+          "mandatory",
+          "pending_human",
+          "measured_turn",
+          "verdict"
+        ],
+        "title": "ProgressOut",
+        "type": "object"
+      },
       "ResumeSession": {
         "additionalProperties": false,
         "description": "恢复时的预算。tokens / cost / turns 不给就沿用会话里存的上限；墙钟不存进会话，要限就每次打开\n重给，从这一刻起算。",
@@ -2224,28 +2416,26 @@
           "budget": {
             "anyOf": [
               {
-                "additionalProperties": true,
-                "type": "object"
+                "$ref": "#/components/schemas/BudgetViewOut"
               },
               {
                 "type": "null"
               }
-            ],
-            "title": "Budget",
-            "x-syndica-stability": "provisional"
+            ]
           },
           "progress": {
             "anyOf": [
               {
-                "additionalProperties": true,
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ProgressOut"
+                },
                 "type": "object"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Progress",
-            "x-syndica-stability": "provisional"
+            "title": "Progress"
           },
           "pending": {
             "items": {

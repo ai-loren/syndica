@@ -5,8 +5,7 @@
 快照每变一次，这里记一条：日期、快照 sha256 的前 12 位、改了什么、是不是破坏性变更。用例按摘要判，
 漏记一条会变红。
 
-标 `x-syndica-stability: provisional` 的字段来自内核里 M12 才冻结的类型（预算视图、进度），在那之前
-形状仍可能变，变了照样记在这里。
+v1.0 起快照里没有标 provisional 的字段：每个字段都按这里记下的规则演进，追加不破坏，删改破坏。
 
 ## 2026-10-06 · `99c4b2720a3e` · 首版
 
@@ -70,3 +69,14 @@
   里 `interop.acp.agents[].name`），`activity_id` 是它报来的工具调用 id（计划更新是 `plan`）。此前它发的是
   `source: "acp:<名字>"`、`name` 与 `activity_id` 都是工具调用 id，不符合上面的契约；照着那份旧取值解析
   `source` 的客户端要改成读 `name`。
+
+## 2026-10-10 · `5d50488422b0` · 快照的预算与进度转正（追加，不破坏）
+
+- `Snapshot.budget` 与 `Snapshot.progress` 去掉 `x-syndica-stability: provisional`：它们序列化的内核类型
+  （`BudgetView`、`ProgressSnapshot` 与裁决）在 v1.0 进了公开面，形状随之冻结。`info.description` 不再提
+  provisional。
+- 两个字段从「任意对象」写成具体的 schema，取值与此前实际交出的相同：`budget` 是 `BudgetViewOut`
+  （`limit` / `remaining` 是 `BudgetAmounts`：`tokens`、`cost`（十进制字符串）、`wall_clock_s`、`turns`，
+  不限的那一维是 null；`used` 是 `BudgetSpent`；`exhausted` 是已用完的维度名）；`progress` 是 Agent id 到
+  `ProgressOut` 的映射（`satisfied`、`mandatory`、`pending_human`、`measured_turn`、`verdict`，与
+  `progress_measured` 事件的必有键相同，多出的键照样交出）。

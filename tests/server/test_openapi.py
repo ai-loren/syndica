@@ -90,7 +90,52 @@ def test_every_event_kind_a_client_can_receive_has_a_schema():
     assert events['budget_question']['required'] == ['request_id', 'view']
 
 
-def test_fields_from_types_frozen_only_in_m12_are_marked_provisional():
-    properties = openapi()['components']['schemas']['Snapshot']['properties']
-    assert properties['budget']['x-syndica-stability'] == 'provisional'
-    assert properties['progress']['x-syndica-stability'] == 'provisional'
+def test_no_field_is_marked_provisional():
+    assert 'x-syndica-stability' not in json.dumps(openapi())
+
+
+def test_the_snapshot_budget_and_progress_have_typed_schemas():
+    schemas = openapi()['components']['schemas']
+    properties = schemas['Snapshot']['properties']
+    assert properties['budget']['anyOf'][0] == {'$ref': '#/components/schemas/BudgetViewOut'}
+    assert properties['progress']['anyOf'][0]['additionalProperties'] == {
+        '$ref': '#/components/schemas/ProgressOut'
+    }
+    assert list(schemas['BudgetViewOut']['properties']) == [
+        'limit',
+        'used',
+        'remaining',
+        'exhausted',
+    ]
+    assert schemas['ProgressOut']['required'] == [
+        'satisfied',
+        'mandatory',
+        'pending_human',
+        'measured_turn',
+        'verdict',
+    ]
+
+
+def test_the_typed_budget_and_progress_accept_what_the_kernel_produces():
+    from decimal import Decimal
+
+    from syndica.kernel import Budget, BudgetView, Usage
+    from syndica.kernel.transcript import budget_payload
+    from syndica.server.models import BudgetViewOut, ProgressOut
+
+    view = BudgetView(
+        limit=Budget(turns=10, cost=Decimal('0.50'), wall_clock_s=30.0),
+        used=Usage(input_tokens=3, output_tokens=4, turns=2, estimated=True),
+        remaining=Budget(turns=8, cost=None),
+        exhausted=('tokens',),
+    )
+    payload = budget_payload(view)
+    assert BudgetViewOut.model_validate(payload).model_dump() == payload
+    progress = {
+        'satisfied': ['R1'],
+        'mandatory': ['R1', 'R2'],
+        'pending_human': [],
+        'measured_turn': 7,
+        'verdict': 'partial',
+    }
+    assert ProgressOut.model_validate(progress).model_dump() == progress

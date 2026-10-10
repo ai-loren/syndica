@@ -1,6 +1,5 @@
 """HTTP / SSE / WebSocket 的数据形状。OpenAPI 快照由这些模型生成；响应在交出之前也按它们校验一遍，
-文档与实际交出的东西因此不会分叉。由内核里 M12 才公开的类型（裁决、进度、预算视图）序列化来的部分在
-快照里标 provisional。"""
+文档与实际交出的东西因此不会分叉。"""
 
 from __future__ import annotations
 
@@ -27,7 +26,10 @@ __all__ = [
     'TraceList',
     'TraceRow',
     'Block',
+    'BudgetAmounts',
     'BudgetRequest',
+    'BudgetSpent',
+    'BudgetViewOut',
     'CreateSession',
     'DoctorCheck',
     'DoctorReport',
@@ -37,6 +39,7 @@ __all__ = [
     'LoginRequest',
     'LoginResponse',
     'PendingRequest',
+    'ProgressOut',
     'Roles',
     'RpcReply',
     'RpcRequest',
@@ -248,16 +251,56 @@ class PendingRequest(_Model):
     agent_id: str
 
 
+class BudgetAmounts(_Model):
+    """`Budget` 的四维；None 是那一维不限。金额是十进制字符串。"""
+
+    tokens: int | None
+    cost: str | None
+    wall_clock_s: float | None
+    turns: int | None
+
+
+class BudgetSpent(_Model):
+    """`Usage`。`cost` 为 None 是其中有价格未知的调用；`estimated` 是其中有按字符估出来的 token。"""
+
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    cost: str | None
+    turns: int
+    estimated: bool
+
+
+class BudgetViewOut(_Model):
+    """`BudgetView`：根 Agent 此刻的上限、已用与剩余，`exhausted` 是已经用完的维度。"""
+
+    limit: BudgetAmounts
+    used: BudgetSpent
+    remaining: BudgetAmounts
+    exhausted: list[str]
+
+
+class ProgressOut(_Model):
+    """一个 Agent 最近一次量到的进度（`ProgressSnapshot` 加那一次的裁决）。来自
+    `progress_measured` 事件，与事件一样只约束必有键。"""
+
+    model_config = ConfigDict(extra='allow')
+
+    satisfied: list[str]
+    mandatory: list[str]
+    pending_human: list[str]
+    measured_turn: int | None
+    verdict: Literal['pass', 'partial', 'block', 'unverified']
+
+
 class Snapshot(_Model):
     sid: str
     root_id: str
     as_of: str
     agents: list[AgentNode]
     transcripts: dict[str, Transcript]
-    budget: dict[str, Any] | None = Field(json_schema_extra={'x-syndica-stability': 'provisional'})
-    progress: dict[str, Any] | None = Field(
-        json_schema_extra={'x-syndica-stability': 'provisional'}
-    )
+    budget: BudgetViewOut | None
+    progress: dict[str, ProgressOut] | None
     pending: list[PendingRequest]
 
 

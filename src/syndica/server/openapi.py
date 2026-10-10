@@ -295,10 +295,7 @@ def openapi() -> dict[str, Any]:
             'version': '1',
             # 不写 syndica 的版本号：每次升版本都会改快照，逼出一条「什么都没变」的变更记录。契约的
             # 版本是 info.version。
-            'description': (
-                'syndica 的 HTTP / SSE / WebSocket 面。标 x-syndica-stability: '
-                'provisional 的字段来自内核里 M12 才冻结的类型，形状仍可能变。'
-            ),
+            'description': 'syndica 的 HTTP / SSE / WebSocket 面。',
         },
         'paths': paths,
         'components': {
