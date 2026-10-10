@@ -1,0 +1,5 @@
+Merged for 1.3:
+- Sessions can be renamed from the web UI.
+- The batch runner prints one JSON line per task as soon as the task ends.
+- Fixed: very long tool output no longer stalls the event stream.
+- Removed: the deprecated `--legacy-trace` option.

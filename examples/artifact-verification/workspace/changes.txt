@@ -1,0 +1,6 @@
+Merged for 2.0:
+- Breaking: the `--legacy-trace` option is removed; use `--trace replay`.
+- New: sessions can be exported with `syndica export trajectory`.
+- New: the web UI previews spreadsheets.
+- Faster: cold start-up is 40% faster.
+- Fixed: very long tool output no longer stalls the event stream.

@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "when": "Fix the failing test",
+      "steps": [
+        {"tool_calls": [{"name": "Bash", "arguments": {"command": "python3 -m unittest -q"}}]},
+        {"tool_calls": [{"name": "Read", "arguments": {"path": "wordcount.py"}}]},
+        {"tool_calls": [{"name": "Edit", "arguments": {"path": "wordcount.py", "old_string": "text.split(' ')", "new_string": "text.split()"}}]},
+        {"tool_calls": [{"name": "Bash", "arguments": {"command": "python3 -m unittest -q"}}]},
+        {"content": "count_words split on single spaces only, so runs of whitespace and the empty string were miscounted. It now uses str.split() with no argument; all three tests pass."}
+      ]
+    }
+  ]
+}

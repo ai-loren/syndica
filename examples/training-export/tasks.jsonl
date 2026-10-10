@@ -1,0 +1,4 @@
+{"id": "release-1.2", "agent": "Worker", "prompt": "Write the release note for version 1.2 to release-1.2.md from changes/1.2.txt, then deliver it.", "goal": "a release note with a Highlights section"}
+{"id": "release-1.3", "agent": "Worker", "prompt": "Write the release note for version 1.3 to release-1.3.md from changes/1.3.txt, then deliver it.", "goal": "a release note with a Highlights section"}
+{"id": "summary-1.3", "agent": "Worker", "prompt": "Summarise changes/1.3.txt for the support team in summary.md.", "goal": "a three-bullet summary in summary.md"}
+{"id": "haiku", "agent": "Worker", "prompt": "Write a haiku about release day to haiku.md, then deliver it.", "goal": "a haiku about release day that feels calm"}

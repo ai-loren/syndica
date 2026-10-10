@@ -1,0 +1,43 @@
+{
+  "rules": [
+    {
+      "system": "投影器",
+      "reply": {
+        "rubrics": [
+          {"id": "R1", "statement": "notes.md has a Highlights section", "quote": "a Highlights section"},
+          {"id": "R2", "statement": "notes.md lists the breaking change", "quote": "the breaking change"}
+        ]
+      }
+    },
+    {
+      "system": "输出验收器",
+      "reply": {"content": "{\"complete\": true, \"reason\": \"notes.md was written and delivered\"}"}
+    },
+    {
+      "system": "结果验收器",
+      "reply": {
+        "content": "{\"outcomes\": [{\"rubric_id\": \"R1\", \"result\": \"satisfied\", \"evidence\": [{\"source\": \"file\", \"locator\": \"notes.md\", \"quote\": \"## Highlights\"}]}, {\"rubric_id\": \"R2\", \"result\": \"satisfied\", \"evidence\": [{\"source\": \"file\", \"locator\": \"notes.md\", \"quote\": \"--legacy-trace\"}]}], \"reason\": \"both rubrics are visible in notes.md\"}"
+      }
+    },
+    {
+      "when": "release note for version 2.0",
+      "tool": "Write",
+      "steps": [
+        {"tool_calls": [{"name": "Read", "arguments": {"path": "changes.txt"}}]},
+        {
+          "tool_calls": [
+            {
+              "name": "Write",
+              "arguments": {
+                "path": "notes.md",
+                "content": "# Release 2.0\n\n## Highlights\n\n- Export whole sessions with `syndica export trajectory`.\n- The web UI previews spreadsheets.\n- Cold start-up is 40% faster.\n\n## Breaking changes\n\n- `--legacy-trace` is removed; use `--trace replay`.\n\n## Fixes\n\n- Very long tool output no longer stalls the event stream.\n"
+              }
+            }
+          ]
+        },
+        {"tool_calls": [{"name": "Deliver", "arguments": {"path": "notes.md", "kind": "document", "note": "release note for 2.0"}}]},
+        {"content": "Wrote notes.md (Highlights, Breaking changes, Fixes) and delivered it."}
+      ]
+    }
+  ]
+}

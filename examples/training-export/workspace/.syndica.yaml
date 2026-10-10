@@ -1,0 +1,14 @@
+version: 1
+
+# Every task ends with a verdict: rubrics are projected from the goal before work starts, L2 checks
+# that everything asked was done, L3 checks each rubric against the reply and the files.
+modules: [acceptance]
+flags:
+  acceptance_rubrics: true
+  acceptance_output: true
+  acceptance_outcome: true
+  # Record the first verdict instead of sending the agent back, so the batch keeps a spread of
+  # verdicts to learn from.
+  acceptance_output_retries: 0
+  acceptance_outcome_block_retries: 0
+  acceptance_outcome_partial_retries: 0

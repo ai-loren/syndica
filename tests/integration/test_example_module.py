@@ -100,6 +100,18 @@ async def test_an_installed_example_gives_the_agent_its_tool_flag_and_hook(examp
     assert greetings.names == ['Ada']  # pyright: ignore[reportUnknownMemberType]
 
 
+async def test_the_model_receives_greet_with_a_description_and_a_described_argument(
+    example: ModuleType,
+):
+    llm = _greet_llm()
+    await _run(Runtime(modules=[_module(example)]), llm)
+
+    [greet] = [schema for schema in llm.call_kwargs[0]['tools'] if schema['name'] == 'Greet']
+    assert greet['description'] == 'Greet someone by name with the configured greeting word.'
+    assert greet['parameters']['properties']['name']['description'] == 'Who to greet.'
+    assert greet['parameters']['required'] == ['name']
+
+
 async def test_the_flag_default_applies_when_nothing_overrides_it(example: ModuleType):
     trajectory = await _run(Runtime(modules=[_module(example)]), _greet_llm())
 

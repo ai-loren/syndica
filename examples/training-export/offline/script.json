@@ -1,0 +1,75 @@
+{
+  "rules": [
+    {
+      "system": "投影器",
+      "seen": "feels calm",
+      "reply": {"rubrics": [{"id": "R1", "statement": "The haiku feels calm to a reader", "quote": "feels calm", "kind": "judgment"}]}
+    },
+    {
+      "system": "投影器",
+      "seen": "three-bullet summary",
+      "reply": {"rubrics": [{"id": "R1", "statement": "summary.md has exactly three bullet points", "quote": "three-bullet summary"}]}
+    },
+    {
+      "system": "投影器",
+      "seen": "Highlights section",
+      "reply": {"rubrics": [{"id": "R1", "statement": "The release note has a Highlights section", "quote": "Highlights section"}]}
+    },
+    {
+      "system": "输出验收器",
+      "reply": {"content": "{\"complete\": true, \"reason\": \"the agent did what the task asked or said what it did not do\"}"}
+    },
+    {
+      "system": "结果验收器",
+      "seen": "release-1.3.md",
+      "reply": {"content": "{\"outcomes\": [{\"rubric_id\": \"R1\", \"result\": \"unmet\", \"evidence\": [{\"source\": \"file\", \"locator\": \"release-1.3.md\", \"quote\": \"## Changes\"}]}], \"reason\": \"the note has a Changes section and no Highlights section\"}"}
+    },
+    {
+      "system": "结果验收器",
+      "seen": "release-1.2.md",
+      "reply": {"content": "{\"outcomes\": [{\"rubric_id\": \"R1\", \"result\": \"satisfied\", \"evidence\": [{\"source\": \"file\", \"locator\": \"release-1.2.md\", \"quote\": \"## Highlights\"}]}], \"reason\": \"the Highlights section is there\"}"}
+    },
+    {
+      "system": "结果验收器",
+      "seen": "summary.md",
+      "reply": {"content": "{\"outcomes\": [{\"rubric_id\": \"R1\", \"result\": \"unconfirmed\"}], \"reason\": \"summary.md was not written, so the bullets cannot be counted\"}"}
+    },
+    {
+      "when": "version 1.2",
+      "tool": "Write",
+      "steps": [
+        {"tool_calls": [{"name": "Read", "arguments": {"path": "changes/1.2.txt"}}]},
+        {"tool_calls": [{"name": "Write", "arguments": {"path": "release-1.2.md", "content": "# Release 1.2\n\n## Highlights\n\n- Start-up is 40% faster.\n- `export --since` limits an export to recent sessions.\n\n## Fixes\n\n- A trailing slash in the base URL no longer doubles in requests.\n"}}]},
+        {"tool_calls": [{"name": "Deliver", "arguments": {"path": "release-1.2.md", "kind": "document", "note": "release note for 1.2"}}]},
+        {"content": "Wrote and delivered release-1.2.md with Highlights and Fixes sections."}
+      ]
+    },
+    {
+      "when": "version 1.3",
+      "tool": "Write",
+      "steps": [
+        {"tool_calls": [{"name": "Read", "arguments": {"path": "changes/1.3.txt"}}]},
+        {"tool_calls": [{"name": "Write", "arguments": {"path": "release-1.3.md", "content": "# Release 1.3\n\n## Changes\n\n- Sessions can be renamed from the web UI.\n- The batch runner prints a line per task.\n- Long tool output no longer stalls the event stream.\n- `--legacy-trace` is gone.\n"}}]},
+        {"tool_calls": [{"name": "Deliver", "arguments": {"path": "release-1.3.md", "kind": "document", "note": "release note for 1.3"}}]},
+        {"content": "Wrote and delivered release-1.3.md listing the four changes."}
+      ]
+    },
+    {
+      "when": "Summarise changes/1.3.txt",
+      "tool": "Write",
+      "steps": [
+        {"tool_calls": [{"name": "Read", "arguments": {"path": "changes/1.3.txt"}}]},
+        {"content": "1.3 renames sessions in the web UI, streams batch results and fixes a stall. I have not written summary.md."}
+      ]
+    },
+    {
+      "when": "haiku about release day",
+      "tool": "Write",
+      "steps": [
+        {"tool_calls": [{"name": "Write", "arguments": {"path": "haiku.md", "content": "Tags pushed in the dusk\nthe pipeline hums, then goes still\ntea cools by the log\n"}}]},
+        {"tool_calls": [{"name": "Deliver", "arguments": {"path": "haiku.md", "kind": "document", "note": "the haiku"}}]},
+        {"content": "Wrote and delivered haiku.md."}
+      ]
+    }
+  ]
+}

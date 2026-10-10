@@ -1,0 +1,11 @@
+2026-10-09T21:58:02Z INFO  checkout-api started version=4.18.2 workers=8
+2026-10-09T22:03:11Z INFO  GET /health 200 2ms
+2026-10-09T22:14:47Z WARN  payments: upstream latency 1840ms (threshold 1000ms)
+2026-10-09T22:15:02Z ERROR payments: request to gateway timed out after 5000ms order=88412
+2026-10-09T22:15:09Z ERROR payments: request to gateway timed out after 5000ms order=88417
+2026-10-09T22:15:31Z ERROR payments: circuit breaker opened after 5 consecutive failures
+2026-10-09T22:16:00Z WARN  checkout: falling back to deferred capture for 37 orders
+2026-10-09T22:21:44Z INFO  payments: circuit breaker half-open, probing gateway
+2026-10-09T22:21:45Z INFO  payments: gateway probe succeeded in 212ms
+2026-10-09T22:21:46Z INFO  payments: circuit breaker closed
+2026-10-09T22:30:00Z INFO  checkout: deferred capture completed for 37 orders, 0 failures

@@ -1,0 +1,2 @@
+# The root .gitignore drops *.log; this one is the demo's input.
+!/workspace/logs/app.log

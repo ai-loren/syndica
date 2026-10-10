@@ -48,10 +48,9 @@ class Greetings:
 
 
 class Greet(Tool):
-    """Greet someone by name.
+    """Greets by name and announces each greeting on `example:greeted`.
 
-    Args:
-        name: Who to greet.
+    The model reads its description from `execute`'s docstring, not from this one.
     """
 
     # Greet hands none of its arguments to a shell or interpreter; a tool that does lists them here.
@@ -62,6 +61,11 @@ class Greet(Tool):
         self._greeting = greeting
 
     async def execute(self, name: str) -> ToolResult:
+        """Greet someone by name with the configured greeting word.
+
+        Args:
+            name: Who to greet.
+        """
         await self._agent.trigger_extension(GREETED, name=name)
         return ToolResult(output=f'{self._greeting}, {name}')
 

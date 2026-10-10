@@ -1,0 +1,7 @@
+version: 1
+
+# `syndica run --handoff` runs these itself after the agents finish; what an agent says it ran is
+# listed but never trusted.
+workspace:
+  verify:
+    - python3 -m unittest -q

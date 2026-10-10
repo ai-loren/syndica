@@ -1,0 +1,11 @@
+version: 1
+
+# Acceptance: the goal is projected into rubrics that quote it (before any work starts), the agent
+# marks its deliverable with Deliver, and when it says it is done L1 checks the deliverable's format,
+# L2 checks that everything asked was done, and L3 checks each rubric against the reply and the
+# workspace. The run ends with one of four verdicts: pass, partial, block or unverified.
+modules: [acceptance]
+flags:
+  acceptance_rubrics: true
+  acceptance_output: true
+  acceptance_outcome: true

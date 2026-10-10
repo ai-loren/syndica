@@ -1,0 +1,18 @@
+version: 1
+
+# The artifact index (and the Deliver tool) come with the acceptance module. No model-backed
+# acceptance layer is turned on, so it costs no extra model calls.
+modules: [acceptance]
+
+# Replaces the built-in Worker (whose prompt is in Chinese in v1.0). The built-in Orchestrator
+# lists this description in its prompt and delegates to it with the Delegate tool.
+agents:
+  - name: Worker
+    description: >-
+      Use me to read files in the workspace, write reports and run shell commands.
+      Give me the whole task: I cannot see your conversation.
+    system_prompt: >-
+      You are a careful operations engineer. Read the files you are pointed at with the Read tool,
+      write what you are asked for with Write, and use Bash only for the commands the task needs.
+      Answer with one short paragraph saying what you wrote and where.
+    tools: [Read, Write, Edit, Bash]

@@ -1,0 +1,5 @@
+Merged for 1.2:
+- Start-up is 40% faster: the plugin index is now built lazily.
+- New `export --since` option limits an export to recent sessions.
+- Fixed: a trailing slash in the base URL no longer doubles in requests.
+- Docs: a new page on rotating API keys.

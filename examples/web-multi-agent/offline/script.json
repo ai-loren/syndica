@@ -1,0 +1,44 @@
+{
+  "rules": [
+    {
+      "when": "incident summary of logs/app.log",
+      "tool": "Delegate",
+      "steps": [
+        {
+          "tool_calls": [
+            {
+              "name": "Delegate",
+              "arguments": {
+                "agent": "Worker",
+                "query": "Read logs/app.log and write an incident summary to incident.md: what failed, when, the impact and how it recovered. Then copy it with `cp incident.md ../outbox/incident.md`."
+              }
+            }
+          ]
+        },
+        {
+          "content": "The Worker wrote incident.md (open it in the Artifacts panel) and copied it to ../outbox/incident.md once you allowed the copy."
+        }
+      ]
+    },
+    {
+      "when": "write an incident summary to incident.md",
+      "tool": "Write",
+      "steps": [
+        {"tool_calls": [{"name": "Read", "arguments": {"path": "logs/app.log"}}]},
+        {
+          "tool_calls": [
+            {
+              "name": "Write",
+              "arguments": {
+                "path": "incident.md",
+                "content": "# Incident: payment gateway timeouts\n\n- **When:** 2026-10-09 22:14:47Z to 22:21:46Z (about 7 minutes).\n- **What failed:** requests from checkout-api to the payment gateway timed out after 5000 ms; the circuit breaker opened after 5 consecutive failures.\n- **Impact:** 37 orders fell back to deferred capture; no order was lost.\n- **Recovery:** the breaker went half-open at 22:21:44Z, a probe succeeded in 212 ms and it closed; deferred capture finished at 22:30:00Z with 0 failures.\n"
+              }
+            }
+          ]
+        },
+        {"tool_calls": [{"name": "Bash", "arguments": {"command": "cp incident.md ../outbox/incident.md"}}]},
+        {"content": "Wrote incident.md (gateway timeouts from 22:14 to 22:21, 37 orders deferred, no loss) and copied it to ../outbox/incident.md."}
+      ]
+    }
+  ]
+}

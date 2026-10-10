@@ -1,0 +1,1 @@
+Have the Worker write an incident summary of logs/app.log to incident.md, then copy it to ../outbox/incident.md for the on-call channel.
