@@ -1,0 +1,75 @@
+site_name: Syndica
+site_description: A multi-agent harness for verifiable knowledge work
+repo_url: https://github.com/ai-loren/syndica
+repo_name: ai-loren/syndica
+edit_uri: edit/main/docs/user/
+# 只发布用户文档。docs/ 下其余目录是维护者的中文设计记录，页面要引用时链到 GitHub 上的原文，
+# 不拉进站点。
+docs_dir: docs/user
+strict: true
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+validation:
+  nav:
+    omitted_files: warn
+    # reference/errors.md、reference/api.md 与 versioning.md 由 M12 的另外两条线写，导航里先列上。
+    # 三个文件都进了 docs/user 之后改回 warn：否则导航里指向不存在页面的条目在 --strict 下也不再失败。
+    not_found: info
+    absolute_links: warn
+  links:
+    not_found: warn
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
+
+nav:
+  - Home: index.md
+  - Install: install.md
+  - Quickstart: quickstart.md
+  - Concepts:
+      - Runtime and agents: concepts/runtime-and-agents.md
+      - Tools: concepts/tools.md
+      - Trust and provenance: concepts/trust-and-provenance.md
+      - Danger judgement and dispositions: concepts/danger.md
+      - Artifacts and acceptance: concepts/artifacts-and-acceptance.md
+      - Sessions, compaction and memory: concepts/sessions-compaction-memory.md
+      - Budgets and long-horizon work: concepts/budgets-and-long-horizon.md
+      - Traces and redaction: concepts/traces-and-redaction.md
+  - Guides:
+      - Configuration: guides/configuration.md
+      - Model providers: guides/models.md
+      - Writing an agent: guides/writing-an-agent.md
+      - Writing a tool: guides/writing-a-tool.md
+      - Writing a Runtime Module: guides/writing-a-module.md
+      - Writing a backend or store: guides/writing-a-backend.md
+      - Interop (MCP, ACP, A2A, OpenAI HTTP): guides/interop.md
+      - Web UI and HTTP API: guides/web-ui.md
+      - Changing a repository (development mode): guides/development-mode.md
+      - Training export: guides/training-export.md
+      - Observability: guides/observability.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Configuration schema: reference/configuration.md
+      - Flags: reference/flags.md
+      - HTTP API: reference/http-api.md
+      - Python API: reference/api.md
+      - Errors: reference/errors.md
+  - Troubleshooting: troubleshooting.md
+  - Security model: security.md
+  - Versioning: versioning.md
