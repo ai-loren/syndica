@@ -26,13 +26,13 @@ matrix passes, and this month has no GitHub Actions minutes left.
 - [ ] Never run pull requests from forks on self-hosted runners; keep `ci.yml` on GitHub-hosted runners only.
 - [ ] Publish the docs site (`mkdocs build` from `docs/user`, e.g. GitHub Pages) and point
       `[project.urls] Documentation` in `pyproject.toml` and the README links at it.
-
-## 4. GitHub repository settings (any time, maintainer only)
-
 - [ ] Enable *Private vulnerability reporting*: [SECURITY.md](SECURITY.md) sends reports there.
 - [ ] Enable *Reported content*: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) relies on it for enforcement reports.
 
-## 5. Optional
+  Both settings exist only for public repositories: while the repository is private, the
+  private-vulnerability-reporting API answers 404 (checked 2026-10-11).
+
+## 4. Optional
 
 - [ ] Real-model acceptance: export a model key in the environment and run `sh scripts/acceptance.sh`; it
       repeats the README run and the batch / export against the real model (the key goes to the container on
