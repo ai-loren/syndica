@@ -1,0 +1,52 @@
+name: Feature request
+description: Propose a capability or a change to Syndica.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start from the problem you are trying to solve; a good problem statement is more useful than a finished design.
+        Many capabilities fit as a Runtime Module or a backend without changing the kernel.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you are trying to do, and where Syndica gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What you would like Syndica to do.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Kernel (Python API)
+        - Runtime Modules and extension points
+        - CLI
+        - Web UI and local server
+        - Interop (MCP, ACP, A2A, OpenAI-compatible HTTP)
+        - Artifacts and acceptance
+        - Long-horizon control
+        - Training export
+        - Packaging and documentation
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Workarounds you use today, or other designs you considered.
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Public surface
+      description: |
+        Would this add, change or remove anything public (Python names, Flag keys, `.syndica.yaml` fields, HTTP API, CLI options)?
+        Removals and changes follow the [versioning policy](https://github.com/ai-loren/syndica/blob/main/docs/user/versioning.md).

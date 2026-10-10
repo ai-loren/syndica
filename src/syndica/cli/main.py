@@ -327,6 +327,12 @@ _EXHAUSTION_HELP = (
 def _parser() -> _ArgumentParser:
     parser = _ArgumentParser(prog='syndica')
     parser.add_argument('--config', default='.syndica.yaml')
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'syndica {__version__}',
+        help='打印版本号后退出（与 syndica version 相同）',
+    )
     commands = parser.add_subparsers(dest='command', required=True)
     run = commands.add_parser('run')
     run.add_argument('prompt', nargs='+')
@@ -731,7 +737,7 @@ def _route(
     training: TrainingControl | None = None,
 ) -> int:
     first = _first_positional(received)
-    if first is not None and first.startswith('-') and first not in {'-h', '--help'}:
+    if first is not None and first.startswith('-') and first not in {'-h', '--help', '--version'}:
         _write(
             streams.stderr,
             '期望: 首个位置参数是命令名或隐式 run 的 prompt\n'

@@ -142,9 +142,36 @@ print(json.dumps({'code': code, 'loaded': loaded}))
 
     assert completed.returncode == 0
     lines = completed.stdout.splitlines()
-    assert lines[0] == 'syndica 0.0.0'
+    assert lines[0] == f'syndica {_pyproject_version()}'
     assert json.loads(lines[1]) == {'code': 0, 'loaded': []}
     assert completed.stderr == ''
+
+
+def _pyproject_version() -> str:
+    pyproject = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8'))
+    return pyproject['project']['version']
+
+
+@pytest.mark.parametrize('argv', [['--version'], ['--config', 'other.yaml', '--version']])
+def test_version_flag_prints_the_same_line_as_the_version_command(argv: list[str]) -> None:
+    flag_out, flag_err = StringIO(), StringIO()
+    command_out = StringIO()
+
+    flag_code = main(argv, host=_Host(), io=CliIO(StringIO(), flag_out, flag_err))
+    command_code = main(['version'], host=_Host(), io=CliIO(StringIO(), command_out, StringIO()))
+
+    assert (flag_code, command_code) == (0, 0)
+    assert flag_out.getvalue() == command_out.getvalue() == f'syndica {_pyproject_version()}\n'
+    assert flag_err.getvalue() == ''
+
+
+def test_top_level_help_lists_the_version_flag() -> None:
+    stdout = StringIO()
+
+    code = main(['--help'], host=_Host(), io=CliIO(StringIO(), stdout, StringIO()))
+
+    assert code == 0
+    assert '--version' in stdout.getvalue()
 
 
 def test_cli_escapes_exactly_the_characters_the_kernel_refuses_to_show() -> None:

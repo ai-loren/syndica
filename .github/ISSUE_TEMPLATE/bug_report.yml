@@ -1,0 +1,82 @@
+name: Bug report
+description: Something in Syndica does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security problems do not go here.** Report them privately: Security tab → Report a vulnerability
+        (see [SECURITY.md](https://github.com/ai-loren/syndica/blob/main/SECURITY.md)).
+
+        Remove secrets (API keys, tokens, passwords in URLs) from everything you paste below.
+  - type: input
+    id: version
+    attributes:
+      label: Syndica version
+      description: The output of `syndica --version`.
+      placeholder: syndica 1.0.0rc1
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: Native Windows is not supported; use WSL2.
+      options:
+        - Linux
+        - macOS
+        - Windows (WSL2)
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: The output of `python --version` in the environment Syndica is installed in.
+      placeholder: Python 3.11.9
+    validations:
+      required: true
+  - type: input
+    id: install
+    attributes:
+      label: How Syndica is installed
+      description: The installer and the extras, for example `pip install 'syndica[server,mcp]'` or a source checkout with `uv sync --all-extras`.
+    validations:
+      required: true
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+      description: What you did and what Syndica did.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The smallest `.syndica.yaml`, command and prompt that show the problem. If a model is involved,
+        say which one; a `syndica trace replay` of the run is the most useful reproduction.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The complete error, including its expected / received / next-step lines (期望 / 实际 / 下一步).
+      render: text
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed secrets from everything above.
+          required: true
+        - label: I searched the existing issues for this problem.
+          required: true

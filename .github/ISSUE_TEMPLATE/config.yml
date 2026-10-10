@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ai-loren/syndica/security/advisories/new
+    about: Report privately to the maintainers. Do not open a public issue for security problems.
+  - name: Documentation
+    url: https://github.com/ai-loren/syndica/tree/main/docs/user
+    about: Guides, concepts, the API reference and the versioning policy.

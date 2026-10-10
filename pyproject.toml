@@ -1,12 +1,54 @@
 [project]
 name = "syndica"
-version = "0.0.0"
+# 版本号只写在这里：`syndica.__version__` 与 `syndica --version` 从装好的发行版元数据读它。
+version = "1.0.0rc1"
 description = "A multi-agent harness for verifiable knowledge work"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Loren Zhang" }]
+keywords = [
+    "agents",
+    "multi-agent",
+    "llm",
+    "agent-harness",
+    "knowledge-work",
+    "asyncio",
+    "mcp",
+    "acp",
+    "a2a",
+    "training-data",
+]
+# 只声明 Linux 与 macOS：进程组、setsid、伪终端没有 Windows 分支，Windows 用户走 WSL2。
+# 许可证由 `license` 的 SPDX 表达式给出，不再加 License :: 分类（PEP 639 下两者并存会被拒）。
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
 dependencies = ["pydantic>=2.0", "PyYAML>=6.0"]
+
+# 文档站上线之前，Documentation 指向仓库里的英文用户文档目录；站点地址定下来后换成它。
+[project.urls]
+Homepage = "https://github.com/ai-loren/syndica"
+Repository = "https://github.com/ai-loren/syndica"
+Issues = "https://github.com/ai-loren/syndica/issues"
+Changelog = "https://github.com/ai-loren/syndica/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/ai-loren/syndica/tree/main/docs/user"
 
 [project.scripts]
 syndica = "syndica.__main__:entrypoint"
@@ -39,6 +81,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/syndica"]
+
+# sdist 只装重建 wheel 要的东西（`uv build` 的 wheel 就是从 sdist 构建的）。测试不进：套件读 docs/、
+# scripts/、web/、examples/ 与 .github/，只带 tests/ 得到的是一套跑不通的用例；要跑测试用打了标签的
+# 仓库归档。前端源码不进：wheel 里是 src/syndica/server/static 下已提交的构建产物。
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "README.md", "LICENSE", "CHANGELOG.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
