@@ -85,8 +85,17 @@ distribution, `syndica`, with optional extras `openai`, `server`, `otel`, `mcp`,
 
 ### Breaking changes before 1.0
 
-Public names withdrawn before the 1.0 freeze are listed here, with what to use instead. Nothing has
-been listed yet.
+Public names withdrawn before the 1.0 freeze are listed here, with what to use instead.
+
+- `syndica.kernel.provenance_of` and `syndica.kernel.strictest_trust` are no longer exported: no
+  public signature takes or returns what they compute. They are internal helpers in
+  `syndica.kernel.context` and may change without notice.
+- The public import surface is now exactly the modules listed in the
+  [API reference](docs/user/reference/api.md): `syndica`, `syndica.kernel`, `syndica.kernel.contracts`,
+  `syndica.runner`, and the `llm_openai`, `llm_router`, `otel_otlp` and `trl` backends. The kernel's
+  subpackages, `syndica.cli`, `syndica.server` and the MCP / ACP / A2A backends are internal; import
+  public names from `syndica.kernel`, use the CLI and the HTTP API as the contracts for the surfaces,
+  and configure interop through `.syndica.yaml`.
 
 ### Known limitations
 
