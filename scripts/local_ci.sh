@@ -81,7 +81,7 @@ short=$(echo "$sha" | cut -c1-12)
 out="${LOCAL_CI_OUT:-$HOME/.cache/syndica-local-ci}/$short"
 host_uv=$(uv --version 2>/dev/null | awk '{ print $2 }')
 if [ "$host_uv" != "$UV_VERSION" ]; then
-  echo "注意: 本机 uv 是 ${host_uv:-没装}，CI 钉的是 $UV_VERSION；本机各格用本机的 uv，结论可能与 CI 不同。" >&2
+  echo "注意: 本机 uv 是 ${host_uv:-没装}，CI 钉的是 ${UV_VERSION}；本机各格用本机的 uv，结论可能与 CI 不同。" >&2
 fi
 
 if [ -d "$out" ]; then
@@ -92,7 +92,7 @@ mkdir -p "$out/export" "$out/harness" "$out/results"
 git -C "$repo" archive "$sha" | tar -x -C "$out/export" ||
   fail_usage "能把 $short 导出到 $out/export" 'git archive 或 tar 失败' '确认磁盘空间与目录权限'
 cp "$here/local_ci_cell.sh" "$out/harness/"
-echo "提交 $short，输出在 $out"
+echo "提交 ${short}，输出在 $out"
 
 duration() {
   printf '%dm%02ds' $(($1 / 60)) $(($1 % 60))
@@ -213,7 +213,7 @@ lane_linux() {
   done
 }
 
-started=$(date +%s)
+run_started=$(date +%s)
 if [ "$jobs" = 2 ]; then
   lane_host &
   lane_linux &
@@ -224,7 +224,7 @@ else
 fi
 
 echo
-echo "== 提交 $short，共 $(duration $(($(date +%s) - started)))"
+echo "== 提交 ${short}，共 $(duration $(($(date +%s) - run_started)))"
 status=0
 for cell in $cells; do
   if [ -f "$out/results/$cell" ]; then
