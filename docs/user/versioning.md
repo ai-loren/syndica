@@ -17,8 +17,8 @@ Names withdrawn between a release candidate and the final release are listed in 
 
 ## What is public
 
-The authoritative list of public Python names is the API reference, `docs/user/reference/api.md`,
-which is generated from a reviewed snapshot. The public surface is:
+The authoritative list of public Python names is the [API reference](reference/api.md), which is
+generated from a reviewed snapshot. The public surface is:
 
 1. **Python names** exported in the `__all__` of the modules the API reference lists: their call
    signatures (parameter names, kinds and defaults), the public members of exported classes, and

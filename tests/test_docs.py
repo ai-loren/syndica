@@ -60,12 +60,6 @@ DOCS_ROOT = REPO_ROOT / 'docs' / 'user'
 PAGES = (REPO_ROOT / 'README.md', *sorted(DOCS_ROOT.rglob('*.md')))
 REPO_URL = 'https://github.com/ai-loren/syndica'
 FAKE_OPENAI = REPO_ROOT / 'tests' / 'e2e' / 'fake_openai.py'
-
-# M12 的另外两条线写这几个文件：导航先列上（mkdocs.yml 为此把 nav.not_found 降成 info），站内正文
-# 不链它们。根目录的 SECURITY.md 同理，页面经 GitHub 的绝对链接引用它。文件进了仓库之后照常核对。
-OTHER_LINES_PAGES = frozenset({'reference/errors.md', 'reference/api.md', 'versioning.md'})
-OTHER_LINES_FILES = frozenset({'SECURITY.md'})
-
 SHELL = frozenset({'bash', 'sh', 'shell', 'console'})
 TESTED = SHELL | {'yaml', 'yml', 'python', 'py', 'json', 'jsonl', 'toml'}
 _FENCE_OPEN = re.compile(r'^(?P<indent>[ \t]*)(?P<fence>`{3,}|~{3,})(?P<info>[^`]*)$')
@@ -617,8 +611,6 @@ def _check_repository_url(where: str, url: str) -> None:
     if match is None:
         return
     relative = match.group(1).rstrip('/')
-    if relative in OTHER_LINES_FILES and not (REPO_ROOT / relative).exists():
-        return
     assert (REPO_ROOT / relative).exists(), (
         f'期望: {where} 链到本仓 main 上的 {relative}，它在仓库里。实际: 没有这个路径。'
         ' 下一步: 改成存在的路径。'
@@ -645,7 +637,7 @@ def test_every_page_is_in_the_navigation_and_every_entry_exists() -> None:
     assert len(listed) == len(set(listed))
     present = {page.relative_to(DOCS_ROOT).as_posix() for page in DOCS_ROOT.rglob('*.md')}
     assert present - set(listed) == set(), '期望: docs/user 下每一页都在 mkdocs.yml 的 nav 里。'
-    missing = set(listed) - present - OTHER_LINES_PAGES
+    missing = set(listed) - present
     assert missing == set(), f'期望: nav 的每一项都存在。实际: 没有 {sorted(missing)}。'
 
 

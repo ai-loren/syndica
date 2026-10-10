@@ -47,6 +47,7 @@ release.
 
 *class* — Registry of agent manifests (declarative and class-based) with queryable same-name overrides; `freeze` turns it into agent factories.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 AgentCatalog() -> None
 ```
@@ -68,6 +69,7 @@ Members:
 
 *type alias* — Callable that builds one `BaseAgent` from a `HooksCenter` and an `EventBus`; what `Runtime.spawn` takes.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 AgentFactory = Callable[[HooksCenter, EventBus], BaseAgent]
 ```
@@ -76,8 +78,9 @@ AgentFactory = Callable[[HooksCenter, EventBus], BaseAgent]
 
 *dataclass* — Serializable registry entry for one agent: id, name, `agent_type`, status, parent, children, session, lease, flags and metadata.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-AgentInfo(agent_id: str, name: str, agent_type: str, status: AgentStatus = AgentStatus.IDLE, parent_id: str | None = None, children: list[str] = <_HAS_DEFAULT_FACTORY_CLASS>, session_id: str | None = None, metadata: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, owner: str | None = None, heartbeat_at: float | None = None, created_at: float = <_HAS_DEFAULT_FACTORY_CLASS>, flags: dict[str, bool | int | str] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None
+AgentInfo(agent_id: str, name: str, agent_type: str, status: AgentStatus = AgentStatus.IDLE, parent_id: str | None = None, children: list[str] = <factory>, session_id: str | None = None, metadata: dict[str, Any] = <factory>, owner: str | None = None, heartbeat_at: float | None = None, created_at: float = <factory>, flags: dict[str, bool | int | str] = <factory>) -> None
 ```
 
 Fields: `agent_id: str`, `name: str`, `agent_type: str`, `status: AgentStatus`, `parent_id: str | None`, `children: list[str]`, `session_id: str | None`, `metadata: dict[str, Any]`, `owner: str | None`, `heartbeat_at: float | None`, `created_at: float`, `flags: dict[str, bool | int | str]`.
@@ -86,6 +89,7 @@ Fields: `agent_id: str`, `name: str`, `agent_type: str`, `status: AgentStatus`, 
 
 *dataclass* — One declarative (or class-based) agent manifest; field order is part of the API and new fields are only appended.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 AgentManifest(name: str, description: str, system_prompt: str = '', tools: tuple[str, ...] = (), subagents: tuple[str, ...] = (), model: str = 'default', extends: str | None = None, skills: tuple[str, ...] = (), budget: Mapping[str, int | None] | None = None, artifact_kinds: tuple[str, ...] = (), impl: type[BaseAgent] | str | None = None, source: ManifestSource = ManifestSource(kind='mapping', location='<mapping>', origin=None)) -> None
 ```
@@ -96,8 +100,9 @@ Fields: `name: str`, `description: str`, `system_prompt: str`, `tools: tuple[str
 
 *dataclass* — Static configuration of one agent: name, LLM, tools, system prompt, turn limit, danger judge and policy, tool concurrency.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-AgentOptions(name: str, llm: LLM, tools: dict[str, Tool] = <_HAS_DEFAULT_FACTORY_CLASS>, system_prompt: str = '', max_turns: int | None = 50, danger_judge: DangerJudge | None = None, danger_policy: DangerPolicy | None = None, max_tool_concurrency: int = 4) -> None
+AgentOptions(name: str, llm: LLM, tools: dict[str, Tool] = <factory>, system_prompt: str = '', max_turns: int | None = 50, danger_judge: DangerJudge | None = None, danger_policy: DangerPolicy | None = None, max_tool_concurrency: int = 4) -> None
 ```
 
 Fields: `name: str`, `llm: LLM`, `tools: dict[str, Tool]`, `system_prompt: str`, `max_turns: int | None`, `danger_judge: DangerJudge | None`, `danger_policy: DangerPolicy | None`, `max_tool_concurrency: int`.
@@ -120,8 +125,9 @@ Members:
 
 *dataclass* — One slot of a topology: which role fills it, how many instances, boot and exit behaviour, extra tools, budget and isolation.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-AgentSlot(name: str, agent: str, is_root: bool = False, cardinality: str = 'on-demand', key_field: str | None = None, boot: str = 'lazy', exit_mode: ExitMode = ExitMode.ZOMBIE, extra_tools: tuple[str, ...] = (), budget: Mapping[str, int | None] | None = None, metadata: Mapping[str, object] = <_HAS_DEFAULT_FACTORY_CLASS>, isolation: str = 'shared') -> None
+AgentSlot(name: str, agent: str, is_root: bool = False, cardinality: str = 'on-demand', key_field: str | None = None, boot: str = 'lazy', exit_mode: ExitMode = ExitMode.ZOMBIE, extra_tools: tuple[str, ...] = (), budget: Mapping[str, int | None] | None = None, metadata: Mapping[str, object] = <factory>, isolation: str = 'shared') -> None
 ```
 
 Fields: `name: str`, `agent: str`, `is_root: bool`, `cardinality: str`, `key_field: str | None`, `boot: str`, `exit_mode: ExitMode`, `extra_tools: tuple[str, ...]`, `budget: Mapping[str, int | None] | None`, `metadata: Mapping[str, object]`, `isolation: str`.
@@ -144,6 +150,7 @@ Members:
 
 *dataclass* — One link of a re-openable reference chain (user message, file or artifact location plus the quoted text).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Anchor(source: AnchorSource, locator: str, quote: str = '') -> None
 ```
@@ -179,6 +186,7 @@ Members:
 
 *dataclass* — Reference to one version of an artifact: id, path, version, kind, mime and whether it is a deliverable.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ArtifactRef(id: str, path: str, kind: str, mime: str, version: str, producer: str, is_deliverable: bool = False) -> None
 ```
@@ -189,6 +197,7 @@ Fields: `id: str`, `path: str`, `kind: str`, `mime: str`, `version: str`, `produ
 
 *class* — Tool that asks a human for free-form input and waits for the answer.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 AskUser(runtime: _HumanRuntime, agent_id: str) -> None
 ```
@@ -206,6 +215,7 @@ Members:
 
 *class* — Tool that asks a human to choose one of several options and waits for the answer.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 AskUserQuestion(runtime: _HumanRuntime, agent_id: str) -> None
 ```
@@ -223,6 +233,7 @@ Members:
 
 *type alias* — Type of a trace span attribute value.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 AttributeValue = str | int | bool | list[str] | None
 ```
@@ -231,6 +242,7 @@ AttributeValue = str | int | bool | list[str] | None
 
 *class* — The turn loop of one agent: calls the LLM, runs tools through the executor and fires the hook junctions.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 BaseAgent(options: AgentOptions, *, hooks: HooksCenter, events: EventBus) -> None
 ```
@@ -269,6 +281,7 @@ Members:
 
 *dataclass* — Four-dimensional budget (tokens, cost, wall clock, turns); `None` means unlimited in that dimension.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Budget(tokens: int | None = None, cost: Decimal | None = None, wall_clock_s: float | None = None, turns: int | None = None) -> None
 ```
@@ -283,6 +296,7 @@ Members:
 
 *dataclass* — What a strategy wants when budget runs low: continue (optionally with advice) or wrap up next turn.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 BudgetAction(move: BudgetMove, message: str = '') -> None
 ```
@@ -299,8 +313,9 @@ Members: `CONTINUE` = `"continue"`, `WRAP_UP` = `"wrap_up"`.
 
 *dataclass* — Budget settings of a `Runtime`: the root budget, prices, and what to do when it runs out.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-BudgetPolicy(root: Budget = <_HAS_DEFAULT_FACTORY_CLASS>, on_exhausted: Exhaustion = Exhaustion.GRACEFUL_WRAPUP, prices: PriceTable | None = None, ask_human: AskHuman | None = None, ask_timeout_s: float = 300.0) -> None
+BudgetPolicy(root: Budget = <factory>, on_exhausted: Exhaustion = Exhaustion.GRACEFUL_WRAPUP, prices: PriceTable | None = None, ask_human: AskHuman | None = None, ask_timeout_s: float = 300.0) -> None
 ```
 
 Fields: `root: Budget`, `on_exhausted: Exhaustion`, `prices: PriceTable | None`, `ask_human: AskHuman | None`, `ask_timeout_s: float`.
@@ -309,6 +324,7 @@ Fields: `root: Budget`, `on_exhausted: Exhaustion`, `prices: PriceTable | None`,
 
 *dataclass* — Read-only view of one agent's budget node: limit, used (including descendants), remaining and exhausted dimensions.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 BudgetView(limit: Budget, used: Usage, remaining: Budget, exhausted: tuple[str, ...] = ()) -> None
 ```
@@ -327,8 +343,9 @@ Members:
 
 *dataclass* — Causal link between two trace spans (spawn, message and other `EdgeKind`s).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-CausalityEdge(kind: EdgeKind, source_span_id: str, target_span_id: str, attributes: dict[str, AttributeValue] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None
+CausalityEdge(kind: EdgeKind, source_span_id: str, target_span_id: str, attributes: dict[str, AttributeValue] = <factory>) -> None
 ```
 
 Fields: `kind: EdgeKind`, `source_span_id: str`, `target_span_id: str`, `attributes: dict[str, AttributeValue]`.
@@ -337,6 +354,7 @@ Fields: `kind: EdgeKind`, `source_span_id: str`, `target_span_id: str`, `attribu
 
 *exception* — Raised when a value the caller supplied is invalid: configuration, a declaration, or an argument to a public API. Fix the value and call again.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ConfigError(*, expected: str, received: str, next_action: str) -> None
 ```
@@ -349,6 +367,7 @@ Members:
 
 *dataclass* — Waiter for a human's confirmation of one tool call.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Confirmation(timeout: float, tool_call_id: str) -> None
 ```
@@ -373,6 +392,7 @@ Members: `ABORTED` = `"aborted"`, `APPROVED` = `"approved"`, `PREEMPTED` = `"pre
 
 *dataclass* — Immutable snapshot of one request for human confirmation of a tool call.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ConfirmationRequest(request_id: str, agent_id: str, tool_call_id: str, tool_name: str, arguments: str, verdict: DangerVerdict, request_ref: tuple[str | int, ...] | None = None, untrusted: bool = False) -> None
 ```
@@ -383,6 +403,7 @@ Fields: `request_id: str`, `agent_id: str`, `tool_call_id: str`, `tool_name: str
 
 *class* — An agent's conversation state: the current trajectory of `ContextBlock`s plus stop reason and bookkeeping.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Context() -> None
 ```
@@ -396,8 +417,9 @@ Members:
 
 *dataclass* — One block of a trajectory (system, user, assistant or tool) with its trust level.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-ContextBlock(role: Role, content: str | list[Any] | None = None, tool_calls: list[ToolCall] = <_HAS_DEFAULT_FACTORY_CLASS>, tool_call_id: str | None = None, artifacts: list[ArtifactRef] = <_HAS_DEFAULT_FACTORY_CLASS>, trust: TrustLevel = TrustLevel.TRUSTED, extra: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None
+ContextBlock(role: Role, content: str | list[Any] | None = None, tool_calls: list[ToolCall] = <factory>, tool_call_id: str | None = None, artifacts: list[ArtifactRef] = <factory>, trust: TrustLevel = TrustLevel.TRUSTED, extra: dict[str, Any] = <factory>) -> None
 ```
 
 Fields: `role: Role`, `content: str | list[Any] | None`, `tool_calls: list[ToolCall]`, `tool_call_id: str | None`, `artifacts: list[ArtifactRef]`, `trust: TrustLevel`, `extra: dict[str, Any]`.
@@ -406,6 +428,7 @@ Fields: `role: Role`, `content: str | list[Any] | None`, `tool_calls: list[ToolC
 
 *exception* — Raised by an LLM when a request exceeds the context window; triggers the `context_overflow` junction.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ContextOverflowError(*, expected: str, received: str, next_action: str) -> None
 ```
@@ -418,6 +441,7 @@ Members:
 
 *exception* — Raised when a documented protocol or caller contract is broken: the value is fine but the call is not allowed now, or an implementation broke a protocol's promise.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ContractViolation(*, expected: str, received: str, next_action: str) -> None
 ```
@@ -434,6 +458,7 @@ Members:
 
 *class* — Pure, stateless judge that matches a tool call against a rule table and returns a `DangerVerdict`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 DangerJudge(rules: object = None) -> None
 ```
@@ -455,6 +480,7 @@ Members:
 
 *dataclass* — What a `DangerPolicy` receives for one call: the verdict, the call and its provenance.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 DangerRequest(verdict: DangerVerdict, call: ToolCall, provenance: TrustLevel | None) -> None
 ```
@@ -465,6 +491,7 @@ Fields: `verdict: DangerVerdict`, `call: ToolCall`, `provenance: TrustLevel | No
 
 *dataclass* — One danger rule; `matches` is a pure function of the command text.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 DangerRule(rule_id: str, level: RiskLevel, reason: str, matches: Callable[[str], bool], params: tuple[tuple[str, str], ...] = ()) -> None
 ```
@@ -475,6 +502,7 @@ Fields: `rule_id: str`, `level: RiskLevel`, `reason: str`, `matches: Callable[[s
 
 *dataclass* — Result of judging one call: rule id, risk level and reason.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 DangerVerdict(rule_id: str, level: RiskLevel, reason: str) -> None
 ```
@@ -485,6 +513,7 @@ Fields: `rule_id: str`, `level: RiskLevel`, `reason: str`.
 
 *dataclass* — Structured outcome of `Runtime.send`; delivery failures are returned, not raised.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 DeliveryResult(ok: bool, message_id: str | None = None, reason: str | None = None) -> None
 ```
@@ -495,6 +524,7 @@ Fields: `ok: bool`, `message_id: str | None`, `reason: str | None`.
 
 *dataclass* — Semantic difference between two artifact versions, with a human-readable summary.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Diff(summary: str, changed: bool = True) -> None
 ```
@@ -511,6 +541,7 @@ Members: `ALLOW` = `"allow"`, `BLOCK` = `"block"`, `CONFIRM` = `"confirm"`.
 
 *dataclass* — What a strategy wants after goal drift is confirmed: continue, or have the original goal re-injected.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 DriftAction(move: DriftMove, message: str = '') -> None
 ```
@@ -527,6 +558,7 @@ Members: `CONTINUE` = `"continue"`, `REMIND` = `"remind"`.
 
 *dataclass* — Result of the latest goal-drift check over a window of turns.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 DriftReport(window_turns: int, anchored: bool, confirmed: bool | None = None, reason: str = '') -> None
 ```
@@ -543,8 +575,9 @@ Members: `ARTIFACT` = `"artifact"`, `MESSAGE` = `"message"`, `SPAWN` = `"spawn"`
 
 *dataclass* — One record published on the `EventBus`: kind, agent id, payload and sequence.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-Event(kind: str, agent_id: str, payload: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, sequence: int = 0, time_ns: int = 0) -> None
+Event(kind: str, agent_id: str, payload: dict[str, Any] = <factory>, sequence: int = 0, time_ns: int = 0) -> None
 ```
 
 Fields: `kind: str`, `agent_id: str`, `payload: dict[str, Any]`, `sequence: int`, `time_ns: int`.
@@ -553,6 +586,7 @@ Fields: `kind: str`, `agent_id: str`, `payload: dict[str, Any]`, `sequence: int`
 
 *class* — In-process event bus with a bounded buffer per subscriber.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 EventBus(*, capacity: object = 1024) -> None
 ```
@@ -568,6 +602,7 @@ Members:
 
 *dataclass* — Result of one command run through a `Portal`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ExecResult(exit_code: int | None, stdout: str, stderr: str, truncated: bool, running: bool, timed_out: bool = False, stdout_end: int = 0, stderr_end: int = 0) -> None
 ```
@@ -590,6 +625,7 @@ Members: `EXIT` = `"exit"`, `IDLE` = `"idle"`, `ZOMBIE` = `"zombie"`.
 
 *class* — Handle of a Module-owned extension junction (`<module>:<event>`), declared in the Module manifest.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ExtensionJunction(name: str, kind: JunctionKind) -> None
 ```
@@ -604,6 +640,7 @@ Members:
 
 *dataclass* — Judge, policy, guard and confirmation used by `call_external` for one external call.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ExternalCallPolicy(judge: DangerJudge, policy: DangerPolicy, untrusted_high_risk: Disposition = Disposition.BLOCK, guard: DangerJudge | None = None, confirm: ConfirmationHandler | None = None) -> None
 ```
@@ -614,6 +651,7 @@ Fields: `judge: DangerJudge`, `policy: DangerPolicy`, `untrusted_high_risk: Disp
 
 *class* — `SessionStore` that keeps sessions as files under a directory.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 FileSessionStore(root: str | os.PathLike[str]) -> None
 ```
@@ -635,6 +673,7 @@ Members:
 
 *dataclass* — Version, size and executable bit of one workspace file.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 FileStat(version: str, size: int, executable: bool = False) -> None
 ```
@@ -645,6 +684,7 @@ Fields: `version: str`, `size: int`, `executable: bool`.
 
 *class* — Tracks which workspace files were written from untrusted content, relative to a baseline.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 FileTaint(root: str | Path, *, baseline: bool = True, max_files: int = 20000) -> None
 ```
@@ -661,6 +701,7 @@ Members:
 
 *class* — `TraceStore` that keeps traces as files under a directory.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 FileTraceStore(root: str | os.PathLike[str]) -> None
 ```
@@ -690,6 +731,7 @@ Members:
 
 *dataclass* — One hit of the redactor's commit gate: line number and rule id, never the secret itself.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Finding(line: int, rule_id: str) -> None
 ```
@@ -700,6 +742,7 @@ Fields: `line: int`, `rule_id: str`.
 
 *dataclass* — Declaration of one Flag (key, default, description, choices, bounds) consumed by code, settings UI and docs.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 FlagDeclaration(key: str, default: FlagValue, description: str, choices: tuple[FlagValue, ...] = (), minimum: int | None = None, maximum: int | None = None) -> None
 ```
@@ -710,6 +753,7 @@ Fields: `key: str`, `default: FlagValue`, `description: str`, `choices: tuple[Fl
 
 *dataclass* — One row of the Flag reference: key, owning Module, type, default, choices, bounds and description.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 FlagRow(key: str, module: str, kind: str, default: FlagValue, choices: tuple[FlagValue, ...], minimum: int | None, maximum: int | None, description: str) -> None
 ```
@@ -720,6 +764,7 @@ Fields: `key: str`, `module: str`, `kind: str`, `default: FlagValue`, `choices: 
 
 *type alias* — Type of a Flag value: `bool`, `int` or `str`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 FlagValue = bool | int | str
 ```
@@ -728,6 +773,7 @@ FlagValue = bool | int | str
 
 *dataclass* — The authoritative statement of what the user wants, with anchors back to the user's words and its trust level.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Goal(intent: str, anchors: tuple[Anchor, ...] = (), trust: TrustLevel = TrustLevel.TRUSTED) -> None
 ```
@@ -738,6 +784,7 @@ Fields: `intent: str`, `anchors: tuple[Anchor, ...]`, `trust: TrustLevel`.
 
 *dataclass* — One match of a workspace text search: relative path, line number and line.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 GrepHit(path: str, line: int, text: str) -> None
 ```
@@ -748,6 +795,7 @@ Fields: `path: str`, `line: int`, `text: str`.
 
 *type alias* — Type of a hook callback registered on a junction.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 HookCallback = Callable[..., Awaitable[HookResult | None]]
 ```
@@ -756,8 +804,9 @@ HookCallback = Callable[..., Awaitable[HookResult | None]]
 
 *dataclass* — A hook's opinion on one operation: skip it, replace its result, modify its arguments, add history, or mark it untrusted.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-HookResult(skip: bool = False, modified: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, result: Any = None, history: dict[str, list[Any]] = <_HAS_DEFAULT_FACTORY_CLASS>, untrusted: bool = False) -> None
+HookResult(skip: bool = False, modified: dict[str, Any] = <factory>, result: Any = None, history: dict[str, list[Any]] = <factory>, untrusted: bool = False) -> None
 ```
 
 Fields: `skip: bool`, `modified: dict[str, Any]`, `result: Any`, `history: dict[str, list[Any]]`, `untrusted: bool`.
@@ -771,6 +820,7 @@ Members:
 
 *class* — Dispatch centre for hook junctions; kernel junctions and declared extension junctions.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 HooksCenter(*, outer: HooksCenter | None = None) -> None
 ```
@@ -786,6 +836,7 @@ Members:
 
 *dataclass* — Static facts about the host (OS, platform, shell) that may appear in a system prompt.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 HostFacts(os: str, platform: str, shell: str) -> None
 ```
@@ -796,6 +847,7 @@ Fields: `os: str`, `platform: str`, `shell: str`.
 
 *dataclass* — Runtime Module that installs `AskUser` and `AskUserQuestion` for every agent.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 HumanInteractionModule() -> None
 ```
@@ -815,6 +867,7 @@ Members:
 
 *class* — In-process `AgentRegistry`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 InMemoryAgentRegistry() -> None
 ```
@@ -833,6 +886,7 @@ Members:
 
 *class* — In-process `MessageBroker`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 InMemoryMessageBroker() -> None
 ```
@@ -852,6 +906,7 @@ Members:
 
 *class* — In-process `SessionStore`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 InMemorySessionStore() -> None
 ```
@@ -872,6 +927,7 @@ Members:
 
 *class* — In-process `TraceStore`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 InMemoryTraceStore() -> None
 ```
@@ -908,6 +964,7 @@ Members: `INTERCEPTABLE` = `"interceptable"`, `OBSERVABLE` = `"observable"`.
 
 *type alias* — A kernel `Junction` or the name of an extension junction.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 JunctionRef = Junction | str
 ```
@@ -925,8 +982,9 @@ Members:
 
 *dataclass* — Configuration of one LLM call; provider and model decide the cache key and billing.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-LLMConfig(provider: str, model: str, client_args: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, request_args: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, timeout: float = 600.0, context_window: int | None = None) -> None
+LLMConfig(provider: str, model: str, client_args: dict[str, Any] = <factory>, request_args: dict[str, Any] = <factory>, timeout: float = 600.0, context_window: int | None = None) -> None
 ```
 
 Fields: `provider: str`, `model: str`, `client_args: dict[str, Any]`, `request_args: dict[str, Any]`, `timeout: float`, `context_window: int | None`.
@@ -939,6 +997,7 @@ Members:
 
 *exception* — Raised when an LLM reply cannot be used as a valid result.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 LLMResponseError(*, expected: str, received: str, next_action: str) -> None
 ```
@@ -951,6 +1010,7 @@ Members:
 
 *class* — Isolation for a local workspace: per-agent copies and their three-way merge back.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 LocalIsolator(*, shell: str, env: Mapping[str, str], git: str | None = None, scratch: str | None = None) -> None
 ```
@@ -970,6 +1030,7 @@ Members:
 
 *class* — Local `Workspace`: root, shell and subprocess environment are supplied by the host.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 LocalWorkspace(root: str, *, shell: str, env: Mapping[str, str], private: Iterable[str] = ()) -> None
 ```
@@ -1005,6 +1066,7 @@ Members:
 
 *dataclass* — Read-only snapshot a `LongHorizonStrategy` decides from: goal, rubrics, progress, budget, stalls, drift and the latest verdict.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 LongHorizonContext(agent_id: str, cycle: int, turn: int, goal: Goal | None, rubrics: tuple[Rubric, ...], progress: ProgressSnapshot, budget: BudgetView | None, stalled_turns: int, drift: DriftReport | None = None, verdict: Verdict | None = None) -> None
 ```
@@ -1026,6 +1088,7 @@ Members:
 
 *constant* — Maximum length of the text a `LongHorizonStrategy` action may return; it enters the history.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 MESSAGE_LIMIT = 2000
 ```
@@ -1034,6 +1097,7 @@ MESSAGE_LIMIT = 2000
 
 *class* — `ConfirmationHandler` that publishes a request event and waits for one trusted human reply in the agent's mailbox.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 MailboxConfirmationHandler(*, timeout: float = 300.0) -> None
 ```
@@ -1046,6 +1110,7 @@ Members:
 
 *dataclass* — Where a manifest came from (mapping, file, directory, built-in or class).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ManifestSource(kind: Literal['mapping', 'json_file', 'json_directory', 'yaml_file', 'builtin', 'class'], location: str, origin: str | None = None) -> None
 ```
@@ -1056,6 +1121,7 @@ Fields: `kind: Literal['mapping', 'json_file', 'json_directory', 'yaml_file', 'b
 
 *dataclass* — One file that could not be merged back from an isolated copy.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 MergeConflict(path: str, reason: str, theirs: str | None = None, removed: bool = False) -> None
 ```
@@ -1066,6 +1132,7 @@ Fields: `path: str`, `reason: str`, `theirs: str | None`, `removed: bool`.
 
 *dataclass* — Result of merging an isolated copy back: merged files and conflicts.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 MergeReport(agent_id: str, strategy: str, merged: tuple[str, ...], conflicts: tuple[MergeConflict, ...], note: str = '', kept: str | None = None) -> None
 ```
@@ -1081,8 +1148,9 @@ Members:
 
 *dataclass* — One message between agents or from the host, with trigger, correlation id and trust level.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-Message(sender: str, receiver: str, content: str, trigger: Trigger = Trigger.PENDING, correlation_id: str | None = None, trust: TrustLevel = TrustLevel.TRUSTED, id: str = <_HAS_DEFAULT_FACTORY_CLASS>) -> None
+Message(sender: str, receiver: str, content: str, trigger: Trigger = Trigger.PENDING, correlation_id: str | None = None, trust: TrustLevel = TrustLevel.TRUSTED, id: str = <factory>) -> None
 ```
 
 Fields: `sender: str`, `receiver: str`, `content: str`, `trigger: Trigger`, `correlation_id: str | None`, `trust: TrustLevel`, `id: str`.
@@ -1106,6 +1174,7 @@ Members:
 
 *type alias* — Callback a `MessageBroker` invokes when a message is published to an agent without a mailbox.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 MissingQueueCallback = Callable[[str], Awaitable[bool]]
 ```
@@ -1114,6 +1183,7 @@ MissingQueueCallback = Callable[[str], Awaitable[bool]]
 
 *dataclass* — What the host hands a third-party Module factory: workspace root, the allow-listed environment and the redactor.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ModuleHost(workspace_root: Path, environment: Mapping[str, str], redactor: Redactor) -> None
 ```
@@ -1142,6 +1212,7 @@ Members:
 
 *class* — Built-in class-based role that delegates work to Planner, Explorer and Worker and never edits files itself.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Orchestrator(options: AgentOptions, *, hooks: HooksCenter, events: EventBus) -> None
 ```
@@ -1168,6 +1239,7 @@ Members: `NEEDS_HUMAN` = `"needs_human"`, `SATISFIED` = `"satisfied"`, `UNCONFIR
 
 *dataclass* — Snapshot left behind when a manifest is overridden by name.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 OverrideRecord(name: str, displaced_source: ManifestSource, displaced_at_index: int, by_source: ManifestSource) -> None
 ```
@@ -1178,6 +1250,7 @@ Fields: `name: str`, `displaced_source: ManifestSource`, `displaced_at_index: in
 
 *dataclass* — Reference to a free-text payload stored by a `TraceStore` (sha256 of its UTF-8 bytes).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 PayloadRef(trace_id: str, digest: str) -> None
 ```
@@ -1188,6 +1261,7 @@ Fields: `trace_id: str`, `digest: str`.
 
 *exception* — Raised by a `TraceStore` that cannot accept one payload (too large) while the store itself is healthy.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 PayloadRefused(*, expected: str, received: str, next_action: str) -> None
 ```
@@ -1200,6 +1274,7 @@ Members:
 
 *dataclass* — Scenario-document reference to a payload stored next to the trace.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 PayloadText(digest: str) -> None
 ```
@@ -1248,6 +1323,7 @@ Members:
 
 *dataclass* — Runtime Module that records prefix-cache drift between consecutive requests of each agent.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 PrefixDriftModule(*, token_counter: Callable[[bytes], int] | None = None) -> None
 ```
@@ -1258,6 +1334,7 @@ Fields: `name: str`, `flags: tuple[FlagDeclaration, ...]`, `agent_plugins: tuple
 
 *dataclass* — One recorded prefix drift: which request unit changed and its digests before and after.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 PrefixDriftRecord(agent_id: str, unit: str, before_digest: str | None, after_digest: str | None, lost_bytes: int, estimated_tokens: int, exact: bool) -> None
 ```
@@ -1268,6 +1345,7 @@ Fields: `agent_id: str`, `unit: str`, `before_digest: str | None`, `after_digest
 
 *class* — Runtime service holding each agent's request baseline and its drift records.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 PrefixDriftService(token_counter: Callable[[bytes], int]) -> None
 ```
@@ -1280,6 +1358,7 @@ Members:
 
 *dataclass* — A readable rendering of an artifact version.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Preview(text: str) -> None
 ```
@@ -1298,6 +1377,7 @@ Members:
 
 *dataclass* — Per-million-token prices of one model: input, output and cached input.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Prices(input: Decimal, output: Decimal, cached_input: Decimal) -> None
 ```
@@ -1312,6 +1392,7 @@ Members:
 
 *dataclass* — Latest measured progress: satisfied and mandatory rubric ids, rubrics waiting for a human, and the turn it was measured on.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ProgressSnapshot(satisfied: tuple[str, ...] = (), mandatory: tuple[str, ...] = (), pending_human: tuple[str, ...] = (), measured_turn: int | None = None) -> None
 ```
@@ -1327,6 +1408,7 @@ Members:
 
 *dataclass* — Output read from an agent's terminal session.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 PtyCapture(text: str, end: int, running: bool, exit_code: int | None, truncated: bool) -> None
 ```
@@ -1337,6 +1419,7 @@ Fields: `text: str`, `end: int`, `running: bool`, `exit_code: int | None`, `trun
 
 *dataclass* — State of a terminal session without its output.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 PtyStatus(running: bool, exit_code: int | None, cols: int, rows: int, end: int) -> None
 ```
@@ -1347,6 +1430,7 @@ Fields: `running: bool`, `exit_code: int | None`, `cols: int`, `rows: int`, `end
 
 *class* — Trajectory content whose every leaf has been redacted; produced only by `redacted_content`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 RedactedContent(content: list[ContextBlock], *, _mint: object = None) -> None
 ```
@@ -1359,6 +1443,7 @@ Members:
 
 *class* — A `SessionRecord` whose content has been redacted; produced only by `redacted_record`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 RedactedSessionRecord(record: SessionRecord, *, _mint: object = None) -> None
 ```
@@ -1375,6 +1460,7 @@ Members:
 
 *dataclass* — A user-supplied redaction rule (`custom.*` id and a regular expression).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 RedactionRule(rule_id: str, pattern: str) -> None
 ```
@@ -1394,6 +1480,7 @@ Members:
 
 *dataclass* — Waiter for a reply to one specific request, matched by correlation id.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Reply(timeout: float, correlation_id: str) -> None
 ```
@@ -1404,6 +1491,7 @@ Fields: `timeout: float`, `correlation_id: str`.
 
 *dataclass* — Runtime Module that retries failed LLM calls with backoff and optional fallbacks.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 RetryModule(fallbacks: Mapping[str, LLM], *, sleep: Callable[[float], Awaitable[None]] = <function sleep>) -> None
 ```
@@ -1420,6 +1508,7 @@ Members: `HIGH` = `"high"`, `LOW` = `"low"`, `NONE` = `"none"`.
 
 *type alias* — Role of a context block: system, user, assistant or tool.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Role = Literal['system', 'user', 'assistant', 'tool']
 ```
@@ -1428,6 +1517,7 @@ Role = Literal['system', 'user', 'assistant', 'tool']
 
 *dataclass* — One checkable projection of the `Goal`, anchored back to it; mandatory or optional, checkable or judgment.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Rubric(id: str, statement: str, kind: RubricKind, anchors: tuple[Anchor, ...], mandatory: bool = True, status: RubricStatus = RubricStatus.ACTIVE, trust: TrustLevel = TrustLevel.TRUSTED, origin: RubricOrigin = RubricOrigin.PROJECTED) -> None
 ```
@@ -1450,6 +1540,7 @@ Members: `FEEDBACK` = `"feedback"`, `PROJECTED` = `"projected"`.
 
 *dataclass* — The acceptance outcome for one rubric, with evidence anchors.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 RubricOutcome(rubric_id: str, kind: OutcomeKind, evidence: tuple[Anchor, ...] = ()) -> None
 ```
@@ -1466,6 +1557,7 @@ Members: `ACTIVE` = `"active"`, `PROPOSED` = `"proposed"`.
 
 *class* — The kernel's `Redactor`: built-in rules plus user rules and literal secret values.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 RuleRedactor(*, secrets: Iterable[str] = (), rules: Sequence[RedactionRule] = ()) -> None
 ```
@@ -1481,6 +1573,7 @@ Members:
 
 *class* — Drives agent lifecycles: spawn, kill, pause, resume, abort, send, wait, addressing and topology assembly.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Runtime(*, registry: object = None, broker: object = None, plugins: Sequence[Plugin] | None = None, agents: Mapping[str, AgentFactory] | None = None, orchestration: bool = False, modules: Sequence[RuntimeModule] | None = None, flags: Mapping[str, FlagValue] | None = None, confirmation_handler: ConfirmationHandler | None = None, ids: IdSource | None = None, tracer: Tracer | None = None, untrusted_output_modules: Sequence[str] = (), workspace: WorkspaceRouter | None = None, sessions: SessionStore | None = None, redactor: Redactor | None = None, artifacts: ArtifactStore | None = None, budget: BudgetPolicy | None = None, keep_finished_children: int = 8) -> None
 ```
@@ -1517,6 +1610,7 @@ Members:
 
 *dataclass* — Self-contained Runtime capability with Flags: plugins, tools, services, lifecycle hooks, junctions and artifact handlers, plus a manifest for review.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 RuntimeModule(name: str, *, flags: Sequence[FlagDeclaration] = (), agent_plugins: Sequence[AgentPluginFactory] = (), services: Mapping[str, RuntimeServiceFactory] | None = None, tool_factories: Sequence[AgentToolFactory] = (), on_start: RuntimeStartHook | None = None, on_shutdown: RuntimeShutdownHook | None = None, version: str = '0.0.0', description: str = '', capabilities: Sequence[str] | None = None, requires: Sequence[str] = (), junctions: Sequence[ExtensionJunction] = (), replay_safe: bool = False, security_notes: str = '', artifact_handlers: Sequence[ArtifactHandler] = ()) -> None
 ```
@@ -1527,6 +1621,7 @@ Fields: `name: str`, `flags: tuple[FlagDeclaration, ...]`, `agent_plugins: tuple
 
 *dataclass* — Built-in Module declaring the wait wall-clock limit and the handling of untrusted high-risk calls.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 SafetyModule() -> None
 ```
@@ -1537,6 +1632,7 @@ Fields: `name: str`, `flags: tuple[FlagDeclaration, ...]`, `agent_plugins: tuple
 
 *dataclass* — Validated, immutable scenario document (a captured or hand-written run that can be replayed).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioDocument(version: int, name: str, roles: Mapping[str, ScenarioRole], topology: Topology | None, entry: ScenarioEntry, responses: tuple[ScenarioResponse, ...], expect: ScenarioExpectation, source: str, host: HostProfile | None = None, host_actions: tuple[HostAction, ...] = (), ids: tuple[tuple[tuple[str | int, ...], str], ...] = (), origin: ScenarioSource | None = None) -> None
 ```
@@ -1547,6 +1643,7 @@ Fields: `version: int`, `name: str`, `roles: Mapping[str, ScenarioRole]`, `topol
 
 *class* — LLM test double that replays scripted turns in order.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScriptedLLM(script: list[ScriptedTurn], config: LLMConfig | None = None) -> None
 ```
@@ -1561,8 +1658,9 @@ Members:
 
 *dataclass* — One scripted reply of a `ScriptedLLM`: content, tool calls or an exception to raise.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-ScriptedTurn(content: str | None = None, tool_calls: list[ToolCall] = <_HAS_DEFAULT_FACTORY_CLASS>, raises: BaseException | None = None) -> None
+ScriptedTurn(content: str | None = None, tool_calls: list[ToolCall] = <factory>, raises: BaseException | None = None) -> None
 ```
 
 Fields: `content: str | None`, `tool_calls: list[ToolCall]`, `raises: BaseException | None`.
@@ -1571,6 +1669,7 @@ Fields: `content: str | None`, `tool_calls: list[ToolCall]`, `raises: BaseExcept
 
 *dataclass* — Additive budget limits and usage stored with a session.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 SessionBudget(tokens: int | None, cost: Decimal | None, turns: int | None, used: Usage) -> None
 ```
@@ -1581,8 +1680,9 @@ Fields: `tokens: int | None`, `cost: Decimal | None`, `turns: int | None`, `used
 
 *dataclass* — Session metadata readable without loading its content.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-SessionMeta(sid: str, title: str = '', agent: str = '', workspace: str | None = None, status: SessionStatus = SessionStatus.ACTIVE, turns: int = 0, archived: int = 0, last_trace: str | None = None, created_at: float = <_HAS_DEFAULT_FACTORY_CLASS>, updated_at: float = <_HAS_DEFAULT_FACTORY_CLASS>) -> None
+SessionMeta(sid: str, title: str = '', agent: str = '', workspace: str | None = None, status: SessionStatus = SessionStatus.ACTIVE, turns: int = 0, archived: int = 0, last_trace: str | None = None, created_at: float = <factory>, updated_at: float = <factory>) -> None
 ```
 
 Fields: `sid: str`, `title: str`, `agent: str`, `workspace: str | None`, `status: SessionStatus`, `turns: int`, `archived: int`, `last_trace: str | None`, `created_at: float`, `updated_at: float`.
@@ -1591,8 +1691,9 @@ Fields: `sid: str`, `title: str`, `agent: str`, `workspace: str | None`, `status
 
 *dataclass* — All serializable state of one session: metadata, the root agent's trajectory, prefix snapshot and flags.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-SessionRecord(meta: SessionMeta, content: list[ContextBlock] = <_HAS_DEFAULT_FACTORY_CLASS>, system_prompt: str = '', model: str = '', tools: list[str] = <_HAS_DEFAULT_FACTORY_CLASS>, flags: dict[str, bool | int | str] = <_HAS_DEFAULT_FACTORY_CLASS>, budget: SessionBudget | None = None) -> None
+SessionRecord(meta: SessionMeta, content: list[ContextBlock] = <factory>, system_prompt: str = '', model: str = '', tools: list[str] = <factory>, flags: dict[str, bool | int | str] = <factory>, budget: SessionBudget | None = None) -> None
 ```
 
 Fields: `meta: SessionMeta`, `content: list[ContextBlock]`, `system_prompt: str`, `model: str`, `tools: list[str]`, `flags: dict[str, bool | int | str]`, `budget: SessionBudget | None`.
@@ -1623,8 +1724,9 @@ Members:
 
 *dataclass* — One unit of traced work with start, end, attributes and status.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-Span(span_id: str, parent_span_id: str | None, kind: SpanKind, name: str, agent_id: str, start_ns: int, end_ns: int, status: SpanStatus, attributes: dict[str, AttributeValue] = <_HAS_DEFAULT_FACTORY_CLASS>, events: tuple[SpanEvent, ...] = ()) -> None
+Span(span_id: str, parent_span_id: str | None, kind: SpanKind, name: str, agent_id: str, start_ns: int, end_ns: int, status: SpanStatus, attributes: dict[str, AttributeValue] = <factory>, events: tuple[SpanEvent, ...] = ()) -> None
 ```
 
 Fields: `span_id: str`, `parent_span_id: str | None`, `kind: SpanKind`, `name: str`, `agent_id: str`, `start_ns: int`, `end_ns: int`, `status: SpanStatus`, `attributes: dict[str, AttributeValue]`, `events: tuple[SpanEvent, ...]`.
@@ -1633,8 +1735,9 @@ Fields: `span_id: str`, `parent_span_id: str | None`, `kind: SpanKind`, `name: s
 
 *dataclass* — A point in time recorded on a span.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-SpanEvent(name: str, time_ns: int, attributes: dict[str, AttributeValue] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None
+SpanEvent(name: str, time_ns: int, attributes: dict[str, AttributeValue] = <factory>) -> None
 ```
 
 Fields: `name: str`, `time_ns: int`, `attributes: dict[str, AttributeValue]`.
@@ -1655,6 +1758,7 @@ Members: `CANCELLED` = `"cancelled"`, `ERROR` = `"error"`, `OK` = `"ok"`.
 
 *type alias* — Type of the stable key an `IdSource` derives ids from.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 StableKey = tuple[str | int, ...]
 ```
@@ -1663,6 +1767,7 @@ StableKey = tuple[str | int, ...]
 
 *dataclass* — What a strategy wants when progress stalls: continue, or nudge the agent with a message.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 StallAction(move: StallMove, message: str = '') -> None
 ```
@@ -1679,6 +1784,7 @@ Members: `CONTINUE` = `"continue"`, `NUDGE` = `"nudge"`.
 
 *class* — `PriceTable` looked up by model name, optionally falling back to another table.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 StaticPrices(prices: Mapping[str, Prices], *, fallback: PriceTable | None = None) -> None
 ```
@@ -1691,6 +1797,7 @@ Members:
 
 *dataclass* — Whether a strategy wants the agent to stop, and why.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 StopDecision(stop: bool, reason: str = '') -> None
 ```
@@ -1707,6 +1814,7 @@ Members: `ABORTED` = `"aborted"`, `BUDGET` = `"budget"`, `COMPLETED` = `"complet
 
 *class* — One subscription to the `EventBus` with its own buffer and drop counter.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Subscription(buffer: _Buffer, detach: Callable[[_Buffer], None]) -> None
 ```
@@ -1720,6 +1828,7 @@ Members:
 
 *exception* — Base class of Syndica's errors; every instance carries `expected`, `received` and `next_action`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 SyndicaError(*, expected: str, received: str, next_action: str) -> None
 ```
@@ -1745,6 +1854,7 @@ Members:
 
 *dataclass* — One tool call requested by the model: id, tool name and JSON arguments.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ToolCall(id: str, name: str, arguments: str) -> None
 ```
@@ -1755,6 +1865,7 @@ Fields: `id: str`, `name: str`, `arguments: str`.
 
 *exception* — Raised by a tool for errors that cannot succeed on retry; it propagates to the agent loop instead of becoming model-visible output.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ToolFatalError(*, expected: str, received: str, next_action: str) -> None
 ```
@@ -1767,8 +1878,9 @@ Members:
 
 *dataclass* — Result of one tool call: output, trust level, metadata and artifacts.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-ToolResult(output: str | list[Any], meta: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, artifacts: list[ArtifactRef] = <_HAS_DEFAULT_FACTORY_CLASS>, trust: TrustLevel = TrustLevel.TRUSTED) -> None
+ToolResult(output: str | list[Any], meta: dict[str, Any] = <factory>, artifacts: list[ArtifactRef] = <factory>, trust: TrustLevel = TrustLevel.TRUSTED) -> None
 ```
 
 Fields: `output: str | list[Any]`, `meta: dict[str, Any]`, `artifacts: list[ArtifactRef]`, `trust: TrustLevel`.
@@ -1777,6 +1889,7 @@ Fields: `output: str | list[Any]`, `meta: dict[str, Any]`, `artifacts: list[Arti
 
 *dataclass* — A set of agent slots; slot names are unique and at most one is the root.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Topology(slots: tuple[AgentSlot, ...] = ()) -> None
 ```
@@ -1791,8 +1904,9 @@ Members:
 
 *dataclass* — Header of one trace: id, level, source, redaction rules, start and end.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-TraceHeader(trace_id: str, started_ns: int, level: TraceLevel, redaction: TraceRedaction, source: TraceSource = <_HAS_DEFAULT_FACTORY_CLASS>, ended_ns: int | None = None, status: SpanStatus | None = None, schema: str = 'syndica.trace/8') -> None
+TraceHeader(trace_id: str, started_ns: int, level: TraceLevel, redaction: TraceRedaction, source: TraceSource = <factory>, ended_ns: int | None = None, status: SpanStatus | None = None, schema: str = 'syndica.trace/8') -> None
 ```
 
 Fields: `trace_id: str`, `started_ns: int`, `level: TraceLevel`, `redaction: TraceRedaction`, `source: TraceSource`, `ended_ns: int | None`, `status: SpanStatus | None`, `schema: str`.
@@ -1807,6 +1921,7 @@ Members: `FULL` = `"full"`, `OFF` = `"off"`, `REPLAY` = `"replay"`, `STRUCTURE` 
 
 *class* — `Tracer` that records one run as a trace in a `TraceStore`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 TraceRecorder(store: TraceStore, redactor: RuleRedactor, *, level: TraceLevel = TraceLevel.REPLAY, source: TraceSource | None = None, clock: Callable[[], int] = <function time_ns>, monotonic: Callable[[], int] = <function monotonic_ns>, trace_id: str | None = None) -> None
 ```
@@ -1834,6 +1949,7 @@ Members:
 
 *dataclass* — The redaction rule set a trace was recorded with.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 TraceRedaction(digest: str, rules_version: int, rules: tuple[RedactionRule, ...] = ()) -> None
 ```
@@ -1844,6 +1960,7 @@ Fields: `digest: str`, `rules_version: int`, `rules: tuple[RedactionRule, ...]`.
 
 *dataclass* — Where a trace came from: arguments, config digest, Syndica version and git commit.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 TraceSource(argv: tuple[str, ...] = (), config_sha256: str | None = None, version: str = '', git_commit: str | None = None, replay_of: str | None = None) -> None
 ```
@@ -1900,8 +2017,9 @@ Members: `TRUSTED` = `"trusted"`, `UNTRUSTED` = `"untrusted"`.
 
 *dataclass* — Consumption: token counts by tier, cost, turns, and whether any count is estimated.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-Usage(input_tokens: int = 0, output_tokens: int = 0, cached_input_tokens: int = 0, cost: Decimal | None = <_HAS_DEFAULT_FACTORY_CLASS>, turns: int = 0, estimated: bool = False) -> None
+Usage(input_tokens: int = 0, output_tokens: int = 0, cached_input_tokens: int = 0, cost: Decimal | None = <factory>, turns: int = 0, estimated: bool = False) -> None
 ```
 
 Fields: `input_tokens: int`, `output_tokens: int`, `cached_input_tokens: int`, `cost: Decimal | None`, `turns: int`, `estimated: bool`.
@@ -1914,8 +2032,9 @@ Members:
 
 *dataclass* — Waiter for free-form input from a human.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-UserInput(timeout: float, request_id: str = <_HAS_DEFAULT_FACTORY_CLASS>) -> None
+UserInput(timeout: float, request_id: str = <factory>) -> None
 ```
 
 Fields: `timeout: float`, `request_id: str`.
@@ -1924,6 +2043,7 @@ Fields: `timeout: float`, `request_id: str`.
 
 *dataclass* — The four-valued acceptance verdict (pass, partial, block, unverified) with per-rubric outcomes; build it with `derive_verdict`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Verdict(status: VerdictStatus, outcomes: tuple[RubricOutcome, ...], needs_human: tuple[str, ...], reason: str = '', unverified_cause: str | None = None, trust: TrustLevel = TrustLevel.TRUSTED) -> None
 ```
@@ -1940,6 +2060,7 @@ Members: `BLOCK` = `"block"`, `PARTIAL` = `"partial"`, `PASS` = `"pass"`, `UNVER
 
 *dataclass* — One change of one file in a workspace's version layer.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 VersionEntry(path: str, version: str | None, producer: str, redacted: bool, removed: bool, commit: str) -> None
 ```
@@ -1950,6 +2071,7 @@ Fields: `path: str`, `version: str | None`, `producer: str`, `redacted: bool`, `
 
 *class* — A workspace's version layer: content-addressed history of file changes.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 VersionStore(root: str | Path, *, redactor: Redactor) -> None
 ```
@@ -1967,6 +2089,7 @@ Members:
 
 *dataclass* — One L1 format violation reported by an artifact handler, with an optional anchor.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Violation(rule: str, message: str, anchor: str | None = None) -> None
 ```
@@ -1977,6 +2100,7 @@ Fields: `rule: str`, `message: str`, `anchor: str | None`.
 
 *dataclass* — Outcome of one wait: its state and the message that answered it.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 WaitResult(state: WaitState, message: Message | None = None) -> None
 ```
@@ -1993,6 +2117,7 @@ Members: `ABORTED` = `"aborted"`, `ANSWERED` = `"answered"`, `PREEMPTED` = `"pre
 
 *dataclass* — Sealed base of the things an agent can wait for (`UserInput`, `Confirmation`, `Reply`).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Waiter(timeout: float) -> None
 ```
@@ -2012,6 +2137,7 @@ Members:
 
 *class* — A Runtime's workspace router; routes each agent's file and process operations to its workspace or isolated copy.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 WorkspaceRouter(root: Workspace, *, versions: VersionStore | None = None, isolator: LocalIsolator | None = None, taint: FileTaint | None = None) -> None
 ```
@@ -2066,6 +2192,7 @@ Members:
 
 *exception* — Raised by a versioned write when the file is no longer at the version the caller expected.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 WriteConflict(path: str, expected: str | None, current: str | None, *, unread: bool = False) -> None
 ```
@@ -2074,6 +2201,7 @@ WriteConflict(path: str, expected: str | None, current: str | None, *, unread: b
 
 *async function* — Run one external tool call through judge, guard and policy, under untrusted provenance, and trace it.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 async def call_external(runtime: Runtime | None, tool: Tool, args: Mapping[str, object], *, caller: str, agent_id: str | None, policy: ExternalCallPolicy, provenance: TrustLevel = TrustLevel.UNTRUSTED) -> ToolResult
 ```
@@ -2082,6 +2210,7 @@ async def call_external(runtime: Runtime | None, tool: Tool, args: Mapping[str, 
 
 *function* — Derive the four-valued `Verdict` from rubrics and per-rubric outcomes; the only sanctioned way to build one.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def derive_verdict(rubrics: Sequence[Rubric], reported: Mapping[str, RubricOutcome], *, reason: str = '', trust: TrustLevel = TrustLevel.TRUSTED, failure: str | None = None) -> Verdict
 ```
@@ -2090,6 +2219,7 @@ def derive_verdict(rubrics: Sequence[Rubric], reported: Mapping[str, RubricOutco
 
 *function* — Redact every string leaf of a JSON-like value and encode it as canonical JSON (`RedactedText`).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def encode_redacted(value: object, redactor: Redactor, *, identifiers: Collection[str] = ()) -> RedactedText
 ```
@@ -2098,6 +2228,7 @@ def encode_redacted(value: object, redactor: Redactor, *, identifiers: Collectio
 
 *function* — All Flags the given Modules declare, in assembly order, as `FlagRow`s.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def flag_reference(modules: Sequence[RuntimeModule]) -> tuple[FlagRow, ...]
 ```
@@ -2106,6 +2237,7 @@ def flag_reference(modules: Sequence[RuntimeModule]) -> tuple[FlagRow, ...]
 
 *function* — The local file and shell tools bound to a `Portal`, keyed by tool name.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def local_tools(portal: Portal, *, output_limit: int | None = None, artifact_kinds: Callable[[], Collection[str]] | None = None) -> dict[str, Tool]
 ```
@@ -2114,6 +2246,7 @@ def local_tools(portal: Portal, *, output_limit: int | None = None, artifact_kin
 
 *function* — The orchestration tools (Delegate, Fork, SendMessage, QueryAgent, KillAgent) for one agent, keyed by tool name.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def orchestration_tools(runtime: Runtime, agent_id: str) -> dict[str, Tool]
 ```
@@ -2122,6 +2255,7 @@ def orchestration_tools(runtime: Runtime, agent_id: str) -> dict[str, Tool]
 
 *function* — Validate a scenario document mapping and return an immutable `ScenarioDocument`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def parse_scenario_document(raw: object, *, source: str) -> ScenarioDocument
 ```
@@ -2130,6 +2264,7 @@ def parse_scenario_document(raw: object, *, source: str) -> ScenarioDocument
 
 *function* — Redact a trajectory segment leaf by leaf and return it as `RedactedContent`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def redacted_content(content: list[ContextBlock], redactor: Redactor) -> RedactedContent
 ```
@@ -2138,6 +2273,7 @@ def redacted_content(content: list[ContextBlock], redactor: Redactor) -> Redacte
 
 *function* — Redact a `SessionRecord`'s content and return it as `RedactedSessionRecord`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def redacted_record(record: SessionRecord, redactor: Redactor) -> RedactedSessionRecord
 ```
@@ -2146,6 +2282,7 @@ def redacted_record(record: SessionRecord, redactor: Redactor) -> RedactedSessio
 
 *function* — Register the built-in roles (Planner, Explorer, Worker, Orchestrator) into an `AgentCatalog`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def register_builtins(catalog: object) -> None
 ```
@@ -2154,6 +2291,7 @@ def register_builtins(catalog: object) -> None
 
 *function* — Whether a trace attribute holds a kernel-generated identifier, digest, payload reference or closed-set value that is recorded without redaction.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def verbatim_attribute(key: str) -> bool
 ```
@@ -2332,6 +2470,7 @@ Members:
 
 *constant* — `AgentInfo` fields `AgentRegistry.update` must refuse to write.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 UPDATE_PROTECTED_FIELDS = ["agent_id", "children", "created_at", "flags", "parent_id", "status"]
 ```
@@ -2344,6 +2483,7 @@ UPDATE_PROTECTED_FIELDS = ["agent_id", "children", "created_at", "flags", "paren
 
 *constant* — `AgentInfo` fields `AgentRegistry.update` may write.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 UPDATE_WRITABLE_FIELDS = ["agent_type", "heartbeat_at", "metadata", "name", "owner", "session_id"]
 ```
@@ -2417,6 +2557,7 @@ Only the names below are public; the rest of this module is internal.
 
 *class* — One agent's isolated copy of the workspace, with the file versions it started from.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 IsolatedCopy(*, agent_id: str, strategy: str, location: Path, base_dir: Path | None, base: dict[str, str], workspace: LocalWorkspace, note: str, base_executable: frozenset[str] = frozenset()) -> None
 ```
@@ -2436,6 +2577,7 @@ Only the names below are public; the rest of this module is internal.
 
 *dataclass* — Scenario-document record of a per-role danger policy.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 DangerPolicySpec(policy: str, table: Mapping[str, str] | None = None) -> None
 ```
@@ -2446,8 +2588,9 @@ Fields: `policy: str`, `table: Mapping[str, str] | None`.
 
 *dataclass* — Scenario-document record of one danger rule and its parameters.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-DangerRuleSpec(id: str, params: Mapping[str, str] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None
+DangerRuleSpec(id: str, params: Mapping[str, str] = <factory>) -> None
 ```
 
 Fields: `id: str`, `params: Mapping[str, str]`.
@@ -2456,6 +2599,7 @@ Fields: `id: str`, `params: Mapping[str, str]`.
 
 *dataclass* — Scenario-document record of a frozen role: interpolated system prompt and tools in order.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 FrozenRole(system_prompt: Text, tools: tuple[str, ...], max_turns: int | None = None, impl: str | None = None, model: str = 'default', description: str | None = None, artifact_kinds: tuple[str, ...] = ()) -> None
 ```
@@ -2466,6 +2610,7 @@ Fields: `system_prompt: Text`, `tools: tuple[str, ...]`, `max_turns: int | None`
 
 *dataclass* — Scenario-document record of one danger-gate decision.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 GateRecord(call: tuple[int, int, int], rule_ids: tuple[str, ...], risk: str, provenance: str, decided_by: str, disposition: str, outcome: str | None = None) -> None
 ```
@@ -2476,6 +2621,7 @@ Fields: `call: tuple[int, int, int]`, `rule_ids: tuple[str, ...]`, `risk: str`, 
 
 *dataclass* — Scenario-document record of a host action (abort, interrupt, shutdown).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 HostAction(kind: str, key: tuple[str | int, ...] | None = None, waiting: tuple[tuple[str | int, ...], ...] | None = None) -> None
 ```
@@ -2486,8 +2632,9 @@ Fields: `kind: str`, `key: tuple[str | int, ...] | None`, `waiting: tuple[tuple[
 
 *dataclass* — Scenario-document record of how the host assembled the Runtime.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-HostProfile(flags: Mapping[str, bool | int | str] = <_HAS_DEFAULT_FACTORY_CLASS>, danger_rules: tuple[DangerRuleSpec, ...] | None = None, danger_table: Mapping[str, str] | None = None, danger_policy: str | None = None, output_limit: int | None = None, host_facts: HostFacts | None = None, max_turns: int | None = None, no_write: bool = False, modules: tuple[str, ...] | None = None, orchestration: bool = True, root_turns: int | None = None, root_tokens: int | None = None, root_budget: bool = False, on_exhausted: str = 'graceful_wrapup', confirmation_timeout: float | None = 300.0, danger_roles: Mapping[str, DangerPolicySpec] = <_HAS_DEFAULT_FACTORY_CLASS>, module_records: tuple[ModuleRecord, ...] = (), untrusted_output_modules: tuple[str, ...] = ()) -> None
+HostProfile(flags: Mapping[str, bool | int | str] = <factory>, danger_rules: tuple[DangerRuleSpec, ...] | None = None, danger_table: Mapping[str, str] | None = None, danger_policy: str | None = None, output_limit: int | None = None, host_facts: HostFacts | None = None, max_turns: int | None = None, no_write: bool = False, modules: tuple[str, ...] | None = None, orchestration: bool = True, root_turns: int | None = None, root_tokens: int | None = None, root_budget: bool = False, on_exhausted: str = 'graceful_wrapup', confirmation_timeout: float | None = 300.0, danger_roles: Mapping[str, DangerPolicySpec] = <factory>, module_records: tuple[ModuleRecord, ...] = (), untrusted_output_modules: tuple[str, ...] = ()) -> None
 ```
 
 Fields: `flags: Mapping[str, bool | int | str]`, `danger_rules: tuple[DangerRuleSpec, ...] | None`, `danger_table: Mapping[str, str] | None`, `danger_policy: str | None`, `output_limit: int | None`, `host_facts: HostFacts | None`, `max_turns: int | None`, `no_write: bool`, `modules: tuple[str, ...] | None`, `orchestration: bool`, `root_turns: int | None`, `root_tokens: int | None`, `root_budget: bool`, `on_exhausted: str`, `confirmation_timeout: float | None`, `danger_roles: Mapping[str, DangerPolicySpec]`, `module_records: tuple[ModuleRecord, ...]`, `untrusted_output_modules: tuple[str, ...]`.
@@ -2496,6 +2643,7 @@ Fields: `flags: Mapping[str, bool | int | str]`, `danger_rules: tuple[DangerRule
 
 *dataclass* — Scenario-document record of a third-party Module: distribution, version and flags.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ModuleRecord(name: str, module_version: str, distribution: str | None = None, distribution_version: str | None = None) -> None
 ```
@@ -2510,6 +2658,7 @@ Fields: `name: str`, `module_version: str`, `distribution: str | None`, `distrib
 
 *dataclass* — Scenario-document record of one tool call the model made.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioCall(id: str, name: str, arguments: str) -> None
 ```
@@ -2520,6 +2669,7 @@ Fields: `id: str`, `name: str`, `arguments: str`.
 
 *dataclass* — Scenario-document record of how the run started (slot, query or send).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioEntry(prompt: Text, mode: str = 'slot', slot: str | None = None, agent: str | None = None, trust: str = 'trusted') -> None
 ```
@@ -2530,6 +2680,7 @@ Fields: `prompt: Text`, `mode: str`, `slot: str | None`, `agent: str | None`, `t
 
 *dataclass* — Scenario-document record of a typed failure.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioError(type: str, message: Text, status_code: int | None = None, retry_after: float | None = None) -> None
 ```
@@ -2540,6 +2691,7 @@ Fields: `type: str`, `message: Text`, `status_code: int | None`, `retry_after: f
 
 *dataclass* — What a scenario expects; only the specified items are compared.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioExpectation(final_output: Mapping[str, str], tool_order: Mapping[str, tuple[str, ...]], stop_reasons: Mapping[str, str], errors: Mapping[str, str], statuses: Mapping[str, str], events: tuple[str, ...], workspace: Mapping[str, str], specified: frozenset[str], events_by_agent: Mapping[str, tuple[str, ...]] | None = None) -> None
 ```
@@ -2550,8 +2702,9 @@ Fields: `final_output: Mapping[str, str]`, `tool_order: Mapping[str, tuple[str, 
 
 *dataclass* — Scenario-document record of one runtime instance of a role.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-ScenarioInstance(replies: tuple[ScenarioReply, ...], key: tuple[str | int, ...] | None = None, tool_results: tuple[ToolOutcome, ...] = (), skipped: tuple[SkippedCall, ...] = (), gate: tuple[GateRecord, ...] = (), messages: Mapping[int, tuple[str, ...]] | None = None, deferred: Mapping[int, tuple[str, ...]] = <_HAS_DEFAULT_FACTORY_CLASS>, continued: frozenset[int] = frozenset(), cut: tuple[tuple[int, int, int], ...] = (), unlanded: tuple[tuple[int, int, int], ...] = ()) -> None
+ScenarioInstance(replies: tuple[ScenarioReply, ...], key: tuple[str | int, ...] | None = None, tool_results: tuple[ToolOutcome, ...] = (), skipped: tuple[SkippedCall, ...] = (), gate: tuple[GateRecord, ...] = (), messages: Mapping[int, tuple[str, ...]] | None = None, deferred: Mapping[int, tuple[str, ...]] = <factory>, continued: frozenset[int] = frozenset(), cut: tuple[tuple[int, int, int], ...] = (), unlanded: tuple[tuple[int, int, int], ...] = ()) -> None
 ```
 
 Fields: `replies: tuple[ScenarioReply, ...]`, `key: tuple[str | int, ...] | None`, `tool_results: tuple[ToolOutcome, ...]`, `skipped: tuple[SkippedCall, ...]`, `gate: tuple[GateRecord, ...]`, `messages: Mapping[int, tuple[str, ...]] | None`, `deferred: Mapping[int, tuple[str, ...]]`, `continued: frozenset[int]`, `cut: tuple[tuple[int, int, int], ...]`, `unlanded: tuple[tuple[int, int, int], ...]`.
@@ -2560,6 +2713,7 @@ Fields: `replies: tuple[ScenarioReply, ...]`, `key: tuple[str | int, ...] | None
 
 *dataclass* — Scenario-document record of one model reply (or the exception it raised).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioReply(content: Text | tuple[object, ...] | None = None, tool_calls: tuple[ScenarioCall, ...] = (), raises: ScenarioError | None = None, turn: int | None = None, attempt: int | None = None, extra: Mapping[str, object] | None = None, trust: str = 'trusted', request_digests: tuple[str, ...] | None = None) -> None
 ```
@@ -2570,6 +2724,7 @@ Fields: `content: Text | tuple[object, ...] | None`, `tool_calls: tuple[Scenario
 
 *dataclass* — Scenario-document record of one human answer.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioResponse(kind: str, answer: Text | None = None, agent: str | None = None, tool_call_id: str | None = None, key: tuple[str | int, ...] | None = None, trust: str = 'trusted') -> None
 ```
@@ -2580,6 +2735,7 @@ Fields: `kind: str`, `answer: Text | None`, `agent: str | None`, `tool_call_id: 
 
 *dataclass* — Scenario-document record of a role: a manifest or a frozen role.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioRole(name: str, instances: tuple[ScenarioInstance, ...], manifest: Mapping[str, object] | None = None, frozen: FrozenRole | None = None) -> None
 ```
@@ -2590,6 +2746,7 @@ Fields: `name: str`, `instances: tuple[ScenarioInstance, ...]`, `manifest: Mappi
 
 *dataclass* — Scenario-document record of where it was captured: trace id, arguments, config digest, version, commit.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioSource(trace_id: str | None = None, argv: tuple[str, ...] = (), version: str | None = None, config_sha256: str | None = None, git_commit: str | None = None) -> None
 ```
@@ -2600,8 +2757,9 @@ Fields: `trace_id: str | None`, `argv: tuple[str, ...]`, `version: str | None`, 
 
 *dataclass* — Scenario-document record of a call skipped by a `pre_tool_use` hook.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-SkippedCall(call: tuple[int, int, int], output: Text | tuple[object, ...], meta: Mapping[str, object] = <_HAS_DEFAULT_FACTORY_CLASS>, trust: str = 'trusted', artifacts: tuple[Mapping[str, object], ...] = ()) -> None
+SkippedCall(call: tuple[int, int, int], output: Text | tuple[object, ...], meta: Mapping[str, object] = <factory>, trust: str = 'trusted', artifacts: tuple[Mapping[str, object], ...] = ()) -> None
 ```
 
 Fields: `call: tuple[int, int, int]`, `output: Text | tuple[object, ...]`, `meta: Mapping[str, object]`, `trust: str`, `artifacts: tuple[Mapping[str, object], ...]`.
@@ -2610,6 +2768,7 @@ Fields: `call: tuple[int, int, int]`, `output: Text | tuple[object, ...]`, `meta
 
 *type alias* — Text in a scenario document: inline, or a `PayloadText` reference.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Text = str | PayloadText
 ```
@@ -2618,8 +2777,9 @@ Text = str | PayloadText
 
 *dataclass* — Scenario-document record of what a tool call returned or raised before hooks rewrote it.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-ToolOutcome(call: tuple[int, int, int], output: Text | tuple[object, ...] | None = None, meta: Mapping[str, object] = <_HAS_DEFAULT_FACTORY_CLASS>, trust: str = 'trusted', artifacts: tuple[Mapping[str, object], ...] = (), raised: ScenarioError | None = None, arguments_digest: str | None = None) -> None
+ToolOutcome(call: tuple[int, int, int], output: Text | tuple[object, ...] | None = None, meta: Mapping[str, object] = <factory>, trust: str = 'trusted', artifacts: tuple[Mapping[str, object], ...] = (), raised: ScenarioError | None = None, arguments_digest: str | None = None) -> None
 ```
 
 Fields: `call: tuple[int, int, int]`, `output: Text | tuple[object, ...] | None`, `meta: Mapping[str, object]`, `trust: str`, `artifacts: tuple[Mapping[str, object], ...]`, `raised: ScenarioError | None`, `arguments_digest: str | None`.
@@ -2632,6 +2792,7 @@ Only the names below are public; the rest of this module is internal.
 
 *type alias* — Callback that observes every tool call's outcome, including calls a hook cut short.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ToolOutcomeObserver = Callable[[ToolCall, Mapping[str, Any], ToolResult], None]
 ```
@@ -2652,6 +2813,7 @@ Only the names below are public; the rest of this module is internal.
 
 *constant* — Schema identifier written into every trace header.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 TRACE_SCHEMA = "syndica.trace/8"
 ```
@@ -2664,6 +2826,7 @@ Only the names below are public; the rest of this module is internal.
 
 *constant* — Write precondition that skips the version check.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ANY = "_Any.ANY"
 ```
@@ -2672,6 +2835,7 @@ ANY = "_Any.ANY"
 
 *type alias* — Type of a write precondition: `ANY` (no check), a version string (must match), or `None` (file must not exist).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Expected = _Any | str | None
 ```
@@ -2682,6 +2846,7 @@ Expected = _Any | str | None
 
 *dataclass* — One place where a replay diverged from the recorded run.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Divergence(kind: str, where: str, detail: str) -> None
 ```
@@ -2692,8 +2857,9 @@ Fields: `kind: str`, `where: str`, `detail: str`.
 
 *dataclass* — Result of a replay: divergences (empty when the run was reproduced), the scenario result and unrebuilt Modules.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
-ReplayResult(divergences: tuple[Divergence, ...], result: ScenarioResult, unrebuilt: tuple[str, ...] = (), trajectories: Mapping[str, tuple[ContextBlock, ...]] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None
+ReplayResult(divergences: tuple[Divergence, ...], result: ScenarioResult, unrebuilt: tuple[str, ...] = (), trajectories: Mapping[str, tuple[ContextBlock, ...]] = <factory>) -> None
 ```
 
 Fields: `divergences: tuple[Divergence, ...]`, `result: ScenarioResult`, `unrebuilt: tuple[str, ...]`, `trajectories: Mapping[str, tuple[ContextBlock, ...]]`.
@@ -2706,6 +2872,7 @@ Members:
 
 *class* — Replays a captured scenario document against the real runtime with a scripted model.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ReplayRunner(*, payloads: Callable[[str], str | None] | None = None, redactor: Redactor | None = None, allow_divergence: bool = False, perturb: Callable[[], Awaitable[None]] | None = None, real_tools: bool = False, modules: ModuleRebuilder | None = None) -> None
 ```
@@ -2718,6 +2885,7 @@ Members:
 
 *dataclass* — A parsed v1 declarative scenario: catalog, agents, topology, prompt, scripted responses and expectations.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 Scenario(version: int, name: str, catalog: AgentCatalog, agents: Mapping[str, ScenarioAgent], topology: Topology, entry_slot: str, prompt: str, responses: tuple[ScenarioResponse, ...], expect: ScenarioExpectation, source: str) -> None
 ```
@@ -2728,6 +2896,7 @@ Fields: `version: int`, `name: str`, `catalog: AgentCatalog`, `agents: Mapping[s
 
 *dataclass* — One agent of a v1 scenario: its manifest and the scripted turns of each instance.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioAgent(manifest: AgentManifest, instances: tuple[tuple[ScriptedTurn, ...], ...]) -> None
 ```
@@ -2738,6 +2907,7 @@ Fields: `manifest: AgentManifest`, `instances: tuple[tuple[ScriptedTurn, ...], .
 
 *dataclass* — One event observed while running a scenario.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioEvent(sequence: int, kind: str, agent: str, payload: Mapping[str, Any]) -> None
 ```
@@ -2748,6 +2918,7 @@ Fields: `sequence: int`, `kind: str`, `agent: str`, `payload: Mapping[str, Any]`
 
 *dataclass* — What a scenario expects; only the specified items are compared.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioExpectation(final_output: Mapping[str, str], tool_order: Mapping[str, tuple[str, ...]], stop_reasons: Mapping[str, str], errors: Mapping[str, str], statuses: Mapping[str, str], events: tuple[str, ...], workspace: Mapping[str, str], specified: frozenset[str], events_by_agent: Mapping[str, tuple[str, ...]] | None = None) -> None
 ```
@@ -2758,6 +2929,7 @@ Fields: `final_output: Mapping[str, str]`, `tool_order: Mapping[str, tuple[str, 
 
 *exception* — Raised when a scenario ran but did not meet its declared expectation.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioMismatch(*, expected: str, received: str, next_action: str) -> None
 ```
@@ -2770,6 +2942,7 @@ Members:
 
 *dataclass* — One scripted human answer in a v1 scenario.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioResponse(kind: str, agent: str, answer: str, tool_call_id: str | None = None) -> None
 ```
@@ -2780,6 +2953,7 @@ Fields: `kind: str`, `agent: str`, `answer: str`, `tool_call_id: str | None`.
 
 *dataclass* — What running a scenario produced: outputs, tool order, stop reasons, errors, statuses, events and workspace.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ScenarioResult(name: str, final_output: Mapping[str, str], tool_order: Mapping[str, tuple[str, ...]], stop_reasons: Mapping[str, str], errors: Mapping[str, str], statuses: Mapping[str, str], events: tuple[ScenarioEvent, ...], workspace: Mapping[str, str]) -> None
 ```
@@ -2798,6 +2972,7 @@ Members:
 
 *function* — Read a scenario document from a YAML or JSON file and validate it.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def load_document(path: object) -> ScenarioDocument
 ```
@@ -2806,6 +2981,7 @@ def load_document(path: object) -> ScenarioDocument
 
 *function* — Parse one v1 scenario file without importing any backend.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def load_scenario(path: object) -> Scenario
 ```
@@ -2824,6 +3000,7 @@ Members:
 
 *class* — `LLM` that calls a model endpoint speaking the OpenAI chat/completions protocol.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 OpenAICompatible(config: LLMConfig, *, client: httpx.AsyncClient | None = None) -> None
 ```
@@ -2838,6 +3015,7 @@ Members:
 
 *exception* — Raised when the endpoint answers with an HTTP error status.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ProviderHTTPError(*, expected: str, received: str, next_action: str, status_code: int | None = None, retry_after: float | None = None) -> None
 ```
@@ -2850,6 +3028,7 @@ Members:
 
 *function* — Whether a failure may resolve on its own after waiting (rate limits, transient server errors).
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def recoverable(error: BaseException) -> bool
 ```
@@ -2858,6 +3037,7 @@ def recoverable(error: BaseException) -> bool
 
 *function* — The earliest retry delay in seconds the endpoint asked for, or `None`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def retry_after(error: BaseException) -> float | None
 ```
@@ -2868,6 +3048,7 @@ def retry_after(error: BaseException) -> float | None
 
 *dataclass* — Per-platform exponential backoff settings of a `ModelRouter`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 BackoffPolicy(base: float = 2.0, factor: float = 2.0, maximum: float = 300.0, jitter: float = 0.2, max_wait: float = 120.0) -> None
 ```
@@ -2878,6 +3059,7 @@ Fields: `base: float`, `factor: float`, `maximum: float`, `jitter: float`, `max_
 
 *dataclass* — Health snapshot of one platform in a `ModelRouter`.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 MemberHealth(name: str, failures: int, retry_at: float, last_error: str | None) -> None
 ```
@@ -2888,6 +3070,7 @@ Fields: `name: str`, `failures: int`, `retry_at: float`, `last_error: str | None
 
 *class* — `LLM` that rotates across several platforms in declared order, backing each off independently on failure.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 ModelRouter(members: Sequence[tuple[str, LLM]], *, policy: BackoffPolicy | None = None, retry_after: Callable[[Exception], float | None] = <function _no_hint>, recoverable: Callable[[Exception], bool] = <function _always_recoverable>, clock: Callable[[], float] = <function monotonic>, sleep: Callable[[float], Awaitable[None]] = <function sleep>, rand: Callable[[], float] = <function Random.random>) -> None
 ```
@@ -2905,6 +3088,7 @@ Members:
 
 *exception* — Raised when the collector did not accept an export; `resendable` says whether resending is safe.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 OtlpExportError(*, expected: str, received: str, next_action: str) -> None
 ```
@@ -2918,6 +3102,7 @@ Members:
 
 *class* — Exports a stored trace to an OTLP/HTTP JSON traces endpoint.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 OtlpHttpExporter(url: str, *, redactor: Redactor, headers: Mapping[str, str] | None = None, resource: Mapping[str, str] | None = None, client: httpx.AsyncClient | None = None, batch: int = 512, timeout: float = 10.0, deadline: float = 120.0) -> None
 ```
@@ -2930,6 +3115,7 @@ Members:
 
 *function* — Render one stored trace as OTLP/HTTP JSON request bodies, in batches.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def otlp_documents(header: TraceHeader, spans: Sequence[Span], edges: Sequence[CausalityEdge], *, redactor: Redactor, resource: Mapping[str, str] | None = None, batch: int = 512) -> Iterator[dict[str, Any]]
 ```
@@ -2940,6 +3126,7 @@ def otlp_documents(header: TraceHeader, spans: Sequence[Span], edges: Sequence[C
 
 *function* — Load an exported SFT dataset into TRL's `SFTTrainer` with a tiny local model, without downloading one.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def dry_run(dataset: Path) -> dict[str, object]
 ```
@@ -2948,6 +3135,7 @@ def dry_run(dataset: Path) -> dict[str, object]
 
 *function* — Load an exported preference dataset into TRL's `DPOTrainer` with a tiny local model, without downloading one.
 
+<!-- not-tested: a signature from the public API snapshot, not code -->
 ```python
 def dry_run_preference(dataset: Path) -> dict[str, object]
 ```

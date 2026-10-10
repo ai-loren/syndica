@@ -28,9 +28,7 @@ markdown_extensions:
 validation:
   nav:
     omitted_files: warn
-    # reference/errors.md、reference/api.md 与 versioning.md 由 M12 的另外两条线写，导航里先列上。
-    # 三个文件都进了 docs/user 之后改回 warn：否则导航里指向不存在页面的条目在 --strict 下也不再失败。
-    not_found: info
+    not_found: warn
     absolute_links: warn
   links:
     not_found: warn

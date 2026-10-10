@@ -14,6 +14,7 @@ the class you were constructing. Errors survive `copy` and `pickle` with their n
 
 ## Hierarchy
 
+<!-- not-tested: a diagram; tests/test_error_taxonomy.py pins the same parents -->
 ```text
 Exception
 ├── SyndicaError

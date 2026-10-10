@@ -1301,7 +1301,7 @@
             }
           ],
           "frozen": false,
-          "init": "(agent_id: str, name: str, agent_type: str, status: AgentStatus = AgentStatus.IDLE, parent_id: str | None = None, children: list[str] = <_HAS_DEFAULT_FACTORY_CLASS>, session_id: str | None = None, metadata: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, owner: str | None = None, heartbeat_at: float | None = None, created_at: float = <_HAS_DEFAULT_FACTORY_CLASS>, flags: dict[str, bool | int | str] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None",
+          "init": "(agent_id: str, name: str, agent_type: str, status: AgentStatus = AgentStatus.IDLE, parent_id: str | None = None, children: list[str] = <factory>, session_id: str | None = None, metadata: dict[str, Any] = <factory>, owner: str | None = None, heartbeat_at: float | None = None, created_at: float = <factory>, flags: dict[str, bool | int | str] = <factory>) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -1459,7 +1459,7 @@
             }
           ],
           "frozen": false,
-          "init": "(name: str, llm: LLM, tools: dict[str, Tool] = <_HAS_DEFAULT_FACTORY_CLASS>, system_prompt: str = '', max_turns: int | None = 50, danger_judge: DangerJudge | None = None, danger_policy: DangerPolicy | None = None, max_tool_concurrency: int = 4) -> None",
+          "init": "(name: str, llm: LLM, tools: dict[str, Tool] = <factory>, system_prompt: str = '', max_turns: int | None = 50, danger_judge: DangerJudge | None = None, danger_policy: DangerPolicy | None = None, max_tool_concurrency: int = 4) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -1582,7 +1582,7 @@
             }
           ],
           "frozen": true,
-          "init": "(name: str, agent: str, is_root: bool = False, cardinality: str = 'on-demand', key_field: str | None = None, boot: str = 'lazy', exit_mode: ExitMode = ExitMode.ZOMBIE, extra_tools: tuple[str, ...] = (), budget: Mapping[str, int | None] | None = None, metadata: Mapping[str, object] = <_HAS_DEFAULT_FACTORY_CLASS>, isolation: str = 'shared') -> None",
+          "init": "(name: str, agent: str, is_root: bool = False, cardinality: str = 'on-demand', key_field: str | None = None, boot: str = 'lazy', exit_mode: ExitMode = ExitMode.ZOMBIE, extra_tools: tuple[str, ...] = (), budget: Mapping[str, int | None] | None = None, metadata: Mapping[str, object] = <factory>, isolation: str = 'shared') -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -2013,7 +2013,7 @@
             }
           ],
           "frozen": true,
-          "init": "(root: Budget = <_HAS_DEFAULT_FACTORY_CLASS>, on_exhausted: Exhaustion = Exhaustion.GRACEFUL_WRAPUP, prices: PriceTable | None = None, ask_human: AskHuman | None = None, ask_timeout_s: float = 300.0) -> None",
+          "init": "(root: Budget = <factory>, on_exhausted: Exhaustion = Exhaustion.GRACEFUL_WRAPUP, prices: PriceTable | None = None, ask_human: AskHuman | None = None, ask_timeout_s: float = 300.0) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -2100,7 +2100,7 @@
             }
           ],
           "frozen": true,
-          "init": "(kind: EdgeKind, source_span_id: str, target_span_id: str, attributes: dict[str, AttributeValue] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None",
+          "init": "(kind: EdgeKind, source_span_id: str, target_span_id: str, attributes: dict[str, AttributeValue] = <factory>) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -2304,7 +2304,7 @@
             }
           ],
           "frozen": false,
-          "init": "(role: Role, content: str | list[Any] | None = None, tool_calls: list[ToolCall] = <_HAS_DEFAULT_FACTORY_CLASS>, tool_call_id: str | None = None, artifacts: list[ArtifactRef] = <_HAS_DEFAULT_FACTORY_CLASS>, trust: TrustLevel = TrustLevel.TRUSTED, extra: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None",
+          "init": "(role: Role, content: str | list[Any] | None = None, tool_calls: list[ToolCall] = <factory>, tool_call_id: str | None = None, artifacts: list[ArtifactRef] = <factory>, trust: TrustLevel = TrustLevel.TRUSTED, extra: dict[str, Any] = <factory>) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -2663,7 +2663,7 @@
             }
           ],
           "frozen": true,
-          "init": "(kind: str, agent_id: str, payload: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, sequence: int = 0, time_ns: int = 0) -> None",
+          "init": "(kind: str, agent_id: str, payload: dict[str, Any] = <factory>, sequence: int = 0, time_ns: int = 0) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -3274,7 +3274,7 @@
             }
           ],
           "frozen": false,
-          "init": "(skip: bool = False, modified: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, result: Any = None, history: dict[str, list[Any]] = <_HAS_DEFAULT_FACTORY_CLASS>, untrusted: bool = False) -> None",
+          "init": "(skip: bool = False, modified: dict[str, Any] = <factory>, result: Any = None, history: dict[str, list[Any]] = <factory>, untrusted: bool = False) -> None",
           "kind": "dataclass",
           "members": {
             "get": {
@@ -3756,7 +3756,7 @@
             }
           ],
           "frozen": true,
-          "init": "(provider: str, model: str, client_args: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, request_args: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, timeout: float = 600.0, context_window: int | None = None) -> None",
+          "init": "(provider: str, model: str, client_args: dict[str, Any] = <factory>, request_args: dict[str, Any] = <factory>, timeout: float = 600.0, context_window: int | None = None) -> None",
           "kind": "dataclass",
           "members": {
             "derive": {
@@ -4224,7 +4224,7 @@
             }
           ],
           "frozen": false,
-          "init": "(sender: str, receiver: str, content: str, trigger: Trigger = Trigger.PENDING, correlation_id: str | None = None, trust: TrustLevel = TrustLevel.TRUSTED, id: str = <_HAS_DEFAULT_FACTORY_CLASS>) -> None",
+          "init": "(sender: str, receiver: str, content: str, trigger: Trigger = Trigger.PENDING, correlation_id: str | None = None, trust: TrustLevel = TrustLevel.TRUSTED, id: str = <factory>) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -5846,7 +5846,7 @@
             }
           ],
           "frozen": false,
-          "init": "(content: str | None = None, tool_calls: list[ToolCall] = <_HAS_DEFAULT_FACTORY_CLASS>, raises: BaseException | None = None) -> None",
+          "init": "(content: str | None = None, tool_calls: list[ToolCall] = <factory>, raises: BaseException | None = None) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -5962,7 +5962,7 @@
             }
           ],
           "frozen": false,
-          "init": "(sid: str, title: str = '', agent: str = '', workspace: str | None = None, status: SessionStatus = SessionStatus.ACTIVE, turns: int = 0, archived: int = 0, last_trace: str | None = None, created_at: float = <_HAS_DEFAULT_FACTORY_CLASS>, updated_at: float = <_HAS_DEFAULT_FACTORY_CLASS>) -> None",
+          "init": "(sid: str, title: str = '', agent: str = '', workspace: str | None = None, status: SessionStatus = SessionStatus.ACTIVE, turns: int = 0, archived: int = 0, last_trace: str | None = None, created_at: float = <factory>, updated_at: float = <factory>) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -6020,7 +6020,7 @@
             }
           ],
           "frozen": false,
-          "init": "(meta: SessionMeta, content: list[ContextBlock] = <_HAS_DEFAULT_FACTORY_CLASS>, system_prompt: str = '', model: str = '', tools: list[str] = <_HAS_DEFAULT_FACTORY_CLASS>, flags: dict[str, bool | int | str] = <_HAS_DEFAULT_FACTORY_CLASS>, budget: SessionBudget | None = None) -> None",
+          "init": "(meta: SessionMeta, content: list[ContextBlock] = <factory>, system_prompt: str = '', model: str = '', tools: list[str] = <factory>, flags: dict[str, bool | int | str] = <factory>, budget: SessionBudget | None = None) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -6154,7 +6154,7 @@
             }
           ],
           "frozen": true,
-          "init": "(span_id: str, parent_span_id: str | None, kind: SpanKind, name: str, agent_id: str, start_ns: int, end_ns: int, status: SpanStatus, attributes: dict[str, AttributeValue] = <_HAS_DEFAULT_FACTORY_CLASS>, events: tuple[SpanEvent, ...] = ()) -> None",
+          "init": "(span_id: str, parent_span_id: str | None, kind: SpanKind, name: str, agent_id: str, start_ns: int, end_ns: int, status: SpanStatus, attributes: dict[str, AttributeValue] = <factory>, events: tuple[SpanEvent, ...] = ()) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -6184,7 +6184,7 @@
             }
           ],
           "frozen": true,
-          "init": "(name: str, time_ns: int, attributes: dict[str, AttributeValue] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None",
+          "init": "(name: str, time_ns: int, attributes: dict[str, AttributeValue] = <factory>) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -6441,7 +6441,7 @@
             }
           ],
           "frozen": false,
-          "init": "(output: str | list[Any], meta: dict[str, Any] = <_HAS_DEFAULT_FACTORY_CLASS>, artifacts: list[ArtifactRef] = <_HAS_DEFAULT_FACTORY_CLASS>, trust: TrustLevel = TrustLevel.TRUSTED) -> None",
+          "init": "(output: str | list[Any], meta: dict[str, Any] = <factory>, artifacts: list[ArtifactRef] = <factory>, trust: TrustLevel = TrustLevel.TRUSTED) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -6527,7 +6527,7 @@
             }
           ],
           "frozen": true,
-          "init": "(trace_id: str, started_ns: int, level: TraceLevel, redaction: TraceRedaction, source: TraceSource = <_HAS_DEFAULT_FACTORY_CLASS>, ended_ns: int | None = None, status: SpanStatus | None = None, schema: str = 'syndica.trace/8') -> None",
+          "init": "(trace_id: str, started_ns: int, level: TraceLevel, redaction: TraceRedaction, source: TraceSource = <factory>, ended_ns: int | None = None, status: SpanStatus | None = None, schema: str = 'syndica.trace/8') -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -6858,7 +6858,7 @@
             }
           ],
           "frozen": true,
-          "init": "(input_tokens: int = 0, output_tokens: int = 0, cached_input_tokens: int = 0, cost: Decimal | None = <_HAS_DEFAULT_FACTORY_CLASS>, turns: int = 0, estimated: bool = False) -> None",
+          "init": "(input_tokens: int = 0, output_tokens: int = 0, cached_input_tokens: int = 0, cost: Decimal | None = <factory>, turns: int = 0, estimated: bool = False) -> None",
           "kind": "dataclass",
           "members": {
             "tokens": {
@@ -6889,7 +6889,7 @@
             }
           ],
           "frozen": true,
-          "init": "(timeout: float, request_id: str = <_HAS_DEFAULT_FACTORY_CLASS>) -> None",
+          "init": "(timeout: float, request_id: str = <factory>) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -8359,7 +8359,7 @@
             }
           ],
           "frozen": true,
-          "init": "(id: str, params: Mapping[str, str] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None",
+          "init": "(id: str, params: Mapping[str, str] = <factory>) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -8640,7 +8640,7 @@
             }
           ],
           "frozen": true,
-          "init": "(flags: Mapping[str, bool | int | str] = <_HAS_DEFAULT_FACTORY_CLASS>, danger_rules: tuple[DangerRuleSpec, ...] | None = None, danger_table: Mapping[str, str] | None = None, danger_policy: str | None = None, output_limit: int | None = None, host_facts: HostFacts | None = None, max_turns: int | None = None, no_write: bool = False, modules: tuple[str, ...] | None = None, orchestration: bool = True, root_turns: int | None = None, root_tokens: int | None = None, root_budget: bool = False, on_exhausted: str = 'graceful_wrapup', confirmation_timeout: float | None = 300.0, danger_roles: Mapping[str, DangerPolicySpec] = <_HAS_DEFAULT_FACTORY_CLASS>, module_records: tuple[ModuleRecord, ...] = (), untrusted_output_modules: tuple[str, ...] = ()) -> None",
+          "init": "(flags: Mapping[str, bool | int | str] = <factory>, danger_rules: tuple[DangerRuleSpec, ...] | None = None, danger_table: Mapping[str, str] | None = None, danger_policy: str | None = None, output_limit: int | None = None, host_facts: HostFacts | None = None, max_turns: int | None = None, no_write: bool = False, modules: tuple[str, ...] | None = None, orchestration: bool = True, root_turns: int | None = None, root_tokens: int | None = None, root_budget: bool = False, on_exhausted: str = 'graceful_wrapup', confirmation_timeout: float | None = 300.0, danger_roles: Mapping[str, DangerPolicySpec] = <factory>, module_records: tuple[ModuleRecord, ...] = (), untrusted_output_modules: tuple[str, ...] = ()) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -8958,7 +8958,7 @@
             }
           ],
           "frozen": true,
-          "init": "(replies: tuple[ScenarioReply, ...], key: tuple[str | int, ...] | None = None, tool_results: tuple[ToolOutcome, ...] = (), skipped: tuple[SkippedCall, ...] = (), gate: tuple[GateRecord, ...] = (), messages: Mapping[int, tuple[str, ...]] | None = None, deferred: Mapping[int, tuple[str, ...]] = <_HAS_DEFAULT_FACTORY_CLASS>, continued: frozenset[int] = frozenset(), cut: tuple[tuple[int, int, int], ...] = (), unlanded: tuple[tuple[int, int, int], ...] = ()) -> None",
+          "init": "(replies: tuple[ScenarioReply, ...], key: tuple[str | int, ...] | None = None, tool_results: tuple[ToolOutcome, ...] = (), skipped: tuple[SkippedCall, ...] = (), gate: tuple[GateRecord, ...] = (), messages: Mapping[int, tuple[str, ...]] | None = None, deferred: Mapping[int, tuple[str, ...]] = <factory>, continued: frozenset[int] = frozenset(), cut: tuple[tuple[int, int, int], ...] = (), unlanded: tuple[tuple[int, int, int], ...] = ()) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -9199,7 +9199,7 @@
             }
           ],
           "frozen": true,
-          "init": "(call: tuple[int, int, int], output: Text | tuple[object, ...], meta: Mapping[str, object] = <_HAS_DEFAULT_FACTORY_CLASS>, trust: str = 'trusted', artifacts: tuple[Mapping[str, object], ...] = ()) -> None",
+          "init": "(call: tuple[int, int, int], output: Text | tuple[object, ...], meta: Mapping[str, object] = <factory>, trust: str = 'trusted', artifacts: tuple[Mapping[str, object], ...] = ()) -> None",
           "kind": "dataclass",
           "members": {}
         },
@@ -9261,7 +9261,7 @@
             }
           ],
           "frozen": true,
-          "init": "(call: tuple[int, int, int], output: Text | tuple[object, ...] | None = None, meta: Mapping[str, object] = <_HAS_DEFAULT_FACTORY_CLASS>, trust: str = 'trusted', artifacts: tuple[Mapping[str, object], ...] = (), raised: ScenarioError | None = None, arguments_digest: str | None = None) -> None",
+          "init": "(call: tuple[int, int, int], output: Text | tuple[object, ...] | None = None, meta: Mapping[str, object] = <factory>, trust: str = 'trusted', artifacts: tuple[Mapping[str, object], ...] = (), raised: ScenarioError | None = None, arguments_digest: str | None = None) -> None",
           "kind": "dataclass",
           "members": {}
         }
@@ -9597,7 +9597,7 @@
             }
           ],
           "frozen": true,
-          "init": "(divergences: tuple[Divergence, ...], result: ScenarioResult, unrebuilt: tuple[str, ...] = (), trajectories: Mapping[str, tuple[ContextBlock, ...]] = <_HAS_DEFAULT_FACTORY_CLASS>) -> None",
+          "init": "(divergences: tuple[Divergence, ...], result: ScenarioResult, unrebuilt: tuple[str, ...] = (), trajectories: Mapping[str, tuple[ContextBlock, ...]] = <factory>) -> None",
           "kind": "dataclass",
           "members": {
             "reproduced": {

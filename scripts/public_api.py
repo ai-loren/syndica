@@ -154,6 +154,9 @@ def _value(value: object) -> str:
     if isinstance(value, type):
         return value.__qualname__
     text = repr(value)
+    if text == '<factory>':
+        # dataclasses 给 default_factory 字段的哨兵；它的 repr 本来就稳定、读者也认得。
+        return text
     if text.startswith('<') and text.endswith('>'):
         return f'<{type(value).__qualname__}>'
     return _checked(text)
@@ -703,7 +706,15 @@ def render_reference(data: Mapping[str, Any], described: Mapping[str, Mapping[st
             lines.append('')
             signature = _signature_of(entry, name)
             if signature is not None:
-                lines.extend(['```python', signature, '```', ''])
+                lines.extend(
+                    [
+                        '<!-- not-tested: a signature from the public API snapshot, not code -->',
+                        '```python',
+                        signature,
+                        '```',
+                        '',
+                    ]
+                )
             if entry['kind'] == 'enum':
                 members = cast(Mapping[str, object], entry['members'])
                 rendered = ', '.join(
