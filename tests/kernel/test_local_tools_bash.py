@@ -369,7 +369,10 @@ async def test_bash_output_clips_a_finished_background_command_too(
             break
         await asyncio.sleep(0.1)
         result = await output.execute(handle)
+    # truncated 说的是这一次交出的那段：命令还在跑时的轮询可能已经把大部分输出当增量读走了。
+    result = await output.execute(handle, full=True)
 
+    assert result.meta['running'] is False
     assert list(result.meta) == ['handle', *_META_KEYS]
     assert result.meta['truncated'] is True
     stdout = result.meta['stdout']
