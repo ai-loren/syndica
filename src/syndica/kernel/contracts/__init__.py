@@ -1,5 +1,6 @@
 from syndica.kernel.contracts.base import ContractSuite
 from syndica.kernel.contracts.broker import MessageBrokerContract
+from syndica.kernel.contracts.long_horizon import LongHorizonStrategyContract
 from syndica.kernel.contracts.registry import AgentRegistryContract
 from syndica.kernel.contracts.session import SessionStoreContract
 from syndica.kernel.contracts.trace import TraceStoreContract
@@ -13,6 +14,7 @@ from syndica.kernel.protocols.registry import (
 __all__ = [
     'AgentRegistryContract',
     'ContractSuite',
+    'LongHorizonStrategyContract',
     'MessageBrokerContract',
     'SessionStoreContract',
     'TraceStoreContract',

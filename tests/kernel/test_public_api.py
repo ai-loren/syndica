@@ -37,13 +37,20 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'AgentSlot',
     'AgentStatus',
     'AllowAll',
+    'Anchor',
+    'AnchorSource',
+    'ArtifactHandler',
+    'ArtifactReader',
     'ArtifactRef',
     'AskUser',
     'AskUserQuestion',
     'AttributeValue',
     'BaseAgent',
+    'BaselineStrategy',
     'BlockHighRisk',
     'Budget',
+    'BudgetAction',
+    'BudgetMove',
     'BudgetPolicy',
     'BudgetView',
     'CachePrefixProvider',
@@ -64,7 +71,11 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'DangerRule',
     'DangerVerdict',
     'DeliveryResult',
+    'Diff',
     'Disposition',
+    'DriftAction',
+    'DriftMove',
+    'DriftReport',
     'EdgeKind',
     'Event',
     'EventBus',
@@ -81,6 +92,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'FlagDeclaration',
     'FlagRow',
     'FlagValue',
+    'Goal',
     'GrepHit',
     'HookCallback',
     'HookResult',
@@ -100,6 +112,9 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'LLMResponseError',
     'LocalIsolator',
     'LocalWorkspace',
+    'LongHorizonContext',
+    'LongHorizonStrategy',
+    'MESSAGE_LIMIT',
     'MailboxConfirmationHandler',
     'ManifestSource',
     'MergeConflict',
@@ -111,6 +126,7 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'NO_RULE_MATCHED',
     'NullTracer',
     'Orchestrator',
+    'OutcomeKind',
     'OverrideRecord',
     'PayloadRef',
     'PayloadRefused',
@@ -120,8 +136,10 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'PrefixDriftModule',
     'PrefixDriftRecord',
     'PrefixDriftService',
+    'Preview',
     'PriceTable',
     'Prices',
+    'ProgressSnapshot',
     'PtyCapture',
     'PtyStatus',
     'RedactedContent',
@@ -133,6 +151,11 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'RetryModule',
     'RiskLevel',
     'Role',
+    'Rubric',
+    'RubricKind',
+    'RubricOrigin',
+    'RubricOutcome',
+    'RubricStatus',
     'RuleRedactor',
     'Runtime',
     'RuntimeModule',
@@ -150,7 +173,10 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'SpanKind',
     'SpanStatus',
     'StableKey',
+    'StallAction',
+    'StallMove',
     'StaticPrices',
+    'StopDecision',
     'StopReason',
     'Subscription',
     'SyndicaError',
@@ -170,8 +196,11 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'TrustLevel',
     'Usage',
     'UserInput',
+    'Verdict',
+    'VerdictStatus',
     'VersionEntry',
     'VersionStore',
+    'Violation',
     'WaitResult',
     'WaitState',
     'Waiter',
@@ -179,22 +208,22 @@ _KERNEL_EXPORTS: tuple[str, ...] = (
     'WorkspaceRouter',
     'WriteConflict',
     'call_external',
+    'derive_verdict',
     'encode_redacted',
     'flag_reference',
     'local_tools',
     'orchestration_tools',
     'parse_scenario_document',
-    'provenance_of',
     'redacted_content',
     'redacted_record',
     'register_builtins',
-    'strictest_trust',
     'verbatim_attribute',
 )
 # contracts 随 wheel 发布，是第三方写 Store 实现的入口（spec §13.3），同属兼容承诺。
 _CONTRACT_EXPORTS: tuple[str, ...] = (
     'AgentRegistryContract',
     'ContractSuite',
+    'LongHorizonStrategyContract',
     'MessageBrokerContract',
     'SessionStoreContract',
     'TraceStoreContract',
@@ -364,8 +393,17 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 # - `LocalAgentTable`：spec §4.3 明文说它只在进程内有意义、不进 Protocol。
 # - `correlation_of`：`Waiter` 密封分发的内部收口，`wait_for` 自己调。
 # - 八个工具类不进承诺面，宿主用 `local_tools` 按键取。
-# - `RuleTablePolicy`：M2 开发期宿主用的按表处置；进不进承诺面在 M12 冻结公开 API 时定。
-# - 三个规则工厂（`git_state_change_rule` 等）：M2 开发期宿主组合的可选规则，同上待 M12 定。
+# - `RuleTablePolicy` 与三个规则工厂（`git_state_change_rule` 等）：CLI 开发期宿主自己组合的处置与
+#   可选规则；`DangerPolicy` / `DangerRule` 已公开，宿主照着协议写自己的即可。
+# - `provenance_of` / `strictest_trust`：判据的单一定义落点，内核与编排工具共用；没有公开签名收或交
+#   它们，宿主读溯源看块上的 `trust`。
+# - `ArtifactHandlers`（注册表）、`GenericHandler`、`KINDS`：第三方经
+#   `RuntimeModule(artifact_handlers=)` 装处理器，注册表归宿主；协议与它方法签名里的类型已公开。
+# - `AcceptanceModule` / `LongHorizonModule` 与 `RubricStore` / `ArtifactStore` / `MemoryStore`
+#   及其契约：v1.0 provisional。两个 Module 的构造签名收这几个 store，公开它们就得同时冻结 store
+#   的形状；策略的作者需要的协议、快照、动作与契约已公开。
+# - 预算树的读写入口（`Runtime._budget_of` / `_grant_budget`）：策略经快照里的 `BudgetView` 读预算，
+#   宿主经 `BudgetPolicy.ask_human` 追加；只有树内的宿主直接调它们。
 # - `RULE_IDS` / `RULES_VERSION`：宿主不需要它们就能构造与使用脱敏器；两者都算进了
 #   `RuleRedactor.digest`，判断两套规则是不是同一套比摘要即可。
 # - `looks_secret`：宿主从自己的环境里挑密钥值时用；内核的公开入口只收挑好的值。
@@ -382,7 +420,7 @@ _PACKAGE = Path(__file__).resolve().parents[2] / 'src' / 'syndica' / 'kernel'
 #   记录时同样的指纹；宿主不需要它们就能记录与回放。
 # - `analyze_trace`：服务面把一份 trace 交给前端核对时间线用的纯数据分析；CLI 的文字视图另有渲染。
 # - `block_payload` / `budget_payload` / `artifact_payload` / `plain_data`：内核对象的纯数据表示，
-#   事件 payload 用它们；宿主读的是事件里已经算好的那一份，快照由宿主装配自己调。M12 定。
+#   事件 payload 用它们；宿主读的是事件里已经算好的那一份，形状由 HTTP 契约冻结。
 # - `KERNEL_EVENTS` 与 `SCENARIO_EVENT_KINDS`：经子模块承诺。前者是内核事件种类与必有键的表，
 #   SSE 出口按它生成每种事件的 schema；后者是场景格式比对的那批种类。
 # - `encode_prepared`：recorder 写回放文档用的编码（各项已在自己的上下文里脱敏）；宿主写自己的
@@ -455,13 +493,7 @@ _WITHHELD: tuple[str, ...] = (
     'BudgetRefused',
     'BudgetTree',
     'PriceUnknown',
-    'BudgetAction',
-    'BudgetMove',
-    'DriftAction',
-    'DriftMove',
-    'DriftReport',
     'LongHorizonBlock',
-    'LongHorizonContext',
     'LongHorizonController',
     'LongHorizonModule',
     'BackgroundCall',
@@ -483,7 +515,6 @@ _WITHHELD: tuple[str, ...] = (
     'BackgroundModule',
     'QueryBackgroundTool',
     'CancelBackgroundTool',
-    'BaselineStrategy',
     'ProgressLedger',
     'ProgressRecord',
     'action_terms',
@@ -491,11 +522,6 @@ _WITHHELD: tuple[str, ...] = (
     'anchored',
     'call_lines',
     'denominator_ids',
-    'LongHorizonStrategy',
-    'ProgressSnapshot',
-    'StallAction',
-    'StallMove',
-    'StopDecision',
     'RESOURCE_DIMENSIONS',
     'overlap',
     'terms',
@@ -517,17 +543,6 @@ _WITHHELD: tuple[str, ...] = (
     'PruningCompaction',
     'RuleBasedCompaction',
     'SummaryCompaction',
-    'Anchor',
-    'AnchorSource',
-    'Goal',
-    'OutcomeKind',
-    'Rubric',
-    'RubricKind',
-    'RubricOutcome',
-    'RubricStatus',
-    'Verdict',
-    'VerdictStatus',
-    'derive_verdict',
     'rubric_trust',
     'ArtifactStore',
     'InMemoryArtifactStore',
@@ -538,26 +553,18 @@ _WITHHELD: tuple[str, ...] = (
     'index_from_json',
     'index_to_json',
     'KINDS',
-    'ArtifactHandler',
     'ArtifactHandlers',
-    'ArtifactReader',
-    'Diff',
     'GenericHandler',
-    'Preview',
-    'Violation',
     'RubricStore',
     'InMemoryRubricStore',
     'FileRubricStore',
     'RubricStoreContract',
-    'LongHorizonStrategyContract',
-    'MESSAGE_LIMIT',
     'RedactedGoal',
     'RedactedRubric',
     'redacted_goal',
     'redacted_rubric',
     'goal_key',
     'meaningful_quote',
-    'RubricOrigin',
     'most_severe',
     'goal_block',
     'rubric_block',
@@ -726,6 +733,8 @@ _WITHHELD: tuple[str, ...] = (
     'write_all',
     'write_new',
     'write_redacted',
+    'provenance_of',
+    'strictest_trust',
 )
 
 

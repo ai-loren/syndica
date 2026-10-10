@@ -80,15 +80,17 @@ class ContractViolation(SyndicaError):
     """Protocol 契约或文档化的调用方契约被违反。
 
     与 `ConfigError` 的分界：**值本身没问题、错在此刻不该这样调**（重复 id、未知 id、替换未结束
-    的任务、shutdown 之后 spawn、往受保护字段上写、hook 用了这个切点读不到的槽位）归本类。
+    的任务、shutdown 之后 spawn、往受保护字段上写、hook 用了这个切点读不到的槽位），或者一个
+    第三方实现（store、工具、处理器）交回了违反 Protocol 承诺的东西，归本类。
     """
 
 
 class ConfigError(SyndicaError):
-    """配置或声明不合法。
+    """调用方交来的值不合法：配置文件、声明，以及公开 API 的实参。
 
-    与 `ContractViolation` 的分界：**值本身作为声明就不合法**（工具 schema 缺键、标注读不懂、
-    工具表的键与 `tool.name` 不一致、capacity < 1、derive 了未声明的字段）归本类。
+    与 `ContractViolation` 的分界：**值本身就不合法，换一个值重新调用就能好**（工具 schema 缺键、
+    标注读不懂、工具表的键与 `tool.name` 不一致、capacity < 1、derive 了未声明的字段、实参的类型
+    或取值不对）归本类。分界写在 `docs/user/reference/errors.md`，以后加子类不改这条分界。
     """
 
 

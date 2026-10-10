@@ -7,8 +7,6 @@
 
 长程 Module 对违约照样兜底（失败开放、截断、记 ERROR），这份契约让策略的作者在装上之前就知道。
 
-先私有（随 wheel 发布但不进 kernel.__all__），与 Goal / Rubric / Verdict 一起等 M12。
-
 **运行前提**见 `syndica.kernel.contracts.base`。
 """
 
