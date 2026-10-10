@@ -75,8 +75,6 @@ jobs:
       - run: npx playwright install --with-deps chromium
         working-directory: web
       - run: scripts/check_e2e.sh
-      # check_web.sh 重新生成类型、重新构建并重写 build-info.json；提交里的产物必须与这次构建逐字节相同，
-      # 否则 wheel 里发出去的前端不是这份源码构建出来的。
       - run: scripts/check_web_reproduced.sh
 
   package:

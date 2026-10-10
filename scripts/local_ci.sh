@@ -112,9 +112,12 @@ record() {
   echo "$line"
 }
 
+# 非交互 shell 的后台任务（--jobs 2 的两路）把 SIGINT、SIGQUIT 设成忽略，忽略会经 exec 一路继承到
+# pytest：Ctrl-C 的用例全红，被测的程序也收不到 Ctrl-C。每一格先复位成默认处置再起。
 host_env() {
   env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" \
-    LANG="${LANG:-en_US.UTF-8}" CI=true "$@"
+    LANG="${LANG:-en_US.UTF-8}" CI=true \
+    perl -e '$SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or die "exec $ARGV[0]: $!\n"' -- "$@"
 }
 
 run_host() {
@@ -129,17 +132,20 @@ run_host() {
 }
 
 image_for() {
-  echo "syndica-local-ci:py$1-uv$UV_VERSION"
+  echo "syndica-local-ci:py$1-trixie-uv$UV_VERSION"
 }
 
+# sh 没有局部变量：这里的名字不能与调用方的 cell / log / python 重名。
 build_image() {
-  python=$1
-  log=$2
-  # python:3.X-bookworm 是带 git、procps 的完整 Debian，与托管 runner 一样以非 root 用户跑：
+  image_python=$1
+  image_log=$2
+  # python:3.X-trixie 是带 git、procps 的完整 Debian。不用 bookworm：它的 git 是 2.39，宿主的 git 调用
+  # 带 --attr-source，要 2.40 以上（托管 runner 的 git 是新的）。与托管 runner 一样以非 root 用户跑：
   # 不少用例在 root 下跳过（root 不受文件权限约束）。
-  docker build --tag "$(image_for "$python")" --build-arg PYTHON="$python" - > "$log" 2>&1 <<EOF
-ARG PYTHON
-FROM python:\${PYTHON}-bookworm
+  docker build --tag "$(image_for "$image_python")" --build-arg PYTHON="$image_python" - \
+    > "$image_log" 2>&1 <<EOF
+ARG PYTHON=3.11
+FROM python:\${PYTHON}-trixie
 COPY --from=ghcr.io/astral-sh/uv:$UV_VERSION /uv /uvx /usr/local/bin/
 RUN command -v git ps \
  && useradd --create-home --uid 1001 ci \
