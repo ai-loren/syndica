@@ -253,9 +253,18 @@ def _require_generic_endpoint(name: str, model: str) -> None:
 
 
 def _default_prices() -> PriceTable:
-    """backend 认得的默认价格（只有免费模型）；`.syndica.yaml` 的 prices: 由宿主排在它前面。"""
-    from syndica.backends.llm_openai import FreeTierPrices
+    """backend 认得的默认价格（只有免费模型）；`.syndica.yaml` 的 prices: 由宿主排在它前面。
 
+    没装 openai extra 时一个模型也建不出来，也就没有要查价的模型：交回空表。每条命令都先建宿主，
+    在这里抛出会让不调模型的 `config trust`、`doctor` 一起以一条裸 ModuleNotFoundError 失败；
+    怎么装由 `_configured_model` 在真要建模型时说。
+    """
+    try:
+        from syndica.backends.llm_openai import FreeTierPrices
+    except ImportError:
+        from syndica.kernel import StaticPrices
+
+        return StaticPrices({})
     return FreeTierPrices()
 
 
@@ -266,7 +275,19 @@ def _configured_model(name: str) -> LLM:
     配置的平台按顺序组成轮换；`<平台>:<型号>` 只走那一家；没有平台前缀的模型名仍按原规则走
     OpenRouter（配置了的话）或 `OPENAI_*`。后两种都不进轮换。
     """
-    from syndica.backends.llm_openai import recoverable, retry_after
+    try:
+        from syndica.backends.llm_openai import recoverable, retry_after
+    except ImportError as exc:
+        from syndica.kernel import ConfigError
+
+        raise ConfigError(
+            expected=(
+                "模型客户端已安装（pip install 'syndica[openai]'）："
+                'OpenAI 兼容端点、Gemini 与 OpenRouter 都经它调用'
+            ),
+            received=f'导入失败：{exc}',
+            next_action="运行 pip install 'syndica[openai]' 后重试",
+        ) from exc
     from syndica.backends.llm_router import ModelRouter
 
     platform, model = _platform_and_model(name)

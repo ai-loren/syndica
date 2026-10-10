@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -758,6 +759,64 @@ def test_module_entrypoint_lists_agents_without_model_configuration(
     assert completed.returncode == 0
     assert completed.stdout.splitlines() == ['Planner', 'Explorer', 'Worker', 'Orchestrator']
     assert completed.stderr == ''
+
+
+_WITHOUT_HTTPX = """\
+import runpy
+import sys
+
+sys.modules['httpx'] = None
+sys.argv = ['syndica', *sys.argv[1:]]
+runpy.run_module('syndica', run_name='__main__', alter_sys=True)
+"""
+
+
+def _without_openai_extra(workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """`syndica <args>` 跑在 import 不到 httpx 的解释器里：等于装了 syndica 却没装 openai extra。"""
+    return subprocess.run(
+        [sys.executable, '-c', _WITHOUT_HTTPX, *args],
+        cwd=workspace,
+        env={
+            **_without_model_env(),
+            'XDG_CONFIG_HOME': str(workspace.parent / 'config'),
+            'OPENAI_BASE_URL': 'https://llm.example.test/v1',
+            'OPENAI_API_KEY': 'test-key',
+            'OPENAI_MODEL': 'model-a',
+        },
+        stdin=subprocess.DEVNULL,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_config_trust_works_without_the_openai_extra(tmp_path: Path) -> None:
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+    (workspace / '.syndica.yaml').write_text('version: 1\nmodules: [acceptance]\n', 'utf-8')
+
+    probe = _without_openai_extra(workspace, 'config', 'trust')
+    digest = re.search(r'--sha256 ([0-9a-f]{64})', probe.stderr)
+    assert digest is not None, probe.stderr
+    assert 'httpx' not in probe.stdout + probe.stderr
+    trusted = _without_openai_extra(workspace, 'config', 'trust', '--sha256', digest.group(1))
+    assert trusted.returncode == 0, trusted.stderr
+
+
+@pytest.mark.parametrize('command', [('doctor',), ('run', 'hello')])
+def test_without_the_openai_extra_building_a_model_names_the_install_command(
+    tmp_path: Path, command: tuple[str, ...]
+) -> None:
+    workspace = tmp_path / 'ws'
+    workspace.mkdir()
+
+    completed = _without_openai_extra(workspace, *command)
+
+    assert completed.returncode == 1
+    lines = completed.stderr.splitlines()
+    assert any(line.startswith('期望: 模型客户端已安装') for line in lines), completed.stderr
+    assert any(line.startswith('实际: 导入失败') for line in lines), completed.stderr
+    assert "下一步: 运行 pip install 'syndica[openai]' 后重试" in lines, completed.stderr
 
 
 def test_module_entrypoint_doctor_builds_the_openai_composition_without_network(
